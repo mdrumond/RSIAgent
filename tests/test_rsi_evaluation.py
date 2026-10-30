@@ -2,6 +2,7 @@
 from dataclasses import asdict, replace
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -35,21 +36,25 @@ def comparison(tmp_path, env, request):
     heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout',
         **getattr(request, 'param', {}))
     calls = []
-    def factory(request, *, reopen):
+    def factory(request, *, reopen, session_factory=None, clock=None):
         calls.append((request.arm, reopen))
         kwargs = dict(injected, backend_identity=request.backend_identity,
-                      session_factory=lambda: Session(repair=request.arm == 'candidate'))
+                      session_factory=session_factory or (lambda: Session(repair=request.arm == 'candidate')))
+        if clock is not None:
+            kwargs['clock'] = clock
         if reopen:
             return ProjectRunner(request.root, **kwargs)
         return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
     def create(**kwargs):
         remaining = kwargs.pop('remaining_parent', {'actor_seconds': 30})
+        repetitions = kwargs.pop('repetitions', 1)
+        limits = kwargs.pop('joint_limits', BudgetLimits(6, 4, 40, 30))
         return SkillEvaluation.create(tmp_path / 'evaluation.json', checkpoints=[heldout],
             training=[case_identity(training)], artifacts=store, memory_ref=memory,
             kdb_ref=store.put_bytes(b'baseline knowledge'), model_config={'model': 'TEST'},
             incumbent=incumbent, candidate=candidate, runner_factory=factory,
-            joint_limits=BudgetLimits(6, 4, 40, 30), remaining_parent=remaining,
-            case_count=1, repetitions=1, **kwargs)
+            joint_limits=limits, remaining_parent=remaining,
+            case_count=1, repetitions=repetitions, **kwargs)
     yield create, learner, calls, store, heldout, training, factory
     heldout_db.close()
     training_db.close()
@@ -72,6 +77,12 @@ def test_real_pairs_promote_only_after_entire_frozen_suite(comparison):
     result = finish(evaluation)
     assert result['decision'] == 'benefit'
     assert result['actor_seconds'] > 0
+    pair = store.read_json(result['pairs'][0])
+    assert pair['decision'] == 'benefit'
+    assert pair['arms']['incumbent']['task_failure'] is True
+    proof = store.read_json(pair['arms']['incumbent']['terminal_failure_ref'])
+    assert any(store.read_json(ref)['classification'] == 'numeric_failure'
+               for ref in proof['command_receipts'])
     assert calls == [('incumbent', False), ('candidate', False)]
     assert evaluation.promote(learner) == evaluation.plan['candidate']
     assert learner.active == evaluation.plan['candidate']
@@ -138,9 +149,8 @@ def test_ties_and_regressions_do_not_call_learning(comparison, mode, decision):
     create, learner, _, _, _, _, factory = comparison
     evaluation = create()
     def both_repair(request, *, reopen):
-        runner = factory(request, reopen=reopen)
-        runner.actor.session_factory = lambda: Session(repair=mode == 'tie' or request.arm == 'incumbent')
-        return runner
+        return factory(request, reopen=reopen,
+                       session_factory=lambda: Session(repair=mode == 'tie' or request.arm == 'incumbent'))
     # Change the scripted provider, not trusted comparison receipts.
     # Factory remains a real canonical runner; its fixed model identity is unchanged.
     evaluation.factory = both_repair
@@ -296,3 +306,99 @@ def test_actual_correctness_pass_cannot_promote_performance_shortfall(comparison
     assert result['decision'] == 'inconclusive'
     assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'forced-validation') == evaluation.plan['incumbent']
     assert learner.active == evaluation.plan['incumbent']
+
+
+@pytest.mark.parametrize('repetitions', [1, 2])
+def test_provider_only_variance_cannot_promote_even_alongside_task_benefit(comparison, repetitions):
+    from coding.pi.rpc import PiDeadlineError
+    create, learner, _, store, _, _, _ = comparison
+    # This tests provider variance, not exhaustion: retain a declared 60-second
+    # arm allowance even on slower registered CPUs and across repetitions.
+    evaluation = create(repetitions=repetitions, joint_limits=BudgetLimits(6, 4, 40, 120),
+                        remaining_parent={'actor_seconds': 120 * repetitions})
+    learner.validate = evaluation.validation
+    factory = evaluation.factory
+    failed_once = False
+    class ClosedProvider(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'design' and any(e['name'] == 'query_kdb' for e in context['evidence']):
+                raise PiDeadlineError('Observed closed provider before any task command')
+            return super().next_action(context, allowed, **kwargs)
+    def trial(request, *, reopen):
+        nonlocal failed_once
+        if not reopen and request.arm == 'incumbent' and not failed_once:
+            failed_once = True
+            return factory(request, reopen=reopen, session_factory=lambda: ClosedProvider())
+        return factory(request, reopen=reopen)
+    evaluation.factory = trial
+    result = finish(evaluation)
+    raw = [store.read_json(ref) for ref in result['pairs']]
+    assert raw[0]['decision'] == 'inconclusive'
+    old, new = raw[0]['arms']['incumbent'], raw[0]['arms']['candidate']
+    assert old['classification'] == 'provider_timeout' and old['task_failure'] is False
+    assert new['outcome'] == 'accepted' and new['correctness'] is True
+    proof = store.read_json(old['terminal_failure_ref'])
+    assert proof['pending'] and proof['retrieval_receipts'] and not proof['command_receipts']
+    assert result['actor_seconds'] == sum(arm['actor_seconds'] for pair in raw for arm in pair['arms'].values()) > 0
+    assert result['actor_seconds'] <= evaluation.plan['parent']['actor_seconds']
+    if repetitions == 2:
+        assert raw[1]['decision'] == 'benefit'
+        assert raw[1]['arms']['incumbent']['task_failure'] is True
+    assert result['decision'] == 'inconclusive'
+    assert evaluation.promote(learner) == evaluation.plan['incumbent']
+    # Even direct Learning validation cannot reinterpret a provider-only failure.
+    assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'provider-validation') == evaluation.plan['incumbent']
+
+
+@pytest.mark.parametrize('setup', ['factory', 'actor'])
+def test_original_parent_deadline_bounds_current_setup_and_resumed_evaluation(comparison, setup):
+    create, learner, calls, store, _, _, factory = comparison
+    class HostClock:
+        offset = 0.
+        def __call__(self):
+            return time.time() + self.offset
+    clock = HostClock()
+    prepared = []
+    class SlowSetup(Session):
+        def prepare(self, timeout, *, schemas):
+            prepared.append(timeout)
+            clock.offset += 50
+            return super().prepare(timeout, schemas=schemas)
+    def trial(request, *, reopen):
+        if not reopen and setup == 'factory':
+            clock.offset += 50
+        return factory(request, reopen=reopen,
+            session_factory=SlowSetup if setup == 'actor' else Session, clock=clock)
+    evaluation = create(clock=clock, remaining_parent={'actor_seconds': 30, 'wall_seconds': 40})
+    evaluation.factory = trial
+    learner.validate = evaluation.validation
+    plan_ref = evaluation.state['plan']
+    deadline = evaluation.plan['created'] + 40
+    frozen = evaluation.pair(0).frozen
+    evaluation.step()  # Executes only the first real canonical arm.
+    pair = evaluation.pair(0)
+    assert pair.state['wall_deadline'] <= deadline
+    old = store.read_json(pair.state['arms']['incumbent']['receipt'])
+    assert old['wall_limited'] and old['outcome'] == 'failed'
+    assert old['actor_seconds'] < 50  # Actual setup is excluded from actor time.
+    workflow = store.read_json(old['workflow_receipt'])
+    created = workflow['created']
+    assert min(workflow['wall_deadlines'].values()) <= deadline
+    assert workflow['limits'] == frozen['allocation']
+    assert pair.state['arms']['candidate']['status'] == 'ready'
+    assert len(calls) == 1
+    if setup == 'actor':
+        assert len(prepared) == 1 and 0 < prepared[0] <= frozen['allocation']['wall_seconds']
+    else:
+        assert not prepared
+    resumed = SkillEvaluation(evaluation.path, artifacts=store, runner_factory=trial, clock=clock)
+    clock.offset += 100
+    with pytest.raises(WorkflowError, match='wall allocation'):
+        resumed.step()
+    retained = resumed.pair(0)
+    assert resumed.state['plan'] == plan_ref and retained.frozen == frozen
+    assert retained.state['wall_deadline'] <= deadline
+    assert store.read_json(retained.state['arms']['incumbent']['receipt']) == old
+    assert store.read_json(old['workflow_receipt'])['created'] == created
+    assert len(calls) == 1 and not [op for op in learner.state['operations'].values()
+                                   if op['request']['kind'] == 'validation']
