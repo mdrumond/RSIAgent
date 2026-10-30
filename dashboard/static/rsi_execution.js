@@ -32,7 +32,7 @@
       if (root.dataset.enabled !== 'true') return;
       const button = form.querySelector('button'); button.disabled = true;
       try {
-        await submit({action, ...transform(Object.fromEntries(new FormData(form)))});
+        await submit({action, ...await transform(Object.fromEntries(new FormData(form)))});
         await refresh();
       } catch (error) { status(error.message); }
       finally { button.disabled = false; }
@@ -46,7 +46,11 @@
     return value;
   });
   bind('tune-form', 'manual-tuning');
-  bind('repo-form', 'add-repo'); bind('export-form', 'export');
+  bind('repo-form', 'add-repo', async value => {
+    const snapshot = await api('/api/rsi/config');
+    return {...value, revision: snapshot.revision};
+  });
+  bind('export-form', 'export');
   function renderLedger(inspection) {
     const ledger = $('time-ledger'); ledger.replaceChildren();
     const add = (tag, text, parent = ledger) => {

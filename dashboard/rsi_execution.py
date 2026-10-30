@@ -85,11 +85,12 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                     if not isinstance(payload.get('project'), dict) or type(payload.get('recover')) is not bool:
                         raise ControlError('Inference requires a project and an explicit recovery choice.')
         elif action == 'add-repo':
-            for key in ('source', 'database', 'embedding_cache', 'collection', 'repository',
-                        'negative_records', 'evidence_store'):
+            for key in ('source', 'collection', 'repository'):
                 _text(payload, key)
-            if payload.get('database_kind') not in ('a3', 'generic'):
-                raise ControlError('Choose the existing database schema.')
+            for key in ('negative_records', 'revision'):
+                _text(payload, key, required=False)
+            if any(key in payload for key in ('database', 'database_kind', 'embedding_cache', 'evidence_store')):
+                raise ControlError('Instance ingestion uses its configured KDB, embeddings and evidence store.')
         elif action == 'export':
             _text(payload, 'task'); _text(payload, 'destination')
         else:
@@ -133,11 +134,15 @@ def register_rsi_execution(app, controls, csrf_token, cli):
             return {'exported': True, 'destination': payload['destination']}
         if action == 'add-repo':
             args = ['kdb-add-repo', payload['source']]
-            for key in ('database', 'database_kind', 'embedding_cache', 'collection',
-                        'repository', 'negative_records', 'evidence_store'):
-                args += ['--' + key.replace('_', '-'), payload[key]]
+            for key in ('collection', 'repository'):
+                args += ['--' + key, payload[key]]
+            if payload.get('negative_records'):
+                args += ['--negative-records', payload['negative_records']]
+            if payload.get('revision'):
+                args += ['--expect-revision', payload['revision']]
             receipt = cli(*args, timeout=1800)
-            return {key: receipt[key] for key in ('reference', 'collection', 'revision', 'documents')
+            return {key: receipt[key] for key in ('reference', 'collection', 'revision', 'baseline_kdb', 'kdb_sha256',
+                         'configuration_revision', 'negative_records')
                     if key in receipt}
         raise ControlError(UNAVAILABLE)
 

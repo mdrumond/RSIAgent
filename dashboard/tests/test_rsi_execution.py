@@ -124,13 +124,14 @@ def test_guards_apply_to_direct_and_generic_queue(execution):
 
 def test_real_ingestion_and_export_arguments_are_forwarded(execution):
     app, client, calls, headers = execution
-    payload = dict(action='add-repo', source='/node/repo with spaces', database='/node/kdb',
-        database_kind='generic', embedding_cache='/node/cache', collection='code',
-        repository='local-repo', negative_records='/node/negatives.json', evidence_store='/node/cas')
+    payload = dict(action='add-repo', source='/node/repo with spaces', collection='new-code',
+        repository='local-repo', negative_records='/node/negatives.json', revision='config-before-ingestion')
     assert settle(app, client.post('/api/rsi/execute', json=payload, headers=headers))['status'] == 'succeeded'
     args, options = calls[-1]
     assert args[:2] == ['kdb-add-repo', payload['source']]
     assert args[args.index('--negative-records') + 1] == payload['negative_records']
+    assert args[args.index('--expect-revision') + 1] == 'config-before-ingestion'
+    assert not set(args) & {'--database', '--database-kind', '--embedding-cache', '--evidence-store'}
     assert options['timeout'] == 1800
     assert settle(app, client.post('/api/rsi/execute', headers=headers,
         json=dict(action='export', task='/node/task', destination='/node/export')))['status'] == 'succeeded'
@@ -218,3 +219,14 @@ def test_ledger_closed_intervals_union_latest_snapshot_and_unresolved():
     assert task['actor_union_seconds'] is None
     snapshot['clock_domain'] = 'remote-epoch'
     assert inspection({'events': [snapshot]})['tasks'][0]['accounting_state'] == 'invalid-clock-domain'
+
+
+
+def test_instance_ingestion_retains_defaults_and_rejects_standalone_overrides(execution):
+    app, client, calls, headers = execution
+    payload = dict(action='add-repo', source='/node/repo', collection='new-code', repository='local')
+    assert settle(app, client.post('/api/rsi/execute', json=payload, headers=headers))['status'] == 'succeeded'
+    assert calls[-1][0] == ['kdb-add-repo', '/node/repo', '--collection', 'new-code', '--repository', 'local']
+    assert client.post('/api/rsi/execute', headers=headers,
+        json=dict(payload, database='/old/baseline.sqlite3')).status_code == 409
+    assert len(calls) == 1

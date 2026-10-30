@@ -18,10 +18,11 @@
 <button>Submit phase command</button></fieldset></form>
 <section class="control-panel"><h2>Retained jobs and evidence</h2><button type="button" id="refresh-jobs">Refresh jobs</button><div id="jobs-list"></div>
 <h3>Time and skill inspection</h3><p>Charged categories: thinking, retrieval, implementation, debug, compilation, execution and profiling. Setup and transfer are excluded. Category durations can overlap; the actor total must be the host’s interval union. Unknown timing is never shown as zero. Wall remaining includes all elapsed time.</p><div id="time-ledger"></div><details><summary>Retained inspection details</summary><pre id="job-inspection">Select a retained job to inspect.</pre></details></section>
-<form id="repo-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Add repository to existing KDB</legend>
-<p>Indexes committed source and preserves supplied negative outcomes. Indexed material is not automatically a known-good idea. Select folders in the input editor and paste their node paths here.</p>
-{% for name,label in [('source','Local repository folder'),('database','Existing database path'),('embedding_cache','Pinned embedding cache folder'),('collection','Collection'),('repository','Credential-free repository identity'),('negative_records','Existing negative-outcome JSON snapshot'),('evidence_store','Evidence store folder')] %}<label>{{ label }}<input name="{{ name }}" required></label>{% endfor %}
-<label>Database schema<select name="database_kind"><option>a3</option><option>generic</option></select></label><button>Add repository</button></fieldset></form>
+<form id="repo-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Add repository to this instance’s KDB</legend>
+<p>Indexes committed source into a new immutable baseline copy. Previously admitted cycles keep their baseline. Configured embeddings and this instance’s evidence store are used automatically. Indexed material is not automatically a known-good idea. Select folders in the input editor and paste their node paths here.</p>
+{% for name,label in [('source','Local repository folder'),('collection','New collection name'),('repository','Credential-free repository identity')] %}<label>{{ label }}<input name="{{ name }}" required></label>{% endfor %}
+<label>Additional negative-outcome JSON snapshot, optional<input name="negative_records"></label>
+<p>Existing negative evidence is retained. Supply an actual JSON snapshot to append new negative results; leaving this blank does not discard prior evidence.</p><button>Add repository to new baseline copy</button></fieldset></form>
 <form id="export-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Export retained task evidence for SFT</legend>
 <p>The task must be quiescent. The CLI verifies artifacts and writes a deterministic manifest; no training labels or missing transcripts are invented.</p>
 <label>Canonical task folder<input name="task" required></label><label>New export destination<input name="destination" required></label><button>Export evidence</button></fieldset></form>
