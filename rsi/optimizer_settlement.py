@@ -67,3 +67,13 @@ def require_settled_candidate(execution, state, *, stop_requested, historical=Fa
                 stopped.validate(execution)
     except (WorkflowError, StopIteration) as error:
         raise ObservationUnavailable('canonical task remains observation-required; no cached result published') from error
+
+
+def canonical_evaluation_pending(execution, state):
+    """A pending TEST may need observed evaluation settlement, never a rerun."""
+    active = state.get('canonical_active')
+    if not active:
+        return False
+    path = Path(execution) / ('canonical-' + str(active['index'])) / 'workflow.json'
+    pending = json.loads(path.read_text())['pending']
+    return pending is not None and pending['stage'] == 'test'

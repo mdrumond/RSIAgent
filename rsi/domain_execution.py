@@ -69,6 +69,7 @@ class DomainActivity:
     def __init__(self, runner, operation):
         self.runner, self.operation = runner, operation
         self.executions = []
+        self.terminal_failures = []
 
     def run(self, name, category, callback, *, execution=False, invocation=None):
         flow = self.runner.workflow
@@ -124,6 +125,8 @@ class DomainActivity:
                 if getattr(error, 'terminal_receipt', None) is not None:
                     failure['terminal_receipt'] = error.terminal_receipt
                 finish(failure, 'failed', True)
+                if execution:
+                    self.terminal_failures.append(name)
             else:
                 flow.accounting.unresolved.add(scope['token'])
                 self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
@@ -349,7 +352,8 @@ class DomainRunner(ProjectRunner):
         observation = self.backend.execute(stage, args, operation, activity)
         if not isinstance(observation, DomainObservation):
             raise TypeError('domain host must return DomainObservation')
-        if stage in (Stage.TEST, Stage.VALIDATION) and not activity.executions:
+        if (stage in (Stage.TEST, Stage.VALIDATION) and not activity.executions
+                and not (observation.passed is False and activity.terminal_failures)):
             raise WorkflowError('domain test/validation requires a real admitted execution')
         for reference in observation.artifact_refs:
             self.store.read_bytes(reference)
