@@ -335,3 +335,43 @@ def test_interrupt_reaps_owned_child_and_retains_charged_receipt(tmp_path, monke
     assert runner.run('cancelled', 'slow') == receipt
     assert runner.workflow.state['executions'] == 1
     assert len(owned) == 1
+
+
+def test_minimal_installed_wheel_executes_cpu_backend(tmp_path):
+    import subprocess
+    import venv
+    repository = Path(__file__).resolve().parents[1]
+    wheels = tmp_path / 'wheels'
+    build = subprocess.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps',
+                            '--no-build-isolation', '--no-index', '--wheel-dir', str(wheels),
+                            str(repository)], capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    environment = tmp_path / 'venv'
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / 'bin/python'
+    wheel, = wheels.glob('rsi-*.whl')
+    install = subprocess.run([str(python), '-m', 'pip', 'install', '--no-deps', '--no-index', str(wheel)],
+                             capture_output=True, text=True)
+    assert install.returncode == 0, install.stdout + install.stderr
+    proof = '''
+import json, sys
+from pathlib import Path
+from rsi.python_execution import PythonExecution
+from rsi.runtime import Workflow
+root = Path.cwd()
+source = root / 'input'
+source.mkdir()
+(source / 'solution.py').write_text('value = 42\\n')
+verifier = root / 'verify.py'
+verifier.write_text('from solution import value\\nassert value == 42\\n')
+runner = PythonExecution.snapshot(root / 'task', source, verifier,
+    commands={'test': [sys.executable, '{verifier}']})
+runner.workflow = Workflow(root / 'workflow.json', lambda *a: True, source_hash=runner.project_hash())
+result = runner.run('minimal-wheel', 'test')
+assert result['classification'] == 'passed', result
+print(json.dumps({'classification': result['classification'], 'tries': runner.workflow.state['executions']}))
+'''
+    run = subprocess.run([str(python), '-I', '-c', proof], cwd=tmp_path,
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert json.loads(run.stdout) == {'classification': 'passed', 'tries': 1}

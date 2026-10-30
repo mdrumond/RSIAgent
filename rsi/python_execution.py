@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from core.artifacts import ContentAddressedArtifacts
 from rsi.contracts import Stage
 from rsi.runtime import WorkflowError
 
