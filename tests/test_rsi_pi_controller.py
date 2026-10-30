@@ -11,9 +11,9 @@ from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import builtin_bundle
 
 
-def response(actions, index, tokens=100):
+def response(actions, index, tokens=100, *, summary=None, finish=None, completion_tokens=10):
     from test_pi_runtime import stream
-    result = stream(*(actions[0] if actions else ('unused', {})), index, finish='tool_calls' if actions else 'stop')
+    result = stream(*(actions[0] if actions else ('unused', {})), index, finish=finish or ('tool_calls' if actions else 'stop'))
     original = result.iter_lines
     def lines():
         for line in original():
@@ -26,9 +26,10 @@ def response(actions, index, tokens=100):
                             function=dict(name=name,arguments=json.dumps(args))) for i,(name,args) in enumerate(actions)]
                     else:
                         delta.pop('tool_calls')
-                        delta['content'] = '# Retained context\nSkills read; retain actual receipts and host evidence. Continue current stage.'
+                        delta['content'] = summary or '# Retained context\nSkills read; retain actual receipts and host evidence. Continue current stage.'
                 if 'usage' in item:
                     item['usage']['prompt_tokens'] = tokens
+                    item['usage']['completion_tokens'] = completion_tokens
                 line = b'data: '+json.dumps(item).encode()
             yield line
     result.iter_lines = lines
@@ -547,3 +548,75 @@ def test_real_project_runner_durably_records_native_pi_event_envelopes(monkeypat
     finally:
         runner.actor.close()
         database.close()
+
+
+def test_native_long_summary_uses_sdk_budget_and_recovers_one_length_failure(monkeypatch,tmp_path):
+    events,requests,recalls,summaries=[],[],[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    long_summary='# Actual checkpoint\n'+('Retain current stage, evidence receipts and guarded actions. '*175)
+    def provider(*_,**kwargs):
+        request=json.loads(kwargs['data']);requests.append(request)
+        assert len(kwargs['data'])<=49152
+        if not request.get('tools'):
+            summaries.append(request)
+            assert request['max_tokens'] in (4096,6553)
+            if len(summaries)==1:
+                return response([],len(requests),len(kwargs['data'])//4,summary=long_summary[:7000],
+                                finish='length',completion_tokens=request['max_tokens'])
+            return response([],len(requests),len(kwargs['data'])//4,summary=long_summary,completion_tokens=3000)
+        read=[row['skill'] for kind,row in events if kind=='skill-usage' and row['kind']=='read'
+              and row['stage']==Stage.TASK_CONSTRUCTION.value]
+        missing=[name for name in names if name not in read]
+        actions=([('read_skill',{'name':missing[0]})] if missing else
+                 [('recall',{'sample':str(len(recalls))})] if len(recalls)<18 else
+                 [('perform',{'proposal':'finish after complete long summary'})])
+        return response(actions,len(requests),len(kwargs['data'])//4)
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    def recall(stage,args,operation,seconds):
+        recalls.append(args['sample'])
+        return dict(reference='actual-'+args['sample'],evidence='retained evidence '*140)
+    actor,flow=native_actor(tmp_path,events,lambda *_:StageResult(),
+        {'recall':EvidenceTool(obj({'sample':STRING}),recall)})
+    try:
+        actor.step({});actor.step({'goal':'long native summaries under original wire cap'})
+    finally:actor.close()
+    compactions=[row['event'] for kind,row in events if kind=='pi-event' and row['event']['type']=='compaction_end']
+    assert any(row.get('errorMessage') and not row.get('result') for row in compactions)
+    successful=[row for row in compactions if row.get('result')]
+    assert successful and any(row['result']['usage']['output']>2048 for row in successful)
+    assert any(long_summary in row['result']['summary'] for row in successful)
+    assert flow.stage==Stage.DESIGN and len(recalls)==18
+
+
+def test_summary_requested_budget_is_honored_within_profile_ceiling():
+    from coding.pi.gateway import Gateway
+    from coding.pi.session import RequestAccounting
+    gateway=Gateway('deepseek','fake',RequestAccounting(),'test',max_output_tokens=8192)
+    payload=dict(model='deepseek-flash',messages=[dict(role='user',content='summarize')],max_tokens=6553)
+    assert gateway.prepare(payload)['max_tokens']==6553
+    sdk=dict(payload);sdk.pop('max_tokens');sdk['max_completion_tokens']=4096
+    assert gateway.prepare(sdk)['max_tokens']==4096
+    assert gateway.prepare(dict(payload,max_tokens=20000))['max_tokens']==8192
+
+
+def test_rejected_request_retains_actual_byte_attempt_before_dispatch(monkeypatch):
+    import requests
+    from coding.pi.gateway import Gateway
+    from coding.pi.session import RequestAccounting
+    records=[]
+    gateway=Gateway('deepseek','fake',RequestAccounting(),'test',hard_bytes=700,
+                    on_record=lambda kind,data:records.append((kind,data)))
+    original=requests.post
+    def route(url,*args,**kwargs):
+        assert url.startswith('http://127.0.0.1:')
+        return original(url,*args,**kwargs)
+    monkeypatch.setattr('coding.pi.gateway.requests.post',route)
+    with gateway:
+        result=requests.post(gateway.url+'/chat/completions',json=dict(model='deepseek-flash',
+            messages=[dict(role='user',content='x'*1000)],max_tokens=6553),
+            headers={'Authorization':'Bearer '+gateway.token},timeout=3)
+    assert result.status_code==413 and gateway.calls==0 and gateway.records==[]
+    rejected=next(data for kind,data in records if kind=='pi-context-limit')
+    assert rejected['request_bytes']>rejected['hard_bytes']==700
+    assert rejected['messages_bytes']>1000 and rejected['message_count']==1
+    assert rejected['summary_request'] is True and len(rejected['request_sha256'])==64
