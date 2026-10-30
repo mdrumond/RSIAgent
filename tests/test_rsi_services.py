@@ -621,3 +621,139 @@ def test_ingestion_missing_or_wrong_baseline_receipt_cannot_be_empty_query_succe
             foreign.query(foreign.spec.baseline_kdb)
     finally:
         foreign.close()
+
+
+class ClosedFailureAfterQuery(Decisions):
+    def next_action(self, context, allowed, **kwargs):
+        from coding.pi.rpc import PiDeadlineError
+        if context['stage'] == 'design' and any(r['name'] == 'query_kdb' for r in context['evidence']):
+            raise PiDeadlineError('observed test provider deadline after completed query')
+        return super().next_action(context, allowed, **kwargs)
+
+
+def test_closed_failed_actor_enters_phase1_memory_and_fresh_recovery_without_clearing_pending(instance):
+    sessions = iter([ClosedFailureAfterQuery(), Decisions()])
+    instance.test = Bindings(instance.test.query, lambda: next(sessions), Roles, instance.test.identity)
+    config = show_configuration(instance.root)['payload']
+    config['recovery']['enabled'] = True
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('failed-and-recovered', 'phase1')
+    try:
+        first = cycle.step()
+        assert first.outcome == 'failed' and first.actor_seconds > 0
+        row = cycle.scheduler.state['originals'][0]
+        failed = cycle.open_project(row['operation_id'])
+        original_state = json.loads(json.dumps(failed.workflow.state))
+        assert failed.workflow.pending and failed.workflow.stage == Stage.DESIGN
+        packet = cycle.store.read_json(first.artifact_ref)
+        proof = cycle.store.read_json(packet['failure_proof_ref'])
+        assert proof['retrieval_receipts'] and proof['stage_completion_claim'] is False
+        assert proof['actor_seconds_total'] == first.actor_seconds
+        assert packet['workflow_valid'] is False
+        with pytest.raises(ValueError, match='unfinished scheduler admission'):
+            cycle.run_project(row['operation_id'])
+        cycle.step()  # Actual failed project packet -> accepted negative memory.
+        assert cycle.memory.records()[0]['proposal']['kind'] == 'failure'
+        recovered = cycle.step()  # New independent canonical task, same fixed skills.
+        assert recovered.outcome == 'accepted'
+        assert cycle.scheduler.state['spent'] == first.actor_seconds + recovered.actor_seconds
+        assert len(cycle.scheduler.state['originals']) == 1 and len(cycle.scheduler.state['recoveries']) == 1
+        assert cycle.open_project(row['operation_id']).workflow.state == original_state
+        assert cycle.scheduler.state['recoveries'][0]['operation_id'] != row['operation_id']
+    finally:
+        cycle.close()
+
+
+def test_known_failed_result_loss_reconciles_once_and_unknown_query_remains_blocked(instance):
+    from rsi.strategy import QueryUnavailable
+    instance.test = Bindings(instance.test.query, ClosedFailureAfterQuery, Roles, instance.test.identity)
+    cycle = instance.create_cycle('lost-failed-result', 'phase1')
+    try:
+        real = cycle.scheduler.runner
+        def lost(*args):
+            real(*args)
+            raise RuntimeError('host return lost after durable failed admission')
+        cycle.scheduler.runner = lost
+        with pytest.raises(RuntimeError):
+            cycle.step()
+        assert not cycle.scheduler.state['originals']
+        cycle.reconcile()
+        row = cycle.scheduler.state['originals'][0]
+        spent = cycle.scheduler.state['spent']
+        assert row['outcome'] == 'failed' and spent == row['actor_seconds']
+        with pytest.raises(ValueError, match='explicit learning'):
+            cycle.reconcile()
+        assert cycle.scheduler.state['spent'] == spent
+    finally:
+        cycle.close()
+    def unavailable(_):
+        raise QueryUnavailable('actual backend unavailable')
+    instance.test = Bindings(unavailable, Decisions, Roles, instance.test.identity)
+    unknown = instance.create_cycle('unknown-query', 'phase1')
+    try:
+        with pytest.raises(RuntimeError, match='suspended'):
+            unknown.step()
+        assert unknown.scheduler.state['pending'] and not unknown.scheduler.state['originals']
+        assert unknown.scheduler.state['spent'] == 0
+    finally:
+        unknown.close()
+
+
+def test_generated_paths_flow_through_service_and_preserve_actual_verification(instance):
+    config = show_configuration(instance.root)['payload']
+    config['project_configs']['answer']['generated_paths'] = ['results.json']
+    set_configuration(instance.root, config)
+    (instance.root / 'source/solution.py').write_text(
+        "from pathlib import Path\nPath('results.json').write_text('generated output')\nanswer = 42\n")
+    cycle = instance.create_cycle('generated', 'phase1')
+    try:
+        assert cycle.step().outcome == 'accepted'
+        runner = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+        assert (runner.backend.project / 'results.json').is_file()
+        assert runner.workflow.verified_source == runner.backend.project_hash()
+    finally:
+        cycle.close()
+
+
+def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trace(instance):
+    from rsi.roles import SkillEdit
+    class Writer(Roles):
+        def skillwriter(self, prompt, evidence, *, deadline):
+            self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
+            return SkillProposal('Use observed failure context before selecting strategy',
+                (evidence[0].evidence_id,), (SkillEdit('design', 'replace',
+                    'Review completed retrieval and retained provider-failure evidence before selecting strategy.'),))
+    sessions = iter([ClosedFailureAfterQuery(), ClosedFailureAfterQuery(), Decisions()])
+    instance.test = Bindings(instance.test.query, lambda: next(sessions), Writer, instance.test.identity)
+    config = show_configuration(instance.root)['payload']
+    config['recovery']['enabled'] = True
+    config['recovery']['budgets'] = BudgetLimits(design_iterations=6, implementation_iterations=6,
+        execution_tries=20, actor_seconds=30).to_dict()
+    config['tuning'].update(every_projects=None, at_wave_end=False)
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('paired-failed', 'phase2')
+    try:
+        assert cycle.step().outcome == 'failed'
+        original = cycle.scheduler.state['originals'][0]
+        failed = cycle.open_project(original['operation_id'])
+        frozen_failed = json.loads(json.dumps(failed.workflow.state))
+        cycle.step()  # Memory accepts actual observed failure.
+        cycle.step()  # Real writer proposes different immutable design guidance.
+        assert cycle.learning.active == cycle.scheduler.state['skills']
+        cycle.step()  # Existing CycleController drains old/new canonical pair and validation.
+        assert cycle.open_project(original['operation_id']).workflow.state == frozen_failed
+        assert frozen_failed['pending']
+        pair_path = next((cycle.root / 'pairs').glob('*.json'))
+        from rsi.recovery import PairedRecovery
+        pair = PairedRecovery(pair_path, artifacts=cycle.store, runner_factory=cycle.trial)
+        comparison = pair.result()
+        assert comparison['arms']['incumbent']['outcome'] == 'failed'
+        assert comparison['arms']['incumbent']['workflow'] is False
+        assert comparison['arms']['candidate']['outcome'] == 'accepted'
+        assert pair.frozen['terminal_failure_ref']
+        assert cycle.store.read_json(pair.frozen['original_workflow_ref']) == frozen_failed
+        assert cycle.learning.active == cycle.scheduler.state['skills'] == pair.frozen['candidate']
+        assert pair.frozen['incumbent'] != pair.frozen['candidate']
+        assert cycle.scheduler.state['spent'] == (original['actor_seconds'] + .25 + comparison['actor_seconds'])
+    finally:
+        cycle.close()

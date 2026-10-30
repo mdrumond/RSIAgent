@@ -28,6 +28,7 @@ from rsi.learning import Learning, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
+from rsi.runtime import WorkflowError
 from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
 from rsi.skills import SkillBundle
 from rsi.strategy import knowledge_db_query
@@ -437,7 +438,7 @@ class BoundCycle(TuningBindings):
             raise ValueError('existing admitted operation requires reconciliation')
         binding = dict(memory=memory_ref, skills=skills_ref, configuration=self.spec.configuration_ref,
                        kdb=self.binding['kdb'], provider=self.config['provider'],
-                       test_identity=self.binding['test_identity'])
+                       test_identity=self.binding['test_identity'], actor_seconds_baseline=0.0)
         backend = self.store.put_json(binding)
         runner = self.runner(root, spec=spec, bundle=SkillBundle.from_dict(self.store.read_json(skills_ref)),
             config=self.services.project_config(self.config, spec), memory_ref=memory_ref, backend_identity=backend)
@@ -448,17 +449,34 @@ class BoundCycle(TuningBindings):
 
     def finish_project(self, runner, operation, result, original_id=None):
         pending = self.scheduler.state['pending']
-        if original_id is None:
-            if not pending or pending['id'] != operation:
-                raise ValueError('no matching scheduler admission')
-            original_id = pending['original_id']
+        if not pending or pending['id'] != operation or pending['kind'] not in ('original', 'recovery'):
+            raise ValueError('no matching scheduler admission')
+        original_id = original_id or pending['original_id']
+        outcome, failure = result['status'], None
+        if outcome != 'accepted' and (runner.workflow.pending or outcome == 'suspended'):
+            try:
+                failure = runner.terminal_failure_proof(closure_ref=result.get('actor_closure_ref'))
+                outcome = 'failed'
+            except WorkflowError:
+                pass  # Unknown effects remain suspended; no fabricated closure.
         self.retain(runner)
-        ref = self.store.put_json(dict(operation_id=operation, original_id=original_id,
-            root=str(runner.root), result=result, workflow=runner.workflow.state))
+        baseline = json.loads((runner.root / 'service-binding.json').read_text()).get('actor_seconds_baseline', 0.0)
+        total = runner.workflow.accounting.seconds()
+        if type(baseline) not in (int, float) or not 0 <= baseline <= total:
+            raise ValueError('invalid previously charged actor baseline')
+        delta = total - baseline
+        proof_ref = self.store.put_json(failure) if failure else None
+        packet = dict(operation_id=operation, original_id=original_id, root=str(runner.root),
+            result=result, workflow=runner.workflow.state, host_outcome=outcome,
+            failure_proof_ref=proof_ref, actor_seconds_total=total,
+            actor_seconds_baseline=baseline, actor_seconds_delta=delta,
+            workflow_valid=False if failure else runner.workflow.outcome == 'accepted')
+        ref = self.store.put_json(packet)
         atomic_json(runner.root / 'service-result.json', dict(reference=ref))
-        if result['status'] not in ('accepted', 'rejected', 'budget_exhausted') or runner.workflow.pending:
+        if outcome not in ('accepted', 'rejected', 'budget_exhausted', 'failed') or (
+                runner.workflow.pending and failure is None):
             raise RuntimeError('project suspended; reconcile same operation before cycle continuation')
-        return HostTaskResult(result['status'], ref, runner.workflow.accounting.seconds())
+        return HostTaskResult(outcome, ref, delta)
 
     def open_project(self, operation):
         root = self.root / 'projects' / _name(operation)
@@ -482,7 +500,13 @@ class BoundCycle(TuningBindings):
             raise ValueError('project contract differs')
         result = packet['result']
         validation = runner.latest('validation-results')
-        if (packet['workflow'] != runner.workflow.state or row['outcome'] != result['status']
+        host_outcome = packet.get('host_outcome', result['status'])
+        proof = None
+        if packet.get('failure_proof_ref'):
+            proof = self.store.read_json(packet['failure_proof_ref'])
+            if proof != runner.terminal_failure_proof(closure_ref=proof['closure_ref']):
+                raise ValueError('terminal failure proof differs from authoritative checkpoint')
+        if (packet['workflow'] != runner.workflow.state or row['outcome'] != host_outcome
                 or runner.backend.project_hash() != result['source_hash']
                 or (result['status'] == 'accepted' and (runner.workflow.outcome != 'accepted'
                     or runner.workflow.verified_source != result['source_hash']
@@ -499,9 +523,14 @@ class BoundCycle(TuningBindings):
             if event['type'] == 'skill-usage':
                 usage.append({k: v for k, v in event.items() if k != 'type'})
         kind = 'correctness' if result['status'] == 'accepted' and result['correctness'] is True else 'failure'
-        return dict(project_id=row['original_id'], outcome=result['status'],
-            evidence={row['artifact_ref']: dict(kind=kind, summary=result['status'])},
-            queries=queries, usage=usage, raw_refs=list(result['events']))
+        summary = (str(proof['classification']) + ': ' + str(proof['error'])
+                   if proof else host_outcome)
+        raw = list(result['events'])
+        if proof:
+            raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
+        return dict(project_id=row['original_id'], outcome=host_outcome,
+            evidence={row['artifact_ref']: dict(kind=kind, summary=summary)},
+            queries=queries, usage=usage, raw_refs=raw)
 
     def isolate(self, memory, skills, context):
         receipt = fork_inference(self.root / 'inference', self.memory, self.learning.path,
@@ -534,7 +563,9 @@ class BoundCycle(TuningBindings):
         if path.exists():
             return PairedRecovery(path, artifacts=self.store, runner_factory=self.trial)
         checkpoint = self.open_project(event['original']['operation_id'])
+        packet = self.store.read_json(event['original']['artifact_ref'])
         return PairedRecovery.create(path, checkpoint, artifacts=self.store, memory_ref=event['memory'],
+            terminal_failure_ref=packet.get('failure_proof_ref'),
             kdb_ref=self.binding['kdb'], model_config=self.config['provider'], incumbent=event['incumbent'],
             candidate=event['candidate'], joint_limits=BudgetLimits.from_dict(
                 self.config.get('recovery', {}).get('budgets', self.config['budgets'])),
@@ -576,11 +607,23 @@ class BoundCycle(TuningBindings):
         if not pending or pending['kind'] not in ('original', 'recovery'):
             raise ValueError('explicit learning/absence reconciliation required')
         runner = self.open_project(pending['id'])
+        path = runner.root / 'service-result.json'
+        if path.exists():
+            ref = json.loads(path.read_text())['reference']
+            packet = self.store.read_json(ref)
+            failure = packet.get('failure_proof_ref')
+            if failure:
+                proof = self.store.read_json(failure)
+                if (packet['workflow'] != runner.workflow.state or
+                        proof != runner.terminal_failure_proof(closure_ref=proof['closure_ref'])):
+                    raise ValueError('failed task admission proof no longer matches')
+                self.scheduler.reconcile(pending['id'], HostTaskResult('failed', ref,
+                    packet['actor_seconds_delta']))
+                return
         runner.reconcile()
         if runner.workflow.pending:
             raise ValueError('project is not terminal; continue same admitted runner explicitly')
         self.retain(runner)
-        path = runner.root / 'service-result.json'
         if not path.exists():
             raise ValueError('retained project result required')
         ref = json.loads(path.read_text())['reference']
@@ -590,7 +633,7 @@ class BoundCycle(TuningBindings):
         if packet['workflow'] != runner.workflow.state:
             raise ValueError('result is stale; retain current project completion first')
         self.scheduler.reconcile(pending['id'], HostTaskResult(packet['result']['status'], ref,
-            runner.workflow.accounting.seconds()))
+            packet.get('actor_seconds_delta', runner.workflow.accounting.seconds())))
 
     def adopt_revision(self, configuration=None):
         return revisions.adopt(self, configuration or show_configuration(self.services.root))
@@ -625,6 +668,9 @@ class BoundCycle(TuningBindings):
         return self.tuning.step()
 
     def run_project(self, operation_id):
+        pending = self.scheduler.state['pending']
+        if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery'):
+            raise ValueError('explicit continuation requires matching unfinished scheduler admission')
         runner = self.open_project(operation_id)
         # Observation may finish a durable receipt, but must never replay unknown work.
         runner.reconcile()
