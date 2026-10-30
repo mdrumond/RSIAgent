@@ -44,8 +44,10 @@ def run(command, *, cwd, env, timeout):
         if code:
             raise ValueError(f'setup command {Path(command[0]).name} failed (exit {code})')
     except BaseException:
-        if child.poll() is None:
+        try:
             os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         child.wait()
         raise
 
@@ -120,7 +122,7 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             purelib = subprocess.check_output(
                 [str(interpreter), '-I', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
                 text=True, env=env, cwd=runtime, timeout=10).strip()
-            if not Path(purelib).resolve().is_relative_to(Path(interpreter).parent.parent.parent):
+            if not Path(purelib).resolve().is_relative_to(Path(interpreter).parent.parent):
                 raise ValueError('venv install target escapes owned environment')
             options = ['--ignore-installed', '--target', purelib, '--timeout', '30', '--retries', '1']
             if offline:
