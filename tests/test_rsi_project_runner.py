@@ -283,12 +283,15 @@ def test_copy_consumes_wall_budget_but_not_actor_budget(tmp_path, monkeypatch):
         assert runner.workflow.remaining() == dict(actor_seconds=30., wall_seconds=0.)
         assert result['history'] == [] and result['pending'] is None
         assert session.calls == 0
+        proof = runner.terminal_failure_proof()
+        assert proof['actor_seconds_total'] == 0
+        assert proof['pending'] is None
     finally:
         database.close()
 
 
 @pytest.mark.parametrize('error_type,classification', [
-    ('ActionError', 'malformed_action'), ('PiProviderError', 'provider_failure'),
+    ('PiProviderError', 'provider_failure'),
     ('PiDeadlineError', 'provider_timeout'), ('PiCancelled', 'actor_cancelled'),
     ('PiError', 'actor_failure')])
 def test_known_pi_failure_is_durable_charged_and_never_replayed(tmp_path, error_type, classification):
@@ -452,5 +455,476 @@ def test_explicit_redesign_has_scoped_cas_reason_and_new_design_evidence(tmp_pat
         from rsi.runtime import WorkflowError
         with pytest.raises(WorkflowError, match='redesign requires'):
             runner.tool('request_redesign', Stage.ACCEPTANCE, {'reason': 'skip stage'}, 'unknown')
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('requested_path', ['guidance.md', '../guidance.md'])
+def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path):
+    class CorrectPath(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                rows = context['evidence']
+                if not any(r['name'] == 'query_kdb' for r in rows):
+                    return 'query_kdb', dict(query='stable sum')
+                reads = [r['result'] for r in rows if r['name'] == 'read_project_file']
+                if not reads:
+                    return 'read_project_file', dict(path=requested_path)
+                assert reads[0]['status'] == 'error'
+                assert reads[0]['evidence']['path'] == requested_path
+                assert 'content' not in reads[0]['evidence']
+                if len(reads) == 1:
+                    assert context['source']['path'] == 'solution.py'
+                    return 'read_project_file', dict(path='helper.py')
+                assert reads[1]['status'] == 'ok'
+                assert reads[1]['evidence']['content'] == 'value = 1\n'
+                # Select solution again before numeric debug needs to edit it.
+                if len(reads) == 2:
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, CorrectPath())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        errors = [e for e in runner.events if e['type'] == 'project-tool' and e['status'] == 'error']
+        assert len(errors) == 1
+        payload = runner.store.read_json(errors[0]['reference'])
+        assert payload['error_type'] in ('ValueError', 'FileNotFoundError')
+        assert payload['editable_files'] == ['solution.py', 'helper.py']
+        assert result['pending'] is None
+    finally:
+        database.close()
+
+
+def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
+    runner, _, database = make(tmp_path)
+    try:
+        def denied(_):
+            raise PermissionError('unreadable protected input')
+        monkeypatch.setattr(runner.backend, 'read', denied)
+        with pytest.raises(PermissionError):
+            runner.tool('read_project_file', Stage.PREFLIGHT, dict(path='solution.py'), 'unused')
+        assert runner.events == []
+    finally:
+        database.close()
+
+
+def test_evidence_inventory_is_compact_and_full_records_remain_available(tmp_path):
+    import json
+    runner, _, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        callback = runner.service.query_backend
+        def with_large_manifest(payload):
+            response = callback(payload)  # Real configured KnowledgeDB query.
+            response['provenance']['test_large_manifest'] = 'x' * 10000
+            return response
+        runner.service.query_backend = with_large_manifest
+        retrieval = runner.tool('query_kdb', Stage.DESIGN, dict(query='stable sum'), operation)
+        summary = retrieval['summary']
+        full = runner.store.read_json(retrieval['reference'])
+        assert retrieval['evidence'] == full
+        assert summary['query_ref'] == retrieval['reference']
+        assert summary['operation_id'] == operation and summary['stage'] == Stage.DESIGN.value
+        assert summary['host_perform_ready'] is False
+        assert summary['mapped_skill_reads_required'] == list(runner.bundle.skills_for(Stage.DESIGN))
+        for group in ('results', 'negative_records'):
+            count = len(full['payload']['response'][group])
+            assert summary['counts'][group] == count
+            assert summary['decision_indexes'][group] == list(range(count))
+        assert len(json.dumps(summary)) < 2048
+        assert len(full['payload']['response']['provenance']['test_large_manifest']) == 10000
+        retro = runner.tool('retrospect', Stage.DESIGN, dict(supplement='Consider actual history'), operation)
+        payload = runner.store.read_json(retro['reference'])['payload']
+        assert retro['summary']['retrospective_ref'] == retro['reference']
+        assert retro['summary']['history_count'] == len(payload['history']) == 2
+        assert retro['summary']['failure_indexes'] == payload['failures']
+        assert retro['summary']['redirection_indexes'] == payload['redirections']
+        assert retro['evidence']['payload'] == payload
+    finally:
+        runner.actor.close()
+        database.close()
+
+
+def test_repeated_malformed_actions_recover_until_original_actor_budget(tmp_path):
+    from coding.pi.session import ActionError
+    clock = Clock()
+    class Malformed(Session):
+        def next_action(self, *args, **kwargs):
+            self.calls += 1
+            clock.value += 2
+            raise ActionError('select_strategy missing required query_ref')
+    session = Malformed()
+    runner, injections, database = make(tmp_path, session, clock=clock,
+                                       budgets=BudgetLimits(actor_seconds=5))
+    try:
+        result = runner.run()
+        assert result['status'] == 'budget_exhausted', result
+        assert runner.workflow.accounting.seconds('thinking') == 6
+        assert session.calls == 3 and result['pending']
+        assert runner.workflow.outcome is None
+        proof = runner.terminal_failure_proof()
+        assert proof['classification'] == 'budget_exhausted' and proof['actor_seconds_total'] == 6
+        assert proof['pending'] == result['pending']
+        feedback = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(feedback) == 2 and all(e['accepted'] is False for e in feedback)
+        assert not any(e['type'] == 'host-dispatch' for e in runner.events)
+        reopened = ProjectRunner(runner.root, **injections).run()
+        assert reopened['pending'] == result['pending'] and session.calls == 3
+    finally:
+        database.close()
+
+
+def test_malformed_model_arguments_and_missing_read_are_corrected_in_same_operation(tmp_path):
+    from coding.pi.session import ActionError
+    class CorrectArguments(Session):
+        rejected = False
+        observed_feedback = False
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                if not self.rejected:
+                    self.rejected = True
+                    raise ActionError('read_project_file requires path')
+                if not self.observed_feedback:
+                    assert context['observation']['event'] == 'invalid-action'
+                    assert context['observation']['accepted'] is False
+                    self.observed_feedback = True
+                    return 'read_project_file', dict(path='guidance.md')
+                reads = [r for r in context['evidence'] if r['name'] == 'read_project_file']
+                if len(reads) == 1:
+                    assert reads[0]['result']['status'] == 'error'
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    session = CorrectArguments()
+    runner, _, database = make(tmp_path, session)
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        assert session.observed_feedback
+        failures = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(failures) == 1
+        completed = [r for r in result['history'] if r.get('evidence', {}).get('operation_id')
+                     == failures[0]['operation_id']]
+        assert len(completed) == 1 and completed[0]['passed']
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('declared', [True, False])
+def test_generated_output_configuration_controls_source_identity(tmp_path, declared):
+    compile_script = (
+        "import py_compile; from pathlib import Path; "
+        "py_compile.compile('solution.py', doraise=True); "
+        "Path('results.json').write_text('{}'); "
+        "Path('build').mkdir(exist_ok=True); Path('build/coverage.json').write_text('{}')")
+    runner, injections, database = make(tmp_path,
+        source_text='from math import fsum\ndef solve(xs): return fsum(xs)\n',
+        config_overrides=dict(generated_paths=['results.json', 'build'] if declared else [],
+            commands={'compile': [sys.executable, '-c', compile_script],
+                      'test': [sys.executable, '{verifier}'],
+                      'validation': [sys.executable, '{verifier}']}))
+    try:
+        initial = runner.backend.project_hash()
+        result = runner.run()
+        assert (runner.backend.project / 'results.json').read_text() == '{}'
+        assert (runner.backend.project / 'build/coverage.json').read_text() == '{}'
+        assert runner.config.generated_paths == (('results.json', 'build') if declared else ())
+        if declared:
+            assert result['status'] == 'accepted', result
+            assert result['source_hash'] == initial
+            assert runner.backend.contract['generated_paths'] == ['build', 'results.json']
+            reopened = ProjectRunner(runner.root, **injections)
+            assert reopened.config.generated_paths == runner.config.generated_paths
+            assert reopened.backend.project_hash() == initial
+            (reopened.backend.project / 'unlisted.json').write_text('{}')
+            assert reopened.backend.project_hash() != initial
+        else:
+            assert result['status'] == 'suspended', result
+            assert result['source_hash'] != initial
+            assert runner.workflow.outcome is None
+            rows = runner.latest('command-results')['receipts']
+            assert rows[0]['classification'] == 'source_changed'
+            proof = runner.terminal_failure_proof()
+            assert proof['source_hash'] == result['source_hash']
+            assert proof['stage_initial_source'] == initial != proof['source_hash']
+    finally:
+        database.close()
+
+
+def failed_after_query(tmp_path, *, after_commands=False):
+    from coding.pi.rpc import PiDeadlineError
+    class Terminal(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if (context['stage'] == (Stage.DEBUG.value if after_commands else Stage.DESIGN.value)
+                    and (after_commands or any(r['name'] == 'query_kdb' for r in context['evidence']))):
+                raise PiDeadlineError('observed terminal provider deadline')
+            return super().next_action(context, allowed, **kwargs)
+    runner, injections, database = make(tmp_path, Terminal())
+    result = runner.run()
+    assert result['status'] == 'suspended' and result['actor_closure_ref']
+    return runner, injections, database, result
+
+
+@pytest.mark.parametrize('after_commands', [False, True])
+def test_terminal_failure_proof_preserves_pending_and_completed_effects(tmp_path, after_commands):
+    import json
+    runner, injections, database, result = failed_after_query(tmp_path, after_commands=after_commands)
+    try:
+        before_state = (runner.root / 'workflow.json').read_bytes()
+        before_index = runner.event_path.read_bytes()
+        before_objects = set(runner.store.objects.rglob('*'))
+        proof = runner.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
+        assert proof['outcome'] == 'failed' and proof['classification'] == 'provider_timeout'
+        assert proof['pending'] == result['pending']
+        assert proof['stage_completion_claim'] is False and proof['replay_allowed'] is False
+        assert proof['retrieval_receipts']
+        assert len(proof['command_receipts']) == (2 if after_commands else 0)
+        assert proof['actor_seconds_total'] == runner.workflow.accounting.seconds()
+        assert before_state == (runner.root / 'workflow.json').read_bytes()
+        assert before_index == runner.event_path.read_bytes()
+        assert before_objects == set(runner.store.objects.rglob('*'))
+        reopened = ProjectRunner(runner.root, **injections)
+        assert reopened.terminal_failure_proof() == proof
+        reopened.run()  # Observing the retained pending work never replays it.
+        assert reopened.terminal_failure_proof() == proof
+        assert reopened.workflow.outcome is None and reopened.workflow.pending == proof['pending']
+    finally:
+        database.close()
+
+
+def test_unobserved_restart_requires_explicit_terminal_observation(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, injections, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        runner.workflow.dispatched(operation, 'pi:actually-closed-test-session')
+        # The host observed this test session close; reopening alone has no receipt.
+        session = Session()
+        session.close()
+        reopened = ProjectRunner(runner.root, **injections)
+        result = reopened.run()
+        with pytest.raises(WorkflowError, match='closure receipt'):
+            reopened.terminal_failure_proof()
+        pending = dict(reopened.workflow.pending)
+        controller_proof = dict(handle=pending['handle'], actor_closed=True, provider_settled=True,
+            observation='Host observed the owned test session close without running commands/queries',
+            completed_query_refs=[])
+        reopened.record_terminal_observation(result, controller_proof=controller_proof,
+                                              observed_source_hash=reopened.backend.project_hash())
+        proof = reopened.terminal_failure_proof()
+        assert proof['pending'] == pending and reopened.workflow.pending == pending
+        assert proof['command_receipts'] == [] and proof['retrieval_receipts'] == []
+    finally:
+        database.close()
+
+
+def test_failure_proof_refuses_pending_execution_reservation(tmp_path, monkeypatch):
+    from rsi.runtime import WorkflowError
+    runner, _, database = make(tmp_path)
+    def disconnected(operation, *args, **kwargs):
+        runner.workflow.reserve_execution(operation)
+        raise WorkflowError('execution disconnected before receipt')
+    monkeypatch.setattr(runner.backend, 'run', disconnected)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended' and result['actor_closure_ref']
+        with pytest.raises(WorkflowError, match='complete receipt'):
+            runner.terminal_failure_proof()
+        assert runner.workflow.pending == result['pending']
+    finally:
+        database.close()
+
+
+def test_unknown_query_cannot_admit_failure(tmp_path):
+    from rsi.runtime import WorkflowError
+    def unavailable(_):
+        raise OSError('query lifecycle unknown')
+    runner, _, database = make(tmp_path, query=unavailable)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended'
+        with pytest.raises(WorkflowError, match='query'):
+            runner.terminal_failure_proof()
+    finally:
+        database.close()
+
+
+def test_failure_proof_refuses_changed_source_manifest_and_clock(tmp_path):
+    from rsi.runtime import WorkflowError
+    import json
+    runner, _, database, _ = failed_after_query(tmp_path)
+    try:
+        path = runner.backend.project / 'solution.py'
+        original = path.read_text()
+        path.write_text(original + '\n# unexplained change\n')
+        with pytest.raises(WorkflowError):
+            runner.terminal_failure_proof()
+        path.write_text(original)
+        manifest = runner.root / 'manifest.json'
+        original_manifest = manifest.read_bytes()
+        manifest.write_text(json.dumps({'contract': 'changed'}))
+        with pytest.raises(WorkflowError, match='manifest'):
+            runner.terminal_failure_proof()
+        manifest.write_bytes(original_manifest)
+        token = runner.workflow.accounting.start('execution')
+        with pytest.raises(WorkflowError):
+            runner.terminal_failure_proof()
+        runner.workflow.accounting.end(token)
+        assert runner.workflow.pending is not None
+    finally:
+        database.close()
+
+
+def test_unknown_session_close_does_not_certify_production_provider_settled(tmp_path):
+    from coding.pi.rpc import PiDeadlineError
+    from rsi.runtime import WorkflowError
+    class Unobserved(Session):
+        def next_action(self, *args, **kwargs):
+            raise PiDeadlineError('provider lifecycle unobserved')
+    runner, _, database = make(tmp_path, Unobserved(), test_backend=False)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended'
+        with pytest.raises(WorkflowError, match='closure was not observed'):
+            runner.terminal_failure_proof()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('error', [OSError('dependency readiness failed'), TimeoutError('readiness timed out')])
+def test_prepare_failure_retains_closed_session_proof_before_dispatch(tmp_path, error):
+    class Startup(Session):
+        closed = 0
+        def prepare(self, timeout, *, schemas):
+            raise error
+        def close(self):
+            self.closed += 1
+    session = Startup()
+    runner, injections, database = make(tmp_path, session)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended' and result['actor_closure_ref']
+        assert result['pending']['handle'] is None and session.closed == 1 and session.calls == 0
+        proof = runner.terminal_failure_proof()
+        assert proof['outcome'] == 'failed' and proof['pending'] == result['pending']
+        assert proof['actor_seconds_total'] == 0
+        reopened = ProjectRunner(runner.root, **injections)
+        assert reopened.terminal_failure_proof() == proof
+        assert runner.workflow.pending == result['pending'] and runner.workflow.outcome is None
+    finally:
+        database.close()
+
+
+def test_real_rpc_setup_close_and_provider_settlement_are_observed(tmp_path):
+    from pathlib import Path
+    from threading import Event
+    from types import SimpleNamespace
+    from coding.pi.rpc import PiRPC
+    from rsi.actor import PiSessionAdapter
+    class StartingPi(PiSessionAdapter):
+        def __init__(self):
+            rpc = PiRPC([sys.executable, '-c', 'import sys; sys.stdin.readline()'],
+                        cwd=Path(tmp_path), env=None)
+            settled = Event()
+            settled.set()  # No provider request was dispatched during failed setup.
+            self.session = SimpleNamespace(rpc=rpc, gateway=SimpleNamespace(finished=settled), close=rpc.close)
+        def prepare(self, timeout, *, schemas):
+            raise TimeoutError('handshake readiness timeout')
+    sessions = []
+    def factory():
+        session = StartingPi()
+        sessions.append(session)
+        return session
+    runner, _, database = make(tmp_path, session_factory=factory, test_backend=False)
+    try:
+        result = runner.run()
+        assert sessions[0].session.rpc.process.poll() is not None
+        assert result['pending']['handle'] is None
+        closure = runner.store.read_json(result['actor_closure_ref'])['observation']
+        assert closure['actor_closed'] is True and closure['provider_settled'] is True
+        assert runner.terminal_failure_proof()['outcome'] == 'failed'
+    finally:
+        for session in sessions:
+            session.session.rpc.close()
+        database.close()
+
+
+def test_raising_factory_partial_start_needs_scoped_explicit_observation(tmp_path):
+    import subprocess
+    from rsi.runtime import WorkflowError
+    processes = []
+    def factory():
+        processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        raise OSError('factory raised after partially starting a child')
+    runner, injections, database = make(tmp_path, session_factory=factory)
+    try:
+        result = runner.run()
+        assert result['actor_closure_ref'] is None and result['pending']['handle'] is None
+        assert processes[0].poll() is None
+        with pytest.raises(WorkflowError, match='closure receipt'):
+            runner.terminal_failure_proof()
+        reopened = ProjectRunner(runner.root, **injections)
+        observed = reopened.run()
+        assert len(processes) == 1 and observed['actor_closure_ref'] is None
+        # The host now actually terminates/reaps the child it owns. No provider ran.
+        processes[0].terminate()
+        processes[0].wait(timeout=3)
+        pending = reopened.workflow.pending
+        proof = dict(operation_id=pending['id'], handle=None, no_actor_dispatched=True,
+            actor_closed=True, provider_settled=True,
+            observation='Host terminated/reaped its partially started child; no Pi/provider dispatch occurred')
+        with pytest.raises(WorkflowError):
+            reopened.record_terminal_observation(observed, controller_proof=dict(proof, operation_id='other'),
+                                                  observed_source_hash=reopened.backend.project_hash())
+        reopened.record_terminal_observation(observed, controller_proof=proof,
+                                              observed_source_hash=reopened.backend.project_hash())
+        admitted = reopened.terminal_failure_proof()
+        assert admitted['pending'] == pending and reopened.workflow.pending == pending
+        # The narrow no-effect API also permits explicitly observed None handles,
+        # but releases only after reject_operation and keeps consumed allocations.
+        failure = reopened.record_admission_failure(pending['id'],
+            controller_proof=dict(proof, no_host_effects=True), observed_source_hash=reopened.backend.project_hash())
+        charged, limits = reopened.workflow.accounting.seconds(), dict(reopened.workflow.state['limits'])
+        reopened.workflow.reject_operation(pending['id'], failure, reopened.backend.project_hash())
+        assert reopened.workflow.pending is None
+        assert reopened.workflow.accounting.seconds() == charged and reopened.workflow.state['limits'] == limits
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+        database.close()
+
+
+def test_unfinished_query_dispatch_vetoes_admission_record_and_old_rejection(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, injections, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        runner.workflow.dispatched(operation, 'pi:closed-before-observation')
+        runner.actor.close()
+        source = runner.backend.project_hash()
+        proof = dict(handle=runner.workflow.pending['handle'], actor_closed=True, no_host_effects=True,
+                     observation='Host observed owned Pi closed; callback status must be checked separately')
+        old_reference = runner.record_admission_failure(operation, controller_proof=proof, observed_source_hash=source)
+        token = runner.workflow.accounting.start('retrieval')
+        runner.append(dict(type='query-dispatch', operation_id=operation, call_id='unknown-callback',
+                           request_ref=runner.store.put_json(dict(query='stable sum'))))
+        observed_end = runner.workflow.clock()
+        # Crash/reopen: reconcile only observed elapsed time, not callback completion.
+        reopened = ProjectRunner(runner.root, **injections)
+        reopened.workflow.accounting.reconcile(token, observed_end)
+        assert reopened.no_host_effects(operation) is False
+        with pytest.raises(WorkflowError, match='no host effects'):
+            reopened.record_admission_failure(operation, controller_proof=proof, observed_source_hash=source)
+        with pytest.raises(WorkflowError, match='untrusted'):
+            reopened.workflow.reject_operation(operation, old_reference, source)
+        assert reopened.workflow.pending['id'] == operation
     finally:
         database.close()
