@@ -223,7 +223,7 @@ def test_adaptive_failed_trace_is_retained_without_positive_label(tmp_path):
     request = _request(tmp_path, executor)
     actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"broken source"}}', '{"run":{}}'])
     driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
-        phase="phase2", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
+        phase="phase1", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
     ))
     with pytest.raises(RuntimeError, match="without host-verified"):
         driver(request)
@@ -238,7 +238,7 @@ def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp
     from benchmarks.a5kernels.sft_dataset import _read_trace, _example
     actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
                                 '{"run":{}}', '{"submit":{}}'])
-    factory = recorder_factory(phase="phase2", round_id="round-2", model="fixture",
+    factory = recorder_factory(phase="phase1", round_id="round-2", model="fixture",
                                source_manifest_sha256="a" * 64)
     def run(index):
         executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / str(index) / "evidence.jsonl"))
@@ -494,7 +494,7 @@ def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, cl
     factory = None
     if traced:
         from benchmarks.ascend.training_traces import recorder_factory
-        factory = recorder_factory(phase="phase2", round_id="semantic-failure", model="fixture",
+        factory = recorder_factory(phase="phase1", round_id="semantic-failure", model="fixture",
                                    source_manifest_sha256="a" * 64)
     request = _request(tmp_path, executor)
     result = AdaptiveActorProjectExecutor(executor, actor, object(),

@@ -27,43 +27,6 @@ def test_legacy_device_and_explicit_pool():
     assert native_devices({"physical_device": 7, "physical_devices": [2, 3]}) == [2, 3]
 
 
-@pytest.mark.parametrize("explicit_device, expected", [(None, 2), (7, 7)])
-def test_phase1_pool_config_hands_off_to_one_serial_phase2_device(tmp_path, monkeypatch, explicit_device, expected):
-    from types import SimpleNamespace
-    from benchmarks.ascend import phase1_cli, phase2_cli
-    guide, initial = tmp_path / "guide.md", tmp_path / "initial.md"
-    guide.write_text("Native guide")
-    initial.write_bytes(b"")
-    config = dict(guide=str(guide), target="a3", arch="arch", execution_profile="bz-a3-1",
-        cpl_skills_revision="a" * 40, cpl_remote="/tools/cpl-remote",
-        validation_wrapper="/checked/catlass-validation.sh", remote_workspace="/owned",
-        physical_devices=[2, 5], environment_identity=dict(cann_version="cann", profiler_version="msprof"))
-    if explicit_device is not None:
-        config["physical_device"] = explicit_device
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(config))
-    snapshot = SimpleNamespace(destination=SimpleNamespace(source_identity=config))
-    monkeypatch.setattr(phase2_cli, "admit_native_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr("benchmarks.a5kernels.phase1_production.load_direct_environment", lambda *args, **kwargs: {})
-    transports = []
-    class Transport:
-        def __init__(self, **kwargs):
-            transports.append(kwargs)
-    native_transport = phase1_cli.native_transport
-    monkeypatch.setattr(phase1_cli, "native_transport",
-        lambda config, root: native_transport(config, root, factory=Transport))
-    runner = object()
-    def build(admitted, guide_bytes, transport, **kwargs):
-        assert admitted is snapshot and guide_bytes == b"Native guide"
-        assert isinstance(transport, Transport)
-        return runner
-    monkeypatch.setattr(phase2_cli, "build_native_phase2", build)
-    args = SimpleNamespace(config=path, phase1_root=tmp_path / "phase1", initial_memory=initial,
-        review=tmp_path / "review.json", root=tmp_path / "phase2", env_file=None)
-    assert phase2_cli.native_runner(args) is runner
-    assert len(transports) == 1
-    assert transports[0]["physical_device"] == expected
-    assert transports[0]["state_directory"] == args.root / "transport-state"
 
 
 def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
@@ -86,13 +49,13 @@ def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
 
 
 @pytest.mark.parametrize("explicit_device, expected", [(None, 2), (3, 3)])
-@pytest.mark.parametrize("original_retry", [False, True])
+@pytest.mark.parametrize("original_retry", [True])
 def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path, monkeypatch, explicit_device, expected, original_retry):
     import hashlib
     from types import SimpleNamespace
     from benchmarks.ascend import campaign_cli, phase1_cli
-    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
-    from test_ascend_phase2_curriculum import snapshot as reviewed_snapshot
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from reviewed_fixtures import snapshot as reviewed_snapshot
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
     guide = tmp_path / "guide.md"
@@ -138,7 +101,7 @@ def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path
     measurement_bindings.clear()
     reviewed_job = {**job, "phase": 1 if original_retry else 2, "root": str(phase2_root)}
     if original_retry:
-        from benchmarks.ascend.phase2_feedback import FeedbackStore
+        from benchmarks.ascend.feedback import FeedbackStore
         from benchmarks.ascend.manual_retry import ManualPhase1Retry
         from test_generic_failure_feedback import phase1 as failed_campaign
         from test_a5_phase1_adaptive import _project, _result
@@ -148,8 +111,8 @@ def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path
         feedback.import_phase1(tmp_path/'failed', target='a3', language='ascend-c')
         original, = feedback.records()
         selection = json.dumps(dict(selected=[original])).encode()
-        (phase2_root/'phase2-feedback.json').write_bytes(selection)
-        reviewed_job.update(phase1_original_retry=True, phase2_max_seconds=30,
+        (phase2_root/'failure-feedback.json').write_bytes(selection)
+        reviewed_job.update(phase1_original_retry=True, retry_max_seconds=30,
             feedback_root=str(feedback.root), feedback_selection_sha256=hashlib.sha256(selection).hexdigest())
     phase2 = campaign_cli.build_controller(reviewed_job)
     if original_retry:
@@ -157,7 +120,7 @@ def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path
         retry = phase2
         phase2 = retry.runner
         assert retry.row['outcome']['original_spec'] == original_spec
-    assert isinstance(phase2, AdaptivePhase2Coordinator)
+    assert isinstance(phase2, AdaptivePhase1Coordinator)
     assert phase2.snapshot is snapshot
     assert phase2.max_parallel == 1
     transport = phase2.execute_project.executor._backend.transport
@@ -323,7 +286,7 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
 
 def test_phase2_rejects_parallel_workers_before_opening_state(tmp_path):
     from benchmarks.ascend.production import build_native_adaptive_phase1
-    with pytest.raises(ValueError, match="Phase 2 remains serial"):
+    with pytest.raises(ValueError, match="reviewed Phase 1 retries remain serial"):
         build_native_adaptive_phase1(config=None, native_transport=None, profile=None,
             guide_bytes=b"guide", objective="phase2", initial_memory=b"", environment={},
             project_workers=(object(),), reviewed_snapshot=object())

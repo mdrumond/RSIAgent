@@ -1,8 +1,7 @@
 # RSI campaign dashboard
 
-This directory shows current subject campaigns alongside retained Phase 1 and
-Phase 2 artifacts. Campaign controls are disabled unless explicitly configured;
-new Phase 2 execution paths are retired. Copy
+This directory shows current subject campaigns and Phase 1 artifacts. Campaign
+controls are disabled unless explicitly configured. Copy
 `config.example.json`, point each root at a locally mounted or synchronized
 campaign directory, then run:
 
@@ -15,7 +14,7 @@ python -m dashboard serve --config dashboard/config.json --cache-dir .dashboard-
 
 The Kernel Optimizer tab is always visible. Configure its independent
 `optimizer` block using `config.example.json`: an absolute job `root`, explicitly
-listed native A3 Phase 2 `memory_roots`, reviewed seed `snapshot_roots`, and an
+listed reviewed A3 `memory_roots`, reviewed seed `snapshot_roots`, and an
 existing absolute ignored `worker_config`. Set `enabled` only when the optimizer
 worker is installed and configured. Enabled optimizer controls require a
 loopback bind, independently of campaign controls.
@@ -23,8 +22,8 @@ loopback bind, independently of campaign controls.
 Paste Python or upload a `.py` file, select the function/class entrypoint, enter
 representative input signatures and optional constructor arguments, and choose
 eligible completed memory. Discovery shows unavailable sources with their reason;
-creation authenticates the source again and pins its snapshot. Defaults are 25
-candidate attempts and 7200 seconds. Resume requires explicit additional budget.
+creation authenticates the source again and pins its snapshot. The default elapsed allocation is 7200 seconds; candidate counts are telemetry.
+Resume requires an explicit additional elapsed allowance.
 
 Jobs run in detached `python -m optimizer.worker` processes. The dashboard does
 not execute submitted Python and restarting Flask does not launch jobs again.
@@ -51,21 +50,6 @@ payload is added to the SQLite cache. UTF-8 payloads are returned as escaped
 text, while every retained payload is available through the raw download route.
 Missing prompts or artifacts are explicitly marked unavailable.
 
-Fresh autonomous Phase 2 campaigns appear before learner `state.json` exists
-when `goal-selection.json` publishes selection or reference-qualification progress.
-Only its public candidate specification, rationale, citations, proposal count,
-diagnostic and qualified target ID are shown. Reference qualification is not
-counted as learner verification; private reference source and conversations are
-never indexed by the viewer.
-
-Target-driven Phase 2 rows and API routes use `attempt-NNN--project-id`, so target
-retries retain distinct source, traces and performance. Existing Phase 1 and
-legacy Phase 2 project routes are unchanged. The project-wide host ledger cannot
-distinguish target retries; these rows expose each branch's exact verifier result
-instead of attributing another attempt's ledger entries. Terminal readiness,
-stalls and budget exhaustion take precedence over an old worker status; running
-target/practice/review stages and worker failures remain visible separately.
-
 Opening a project's performance section lazily loads retained timing and
 `PipeUtilization` facts. The local SVG views show attempt distributions, shape
 sweeps, and AIC/AIV pipe ratios, with the exact normalized values in an HTML
@@ -79,22 +63,19 @@ dedicated `Memory` profiler capture.
 
 ### Failure-directed learning
 
-Set top-level `feedback_root` to the shared Phase 2 feedback directory. The
+Set top-level `feedback_root` to the shared feedback directory. The
 **Failure feedback** tab displays immutable original outcomes separately from
 investigation status, classifications, linked projects and retries. A verified
 but slow kernel remains a correctness success with a performance shortfall.
 Evidence previews authenticate the retained digest on the host and return only
 an 8 KiB prefix; they never fetch remote raw profiler trees.
 
-With controls enabled, **Import configured Phase 2 results** runs the historical
-importer against every Phase 2 campaign in this dashboard configuration. Select
-failures, a compatible fresh A3 destination preset, and an explicit project
-budget to start a retained Phase 1 investigation awaiting curriculum approval.
-New Phase 2 launches and original-target retries are rejected before dispatch;
-use subject curriculum requests for new work. Phase 2 sampling, approval, and
-execution actions are unavailable, while historical proposals and results remain
-readable. Explicit Phase 1 investigations use the asynchronous operation queue;
-no campaigns start merely by viewing or importing feedback.
+With controls enabled, **Import configured failures** reads the configured current
+campaign results. Select failures, a compatible fresh A3 destination preset, and
+an explicit project budget to start a Phase 1 investigation awaiting curriculum
+approval. Use subject curriculum requests for new work. Explicit investigations
+use the asynchronous operation queue; viewing or importing feedback starts no
+campaigns.
 Resolved results and deferred/infrastructure observations remain visible but
 are not selectable for kernel investigation. Each Phase 1 investigation needs
 unused preset root/control directories, just like retained campaign starts.
@@ -104,8 +85,7 @@ this boundary and accepts loopback IP literals or the exact `localhost` name;
 use an SSH tunnel for remote access. Each preset is a complete server-side A3
 launch definition; browser requests can select a preset
 but cannot supply paths, commands, environment variables, targets, or arbitrary
-arguments. The runner is invoked without a shell. Retained Phase 2 configuration
-is readable but cannot authorize new launches. Every controlled campaign and launch preset
+arguments. The runner is invoked without a shell. Every controlled campaign and launch preset
 must explicitly set `"target": "a3"`; other targets remain viewable but cannot
 be controlled.
 

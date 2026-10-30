@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.ascend import attention as shared
-from benchmarks.a5kernels import phase2_attention as a5
-from benchmarks.a3kernels.phase2_attention import (
+from benchmarks.a5kernels import attention as a5
+from benchmarks.a3kernels.attention import (
     AttentionTargetEvidence, AttentionTargetVerifier, NativeAttentionBackend, build_plan, TARGET_ID,
 )
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence
@@ -17,12 +17,12 @@ extern "C" __global__ __aicore__ void dense_attention(GM_ADDR gm_q, GM_ADDR gm_k
 '''
 
 
-def test_a5_attention_contract_is_shared_without_identity_changes():
+def test_a5_attention_contract_has_neutral_identity_and_shared_semantics():
     assert a5.ATTENTION_CASES is shared.ATTENTION_CASES
     assert a5.build_execution is shared.build_execution
     assert a5.attention_reference is shared.attention_reference
     assert a5.AttentionReceipt is shared.AttentionReceipt
-    assert a5.TARGET_ID == "a5-phase2-dense-forward-attention-v1"
+    assert a5.TARGET_ID == "a5-dense-forward-attention-v1"
     assert a5.SUITE_SHA256 == shared.SUITE_SHA256
 
 

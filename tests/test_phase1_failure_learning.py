@@ -12,7 +12,7 @@ from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
-from benchmarks.a5kernels.phase2_adaptive_memory import _published_evidence, _memory
+from benchmarks.ascend.reviewed_memory import _published_evidence, _memory
 from benchmarks.ascend.training_annex import inventory_campaign, package_campaign
 from test_a5_phase1_adaptive import _project, _result, _wave, SEED
 

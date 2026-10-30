@@ -74,10 +74,10 @@ def compose_adaptive_controller(
             allow_partial=True,
         )
     else:
-        from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+        from benchmarks.ascend.reviewed_memory import reviewed_phase1_coordinator
         if max_parallel != 1 or max_projects is not None:
-            raise ValueError("adaptive Phase 2 uses serial selection and verified project_target")
-        coordinator = AdaptivePhase2Coordinator(
+            raise ValueError("reviewed Phase 1 retries require serial selection and verified project_target")
+        coordinator = reviewed_phase1_coordinator(
             root, objective, reviewed_snapshot, curriculum, project_actor,
             project_target=project_target, trace_hook=trace_hook,
         )
@@ -221,7 +221,7 @@ def build_native_adaptive_phase1(
     from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
 
     if project_workers and reviewed_snapshot is not None:
-        raise ValueError("adaptive Phase 2 remains serial")
+        raise ValueError("reviewed Phase 1 retries remain serial")
     if project_workers:
         request_profile = project_workers[0].request_profile
         request_timing = project_workers[0].request_timing
@@ -257,8 +257,8 @@ def build_native_adaptive_phase1(
         identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
         reviewed_snapshot.verify()
-        identity.update(schema="ascend-native-adaptive-phase2-identity-v1",
-                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
+        identity.update(schema="ascend-native-reviewed-phase1-identity-v1",
+                        reviewed_snapshot_id=reviewed_snapshot.snapshot_id)
     query, adaptive = None, None
     if config.kdb is not None:
         if embeddings is None or not config.collection:

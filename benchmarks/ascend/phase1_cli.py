@@ -124,7 +124,7 @@ def load_native_config(path, worker_config_path=None):
     if any(not config["environment_identity"].get(k) for k in ("cann_version", "profiler_version")):
         raise ValueError("native runtime config requires discovered CANN/profiler versions")
     devices = native_devices(config)
-    # Phase 2 consumes the same runtime file but deliberately remains serial.
+    # task consumes the same runtime file but deliberately remains serial.
     config.setdefault("physical_device", devices[0])
     return config
 

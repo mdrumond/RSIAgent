@@ -84,7 +84,7 @@ _DESCRIPTIONS = {
 _DESCRIPTIONS['observed-compile'] = _DESCRIPTIONS['observed-compile-failure']
 
 _DESCRIPTIONS.update({
-    'READY': ('The Phase 2 curriculum declared readiness after a verified target attempt and no further useful practice.',
+    'READY': ('The current task is ready after independent verification.',
               'Inspect the target attempt evidence and curriculum reason; readiness does not establish correctness on other targets.'),
     'disabled-by-treatment': ('This tool is intentionally unavailable in the selected experimental treatment.',
                               'Continue using the tools allowed by this treatment; preserve the configured experimental restrictions.'),

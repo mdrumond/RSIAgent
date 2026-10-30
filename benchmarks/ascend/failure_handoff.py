@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from .phase2_feedback import FeedbackStore
+from .feedback import FeedbackStore
 
 
 def phase1_contract(spec, inputs=None, expected=None):

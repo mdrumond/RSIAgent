@@ -303,7 +303,7 @@ def test_unstarted_claim_blocks_completion_and_advance(tmp_path):
 
 def test_target_preview_rejects_missing_or_corrupt_qualification_before_mutation(tmp_path):
     from copy import deepcopy
-    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_qualified_targets import qualified, RUNTIME
     from benchmarks.ascend.targets import a3_curriculum_policy
     target, artifacts, backend = qualified(tmp_path / 'qualification')
     good = dict(project_id=target.spec.project_id, spec=target.spec.as_dict(), repairs=[],
@@ -337,7 +337,7 @@ def test_target_preview_rejects_missing_or_corrupt_qualification_before_mutation
 
 
 def test_production_editor_checks_actual_runtime_and_rechecks_qualification_on_approval(tmp_path):
-    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_qualified_targets import qualified, RUNTIME
     from test_subject_runtime import bound
     from benchmarks.ascend.subject_runtime import build_subject_campaign
     from benchmarks.ascend.targets import a3_curriculum_policy
@@ -381,7 +381,7 @@ def test_pending_project_can_receive_reviewed_restart_without_execution(tmp_path
 
 def test_qualified_target_restart_uses_fresh_scheduling_id_without_requalification(tmp_path):
     from copy import deepcopy
-    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_qualified_targets import qualified, RUNTIME
     from benchmarks.ascend.targets import a3_curriculum_policy
     target, artifacts, backend = qualified(tmp_path / 'qualification')
     original = dict(project_id='original-attempt', spec=target.spec.as_dict(), repairs=[],

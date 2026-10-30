@@ -1,9 +1,9 @@
 # Ascend subject curriculum
 
-`run_ascend_subjects.py` replaces new separate Ascend Phase 2 launches. It uses
-one ordered subject list for learning, repair, qualified target tasks and
-optimizer work. Historical Phase 2 readers and controller APIs remain available;
-the standalone Phase 2 scripts reject execution and retain `report`.
+`run_ascend_subjects.py` runs one ordered curriculum of exploration, repair,
+qualified target and optimizer subjects. There is no separate targeted-practice
+stage or handoff campaign. Current subject execution owns task retries and
+retains host-authenticated evidence.
 
 Copy `config/examples/subjects.json` and edit each subject's objective and
 `min_waves` (default three). The curriculum may revisit earlier subjects when

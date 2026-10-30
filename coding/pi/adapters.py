@@ -21,11 +21,6 @@ A5_SCHEMAS = {
                           "limit": {"type": "integer", "minimum": 1, "maximum": 8192}}, ["sha256"]),
     "request-sanitizer": obj({"tool": {"type": "string", "enum": ["memcheck", "racecheck", "initcheck", "synccheck"]}}),
 }
-SOURCE_SCHEMAS = {
-    "candidate_source": obj({"source": STRING}),
-    "compile_probe": obj({"source": STRING}),
-    "knowledge_query": A5_SCHEMAS["query-knowledge"],
-}
 OPTIMIZER_SCHEMAS = {
     **{name: obj({"source": STRING, "block_count": {"type": "integer", "minimum": 1, "maximum": 65535},
                  "summary": STRING}) for name in ("candidate", "compile")},

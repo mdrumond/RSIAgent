@@ -325,7 +325,7 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
             store.add_event(job_id, 'observation-unavailable', {'error': str(exc)})
             raise
         finally:
-            from benchmarks.ascend.phase2_feedback import FeedbackStore
+            from benchmarks.ascend.feedback import FeedbackStore
             FeedbackStore(config.get('feedback_root', Path(root) / 'feedback')).import_optimizer(root)
 
 

@@ -5,11 +5,11 @@ from dataclasses import replace
 import pytest
 
 from benchmarks.ascend.failure_curriculum import FailureCurriculum, select_feedback, retry_spec, link_retry
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumContext
 from optimizer.jobs import canonical, sha
-from test_phase2_feedback import campaign, write
+from test_ascend_feedback import campaign, write
 from test_a5_phase1_adaptive import _project, _wave, _result
 
 
@@ -17,8 +17,8 @@ def setup(tmp_path):
     campaign(tmp_path / 'failed')
     campaign(tmp_path / 'success', result={'verified': True, 'speedup': 2})
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(tmp_path / 'failed')
-    store.import_campaign(tmp_path / 'success')
+    store.import_task_results(tmp_path / 'failed')
+    store.import_task_results(tmp_path / 'success')
     selection = select_feedback(store.root, 'a3')
     root = tmp_path / 'phase1'
     root.mkdir()
@@ -60,73 +60,6 @@ def test_mixed_wave_accepts_new_projects_without_remedial_lineage(tmp_path):
     assert feedback.admit([], wave, context) == ()
 
 
-def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
-    store, selection, feedback = setup(tmp_path)
-    calls = []
-    def complete(messages):
-        calls.append(messages)
-        if len(calls) == 1:
-            prompt = messages[-1]['content']
-            payload = json.loads(_wave(prompt, [_project('probe', 'padded-tail'),
-                _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
-            payload['failure_investigations'] = [investigation(selection)]
-            return 'DECISION: WAVE\n' + json.dumps(payload)
-        row = investigation(selection)
-        row.update(status='ready-to-retry', reason='host controls isolated the tail behavior')
-        return 'DECISION: SATURATED\n' + json.dumps(dict(reason='focused investigation complete',
-            failure_investigations=[row]))
-    curriculum = CurriculumAgent(complete)
-    curriculum.failure_feedback = feedback
-    runner = AdaptivePhase1Coordinator(feedback.root, 'Isolate a tail.', b'{}', curriculum,
-        lambda request: _result(request.spec, True, 'host passed'), max_parallel=2, project_target=3)
-    runner.failure_feedback = feedback
-    result = runner.resume()
-    assert result['status'] == 'SATURATED'
-    original = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
-    assert original['investigation']['status'] == 'ready-to-retry'
-    assert original['outcome']['verified'] is False
-    assert original['investigation']['evidence']
-    assert original['investigation']['projects'][0]['control_project_id'] == 'control'
-    assert runner.resume() == result
-    # The full feedback loop returns to the original task, not a renamed probe.
-    from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
-    from test_ascend_phase2_optimizer_tasks import seed
-    task = original['outcome']['task']
-    original_baseline = json.loads(store.read_evidence(original['outcome']['evidence']['baseline']['sha256'])['text'])
-    class Retry:
-        def __init__(self, directory, selected, memory):
-            assert selected == task
-            from optimizer.jobs import JobStore
-            self.jobs = JobStore(directory/'jobs')
-            spec = selected['submission']
-            self.job = self.jobs.create(spec['source'], spec['entrypoint'],
-                {'signatures': spec['signatures']}, memory,
-                init_args=spec.get('init_args'), init_kwargs=spec.get('init_kwargs'))
-            self.baseline = self.jobs.put_artifact(self.job['job_id'], 'baseline.json', canonical(original_baseline))
-        def prepare(self):
-            return {'suite_sha256': 'fixture-original-suite'}
-        def attempt(self, key, **kwargs):
-            source = 'scripted native candidate source'
-            result = dict(verified=True, summary='scripted host fixture', speedup=2,
-                attempt_id=key, task_id=task['task_id'], job_id=self.job['job_id'],
-                baseline=self.baseline, source_sha256=sha(source.encode()),
-                candidate=self.jobs.put_artifact(self.job['job_id'], 'candidate.json', canonical(source)),
-                result=dict(status='verified', candidate_sha256=sha(source.encode()),
-                    suite_sha256=original_baseline['suite_sha256'], cases=original_baseline['cases']))
-            result['result_artifact'] = self.jobs.put_artifact(self.job['job_id'], 'result.json', canonical(result))
-            self.jobs.add_event(self.job['job_id'], 'phase2-attempt-result', result)
-            return result
-    retry_root = tmp_path / 'new-retry'
-    reviewed = seed()
-    reviewed['source_identity'] = dict(target='a3', language='ascend-c')
-    reviewed['snapshot_id'] = sha(canonical({k:v for k,v in reviewed.items() if k != 'snapshot_id'}))
-    retry = OptimizerPhase2Coordinator(retry_root, 'original retry', reviewed,
-        lambda _: '{"action":"ready","reason":"host fixture passed"}', Retry,
-        fixed_task=task, feedback_root=store.root)
-    assert retry.resume()['status'] == 'READY'
-    link_retry(dict(root=str(retry_root), feedback_root=str(store.root),
-                    retry_feedback_id=original['feedback_id']))
-    assert next(r for r in store.records() if r['feedback_id'] == original['feedback_id'])['investigation']['status'] == 'resolved'
 
 
 def test_successful_new_probes_do_not_automatically_resolve_or_ready(tmp_path):
@@ -188,7 +121,7 @@ def test_feedback_artifact_reads_preserve_selection_turn_accounting(tmp_path):
     agent.failure_feedback = feedback
     from benchmarks.a5kernels.phase1_curriculum_selector import PriorOutcome, ProjectInformation
     prior = PriorOutcome('working', ProjectInformation.from_project(_project('working', 'gm-ub-movement')), True, 'passed')
-    context = CurriculumContext('learn', 1, 'a'*64, (), (prior,), phase2_feedback=feedback.context({}))
+    context = CurriculumContext('learn', 1, 'a'*64, (), (prior,), feedback=feedback.context({}))
     _, session = agent.select(context)
     assert session.turns == 2
 
@@ -197,7 +130,7 @@ def test_feedback_artifact_reads_preserve_selection_turn_accounting(tmp_path):
 def test_slow_original_requires_successful_retry_not_only_correctness(tmp_path, speedup, resolved):
     campaign(tmp_path / 'original', result=dict(verified=True, speedup=.4))
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(tmp_path / 'original')
+    store.import_task_results(tmp_path / 'original')
     original = store.records()[0]
     campaign(tmp_path / 'retry', task=original['outcome']['task'], result=dict(verified=True, speedup=speedup))
     link_retry(dict(root=str(tmp_path / 'retry'), feedback_root=str(store.root),
@@ -207,26 +140,10 @@ def test_slow_original_requires_successful_retry_not_only_correctness(tmp_path, 
     assert len(result['investigation']['retries']) == 1
 
 
-def test_fixed_task_retry_skips_goal_selection_and_qualifies_original(tmp_path):
-    from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
-    from test_ascend_phase2_optimizer_tasks import seed, proposal
-    task, prepared = proposal(), []
-    class Executor:
-        def __init__(self, directory, value, memory):
-            assert value == task
-        def prepare(self):
-            prepared.append(task)
-        def attempt(self, key, **kwargs):
-            return dict(verified=True, summary='host PASS')
-    runner = OptimizerPhase2Coordinator(tmp_path, 'retry', seed(),
-        lambda _: '{"action":"ready","reason":"verified"}', Executor,
-        selector=lambda **kw: pytest.fail('must not select a new goal'), fixed_task=task)
-    assert runner.resume()['status'] == 'READY'
-    assert prepared
 
 
 def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_path):
-    from test_phase2_optimizer_execution import executor
+    from test_optimizer_task_execution import executor
     execution, agent, backend = executor(tmp_path, [])
     frozen = dict(execution.task['submission'])
     expected = dict(frozen_submission=frozen, suite_sha256='suite', policy={'name':'frozen'})
@@ -241,7 +158,7 @@ def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_pat
 
 
 def test_retry_reads_actual_retained_baseline_and_refuses_missing_original(tmp_path):
-    from test_phase2_optimizer_execution import executor
+    from test_optimizer_task_execution import executor
     execution, _, backend = executor(tmp_path, [])
     original = backend.prepare
     frozen = dict(execution.task['submission'])
@@ -277,7 +194,7 @@ def test_cli_pins_feedback_and_rejects_incompatible_before_launch(tmp_path):
     sessions = []
     cli.main(args, screen=lambda job, role: sessions.append(role) or role)
     job = cli._read(tmp_path/'control/job.json')
-    frozen = (tmp_path/'new/phase2-feedback.json').read_bytes()
+    frozen = (tmp_path/'new/failure-feedback.json').read_bytes()
     assert job['feedback_selection_sha256'] == sha(frozen)
     assert job['failure_ids'] == [key] and sessions == ['collector', 'campaign']
     args[args.index('a3')] = 'a5'
@@ -294,7 +211,7 @@ def test_default_selection_filters_shared_store_without_relabeling_other_targets
         root = tmp_path / target
         campaign(root)
         write(root/'seed-memory.json', dict(source_identity=dict(target=target, language=language)))
-        store.import_campaign(root)
+        store.import_task_results(root)
     before = store.records()
     selected = select_feedback(store.root, 'a3')
     assert selected['selected'] == original['selected']
@@ -353,8 +270,8 @@ def test_proposals_and_rejections_do_not_commit_failure_feedback(tmp_path, termi
 
 
 def test_retry_normalizes_omitted_max_cases_in_retained_runtime(tmp_path):
-    from test_phase2_optimizer_execution import executor, snapshot
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from test_optimizer_task_execution import executor, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     fixture, agent, backend = executor(tmp_path, [])
     config = {k:v for k,v in fixture.config.items() if k != 'max_cases'}
     source = tmp_path/'original-campaign'
@@ -368,9 +285,9 @@ def test_retry_normalizes_omitted_max_cases_in_retained_runtime(tmp_path):
     row = campaign(source, task=execution.task, result=dict(verified=False,
         baseline=baseline, job_id=execution.job_id))
     row['execution_directory'] = 'task'
-    write(source/'state.json', dict(phase='optimizer-phase2', target=execution.task, attempts=[row]))
+    write(source/'state.json', dict(phase='optimizer-task', target=execution.task, attempts=[row]))
     store = FeedbackStore(tmp_path/'feedback')
-    store.import_campaign(source)
+    store.import_task_results(source)
     selection = select_feedback(store.root, 'a3')
     assert selection['selected'][0]['outcome']['runtime']['max_cases'] is None
     assert retry_spec(selection, 'a3')['max_cases'] == 24
@@ -529,12 +446,12 @@ def test_concurrent_successful_and_failed_retries_preserve_union_and_resolution(
     from threading import Barrier
     campaign(tmp_path/'original', result={'verified': False})
     store = FeedbackStore(tmp_path/'feedback')
-    store.import_campaign(tmp_path/'original')
+    store.import_task_results(tmp_path/'original')
     original = store.records()[0]
     for name, verified in [('success', True), ('failed', False)]:
         campaign(tmp_path/name, task=original['outcome']['task'],
                  result=dict(verified=verified, speedup=2 if verified else None))
-        store.import_campaign(tmp_path/name)
+        store.import_task_results(tmp_path/name)
     stale = store.records()
     # Force both callers to observe the original pre-union state; lock-protected
     # merging must not depend on these external context snapshots being fresh.
@@ -559,7 +476,7 @@ def test_all_infrastructure_feedback_beyond_first_page_can_defer_without_project
         classification = 'provider' if index % 2 else 'infrastructure'
         campaign(root, result=dict(verified=False, classification=classification,
                                   summary=classification+' transport unavailable'))
-        store.import_campaign(root)
+        store.import_task_results(root)
     selection = select_feedback(store.root, 'a3')
     root = tmp_path/'phase1'
     root.mkdir()
@@ -569,7 +486,7 @@ def test_all_infrastructure_feedback_beyond_first_page_can_defer_without_project
         calls.append(messages)
         if len(calls) == 1:
             payload = json.loads(messages[-1]['content'].rsplit('\n', 1)[-1])
-            manifest.extend(next(row['selected'] for row in payload['phase2_feedback']
+            manifest.extend(next(row['selected'] for row in payload['feedback']
                                  if row['role'] == 'selection-index'))
             assert len(manifest) == 10
         else:
@@ -597,7 +514,7 @@ def test_hidden_mixed_failure_task_is_hash_readable_without_advancing_wave(tmp_p
         campaign(root, task=dict(task_id=f'failure-{index}', rationale='isolate',
             submission={'source': f'reference-{index}'}), result=dict(verified=False,
             classification='infrastructure' if index < 9 else 'compile-error'))
-        store.import_campaign(root)
+        store.import_task_results(root)
     selection = select_feedback(store.root, 'a3')
     selection['selected'].sort(key=lambda row: row['outcome']['result']['classification'] == 'compile-error')
     feedback = FailureCurriculum(tmp_path, store.root, selection)
@@ -689,8 +606,8 @@ def test_linked_failed_retry_is_readable_without_becoming_an_obligation(tmp_path
     campaign(tmp_path/'retry', result=dict(verified=False, summary='new diagnostic',
         result=dict(status='compile-error')))
     campaign(tmp_path/'unrelated', task=dict(task_id='private', submission=dict(source='private')))
-    store.import_campaign(tmp_path/'retry')
-    store.import_campaign(tmp_path/'unrelated')
+    store.import_task_results(tmp_path/'retry')
+    store.import_task_results(tmp_path/'unrelated')
     records = store.records()
     retry = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'retry').resolve()))
     private = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'unrelated').resolve()))
@@ -718,7 +635,7 @@ def test_multiple_originals_snapshot_linked_evidence_once_per_operation(tmp_path
         task = dict(task_id=f'original-{index}', submission=dict(source=f'reference-{index}'))
         root = tmp_path/f'original-{index}'
         campaign(root, task=task)
-        store.import_campaign(root)
+        store.import_task_results(root)
         original = next(row for row in store.records() if row['outcome']['source_root'] == str(root.resolve()))
         originals.append(original)
         retries[original['feedback_id']] = []
@@ -726,7 +643,7 @@ def test_multiple_originals_snapshot_linked_evidence_once_per_operation(tmp_path
             root = tmp_path/f'retry-{index}-{attempt}'
             campaign(root, task=task, baseline=dict(suite_sha256=f'suite-{index}-{attempt}',
                 manifest=dict(policy=dict(name='host-policy'))))
-            store.import_campaign(root)
+            store.import_task_results(root)
             retry = next(row for row in store.records() if row['outcome']['source_root'] == str(root.resolve()))
             store.link_original_retry(original['feedback_id'], retry['feedback_id'])
             retries[original['feedback_id']].append(retry)

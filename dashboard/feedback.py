@@ -1,11 +1,11 @@
-"""Small, read-only views of Phase 2 observations and investigation lineage."""
+"""Small, read-only views of execution observations and investigation lineage."""
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
 from flask import abort, jsonify, render_template, request, send_file
 
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 
 
 class FeedbackView:

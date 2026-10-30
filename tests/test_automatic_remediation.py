@@ -78,7 +78,7 @@ def test_expired_failure_budget_does_not_extend_campaign(tmp_path):
 
 def test_committed_memory_export_authenticates_without_review(tmp_path):
     import pytest
-    from tests.test_a3_reviewed_phase2 import native_source
+    from tests.test_reviewed_memory import native_source
     from optimizer.memory import freeze_committed_phase1, verify_snapshot
     root, review, _ = native_source(tmp_path)
     state = json.loads((root / 'state.json').read_bytes())
@@ -118,11 +118,11 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
 @pytest.mark.parametrize("retry_latency", [5, 11])
 def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry, retry_latency):
     from types import SimpleNamespace
-    from tests.test_a3_reviewed_phase2 import native_source
-    from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from tests.test_reviewed_memory import native_source
+    from tests.test_optimizer_task_execution import Agent, Backend, candidate, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from benchmarks.ascend.automatic_remediation import optimizer_retry_adapter
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from optimizer.jobs import atomic, canonical
     source, _, _ = native_source(tmp_path/'learning')
     state = json.loads((source/'state.json').read_bytes())
@@ -155,11 +155,11 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         agent=Agent([dict(action='cases', signatures=[], summary='freeze'), candidate('bad')]), backend=FrozenBackend(10))
     first.prepare()
     failed = first.attempt('failed')
-    atomic(original_dir/'state.json', canonical(dict(phase='optimizer-phase2', attempts=[
+    atomic(original_dir/'state.json', canonical(dict(phase='optimizer-task', attempts=[
         dict(attempt_id='failed', task=task, result=failed, execution_directory='')])) )
     atomic(original_dir/'campaign-identity.json', canonical(dict(target='a3', language='ascend-c')))
     store = FeedbackStore(tmp_path/'feedback')
-    store.import_campaign(original_dir)
+    store.import_task_results(original_dir)
     row = store.records()[0]
     if standalone:
         submission = first.store.submission(first.job_id)
@@ -175,7 +175,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     received, children, now = [], [], [0]
     def factory(directory, task, memory, bound, **kwargs):
         received.append(memory)
-        assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
+        assert type(bound['attempt_seconds']) is int and bound['attempt_seconds'] == 30
         assert bound['max_cases'] == 2
         backend = FrozenBackend(12, failed=failed_retry, native_latency=retry_latency)
         backend.interrupt = not children
@@ -189,7 +189,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         child.prepare = charged_prepare
         children.append(child)
         return child
-    monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
+    monkeypatch.setattr('benchmarks.ascend.optimizer_execution.OptimizerTaskExecutor', factory)
     runner = SimpleNamespace(root=source, initial_memory=b'', clock=lambda: now[0])
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
     from optimizer.control import ObservationUnavailable, WorkerStopped
@@ -373,17 +373,17 @@ def test_nested_original_retry_reads_parent_memory_artifacts_and_reviewed_seed(t
     import shutil
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.a5kernels.evidence import canonical_bytes
-    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+    from benchmarks.ascend.reviewed_catlass import admit_adaptive_snapshot
     from benchmarks.ascend.agent_presentation import MemoryArtifactReader
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
-    from tests.test_a5_phase2_adaptive_memory import _source
+    from benchmarks.ascend.feedback import FeedbackStore
+    from tests.test_reviewed_catlass_memory import _source
     source_root, source, review, memory = _source(tmp_path/'history')
     parent = tmp_path/'parent'
     initial = b'{}'
     entries = [base64.b64encode(canonical_bytes(memory)).decode()]
     if reviewed:
         snapshot = admit_adaptive_snapshot(source_root, b'', review, source, parent)
-        initial = canonical_bytes(dict(schema='ascend-phase2-curriculum-seed-v1',
+        initial = canonical_bytes(dict(schema='ascend-reviewed-memory-seed-v1',
             snapshot_id=snapshot.snapshot_id, phase1_memory=[memory]))
         entries = []
     requests = []
