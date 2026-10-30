@@ -2,6 +2,7 @@
 from dataclasses import asdict, replace
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -35,10 +36,12 @@ def comparison(tmp_path, env, request):
     heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout',
         **getattr(request, 'param', {}))
     calls = []
-    def factory(request, *, reopen, session_factory=None):
+    def factory(request, *, reopen, session_factory=None, clock=None):
         calls.append((request.arm, reopen))
         kwargs = dict(injected, backend_identity=request.backend_identity,
                       session_factory=session_factory or (lambda: Session(repair=request.arm == 'candidate')))
+        if clock is not None:
+            kwargs['clock'] = clock
         if reopen:
             return ProjectRunner(request.root, **kwargs)
         return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
@@ -341,3 +344,57 @@ def test_provider_only_variance_cannot_promote_even_alongside_task_benefit(compa
     assert evaluation.promote(learner) == evaluation.plan['incumbent']
     # Even direct Learning validation cannot reinterpret a provider-only failure.
     assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'provider-validation') == evaluation.plan['incumbent']
+
+
+@pytest.mark.parametrize('setup', ['factory', 'actor'])
+def test_original_parent_deadline_bounds_current_setup_and_resumed_evaluation(comparison, setup):
+    create, learner, calls, store, _, _, factory = comparison
+    class HostClock:
+        offset = 0.
+        def __call__(self):
+            return time.time() + self.offset
+    clock = HostClock()
+    prepared = []
+    class SlowSetup(Session):
+        def prepare(self, timeout, *, schemas):
+            prepared.append(timeout)
+            clock.offset += 50
+            return super().prepare(timeout, schemas=schemas)
+    def trial(request, *, reopen):
+        if not reopen and setup == 'factory':
+            clock.offset += 50
+        return factory(request, reopen=reopen,
+            session_factory=SlowSetup if setup == 'actor' else Session, clock=clock)
+    evaluation = create(clock=clock, remaining_parent={'actor_seconds': 30, 'wall_seconds': 40})
+    evaluation.factory = trial
+    learner.validate = evaluation.validation
+    plan_ref = evaluation.state['plan']
+    deadline = evaluation.plan['created'] + 40
+    frozen = evaluation.pair(0).frozen
+    evaluation.step()  # Executes only the first real canonical arm.
+    pair = evaluation.pair(0)
+    assert pair.state['wall_deadline'] <= deadline
+    old = store.read_json(pair.state['arms']['incumbent']['receipt'])
+    assert old['wall_limited'] and old['outcome'] == 'failed'
+    assert old['actor_seconds'] < 50  # Actual setup is excluded from actor time.
+    workflow = store.read_json(old['workflow_receipt'])
+    created = workflow['created']
+    assert min(workflow['wall_deadlines'].values()) <= deadline
+    assert workflow['limits'] == frozen['allocation']
+    assert pair.state['arms']['candidate']['status'] == 'ready'
+    assert len(calls) == 1
+    if setup == 'actor':
+        assert len(prepared) == 1 and 0 < prepared[0] <= frozen['allocation']['wall_seconds']
+    else:
+        assert not prepared
+    resumed = SkillEvaluation(evaluation.path, artifacts=store, runner_factory=trial, clock=clock)
+    clock.offset += 100
+    with pytest.raises(WorkflowError, match='wall allocation'):
+        resumed.step()
+    retained = resumed.pair(0)
+    assert resumed.state['plan'] == plan_ref and retained.frozen == frozen
+    assert retained.state['wall_deadline'] <= deadline
+    assert store.read_json(retained.state['arms']['incumbent']['receipt']) == old
+    assert store.read_json(old['workflow_receipt'])['created'] == created
+    assert len(calls) == 1 and not [op for op in learner.state['operations'].values()
+                                   if op['request']['kind'] == 'validation']
