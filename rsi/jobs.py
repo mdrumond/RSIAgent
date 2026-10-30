@@ -157,7 +157,10 @@ def stop(instance, job_id):
         if not _alive(identity):
             return status(root, job_id)
         _publish(directory / f'{job_id}.stop', b'{}\n')
-        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Worker completed between identity observation and the signal.
     finally:
         os.close(descriptor)
     return status(root, job_id)

@@ -189,3 +189,59 @@ def test_competing_dispatch_is_refused_by_instance_lock(instance, monkeypatch):
         assert list(directory.glob('*.json')) == []
     finally:
         os.close(lock)
+
+
+def test_cli_adopt_uses_current_snapshot_action_without_changing_cycle(instance, monkeypatch):
+    from rsi.cli import main
+    job_id, _ = record(instance, state='stopped')
+    path = jobs._path(instance / 'runs/jobs', job_id)
+    previous = json.loads(path.read_text())
+    previous['request']['cycle_id'] = 'retained'
+    _publish(path, _bytes(previous))
+    calls = []
+    monkeypatch.setattr(jobs, 'start', lambda root, request: calls.append(request) or {})
+    assert main(['--instance', str(instance), 'phase1', 'adopt', '--job', job_id]) == 0
+    assert calls == [{'mode': 'phase1', 'cycle_id': 'retained',
+                      'action': 'adopt', 'previous_job': job_id}]
+
+
+def test_worker_main_invokes_shared_service_on_main_thread(instance, monkeypatch):
+    import threading
+    from rsi import job_worker
+    from types import SimpleNamespace
+    job_id, original = record(instance)
+    lock = os.open(instance / 'runs/jobs', os.O_RDONLY | os.O_DIRECTORY)
+    seen = []
+    def service(root, request, configuration, *, should_stop, emit):
+        seen.append((root, request, configuration, threading.current_thread()))
+        return {'status': 'awaiting_tuning', 'pending': None}
+    monkeypatch.setitem(sys.modules, 'rsi.service', SimpleNamespace(run_job=service))
+    monkeypatch.setattr(sys, 'argv', ['worker', str(instance), job_id, str(lock)])
+    job_worker.main()
+    assert seen == [(instance, original['request'], original['configuration'], threading.main_thread())]
+    assert jobs.status(instance, job_id)['result']['status'] == 'awaiting_tuning'
+
+
+def test_worker_sigterm_sets_service_stop_callback_without_killing_caller(instance):
+    job_id, _ = record(instance)
+    lock = os.open(instance / 'runs/jobs', os.O_RDONLY | os.O_DIRECTORY)
+    def service(root, request, configuration, *, should_stop, emit):
+        assert not should_stop()
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert should_stop()
+        emit({'event': 'service-drained-owned-children'})
+        return {'status': 'stopped'}
+    run_owned(instance, job_id, lock, service)
+    result = jobs.evidence(instance, job_id)
+    assert result['job']['state'] == 'stopped'
+    assert result['events'] == [{'event': 'service-drained-owned-children'}]
+
+
+def test_worker_finishing_during_stop_is_reported_not_raised(instance, monkeypatch):
+    identity = jobs._identity(os.getpid())
+    job_id, _ = record(instance, process=identity)
+    def finished(*args):
+        raise ProcessLookupError()
+    monkeypatch.setattr(signal, 'pidfd_send_signal', finished)
+    assert jobs.stop(instance, job_id)['job_id'] == job_id
+    assert (instance / f'runs/jobs/{job_id}.stop').exists()

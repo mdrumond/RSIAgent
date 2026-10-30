@@ -8,7 +8,6 @@ import signal
 import threading
 import sys
 
-
 from .configuration import _bytes, _publish
 from .jobs import _identity, _path
 
