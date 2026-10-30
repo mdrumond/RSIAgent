@@ -152,9 +152,7 @@ class InstanceServices:
         """Continue the SAME admitted runner explicitly; never create on resume."""
         cycle = self.open_cycle(cycle_id)
         try:
-            runner = cycle.open_project(operation_id)
-            result = runner.run()
-            return cycle.finish_project(runner, operation_id, result)
+            return cycle.run_project(operation_id)
         finally:
             cycle.close()
 
@@ -446,6 +444,14 @@ class BoundCycle:
             raise ValueError('result is stale; retain current project completion first')
         self.scheduler.reconcile(pending['id'], HostTaskResult(packet['result']['status'], ref,
             runner.workflow.accounting.seconds()))
+
+    def step(self):
+        """Delegate one dispatch to the shared controller; no service driver loop."""
+        return self.controller.step()
+
+    def run_project(self, operation_id):
+        runner = self.open_project(operation_id)
+        return self.finish_project(runner, operation_id, runner.run())
 
     def close(self):
         self.scheduler.close()
