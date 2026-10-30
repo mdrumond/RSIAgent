@@ -171,7 +171,7 @@ def test_selection_requires_real_retrospective_and_query(setup):
     service, _, _, _, _, skill, _ = setup
     query, retro = prepare(service, skill)
     with pytest.raises(WorkflowError):
-        select(service, skill, '0' * 64, retro)
+        select(service, skill, '0' * 64, retro, decisions(service, query))
     with pytest.raises(WorkflowError):
         select(service, skill, query, '0' * 64)
 
