@@ -52,6 +52,28 @@ def run(command, *, cwd, env, timeout):
         raise
 
 
+def install(interpreter, *arguments, cwd, env, timeout, offline=False, pip_cache=None, runner=run):
+    """Install or repair owned target packages, replacing existing directories."""
+    started = time.monotonic()
+    purelib = subprocess.check_output(
+        [str(interpreter), '-I', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+        text=True, env=env, cwd=cwd, timeout=min(10, timeout)).strip()
+    if not Path(purelib).resolve().is_relative_to(Path(interpreter).parent.parent):
+        raise ValueError('venv install target escapes owned environment')
+    options = ['--upgrade', '--ignore-installed', '--target', purelib, '--timeout', '30', '--retries', '1']
+    if offline:
+        options += ['--no-index']
+        if pip_cache:
+            options += ['--find-links', str(Path(pip_cache).resolve())]
+    elif pip_cache:
+        options += ['--cache-dir', str(Path(pip_cache).resolve())]
+    remaining = timeout - (time.monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError('instance setup elapsed budget exhausted')
+    runner([str(interpreter), '-I', '-m', 'pip', '--isolated', 'install',
+            *options, *map(str, arguments)], cwd=cwd, env=env, timeout=remaining)
+
+
 def _wheel(source, target):
     """Reconstitute the bootstrap's installed-wheel inventory without rebuilding."""
     metadata = list(source.glob('rsi-*.dist-info'))
@@ -77,7 +99,7 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
     if runtime.resolve() != runtime:
         raise ValueError('runtime directory escapes instance')
     lock = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY)
-    dashboard_lock = None
+    dashboard_lock = jobs_lock = None
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -86,8 +108,14 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
                 raise ValueError('dashboard directory escapes instance')
             dashboard_lock = os.open(dashboard, os.O_RDONLY | os.O_DIRECTORY)
             fcntl.flock(dashboard_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Existing owners use these directory descriptions for their lifetime.
+            # Order is runtime -> dashboard -> jobs; release in reverse order.
+            from .jobs import _directory
+            _, directory = _directory(root)
+            jobs_lock = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(jobs_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('setup or dashboard is active; stop it before changing dependencies') from None
+            raise ValueError('setup, dashboard, or job is active; stop it before changing dependencies') from None
         settings = show_configuration(root)['payload'].get('runtime', {})
         python = python or settings.get('python') or sys.executable
         node = Path(node or settings.get('node') or shutil.which('node') or '')
@@ -119,19 +147,11 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             runner([str(item) for item in argv], cwd=runtime, env=env, timeout=remaining)
 
         def pip(interpreter, *arguments):
-            purelib = subprocess.check_output(
-                [str(interpreter), '-I', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
-                text=True, env=env, cwd=runtime, timeout=10).strip()
-            if not Path(purelib).resolve().is_relative_to(Path(interpreter).parent.parent):
-                raise ValueError('venv install target escapes owned environment')
-            options = ['--ignore-installed', '--target', purelib, '--timeout', '30', '--retries', '1']
-            if offline:
-                options += ['--no-index']
-                if pip_cache:
-                    options += ['--find-links', str(Path(pip_cache).resolve())]
-            elif pip_cache:
-                options += ['--cache-dir', str(Path(pip_cache).resolve())]
-            invoke([interpreter, '-I', '-m', 'pip', '--isolated', 'install', *options, *arguments])
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError('instance setup elapsed budget exhausted')
+            install(interpreter, *arguments, cwd=runtime, env=env, timeout=remaining,
+                    offline=offline, pip_cache=pip_cache, runner=runner)
 
         try:
             host = runtime / 'python' / 'bin' / 'python'
@@ -176,6 +196,8 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             _publish(receipt_path, _bytes(receipt))
         return receipt
     finally:
+        if jobs_lock is not None:
+            os.close(jobs_lock)
         if dashboard_lock is not None:
             os.close(dashboard_lock)
         os.close(lock)

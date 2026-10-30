@@ -164,7 +164,7 @@ def test_reconstructed_wheel_installs_and_imports_outside_checkout(tmp_path):
     (source / 'rsi/__init__.py').write_text('value = 42\n')
     wheel = instance_setup._wheel(source, tmp_path)
     environment = tmp_path / 'venv'
-    subprocess.run([sys.executable, '-I', '-m', 'venv', '--without-pip', str(environment)],
+    subprocess.run([sys.executable, '-I', '-m', 'venv', str(environment)],
                    check=True, timeout=60)
     interpreter = environment / 'bin/python'
     purelib = subprocess.check_output([str(interpreter), '-I', '-c',
@@ -172,14 +172,18 @@ def test_reconstructed_wheel_installs_and_imports_outside_checkout(tmp_path):
                                      text=True, timeout=10).strip()
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(('PIP_', 'PYTHON'))}
-    subprocess.run([sys.executable, '-I', '-m', 'pip', '--isolated', 'install',
-                    '--ignore-installed', '--no-index', '--no-deps', '--target', purelib,
-                    str(wheel)], check=True, env=env, cwd=tmp_path, timeout=60,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run([str(interpreter), '-I', '-c',
-                    'import rsi, sys; from pathlib import Path; assert rsi.value == 42; '
-                    'assert Path(rsi.__file__).resolve().is_relative_to(Path(sys.prefix))'],
-                   check=True, env=env, cwd=tmp_path, timeout=10)
+    damaged = Path(purelib) / 'rsi/__init__.py'
+    damaged.parent.mkdir(parents=True, exist_ok=True)
+    # An interrupted initial install and a subsequently damaged installed package
+    # must both be replaced, rather than merely skipped by pip --target.
+    for _ in range(2):
+        damaged.write_text('raise RuntimeError("partial package")\n')
+        instance_setup.install(interpreter, '--no-deps', str(wheel), cwd=tmp_path,
+                               env=env, timeout=60, offline=True)
+        subprocess.run([str(interpreter), '-I', '-c',
+                        'import rsi, sys; from pathlib import Path; assert rsi.value == 42; '
+                        'assert Path(rsi.__file__).resolve().is_relative_to(Path(sys.prefix))'],
+                       check=True, env=env, cwd=tmp_path, timeout=10)
 
 
 def test_stop_never_signals_reused_or_dead_process_identity(tmp_path, monkeypatch):
@@ -249,3 +253,80 @@ def test_owned_dashboard_processes_get_distinct_ports_and_stop(tmp_path):
                 os.waitpid(record['process']['pid'], 0)
             except (ChildProcessError, KeyError, TypeError):
                 pass
+
+
+def test_other_process_job_owner_blocks_setup_before_environment_mutation(tmp_path, monkeypatch):
+    import fcntl
+    import multiprocessing
+    from rsi import jobs
+    root = instance(tmp_path)
+    node, commands, runner = setup_spy(monkeypatch, root)
+    context = multiprocessing.get_context('fork')
+    held, release = context.Event(), context.Event()
+    def own_job():
+        _, directory = jobs._directory(root)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            held.set()
+            release.wait(10)
+        finally:
+            os.close(descriptor)
+    child = context.Process(target=own_job)
+    child.start()
+    try:
+        assert held.wait(5)
+        with pytest.raises(ValueError, match='job is active'):
+            instance_setup.setup(root, node=node, runner=runner)
+        assert not commands
+        assert not (root / 'runtime/setup.json').exists()
+    finally:
+        release.set()
+        child.join(5)
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+    assert child.exitcode == 0
+
+
+def test_other_process_setup_owner_blocks_job_launch_until_failed_receipt_published(tmp_path, monkeypatch):
+    import multiprocessing
+    from rsi import jobs
+    root = instance(tmp_path)
+    source = root / 'machinery/rsi'
+    source.mkdir()
+    for name in ('jobs.py', 'job_worker.py', 'services.py', 'service.py'):
+        (source / name).write_text('# The launch must be refused before this is imported.\n')
+    manifest = json.loads((root / 'instance.json').read_text())
+    manifest['files'] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                         for p in (root / 'machinery').rglob('*') if p.is_file()}
+    (root / 'instance.json').write_text(json.dumps(manifest))
+    node, _, _ = setup_spy(monkeypatch, root)
+    context = multiprocessing.get_context('fork')
+    held, release = context.Event(), context.Event()
+    def install_until_interrupted():
+        def paused(*args, **kwargs):
+            held.set()
+            release.wait(10)
+            raise RuntimeError('controlled setup interruption before venv creation')
+        try:
+            instance_setup.setup(root, node=node, roles=False, runner=paused)
+        except RuntimeError:
+            pass
+    child = context.Process(target=install_until_interrupted)
+    child.start()
+    try:
+        assert held.wait(5)
+        assert json.loads((root / 'runtime/setup.json').read_text())['state'] == 'installing'
+        with pytest.raises(ValueError, match='already has an owned running job'):
+            jobs.start(root, dict(action='start', mode='phase1', cycle_id='blocked'))
+        assert not list((root / 'runs/jobs').glob('*.json'))
+        assert not (root / 'runtime/python').exists()
+    finally:
+        release.set()
+        child.join(5)
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+    assert child.exitcode == 0
+    assert json.loads((root / 'runtime/setup.json').read_text())['state'] == 'failed'
