@@ -252,14 +252,50 @@ def test_distillation_infrastructure_failure_retains_summary_usage(canonical_ker
     assert outcome.status == 'host-verified'
     assert any(not wire.get('tools') for wire in case.wires)
     ledgers = [row for row in case.runner.events if row['type'] == 'pi-provider']
-    assert sum(row.get('usage', {}).get('completion_tokens', 0) for row in ledgers) > 0
+    pi_tokens = sum(row.get('usage', {}).get('completion_tokens', 0) for row in ledgers)
+    assert pi_tokens > 0
     calls = list(case.calls)
+    requests, summary_usage = [], []
+    summary = 'Retain the verified source and exact host evidence references.'
     def failed_transport(**kwargs):
+        request = kwargs['request']
+        requests.append(request)
+        if request['messages'][0]['content'].startswith('Update a compact working log'):
+            summary_usage.append(7)
+            return DirectCompletion(summary, 7)
         raise TimeoutError()
     case.provider._transport = failed_transport
-    learned = case.driver.distill(outcome)
+    # Compact early, while retaining the native terminal schema/citation cap.
+    terminal_budget = ContextBudget(BUDGET.high, BUDGET.target, 48 * 1024)
+    case.provider.context_budgets[case.profile.identity.backend_model.value] = terminal_budget
+    learned = case.driver.distill(outcome,
+        host_summaries=[{'detail': 'retained host diagnostic ' * 30, 'page': page}
+                        for page in range(8)])
     assert learned.status == 'host-verified'
+    assert summary_usage and len(requests) == len(summary_usage) + 1
+    assert all(request_bytes(request) <= terminal_budget.hard for request in requests)
+    assert requests[-1]['messages'][0]['content'] == case.driver.system_prompt
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    records = [json.loads(line)['payload'] for line in
+               (case.workspace.parent / 'evidence.jsonl').read_text().splitlines()]
+    summaries = [row for row in records if row.get('stage') == 'compaction'
+                 and row.get('role') == 'provider-response']
+    artifacts = ContentAddressedArtifacts(case.workspace.parent / 'artifacts')
+    assert len(summaries) == len(summary_usage)
+    assert all(artifacts.read_bytes(row['sha256']) == summary.encode() for row in summaries)
+    assert learned.tokens == sum(summary_usage)
+    assert learned.terminal_response is None and learned.distillation is None
+    assert learned.distillation_failure is not None
+    proof = case.runner.store.read_json(learned.distillation_failure)
+    assert proof == dict(kind='domain-distillation-failure-v1',
+        exception_type='InfrastructureFailure', source_hash=case.runner.backend.project_hash(),
+        contract_ref=case.runner.contract_ref, host_outcome='host-verified')
+    assert any(row['type'] == 'domain-distillation-failure'
+               and row['reference'] == learned.distillation_failure for row in case.runner.events)
     assert [row for row in case.runner.events if row['type'] == 'pi-provider'] == ledgers
+    retained_pi_tokens = sum(row.get('usage', {}).get('completion_tokens', 0)
+                             for row in case.runner.events if row['type'] == 'pi-provider')
+    assert retained_pi_tokens + learned.tokens == pi_tokens + sum(summary_usage)
     assert case.calls == calls and case.actions.latest.evidence.verified
 
 
