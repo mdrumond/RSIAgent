@@ -18,8 +18,9 @@ class TestEmbedding:
 
 
 class Session:
-    def __init__(self, *, missing_query=False, repair=True, redirect=False):
+    def __init__(self, *, missing_query=False, repair=True, redirect=False, perform_label=None):
         self.missing_query, self.repair = missing_query, repair
+        self.perform_label = perform_label
         self.redirect = redirect
         self.calls = 0
 
@@ -53,7 +54,7 @@ class Session:
                     skill_refs=[r['receipt_id'] for r in context['read_skills']], decisions=decisions)
             if stage == Stage.OPTIMISATION and 'optimisation_decision' not in evidence:
                 return 'optimisation_decision', dict(action='noop', reason='Correctness established; preserve stable sum')
-        args = {'proposal': 'Use stable accumulation'}
+        args = {'proposal': self.perform_label or 'Use stable accumulation'}
         if stage == Stage.DEBUG and self.repair and any(
                 row['classification'] == 'numeric_failure' for row in context['task']['feedback']):
             snapshot = context['source']
@@ -65,7 +66,7 @@ class Session:
         pass
 
 
-def make(tmp_path, session=None, *, config_overrides=None, **overrides):
+def make(tmp_path, session=None, *, config_overrides=None, budgets=None, **overrides):
     source = tmp_path / 'input'
     source.mkdir()
     (source / 'solution.py').write_text('def solve(xs):\n    total = 0.0\n    for x in xs: total += x\n    return total\n')
@@ -81,7 +82,7 @@ def make(tmp_path, session=None, *, config_overrides=None, **overrides):
                     session_factory=lambda: session or Session())
     injected.update(overrides)
     spec = ProjectSpec('sum', 'Stable numeric sum', (sys.executable, 'solution.py'),
-                       budgets=BudgetLimits(execution_tries=40))
+                       budgets=budgets or BudgetLimits(execution_tries=40))
     config = dict(source=str(source), verifier=str(verifier),
         editable_files=['solution.py', 'helper.py'], commands={
             'compile': [sys.executable, '-m', 'py_compile', 'solution.py'],
@@ -227,5 +228,77 @@ def test_correctness_and_performance_shortfall_are_separate(tmp_path):
         reopened = runner.run()
         assert reopened['status'] == 'suspended'
         assert reopened['correctness'] is None
+    finally:
+        database.close()
+
+
+def test_perform_label_can_paraphrase_verified_selection(tmp_path):
+    runner, _, database = make(tmp_path, Session(perform_label='Apply the chosen stable approach'))
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        assert runner.store.read_json(result['contract_ref'])['spec']['goal'] == runner.spec.goal
+        assert runner.store.read_json(result['execution_contract_ref']) == runner.backend.contract
+    finally:
+        database.close()
+
+
+class Clock:
+    value = 1000.
+
+    def __call__(self):
+        return self.value
+
+
+def test_copy_consumes_wall_budget_but_not_actor_budget(tmp_path, monkeypatch):
+    import rsi.python_execution as execution
+    clock, session = Clock(), Session()
+    copy = execution.shutil.copytree
+    def delayed_copy(*args, **kwargs):
+        result = copy(*args, **kwargs)
+        clock.value += 20
+        return result
+    monkeypatch.setattr(execution.shutil, 'copytree', delayed_copy)
+    runner, _, database = make(tmp_path, session, clock=clock,
+        budgets=BudgetLimits(actor_seconds=30, wall_seconds=10))
+    try:
+        result = runner.run()
+        assert result['status'] == 'budget_exhausted', result
+        assert runner.workflow.state['created'] == 1000.
+        assert runner.workflow.remaining() == dict(actor_seconds=30., wall_seconds=0.)
+        assert result['history'] == [] and result['pending'] is None
+        assert session.calls == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('error_type,classification', [
+    ('ActionError', 'malformed_action'), ('PiProviderError', 'provider_failure'),
+    ('PiDeadlineError', 'provider_timeout'), ('PiCancelled', 'actor_cancelled'),
+    ('PiError', 'actor_failure')])
+def test_known_pi_failure_is_durable_charged_and_never_replayed(tmp_path, error_type, classification):
+    from coding.pi import rpc, session as pi_session
+    error = getattr(pi_session if error_type == 'ActionError' else rpc, error_type)
+    clock = Clock()
+    class Failed(Session):
+        def prepare(self, timeout, *, schemas):
+            clock.value += 100  # Actor setup is excluded.
+        def next_action(self, *args, **kwargs):
+            self.calls += 1
+            clock.value += 2
+            raise error('controlled provider/action failure')
+    session = Failed()
+    runner, injections, database = make(tmp_path, session, clock=clock)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended'
+        assert result['classification'] == classification
+        assert result['pending'] and runner.workflow.outcome is None
+        assert runner.workflow.accounting.seconds('thinking') == 2
+        assert runner.workflow.accounting.seconds('setup') == 100
+        assert runner.latest('project-failure')['classification'] == classification
+        reopened = ProjectRunner(runner.root, **injections).run()
+        assert reopened['pending'] == result['pending']
+        assert session.calls == 1
     finally:
         database.close()

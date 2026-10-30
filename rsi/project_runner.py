@@ -10,7 +10,10 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+import time
 
+from coding.pi.rpc import PiError, PiProviderError, PiDeadlineError, PiCancelled
+from coding.pi.session import ActionError
 from coding.pi.schema import INTEGER, STRING, obj
 from rsi.actor import EvidenceTool, SourceSnapshot, StageResult, WorkflowActor
 from rsi.contracts import ProjectSpec, Stage, StepEvidence
@@ -51,16 +54,17 @@ class ProjectRunner:
     """
     @classmethod
     def create(cls, root, spec, bundle, config, **injections):
+        created = injections.get('clock', time.time)()
         config = ProjectConfig.from_dict(asdict(config) if isinstance(config, ProjectConfig) else config)
         backend = PythonExecution.snapshot(root, config.source, config.verifier,
             commands=config.commands, editable_files=config.editable_files,
             performance_seconds=config.performance_seconds)
-        frozen = dict(spec=spec.to_dict(), skills=bundle.to_dict(), config=asdict(config),
+        frozen = dict(created=created, spec=spec.to_dict(), skills=bundle.to_dict(), config=asdict(config),
                       backend_identity=injections['backend_identity'])
         atomic_json(backend.root / 'runner.json', {'contract': backend.store.put_json(frozen)})
         return cls(root, **injections)
 
-    def __init__(self, root, *, query, backend_identity, session_factory, test_backend=False):
+    def __init__(self, root, *, query, backend_identity, session_factory, test_backend=False, clock=time.time):
         self.backend = PythonExecution(root)
         self.root, self.store = self.backend.root, self.backend.store
         self.contract_ref = json.loads((self.root / 'runner.json').read_text())['contract']
@@ -77,7 +81,10 @@ class ProjectRunner:
         persisted = json.loads(state_path.read_text()) if state_path.exists() else None
         self.workflow = Workflow(state_path, self.resolve,
             source_hash=persisted['source'] if persisted else self.backend.project_hash(),
-            limits=self.spec.budgets)
+            limits=self.spec.budgets, clock=clock)
+        if 'created' in frozen and self.workflow.state['created'] != frozen['created']:
+            self.workflow.state['created'] = frozen['created']
+            self.workflow._save()
         self.backend.workflow = self.workflow
         self.service = StrategyEvidence(self.store, self.append, lambda: self.workflow.state,
             self.bundle, query, workflow_id=self.contract_ref, backend_identity=backend_identity,
@@ -159,12 +166,17 @@ class ProjectRunner:
         self.append(dict(type='host-result', operation_id=operation, result=asdict(result)))
         return result
 
-    def selection(self, operation, proposal):
+    def selection(self, operation):
         rows = [self.store.read_json(e['reference']) for e in self.events
                 if e['type'] == 'project-tool' and e['operation_id'] == operation
                 and e['name'] == 'select_strategy']
-        if not rows or rows[-1]['payload']['proposal'] != proposal:
-            raise WorkflowError('perform requires matching host-verified strategy selection')
+        if not rows:
+            raise WorkflowError('perform requires host-verified strategy selection')
+        # Recheck scope and authority; perform.proposal is only a display label.
+        payload = rows[-1]['payload']
+        if not all(self.resolve(kind, payload[field], self.workflow.stage, operation)
+                   for kind, field in (('retrieval', 'query_ref'), ('retrospective', 'retrospective_ref'))):
+            raise WorkflowError('strategy selection is no longer valid for this operation')
         return rows[-1]['payload']
 
     @contextmanager
@@ -179,7 +191,7 @@ class ProjectRunner:
         with self.charged_host():
             refs, selection, changed = [], None, None
             if stage in (Stage.DESIGN, Stage.OPTIMISATION):
-                selection = self.selection(operation, args['proposal'])
+                selection = self.selection(operation)
             decision = None
             if stage == Stage.OPTIMISATION:
                 decisions = [e for e in self.events if e['type'] == 'project-tool'
@@ -260,24 +272,41 @@ class ProjectRunner:
             flow.source_changed(actual)
 
     def run(self):
-        status, error = None, None
+        status, error, classification = None, None, None
         try:
             self.reconcile()
             while not self.workflow.outcome:
                 self.actor.step(self.context())
             status = self.workflow.outcome
+        except PiError as exc:
+            status, error = 'suspended', str(exc)
+            classification = ('malformed_action' if isinstance(exc, ActionError) else
+                'provider_timeout' if isinstance(exc, PiDeadlineError) else
+                'provider_failure' if isinstance(exc, PiProviderError) else
+                'actor_cancelled' if isinstance(exc, PiCancelled) else 'actor_failure')
+            self.append(dict(type='project-failure', classification=classification,
+                error_type=type(exc).__name__, pending=self.workflow.pending))
         except QueryUnavailable as exc:
             status, error = 'suspended', str(exc)
         except (WorkflowError, ValueError, OSError) as exc:
             error = str(exc)
             status = 'budget_exhausted' if 'exhausted' in error else 'suspended'
         finally:
-            self.actor.close()
+            try:
+                self.actor.close()
+            except PiError as exc:
+                self.append(dict(type='project-failure', classification='actor_cleanup_failure',
+                    error_type=type(exc).__name__, pending=self.workflow.pending))
+                if error is None:
+                    status, error, classification = 'suspended', str(exc), 'actor_cleanup_failure'
         validation = self.latest('validation-results')
         if validation and validation['source_hash'] != self.backend.project_hash():
             validation = None
-        return dict(status=status, error=error, stage=self.workflow.stage.value,
+        return dict(status=status, error=error, classification=classification or status,
+            stage=self.workflow.stage.value,
             correctness=validation['correctness'] if validation else None,
             performance=validation['performance'] if validation else 'not_measured',
             history=self.workflow.state['history'], pending=self.workflow.pending,
-            events=tuple(self.event_refs), source_hash=self.backend.project_hash())
+            events=tuple(self.event_refs), source_hash=self.backend.project_hash(),
+            contract_ref=self.contract_ref, execution_contract_ref=self.backend.manifest['contract'],
+            skill_bundle_hash=self.bundle.digest)
