@@ -44,9 +44,9 @@ def execution(tmp_path):
         elif args[:2] == ['skills', 'set'] or args[:3] == ['skills', 'map', 'set']:
             result = {'bundle_ref': 'baseline2', 'configuration_revision': 'config2'}
         elif args == ['job', 'list']:
-            result = [retained]
+            result = [app.config.get('TEST_JOB', retained)]
         elif args[:2] == ['job', 'evidence']:
-            result = {'job': retained, 'events': [{'prompt': 'private'}], 'log': 'private'}
+            result = {'job': app.config.get('TEST_JOB', retained), 'events': [{'prompt': 'private'}], 'log': 'private'}
         else:
             result = {'job_id': 'new-job', 'state': 'launching'}
         return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr='')
@@ -309,3 +309,61 @@ def test_ledger_keeps_authoritative_uncertainty():
     assert task_inspection(task)['accounting_state'] == 'uncertain'
     del task['actor_union_seconds']
     assert task_inspection(task)['actor_union_seconds'] is None
+
+
+
+@pytest.mark.parametrize('result,expected', [
+    ({'status': 'suspended', 'error': 'private provider detail'}, 'suspended'),
+    ({'status': 'awaiting_tuning'}, 'awaiting_tuning'),
+    ({'status': 'tuned'}, 'tuned'),
+    ({'state': 'stopped'}, 'stopped'),
+    ({'status': 'private provider detail', 'state': 'complete'}, None),
+])
+def test_completed_worker_retains_safe_service_status_in_list_and_detail(execution, result, expected):
+    app, client, _, _ = execution
+    app.config['TEST_JOB'] = dict(job_id='one', state='completed', result=result,
+        request={'mode': 'phase2', 'cycle_id': 'cycle-one'}, configuration={'revision': 'frozen'})
+    listing = client.get('/api/rsi/jobs').json['jobs'][0]
+    detail = client.get('/api/rsi/jobs/one').json['job']
+    for observed in (listing, detail):
+        assert observed['state'] == 'completed'
+        assert observed['service_status'] == observed['result_state'] == expected
+        assert 'result' not in observed and 'error' not in observed
+
+
+def test_browser_job_label_separates_worker_completion_from_service_suspension():
+    from pathlib import Path
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is unavailable')
+    script = r"""
+const assert = require('node:assert/strict'), vm = require('node:vm');
+class Element {
+  constructor() { this.children=[]; this.listeners={}; this.dataset={}; this.value=''; }
+  addEventListener(name,fn) { this.listeners[name]=fn; }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children=nodes; }
+}
+const nodes=new Map(), get=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
+get('rsi-execution').dataset.enabled='true';
+get('phase-form').elements={operation:new Element()};
+const context={document:{getElementById:get,createElement:()=>new Element(),body:{dataset:{csrf:'token'}}},
+ Option:class extends Element {constructor(text,value){super();this.textContent=text;this.value=value;}},
+ fetch:async url=>({ok:true,json:async()=>url==='/api/rsi/capabilities'?{}:{jobs:[
+   {job_id:'retained',mode:'phase2',cycle_id:'application',state:'completed',service_status:'suspended'}]}}),
+ setTimeout, console};
+vm.runInNewContext(require('node:fs').readFileSync(process.argv[1],'utf8'),context);
+setImmediate(()=>{
+  try {
+    const label=get('jobs-list').children[0].textContent;
+    assert.ok(label.includes('worker: completed'));
+    assert.ok(label.includes('service: suspended'));
+    assert.equal(get('retained-job').children[1].value,'retained');
+    assert.equal(get('retained-job').children[1].textContent,label);
+  } catch(error) {console.error(error);process.exitCode=1;}
+});
+"""
+    subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/rsi_execution.js')],
+                   check=True, capture_output=True, text=True, timeout=20)
