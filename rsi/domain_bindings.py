@@ -324,6 +324,34 @@ class KernelActionsHost(SourceHost):
         latest = self.actions.latest_run
         return bool(latest and latest.verified.passed)
 
+    def before_edit(self, stage, edit, operation, activity):
+        if not self.adaptive or stage != Stage.OPTIMISATION or edit['source'] == self.source:
+            return
+        spec = self.actions.request.spec
+        if 'sync-performance' not in spec.learning_focus:
+            return
+        if not self.verified():
+            raise WorkflowError('sync-performance comparison requires current host-verified source')
+        # Measure the already verified pre-edit source. _ProjectActions._write
+        # retains its actual receipt as comparison-* when the source changes;
+        # final VALIDATION independently measures the new verified revision.
+        if spec.profile_metric is not None:
+            name, role = 'request-profile', 'profiling'
+        elif spec.timing_lengths:
+            name, role = 'request-timing', 'performance-study'
+        else:
+            raise CanonicalConfigurationError('sync-performance requires a configured profile or timing study')
+        current = self.actions.source_sha256
+        if any(admitted_role == role and self.store.read_json(reference).get('candidate_sha256') == current
+               for reference, admitted_role in self.actions.admitted.items() if admitted_role == role):
+            return
+        _, raw = self.call(activity, 'pre-edit-' + name, 'profiling', lambda seconds: self.action(name))
+        if raw.get('error') or raw.get('passed') is not True:
+            raise WorkflowError('pre-edit comparison measurement did not pass; source remains unchanged')
+        if not any(admitted_role == role and self.store.read_json(reference).get('candidate_sha256') == current
+                   for reference, admitted_role in self.actions.admitted.items() if admitted_role == role):
+            raise WorkflowError('pre-edit comparison measurement omitted its actual source-bound receipt')
+
     def execute(self, stage, args, operation, activity):
         passed = True
         commands = ['compile', 'run'] if stage == Stage.TEST else ['run'] if stage == Stage.VALIDATION else []

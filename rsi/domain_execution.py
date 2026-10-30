@@ -309,6 +309,11 @@ class DomainRunner(ProjectRunner):
             raise WorkflowError('domain source changed outside current stage')
         if 'edit' in args:
             edit = args['edit']
+            before_edit = getattr(self.backend, 'before_edit', None)
+            if before_edit is not None:
+                before_edit(stage, edit, operation, activity)
+                if self.backend.project_hash() != old_hash:
+                    raise WorkflowError('domain pre-edit activity changed the current source')
             activity.run('edit', 'implementation', lambda _: self.backend.edit(edit['path'], edit['source'],
                 expected_file_hash=edit['sha256'], expected_project_hash=old_hash))
         observation = self.backend.execute(stage, args, operation, activity)
