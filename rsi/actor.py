@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 
+from coding.pi.context import ContextRecords, encoded
 from coding.pi.schema import STRING, obj, validate
 from coding.pi.session import ActionError, PiCodingSession
 from rsi.contracts import Stage, StepEvidence
@@ -34,6 +35,9 @@ SYSTEM = (
     'Use the current stage and observation; never skip stages or claim success '
     'from a queued action. Source edits require the exact editable path/hash. '
     'Design and optimisation require real retrospective and KDB evidence. '
+    'Read results appear in the next host snapshot as executed observations. '
+    'Use current_skill_content for already-read skills; use read_context when '
+    'content is paged. Do not repeat a completed read because its native receipt was queued. '
     'Select exactly one typed host action per turn.'
 )
 
@@ -73,6 +77,101 @@ class EvidenceTool:
             object.__setattr__(self, 'stages', tuple(Stage(stage) for stage in self.stages))
 
 
+class WorkflowContextRecords(ContextRecords):
+    """Canonical projection: current completed reads are usable without paging.
+
+    Histories retain the existing record/page mechanism. Only actual host-returned
+    text is inlined, within fixed per-result and complete-snapshot byte bounds.
+    """
+    def snapshot(self, context, *, target=24576):
+        result = super().snapshot(context, target=target)
+        original, projected = context.get('host', {}), result.get('host', {})
+        observation = original.get('observation')
+        if isinstance(observation, dict) and observation.get('executed') is True:
+            for key, limit in (('content', 4096), ('summary', 2048)):
+                value = observation.get(key)
+                if value is None or len(encoded(value)) > limit:
+                    continue
+                old = projected['observation'].get(key)
+                projected['observation'][key] = value
+                if len(encoded(result)) > target:
+                    projected['observation'][key] = old
+        latest = {}
+        for row in original.get('read_skills', []):
+            if row.get('section') is None:
+                latest[row['skill']] = dict(receipt_id=row['receipt_id'], content=row['content'])
+        visible = {}
+        projected['current_skill_content'] = visible
+        for name, row in reversed(list(latest.items())):
+            if len(encoded(row)) > 4096:
+                continue
+            visible[name] = row
+            if len(encoded(visible)) > 4096 or len(encoded(result)) > target:
+                del visible[name]
+        if len(encoded(result)) > target:
+            projected.pop('current_skill_content', None)
+        return result
+
+
+class SkillDelivery:
+    """Evidence that actual forwarded requests contained complete skill bytes."""
+    def __init__(self):
+        self.operation = None
+        self.expected, self.delivered, self.pages = {}, set(), {}
+
+    def begin(self, operation):
+        if operation != self.operation:
+            self.operation = operation
+            self.expected, self.delivered, self.pages = {}, set(), {}
+
+    def expect(self, reference, content):
+        self.expected[reference] = content
+
+    def observe(self, request, record):
+        strings, pages = [], []
+        def visit(value):
+            if isinstance(value, str):
+                strings.append(value)
+                if value.startswith(('{', '[')):
+                    try:
+                        visit(json.loads(value))
+                    except ValueError:
+                        pass
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                if {'record', 'offset', 'text'} <= value.keys():
+                    pages.append(value)
+                for item in value.values():
+                    visit(item)
+        visit(request.get('messages', request.get('input', [])))
+        for reference, content in self.expected.items():
+            if reference in self.delivered:
+                continue
+            raw, digest = content.encode(), sha256(content.encode()).hexdigest()
+            spans = self.pages.setdefault(digest, [])
+            for page in pages:
+                offset, text = page['offset'], page['text']
+                if page['record'] != digest or type(offset) is not int or offset < 0 or not isinstance(text, str):
+                    continue
+                fragment = text.encode()
+                if raw[offset:offset+len(fragment)] == fragment:
+                    spans.append((offset, offset+len(fragment)))
+            boundary = 0
+            for start, end in sorted(spans):
+                if start > boundary:
+                    break
+                boundary = max(boundary, end)
+            if any(content in text for text in strings) or boundary >= len(raw):
+                self.delivered.add(reference)
+                record('skill-delivered', dict(receipt_id=reference, content_hash=digest))
+
+    def missing(self, references):
+        return [dict(receipt_id=ref, content=self.expected[ref])
+                for ref in dict.fromkeys(references) if ref not in self.delivered]
+
+
 class PiSessionAdapter:
     """Reuse Pi's schemas, loopback gateway, context paging and exact edits.
 
@@ -81,8 +180,25 @@ class PiSessionAdapter:
     only afterward from the remaining charged allocation.
     """
     def __init__(self, **kwargs):
+        kwargs.setdefault('context_factory', WorkflowContextRecords)
+        self.delivery = SkillDelivery()
         self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
                                        first_action_only=True, **kwargs)
+        self.session.gateway.request_projector = self._project_tools
+
+    def _project_tools(self, request, **_kwargs):
+        # Keep the provider-visible and host-validated perform schema identical.
+        for tool in request.get('tools', []):
+            function = tool.get('function', tool)
+            if function.get('name') == 'perform':
+                function['parameters'] = self.session.schemas['perform']
+        return request
+
+    def expect_read(self, reference, content):
+        self.delivery.expect(reference, content)
+
+    def missing_reads(self, references):
+        return self.delivery.missing(references)
 
     def prepare(self, timeout, *, schemas):
         session = self.session
@@ -110,6 +226,13 @@ class PiSessionAdapter:
 
     def next_action(self, context, allowed, *, seconds, record, source):
         session = self.session
+        self.delivery.begin(context.get('operation_id'))
+        mutable = Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)
+        session.schemas['perform'] = SCHEMAS['perform'] if mutable else obj({'proposal': STRING})
+        def observed(kind, data):
+            if kind == 'pi-provider-request':
+                self.delivery.observe(data['request'], record)
+            record(kind, data)
         # threading's maximum is a technical RPC bound, not a workflow budget.
         session.deadline = time.monotonic() + (threading.TIMEOUT_MAX if seconds is None else seconds)
         session.gateway.deadline = session.deadline
@@ -118,7 +241,7 @@ class PiSessionAdapter:
                 and Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)):
             write = lambda text: ('perform', {'proposal': 'Apply exact source edit',
                 'edit': {'path': source.path, 'sha256': source.sha256, 'source': text}})
-        return session.next_action(context, allowed, record=record,
+        return session.next_action(context, allowed, record=observed,
             source=source.text if source else None, write_action=write)
 
     def close(self):
@@ -303,6 +426,8 @@ class WorkflowActor:
                     # A section read is genuine evidence, but does not replace the
                     # required full step contract. Return it without inventing reads.
                     reference = self._read_reference(usage)
+                    if hasattr(self.session, 'expect_read'):
+                        self.session.expect_read(reference, text)
                     refs.append(reference)
                     read_material.append(dict(skill=args['name'], section=args.get('section'),
                         content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id']))
@@ -312,12 +437,16 @@ class WorkflowActor:
                             section=args.get('section'), receipt_id=reference)
                     if args.get('section') is None:
                         read_names.add(args['name'])
-                    observation = dict(content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
+                    observation = dict(action='read_skill', executed=True, status='completed',
+                        skill=args['name'], section=args.get('section'), content=text,
+                        receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
                     seconds = self._available()
                     observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
                         stage, args, operation, seconds))
+                    observation = (dict(observation, action=name, executed=True) if isinstance(observation, dict)
+                                   else dict(result=observation, action=name, executed=True))
                     material = {'name': name, 'result': observation}
                     evidence_material.append(material)
                     if isinstance(observation, dict) and isinstance(observation.get('reference'), str):
@@ -326,12 +455,24 @@ class WorkflowActor:
                             evidence_summaries[name] = observation['summary']
                     record('evidence-tool-result', material)
                     continue
+                if hasattr(self.session, 'missing_reads'):
+                    missing = self.session.missing_reads(refs)
+                    if missing:
+                        observation = dict(event='skill-delivery-required', accepted=False,
+                            reads={row['receipt_id']:dict(content=row['content']) for row in missing})
+                        record('skill-delivery-required', observation)
+                        continue
                 if 'edit' in args:
                     edit = args['edit']
                     if (stage not in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)
                             or source is None or edit['path'] != source.path
                             or edit['sha256'] != source.sha256):
-                        raise WorkflowError('source edit is unavailable or stale')
+                        error = 'source edit is unavailable or stale'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', error=error, accepted=False, allowed=list(allowed))
+                        record('actor-invalid-action', observation)
+                        continue
                 seconds = self._available()
                 if stage in (Stage.TEST, Stage.VALIDATION):
                     if self.managed_executions:
