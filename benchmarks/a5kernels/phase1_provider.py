@@ -446,7 +446,7 @@ class DirectActorDriver:
     def __init__(
         self, provider: DirectCompletionProvider, *, max_turns: int = 40, max_seconds: float = 3600, clock=None,
         trace_event: Callable[[str, Mapping[str, object]], None] | None = None,
-        system_prompt: str = _SYSTEM_PROMPT,
+        system_prompt: str = _SYSTEM_PROMPT, canonical=None,
     ):
         from benchmarks.ascend.time_budget import deadline_after
         deadline_after(max_seconds)
@@ -458,6 +458,7 @@ class DirectActorDriver:
             raise TypeError("trace_event must be callable")
         self.trace_event = trace_event
         self.system_prompt = system_prompt
+        self.canonical = canonical
 
     def _trace(self, kind: str, payload: Mapping[str, object]) -> None:
         if self.trace_event is not None:
@@ -466,7 +467,7 @@ class DirectActorDriver:
     def with_trace(self, trace_event):
         """Bind a project-local observer without mutating this shared driver."""
         return type(self)(self.provider, max_turns=self.max_turns, max_seconds=self.max_seconds, clock=self.clock,
-                          trace_event=trace_event, system_prompt=self.system_prompt)
+                          trace_event=trace_event, system_prompt=self.system_prompt, canonical=self.canonical)
 
     def with_time_budget(self, seconds):
         """Bind provider calls to one request without mutating a shared driver."""
@@ -555,74 +556,10 @@ class DirectActorDriver:
     def __call__(self, instruction: str, *, profile: DirectModelProfile,
                  workspace, context, turn_parser: Callable[[str], TrialAction | None],
                  action_executor: Callable[[TrialAction], ActionOutcome]) -> ActorOutcome:
-        recorder = _ProviderEvidenceRecorder(workspace)
-        working = WorkingContext([
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": instruction},
-        ])
-        from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
-        conversation = ActorConversation(workspace, instruction, working, action_executor)
-        for message in working.fixed:
-            self._trace("message", message)
-        tokens, turn = 0, conversation.turn
-        deadline = min(self.clock() + self.max_seconds,
-                       getattr(action_executor, 'deadline', float('inf')))
-        with self._action_session(profile, action_executor, deadline) as session:
-            while self.clock() < deadline:
-                try:
-                    feedback = conversation.boundary()
-                except ActorStopped:
-                    return ActorOutcome('user-stopped', turn, tokens)
-                turn += 1
-                selection = self._select_action(session, working=working, profile=profile,
-                    recorder=recorder, turn=turn, feedback=feedback, action_executor=action_executor,
-                    turn_parser=turn_parser, deadline=deadline)
-                tokens += selection.tokens
-                if selection.exhausted or self.clock() >= deadline:
-                    break
-                recorder.response(selection.text, stage="action", turn=turn)
-                message = {"role": "assistant", "content": selection.text}
-                working.append(message)
-                self._trace("message", message)
-                if conversation.control.pending():
-                    working.append({'role': 'user', 'content':
-                        'The preceding proposed action was not executed because user input arrived.'})
-                    conversation.save(turn)
-                    continue
-                action, outcome = selection.action, None
-                if action is None:
-                    observation = selection.invalid_observation or json.dumps({
-                        "host": {"event": "invalid-action", "required": _ACTION_NUDGE}
-                    }, sort_keys=True, separators=(",", ":"))
-                else:
-                    if hasattr(action_executor, "action_event_turn"):
-                        action_executor.action_event_turn = turn
-                    outcome = action_executor(action)
-                    observation = outcome.observation
-                    self._observed_action(session, action, observation, action_executor)
-                    try:
-                        host = json.loads(observation).get("host", {})
-                    except (AttributeError, json.JSONDecodeError):
-                        host = {}
-                    failed = (host.get("passed") is False or host.get("status") in {"failed", "error"}
-                              or "fail" in str(host.get("event", "")).lower())
-                    self._trace("tool", {"name": action.kind,
-                        "status": "failed" if failed else "observed", "observation": observation})
-                message = {"role": "user", "content": observation}
-                working.append(message)
-                self._trace("message", message)
-                conversation.save(turn)
-                if outcome is not None and outcome.terminal:
-                    self._trace("terminal", {"status": outcome.status,
-                        "admitted_artifacts": dict(outcome.admitted_artifacts)})
-                    retained = self._terminal_context(working, profile)
-                    return ActorOutcome(outcome.status, turn, tokens,
-                        admitted_artifacts=dict(outcome.admitted_artifacts),
-                        continuation=_ActorContinuation(profile, tuple(retained), recorder,
-                                                        working, turn, deadline))
-                recorder.observation(observation, turn=turn)
-        self._trace("terminal", {"status": "time-budget-exhausted"})
-        return ActorOutcome("time-budget-exhausted", turn, tokens)
+        from rsi.domain_execution import require_adoption
+        return require_adoption(self.canonical).run(self, instruction=instruction,
+            profile=profile, workspace=workspace, context=context,
+            turn_parser=turn_parser, action_executor=action_executor)
 
     def distill(
         self,
@@ -631,94 +568,13 @@ class DirectActorDriver:
         admitted_artifacts: Mapping[str, str] | None = None,
         host_summaries: Sequence[Mapping[str, object]] = (),
     ) -> ActorOutcome:
-        """Resume the exact terminal Actor history after all host work completes."""
-
-        continuation = outcome.continuation
-        if (not isinstance(continuation, _ActorContinuation)
-                or outcome.distillation is not None):
-            raise ValueError("Actor outcome is not awaiting terminal distillation")
-        admitted = dict(outcome.admitted_artifacts)
-        if admitted_artifacts is not None:
-            admitted.update(admitted_artifacts)
-        messages = [dict(item) for item in continuation.messages]
-        context = {
-            "admitted_artifacts": admitted,
-            "artifact_payloads": continuation.recorder.bounded_payloads(
-                admitted, max_bytes=self.provider.context_budget(continuation.profile).target // 4,
-            ),
-            "host_summaries": [dict(item) for item in host_summaries[:16]],
-            "terminal_host_observation": continuation.messages[-1]["content"],
-        }
-        if continuation.recorder.enabled:
-            from benchmarks.ascend.agent_presentation import compact_observation
-            context["host_summaries"] = [compact_observation(dict(item), continuation.recorder.artifacts)
-                                         for item in host_summaries[:16]]
-            if request_bytes(context) > self.provider.context_budget(continuation.profile).target // 2:
-                context = compact_observation({"event": "terminal-distillation-context", **context},
-                                              continuation.recorder.artifacts)
-                context["admitted_artifacts"] = admitted
-        messages.append({
-            "role": "user",
-            "content": DISTILLATION_PROMPT + "\n" + json.dumps(
-                context, sort_keys=True, separators=(",", ":")
-            ),
-        })
-        self._trace("message", messages[-1])
-        working = deepcopy(continuation.working_context)
-        # Terminal schema and admitted citation identities must survive repairs:
-        # they are instructions, not history that a work log may fold away.
-        working.pinned.append(dict(messages[-1]))
-        tokens = outcome.tokens or 0
-        deadline = continuation.deadline or self.clock() + self.max_seconds
-        correction = -1
-        while self.clock() < deadline:
-            correction += 1
-            turn = continuation.total_turns + correction + 1
-            messages, summary_tokens = self._prepare_context(
-                working, continuation.profile, continuation.recorder, turn=turn,
-            )
-            tokens += summary_tokens
-            self._request(continuation.recorder,
-                continuation.profile, messages, stage="distillation", turn=turn,
-            )
-            try:
-                completion = self._complete(continuation.recorder, continuation.profile,
-                                            messages, stage="distillation", turn=turn)
-            except InfrastructureFailure as exc:
-                continuation.recorder.failure(
-                    exc, stage="distillation", turn=turn,
-                )
-                return replace(outcome, tokens=tokens)
-            except Exception as exc:
-                continuation.recorder.failure(exc, stage="distillation", turn=turn)
-                raise
-            continuation.recorder.response(
-                completion.text, stage="distillation", turn=turn,
-            )
-            self._trace("message", {"role": "assistant", "content": completion.text})
-            tokens += completion.completion_tokens
-            try:
-                distillation = parse_agent_distillation(completion.text, admitted)
-            except ValueError as exc:
-                if self.clock() >= deadline:
-                    raise
-                messages.extend((
-                    {"role": "assistant", "content": completion.text},
-                    {"role": "user", "content": (
-                        "The previous distillation was invalid: " + str(exc) + ". "
-                        "Correct only the structured distillation JSON. Do not propose "
-                        "or rerun kernel actions."
-                    )},
-                ))
-                working.tail = [dict(message) for message in messages[-2:]]
-                self._trace("message", messages[-1])
-                continue
-            return ActorOutcome(
-                outcome.status, outcome.iterations, tokens, outcome.wall_time_s,
-                completion.text, distillation, admitted, None,
-            )
-        self._trace("terminal", {"status": "distillation-time-budget-exhausted"})
-        return replace(outcome, tokens=tokens)
+        """Use the target binding's retained canonical history and charged clock."""
+        from rsi.domain_execution import require_adoption, CanonicalConfigurationError
+        binding = require_adoption(self.canonical)
+        if not callable(binding.distill):
+            raise CanonicalConfigurationError('canonical target binding lacks terminal distillation')
+        return binding.distill(self, outcome, admitted_artifacts=admitted_artifacts,
+                               host_summaries=host_summaries)
 
 
 __all__ = [

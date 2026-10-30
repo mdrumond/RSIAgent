@@ -190,50 +190,16 @@ class ActorDriver(Protocol):
 class CoreAttemptDriver:
     """Bind a restricted A5 role to ``core.loop.run_attempt``'s opt-in seam."""
 
-    def __init__(self, vm, cfg, sink_factory: Callable[[Path], object]):
+    def __init__(self, vm, cfg, sink_factory: Callable[[Path], object], *, canonical=None):
         self.vm, self.cfg, self.sink_factory = vm, cfg, sink_factory
+        self.canonical = canonical
 
     def __call__(self, instruction: str, *, profile: A5ModelProfile,
                  workspace: Path, context: Path, turn_parser, action_executor) -> ActorOutcome:
-        from core.loop import DomainActionResult, run_attempt
-
-        cfg = copy(self.cfg)
-        cfg.model = profile.model
-        cfg.max_tokens = profile.generation.max_tokens
-        cfg.temperature = profile.generation.temperature
-        cfg.primary_temperature = profile.generation.temperature
-        cfg.retry_temperature = profile.generation.temperature
-        cfg.top_p = profile.generation.top_p
-        cfg.reasoning_effort = profile.generation.reasoning_effort
-        cfg.allow_truncation_retry = profile.generation.allow_truncation_retry
-        cfg.provider_order = (profile.provider,)
-        cfg.provider_allow_fallbacks = profile.allow_fallbacks
-        cfg.provider_require_parameters = profile.require_parameters
-        cfg.independent_verify = False
-        # Core's optional summarizer has its own generation policy. Keep the
-        # complete history so every A5 completion uses the fixed actor route.
-        cfg.history_keep_pairs = 0
-        def execute(action):
-            outcome = action_executor(action)
-            return DomainActionResult(
-                outcome.observation,
-                outcome.terminal,
-                outcome.status,
-                budget_exempt=outcome.budget_exempt,
-            )
-
-        result, _ = run_attempt(
-            instruction, self.vm, cfg, self.sink_factory(context),
-            turn_parser=turn_parser, action_executor=execute,
-            system_prompt=_SYSTEM_PROMPT, instruction_is_complete_opening=True,
-            action_nudge=_ACTION_NUDGE, strict_action_nudge=_ACTION_NUDGE,
-            surface_baseline="",
-        )
-        return ActorOutcome(
-            result.status,
-            result.turns,
-            wall_time_s=result.wall_secs,
-        )
+        from rsi.domain_execution import require_adoption
+        return require_adoption(self.canonical).run(self, instruction=instruction,
+            profile=profile, workspace=workspace, context=context,
+            turn_parser=turn_parser, action_executor=action_executor)
 
 
 _JSON_ACTION_CONTRACT = """Respond with exactly one JSON object:

@@ -227,7 +227,7 @@ class A3TrialLoop:
         timing_dimensions: StudyDimensions | None = None,
         execution_profile: str = "gz-a3",
         infrastructure_attempt_ordinal: int = 0,
-        clock=None,
+        clock=None, canonical=None,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -257,25 +257,11 @@ class A3TrialLoop:
         if timing_dimensions is not None and not isinstance(timing_dimensions, StudyDimensions):
             raise TypeError("timing_dimensions must be StudyDimensions")
         self.timing_dimensions = timing_dimensions
+        self.canonical = canonical
 
     def run(self) -> TrialResult:
-        from benchmarks.ascend.time_budget import AttemptTimeBudget
-        budget = AttemptTimeBudget(self.workdir / "time-budget.json", self.budgets.max_seconds, clock=self.clock)
-        self.deadline = budget.deadline
-        try:
-            bind = getattr(self.actor, "bind_host", None)
-            if bind is not None:
-                bind(lambda kind, payload: self.evidence.append(EvidenceKind.ARTIFACT,
-                     self._identity({"pi_event": kind, "data": payload})),
-                     replace(self.budgets, max_seconds=max(0.001, self.deadline-self.clock())))
-            from benchmarks.ascend.execution import process_deadline
-            with process_deadline(time.monotonic() + max(0, self.deadline-self.clock())):
-                return self._run()
-        finally:
-            budget.close()
-            close = getattr(self.actor, "close", None)
-            if close is not None:
-                close()
+        from rsi.domain_execution import require_adoption
+        return require_adoption(self.canonical).run(self)
 
     def _run(self) -> TrialResult:
         source = None
