@@ -726,8 +726,38 @@ def test_generated_paths_flow_through_service_and_preserve_actual_verification(i
         cycle.close()
 
 
-def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trace(instance):
+def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trace(instance, monkeypatch):
     from rsi.roles import SkillEdit
+    from rsi.project_runner import ProjectRunner
+    import rsi.services as service_module
+
+    class Clock:
+        # Keep actual command elapsed/receipts valid in the host clock domain;
+        # only the scripted incumbent's thinking interval jumps explicitly.
+        offset = 0.0
+        def __call__(self):
+            return time.time() + self.offset
+        def advance(self, seconds):
+            self.offset += seconds
+    clock = Clock()
+
+    class ClockedRunner(ProjectRunner):
+        @classmethod
+        def create(cls, *args, **kwargs):
+            return super().create(*args, **dict(kwargs, clock=clock))
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **dict(kwargs, clock=clock))
+    # Inject at the existing public runner clock boundary for BOTH create/open.
+    # The real backend still runs and verifies all declared Python commands.
+    monkeypatch.setattr(service_module, 'ProjectRunner', ClockedRunner)
+
+    class ExhaustThinking(Decisions):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'design' and any(
+                    row['name'] == 'query_kdb' for row in context['evidence']):
+                clock.advance(kwargs['seconds'] + .02)
+            return super().next_action(context, allowed, **kwargs)
+
     class Writer(Roles):
         def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
             now = time.monotonic()
@@ -738,13 +768,16 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
                 (evidence[0].evidence_id,), (SkillEdit('design', 'replace',
                     builtin_bundle().document('design').read('learned-guidance') +
                     '\nReview retained evidence promptly and preserve time for execution/verification.'),))
-    sessions = iter([ClosedBudgetAfterQuery(), ClosedBudgetAfterQuery(), Decisions()])
+    sessions = iter([ExhaustThinking(), ExhaustThinking(), Decisions()])
     instance.test = Bindings(instance.test.query, lambda: next(sessions), Writer, instance.test.identity)
     config = show_configuration(instance.root)['payload']
     config['recovery']['enabled'] = True
-    config['phase2_projects'][0]['budgets']['actor_seconds'] = 1.0
+    # This tests failure-proof/pair wiring, not CPU speed. Each arm gets the
+    # same generous real child-command envelope; incumbent exhaustion is an
+    # explicit clock advance, never a long sleep or a tiny host-speed deadline.
+    config['phase2_projects'][0]['budgets'].update(actor_seconds=600, wall_seconds=None)
     config['recovery']['budgets'] = BudgetLimits(design_iterations=6, implementation_iterations=6,
-        execution_tries=20, actor_seconds=6).to_dict()
+        execution_tries=20, actor_seconds=1200).to_dict()
     config['tuning'].update(every_projects=None, at_wave_end=False)
     set_configuration(instance.root, config)
     cycle = instance.create_cycle('paired-failed', 'phase2')
@@ -766,6 +799,9 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
         assert comparison['arms']['incumbent']['outcome'] == 'failed'
         assert comparison['arms']['incumbent']['workflow'] is False
         assert comparison['arms']['candidate']['outcome'] == 'accepted'
+        assert pair.frozen['allocation']['actor_seconds'] == 600
+        assert comparison['arms']['incumbent']['actor_seconds'] > 600
+        assert comparison['arms']['candidate']['actor_seconds'] < 600
         assert pair.frozen['terminal_failure_ref']
         assert cycle.store.read_json(pair.frozen['original_workflow_ref']) == frozen_failed
         assert cycle.learning.active == cycle.scheduler.state['skills'] == pair.frozen['candidate']
