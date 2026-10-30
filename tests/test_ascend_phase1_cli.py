@@ -16,8 +16,11 @@ def test_a5_selection_delegates_exact_legacy_arguments():
     assert calls == [["report", "--root", "existing"]]
 
 
+@pytest.mark.parametrize("knowledge_mode", ["without-kdb", "with-kdb"])
 @pytest.mark.parametrize("sync_performance", [False, True])
-def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys, sync_performance):
+def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys, sync_performance, knowledge_mode, monkeypatch):
+    from canonical_a3_fixtures import install_native_kernel, native_knowledge_config, embedding_factory
+    sessions = install_native_kernel(monkeypatch, baseline_root=tmp_path, revise=sync_performance)
     guide = tmp_path / "guide.md"
     guide.write_text("Native guide; do not use Catlass DSL.")
     memory = tmp_path / "initial.md"
@@ -27,6 +30,7 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         cpl_remote="/tools/cpl-remote", validation_wrapper="/checked/catlass-validation.sh",
         remote_workspace="/owned", physical_device=1,
         environment_identity=dict(cann_version="discovered-cann", profiler_version="discovered-msprof"))
+    config.update(native_knowledge_config(tmp_path))
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     root = tmp_path / "campaign"
@@ -60,12 +64,6 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
                         artifact_payloads={digest: raw}, evidence_sha256=digest)
 
     source = 'extern "C" __global__ __aicore__ void project_kernel(GM_ADDR gm_input0, GM_ADDR gm_output) {}'
-    actions = [json.dumps({"write": {"slot": "kernel", "content": source}}),
-               '{"compile":{}}', '{"run":{}}', '{"request-profile":{}}']
-    if sync_performance:
-        actions += [json.dumps({"write": {"slot": "kernel", "content": source + " // variant"}}),
-                    '{"run":{}}', '{"request-profile":{}}']
-    actions = iter([*actions, '{"submit":{}}'])
     def provider(**kwargs):
         messages = kwargs["request"]["messages"]
         if "Curriculum Agent" in messages[0]["content"]:
@@ -82,15 +80,23 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         elif "Distill only" in messages[0]["content"] or "Distill only" in messages[-1]["content"]:
             text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
         else:
-            text = next(actions)
+            pytest.fail("kernel decisions escaped the canonical session factory")
         return DirectCompletion(text, 1)
 
     main(["--target", "a3", "run", "--root", str(root), "--objective", "Learn native copy profiling",
           "--initial-memory", str(memory), "--config", str(config_path), "--model", "openai/gpt-5.6-sol",
-          "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance",
+          "--knowledge", knowledge_mode, "--profiling", "without-profiling-guidance",
           "--project-target", "1", "--max-seconds", "300"],
          transport_factory=Transport, provider_transport=provider, measurement_factory=Measurements,
+         embedding_factory=embedding_factory,
          environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
+    assert sessions and all(session.contexts for session in sessions)
+    for session in sessions:
+        host = session.runner.backend.host
+        experience_dispatches = [row for row in host.observations if row['action'] == 'query-knowledge']
+        assert bool(experience_dispatches) == (knowledge_mode == 'with-kdb')
+        assert (host.control_root / 'baseline-queries.jsonl').is_file()
+
     assert events.index("probe-run") < events.index("run")
     assert "profile" in events
     assert events.index("run") < events.index("profile")
@@ -99,15 +105,23 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         import hashlib
         store = ContentAddressedArtifacts(root / "waves/wave-001/branches/profile-copy/artifacts")
-        payloads = [json.loads(path.read_bytes()) for path in store.objects.glob("*/*")
-                    if path.read_bytes().startswith(b'{')]
-        assert {hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")} <= {
-            row.get("candidate_sha256") for row in payloads}
+        profiling_receipts = [store.read_json(digest)
+            for session in sessions
+            for digest, role in session.runner.backend.host.actions.admitted.items()
+            if role in {"profiling", "comparison-profiling"}]
+        source_bound_profiles = [row for row in profiling_receipts if "candidate_sha256" in row]
+        assert len(source_bound_profiles) == 2
+        assert all(row["summary"]["actual_metric"] == "PipeUtilization" for row in source_bound_profiles)
+        assert {row["candidate_sha256"] for row in source_bound_profiles} == {
+            hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")}
     identity = json.loads((root / "campaign-identity.json").read_text())
     assert identity["language"] == "ascend-c"
     assert identity["runtime_budget"] == {"policy": "elapsed-time-v1", "max_seconds": 300}
     assert "discovered-a3" in (root / "campaign-identity.json").read_text()
-    assert "CATLASS" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert report["successful_projects"] == 1 and report["published_projects"] == ["profile-copy"]
+    assert "CATLASS" not in output
 
 
 def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
