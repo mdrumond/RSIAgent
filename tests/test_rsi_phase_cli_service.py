@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from test_rsi_services import instance as bound_instance
 from rsi import jobs
 from rsi.cli import main
@@ -36,6 +38,7 @@ def test_cli_owned_job_seeds_accepted_parent_with_current_curriculum(bound_insta
     import rsi.instance_dispatch
     monkeypatch.setattr(rsi.instance_dispatch, 'launch_context',
         lambda instance, **kwargs: (instance, source, sys.executable, dict(os.environ)))
+    fixture_dependencies = str(Path(pytest.__file__).parent.parent)
     original_popen = subprocess.Popen
     children = []
     # Only the explicit provider/session test seam is injected in the real child.
@@ -43,22 +46,24 @@ def test_cli_owned_job_seeds_accepted_parent_with_current_curriculum(bound_insta
     program = r'''
 import sys
 from pathlib import Path
+# -I stays enabled; import the existing scripted fixture's explicit test dependencies.
+sys.path.insert(0, sys.argv[3])
 sys.path.insert(0, sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 from test_rsi_services import Bindings, Decisions, Roles
 from rsi.services import InstanceServices
 import rsi.service as service
-instance = InstanceServices(Path(sys.argv[3]), environment={}, test_bindings=Bindings(
+instance = InstanceServices(Path(sys.argv[4]), environment={}, test_bindings=Bindings(
     lambda _: dict(results=[], negative_records=[], provenance={'test': True}),
     Decisions, Roles, 'explicit-test-binding'))
 service.InstanceServices = lambda _: instance
 from rsi.job_worker import main
-sys.argv = ['worker', *sys.argv[3:6]]
+sys.argv = ['worker', *sys.argv[4:7]]
 main()
 '''
     def worker(argv, **kwargs):
         child = original_popen([sys.executable, '-I', '-c', program,
-            str(source), str(tests), *argv[-3:]], **kwargs)
+            str(source), str(tests), fixture_dependencies, *argv[-3:]], **kwargs)
         children.append(child)
         return child
     monkeypatch.setattr(subprocess, 'Popen', worker)
