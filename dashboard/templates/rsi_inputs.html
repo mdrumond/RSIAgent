@@ -4,6 +4,7 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='rsi_inputs.css') }}">
 <section id="rsi-inputs" data-enabled="{{ 'true' if enabled else 'false' }}">
 <h1>RSI inputs</h1>
+<p><a href="{{ url_for('rsi_execution_page') }}">Run phases, inference and inspect retained jobs</a></p>
 <p>Edit the inputs for future projects. Running projects keep their existing settings.</p>
 {% if not enabled %}<p>Read-only view. Editing is disabled.</p>{% endif %}
 <p id="input-status" role="status" aria-live="polite">Loading settings…</p>
