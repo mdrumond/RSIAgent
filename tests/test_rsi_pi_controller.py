@@ -80,6 +80,7 @@ def test_native_completed_tools_keep_conversation_and_main_thread(monkeypatch, t
 
 def test_native_compaction_runs_through_same_gateway_without_context_rewrite(monkeypatch,tmp_path):
     events, requests, recalls, summaries = [], [], [], []
+    visible_receipts = []
     names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
     def provider(*_, **kwargs):
         request=json.loads(kwargs['data']);requests.append(request)
@@ -87,6 +88,15 @@ def test_native_compaction_runs_through_same_gateway_without_context_rewrite(mon
         if not request.get('tools'):
             summaries.append(request)
             return response([],len(requests),tokens=len(kwargs['data'])//4)
+        for message in request['messages']:
+            if message['role'] != 'tool':
+                continue
+            result = json.loads(message['content'])
+            observation = result['observation']
+            if observation.get('action') == 'recall':
+                reference = observation['reference']
+                assert {'name': 'recall', 'reference': reference} in result['state']['evidence_receipts']
+                visible_receipts.append(reference)
         read=[row['skill'] for kind,row in events if kind=='skill-usage' and row['kind']=='read'
               and row['stage']==Stage.TASK_CONSTRUCTION.value]
         missing=[name for name in names if name not in read]
@@ -105,7 +115,7 @@ def test_native_compaction_runs_through_same_gateway_without_context_rewrite(mon
         actor.step({'goal':'force Pi native compaction'})
         actor.step({'goal':'force Pi native compaction'})
     finally:actor.close()
-    assert summaries and len(recalls)==9 and flow.stage==Stage.DESIGN
+    assert summaries and visible_receipts and len(recalls)==9 and flow.stage==Stage.DESIGN
     assert any(kind=='pi-event' and row['event']['type']=='compaction_end' and not row['event'].get('aborted') for kind,row in events), [row['event'] for kind,row in events if kind=='pi-event' and 'compact' in row['event']['type']]
     assert len([row for kind,row in events if kind=='pi-provider-request'])==len(requests)
     assert any('retained evidence' in json.dumps(request) for request in summaries)
