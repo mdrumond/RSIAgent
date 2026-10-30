@@ -1,0 +1,247 @@
+"""Actual CPU controllers with explicitly injected model decisions only."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+import pytest
+
+from benchmarks.a5kernels.knowledge import KnowledgeDB
+from rsi.configuration import set_configuration, show_configuration
+from rsi.contracts import BudgetLimits, ProjectSpec, Stage
+from rsi.roles import CurriculumProposal, SkillProposal
+from rsi.services import InstanceServices, TestBindings as Bindings
+from rsi.skills import builtin_bundle
+
+
+class Embedding:
+    model, revision = 'TEST', '1'
+    def embed(self, texts):
+        return [[1., 0.] for _ in texts]
+
+
+class Decisions:
+    calls = 0
+    tasks = []
+    def prepare(self, timeout, *, schemas):
+        pass
+    def next_action(self, context, allowed, **kwargs):
+        type(self).calls += 1
+        type(self).tasks.append(context['task'])
+        for skill in context['skills']:
+            if skill not in {r['skill'] for r in context['read_skills']}:
+                return 'read_skill', {'name': skill}
+        evidence = {r['name']: r['result'] for r in context['evidence']}
+        if Stage(context['stage']) in (Stage.DESIGN, Stage.OPTIMISATION):
+            if 'query_kdb' not in evidence:
+                return 'query_kdb', {'query': 'safe numeric computation'}
+            if 'retrospect' not in evidence:
+                return 'retrospect', {'supplement': 'Use retained independent correctness checks'}
+            if 'select_strategy' not in evidence:
+                return 'select_strategy', dict(proposal='Preserve verified result',
+                    query_ref=evidence['query_kdb']['reference'],
+                    retrospective_ref=evidence['retrospect']['reference'],
+                    skill_refs=[r['receipt_id'] for r in context['read_skills']], decisions=[])
+            if context['stage'] == 'optimisation' and 'optimisation_decision' not in evidence:
+                return 'optimisation_decision', dict(action='noop', reason='Correctness before speed')
+        return 'perform', {'proposal': 'Preserve verified result'}
+    def close(self):
+        pass
+
+
+class Roles:
+    prompts = []
+    def __init__(self, observer):
+        self.observer = observer
+    def skillwriter(self, prompt, evidence, *, deadline):
+        type(self).prompts.append(prompt)
+        self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=0.25))
+        return SkillProposal('No supported changes', (evidence[0].evidence_id,), ())
+    def curriculum(self, prompt, evidence, *, deadline):
+        type(self).prompts.append(prompt)
+        self.observer('role_finished', dict(role='curriculum', success=True, elapsed_seconds=0.125))
+        return CurriculumProposal('Retain configured host cases', (evidence[0].evidence_id,), ())
+
+
+@pytest.fixture
+def instance(tmp_path):
+    root = tmp_path / 'instance'
+    for name in ('config', 'skills', 'memory', 'source', 'runs'):
+        (root / name).mkdir(parents=True)
+    (root / 'source/solution.py').write_text('answer = 42\n')
+    (root / 'verify.py').write_text("import runpy\nassert runpy.run_path('solution.py')['answer'] == 42\n")
+    db = KnowledgeDB(root / 'memory/knowledge.sqlite3', Embedding())
+    db.close()
+    bundle = builtin_bundle()
+    for doc in bundle.documents:
+        path = root / 'skills' / doc.name / 'SKILL.md'
+        path.parent.mkdir()
+        path.write_text(doc.content)
+    (root / 'config/skill-map.json').write_text(json.dumps(
+        {stage.value: list(names) for stage, names in bundle.mapping}))
+    config = dict(kdb='memory/knowledge.sqlite3', skills='skills', skill_map='config/skill-map.json',
+                  machinery='machinery', dashboard={})
+    (root / 'config/instance.json').write_text(json.dumps(config))
+    checksum = hashlib.sha256((root / config['kdb']).read_bytes()).hexdigest()
+    (root / 'instance.json').write_text(json.dumps({'files': {config['kdb']: checksum}}))
+    command = (sys.executable, '{verifier}')
+    project = ProjectSpec('answer', 'Compute correct answer', command,
+                          budgets=BudgetLimits(actor_seconds=30, wall_seconds=60))
+    config.update(phase1_projects=[project.to_dict()], phase2_projects=[project.to_dict()],
+        project_configs={'answer': dict(source='source', verifier='verify.py',
+            commands=dict(compile=[sys.executable, '-m', 'py_compile', 'solution.py'],
+                          test=list(command), validation=list(command)))},
+        prompts=dict(actor='actor-steering', curriculum='curriculum-steering',
+                     waves='waves-steering', skillwriter='writer-steering'),
+        recovery={'enabled': False})
+    set_configuration(root, config)
+    services = InstanceServices(root, environment={}, test_bindings=Bindings(
+        lambda _: dict(results=[], negative_records=[], provenance={'test': True}),
+        Decisions, Roles, 'explicit-test-binding'))
+    Decisions.calls, Decisions.tasks, Roles.prompts = 0, [], []
+    return services
+
+
+def test_phase1_runs_real_host_validation_retains_usage_and_freezes_config(instance):
+    cycle = instance.create_cycle('first', 'phase1')
+    frozen = cycle.spec.configuration_ref
+    edited = show_configuration(instance.root)['payload']
+    edited['prompts']['actor'] = 'later-steering'
+    set_configuration(instance.root, edited)
+    try:
+        result = cycle.controller.step()
+        assert result.outcome == 'accepted'
+        row = cycle.scheduler.state['originals'][0]
+        packet = cycle.load_project(row)
+        assert packet['outcome'] == 'accepted' and packet['queries']
+        assert any(r['kind'] == 'read' for r in packet['usage'])
+        assert all(task['configuration_ref'] == frozen for task in Decisions.tasks)
+        assert all(task['user_guidance']['actor'] == 'actor-steering' for task in Decisions.tasks)
+        cycle.controller.step()  # Phase1 wave memory only.
+        assert cycle.memory.records()[0]['proposal']['kind'] == 'correctness'
+        assert not Roles.prompts
+    finally:
+        cycle.close()
+    later = instance.create_cycle('later', 'phase1')
+    try:
+        assert later.config['prompts']['actor'] == 'later-steering'
+    finally:
+        later.close()
+
+
+def test_phase2_writer_uses_real_observer_elapsed_and_keeps_incumbent(instance):
+    cycle = instance.create_cycle('second', 'phase2')
+    try:
+        incumbent = cycle.scheduler.state['skills']
+        cycle.controller.step()
+        cycle.controller.step()  # Memory.
+        cycle.controller.step()  # Typed writer.
+        assert cycle.scheduler.state['spent'] >= .25
+        assert cycle.role_elapsed(cycle.scheduler.state['candidates'][0]['operation_id']) == .25
+        assert Roles.prompts and cycle.config['prompts']['skillwriter'] in Roles.prompts[-1]
+        assert cycle.config['prompts']['curriculum'] in Roles.prompts[-1]
+        assert cycle.config['prompts']['waves'] in Roles.prompts[-1]
+        cycle.controller.step()  # No independent success cases => no fabricated promotion.
+        assert cycle.scheduler.state['skills'] == incumbent
+        assert cycle.learning.active == incumbent
+    finally:
+        cycle.close()
+
+
+def test_inference_mutable_heads_are_separate_and_reopen_uses_frozen_settings(instance):
+    cycle = instance.create_cycle('inference', 'inference')
+    try:
+        parent = cycle.memory.root
+        receipt = cycle.controller.step()
+        receipt.verify()
+        assert cycle.memory.root != parent
+        cycle.controller.step()
+        cycle.controller.step()
+        assert cycle.memory.records()
+        assert not json.loads((parent / 'active.json').read_text())['active']
+    finally:
+        cycle.close()
+    reopened = instance.open_cycle('inference')
+    try:
+        assert reopened.memory.root == Path(receipt.branch_root) / 'memory'
+    finally:
+        reopened.close()
+
+
+def test_baseline_corruption_and_backend_substitution_are_rejected(instance):
+    cycle = instance.create_cycle('safe', 'phase1')
+    cycle.close()
+    with pytest.raises(ValueError, match='backend binding'):
+        InstanceServices(instance.root, environment={}).open_cycle('safe')
+    with (instance.root / 'memory/knowledge.sqlite3').open('ab') as stream:
+        stream.write(b'changed')
+    with pytest.raises(ValueError, match='checksum'):
+        instance.create_cycle('bad', 'phase1')
+    assert not (instance.root / 'runs/bad').exists()
+
+
+def test_unknown_work_is_not_replayed_and_status_does_not_dispatch(instance):
+    cycle = instance.create_cycle('pending', 'phase1')
+    def fail(*args):
+        raise RuntimeError('provider work unknown')
+    cycle.scheduler.runner = fail
+    with pytest.raises(RuntimeError):
+        cycle.controller.step()
+    pending = cycle.scheduler.state['pending']['id']
+    cycle.close()
+    before = Decisions.calls
+    status = instance.status('pending')
+    assert status['cycle.json']['pending']['id'] == pending
+    reopened = instance.open_cycle('pending')
+    try:
+        with pytest.raises(Exception, match='reconciliation'):
+            reopened.controller.step()
+        assert Decisions.calls == before
+    finally:
+        reopened.close()
+
+
+def test_role_curriculum_receives_frozen_guidance_and_no_setup_wallcharge(instance):
+    cycle = instance.create_cycle('ideas', 'phase1')
+    try:
+        proposal = cycle.propose_curriculum(operation_id='ideas-op', deadline=time.monotonic() + 10)
+        assert proposal.evidence_ids == (cycle.spec.configuration_ref,)
+        assert json.loads(Roles.prompts[-1]) == {
+            'curriculum': cycle.config['prompts']['curriculum'],
+            'waves': cycle.config['prompts']['waves']}
+        assert cycle.role_elapsed('ideas-op') == .125
+        with pytest.raises(ValueError, match='finished'):
+            cycle.role_elapsed('missing')
+    finally:
+        cycle.close()
+
+
+def test_production_embedding_load_failure_never_becomes_empty_success(instance, monkeypatch):
+    from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+    instance.test = None
+    cycle = instance.create_cycle('production-kdb', 'phase1')
+    def unavailable(self):
+        raise RuntimeError('pinned embedding cache unavailable')
+    monkeypatch.setattr(PinnedBGEEmbeddings, '_load', unavailable)
+    try:
+        with pytest.raises(RuntimeError, match='cache unavailable'):
+            cycle.query(cycle.spec.baseline_kdb)
+        assert cycle.database is None
+    finally:
+        cycle.close()
+
+
+def test_global_caps_and_configured_public_command_are_enforced(instance):
+    config = show_configuration(instance.root)['payload']
+    config['budgets']['actor_seconds'] = 5
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('bounded', 'phase1')
+    try:
+        assert cycle.spec.projects[0].budgets.actor_seconds == 5
+    finally:
+        cycle.close()
+    config['project_configs']['answer']['commands']['test'] = ['unrelated-command']
+    set_configuration(instance.root, config)
+    with pytest.raises(ValueError, match='command must equal'):
+        instance.create_cycle('mismatched', 'phase1')
