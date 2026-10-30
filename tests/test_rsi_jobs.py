@@ -298,6 +298,25 @@ def test_abandoned_startup_is_interrupted_without_mutating_or_replaying(instance
     assert json.loads(jobs._path(instance / 'runs/jobs', identity).read_text()) == original
 
 
+def test_revisit_startup_lock_does_not_resurrect_superseded_launch(instance, held_startup):
+    replacement, active, _ = held_startup
+    predecessor, original = record(instance, state='launching')
+    active['request'].update(action='revisit', previous_job=predecessor)
+    directory = instance / 'runs/jobs'
+    _publish(jobs._path(directory, replacement), _bytes(active))
+
+    assert jobs.status(instance, predecessor)['state'] == 'interrupted'
+    assert jobs.status(instance, replacement)['state'] == 'launching'
+    observed = {row['job_id']: row for row in jobs.list_jobs(instance)}
+    assert observed[predecessor]['state'] == 'interrupted'
+    assert observed[replacement]['process'] is None
+    jobs.stop(instance, predecessor)
+    assert (directory / f'{predecessor}.stop').exists()
+    assert not (directory / f'{replacement}.stop').exists()
+    assert jobs.status(instance, replacement)['state'] == 'launching'
+    assert json.loads(jobs._path(directory, predecessor).read_text()) == original
+
+
 def test_new_dispatch_lock_cannot_hide_an_abandoned_launch(instance, monkeypatch):
     from types import SimpleNamespace
     identity, _ = record(instance, state='launching')
