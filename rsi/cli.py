@@ -8,6 +8,9 @@ import subprocess
 from .configuration import list_folders, set_configuration, show_configuration
 from .contracts import CycleSpec, ProjectSpec
 from .instances import create_instance, inspect_instance
+from .job_cli import register as register_jobs, execute as execute_jobs
+from .cli_evidence import register as register_evidence
+from .cli_skills import register as register_skills, execute as execute_skills
 
 
 def register_configuration_commands(commands):
@@ -29,6 +32,10 @@ def main(argv=None):
     parser.add_argument("--instance", type=Path, help="independent RSI instance directory")
     commands = parser.add_subparsers(dest="command", required=True)
     register_configuration_commands(commands)
+    register_jobs(commands)
+    register_evidence(commands)
+    register_skills(commands)
+    commands.add_parser("capabilities", help="discover supported instance interfaces")
     validate = commands.add_parser("validate-spec", help="validate and normalise a JSON specification")
     validate.add_argument("path", type=Path)
     validate.add_argument("--kind", choices=("cycle", "project"), default="cycle")
@@ -46,6 +53,24 @@ def main(argv=None):
     inspect.add_argument("path", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.instance is not None:
+            from .pinned_cli import dispatch
+            result = dispatch(args.instance, list(sys.argv[1:] if argv is None else argv))
+            if result is not None:
+                return result
+        if args.command == "capabilities":
+            print(json.dumps(dict(manual_tuning=True, skill_content_editing=True,
+                                  skill_map_editing=True, job_accounting=True)))
+            return 0
+        if args.command == "skills":
+            print(json.dumps(execute_skills(args), indent=2, allow_nan=False))
+            return 0
+        if hasattr(args, "evidence_handler"):
+            print(json.dumps(args.evidence_handler(args), indent=2, allow_nan=False))
+            return 0
+        if args.command in ("phase1", "phase2", "inference", "job"):
+            print(json.dumps(execute_jobs(args), indent=2, allow_nan=False))
+            return 0
         if args.command in ("config", "folders"):
             if args.command == "folders":
                 result = list_folders(args.instance, args.path)
