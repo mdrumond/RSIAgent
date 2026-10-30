@@ -1113,6 +1113,10 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
                           test_backend=test_backend, **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             runner = DomainRunner(root, host, **injections)
+            from rsi.domain_allocations import optimizer_resume_grants
+            if not runner.workflow.outcome and not row['stop_requested']:
+                optimizer_resume_grants(owner, runner)
+                runner.recover_exhausted_admission()
             boundary = runner.workflow.state.pop('domain_boundary', None)
             # JobStore.resume is the public control boundary. Preserve every
             # pending operation/clock row: resume only removes the stop flag;
@@ -1123,6 +1127,8 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
             if boundary or resumed:
                 runner.workflow.resume()
             return runner
+        from rsi.domain_allocations import optimizer_allocation_anchor
+        row, host.allocation_anchor = optimizer_allocation_anchor(owner)
         bundle, limits = baseline_contract(owner, max(0.001, row['max_seconds'] - row['elapsed_seconds']))
         return DomainRunner.create(root, ProjectSpec(owner.key, host.instruction, ('optimizer-host',),
             budgets=limits), bundle, host, **injections)

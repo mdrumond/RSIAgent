@@ -15,6 +15,8 @@ def completed_effects(root, store, contract, state, events, backend, test_backen
         raise WorkflowError('native actor or activity remains unobserved')
     pointer = json.loads((root/'domain.json').read_text())
     frozen = store.read_json(contract)
+    from rsi.domain_allocations import check_grants
+    check_grants(state, store, contract, events)
     if (pointer['contract'] != contract or frozen['identity'] != identity
             or frozen['backend_identity'] != backend or frozen.get('test_backend', False) != test_backend
             or frozen['spec']['budgets'] != state['limits']):
