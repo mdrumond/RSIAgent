@@ -345,3 +345,44 @@ def test_other_process_setup_owner_blocks_job_launch_until_failed_receipt_publis
             child.join(5)
     assert child.exitcode == 0
     assert json.loads((root / 'runtime/setup.json').read_text())['state'] == 'failed'
+
+
+@pytest.mark.parametrize('prebound', [False, True])
+def test_dashboard_restart_preserves_user_configuration_and_instance_binding(tmp_path, monkeypatch, prebound):
+    import types
+    import dashboard.app
+    import werkzeug.serving
+    from dashboard.store import dashboard_configuration
+    root = instance(tmp_path)
+    directory = root / 'dashboard'
+    captured = []
+    def app(config, cache):
+        captured.append(dashboard_configuration(config))
+        return object()
+    monkeypatch.setattr(dashboard.app, 'create_app', app)
+    monkeypatch.setattr(werkzeug.serving, 'make_server', lambda *a, **kw: types.SimpleNamespace(
+        server_port=12345, serve_forever=lambda **kw: None, server_close=lambda: None))
+    def restart(identity):
+        (directory / 'process.json').write_text(json.dumps(
+            {'launch_id': identity, 'state': 'launching', 'requested_port': 0}))
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        dashboard_runtime.serve(str(root), identity, str(descriptor))
+        assert json.loads((directory / 'process.json').read_text())['state'] == 'stopped'
+    restart('initial')
+    assert captured[-1]['rsi_instance'] == str(root)
+    # Represent an operator's existing usable configuration; no RSI-to-legacy
+    # campaign conversion is performed by the lifecycle launcher.
+    settings = {'campaigns': [{'id': 'operator-run', 'phase': 1,
+                               'root': str(root / 'retained-campaign')}],
+                'controls': {'enabled': False, 'presets': []}, 'operator_setting': {'refresh': 17}}
+    if prebound:
+        settings['rsi_instance'] = str(root)
+    data = json.dumps(settings, indent=4).encode()
+    config = directory / 'config.json'
+    config.write_bytes(data)
+    restart('again')
+    result = dashboard_configuration(config)
+    assert result == dict(settings, rsi_instance=str(root))
+    assert captured[-1] == result
+    if prebound:
+        assert config.read_bytes() == data

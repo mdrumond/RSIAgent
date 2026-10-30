@@ -683,9 +683,16 @@ class BoundCycle(TuningBindings):
             evaluation = SkillEvaluation(path, artifacts=self.store, runner_factory=self.trial)
             if 'path' not in pending:
                 self.tuning.bind_pending(evaluation)
-            if evaluation.result() is None:
+            result = evaluation.result()
+            if result is not None:
+                return result
+            if any(arm['status'] == 'pending'
+                    for i in range(len(evaluation.plan['pairs']))
+                    for arm in evaluation.pair(i).state['arms'].values()):
                 return evaluation.reconcile()
-            return evaluation.result()
+            # A retained round can be between completed arms. Observation has
+            # nothing to reconcile; the next normal controller step owns dispatch.
+            return None
         if self.controller.state['pending']:
             return self.controller.reconcile()
         pending = self.scheduler.state['pending']

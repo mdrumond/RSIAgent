@@ -11,6 +11,33 @@ from rsi.skills import SkillBundle, builtin_bundle
 from core.artifacts import ContentAddressedArtifacts
 
 
+def test_learning_metadata_uses_shared_contract_and_preserves_valid_bundle():
+    from dataclasses import replace
+    from rsi.learning import _skill_metadata
+    bundle = builtin_bundle()
+    assert _skill_metadata(bundle) is bundle
+    invalid = replace(bundle, documents=(replace(bundle.documents[0], content='No metadata'),
+                                         *bundle.documents[1:]))
+    with pytest.raises(ValueError, match='metadata'):
+        _skill_metadata(invalid)
+
+
+def test_learning_missing_yaml_remains_host_failure_not_proposal_rejection(monkeypatch):
+    import builtins
+    from rsi.learning import ProposalRejected, validate_skill_proposal
+    bundle = builtin_bundle()
+    original_import = builtins.__import__
+    def without_yaml(name, *args, **kwargs):
+        if name == 'yaml':
+            raise ModuleNotFoundError('host YAML unavailable', name='yaml')
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_yaml)
+    wire = {'rationale': 'Retain validated baseline', 'evidence_ids': ['outcome'], 'edits': []}
+    with pytest.raises(ModuleNotFoundError) as caught:
+        validate_skill_proposal(bundle, wire, {'outcome': {'kind': 'correctness'}}, {})
+    assert not isinstance(caught.value, ProposalRejected)
+
+
 @pytest.fixture
 def baseline(tmp_path):
     root = tmp_path / 'instance'
