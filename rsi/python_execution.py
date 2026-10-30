@@ -40,27 +40,74 @@ def atomic_json(path, value):
         os.close(fd)
 
 
-def ingest_elapsed(clock, operation_id, receipt, *, observed_start, observed_end, category):
-    """Map producer monotonic duration into a host observation envelope.
+def ingest_elapsed(clock, operation_id, receipt, *, observed_start, observed_end, category,
+                   observed_execution_start=None, observed_execution_end=None):
+    """Ingest producer duration, never remote epochs (trusted host API).
 
-    The host must retain its envelope with the operation before dispatch and
-    observation. No remote epoch is used. Charging the interval ending at host
-    observation conservatively places unlocated work within that envelope.
-    Duplicate receipts are idempotent; conflicting receipts fail closed.
+    Explicit execution bounds must come from authoritative host observation or
+    a transport's validated clock mapping. Duration-only placement is synthetic:
+    accept it only when overlap-union accounting is independent of placement.
+    Uncertain envelopes persist and block budgeted work until exact reconciliation.
     """
+    key = 'receipt:' + operation_id
     elapsed = receipt.get('elapsed')
     if (type(elapsed) not in (int, float) or not math.isfinite(elapsed)
             or elapsed < 0 or not all(math.isfinite(x) for x in (observed_start, observed_end))
             or observed_end > clock.clock() or observed_end < observed_start
             or elapsed > observed_end - observed_start or category not in clock.BILLABLE):
+        clock.uncertainties[key] = {'error': 'invalid duration or envelope'}
+        clock.save()
         raise WorkflowError('missing or invalid producer duration/observation envelope')
-    interval = [category, observed_end - elapsed, observed_end]
-    key = 'receipt:' + operation_id
-    if key in clock.records:
-        if clock.records[key] != interval:
-            raise WorkflowError('conflicting elapsed receipt')
+    metadata = dict(elapsed=elapsed, envelope=[observed_start, observed_end], category=category)
+    exact = observed_execution_start is not None or observed_execution_end is not None
+    previous = clock.receipts.get(key)
+    if previous and any(previous[field] != metadata[field] for field in metadata):
+        clock.uncertainties[key] = metadata
+        clock.save()
+        raise WorkflowError('conflicting duration or observation envelope')
+    if previous and not exact and key not in clock.uncertainties:
         return
+    for name, prior in clock.receipts.items():
+        if (name != key and prior['placement'] == 'synthetic_union_equivalent'
+                and prior['envelope'][0] < observed_end and prior['envelope'][1] > observed_start):
+            clock.uncertainties[key] = metadata
+            clock.save()
+            raise WorkflowError('overlapping synthetic receipt requires authoritative reconciliation')
+    if exact:
+        start, end = observed_execution_start, observed_execution_end
+        if (start is None or end is None or not all(math.isfinite(x) for x in (start, end))
+                or start < observed_start or end > observed_end or end < start
+                or not math.isclose(end - start, elapsed, rel_tol=0, abs_tol=1e-6)):
+            clock.uncertainties[key] = metadata
+            clock.save()
+            raise WorkflowError('invalid authoritative execution interval')
+        metadata['placement'] = 'authoritative_host_interval'
+    else:
+        intervals = sorted((max(observed_start, start), min(observed_end, clock.clock() if end is None else end))
+                           for kind, start, end in clock.records.values()
+                           if kind in clock.BILLABLE and start < observed_end
+                           and (clock.clock() if end is None else end) > observed_start)
+        coverage, boundary = 0., observed_start
+        for start, end in intervals:
+            coverage += max(0, end - max(start, boundary))
+            boundary = max(boundary, end)
+        if clock.unresolved or (0 < elapsed < observed_end - observed_start
+                                and 0 < coverage < observed_end - observed_start):
+            clock.uncertainties[key] = metadata
+            clock.save()
+            raise WorkflowError('uncertain partial overlap requires authoritative execution interval')
+        start, end = observed_end - elapsed, observed_end
+        metadata['placement'] = 'synthetic_union_equivalent'
+    interval = [category, start, end]
+    if (key in clock.records and clock.records[key] != interval
+            and (not exact or previous['placement'] != 'synthetic_union_equivalent')):
+        clock.uncertainties[key] = metadata
+        clock.save()
+        raise WorkflowError('conflicting elapsed receipt')
+    # Retain producer duration and uncertainty envelope, not fictitious exact times.
+    clock.receipts[key] = metadata
     clock.records[key] = interval
+    clock.uncertainties.pop(key, None)
     clock.save()
 
 
@@ -82,7 +129,7 @@ class PythonExecution:
         self.contract = self.store.read_json(self.manifest['contract'])
 
     @classmethod
-    def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None):
+    def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None, editable_files=None):
         root, source, verifier = Path(root).absolute(), Path(source).resolve(), Path(verifier).resolve()
         if root.exists() or root.resolve().is_relative_to(source):
             raise ValueError('task must be new and outside the input folder')
@@ -102,15 +149,28 @@ class PythonExecution:
                 raise ValueError('commands must be nonempty argv arrays')
         if any(path.is_symlink() for path in source.rglob('*')):
             raise ValueError('snapshot inputs must not contain symlinks')
+        verifier_name = verifier.relative_to(source).as_posix() if verifier.is_relative_to(source) else None
+        if editable_files is None:
+            editable_files = [p.relative_to(source).as_posix() for p in source.rglob('*')
+                              if p.is_file() and not any(part in {'.git', '__pycache__', '.pytest_cache'}
+                                                        for part in p.relative_to(source).parts)
+                              and p.relative_to(source).as_posix() != verifier_name]
+        editable_files = sorted(set(editable_files))
+        for name in editable_files:
+            if (not name or Path(name).is_absolute() or '..' in Path(name).parts
+                    or name == verifier_name):
+                raise ValueError('invalid editable file manifest')
         root.mkdir(parents=True)
         try:
             shutil.copytree(source, root / 'project', ignore=shutil.ignore_patterns('.git'))
+            if verifier_name:
+                (root / 'project' / verifier_name).unlink()
             (root / 'frozen').mkdir()
             shutil.copyfile(verifier, root / 'frozen/verify.py')
             (root / 'receipts').mkdir()
             store = ContentAddressedArtifacts(root / 'artifacts')
             contract = dict(commands={key: list(value) for key, value in commands.items()},
-                            verifier=digest(verifier.read_bytes()),
+                            editable_files=editable_files, verifier=digest(verifier.read_bytes()),
                             performance_seconds=performance_seconds)
             atomic_json(root / 'manifest.json', {'contract': store.put_json(contract)})
             return cls(root)
@@ -120,11 +180,9 @@ class PythonExecution:
 
     def project_hash(self):
         entries = []
-        for path in sorted(self.project.rglob('*')):
-            if path.is_symlink():
-                raise WorkflowError('editable project contains a symlink')
-            if path.is_file():
-                entries.append([path.relative_to(self.project).as_posix(), digest(path.read_bytes())])
+        for name in self.contract['editable_files']:
+            path = self._file(name)
+            entries.append([name, digest(path.read_bytes()) if path.is_file() else None])
         return digest(json.dumps(entries, separators=(',', ':')).encode())
 
     def sync_source(self):
@@ -134,6 +192,8 @@ class PythonExecution:
         return current
 
     def _file(self, name):
+        if name not in self.contract['editable_files']:
+            raise ValueError('file is not in the frozen editable manifest')
         path = self.project / name
         if Path(name).is_absolute() or '..' in Path(name).parts or not name:
             raise ValueError('file must be inside editable project')
@@ -212,6 +272,8 @@ class PythonExecution:
                    PYTHONPYCACHEPREFIX=str(self.root / 'cache'))
         record = dict(operation_id=operation, source_hash=source_hash, command=command,
                       argv=argv, status='pending', category=category, numeric=numeric, profiling=profile)
+        if not self.workflow.reserve_execution(operation):
+            raise WorkflowError('reserved command has no receipt; reconcile before dispatch')
         self._save(operation, record)
         token = self.workflow.accounting.start(category)
         record['clock_token'] = token

@@ -152,3 +152,89 @@ def test_edit_in_mutation_operation_defers_source_commit(tmp_path):
     assert changed != original
     assert runner.workflow.source_hash == original
     assert runner.workflow.pending is not None
+
+
+@pytest.mark.parametrize('command,profile', [('compile', False), ('test', False), ('profile', True)])
+def test_each_command_reserves_try_including_failures(tmp_path, command, profile):
+    source = tmp_path / 'input'
+    source.mkdir()
+    (source / 'broken.py').write_text('invalid syntax here\n')
+    verifier = tmp_path / 'verify.py'
+    verifier.write_text('raise AssertionError("numeric mismatch")\n')
+    runner = PythonExecution.snapshot(tmp_path / 'task', source, verifier, commands={
+        'compile': [sys.executable, '-m', 'compileall', '-q', '.'],
+        'test': [sys.executable, '{verifier}'],
+        'profile': [sys.executable, 'broken.py']})
+    runner.workflow = Workflow(tmp_path / 'state.json', lambda *a: True,
+        source_hash=runner.project_hash(), limits=BudgetLimits(execution_tries=1))
+    result = runner.run('first', command, profile=profile)
+    assert result['returncode'] != 0
+    assert runner.run('first', command, profile=profile) == result
+    assert runner.workflow.state['executions'] == 1
+    with pytest.raises(WorkflowError):
+        runner.run('second', command, profile=profile)
+    assert runner.workflow.state['executions'] == 1
+
+
+def test_legacy_execution_credit_and_unknown_reservation_survive_restart(tmp_path):
+    runner = backend(tmp_path)
+    runner.workflow.begin(execution=True)
+    runner.run('legacy-command', 'test')
+    assert runner.workflow.state['executions'] == 1
+    runner.run('another-command', 'test')
+    assert runner.workflow.state['executions'] == 2
+    assert runner.workflow.reserve_execution('crashed-before-receipt')
+    workflow = Workflow(runner.workflow.path, lambda *a: True, source_hash=runner.project_hash())
+    runner.workflow = workflow
+    with pytest.raises(WorkflowError):
+        runner.run('crashed-before-receipt', 'test')
+    assert workflow.state['executions'] == 3
+
+
+def test_generated_cache_does_not_invalidate_but_declared_inputs_do(tmp_path):
+    source = tmp_path / 'input'
+    source.mkdir()
+    (source / 'solution.py').write_text('value = 42\n')
+    (source / 'input.json').write_text('{}')
+    verifier = source / 'verify.py'
+    verifier.write_text('from pathlib import Path\nfrom solution import value\n'
+                        'assert value == 42\nPath(".pytest_cache").mkdir(exist_ok=True)\n'
+                        'Path(".pytest_cache/log").write_text("generated")\n'
+                        'Path("output.log").write_text("run output")\n')
+    runner = PythonExecution.snapshot(tmp_path / 'task', source, verifier,
+        commands={'test': [sys.executable, '{verifier}']})
+    runner.workflow = Workflow(tmp_path / 'state.json', lambda *a: True,
+                               source_hash=runner.project_hash())
+    original = runner.project_hash()
+    assert not (runner.project / 'verify.py').exists()
+    with pytest.raises(ValueError):
+        runner.read('verify.py')
+    for operation in ('first', 'second'):
+        assert runner.numeric(operation)['classification'] == 'passed'
+        assert runner.project_hash() == original
+    (runner.project / 'input.json').write_text('{"changed":true}')
+    assert runner.project_hash() != original
+
+
+def test_partial_overlap_cannot_invent_execution_placement(tmp_path):
+    now = [100.]
+    workflow = Workflow(tmp_path / 'state.json', lambda *a: True, source_hash='x',
+                        clock=lambda: now[0])
+    now[0] = 110.
+    thinking = workflow.accounting.start('thinking')
+    now[0] = 120.
+    workflow.accounting.end(thinking)
+    with pytest.raises(WorkflowError):
+        ingest_elapsed(workflow.accounting, 'compile', {'elapsed': 10., 'producer_epoch': 999999.},
+                       observed_start=100., observed_end=120., category='compilation')
+    with pytest.raises(WorkflowError):
+        workflow.remaining()
+    workflow = Workflow(workflow.path, lambda *a: True, source_hash='x', clock=lambda: now[0])
+    with pytest.raises(WorkflowError):
+        workflow.reserve_execution('next')
+    assert workflow.accounting.uncertainties['receipt:compile']['envelope'] == [100., 120.]
+    ingest_elapsed(workflow.accounting, 'compile', {'elapsed': 10.},
+                   observed_start=100., observed_end=120., category='compilation',
+                   observed_execution_start=100., observed_execution_end=110.)
+    assert workflow.accounting.seconds() == 20.
+    assert workflow.accounting.receipts['receipt:compile']['placement'] == 'authoritative_host_interval'
