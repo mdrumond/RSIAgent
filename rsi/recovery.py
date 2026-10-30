@@ -12,6 +12,8 @@ import os
 import shutil
 from pathlib import Path
 import uuid
+import time
+import math
 
 from benchmarks.ascend.subject_memory import SubjectMemory, digest as memory_digest
 from rsi.contracts import BudgetLimits, Mode, ProjectSpec, Stage
@@ -77,12 +79,16 @@ class PairedRecovery:
     @classmethod
     def create(cls, path, checkpoint, *, artifacts, memory_ref, kdb_ref,
                model_config, incumbent, candidate, joint_limits,
-               remaining_parent, runner_factory, terminal_failure_ref=None):
+               remaining_parent, runner_factory, terminal_failure_ref=None, clock=None):
+        if not isinstance(checkpoint, ProjectRunner):
+            raise ValueError('canonical checkpoint required')
+        clock = clock or checkpoint.workflow.clock
+        created = clock()
+        walls = [v for v in (joint_limits.wall_seconds, remaining_parent.get('wall_seconds')) if v is not None]
+        deadline = created + min(walls) if walls else None
         path = Path(path)
         if path.exists():
             raise ValueError('pair already exists; reopen it')
-        if not isinstance(checkpoint, ProjectRunner):
-            raise ValueError('canonical checkpoint required')
         failure = None
         if terminal_failure_ref is not None:
             retained = artifacts.read_json(terminal_failure_ref)
@@ -119,17 +125,39 @@ class PairedRecovery:
             original_workflow_ref=artifacts.put_json(checkpoint.workflow.state))
         frozen_ref = artifacts.put_json(frozen)
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json(path, dict(frozen=frozen_ref, arms={name: dict(
+        atomic_json(path, dict(frozen=frozen_ref, created=created, wall_deadline=deadline, last_clock=created, arms={name: dict(
             operation_id=uuid.uuid4().hex, status='ready') for name in ('incumbent', 'candidate')}))
-        return cls(path, artifacts=artifacts, runner_factory=runner_factory)
+        return cls(path, artifacts=artifacts, runner_factory=runner_factory, clock=clock)
 
-    def __init__(self, path, *, artifacts, runner_factory):
+    def __init__(self, path, *, artifacts, runner_factory, clock=time.time):
+        self.clock = clock
         self.path, self.store, self.factory = Path(path), artifacts, runner_factory
         self.state = json.loads(self.path.read_text())
         self.frozen = self.store.read_json(self.state['frozen'])
 
     def _save(self):
         atomic_json(self.path, self.state)
+
+    def bind_parent_wall_deadline(self, deadline):
+        """Only tighten a retained pair deadline; observation remains possible."""
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError('finite parent deadline required')
+        prior = self.state.get('wall_deadline')
+        self.state['wall_deadline'] = min(prior, deadline) if prior is not None else deadline
+        self._save()
+
+    def _admit_wall(self):
+        now = self.clock()
+        if not math.isfinite(now) or now < self.state.get('last_clock', now):
+            raise WorkflowError('pair clock moved backwards')
+        deadline = self.state.get('wall_deadline')
+        allowance = self.frozen['allocation']['wall_seconds']
+        if allowance is not None and 'wall_deadline' not in self.state:
+            raise WorkflowError('legacy pair requires authoritative parent wall deadline')
+        if deadline is not None and (deadline <= now or allowance is not None and deadline - now < allowance):
+            raise WorkflowError('insufficient parent wall allocation for frozen arm')
+        self.state['last_clock'] = now
+        return now
 
     def request(self, arm):
         frozen, row = self.frozen, self.state['arms'][arm]
@@ -177,12 +205,19 @@ class PairedRecovery:
         arm = next((name for name, row in self.state['arms'].items() if row['status'] == 'ready'), None)
         if arm is None:
             return self.result()
+        started = self._admit_wall()
         request = self.request(arm)
         row = self.state['arms'][arm]
+        bounds = [v for v in (self.state.get('wall_deadline'),
+            started + request.spec.budgets.wall_seconds if request.spec.budgets.wall_seconds is not None else None)
+            if v is not None]
+        row['wall_deadline'] = min(bounds) if bounds else None
         row['status'] = 'pending'
         self._save()  # Includes factory/setup failure: absence must be confirmed explicitly.
         runner = self.factory(request, reopen=False)
         self._check(runner, request, fresh=True)
+        if row['wall_deadline'] is not None:
+            runner.workflow.constrain_wall_deadline('paired:' + request.operation_id, row['wall_deadline'])
         row['run_result'] = runner.run()
         self._save()
         return self.reconcile(arm, runner)
@@ -243,6 +278,8 @@ class PairedRecovery:
             workflow=workflow, correctness=correctness,
             performance=failure['performance'] if failure else validation['performance'] if validation else 'not_measured',
             outcome=terminal, classification=classification, task_failure=task_failure, actor_seconds=seconds,
+            wall_deadline=row.get('wall_deadline'),
+            wall_limited=row.get('wall_deadline') is not None and self.clock() >= row['wall_deadline'],
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
             terminal_failure_ref=self.store.put_json(failure) if failure else None,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
@@ -264,6 +301,8 @@ class PairedRecovery:
                     'regression' if success['incumbent'] and not success['candidate']
                     and rows['candidate'].get('task_failure', rows['candidate']['outcome'] in ('budget_exhausted', 'rejected'))
                     else 'inconclusive')
+        if any(r.get('wall_limited') for r in rows.values()):
+            decision = 'inconclusive'  # Retain raw outcomes; truncated comparisons cannot promote.
         return dict(decision=decision, frozen=self.state['frozen'], arms=rows,
                     actor_seconds=sum(r['actor_seconds'] for r in rows.values()),
                     evidence_ref=self.store.put_json(dict(frozen=self.state['frozen'], arms=rows, decision=decision)))
@@ -362,7 +401,15 @@ class CycleController:
         result = pending.get('result')
         if result is None:
             if event['kind'] == 'paired_recovery_due':
+                if 'wall_deadline' not in pending:
+                    cap = self.scheduler.config['wall_seconds']
+                    pending['wall_deadline'] = self.scheduler.state['created'] + cap if cap is not None else None
+                    self._save()
+                if dispatch and pending['wall_deadline'] is not None and self.scheduler.clock() >= pending['wall_deadline']:
+                    raise WorkflowError('parent wall allocation exhausted; observe retained arms only')
                 pair = self.pair_factory(copy.deepcopy(event), operation, self.scheduler.remaining())
+                if pending['wall_deadline'] is not None:
+                    pair.bind_parent_wall_deadline(pending['wall_deadline'])
                 if dispatch:
                     while pair.result() is None:
                         if self.scheduler.state['stopped']:
@@ -379,6 +426,9 @@ class CycleController:
         if result['decision'] in ('benefit', 'validation') and 'active' not in pending:
             if self.scheduler.state['stopped']:
                 raise WorkflowError('cycle stopped before validation')
+            wall = self.scheduler.remaining()['wall_seconds']
+            if wall is not None and wall <= 0:
+                raise WorkflowError('parent wall allocation exhausted before validation')
             cases = result.get('cases', [result['evidence_ref']] if 'evidence_ref' in result else [])
             # Learning owns durable validation identity; an interrupted callback
             # must be reconciled there before this coordinator can continue.
