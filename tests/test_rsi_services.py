@@ -1072,3 +1072,89 @@ def test_unknown_writer_failure_keeps_pending_and_never_auto_replays(instance, m
         assert not cycle.scheduler.state['candidates'] and not cycle.learning.state['candidates']
     finally:
         cycle.close()
+
+
+def test_job_resume_between_completed_heldout_arms_dispatches_only_remaining_arm(instance, monkeypatch):
+    import rsi.service
+    from rsi.evaluation import SkillEvaluation
+    configure_heldout(instance)
+    cycle = instance.create_cycle('heldout-stop', 'phase2')
+    try:
+        for _ in range(4):
+            cycle.step()  # Original, memory, writer, candidate-validation event.
+        cycle.step()  # Incumbent arm completed; candidate is not dispatched yet.
+        pending = json.loads(json.dumps(cycle.tuning.state['pending']))
+        path = Path(pending['path'])
+        evaluation = SkillEvaluation(path, artifacts=cycle.store, runner_factory=cycle.trial)
+        pair = evaluation.pair(0)
+        assert pair.state['arms']['incumbent']['status'] == 'complete'
+        assert pair.state['arms']['candidate']['status'] == 'ready'
+        incumbent = json.loads(json.dumps(pair.state['arms']['incumbent']))
+        request = pair.request('incumbent')
+        completed_workflow = (request.root / 'workflow.json').read_bytes()
+        actor_calls = Decisions.calls
+        cycle.scheduler.stop()
+    finally:
+        cycle.close()
+    monkeypatch.setattr(rsi.service, 'InstanceServices', lambda _: instance)
+    # Reconciliation itself is observational, not a hidden next-arm dispatch.
+    resumed = instance.open_cycle('heldout-stop')
+    try:
+        assert resumed.reconcile() is None
+        assert Decisions.calls == actor_calls
+        assert resumed.tuning.state['pending'] == pending
+    finally:
+        resumed.close()
+    events = []
+    result = rsi.service.run_job(instance.root, dict(action='resume', cycle_id='heldout-stop'),
+        should_stop=lambda: False, emit=events.append)
+    assert result['status'] == 'complete'
+    assert Decisions.calls > actor_calls
+    state = instance.status('heldout-stop')
+    assert state['tuning.json']['pending'] is None
+    assert len(state['cycle.json']['originals']) == 1
+    # The finished arm's identity, receipt, and actual workflow remain immutable.
+    pair_state = json.loads(Path(evaluation.plan['pairs'][0]['path']).read_text())
+    assert pair_state['arms']['incumbent'] == incumbent
+    assert pair_state['arms']['candidate']['status'] == 'complete'
+    assert (request.root / 'workflow.json').read_bytes() == completed_workflow
+
+
+def test_job_resume_unresolved_heldout_query_stays_suspended_without_replay(instance, monkeypatch):
+    import rsi.service
+    from rsi.evaluation import SkillEvaluation
+    from rsi.strategy import QueryUnavailable
+    configure_heldout(instance)
+    original_query = instance.test.query
+    blocked = False
+    queries = []
+    def query(payload):
+        queries.append(payload)
+        if blocked:
+            raise QueryUnavailable('retained heldout query effects unavailable')
+        return original_query(payload)
+    instance.test = Bindings(query, Decisions, Roles, instance.test.identity)
+    cycle = instance.create_cycle('heldout-unknown', 'phase2')
+    try:
+        for _ in range(5):
+            cycle.step()  # Through the completed incumbent heldout arm.
+        blocked = True
+        with pytest.raises(RuntimeError):
+            cycle.step()  # Candidate query has no observed completion receipt.
+        evaluation = SkillEvaluation(Path(cycle.tuning.state['pending']['path']),
+            artifacts=cycle.store, runner_factory=cycle.trial)
+        pair = evaluation.pair(0)
+        arms = json.loads(json.dumps(pair.state['arms']))
+        assert arms['incumbent']['status'] == 'complete' and arms['candidate']['status'] == 'pending'
+        actor_calls, query_count = Decisions.calls, len(queries)
+        cycle.scheduler.stop()
+    finally:
+        cycle.close()
+    monkeypatch.setattr(rsi.service, 'InstanceServices', lambda _: instance)
+    result = rsi.service.run_job(instance.root, dict(action='resume', cycle_id='heldout-unknown'),
+        should_stop=lambda: False, emit=lambda _: None)
+    assert result['status'] == 'suspended'
+    assert Decisions.calls == actor_calls and len(queries) == query_count
+    state = instance.status('heldout-unknown')
+    assert state['tuning.json']['pending'] is not None
+    assert json.loads(Path(evaluation.plan['pairs'][0]['path']).read_text())['arms'] == arms
