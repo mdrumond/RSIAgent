@@ -38,10 +38,13 @@
         if (options.json && options.array && (!Array.isArray(value) || value.some(v => typeof v !== 'string'))) throw new Error('array of arguments');
         if (options.json && !options.array && (value === null || Array.isArray(value) || typeof value !== 'object')) throw new Error('object');
         if (options.nullable && value === '') value = null;
+        if (options.validate) options.validate(value);
+        const previous = object[key];
         if (options.json && !options.array && object[key] && typeof object[key] === 'object') {
           for (const name of Object.keys(object[key])) delete object[key][name];
           Object.assign(object[key], value);
         } else object[key] = value;
+        if (options.changed) options.changed(value, previous);
         pending.delete(input); input.setCustomValidity(''); sync();
       } catch (_) { pending.add(input); input.setCustomValidity('Enter valid ' + (options.json ? 'JSON' : 'positive number') + '.'); }
     });
@@ -72,6 +75,16 @@
       });
     }
   }
+  function moveExecution(previous, value) {
+    const configurations = payload.project_configs;
+    if (!configurations || previous === value || !Object.hasOwn(configurations, previous)) return;
+    const execution = configurations[previous];
+    const shared = [payload.phase1_projects || [], payload.phase2_projects || []]
+      .some(rows => rows.some(project => project.project_id === previous));
+    configurations[value] = shared ? copy(execution) : execution;
+    if (!shared) delete configurations[previous];
+    return configurations[value];
+  }
   function projects(name, target) {
     const parent = $(target); parent.replaceChildren();
     (payload[name] || []).forEach((project, index) => {
@@ -80,7 +93,10 @@
       for (const [key, title] of [['project_id', 'Project ID'], ['goal', 'Goal'], ['command', 'Command arguments (JSON array)'],
         ['starting_folder', 'Starting folder'], ['repository_ref', 'Repository reference'], ['correctness_ref', 'Correctness reference'], ['performance_goal', 'Performance goal']]) {
         field(card, title, project, key, {json: key === 'command', array: key === 'command', fallback: [], multiline: key === 'goal',
-          folder: key === 'starting_folder', nullable: ['starting_folder', 'repository_ref', 'correctness_ref', 'performance_goal'].includes(key)});
+          folder: key === 'starting_folder', nullable: ['starting_folder', 'repository_ref', 'correctness_ref', 'performance_goal'].includes(key),
+          validate: value => {
+            if (key === 'project_id' && value !== project.project_id && Object.hasOwn(payload.project_configs || {}, value)) throw new Error('execution ID exists');
+          }, changed: (value, previous) => { if (key === 'project_id') moveExecution(previous, value); }});
       }
       project.budgets ||= {};
       const detail = element('details'); detail.append(element('summary', 'Project budgets')); card.append(detail); budgets(detail, project.budgets);
