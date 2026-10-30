@@ -5,13 +5,30 @@ from pathlib import Path
 import sys
 import subprocess
 
+from .configuration import list_folders, set_configuration, show_configuration
 from .contracts import CycleSpec, ProjectSpec
 from .instances import create_instance, inspect_instance
 
 
+def register_configuration_commands(commands):
+    """Keep input editing registration separate from future execution commands."""
+    config = commands.add_parser("config", help="read or revise instance inputs")
+    actions = config.add_subparsers(dest="action", required=True)
+    actions.add_parser("show")
+    update = actions.add_parser("set")
+    update.add_argument("--file", type=Path, required=True)
+    update.add_argument("--expect-revision")
+    folders = commands.add_parser("folders", help="browse allowed node folders")
+    actions = folders.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("path", nargs="?", type=Path)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="rsi", description="RSI programming workflows")
+    parser.add_argument("--instance", type=Path, help="independent RSI instance directory")
     commands = parser.add_subparsers(dest="command", required=True)
+    register_configuration_commands(commands)
     validate = commands.add_parser("validate-spec", help="validate and normalise a JSON specification")
     validate.add_argument("path", type=Path)
     validate.add_argument("--kind", choices=("cycle", "project"), default="cycle")
@@ -29,6 +46,17 @@ def main(argv=None):
     inspect.add_argument("path", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command in ("config", "folders"):
+            if args.command == "folders":
+                result = list_folders(args.instance, args.path)
+            elif args.action == "show":
+                result = show_configuration(args.instance)
+            else:
+                result = set_configuration(
+                    args.instance, json.loads(args.file.read_text(encoding="utf-8")),
+                    expect_revision=args.expect_revision)
+            print(json.dumps(result, indent=2, allow_nan=False))
+            return 0
         if args.command == "instance":
             if args.action == "create":
                 result = create_instance(
@@ -42,7 +70,7 @@ def main(argv=None):
         model = CycleSpec if args.kind == "cycle" else ProjectSpec
         spec = model.from_dict(json.loads(args.path.read_text(encoding="utf-8")))
         print(json.dumps(spec.to_dict(), indent=2, allow_nan=False))
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"rsi: {exc}", file=sys.stderr)
         return 2
     return 0
