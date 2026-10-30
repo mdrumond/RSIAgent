@@ -26,8 +26,8 @@ the service unwinds canonical actor and child cleanup, preserving actual elapsed
 time and pending operation identities. Interrupted work requires explicit resume
 or revisit; unknown pending work is observed and never automatically replayed.
 
-`revisit` starts a new cycle from the current frozen inputs and retains predecessor
-lineage in its request. `resume` opens the existing cycle. To steer upcoming tasks
+`revisit` starts a new cycle from the previous accepted input heads and current
+curriculum/prompts, retaining predecessor lineage. `resume` opens the existing cycle. To steer upcoming tasks
 in a retained cycle, stop it, edit configuration, then submit:
 
 ```console

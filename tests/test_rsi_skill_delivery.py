@@ -85,3 +85,58 @@ def test_builtin_cli_delivery_needs_no_instance_or_model_setup(tmp_path, capsys)
     result = json.loads(capsys.readouterr().out)
     assert result['bundle_hash'] == builtin_bundle().digest
     assert capture(destination) == builtin_bundle()
+
+
+def test_published_cycle_delivery_ignores_baseline_and_pending_candidates_and_bootstraps(tmp_path, capsys):
+    from dataclasses import replace
+    import shutil
+    from test_rsi_handoffs import setup, parent
+    from rsi.cli import main
+    from rsi.contracts import Mode
+    from rsi.python_execution import atomic_json
+    inputs = setup(tmp_path)
+    root, store, baseline, _, _ = inputs
+    folder, scheduler, _ = parent(inputs, 'validated', Mode.PHASE2)
+    original = builtin_bundle()
+    published = replace(original, documents=tuple(
+        replace(d, content=d.content + '\n## Accepted recovery\nUse independent numeric checks.\n')
+        if d.name == 'debug' else d for d in original.documents))
+    accepted = store.put_json(published.to_dict())
+    pending = store.put_json(replace(original, documents=tuple(
+        replace(d, content=d.content + '\nUnvalidated idea.\n') if d.name == 'debug' else d
+        for d in original.documents)).to_dict())
+    learning = dict(active=accepted, versions=[baseline, accepted], candidates={
+        accepted: dict(quarantined=False, validation=dict(workflow=True, correctness=True)),
+        pending: dict(quarantined=False, validation=None)})
+    atomic_json(folder / 'learning.json', learning)
+    scheduler.publish_validated_skills(baseline, accepted)
+    scheduler.close()
+    before = {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+    # Published CAS is the authority even if the original baseline folder is gone.
+    shutil.rmtree(root / 'skills')
+    assert not (root / 'runtime/setup.json').exists()
+    assert main(['--instance', str(root), 'skills', 'get', '--cycle', 'validated']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['bundle_ref'] == accepted and result['bundle_hash'] == published.digest
+    assert SkillBundle.from_dict({k: result[k] for k in ('schema_version', 'documents', 'mapping')}) == published
+    proof = store.read_json(result['provenance_ref'])
+    assert proof['cycle_id'] == 'validated' and proof['bundle_ref'] == accepted
+    destination = tmp_path / 'accepted-delivery'
+    assert main(['--instance', str(root), 'skills', 'export', '--cycle', 'validated',
+                 '--destination', str(destination)]) == 0
+    exported = json.loads(capsys.readouterr().out)
+    assert exported['bundle_ref'] == accepted and capture(destination) == published
+    kdb = tmp_path / 'bootstrap-memory'
+    kdb.mkdir()
+    (kdb / 'README.md').write_text('Independent baseline input.\n')
+    fresh = tmp_path / 'fresh-from-accepted'
+    create_instance(fresh, baseline_kdb=kdb, baseline_skills=destination, skill_map=destination / 'map.json')
+    mapping = json.loads((fresh / 'config/skill-map.json').read_text())
+    assert SkillBundle.capture(fresh / 'skills', {Stage(k): tuple(v) for k, v in mapping.items()}) == published
+    assert before == {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+    learning['candidates'][accepted]['quarantined'] = True
+    atomic_json(folder / 'learning.json', learning)
+    rejected = tmp_path / 'quarantined-delivery'
+    assert main(['--instance', str(root), 'skills', 'export', '--cycle', 'validated',
+                 '--destination', str(rejected)]) == 2
+    assert not rejected.exists()
