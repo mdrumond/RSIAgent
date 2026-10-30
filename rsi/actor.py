@@ -502,6 +502,18 @@ class WorkflowActor:
                         receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
+                    if name == 'select_strategy' and self.recover_invalid_actions:
+                        required = {'query_ref': 'query_kdb', 'retrospective_ref': 'retrospect'}
+                        invalid = {field: tool for field, tool in required.items()
+                            if args[field] not in {row['result'].get('reference')
+                                for row in evidence_material if row['name'] == tool}}
+                        if invalid:
+                            observation = dict(event='invalid-action', action=name,
+                                error='strategy references must be exact receipts delivered in this operation',
+                                accepted=False, executed=False, invalid_fields=list(invalid),
+                                required_tools=invalid, **inventory)
+                            record('actor-invalid-action', observation)
+                            continue
                     if ('skill_refs' in args and
                             any(ref not in self._reads for ref in args['skill_refs'])):
                         error = 'skill_refs must contain current host read receipt IDs, not skill names'
