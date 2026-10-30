@@ -249,3 +249,163 @@ def test_global_caps_and_configured_public_command_are_enforced(instance):
     set_configuration(instance.root, config)
     with pytest.raises(ValueError, match='command must equal'):
         instance.create_cycle('mismatched', 'phase1')
+
+
+def two_projects(instance):
+    config = show_configuration(instance.root)['payload']
+    second = dict(config['phase2_projects'][0], project_id='second')
+    config['phase2_projects'].append(second)
+    config['project_configs']['second'] = dict(config['project_configs']['answer'])
+    set_configuration(instance.root, config)
+    return instance.create_cycle('steered', 'phase2')
+
+
+def task_boundary(cycle):
+    cycle.step()  # Original.
+    cycle.step()  # Memory.
+    cycle.step()  # Writer.
+    cycle.step()  # Candidate validation remains pending without independent cases.
+    assert cycle.scheduler.state['phase'] == 'original'
+
+
+def test_upcoming_revision_adopts_transactionally_without_changing_history_or_budget(instance):
+    import copy
+    cycle = two_projects(instance)
+    try:
+        task_boundary(cycle)
+        before = copy.deepcopy(cycle.scheduler.state)
+        old_ref = cycle.spec.configuration_ref
+        first_op = before['originals'][0]['operation_id']
+        config = show_configuration(instance.root)['payload']
+        config['phase2_projects'][1]['goal'] = 'Steered second goal'
+        config['prompts'] = {key: 'new-' + value for key, value in config['prompts'].items()}
+        config['budgets']['actor_seconds'] = 4
+        snapshot = set_configuration(instance.root, config)
+        result = cycle.adopt_revision(snapshot)
+        assert result['cursor'] == 1 and result['configuration'] != old_ref
+        for field in ('spent', 'recovery_spent', 'created', 'originals', 'completed_operations', 'memory', 'skills'):
+            assert cycle.scheduler.state[field] == before[field]
+        assert cycle.spec.projects[0].to_dict() == before['config']['spec']['projects'][0]
+        assert cycle.spec.projects[1].goal == config['phase2_projects'][1]['goal']
+        assert cycle.spec.projects[1].budgets.actor_seconds == 4
+        assert cycle.open_project(first_op).context()['user_guidance']['actor'] == 'actor-steering'
+        # Folder contents are frozen when NEXT task is admitted, not at revision editing.
+        (instance.root / 'source/solution.py').write_text('answer = 42\n# changed before admission\n')
+        cycle.step()
+        second = cycle.open_project(cycle.scheduler.state['originals'][1]['operation_id'])
+        assert second.backend.read('solution.py')['content'] == (instance.root / 'source/solution.py').read_text()
+        assert second.context()['user_guidance'] == config['prompts']
+        cycle.step()
+        cycle.step()
+        assert config['prompts']['skillwriter'] in Roles.prompts[-1]
+        assert list((cycle.root / 'revisions').glob('*.json'))
+    finally:
+        cycle.close()
+
+
+def test_adoption_refuses_pending_and_historical_edits(instance):
+    cycle = two_projects(instance)
+    try:
+        task_boundary(cycle)
+        config = show_configuration(instance.root)['payload']
+        config['phase2_projects'][0]['goal'] = 'Rewrite completed history'
+        with pytest.raises(ValueError, match='admitted project contracts'):
+            cycle.adopt_revision(set_configuration(instance.root, config))
+        cycle.scheduler.state['pending'] = {'id': 'unknown', 'kind': 'original'}
+        cycle.scheduler._save()
+        with pytest.raises(ValueError, match='idle task/wave boundary'):
+            cycle.adopt_revision(show_configuration(instance.root))
+    finally:
+        cycle.close()
+
+
+def test_partial_adoption_recovers_exact_transaction_without_dispatch_or_refund(instance, monkeypatch):
+    import copy
+    from rsi import revisions
+    cycle = two_projects(instance)
+    task_boundary(cycle)
+    before = copy.deepcopy(cycle.scheduler.state)
+    config = show_configuration(instance.root)['payload']
+    config['prompts']['actor'] = 'recovered-adoption'
+    snapshot = set_configuration(instance.root, config)
+    publish = revisions.atomic_json
+    def fail_service(path, value):
+        if path.name == 'service.json':
+            raise OSError('controller interrupted after cycle pointer')
+        return publish(path, value)
+    with monkeypatch.context() as patch:
+        patch.setattr(revisions, 'atomic_json', fail_service)
+        with pytest.raises(OSError):
+            cycle.adopt_revision(snapshot)
+    cycle.close()
+    calls = Decisions.calls
+    reopened = instance.open_cycle('steered')
+    try:
+        assert Decisions.calls == calls
+        assert reopened.config['prompts']['actor'] == config['prompts']['actor']
+        assert reopened.scheduler.state['spent'] == before['spent']
+        assert reopened.scheduler.state['created'] == before['created']
+        assert reopened.scheduler.state['originals'] == before['originals']
+        assert not (reopened.root / 'revision.pending.json').exists()
+    finally:
+        reopened.close()
+
+
+def test_dispatcher_snapshot_and_recovery_override_are_frozen_at_create(instance):
+    frozen = show_configuration(instance.root)
+    edited = json.loads(json.dumps(frozen['payload']))
+    edited['prompts']['actor'] = 'later-editor-value'
+    set_configuration(instance.root, edited)
+    cycle = instance.create_cycle('launch-snapshot', 'phase1', configuration=frozen, recover=False)
+    try:
+        assert cycle.config['prompts']['actor'] == frozen['payload']['prompts']['actor']
+        assert cycle.scheduler.config['recover'] is False
+    finally:
+        cycle.close()
+
+
+def test_owned_job_stop_reaps_canonical_python_child_and_retains_pending(instance, tmp_path):
+    import os
+    import subprocess
+    # Run signal handling in its OWN worker, never pytest's main interpreter.
+    verifier = instance.root / 'verify.py'
+    verifier.write_text('import time\ntime.sleep(60)\n')
+    result_path = tmp_path / 'worker-result.json'
+    program = r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from test_rsi_services import Bindings, Decisions, Roles
+from rsi.services import InstanceServices
+import rsi.service as adapter
+root, output = Path(sys.argv[2]), Path(sys.argv[3])
+services = InstanceServices(root, environment={}, test_bindings=Bindings(
+    lambda _: dict(results=[], negative_records=[], provenance={'test': True}),
+    Decisions, Roles, 'explicit-test-binding'))
+adapter.InstanceServices = lambda _: services
+from rsi.configuration import show_configuration
+child = None
+def stop():
+    global child
+    for path in (root / 'runs/worker/projects').glob('*/receipts/*.json'):
+        row = json.loads(path.read_text())
+        if row.get('command') == 'test' and row.get('pid'):
+            child = row['pid']
+            return True
+    return False
+result = adapter.run_job(root, dict(action='start', cycle_id='worker', mode='phase1'),
+                         show_configuration(root), should_stop=stop, emit=lambda _: None)
+project = next((root / 'runs/worker/projects').iterdir())
+workflow = json.loads((project / 'workflow.json').read_text())
+output.write_text(json.dumps(dict(result=result, child=child,
+    child_alive=Path('/proc/' + str(child)).exists(), workflow=workflow)))
+'''
+    completed = subprocess.run([sys.executable, '-c', program, str(Path(__file__).parent),
+        str(instance.root), str(result_path)], capture_output=True, text=True, timeout=20,
+        env=dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1])))
+    assert completed.returncode == 0, completed.stderr
+    receipt = json.loads(result_path.read_text())
+    assert receipt['result']['status'] == 'stopped'
+    assert receipt['child'] and not receipt['child_alive']
+    assert receipt['workflow']['stopped'] and receipt['workflow']['pending']
+    assert all(row[2] is not None for row in receipt['workflow']['intervals'].values())
