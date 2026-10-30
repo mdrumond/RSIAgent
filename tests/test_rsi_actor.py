@@ -38,7 +38,7 @@ def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20):
     called = []
     def perform(stage, args, operation, deadline):
         assert workflow.pending['id'] == operation
-        assert workflow.pending['handle'] == 'host:'+operation
+        assert workflow.pending['handle'].startswith('pi:'+operation+':')
         called.append((stage, args, deadline))
         clock.value += 3
         return StageResult()
@@ -158,7 +158,7 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
         assert len(flow.state['history'][-1]['evidence']['skill_refs']) == 2
     else:
         assert flow.stage == Stage.TASK_CONSTRUCTION and not executed
-        assert flow.pending['handle'] is None
+        assert flow.pending['handle'].startswith('pi:')
     assert 'fake-provider-secret' not in json.dumps(calls)
 
 
@@ -209,7 +209,7 @@ def test_stale_edit_is_not_executed(tmp_path):
         ('perform', {'proposal':'edit', 'edit':dict(path='src/solution.py',sha256='stale',source='x=1')})], stage=Stage.IMPLEMENTATION)
     actor.source_snapshot = lambda: SourceSnapshot('src/solution.py','x=0','project-v1')
     with pytest.raises(WorkflowError, match='stale'): actor.step({})
-    assert not called and flow.pending['handle'] is None
+    assert not called and flow.pending['handle'].startswith('pi:')
 
 
 def test_custom_skill_names_come_only_from_mapping(tmp_path):
@@ -277,3 +277,55 @@ def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
     results = [data for kind, data in events if kind == 'stage-result']
     assert results[0]['result']['artifact_refs'] == ('host-artifact',)
     assert results[0]['operation_id'] == flow.pending['id']
+
+
+def test_read_receipts_can_be_translated_to_strategy_cas_refs(tmp_path):
+    actor, flow, session, _, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'construct'})])
+    actor.skill_reference = lambda raw: 'cas:'+raw
+    actor.step({})
+    refs = flow.state['history'][-1]['evidence']['skill_refs']
+    assert all(ref.startswith('cas:') for ref in refs)
+    assert all(item['receipt_id'] == 'cas:'+item['raw_receipt_id']
+               for item in session.contexts[-1]['read_skills'])
+
+
+def test_durable_pending_result_reconciles_without_new_model_or_reads(tmp_path):
+    from rsi.contracts import StepEvidence
+    actor, flow, _, _, clock, events = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'construct'})])
+    def interrupt(*args, **kwargs): raise RuntimeError('controller interrupted')
+    flow.complete = interrupt
+    with pytest.raises(RuntimeError, match='interrupted'): actor.step({})
+    pending = flow.pending
+    trusted_reads = {data['receipt_id']:data for kind,data in events
+                     if kind == 'skill-usage' and data['kind'] == 'read'}
+    def authority(kind, reference, stage, operation):
+        row = trusted_reads.get(reference)
+        return bool(kind == 'skill' and row and row['stage'] == stage.value
+                    and row['operation_id'] == operation)
+    reopened = Workflow(flow.path, authority, source_hash=flow.source_hash, clock=clock)
+    restored = WorkflowActor(reopened, builtin_bundle(), lambda: pytest.fail('model restarted'),
+        perform=lambda *_: pytest.fail('redispatch'), preflight=lambda *_: pytest.fail('preflight'),
+        emit=lambda *_: pytest.fail('new event'))
+    receipt = next(data for kind,data in events if kind == 'stage-result')
+    restored.reconcile_pending(StepEvidence.from_dict(receipt['evidence']), StageResult(**receipt['result']))
+    assert reopened.stage == Stage.DESIGN and reopened.pending is None
+    assert receipt['operation_id'] == pending['id']
+
+
+def test_pi_dispatch_identity_is_durable_before_thinking(tmp_path):
+    actor, flow, session, _, _, events = harness(tmp_path, [])
+    def fail(*args, **kwargs):
+        assert flow.pending['handle'].startswith('pi:'+flow.pending['id']+':')
+        dispatch = next(data for kind,data in events if kind == 'actor-dispatch')
+        request = next(data for kind,data in events if kind == 'actor-request')
+        assert dispatch['handle'] == request['handle'] == flow.pending['handle']
+        assert request['request_id']
+        kwargs['record']('pi-provider-request', {'provider':'fake'})
+        raise RuntimeError('provider failed')
+    session.next_action = fail
+    with pytest.raises(RuntimeError, match='provider failed'): actor.step({})
+    request = next(data for kind,data in events if kind == 'actor-request')
+    provider = next(data for kind,data in events if kind == 'pi-provider-request')
+    assert request['request_id'] == provider['request_id']

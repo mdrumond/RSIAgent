@@ -131,12 +131,13 @@ class WorkflowActor:
     """
     def __init__(self, workflow, bundle, session_factory, *, perform, preflight,
                  emit, source_snapshot=None, host_category='implementation', setup_timeout=60,
-                 evidence_tools=None):
+                 evidence_tools=None, skill_reference=None):
         self.workflow, self.bundle = workflow, bundle
         self.session_factory, self.session = session_factory, None
         self.perform, self.preflight, self.emit = perform, preflight, emit
         self.source_snapshot, self.host_category = source_snapshot, host_category
         self.setup_timeout = setup_timeout
+        self.skill_reference = skill_reference or (lambda reference: reference)
         self.evidence_tools = dict(evidence_tools or {})
         if self.evidence_tools.keys() & (SCHEMAS.keys() | {'read_context', 'edit_source', 'snapshot'}):
             raise ValueError('evidence tool shadows a core action')
@@ -151,16 +152,35 @@ class WorkflowActor:
         if kind != 'skill':
             return self._upstream_resolver(kind, reference, stage, operation)
         if usage is None or usage.operation_id != operation or usage.stage != stage:
-            return False
+            return self._upstream_resolver(kind, reference, stage, operation)
         record = self._reads.get(reference)
         if record is None:
-            return False
+            return self._upstream_resolver(kind, reference, stage, operation)
         try:
-            usage.resolve_read(reference, stage=stage, skill=record['skill'],
+            usage.resolve_read(record['receipt_id'], stage=stage, skill=record['skill'],
                                section=record['section'])
             return True
         except ValueError:
             return False
+
+    def _read_reference(self, usage):
+        receipt = usage.last_read_receipt
+        reference = self.skill_reference(receipt['receipt_id'])
+        if not isinstance(reference, str) or not reference.strip():
+            raise WorkflowError('host skill reference mapping failed')
+        self._reads[reference] = receipt
+        return reference
+
+    def reconcile_pending(self, evidence, result):
+        """Replay trusted persisted results using the upstream receipt authority.
+
+        Caller loads evidence/result from its host log, never from actor claims.
+        The upstream resolver must verify persisted scoped skill reads (including
+        mapped coverage), retrievals and retrospectives. No new reads occur here.
+        """
+        self._available()
+        self.workflow.reconcile(evidence.operation_id, evidence, passed=result.passed,
+            new_source_hash=result.new_source_hash, redesign=result.redesign)
 
     def _available(self):
         remaining = self.workflow.remaining()
@@ -203,19 +223,22 @@ class WorkflowActor:
         names, refs, read_names = usage.expose(), [], set()
         self._reads = {}
         read_material, evidence_material = [], []
-        record = lambda kind, data: self.emit(kind, dict(data, operation_id=operation, stage=stage.value))
+        scope = dict(operation_id=operation, stage=stage.value)
+        record = lambda kind, data: self.emit(kind, dict(data, **scope))
         observation = None
         if stage == Stage.PREFLIGHT:
             # Preflight belongs to the host, including its actual skill accesses.
             for name in names:
                 usage.read(name)
-                receipt = usage.last_read_receipt
-                self._reads[receipt['receipt_id']] = receipt
-                refs.append(receipt['receipt_id'])
+                refs.append(self._read_reference(usage))
             flow.dispatched(operation, 'host:'+operation)
             result = self._timed('setup', lambda: self.preflight(operation, context))
         else:
             self._setup()
+            self._available()
+            scope['handle'] = 'pi:'+operation+':'+uuid.uuid4().hex
+            record('actor-dispatch', {'timestamp': flow.clock()})
+            flow.dispatched(operation, scope['handle'])
             while True:
                 seconds = self._available()
                 source = self._timed('implementation', self.source_snapshot) if self.source_snapshot else None
@@ -227,6 +250,8 @@ class WorkflowActor:
                     observation=observation,
                     source={'path': source.path, 'text': source.text, 'sha256': source.sha256,
                             'project_hash': source.project_hash} if source else None)
+                scope['request_id'] = uuid.uuid4().hex
+                record('actor-request', {'timestamp': flow.clock()})
                 name, args = self._timed('thinking', lambda: self.session.next_action(
                     payload, list(self.schemas), seconds=seconds, record=record, source=source))
                 self._available()
@@ -238,13 +263,13 @@ class WorkflowActor:
                     receipt = usage.last_read_receipt
                     # A section read is genuine evidence, but does not replace the
                     # required full step contract. Return it without inventing reads.
-                    refs.append(receipt['receipt_id'])
-                    self._reads[receipt['receipt_id']] = receipt
+                    reference = self._read_reference(usage)
+                    refs.append(reference)
                     read_material.append(dict(skill=args['name'], section=args.get('section'),
-                        content=text, receipt_id=receipt['receipt_id']))
+                        content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id']))
                     if args.get('section') is None:
                         read_names.add(args['name'])
-                    observation = dict(content=text, receipt_id=receipt['receipt_id'])
+                    observation = dict(content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
                     seconds = self._available()
@@ -263,7 +288,7 @@ class WorkflowActor:
                             or edit['sha256'] != source.sha256):
                         raise WorkflowError('source edit is unavailable or stale')
                 seconds = self._available()
-                flow.dispatched(operation, 'host:'+operation)
+                record('host-dispatch', {'timestamp': flow.clock()})
                 result = self._timed(self.host_category,
                     lambda: self.perform(stage, args, operation, seconds))
                 break
