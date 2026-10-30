@@ -5,7 +5,7 @@ import json
 import pytest
 
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
-from rsi.cycles import CycleScheduler, HostTaskResult, IsolationSnapshot, SnapshotUpdate
+from rsi.cycles import CycleScheduler, HostTaskResult, IsolationSnapshot, SimplificationResult, SnapshotUpdate
 from rsi.runtime import WorkflowError
 
 
@@ -35,7 +35,8 @@ def test_phase1_memory_before_linked_recovery_and_fixed_skills(tmp_path):
 
     def simplify(project, result, context):
         assert result['outcome'] == 'failed'
-        return replace(project, project_id=project.project_id + '-simple', goal='smaller goal')
+        revised = replace(project, project_id=project.project_id + '-simple', goal='smaller goal')
+        return SimplificationResult(revised, 0, 'host-only-revision')
 
     s = CycleScheduler(tmp_path / 'state.json', spec(), run, memory, simplify=simplify,
                        skill_update=lambda *a: pytest.fail('Phase1 must not update skills'))
@@ -263,3 +264,74 @@ def test_isolation_receipt_rejects_parent_mutable_head_reuse(tmp_path):
     receipt = replace(receipt, receipt_ref=hashlib.sha256(data).hexdigest())
     with pytest.raises(ValueError):
         receipt.verify()
+
+
+def test_simplification_elapsed_receipt_reconciles_once_after_restart(tmp_path):
+    captured, runs = [], []
+
+    def run(project, memory, skills, ctx):
+        runs.append(project.budgets.actor_seconds)
+        return HostTaskResult('accepted' if ctx['recovery'] else 'failed', 'r', 1 if ctx['recovery'] else 2)
+
+    def simplify(project, result, ctx):
+        assert ctx['remaining']['actor_seconds'] == 8
+        assert ctx['remaining']['recovery_seconds'] == 6
+        assert project.budgets.actor_seconds == 6
+        captured.append((ctx['operation_id'], SimplificationResult(
+            replace(project, project_id='revised'), 2.5, 'host-timing-receipt')))
+        raise RuntimeError('lost callback return; host receipt retained')
+
+    path, cycle = tmp_path / 'state', spec(count=1)
+    kwargs = dict(runner=run, memory_update=lambda *a: SnapshotUpdate('m'), simplify=simplify,
+                  actor_seconds=10, recovery_seconds=6)
+    s = CycleScheduler(path, cycle, **kwargs)
+    s.step()
+    s.step()
+    with pytest.raises(RuntimeError):
+        s.step()
+    s.close()
+    s = CycleScheduler(path, cycle, **kwargs)
+    with pytest.raises(WorkflowError):
+        s.step()
+    operation, receipt = captured[0]
+    s.reconcile(operation, receipt)
+    with pytest.raises(WorkflowError):
+        s.reconcile(operation, receipt)
+    assert s.remaining()['actor_seconds'] == 5.5
+    assert s.remaining()['recovery_seconds'] == 3.5
+    revision = next(e for e in s.state['events'] if e['kind'] == 'project_revised')
+    assert revision['receipt_ref'] == 'host-timing-receipt' and revision['actor_seconds'] == 2.5
+    s.close()
+    s = CycleScheduler(path, cycle, **kwargs)
+    finish(s)
+    assert len(captured) == 1 and runs == [10, 3.5]
+    assert s.remaining()['actor_seconds'] == 4.5
+    assert s.remaining()['recovery_seconds'] == 2.5
+    s.close()
+
+
+def test_simplification_exhausts_recovery_before_execution(tmp_path):
+    s = CycleScheduler(tmp_path / 'state', spec(count=1),
+                       lambda *a: HostTaskResult('failed', 'r', 1),
+                       lambda *a: SnapshotUpdate('m'), recovery_seconds=2,
+                       simplify=lambda project, result, ctx: SimplificationResult(
+                           replace(project, project_id='revised'), 2, 'host-timing-receipt'))
+    finish(s)
+    assert not s.state['recoveries']
+    assert s.state['spent'] == 3 and s.state['recovery_spent'] == 2
+    assert any(e['kind'] == 'recovery_exhausted' for e in s.state['events'])
+    s.close()
+
+
+def test_bare_simplification_spec_is_not_silently_free(tmp_path):
+    s = CycleScheduler(tmp_path / 'state', spec(count=1),
+                       lambda *a: HostTaskResult('failed', 'r', 1),
+                       lambda *a: SnapshotUpdate('m'),
+                       simplify=lambda project, result, ctx: replace(project, project_id='revised'))
+    s.step()
+    s.step()
+    with pytest.raises(TypeError):
+        s.step()
+    assert s.state['pending']['kind'] == 'simplify'
+    assert s.state['phase'] == 'simplify' and not s.state['recoveries']
+    s.close()

@@ -39,6 +39,28 @@ class HostTaskResult:
 
 
 @dataclass(frozen=True)
+class SimplificationResult:
+    """Trusted host result with retained timing evidence, never model estimates.
+
+    The hook retains its receipt under context.operation_id before returning;
+    receipt_ref identifies that host record for reconciliation after a lost return.
+    actor_seconds is measured billable elapsed time, including model thinking and
+    failed attempts, excluding setup/transfers. A host-only rewrite supplies zero
+    explicitly. No implicit free-work default is permitted.
+    """
+    spec: ProjectSpec
+    actor_seconds: float
+    receipt_ref: str
+
+    def __post_init__(self):
+        if not isinstance(self.spec, ProjectSpec):
+            raise TypeError('revised ProjectSpec required')
+        if not isinstance(self.receipt_ref, str) or not self.receipt_ref.strip():
+            raise ValueError('retained host timing receipt required')
+        _seconds(self.actor_seconds)
+
+
+@dataclass(frozen=True)
 class IsolationSnapshot:
     """Host receipt for separate mutable heads, even when CAS content is equal."""
     namespace: str
@@ -87,7 +109,8 @@ class CycleScheduler:
     Wall time includes all elapsed time, including controller downtime.
     Inference requires isolate(memory, skills, context) -> IsolationSnapshot
     before any project runs. This hook must publish truly isolated store branches.
-    simplify(spec, result, context) -> ProjectSpec is optional and Phase1-only.
+    simplify(spec, result, context) -> SimplificationResult is Phase1-only.
+    Its spec and context receive remaining parent/recovery elapsed limits.
     Phase2/inference recovery is emitted as deferred work for paired evaluation.
     """
 
@@ -253,13 +276,14 @@ class CycleScheduler:
         s['pending'] = operation
         self._save()  # Identity is durable before any external action, including hooks.
         ctx = self._context(operation)
-        if phase in ('original', 'recovery'):
+        if phase in ('original', 'recovery', 'simplify'):
             spec = ProjectSpec.from_dict(operation['spec'])
             caps = [v for v in (spec.budgets.actor_seconds, remaining['actor_seconds'],
                                 remaining['recovery_seconds'] if operation['recovery'] else None) if v is not None]
             wall = [v for v in (spec.budgets.wall_seconds, remaining['wall_seconds']) if v is not None]
             spec = replace(spec, budgets=replace(spec.budgets, actor_seconds=min(caps) if caps else None,
                                                 wall_seconds=min(wall) if wall else None))
+        if phase in ('original', 'recovery'):
             result = self.runner(spec, s['memory'], s['skills'], ctx)
         elif phase == 'memory':
             rows = s['wave_results'] if self.spec.mode == Mode.PHASE1 else [s['originals'][-1]]
@@ -268,7 +292,7 @@ class CycleScheduler:
             result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(s['originals'][-1]), ctx)
         elif phase == 'simplify':
             item = s['recovery_queue'][0]
-            result = self.simplify(ProjectSpec.from_dict(item['spec']), copy.deepcopy(item['result']), ctx)
+            result = self.simplify(spec, copy.deepcopy(item['result']), ctx)
         elif phase == 'isolate':
             result = self.isolate(s['memory'], s['skills'], ctx)
         else:
@@ -341,13 +365,20 @@ class CycleScheduler:
                     s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
         elif kind == 'simplify':
             original = ProjectSpec.from_dict(op['spec'])
-            if not isinstance(result, ProjectSpec) or result.project_id == original.project_id:
+            if not isinstance(result, SimplificationResult):
+                raise TypeError('host simplification result with elapsed receipt required')
+            revised = result.spec
+            if revised.project_id == original.project_id:
                 raise ValueError('simplification requires a new linked project identity')
-            if result.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
+            if revised.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
                 raise ValueError('revised project identity already used')
             s['events'].append(dict(kind='project_revised', original_id=op['original_id'],
-                                    parent_id=original.project_id, revised=result.to_dict()))
-            s['recovery_queue'][0]['spec'] = result.to_dict()
+                                    parent_id=original.project_id, revised=revised.to_dict(),
+                                    operation_id=operation_id, receipt_ref=result.receipt_ref,
+                                    actor_seconds=result.actor_seconds))
+            s['spent'] += result.actor_seconds
+            s['recovery_spent'] += result.actor_seconds
+            s['recovery_queue'][0]['spec'] = revised.to_dict()
             s['phase'] = 'recovery'
         elif kind == 'isolate':
             if not isinstance(result, IsolationSnapshot):
