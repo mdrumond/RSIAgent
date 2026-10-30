@@ -9,10 +9,14 @@ No tools, execution, memory storage, or proposal application is delegated here.
 """
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from functools import lru_cache
 import json
 import math
+import os
+from pathlib import Path
+import selectors
+import subprocess
 import sys
 import time
 from typing import Any, Literal, Mapping
@@ -230,18 +234,224 @@ class NoncodingRoles:
         try:
             result = asyncio.run(getattr(agent, role)(role_prompt=prompt, admitted_evidence=encoded))
             self._remaining(deadline)
-            if set(result.evidence_ids) - ids:
-                raise ValueError('proposal cites evidence not admitted by the host')
-            common = (result.rationale, tuple(result.evidence_ids))
-            if role == 'curriculum':
-                proposal = CurriculumProposal(*common, tuple(ProjectIdea(**x.model_dump()) for x in result.projects))
-            elif role == 'skillwriter':
-                proposal = SkillProposal(*common, tuple(SkillEdit(**x.model_dump()) for x in result.edits))
-            else:
-                proposal = ReviewProposal(*common, tuple(ReviewFinding(**x.model_dump()) for x in result.findings))
+            proposal = _proposal(role, result.model_dump(mode='json'), ids)
             self.observer('role_proposal', {'role': role, 'proposal': result.model_dump(mode='json')})
             success = True
             return proposal
         finally:
             self.observer('role_finished', {'role': role, 'success': success,
                                            'elapsed_seconds': self.clock() - started})
+
+
+_PROPOSALS = {'curriculum': (CurriculumProposal, 'projects', ProjectIdea),
+              'skillwriter': (SkillProposal, 'edits', SkillEdit),
+              'review': (ReviewProposal, 'findings', ReviewFinding)}
+
+
+def _proposal(role, data, admitted):
+    """Validate the same typed wire result without loading NOOA in the host."""
+    outer, name, inner = _PROPOSALS[role]
+    if type(data) is not dict or set(data) != {'rationale', 'evidence_ids', name}:
+        raise ValueError('invalid proposal fields')
+    ids, rows = data['evidence_ids'], data[name]
+    if not isinstance(data['rationale'], str) or not data['rationale'].strip():
+        raise ValueError('proposal requires rationale')
+    if type(ids) is not list or any(type(x) is not str or x not in admitted for x in ids):
+        raise ValueError('proposal cites unadmitted evidence')
+    if type(rows) is not list or (role == 'curriculum' and not rows):
+        raise ValueError('invalid proposal entries')
+    entries = []
+    for row in rows:
+        if type(row) is not dict or set(row) != {f.name for f in fields(inner)}:
+            raise ValueError('invalid proposal entry fields')
+        if any(type(v) is not str or (not v.strip() and k != 'content') for k, v in row.items()):
+            raise ValueError('invalid proposal entry value')
+        if role == 'skillwriter' and row['operation'] not in ('replace', 'remove'):
+            raise ValueError('invalid skill operation')
+        if role == 'review' and row['severity'] not in ('P0', 'P1', 'P2', 'P3'):
+            raise ValueError('invalid finding severity')
+        entries.append(inner(**row))
+    return outer(data['rationale'], tuple(ids), tuple(entries))
+
+
+class IsolatedRoles:
+    """Explicit roles Python executable; host SDK/environment stays untouched.
+
+    The child runs this same installed/source machinery via PYTHONPATH, using
+    its own NOOA dependencies. Only the selected registered credential crosses
+    in the controlled environment. JSON contains evidence and receipts, not keys.
+    Observer role_finished receipts are authoritative actor elapsed time; worker
+    loss emits accounting_incomplete and must suspend budgeted host dispatch.
+    """
+
+    def __init__(self, roles_python, profile, *, observer, environment,
+                 setup_seconds=60, clock=time.monotonic):
+        from benchmarks.a5kernels.phase1_provider import direct_profile
+        if profile != direct_profile(profile.identity):
+            raise ValueError('unregistered role provider')
+        executable = Path(roles_python)
+        if not executable.is_absolute() or not executable.is_file():
+            raise ValueError('roles_python must be an explicit existing absolute executable')
+        if type(setup_seconds) not in (int, float) or not math.isfinite(setup_seconds) or setup_seconds <= 0:
+            raise ValueError('setup_seconds must be positive finite seconds')
+        key = profile.identity.credential_env
+        secret = environment.get(key)
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError('missing selected provider credential')
+        self.environment = {k: environment[k] for k in ('PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SYSTEMROOT')
+                            if k in environment}
+        self.environment.update({key: secret, 'PYTHONPATH': str(Path(__file__).resolve().parent.parent),
+                                 'PYTHONUNBUFFERED': '1'})
+        self.roles_python, self.profile = str(executable), profile
+        self.observer, self.setup_seconds, self.clock = observer, setup_seconds, clock
+
+    def curriculum(self, prompt, evidence, *, deadline):
+        return self._run('curriculum', prompt, evidence, deadline)
+
+    def skillwriter(self, prompt, evidence, *, deadline):
+        return self._run('skillwriter', prompt, evidence, deadline)
+
+    def review(self, prompt, evidence, *, deadline):
+        return self._run('review', prompt, evidence, deadline)
+
+    def _run(self, role, prompt, evidence, deadline):
+        if type(deadline) not in (float, int) or not math.isfinite(deadline):
+            raise ValueError('invalid actor deadline')
+        allowance = deadline - self.clock()
+        if allowance <= 0:
+            raise TimeoutError('noncoding role actor time exhausted')
+        evidence = list(evidence)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError('role prompt must be nonempty')
+        if any(not isinstance(e, AdmittedEvidence) or type(e.evidence_id) is not str or not e.evidence_id
+               for e in evidence) or len({e.evidence_id for e in evidence}) != len(evidence):
+            raise ValueError('admitted evidence requires unique nonempty IDs')
+        request = {'role': role, 'prompt': prompt, 'evidence': [asdict(e) for e in evidence],
+                   'backend_model': self.profile.identity.backend_model.value, 'seconds': allowance}
+        wire = json.dumps(request, allow_nan=False)
+        secret = self.environment[self.profile.identity.credential_env]
+        if secret in wire:
+            raise ValueError('credential cannot appear in role JSON')
+        started = self.clock()
+        cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
+        process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=self.environment, cwd=Path(__file__).resolve().parent.parent)
+        try:
+            outgoing = wire.encode() + b'\n'
+            os.set_blocking(process.stdin.fileno(), False)
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdin, selectors.EVENT_WRITE)
+                selector.register(process.stdout, selectors.EVENT_READ)
+                pending = b''
+                while True:
+                    remaining = cutoff - self.clock()
+                    ready = selector.select(max(0, remaining))
+                    if remaining <= 0 or not ready:
+                        raise TimeoutError('roles worker deadline exhausted')
+                    if any(key.fileobj is process.stdin for key, _ in ready):
+                        sent = os.write(process.stdin.fileno(), outgoing[:65536])
+                        outgoing = outgoing[sent:]
+                        if not outgoing:
+                            selector.unregister(process.stdin)
+                            process.stdin.close()
+                    if not any(key.fileobj is process.stdout for key, _ in ready):
+                        continue
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    if len(pending) > 4_000_000:
+                        raise ValueError('oversized roles receipt')
+                    while b'\n' in pending:
+                        line, pending = pending.split(b'\n', 1)
+                        if secret.encode() in line:
+                            raise ValueError('credential in worker output')
+                        message = json.loads(line)
+                        if type(message) is not dict or set(message) != {'event', 'payload'}:
+                            raise ValueError('invalid worker envelope')
+                        event, payload = message['event'], message['payload']
+                        if type(payload) is not dict:
+                            raise ValueError('invalid worker payload')
+                        if event in ('role_started', 'role_finished', 'role_response', 'role_proposal') and payload.get('role', role) != role:
+                            raise ValueError('worker role mismatch')
+                        if event == 'role_started':
+                            if active or finished or payload['provider_identity'] != self.profile.identity.as_dict():
+                                raise ValueError('invalid worker start receipt')
+                            active = True
+                            cutoff = self.clock() + allowance
+                        elif event == 'role_finished':
+                            elapsed = payload['elapsed_seconds']
+                            if not active or finished or type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0 or elapsed > self.clock() - started:
+                                raise ValueError('invalid worker elapsed receipt')
+                            if type(payload.get('success')) is not bool:
+                                raise ValueError('invalid worker outcome')
+                            finished = True
+                            self.observer(event, payload)
+                            if elapsed > allowance:
+                                raise TimeoutError('worker exceeded actor allowance')
+                            if not payload['success']:
+                                raise RuntimeError('role failed; elapsed receipt retained')
+                            cutoff = self.clock() + self.setup_seconds
+                        elif event == 'result':
+                            if not finished or proposal is not None:
+                                raise ValueError('unordered worker result')
+                            proposal = _proposal(role, payload, {e.evidence_id for e in evidence})
+                        elif event == 'worker_error':
+                            raise RuntimeError('roles worker failed; inspect host receipts')
+                        elif event not in ('request', 'rejection', 'role_response', 'role_proposal') or not active or finished:
+                            raise ValueError('unordered or unknown worker receipt')
+                        if event != 'role_finished':
+                            self.observer(event, payload)
+            process.wait(timeout=max(0.001, cutoff - self.clock()))
+            if process.returncode or not finished or proposal is None or pending:
+                raise RuntimeError('roles worker missing completion receipts')
+            return proposal
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            if not process.stdin.closed:
+                process.stdin.close()
+            if not finished:
+                self.observer('accounting_incomplete', {'role': role, 'start_receipt_received': active})
+
+
+def _worker():
+    """Private JSON-lines worker, reusing the registered provider and role path."""
+    import contextlib
+    protocol = sys.stdout
+    secret = None
+
+    def emit(event, payload):
+        line = json.dumps({'event': event, 'payload': payload}, allow_nan=False)
+        if secret and secret in line:
+            raise ValueError('credential in role output')
+        protocol.write(line + '\n')
+        protocol.flush()
+
+    try:
+        request = json.loads(sys.stdin.readline())
+        from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+        from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+        identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == request['backend_model'])
+        secret = os.environ[identity.credential_env]
+        with contextlib.redirect_stdout(sys.stderr):
+            provider = DirectCompletionProvider({identity.credential_env: secret},
+                                                models=[identity.backend_model], invalid_prompt_retries=0)
+            roles = NoncodingRoles(provider, direct_profile(identity), observer=emit)
+            evidence = [AdmittedEvidence(**e) for e in request['evidence']]
+            if request['role'] not in _PROPOSALS:
+                raise ValueError('unknown role')
+            result = getattr(roles, request['role'])(request['prompt'], evidence,
+                                                    deadline=time.monotonic() + request['seconds'])
+        emit('result', asdict(result))
+        return 0
+    except Exception:
+        emit('worker_error', {'reason': 'role_failed'})
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(_worker())

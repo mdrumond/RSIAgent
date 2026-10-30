@@ -7,6 +7,7 @@ name = "rsi"
 version = "0.1.0"
 description = "RSI programming workflows and shared contracts"
 requires-python = ">=3.10"
+dynamic = ["optional-dependencies"]
 
 
 [project.scripts]
@@ -25,18 +26,6 @@ exclude = ["*.node_modules", "*.node_modules.*", "tests", "tests.*", "*.tests", 
 "*" = ["*.json", "*.yaml", "*.yml", "*.md", "*.txt", "*.js", "*.mjs", "*.html", "*.css", "*.ts", "*.cpp", "*.inc", "*.sh", "*.lock", "Dockerfile", "*.example"]
 dashboard = ["templates/*.html", "static/*"]
 
-[project.optional-dependencies]
-roles = ['nooa==0.0.10; python_version >= "3.12" and python_version < "3.14"']
-legacy = [
-  "openai==3.0.0",
-  "requests==2.31.0",
-  "requests-toolbelt==1.0.0",
-  "Pillow==11.0.0",
-  "PyYAML==6.0.3",
-  "python-dotenv==1.2.2",
-  "cryptography==50.0.0",
-  "Flask==3.0.3",
-  "huggingface-hub==1.27.0",
-  "docker==7.2.0",
-  "filelock==3.32.6",
-]
+[tool.setuptools.dynamic.optional-dependencies]
+legacy = {file = ["requirements.txt"]}
+roles = {file = ["requirements-roles.txt"]}
