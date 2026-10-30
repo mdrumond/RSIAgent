@@ -12,11 +12,12 @@ import json
 from pathlib import Path
 import time
 from threading import RLock
+from uuid import uuid4
 
 from coding.pi.rpc import PiError, PiProviderError, PiDeadlineError, PiCancelled
 from coding.pi.session import ActionError
 from coding.pi.schema import INTEGER, STRING, obj
-from rsi.actor import EvidenceTool, SourceSnapshot, StageResult, WorkflowActor
+from rsi.actor import EvidenceTool, PiSessionAdapter, SourceSnapshot, StageResult, WorkflowActor
 from rsi.contracts import ProjectSpec, Stage, StepEvidence
 from rsi.python_execution import PythonExecution, atomic_json, digest
 from rsi.runtime import Workflow, WorkflowError
@@ -31,11 +32,16 @@ class ProjectConfig:
     commands: dict
     editable_files: tuple[str, ...] = ('solution.py',)
     performance_seconds: float | None = None
+    generated_paths: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, value):
         value = dict(value)
         value['editable_files'] = tuple(value.get('editable_files', ('solution.py',)))
+        generated = value.get('generated_paths', ())
+        if not isinstance(generated, (list, tuple)) or any(not isinstance(p, str) for p in generated):
+            raise ValueError('generated_paths must be an array of project-relative paths')
+        value['generated_paths'] = tuple(generated)
         result = cls(**value)
         if not {'compile', 'test', 'validation'} <= result.commands.keys():
             raise ValueError('compile, test and validation commands required')
@@ -59,7 +65,7 @@ class ProjectRunner:
         config = ProjectConfig.from_dict(asdict(config) if isinstance(config, ProjectConfig) else config)
         backend = PythonExecution.snapshot(root, config.source, config.verifier,
             commands=config.commands, editable_files=config.editable_files,
-            performance_seconds=config.performance_seconds)
+            performance_seconds=config.performance_seconds, generated_paths=config.generated_paths)
         frozen = dict(created=created, spec=spec.to_dict(), skills=bundle.to_dict(), config=asdict(config),
                       backend_identity=injections['backend_identity'])
         atomic_json(backend.root / 'runner.json', {'contract': backend.store.put_json(frozen)})
@@ -92,7 +98,11 @@ class ProjectRunner:
             self.bundle, query, workflow_id=self.contract_ref, backend_identity=backend_identity,
             events=self.events, test_backend=test_backend)
         self.selected_file = self.config.editable_files[0]
-        self.actor = WorkflowActor(self.workflow, self.bundle, session_factory,
+        self._factory_attempted = False
+        def tracked_factory():
+            self._factory_attempted = True
+            return session_factory()
+        self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
@@ -199,7 +209,17 @@ class ProjectRunner:
     def tool(self, name, stage, args, operation):
         read_error = False
         if name == 'query_kdb':
-            ref = self.service.query(args)
+            call = uuid4().hex
+            self.append(dict(type='query-dispatch', operation_id=operation, call_id=call,
+                             request_ref=self.store.put_json(args)))
+            try:
+                ref = self.service.query(args)
+            except QueryUnavailable:
+                self.append(dict(type='query-finished', operation_id=operation, call_id=call,
+                                 status='unavailable'))
+                raise
+            self.append(dict(type='query-finished', operation_id=operation, call_id=call,
+                             status='complete', reference=ref))
         elif name == 'retrospect':
             ref = self.service.retrospect(**args)
         elif name == 'select_strategy':
@@ -330,6 +350,9 @@ class ProjectRunner:
                 edit = args['edit']
                 changed = self.backend.edit(edit['path'], edit['source'],
                     expected_file_hash=edit['sha256'], expected_project_hash=self.workflow.source_hash)
+                self.append(dict(type='source-edit', operation_id=operation,
+                    before_source=self.workflow.source_hash, after_source=changed,
+                    path=edit['path'], source_ref=self.store.put_bytes(edit['source'].encode())))
         passed = True
         receipts = []
         commands = (['compile', 'test'] if stage == Stage.TEST else
@@ -421,8 +444,178 @@ class ProjectRunner:
         elif actual != flow.source_hash:
             flow.source_changed(actual)
 
+    def _closure(self, observation):
+        pending = self.workflow.pending
+        dispatch = self.latest('actor-dispatch')
+        row = dict(kind='rsi-actor-closure-v1', contract_ref=self.contract_ref,
+            backend_identity=self.service.backend_identity, test_backend=self.service.test_backend,
+            pending=pending, handle=pending['handle'] if pending else dispatch.get('handle') if dispatch else None,
+            stage=self.workflow.stage.value, stage_initial_source=self.workflow.source_hash,
+            source_hash=self.backend.project_hash(), observation=observation)
+        ref = self.store.put_json(row)
+        self.append(dict(type='actor-closure', reference=ref))
+        return ref
+
+    def _outcome(self, result, closure_ref):
+        ref = self.store.put_json(dict(result=dict(result), closure_ref=closure_ref,
+            workflow_state_ref=self.store.put_json(self.workflow.state)))
+        self.append(dict(type='project-run-outcome', reference=ref))
+        return ref
+
+    def _completed_effects(self, observed_queries=()):
+        """Read-only checks. Completed reads are evidence, not unknown effects."""
+        flow = self.workflow
+        if self.actor.session is not None or any(row[2] is None for row in flow.accounting.records.values()):
+            raise WorkflowError('active actor or clock interval prevents failure proof')
+        seconds = flow.accounting.seconds()  # Also rejects unresolved timing placements.
+        if flow.limits.to_dict() != flow.state['limits']:
+            raise WorkflowError('unpersisted budget change prevents failure proof')
+        if (json.loads((self.root / 'manifest.json').read_text()) != self.backend.manifest
+                or json.loads((self.root / 'runner.json').read_text())['contract'] != self.contract_ref):
+            raise WorkflowError('frozen manifest pointer differs')
+        contract = self.store.read_json(self.backend.manifest['contract'])
+        frozen = self.store.read_json(self.contract_ref)
+        config = ProjectConfig.from_dict(frozen['config'])
+        if (contract['commands'] != {k: list(v) for k, v in config.commands.items()}
+                or contract['editable_files'] != sorted(set(config.editable_files))
+                or contract.get('generated_paths', []) != sorted(set(config.generated_paths))
+                or contract['performance_seconds'] != config.performance_seconds
+                or digest(self.backend.verifier.read_bytes()) != contract['verifier']):
+            raise WorkflowError('frozen execution contract or verifier differs')
+        commands, known_sources = [], {flow.source_hash}
+        reservations = flow.state.get('execution_reservations', {})
+        expected_paths = set()
+        for operation, reservation in reservations.items():
+            path = self.backend._receipt_path(operation)
+            expected_paths.add(path)
+            try:
+                receipt = self.backend.receipt(operation)
+                index = json.loads(path.read_text())
+            except (OSError, ValueError, WorkflowError) as exc:
+                raise WorkflowError('execution reservation has no complete receipt') from exc
+            argv = [arg.replace('{verifier}', str(self.backend.verifier))
+                    for arg in contract['commands'].get(receipt['command'], ())]
+            if receipt['profiling']:
+                profile = self.root / 'receipts' / (digest(operation.encode()) + '.profile')
+                argv = [argv[0], '-m', 'cProfile', '-o', str(profile), *argv[1:]] if argv else []
+            if (receipt['status'] != 'complete' or receipt['operation_id'] != operation
+                    or receipt['stage_operation'] != reservation['stage_operation'] or receipt['argv'] != argv):
+                raise WorkflowError('command receipt differs from frozen dispatch')
+            commands.append(index['artifact'])
+            known_sources.add(receipt['current_hash'])
+        if set((self.root / 'receipts').glob('*.json')) != expected_paths:
+            raise WorkflowError('unreserved command receipt prevents failure proof')
+        actual = self.backend.project_hash()
+        for event in self.events:
+            if event['type'] == 'source-edit':
+                source = self.store.read_bytes(event['source_ref'])
+                if event['after_source'] == actual and self.backend._file(event['path']).read_bytes() == source:
+                    known_sources.add(actual)
+        if actual not in known_sources:
+            raise WorkflowError('unobserved source change prevents failure proof')
+        dispatched = {e['call_id']: e for e in self.events if e['type'] == 'query-dispatch'}
+        finished = {e['call_id']: e for e in self.events if e['type'] == 'query-finished'}
+        if set(dispatched) != set(finished) or any(e['status'] != 'complete' for e in finished.values()):
+            raise WorkflowError('unknown or unavailable query prevents failure proof')
+        retrievals = set(observed_queries)
+        for call, event in finished.items():
+            record = self.store.read_json(event['reference'])
+            if (event['operation_id'] != dispatched[call]['operation_id']
+                    or record['context']['operation'] != event['operation_id']
+                    or record['payload']['request'] != self.store.read_json(dispatched[call]['request_ref'])):
+                raise WorkflowError('query receipt scope mismatch')
+            retrievals.add(event['reference'])
+        retained = {e['reference'] for e in self.events if e['type'] == 'strategy-evidence'
+                    and e['kind'] == 'retrieval'}
+        if retrievals != retained or any(e['type'] == 'strategy-evidence' and e['kind'] == 'query-unavailable'
+                                        for e in self.events):
+            raise WorkflowError('query completion coverage is not established')
+        for ref in retrievals:
+            row = self.store.read_json(ref)
+            if (row['kind'] != 'retrieval' or row['context']['workflow'] != self.contract_ref
+                    or row['payload']['backend'] != self.service.backend_identity
+                    or row['payload']['test_backend'] != self.service.test_backend):
+                raise WorkflowError('untrusted retrieval receipt')
+        return dict(command_receipts=commands, retrieval_receipts=sorted(retrievals),
+                    actor_seconds_total=seconds, source_hash=actual)
+
+    def record_terminal_observation(self, result, *, controller_proof, observed_source_hash):
+        """Explicit trusted host observation for old runs; never an actor tool.
+
+        The host must actually observe terminal Pi/provider closure and all query
+        callbacks; merely reopening a runner is insufficient. Pending is retained.
+        """
+        with self.event_lock:
+            pending = self.workflow.pending
+            if (not pending or self.actor.session is not None
+                    or controller_proof.get('handle') != pending['handle']
+                    or not pending['handle'] or controller_proof.get('actor_closed') is not True
+                    or controller_proof.get('provider_settled') is not True
+                    or not isinstance(controller_proof.get('observation'), str)
+                    or not controller_proof['observation'].strip()
+                    or observed_source_hash != self.backend.project_hash()
+                    or result['pending'] != pending or result['source_hash'] != observed_source_hash
+                    or result['stage'] != self.workflow.stage.value
+                    or result.get('contract_ref') != self.contract_ref
+                    or result['status'] not in ('suspended', 'budget_exhausted', 'rejected')):
+                raise WorkflowError('explicit terminal closure/source/result observation required')
+            self._completed_effects(controller_proof.get('completed_query_refs', ()))
+            closure = self._closure(dict(method='trusted-controller', **controller_proof))
+            return self._outcome(result, closure)
+
+    def terminal_failure_proof(self, *, closure_ref=None):
+        """Read-only failure admission evidence; never complete or replay a stage.
+
+        Service persists the returned packet and admits failure once. Missing
+        observations remain suspended, including restarted unobserved actors.
+        """
+        with self.event_lock:
+            outcomes = [e for e in reversed(self.events) if e['type'] == 'project-run-outcome']
+            event = next((e for e in outcomes if self.store.read_json(e['reference'])['closure_ref']
+                          and (closure_ref is None or self.store.read_json(e['reference'])['closure_ref'] == closure_ref)),
+                         outcomes[0] if outcomes else None)
+            if not event or self.workflow.state['stopped']:
+                raise WorkflowError('no observed terminal failed run')
+            outcome = self.store.read_json(event['reference'])
+            result, ref = outcome['result'], outcome['closure_ref']
+            if not ref or closure_ref is not None and closure_ref != ref or not any(
+                    e['type'] == 'actor-closure' and e['reference'] == ref for e in self.events):
+                raise WorkflowError('actual actor closure receipt required')
+            closure = self.store.read_json(ref)
+            if (result['status'] not in ('suspended', 'budget_exhausted', 'rejected')
+                    or result['classification'] == 'actor_cleanup_failure'
+                    or result.get('contract_ref') != self.contract_ref
+                    or result['source_hash'] != closure['source_hash']
+                    or result['stage'] != self.workflow.stage.value
+                    or closure['contract_ref'] != self.contract_ref
+                    or closure['backend_identity'] != self.service.backend_identity
+                    or closure['test_backend'] != self.service.test_backend
+                    or closure['pending'] != self.workflow.pending
+                    or closure['stage_initial_source'] != self.workflow.source_hash
+                    or closure['source_hash'] != self.backend.project_hash()
+                    or self.store.read_json(outcome['workflow_state_ref']) != self.workflow.state):
+                raise WorkflowError('failed run/closure no longer matches current checkpoint')
+            observed = closure['observation']
+            absent = (observed.get('method') == 'host-no-actor-dispatch'
+                and observed.get('actor_absent') is True
+                and not any(e['type'] == 'actor-dispatch' for e in self.events))
+            if (not absent and observed.get('actor_closed') is not True
+                    or observed.get('provider_settled') is not True):
+                raise WorkflowError('actor/provider closure was not observed')
+            effects = self._completed_effects(observed.get('completed_query_refs', ()))
+            packet = dict(kind='rsi-terminal-failure-v1', classification=result['classification'],
+                outcome='failed', error=result['error'], failed_stage=result['stage'], pending=self.workflow.pending,
+                correctness=result.get('correctness'), performance=result.get('performance'),
+                stage_initial_source=self.workflow.source_hash, **effects,
+                project_contract_ref=self.contract_ref, execution_contract_ref=self.backend.manifest['contract'],
+                frozen_skill_hash=self.bundle.digest, result_ref=event['reference'], closure_ref=ref,
+                accounting_snapshot=outcome['workflow_state_ref'], created=self.workflow.state['created'],
+                limits=self.workflow.state['limits'], stage_completion_claim=False, replay_allowed=False)
+            return json.loads(json.dumps(packet, allow_nan=False))  # No mutable state aliases.
+
     def run(self):
-        status, error, classification = None, None, None
+        status, error, classification, closure_ref = None, None, None, None
+        entry_pending = self.workflow.pending
         try:
             self.reconcile()
             while not self.workflow.outcome:
@@ -442,8 +635,24 @@ class ProjectRunner:
             error = str(exc)
             status = 'budget_exhausted' if 'exhausted' in error else 'suspended'
         finally:
+            session = self.actor.session
             try:
                 self.actor.close()
+                if session is not None:
+                    known_pi = isinstance(session, PiSessionAdapter)
+                    rpc = session.session.rpc if known_pi else None
+                    closed = (rpc is None or rpc.process.poll() is not None) if known_pi else self.service.test_backend
+                    settled = session.session.gateway.finished.is_set() if known_pi else self.service.test_backend
+                    closure_ref = self._closure(dict(method='in-process-session-close',
+                        actor_closed=closed, provider_settled=settled,
+                        observation='Known live session close returned; actual RPC/provider terminal state observed'))
+                elif (entry_pending is None and not self._factory_attempted
+                        and not any(e['type'] == 'actor-dispatch' for e in self.events)
+                        and not self.workflow.state.get('execution_reservations')
+                        and not any(e['type'] == 'query-dispatch' for e in self.events)):
+                    closure_ref = self._closure(dict(method='host-no-actor-dispatch',
+                        actor_absent=True, actor_closed=False, provider_settled=True,
+                        observation='This live controller reached failure without calling the actor factory or dispatching backend work'))
             except PiError as exc:
                 self.append(dict(type='project-failure', classification='actor_cleanup_failure',
                     error_type=type(exc).__name__, pending=self.workflow.pending))
@@ -452,11 +661,14 @@ class ProjectRunner:
         validation = self.latest('validation-results')
         if validation and validation['source_hash'] != self.backend.project_hash():
             validation = None
-        return dict(status=status, error=error, classification=classification or status,
+        result = dict(status=status, error=error, classification=classification or status,
             stage=self.workflow.stage.value,
             correctness=validation['correctness'] if validation else None,
             performance=validation['performance'] if validation else 'not_measured',
             history=self.workflow.state['history'], pending=self.workflow.pending,
             events=tuple(self.event_refs), source_hash=self.backend.project_hash(),
             contract_ref=self.contract_ref, execution_contract_ref=self.backend.manifest['contract'],
-            skill_bundle_hash=self.bundle.digest)
+            skill_bundle_hash=self.bundle.digest, actor_closure_ref=closure_ref)
+        result['outcome_ref'] = self._outcome(result, closure_ref)
+        result['events'] = tuple(self.event_refs)
+        return result
