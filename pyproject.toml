@@ -9,6 +9,7 @@ description = "RSI programming workflows and shared contracts"
 requires-python = ">=3.10"
 dynamic = ["optional-dependencies"]
 
+
 [project.scripts]
 rsi = "rsi.cli:main"
 
