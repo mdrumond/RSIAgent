@@ -350,8 +350,11 @@ def test_minimal_installed_wheel_executes_cpu_backend(tmp_path):
     venv.EnvBuilder(with_pip=True).create(environment)
     python = environment / 'bin/python'
     wheel, = wheels.glob('rsi-*.whl')
-    install = subprocess.run([str(python), '-m', 'pip', 'install', '--no-deps', '--no-index', str(wheel)],
-                             capture_output=True, text=True)
+    site = subprocess.check_output([str(python), '-I', '-c',
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])'], text=True).strip()
+    install = subprocess.run([str(python), '-m', 'pip', '--isolated', 'install',
+        '--no-deps', '--no-index', '--ignore-installed', '--target', site, str(wheel)],
+        capture_output=True, text=True)
     assert install.returncode == 0, install.stdout + install.stderr
     proof = r'''
 import json, sys
