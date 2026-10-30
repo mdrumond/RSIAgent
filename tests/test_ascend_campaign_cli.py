@@ -762,21 +762,33 @@ def test_screen_uses_distinct_durable_local_commands_and_reuses_existing(tmp_pat
 
 
 @pytest.mark.skipif(shutil.which("screen") is None, reason="GNU Screen unavailable")
-def test_real_screen_start_returns_while_worker_is_active(tmp_path):
-    job = start(tmp_path)
-    started = []
-    def runner(command, **kwargs):
-        if command[1] != "-ls":
-            started.append(command[2])
-            command = command[:6] + ["sleep", "30"]
-        return subprocess.run(command, timeout=2, **kwargs)
-    try:
-        name = cli.start_screen(job, "collector", runner=runner)
-        sessions = subprocess.run(["screen", "-ls"], capture_output=True, text=True, timeout=2)
-        assert name in sessions.stdout
-    finally:
-        for name in started:
-            subprocess.run(["screen", "-S", name, "-X", "quit"], capture_output=True, timeout=2)
+def test_real_screen_start_returns_while_worker_is_active(tmp_path, monkeypatch):
+    import time
+    from tempfile import TemporaryDirectory
+    # Keep the UNIX socket path short and owned; pytest's nested path can exceed
+    # the socket path limit once Screen appends its PID and session name.
+    with TemporaryDirectory(prefix='rsi-screen-') as sockets:
+        monkeypatch.setenv('SCREENDIR', sockets)
+        job = start(tmp_path)
+        started = []
+        def runner(command, **kwargs):
+            if command[1] != '-ls':
+                started.append(command[2])
+                command = command[:6] + ['sleep', '30']
+            return subprocess.run(command, timeout=2, **kwargs)
+        try:
+            name = cli.start_screen(job, 'collector', runner=runner)
+            deadline = time.monotonic() + 2
+            while True:
+                sessions = subprocess.run(['screen', '-ls'], capture_output=True, text=True,
+                    timeout=max(.01, deadline-time.monotonic()))
+                if name in sessions.stdout or time.monotonic() >= deadline:
+                    break
+                time.sleep(.02)
+            assert name in sessions.stdout
+        finally:
+            for name in started:
+                subprocess.run(['screen', '-S', name, '-X', 'quit'], capture_output=True, timeout=2)
 
 
 @pytest.mark.parametrize("stale_current_archive", [False, True])
@@ -870,6 +882,8 @@ def test_invalid_phase2_or_identity_override_fails_before_start(tmp_path):
 
 
 def test_real_native_composition_runs_actor_host_verification_trace_and_package(tmp_path, monkeypatch):
+    from canonical_a3_fixtures import install_native_kernel, native_knowledge_config, embedding_factory
+    sessions = install_native_kernel(monkeypatch, baseline_root=tmp_path)
     from benchmarks.ascend import phase1_cli
     from benchmarks.a3kernels.candidate import CandidateCompilation
     from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt
@@ -881,7 +895,8 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
     config = write(tmp_path / "native.json", dict(guide=str(guide), target="native-a3", arch="native-arch",
         execution_profile="bz-a3-1", cpl_skills_revision="a" * 40, cpl_remote="/tools/cpl-remote",
         validation_wrapper="/checked/validation", remote_workspace="/owned", physical_device=0,
-        environment_identity=dict(cann_version="actual-cann", profiler_version="actual-msprof")))
+        environment_identity=dict(cann_version="actual-cann", profiler_version="actual-msprof"),
+        **native_knowledge_config(tmp_path)))
     job = start(tmp_path, extra=["--config", str(config), "--model", "openai/gpt-5.6-sol",
         "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance"])
     job["project_target"] = 1
@@ -897,8 +912,6 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
         def remote_candidate_directory(self, plan):
             return PurePosixPath("/owned") / plan.execution_id
     source = 'extern "C" __global__ __aicore__ void project_kernel(GM_ADDR gm_input0, GM_ADDR gm_output) {}'
-    actions = iter([json.dumps({"write": {"slot": "kernel", "content": source}}),
-                    '{"compile":{}}', '{"run":{}}', '{"submit":{}}'])
     def provider(**kwargs):
         messages = kwargs["request"]["messages"]
         if "Curriculum Agent" in messages[0]["content"]:
@@ -913,13 +926,14 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
         elif "Distill only" in messages[0]["content"] or "Distill only" in messages[-1]["content"]:
             text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
         else:
-            text = next(actions)
+            pytest.fail("kernel decisions escaped the canonical session factory")
         return DirectCompletion(text, 1)
     original = phase1_cli.main
     monkeypatch.setattr(phase1_cli, "main", lambda argv, **kwargs: original(argv, **kwargs,
-        transport_factory=Transport, provider_transport=provider,
+        transport_factory=Transport, provider_transport=provider, embedding_factory=embedding_factory,
         environment_loader=lambda **kw: dict(OPENAI_API_KEY="fixture", DEEPSEEK_API_KEY="fixture")))
     result = cli.campaign_worker(job)
+    assert sessions and all(session.contexts for session in sessions)
     assert result["successful_projects"] == 1
     assert len(list(Path(job["root"]).rglob("sft-traces/*.jsonl"))) == 1
     exported = export_annex(job["root"], tmp_path / "dataset")
