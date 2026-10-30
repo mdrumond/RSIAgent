@@ -846,8 +846,18 @@ class OptimizerHost(SourceHost):
                 raise CanonicalConfigurationError('configured optimizer backend has no compile diagnostics capability')
             candidate = dict(source=args['source'], block_count=args['block_count'])
             directory = self.owner.directory / 'compile' / fingerprint(candidate) / operation
-            report = self.call(DomainActivity(self.runner, operation), 'compile-diagnostic', 'compilation',
-                lambda remaining: callback(candidate['source'], directory, block_count=candidate['block_count']))
+            request = self.runner.latest('actor-request', operation)
+            if not request or not request.get('request_id'):
+                raise WorkflowError('compile diagnostic requires an actual current actor request')
+            import uuid
+            invocation = self.store.put_json(dict(kind='domain-tool-invocation-v1', call_id=uuid.uuid4().hex,
+                name='compile-diagnostic', operation_id=operation, request_id=request['request_id'],
+                contract_ref=self.runner.contract_ref, source_hash=self.project_hash(), arguments=args))
+            self.runner.append(dict(type='domain-tool-invocation', operation_id=operation,
+                                    reference=invocation))
+            report = DomainActivity(self.runner, operation).run('compile-diagnostic', 'compilation',
+                lambda remaining: callback(candidate['source'], directory, block_count=candidate['block_count']),
+                execution=True, invocation=invocation)
             ref = self.owner._artifact('compile', report)
             self.owner.state['history'].append(dict(tool=dict(action='compile', **args), result=ref, content=report))
             self.owner._save()
@@ -920,6 +930,39 @@ class OptimizerHost(SourceHost):
                      best=self.owner.state.get('best'))
         return value
 
+    def retain_evaluation(self, evaluation, args, operation):
+        from optimizer.loop import score
+        owner = self.owner
+        self.evaluation, self.value = evaluation, score(self.baseline, evaluation)
+        existing = next((row for row in owner.state['history'] if row.get('domain_operation') == operation), None)
+        if existing is not None:
+            if self.owner._read(existing['result']) != evaluation:
+                raise WorkflowError('retained evaluation history differs from observed terminal result')
+            return existing
+        candidate = json.loads(self.source)
+        ref = owner._artifact('evaluation', evaluation)
+        row = dict(candidate_sha256=sha256(candidate['source'].encode()).hexdigest(),
+            configuration_sha256=fingerprint(candidate), block_count=candidate['block_count'],
+            result=ref, source=owner._artifact('candidate.cpp', candidate['source']),
+            content=evaluation, speedup=self.value, summary=args['proposal'], domain_operation=operation)
+        owner.state['seen'].append(row['configuration_sha256'])
+        owner.state['candidate'] = row['source']
+        owner.state['history'].append(row)
+        if self.value is not None and self.value > owner.state.get('best', {}).get('speedup', 0):
+            owner.state['best'] = dict(row, faster_than_torch=self.value > 1)
+        owner._save()
+        return row
+
+    def recover_terminal_boundary(self, stage, operation, args, receipts):
+        if stage != Stage.TEST or not self.inputs.get('single_evaluation'):
+            return None
+        if len(receipts) != 1 or receipts[0]['dispatch']['name'] != 'evaluate':
+            raise WorkflowError('single evaluation recovery requires exactly its original terminal evaluation')
+        self.retain_evaluation(receipts[0]['result'], args, operation)
+        reference = self.store.put_json(dict(stage=stage.value, passed=self.value is not None,
+            evaluation=self.evaluation, speedup=self.value, source=self.project_hash()))
+        return DomainObservation(self.value is not None, (reference,))
+
     def execute(self, stage, args, operation, activity):
         from optimizer.loop import score
         owner = self.owner
@@ -943,17 +986,7 @@ class OptimizerHost(SourceHost):
                 owner.backend.evaluate(candidate['source'], directory, block_count=candidate['block_count']))
             self.value = score(self.baseline, self.evaluation)
             passed = self.value is not None
-            ref = owner._artifact('evaluation', self.evaluation)
-            row = dict(candidate_sha256=sha256(candidate['source'].encode()).hexdigest(),
-                configuration_sha256=fingerprint(candidate), block_count=candidate['block_count'],
-                result=ref, source=owner._artifact('candidate.cpp', candidate['source']),
-                content=self.evaluation, speedup=self.value, summary=args['proposal'])
-            owner.state['seen'].append(row['configuration_sha256'])
-            owner.state['candidate'] = row['source']
-            owner.state['history'].append(row)
-            if passed and self.value > owner.state.get('best', {}).get('speedup', 0):
-                owner.state['best'] = dict(row, faster_than_torch=self.value > 1)
-            owner._save()
+            self.retain_evaluation(self.evaluation, args, operation)
         if stage == Stage.VALIDATION:
             self.value = activity.run('verify-evaluation', 'execution', lambda seconds:
                 score(self.baseline, self.evaluation) if self.evaluation is not None else None, execution=True)
