@@ -1,7 +1,8 @@
 """Immutable accepted-input handoffs; no providers, replay, or parent writes.
 
 capture_parent(..., inheritance='auto'|'parent'|'baseline', overrides=())
-selects Phase1 for Phase2, Phase2 for inference. Auto refuses edited baseline
+defaults to Phase1 for Phase2, Phase2 for inference, baseline for Phase1.
+Explicit revisits accept any phase. Auto refuses edited baseline
 inputs that differ from the selected parent's admitted configuration. Explicit
 parent acknowledges that choice; baseline ignores parents. overrides names
 memory/skills/kdb to take from CURRENT configuration, independently of parent.
@@ -22,6 +23,7 @@ import re
 from core.artifacts import ContentAddressedArtifacts
 from rsi.configuration import checked_snapshot, show_configuration
 from rsi.contracts import CycleSpec, Mode, Stage
+from rsi.cycles import IsolationSnapshot
 from rsi.skills import SkillBundle
 
 
@@ -32,6 +34,13 @@ class ParentSnapshot:
     kdb_ref: str
     parent_cycle: str | None
     source_config_ref: str
+    provenance: str
+
+
+@dataclass(frozen=True)
+class PublishedSkills:
+    bundle_ref: str
+    bundle: SkillBundle
     provenance: str
 
 
@@ -66,27 +75,41 @@ def _memory(store, reference):
     return snapshot
 
 
-def _parent(root, store, expected):
+def _parent(root, store, expected=None, *, require_memory_boundary=True):
     with _locked(root):
         binding, state = _json(root / 'service.json'), _json(root / 'cycle.json')
         spec = CycleSpec.from_dict(binding['spec'])
-        if spec.mode != expected or spec.cycle_id != root.name:
+        if (expected is not None and spec.mode != expected) or spec.cycle_id != root.name:
             raise ValueError('parent cycle identity/mode differs')
         configuration = checked_snapshot(binding['config'])
         if (store.read_json(spec.configuration_ref) != configuration
                 or state['config']['spec'] != spec.to_dict()):
             raise ValueError('parent configuration differs from admitted state')
         # A constructed cycle or completed project is not yet a memory boundary.
-        if 'memory' not in state['completed_operations'].values():
+        if require_memory_boundary and 'memory' not in state['completed_operations'].values():
             return None
         memory = state['memory']
         accepted = _memory(store, memory)
         from benchmarks.ascend.subject_memory import digest
-        memory_root = root / 'memory'
+        branch = root
+        if spec.mode == Mode.INFERENCE:
+            isolation = state.get('isolation')
+            if not isolation:
+                raise ValueError('inference published heads require verified isolation')
+            branch = Path(isolation['branch_root']).resolve(strict=True)
+            if not branch.is_relative_to(root.resolve()) or branch == root.resolve():
+                raise ValueError('inference branch must be independent within cycle')
+            proof = _json(branch / 'isolation.json')
+            IsolationSnapshot(state['namespace'], proof['memory'], proof['skills'],
+                              str(branch), isolation['receipt_ref']).verify()
+        memory_root = branch / 'memory'
         heads = _json(memory_root / 'active.json')
         if hashlib.sha256(accepted['initial_memory'].encode()).hexdigest() != heads['initial_sha256']:
             raise ValueError('accepted memory initial identity differs')
         admitted = {row['version'] for row in heads['admissions'].values()}
+        # Accepted baseline records are copied into independent mutable heads;
+        # their original admission identities need not be copied by the fork.
+        admitted.update(digest(record) for record in _memory(store, spec.baseline_kdb)['memories'])
         for record in accepted['memories']:
             version = digest(record)
             if (version not in admitted or
@@ -94,12 +117,14 @@ def _parent(root, store, expected):
                 raise ValueError('memory lacks accepted SubjectMemory admission')
         skills = state['skills']
         SkillBundle.from_dict(store.read_json(skills))
-        if expected != Mode.PHASE1:
-            learning = _json(root / 'learning.json')
+        if spec.mode != Mode.PHASE1:
+            learning = _json(branch / 'learning.json')
             if learning['active'] != skills:
                 raise ValueError('published skill and Learning heads differ')
+            record = learning['candidates'].get(skills)
+            if record and record.get('quarantined'):
+                raise ValueError('published skills are quarantined')
             if skills != spec.baseline_skills:
-                record = learning['candidates'].get(skills)
                 if (not record or record.get('quarantined')
                         or record.get('validation', {}).get('workflow') is not True
                         or record.get('validation', {}).get('correctness') is not True
@@ -116,7 +141,7 @@ def _parent(root, store, expected):
         return dict(memory=memory, skills=skills, kdb=kdb, config=configuration,
                     config_ref=spec.configuration_ref, parent=root.name,
                     created=state['created'], pending=state['pending'],
-                    state_ref=store.put_json(state))
+                    state_ref=store.put_json(state), mode=spec.mode.value)
 
 
 def _baseline(root, config, store, needed):
@@ -172,13 +197,13 @@ def capture_parent(instance, mode, from_cycle=None, *, inheritance='auto',
     if from_cycle is not None and (not isinstance(from_cycle, str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', from_cycle)):
         raise ValueError('simple parent cycle identity required')
-    if from_cycle and (inheritance == 'baseline' or mode == Mode.PHASE1):
-        raise ValueError('baseline/Phase1 cannot select a parent')
+    if from_cycle and inheritance == 'baseline':
+        raise ValueError('baseline cannot select a parent')
     current = checked_snapshot(configuration if configuration is not None else show_configuration(root))
     store = ContentAddressedArtifacts(root / 'artifacts')
     selected = None
     expected = Mode.PHASE1 if mode == Mode.PHASE2 else Mode.PHASE2
-    if mode != Mode.PHASE1 and inheritance != 'baseline':
+    if inheritance != 'baseline' and (mode != Mode.PHASE1 or from_cycle or inheritance == 'parent'):
         paths = [root / 'runs' / from_cycle] if from_cycle else sorted((root / 'runs').glob('*'))
         candidates = []
         for folder in paths:
@@ -186,10 +211,11 @@ def capture_parent(instance, mode, from_cycle=None, *, inheritance='auto',
                 if from_cycle:
                     raise ValueError('selected parent cycle does not exist')
                 continue
-            # Other modes are not candidates; selected explicit mode must match.
-            if not from_cycle and _json(folder / 'service.json')['spec']['mode'] != expected.value:
+            # Default curriculum progression is mode-specific; explicit revisits are not.
+            if (not from_cycle and mode != Mode.PHASE1
+                    and _json(folder / 'service.json')['spec']['mode'] != expected.value):
                 continue
-            candidate = _parent(folder, store, expected)
+            candidate = _parent(folder, store, None if from_cycle or mode == Mode.PHASE1 else expected)
             if candidate:
                 candidates.append(candidate)
         if candidates:
@@ -218,3 +244,24 @@ def capture_parent(instance, mode, from_cycle=None, *, inheritance='auto',
         memory_ref=values['memory'], skills_ref=values['skills'], kdb_ref=values['kdb']))
     return ParentSnapshot(values['memory'], values['skills'], values['kdb'],
                           selected['parent'] if selected else None, config_ref, proof)
+
+
+def published_skills(instance, cycle_id):
+    """Export only a locked published head, never an unvalidated candidate.
+
+    The inference head is read from its authenticated isolated Learning branch.
+    A published baseline can be exported before a new memory update; inference
+    must already have completed isolation. The returned receipt freezes scope,
+    source configuration, scheduler state, and any later unresolved operation.
+    """
+    if not isinstance(cycle_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', cycle_id):
+        raise ValueError('simple cycle identity required')
+    root = Path(instance).resolve(strict=True)
+    store = ContentAddressedArtifacts(root / 'artifacts')
+    accepted = _parent(root / 'runs' / cycle_id, store, require_memory_boundary=False)
+    bundle = SkillBundle.from_dict(store.read_json(accepted['skills']))
+    proof = store.put_json(dict(schema='rsi-published-skills-v1', cycle_id=cycle_id,
+        mode=accepted['mode'], bundle_ref=accepted['skills'],
+        source_config_ref=accepted['config_ref'], accepted_state_ref=accepted['state_ref'],
+        later_pending=accepted['pending']))
+    return PublishedSkills(accepted['skills'], bundle, proof)

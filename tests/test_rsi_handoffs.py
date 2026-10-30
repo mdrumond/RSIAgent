@@ -181,3 +181,80 @@ def test_checked_snapshot_detaches_and_rejects_changed_payload():
         checked_snapshot(detached)
     with pytest.raises(ValueError):
         checked_snapshot(_snapshot({'budgets': {'actor_seconds': -1}}))
+
+
+def test_phase1_revisit_and_phase2_same_phase_preserve_parent(tmp_path):
+    from rsi.handoffs import published_skills
+    inputs = setup(tmp_path)
+    root, store, skills, _, config = inputs
+    folder, _, _ = parent(inputs, 'phase-two', Mode.PHASE2)
+    before = {p.name: p.read_bytes() for p in folder.glob('*.json')}
+    for mode in ('phase1', 'phase2'):
+        snapshot = capture_parent(root, mode, 'phase-two', configuration=config)
+        assert snapshot.parent_cycle == 'phase-two' and snapshot.skills_ref == skills
+        assert store.read_json(snapshot.memory_ref)['memories']
+    exported = published_skills(root, 'phase-two')
+    assert exported.bundle_ref == skills
+    assert exported.bundle == builtin_bundle()
+    assert before == {p.name: p.read_bytes() for p in folder.glob('*.json')}
+    baseline = capture_parent(root, 'phase1', configuration=config)
+    assert baseline.parent_cycle is None
+    assert capture_parent(root, 'phase1', inheritance='parent', configuration=config).parent_cycle == 'phase-two'
+
+
+def test_phase1_explicit_phase1_revisit(tmp_path):
+    inputs = setup(tmp_path)
+    root, store, _, _, config = inputs
+    parent(inputs)
+    selected = capture_parent(root, 'phase1', 'research', configuration=config)
+    assert store.read_json(selected.memory_ref)['memories'][0]['proposal']['summary'] == 'research'
+
+
+def test_published_inference_reads_isolated_head_and_vetoes_quarantine(tmp_path):
+    from dataclasses import replace
+    from rsi.cycles import IsolationSnapshot
+    from rsi.handoffs import published_skills
+    inputs = setup(tmp_path)
+    root, store, skills, kdb, config = inputs
+    folder = root / 'runs' / 'isolated'
+    folder.mkdir(parents=True)
+    memory = SubjectMemory(folder / 'memory')
+    baseline = store.put_bytes(memory.snapshot())
+    spec = CycleSpec('isolated', Mode.INFERENCE,
+        (ProjectSpec('tiny', 'Verify', ('python', 'verify.py')),), baseline, skills,
+        configuration_ref=store.put_json(config))
+    branch = folder / 'inference'
+    def isolate(memory_ref, skills_ref, context):
+        SubjectMemory(branch / 'memory')
+        atomic_json(branch / 'learning.json', {'active': skills, 'versions': [skills], 'candidates': {}})
+        atomic_json(branch / 'isolation.json', dict(namespace=context['namespace'],
+            memory=memory_ref, skills=skills_ref, parent=str(memory.root.resolve())))
+        return IsolationSnapshot(context['namespace'], memory_ref, skills_ref, str(branch),
+                                 hashlib.sha256((branch / 'isolation.json').read_bytes()).hexdigest())
+    scheduler = CycleScheduler(folder / 'cycle.json', spec, None, None,
+        skill_update=lambda *a: None, isolate=isolate)
+    atomic_json(folder / 'service.json', {'spec': spec.to_dict(), 'config': config,
+                                        'kdb': store.put_bytes(kdb)})
+    (folder / 'knowledge.sqlite3').write_bytes(kdb)
+    scheduler.step()  # Real isolation reconciliation publishes the branch receipt.
+    # Host publication of a validated bundle, using the scheduler public API.
+    bundle = builtin_bundle()
+    changed = replace(bundle, documents=(replace(bundle.documents[0],
+        content=bundle.documents[0].content + '\nVerified recovery guidance.\n'), *bundle.documents[1:]))
+    candidate = store.put_json(changed.to_dict())
+    learning = {'active': candidate, 'versions': [skills, candidate], 'candidates': {
+        candidate: {'quarantined': False, 'validation': {'workflow': True, 'correctness': True}}}}
+    atomic_json(branch / 'learning.json', learning)
+    # Root Learning is deliberately unrelated: inference must not export it.
+    atomic_json(folder / 'learning.json', {'active': 'wrong-root-head'})
+    scheduler.publish_validated_skills(skills, candidate)
+    scheduler.close()
+    before = (folder / 'cycle.json').read_bytes()
+    exported = published_skills(root, 'isolated')
+    assert exported.bundle_ref == candidate and exported.bundle == changed
+    assert store.read_json(exported.provenance)['mode'] == 'inference'
+    learning['candidates'][candidate]['quarantined'] = True
+    atomic_json(branch / 'learning.json', learning)
+    with pytest.raises(ValueError, match='quarantined'):
+        published_skills(root, 'isolated')
+    assert (folder / 'cycle.json').read_bytes() == before
