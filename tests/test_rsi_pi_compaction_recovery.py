@@ -140,10 +140,12 @@ def test_actual_project_runner_cancel_retains_late_actual_ledger_once(monkeypatc
         runner.actor.close()
         intents=[row for row in runner.events if row['type']=='pi-provider-request']
         ledger=[row for row in runner.events if row['type']=='pi-provider']
-        # Native continuation may already have admitted another request before
-        # RPC abort is observed. Every actual intent must still have one row.
-        assert len(calls)==len(intents)==len(ledger)>=2
-        assert {row['reservation_id'] for row in intents}=={row['reservation_id'] for row in ledger}
+        # A reserved row may be cancelled before durable intent admission.
+        reserved=holders[0].gateway.records
+        dispatched=[row for row in ledger if row['dispatch_attempted']]
+        assert len(calls)==len(dispatched)>=2
+        assert {row['reservation_id'] for row in dispatched} <= {row['reservation_id'] for row in intents}
+        assert {row['reservation_id'] for row in reserved}=={row['reservation_id'] for row in ledger}
         assert len({row['reservation_id'] for row in ledger})==len(ledger)
         assert any(row['usage'] is None and row.get('close_snapshot') for row in ledger)
         assert runner.workflow.pending and runner.workflow.stage==Stage.TASK_CONSTRUCTION
@@ -212,3 +214,55 @@ def test_actual_pi_text_only_turn_continues_pending_stage_and_commits_once(monke
         assert len(flow.state['history'])==2
         assert len([1 for kind,row in events if kind=='pi-event' and row['event']['type']=='agent_settled'])==1
     finally:actor.close()
+
+
+def test_actual_pi_cancel_before_third_intent_retains_unadmitted_reservation(monkeypatch,tmp_path):
+    from test_rsi_project_runner import make
+    from coding.pi.rpc import PiCancelled
+    from rsi.skills import builtin_bundle
+    from coding.pi.session import runtime_preflight,RuntimeUnavailable
+    try:runtime_preflight()
+    except RuntimeUnavailable:pytest.skip('cached pinned Pi/Node22 required')
+    calls,holders,cancelled=[],[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        calls.append(json.loads(kwargs['data']))
+        assert len(calls)<=2  # The third local reservation must never reach HTTP.
+        return response([('read_skill',{'name':name}) for name in names] if len(calls)==1 else [],len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    def factory():
+        adapter=PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'})
+        session=adapter.session;holders.append(session)
+        original=session.requests.get_nowait
+        def dequeue():
+            # Observe the actual queued intent BEFORE the main-thread pump
+            # admits it. Leave it queued so close rejects the waiting callback.
+            with session.requests.mutex:
+                front=session.requests.queue[0] if session.requests.queue else None
+            if not cancelled and front and front[0][:2]==('record','pi-provider-request') and len(session.gateway.records)==3:
+                cancelled.append(front[0][2]['reservation_id'])
+                session.rpc.send({'type':'abort'})
+                raise PiCancelled('operator stops before durable third intent')
+            return original()
+        session.requests.get_nowait=dequeue
+        return adapter
+    runner,_,database=make(tmp_path,session_factory=factory)
+    try:
+        runner.actor.step(runner.context())
+        with pytest.raises(PiCancelled):runner.actor.step(runner.context())
+        runner.actor.close()
+        session=holders[0]
+        reserved=session.gateway.records
+        ledger=[row for row in runner.events if row['type']=='pi-provider']
+        intents=[row for row in runner.events if row['type']=='pi-provider-request']
+        assert len(reserved)==len(ledger)==3 and len(calls)==len(intents)==2
+        assert len({row['reservation_id'] for row in ledger})==3
+        assert {row['reservation_id'] for row in reserved}=={row['reservation_id'] for row in ledger}
+        assert {row['reservation_id'] for row in ledger if row['dispatch_attempted']}=={
+            row['reservation_id'] for row in intents}
+        unadmitted=[row for row in ledger if not row['dispatch_attempted']]
+        assert len(unadmitted)==1 and unadmitted[0]['reservation_id']==cancelled[0]
+        assert unadmitted[0]['usage'] is None and unadmitted[0]['status']=='transport_error'
+        assert runner.workflow.pending and runner.workflow.stage==Stage.TASK_CONSTRUCTION
+        assert session.closed and session.rpc.process.poll() is not None and session.gateway.finished.is_set()
+    finally:runner.actor.close();database.close()
