@@ -147,3 +147,36 @@ def test_actual_project_runner_cancel_retains_late_actual_ledger_once(monkeypatc
         assert runner.workflow.pending and runner.workflow.stage==Stage.TASK_CONSTRUCTION
         assert holders[0].gateway.finished.is_set()
     finally:runner.actor.close();database.close()
+
+
+def test_actual_pi_close_reaps_child_when_host_leaves_accounting_unknown(monkeypatch,tmp_path):
+    from rsi.runtime import WorkflowError
+    from rsi.skills import builtin_bundle
+    events,calls=[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        calls.append(json.loads(kwargs['data']))
+        actions=([('read_skill',{'name':name}) for name in names] if len(calls)==1 else
+                 [('perform',{'proposal':'host failure leaves timing unresolved'})])
+        return response(actions,len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    def failed_host(*args):
+        flow.accounting.uncertainties['host-failure']={'reason':'unknown host interval'}
+        flow.accounting.save()
+        raise RuntimeError('host callback failed with unknown timing')
+    actor,flow=native_actor(tmp_path,events,failed_host)
+    actor.step({'goal':'retain unknown host failure'})
+    with pytest.raises(Exception):
+        actor.step({'goal':'retain unknown host failure'})
+    session=actor.session.session
+    process=session.rpc.process
+    assert process.poll() is None
+    with pytest.raises(WorkflowError):actor.close()
+    assert session.closed and process.poll() is not None
+    assert flow.pending and flow.stage==Stage.TASK_CONSTRUCTION
+    assert 'host-failure' in flow.accounting.uncertainties
+    closure=[row for kind,row in events if kind=='pi-ledger-closure']
+    assert closure and closure[-1]['accounting_unknown'] is True
+    assert {row['reservation_id'] for row in session.gateway.records}=={
+        row['reservation_id'] for kind,row in events if kind=='pi-provider'}
+    actor.close()  # Cleanup remains idempotent without reconciling unknown clocks.

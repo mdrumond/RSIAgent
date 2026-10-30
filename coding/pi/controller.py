@@ -247,17 +247,30 @@ class ControllerSession(PiCodingSession):
         if self.closed:
             return
         actor, record = self.active_actor, self.active_record
-        token = actor.workflow.accounting.start('thinking') if actor else None
+        token, errors = None, []
         try:
+            if actor:
+                try:
+                    token = actor.workflow.accounting.start('thinking')
+                except Exception as exc:
+                    errors.append(exc)
             # Wake blocked callbacks before inherited process/server cleanup.
             while not self.requests.empty():
                 _, done, response = self.requests.get_nowait()
                 response['error'] = 'controller closed; reconcile pending work'
                 done.set()
-            super().close()
+            try:
+                super().close()
+            except Exception as exc:
+                errors.append(exc)
             # No network-abort mechanism: bounded observation of actual final rows.
-            left = [] if actor is None else [v for v in actor.workflow.remaining().values() if v is not None]
-            end = time.monotonic()+min([2.0, *left])
+            try:
+                left = [] if actor is None else [v for v in actor.workflow.remaining().values() if v is not None]
+                wait = max(0, min([2.0, *left])) if not errors else 0
+            except Exception as exc:
+                errors.append(exc)
+                wait = 0  # Unknown allocation cannot authorize additional waiting.
+            end = time.monotonic()+wait
             while not self.gateway.finished.is_set() and time.monotonic() < end:
                 self.gateway.finished.wait(timeout=min(.02,max(0,end-time.monotonic())))
             settled = self.gateway.finished.is_set()
@@ -267,7 +280,13 @@ class ControllerSession(PiCodingSession):
                         record('pi-provider', dict(row, close_snapshot=True, provider_settled=settled))
                         self.retained_reservations.add(row['reservation_id'])
                 record('pi-ledger-closure', dict(provider_settled=settled,
-                    request_count=len(self.gateway.records), retained_count=len(self.retained_reservations)))
+                    request_count=len(self.gateway.records), retained_count=len(self.retained_reservations),
+                    accounting_unknown=bool(errors)))
         finally:
             if token:
-                actor.workflow.accounting.end(token)
+                try:
+                    actor.workflow.accounting.end(token)
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
