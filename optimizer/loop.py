@@ -109,8 +109,16 @@ class OptimizationLoop:
         from rsi.domain_execution import require_adoption
         # A settled user stop needs no provider admission or actor dispatch.
         # Unknown native work is still reconciled by the worker before settlement.
-        if getattr(self, 'store', None) is not None and self.store.get(self.key)['status'] == 'stopped':
-            return self.store.get(self.key)
+        if getattr(self, 'store', None) is not None:
+            row = self.store.get(self.key)
+            active = self.state.get('canonical_active', {})
+            if row['stop_requested'] and active.get('status') == 'accepted' and row['status'] == 'running':
+                # Accepted canonical work has already settled; apply current
+                # control status without provider admission or native replay.
+                self.store.transition(self.key, 'stopped')
+                row = self.store.get(self.key)
+            if row['status'] == 'stopped':
+                return row
         # Preparation and single-evaluation are explicit workload boundaries,
         # not permission to dispatch the previous independent search loop.
         try:

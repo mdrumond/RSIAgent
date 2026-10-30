@@ -70,21 +70,29 @@ class DomainActivity:
         self.runner, self.operation = runner, operation
         self.executions = []
 
-    def run(self, name, category, callback, *, execution=False):
+    def run(self, name, category, callback, *, execution=False, invocation=None):
         flow = self.runner.workflow
         if category not in flow.accounting.BILLABLE | flow.accounting.EXCLUDED:
             raise ValueError('unknown domain activity category')
         if category in ('compilation', 'execution', 'profiling') and not execution:
             raise ValueError('compilation/execution/profiling require an execution reservation')
         seconds = self.runner.actor._available()
+        key = self.operation + ':' + name
+        if invocation is not None:
+            intent = self.runner.store.read_json(invocation)
+            admitted = self.runner.latest('domain-tool-invocation', self.operation)
+            if (not admitted or admitted['reference'] != invocation or intent['operation_id'] != self.operation
+                    or intent['contract_ref'] != self.runner.contract_ref or intent['name'] != name
+                    or intent['source_hash'] != self.runner.backend.project_hash()):
+                raise WorkflowError('diagnostic invocation lacks current host admission')
+            key += ':' + invocation
         if execution:
-            key = self.operation + ':' + name
             if not flow.reserve_execution(key):
                 raise WorkflowError('domain operation already reserved; observe before resuming')
         activity = uuid.uuid4().hex
         dispatch = dict(kind='rsi-domain-dispatch-v1', activity_id=activity,
             operation_id=self.operation, stage=flow.stage.value, name=name, category=category,
-            execution=execution, reservation=self.operation+':'+name if execution else None,
+            execution=execution, reservation=key if execution else None, invocation_ref=invocation,
             contract_ref=self.runner.contract_ref, identity=self.runner.checked_identity(self.runner.backend),
             backend_identity=self.runner.service.backend_identity, test_backend=self.runner.service.test_backend,
             source_hash=self.runner.backend.project_hash(), remaining=flow.remaining())
@@ -296,6 +304,11 @@ class DomainRunner(ProjectRunner):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline changed during workflow')
         selection = self.selection(operation) if stage in (Stage.DESIGN, Stage.OPTIMISATION) else None
+        request = self.latest('actor-request', operation)
+        intent = self.store.put_json(dict(kind='domain-stage-intent-v1', operation_id=operation,
+            stage=stage.value, contract_ref=self.contract_ref, source_hash=self.backend.project_hash(),
+            request_id=request['request_id'] if request else None, arguments=args))
+        self.append(dict(type='domain-stage-intent', operation_id=operation, reference=intent))
         activity = DomainActivity(self, operation)
         if stage == Stage.OPTIMISATION:
             decision = self.store.read_json(next(e['reference'] for e in reversed(self.events)
@@ -309,6 +322,11 @@ class DomainRunner(ProjectRunner):
             raise WorkflowError('domain source changed outside current stage')
         if 'edit' in args:
             edit = args['edit']
+            before_edit = getattr(self.backend, 'before_edit', None)
+            if before_edit is not None:
+                before_edit(stage, edit, operation, activity)
+                if self.backend.project_hash() != old_hash:
+                    raise WorkflowError('domain pre-edit activity changed the current source')
             activity.run('edit', 'implementation', lambda _: self.backend.edit(edit['path'], edit['source'],
                 expected_file_hash=edit['sha256'], expected_project_hash=old_hash))
         observation = self.backend.execute(stage, args, operation, activity)
@@ -440,6 +458,9 @@ class DomainRunner(ProjectRunner):
     def reconcile(self):
         if not self.workflow.pending and self.backend.project_hash() != self.workflow.source_hash:
             raise WorkflowError('domain source changed outside workflow; explicit reconciliation required')
+        if self.workflow.pending and not self.latest('stage-result', self.workflow.pending['id']):
+            from rsi.domain_recovery import recover_completed_boundary
+            recover_completed_boundary(self)
         return super().reconcile()
 
     def run(self):
