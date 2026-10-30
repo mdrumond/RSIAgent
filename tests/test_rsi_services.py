@@ -844,3 +844,69 @@ def test_observed_source_truncation_keeps_complete_artifact_and_negative_fact_sc
         assert cycle.store.read_bytes(row['reference']).decode() == source
     finally:
         cycle.close()
+
+
+def test_repository_ingestion_freezes_old_cycle_and_new_cycle_retrieves_actual_index(instance, tmp_path):
+    from rsi.instance_ingestion import ingest_instance
+    from rsi.strategy import knowledge_db_query
+    from test_rsi_instance_ingestion import source_repo
+    baseline = instance.root / 'memory/knowledge.sqlite3'
+    original = baseline.read_bytes()
+    inventory = (instance.root / 'instance.json').read_bytes()
+    before = instance.create_cycle('before-real-ingest', 'phase1')
+    old_db = (before.root / 'knowledge.sqlite3').read_bytes()
+    old_binding = (before.root / 'service.json').read_bytes()
+    before.close()
+    source, revision = source_repo(tmp_path)
+    ingested = ingest_instance(instance.root, source, collection='new-repository',
+        repository='fixture/new-repository', negative_records=[dict(id='retained-negative', source_revision=revision)],
+        test_embeddings=Embedding())
+    assert baseline.read_bytes() == original
+    assert (instance.root / 'instance.json').read_bytes() == inventory
+    assert (before.root / 'knowledge.sqlite3').read_bytes() == old_db
+    assert (before.root / 'service.json').read_bytes() == old_binding
+    after = instance.create_cycle('after-real-ingest', 'phase1')
+    database = KnowledgeDB.open_read_only(after.root / 'knowledge.sqlite3', Embedding())
+    after.database = database
+    instance.test = Bindings(knowledge_db_query(database, ('new-repository',), negative_query=lambda _: []),
+                             Decisions, Roles, instance.test.identity)
+    try:
+        assert after.config['baseline_kdb'] == ingested['baseline_kdb']
+        assert after.config['kdb_ingestion_refs'] == [ingested['reference']]
+        assert after.step().outcome == 'accepted'
+        runner = after.open_project(after.scheduler.state['originals'][0]['operation_id'])
+        rows = [runner.store.read_json(e['reference'])['payload']['response']
+                for e in runner.events if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert rows and all(any(hit['collection'] == 'new-repository' and hit['text'].strip() == 'answer = 42'
+                               for hit in row['results']) for row in rows)
+        assert all(row['provenance']['ingestions'][0]['reference'] == ingested['reference'] for row in rows)
+        with KnowledgeDB.open_read_only(before.root / 'knowledge.sqlite3', Embedding()) as old:
+            with pytest.raises(KeyError):
+                old.manifest('new-repository')
+    finally:
+        after.close()
+
+
+def test_phase1_explicit_revisit_inherits_accepted_head_and_never_writes_skills(instance):
+    parent = instance.create_cycle('revisit-parent', 'phase1')
+    try:
+        assert parent.step().outcome == 'accepted'
+        parent.step()  # Publish actual accepted memory boundary.
+        memory, skills = parent.scheduler.state['memory'], parent.scheduler.state['skills']
+        parent_bytes = {name: (parent.root / name).read_bytes()
+                        for name in ('cycle.json', 'learning.json', 'memory/active.json')}
+    finally:
+        parent.close()
+    revisited = instance.create_cycle('revisited-phase1', 'phase1', from_cycle='revisit-parent', inheritance='parent')
+    try:
+        assert revisited.scheduler.state['memory'] == memory
+        assert revisited.scheduler.state['skills'] == skills
+        assert revisited.binding['input_handoff']['parent_cycle'] == 'revisit-parent'
+        assert revisited.step().outcome == 'accepted'
+        revisited.step()
+        assert revisited.scheduler.state['skills'] == skills
+        assert not revisited.scheduler.state['candidates'] and not Roles.prompts
+        for name, data in parent_bytes.items():
+            assert (parent.root / name).read_bytes() == data
+    finally:
+        revisited.close()
