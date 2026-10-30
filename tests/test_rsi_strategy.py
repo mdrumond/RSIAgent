@@ -43,6 +43,7 @@ def setup(tmp_path):
     exposure = log[-1]['reference']
     usage.read('design')
     skill = service.read_receipt(usage.last_read_receipt['receipt_id'])
+    usage.read('kdb')
     yield service, make, state, log, store, skill, exposure
     database.close()
 
@@ -66,7 +67,7 @@ def decisions(service, query, *, reuse=False):
 
 def select(service, skill, query, retro, choices=None):
     return service.select('Use compensated sum', query_ref=query, retrospective_ref=retro,
-                          skill_refs=[skill], decisions=choices if choices is not None
+                          skill_refs=list(dict.fromkeys([skill, *service._current_reads(service._context())])), decisions=choices if choices is not None
                           else decisions(service, query))
 
 
@@ -194,3 +195,54 @@ def test_test_backend_requires_explicit_opt_in(setup):
         StrategyEvidence(store, log.append, lambda: state, service.bundle,
                          service.query_backend, workflow_id='project1',
                          backend_identity='TEST@1')
+
+
+def test_kdb_alone_cannot_complete_or_select_and_restart_preserves_gate(setup):
+    service, make, state, _, _, _, _ = setup
+    state['pending']['id'] = 'op2'
+    usage = SkillUsage(service.bundle, 'op2', Stage.DESIGN, service.record_skill_event)
+    usage.expose()
+    usage.read('kdb')
+    kdb = service.read_receipt(usage.last_read_receipt['receipt_id'])
+    query, retro = prepare(service, kdb)
+    assert not service.resolve('skill', kdb, Stage.DESIGN, 'op2')
+    assert not make().resolve('skill', kdb, Stage.DESIGN, 'op2')
+    with pytest.raises(WorkflowError):
+        service.select('Try stable accumulation', query_ref=query, retrospective_ref=retro,
+                       skill_refs=[kdb], decisions=decisions(service, query))
+    usage.read('design')
+    design = service.read_receipt(usage.last_read_receipt['receipt_id'])
+    assert service.resolve('skill', kdb, Stage.DESIGN, 'op2')
+    assert make().resolve('skill', design, Stage.DESIGN, 'op2')
+    # Host has both reads, but selection must explicitly cite the complete set.
+    with pytest.raises(WorkflowError):
+        service.select('Try stable accumulation', query_ref=query, retrospective_ref=retro,
+                       skill_refs=[kdb], decisions=decisions(service, query))
+    service.select('Try stable accumulation', query_ref=query, retrospective_ref=retro,
+                   skill_refs=[kdb, design], decisions=decisions(service, query))
+    assert service.resolve('retrieval', query, Stage.DESIGN, 'op2')
+
+
+def test_runtime_completion_requires_all_mapped_reads(setup, tmp_path):
+    from rsi.contracts import StepEvidence
+    from rsi.runtime import Workflow
+    service, _, state, _, _, _, _ = setup
+    workflow = Workflow(tmp_path / 'workflow.json', service.resolve, source_hash='v1')
+    workflow.state.update(state, pending={'id': 'completion-op'})
+    service.snapshot = lambda: workflow.state
+    usage = SkillUsage(service.bundle, 'completion-op', Stage.DESIGN, service.record_skill_event)
+    usage.expose()
+    usage.read('kdb')
+    kdb = service.read_receipt(usage.last_read_receipt['receipt_id'])
+    query, retro = prepare(service, kdb)
+    evidence = StepEvidence(Stage.DESIGN, 'completion-op', skill_refs=(kdb,),
+                            retrieval_refs=(query,), retrospective_ref=retro, source_hash='v1')
+    with pytest.raises(WorkflowError):
+        workflow.complete(evidence)
+    assert workflow.stage == Stage.DESIGN
+    usage.read('design')
+    design = service.read_receipt(usage.last_read_receipt['receipt_id'])
+    service.select('Stable accumulation', query_ref=query, retrospective_ref=retro,
+                   skill_refs=[design, kdb], decisions=decisions(service, query))
+    workflow.complete(evidence)
+    assert workflow.stage == Stage.IMPLEMENTATION

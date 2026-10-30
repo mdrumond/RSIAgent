@@ -164,8 +164,7 @@ class StrategyEvidence:
         self._load('retrospective', retrospective_ref, context)
         if not isinstance(proposal, str) or not proposal.strip() or not skill_refs:
             raise WorkflowError('proposal and skill reads required')
-        for ref in skill_refs:
-            self._skill(ref, context)
+        self._require_skill_coverage(skill_refs, context)
         rows = query['response']
         expected = {(group, i) for group in ('results', 'negative_records')
                     for i in range(len(rows[group]))}
@@ -191,12 +190,24 @@ class StrategyEvidence:
             raise WorkflowError('exposure or citation is not a skill read')
         return event
 
+    def _require_skill_coverage(self, references, context):
+        reads = {self._skill(ref, context)['skill'] for ref in references}
+        if not set(self.bundle.skills_for(Stage(context['stage']))) <= reads:
+            raise WorkflowError('all mapped stage skills must be read')
+
+    def _current_reads(self, context):
+        return [ref for ref, kind in self.receipts.items()
+                if kind == 'skill'
+                and (record := self.artifacts.read_json(ref))['context'] == context
+                and record['payload']['kind'] == 'read']
+
     def resolve(self, kind, reference, stage, operation_id):
         """Workflow.resolver-compatible; strategy completion requires selection."""
         try:
             context = self._context(stage, operation_id)
             if kind == 'skill':
                 self._skill(reference, context)
+                self._require_skill_coverage(self._current_reads(context), context)
                 return True
             if kind not in ('retrieval', 'retrospective'):
                 return False
