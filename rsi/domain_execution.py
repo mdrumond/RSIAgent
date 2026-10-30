@@ -238,6 +238,15 @@ class DomainRunner(ProjectRunner):
                                       self.spec.performance_goal is not None and validation['performance'] != 'met'):
                 raise WorkflowError('domain host cannot accept a failed validation')
         redesign = observation.redesign
+        implementation_cap = self.workflow.limits.implementation_iterations
+        design_cap = self.workflow.limits.design_iterations
+        if (stage == Stage.DEBUG and self.workflow.state['tested'] != old_hash
+                and implementation_cap is not None
+                and self.workflow.state['implementation'] >= implementation_cap
+                and (design_cap is None or self.workflow.state['design'] < design_cap)):
+            redesign = True
+            self.append(dict(type='domain-redesign', operation_id=operation,
+                reason='Implementation allocation reached; retain failures for next design', source_hash=old_hash))
         request = next((e for e in reversed(self.events) if e['type'] == 'project-tool'
             and e['operation_id'] == operation and e['name'] == 'request_redesign'), None)
         extra_refs = []
