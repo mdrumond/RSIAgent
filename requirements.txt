@@ -11,3 +11,5 @@ Flask==3.0.3
 huggingface-hub==1.27.0
 docker==7.2.0
 filelock==3.32.6
+# Existing dashboard syntax highlighting imports this directly.
+Pygments==2.18.0

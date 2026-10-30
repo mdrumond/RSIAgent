@@ -29,3 +29,4 @@ dashboard = ["templates/*.html", "static/*"]
 [tool.setuptools.dynamic.optional-dependencies]
 legacy = {file = ["requirements.txt"]}
 roles = {file = ["requirements-roles.txt"]}
+embeddings = {file = ["requirements-embeddings.txt"]}

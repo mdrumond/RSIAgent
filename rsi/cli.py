@@ -11,6 +11,7 @@ from .instances import create_instance, inspect_instance
 from .job_cli import register as register_jobs, execute as execute_jobs
 from .cli_evidence import register as register_evidence
 from .cli_skills import register as register_skills, execute as execute_skills
+from .runtime_cli import register as register_runtime
 
 
 def register_configuration_commands(commands):
@@ -51,6 +52,7 @@ def main(argv=None):
     create.add_argument("--repository-revision")
     inspect = actions.add_parser("inspect")
     inspect.add_argument("path", type=Path)
+    register_runtime(commands, actions)
     args = parser.parse_args(argv)
     try:
         if args.instance is not None:
@@ -58,6 +60,9 @@ def main(argv=None):
             result = dispatch(args.instance, list(sys.argv[1:] if argv is None else argv))
             if result is not None:
                 return result
+        if hasattr(args, "runtime_handler"):
+            print(json.dumps(args.runtime_handler(args), indent=2, allow_nan=False))
+            return 0
         if args.command == "capabilities":
             print(json.dumps(dict(manual_tuning=True, skill_content_editing=True,
                                   skill_map_editing=True, job_accounting=True)))
