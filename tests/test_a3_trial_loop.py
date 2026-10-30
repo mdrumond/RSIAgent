@@ -138,7 +138,9 @@ class Resolver:
 
 
 class FakeKnowledge:
-    def __init__(self, enabled): self.enabled, self.queries = enabled, []
+    def __init__(self, enabled):
+        self.enabled, self.queries = enabled, []
+        self.canonical_identity = dict(enabled=enabled, test_collection='CPU', manifest='a3-fixture-v1')
     def query(self, query):
         assert isinstance(query, KnowledgeQuery)
         self.queries.append(query.query)

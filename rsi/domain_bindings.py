@@ -18,6 +18,25 @@ def fingerprint(value):
     return sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def knowledge_identity(knowledge):
+    """Freeze selected collection content and admitted negative provenance."""
+    explicit = getattr(knowledge, 'canonical_identity', None)
+    if explicit is not None:
+        return explicit() if callable(explicit) else explicit
+    manifests = getattr(knowledge, 'manifests', None)
+    manifest = getattr(knowledge, 'manifest', None)
+    if manifests is None and manifest is not None:
+        manifests = {getattr(knowledge, 'collection', None): manifest}
+    if manifests is None:
+        if getattr(knowledge, 'enabled', None) is False:
+            return dict(enabled=False)
+        raise CanonicalConfigurationError('native KDB requires collection manifests or explicit canonical_identity')
+    return dict(enabled=getattr(knowledge, 'enabled', True),
+        manifests={name: json.loads(value.to_json()) for name, value in manifests.items()},
+        negative_snapshots={name: snapshot.manifest for name, snapshot in
+                            getattr(knowledge, 'snapshots', {}).items()})
+
+
 def baseline_contract(owner, parent_seconds):
     bundle = getattr(owner, 'canonical_skills', None) or builtin_bundle()
     if isinstance(bundle, dict):
@@ -129,9 +148,8 @@ class KernelActionsHost(SourceHost):
         memory = request.pre_wave_memory if request is not None else Path(inputs['context']).read_bytes()
         self.identity = dict(target=fingerprint(dict(runtime=getattr(self.runtime, 'runtime_identity',
             type(self.runtime).__qualname__), prepared=str(getattr(self.actions, 'prepared', '')))),
-            provider=inputs['profile'].identity.as_dict(), kdb=fingerprint(dict(
-                query=getattr(getattr(self.actions, 'query_knowledge', None), '__qualname__', None) if self.adaptive else
-                    getattr(self.actions.knowledge, 'collection', None))),
+            provider=inputs['profile'].identity.as_dict(), kdb=fingerprint(knowledge_identity(
+                self.actions.query_knowledge if self.adaptive else self.actions.knowledge)),
             memory=sha256(memory).hexdigest(), verifier=fingerprint(str(
                 getattr(self.actions, 'prepared', inputs.get('context')))))
 
@@ -367,14 +385,26 @@ class A3Host(SourceHost):
             self.source = recovery
         self.feedback, self.observations, self.queries, self.actions = [], [], 0, []
         self.failures, self.failure_classification = [], None
+        memory_context = owner.memory.project_context()
+        # An accepted run appends exactly its own learning entry. Reopening may
+        # reuse that admitted baseline only for the retained, exact post-commit
+        # bytes; subsequent journal changes must still invalidate the baseline.
+        event_path = owner.workdir / 'canonical' / 'events.json'
+        if event_path.exists():
+            events = [self.store.read_json(ref) for ref in json.loads(event_path.read_text())]
+            commit = next((row for row in reversed(events) if row.get('type') == 'domain-memory-commit'), None)
+            if commit is not None:
+                if memory_context.encode() != self.store.read_bytes(commit['after']):
+                    raise CanonicalConfigurationError('native memory changed after retained learning commit')
+                memory_context = self.store.read_bytes(commit['before']).decode()
+        self.admitted_memory = memory_context
         self.instruction = json.dumps(dict(proposal=asdict(owner.proposal),
             profile=owner.profile.as_dict(), execution_profile=owner.execution_profile,
             source_contract=CANDIDATE_SOURCE_CONTRACT.as_dict(),
-            memory=json.loads(owner.memory.project_context())), default=str)
+            memory=json.loads(memory_context)), default=str)
         self.identity = dict(target=owner.execution_profile, provider=owner.profile.as_dict(),
-            kdb=fingerprint(dict(collection=getattr(owner.knowledge, 'collection', None),
-                                 enabled=owner.knowledge.enabled)),
-            memory=fingerprint(dict(cell=owner.memory.cell_id, lineage=owner.memory.lineage_id)),
+            kdb=fingerprint(knowledge_identity(owner.knowledge)),
+            memory=sha256(memory_context.encode()).hexdigest(),
             verifier=fingerprint(dict(proposal=asdict(owner.proposal), parameters=dict(owner.proposal.parameters))))
 
     checkpoint_fields = SourceHost.checkpoint_fields + ('compilation','verified','profile','timing',
@@ -510,12 +540,7 @@ def a3_adoption():
         if session is None:
             raise CanonicalConfigurationError('A3 canonical binding needs the registered Pi actor session')
         def session_factory():
-            from rsi.actor import SYSTEM
-            session.system_prompt = SYSTEM
-            session.first_action_only = True
-            adapter = object.__new__(PiSessionAdapter)
-            adapter.session = session
-            return adapter
+            return PiSessionAdapter.from_existing_session(session)
         root = owner.workdir / 'canonical'
         injections = dict(query=host.query, backend_identity=fingerprint(host.identity), session_factory=session_factory)
         if (root / 'domain.json').exists():
@@ -542,6 +567,10 @@ def a3_adoption():
                 (AgentInterpretation(host.interpretation, ()),))
             existing = next((entry for entry in owner.memory.read() if entry['memory'] == memory.as_dict()), None)
             entry_ref = (existing or owner.memory.append(memory))['entry_sha256']
+            if runner.latest('domain-memory-commit') is None:
+                runner.append(dict(type='domain-memory-commit', entry_sha256=entry_ref,
+                    before=host.store.put_bytes(host.admitted_memory.encode()),
+                    after=host.store.put_bytes(owner.memory.project_context().encode())))
             if not any(e.kind == EvidenceKind.RESULT.value and e.payload.get('memory_entry_sha256') == entry_ref
                        for e in owner.evidence.entries):
                 owner.evidence.append(EvidenceKind.RESULT, owner._identity(dict(verified=host.verified,

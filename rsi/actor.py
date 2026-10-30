@@ -181,10 +181,27 @@ class PiSessionAdapter:
     """
     def __init__(self, **kwargs):
         kwargs.setdefault('context_factory', WorkflowContextRecords)
-        self.delivery = SkillDelivery()
-        self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
+        session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
                                        first_action_only=True, **kwargs)
-        self.session.gateway.request_projector = self._project_tools
+        self._bind_session(session)
+
+    @classmethod
+    def from_existing_session(cls, session):
+        """Adopt a registered Pi session without changing its provider route."""
+        adapter = cls.__new__(cls)
+        adapter._bind_session(session, context_factory=WorkflowContextRecords)
+        return adapter
+
+    def _bind_session(self, session, *, context_factory=None):
+        self.delivery = SkillDelivery()
+        self.session = session
+        session.schemas.update(SCHEMAS)
+        if context_factory is not None:
+            session.context_factory = context_factory
+            session.context = context_factory()
+        session.system_prompt = SYSTEM
+        session.first_action_only = True
+        session.gateway.request_projector = self._project_tools
 
     def _project_tools(self, request, **_kwargs):
         # Keep the provider-visible and host-validated perform schema identical.

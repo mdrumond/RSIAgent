@@ -22,6 +22,12 @@ def declared_cpu_fixture_backend(monkeypatch):
     monkeypatch.setattr(DomainRunner, 'create', classmethod(create))
 
 
+def empty_cpu_knowledge(*_):
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
+    return AdaptiveActionResult(dict(available=True, results=[]))
+empty_cpu_knowledge.canonical_identity = dict(test_collection='CPU', manifest='empty-v1')
+
+
 class CanonicalSession:
     def __init__(self, *, initial='bad', repaired='fixed source'):
         self.initial, self.repaired, self.contexts = initial, repaired, []
@@ -75,6 +81,7 @@ def test_default_shared_kernel_binding_runs_real_adaptive_host_and_numeric_repai
     def query(payload, context):
         queries.append(payload)
         return AdaptiveActionResult(dict(available=True, results=[]))
+    query.canonical_identity = dict(test_collection='CPU', manifest='empty-v1')
     actions = _ProjectActions(executor, request, executor.prepare(request.spec), store,
         max_actions=40, max_seconds=500, max_source_bytes=128000, query_knowledge=query,
         request_profile=lambda *_: None, request_timing=lambda *_: None)
@@ -175,6 +182,11 @@ def canonical_a3_fixture(tmp_path, monkeypatch, *, prepare_failure=False):
     from benchmarks.a3kernels.trial import A3TrialLoop, trial_protocol_sha256
     session = CanonicalSession(initial=SOURCE, repaired=SOURCE)
     class Adapter:
+        @classmethod
+        def from_existing_session(cls, session):
+            result = cls()
+            result.session = session
+            return result
         def prepare(self, timeout, *, schemas):
             self.session.prepare(timeout, schemas=schemas)
         def next_action(self, context, allowed, **kwargs):
@@ -198,9 +210,11 @@ def canonical_a3_fixture(tmp_path, monkeypatch, *, prepare_failure=False):
                 return FailedEvidence.create(plan, stage='prepare', error_type='RuntimeError', detail='CPU TEST unavailable route')
             return super().compile(source, workdir, **kw)
     actor = SimpleNamespace(session=session, close=lambda: None)
+    knowledge = FakeKnowledge(True)
+    knowledge.canonical_identity = dict(test_collection='CPU', manifest='a3-v1')
     trial = A3TrialLoop(cell=cell, proposal=DEFAULT_PROPOSALS[0],
         profile=load_a3_model_profile(cell.backend_model), actor=actor,
-        candidate=Candidate(resolver), knowledge=FakeKnowledge(True), profiler=FakeProfiler(resolver),
+        candidate=Candidate(resolver), knowledge=knowledge, profiler=FakeProfiler(resolver),
         evidence=EvidenceLedger(tmp_path / 'evidence.jsonl'), memory=memory, workdir=tmp_path / 'work')
     trial._run = lambda: pytest.fail('old A3 trial loop ran')
     result = trial.run()
@@ -271,6 +285,7 @@ def test_fresh_kernel_actions_restore_verified_native_cas_without_reexecution(tm
     store=ContentAddressedArtifacts(request.branch_root/'artifacts')
     def knowledge(*_):
         return AdaptiveActionResult(dict(available=True,results=[]))
+    knowledge.canonical_identity = dict(test_collection='CPU', manifest='empty-v1')
     def actions():
         return _ProjectActions(executor,request,executor.prepare(request.spec),store,
             max_actions=40,max_seconds=500,max_source_bytes=128000,query_knowledge=knowledge,
@@ -288,6 +303,9 @@ def test_fresh_kernel_actions_restore_verified_native_cas_without_reexecution(tm
     assert second.status=='host-verified' and fresh_actions.latest.evidence.verified
     assert fresh_actions.source=='fixed source'
     assert before==(len(backend.requests),len(backend.run_requests))
+    knowledge.canonical_identity['manifest'] = 'same-label-different-content'
+    with pytest.raises(bindings.CanonicalConfigurationError, match='changed on resume'):
+        driver('frozen native task', action_executor=actions(), **inputs)
 
 
 def test_failed_native_kernel_exports_actual_domain_receipts_with_pending_stage_intact(tmp_path,monkeypatch):
@@ -304,7 +322,7 @@ def test_failed_native_kernel_exports_actual_domain_receipts_with_pending_stage_
     request=_request(tmp_path,executor)
     actions=_ProjectActions(executor,request,executor.prepare(request.spec),
         ContentAddressedArtifacts(request.branch_root/'artifacts'),max_actions=40,max_seconds=500,
-        max_source_bytes=128000,query_knowledge=lambda *_:AdaptiveActionResult(dict(available=True,results=[])),
+        max_source_bytes=128000,query_knowledge=empty_cpu_knowledge,
         request_profile=lambda *_:None,request_timing=lambda *_:None)
     class FailedSession(CanonicalSession):
         def next_action(self,context,allowed,**kwargs):
@@ -353,3 +371,68 @@ def test_local_native_source_rejection_has_observed_failure_receipt_and_export(t
     rows=[runner.store.read_json(e['reference']) for e in runner.events if e['type']=='domain-result']
     assert any(row['status']=='failed' and row['observed_terminal'] is True for row in rows)
     assert export_task(runner.root,tmp_path/'local-native-failure')['task_contract']==runner.contract_ref
+
+
+def test_existing_pi_session_adoption_preserves_route_and_delivers_reads(monkeypatch):
+    import coding.pi.session as native
+    from rsi.actor import PiSessionAdapter, WorkflowContextRecords, SCHEMAS
+    from pathlib import Path
+    monkeypatch.setattr(native, 'runtime_preflight', lambda: Path('/unused-cpu-fixture'))
+    session = native.PiCodingSession(model='deepseek-flash', schemas={},
+        environ={'DEEPSEEK_API_KEY': 'CPU-fixture-secret'})
+    profile, gateway = session.profile, session.gateway
+    adapter = PiSessionAdapter.from_existing_session(session)
+    assert adapter.session is session and session.profile is profile and session.gateway is gateway
+    assert session._provider_secret == 'CPU-fixture-secret'
+    assert session.context_factory is WorkflowContextRecords
+    delivered = []
+    def next_action(context, allowed, *, record, **kwargs):
+        record('pi-provider-request', dict(request=dict(messages=[dict(content='observed skill bytes')])))
+        return 'perform', dict(proposal='CPU fixture')
+    monkeypatch.setattr(session, 'next_action', next_action)
+    adapter.delivery.begin('operation')
+    adapter.expect_read('receipt', 'observed skill bytes')
+    action = adapter.next_action(dict(operation_id='operation', stage=Stage.TASK_CONSTRUCTION.value),
+        ['perform'], seconds=1, record=lambda kind, data: delivered.append((kind, data)), source=None)
+    assert action[0] == 'perform' and adapter.missing_reads(['receipt']) == []
+    assert any(kind == 'skill-delivered' for kind, _ in delivered)
+    request = dict(tools=[dict(function=dict(name='perform', parameters={}))])
+    assert gateway.request_projector(request)['tools'][0]['function']['parameters'] == session.schemas['perform']
+    assert session.schemas['read_skill'] == SCHEMAS['read_skill']
+    adapter.close()
+
+
+@pytest.mark.parametrize('changed', ['memory', 'collection', 'negative_snapshot'])
+def test_native_reopen_refuses_same_labels_with_changed_admitted_content(tmp_path, monkeypatch, changed):
+    _, _, owner = canonical_a3_fixture(tmp_path, monkeypatch)
+    if changed == 'memory':
+        original = owner.memory.project_context
+        def changed_context():
+            value = json.loads(original())
+            value['projects'].append(dict(negative_result='newly admitted failure'))
+            value['completed_projects'] += 1
+            return json.dumps(value)
+        monkeypatch.setattr(owner.memory, 'project_context', changed_context)
+    else:
+        before = dict(owner.knowledge.canonical_identity)
+        owner.knowledge.canonical_identity = dict(before, **{changed: 'different-content'})
+    from rsi.domain_execution import CanonicalConfigurationError
+    with pytest.raises(CanonicalConfigurationError):
+        bindings.a3_adoption().build(owner)
+
+
+def test_collection_identity_includes_actual_sources_and_negative_provenance():
+    from dataclasses import replace
+    from benchmarks.a5kernels.knowledge import CollectionManifest, SourceFingerprint
+    manifest = CollectionManifest('same-name', 'python', 'TEST', 'TEST',
+        (SourceFingerprint('kernel.py', 'a'*64, 1),), 'b'*64)
+    knowledge = SimpleNamespace(enabled=True, collection='same-name', manifest=manifest,
+        snapshots={'same-name': SimpleNamespace(manifest=dict(fingerprint='negative-v1'))})
+    original = bindings.fingerprint(bindings.knowledge_identity(knowledge))
+    knowledge.manifest = replace(manifest, sources=(SourceFingerprint('kernel.py', 'c'*64, 1),))
+    assert bindings.fingerprint(bindings.knowledge_identity(knowledge)) != original
+    knowledge.manifest = manifest
+    knowledge.snapshots['same-name'].manifest['fingerprint'] = 'negative-v2'
+    assert bindings.fingerprint(bindings.knowledge_identity(knowledge)) != original
+    with pytest.raises(bindings.CanonicalConfigurationError):
+        bindings.knowledge_identity(lambda *_: [])
