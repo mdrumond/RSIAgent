@@ -65,7 +65,7 @@ class Session:
         pass
 
 
-def make(tmp_path, session=None, **overrides):
+def make(tmp_path, session=None, *, config_overrides=None, **overrides):
     source = tmp_path / 'input'
     source.mkdir()
     (source / 'solution.py').write_text('def solve(xs):\n    total = 0.0\n    for x in xs: total += x\n    return total\n')
@@ -87,6 +87,7 @@ def make(tmp_path, session=None, **overrides):
             'compile': [sys.executable, '-m', 'py_compile', 'solution.py'],
             'test': [sys.executable, '{verifier}'],
             'validation': [sys.executable, '{verifier}']})
+    config.update(config_overrides or {})
     runner = ProjectRunner.create(tmp_path / 'task', spec, builtin_bundle(), config, **injected)
     return runner, injected, database
 
@@ -205,5 +206,26 @@ def test_budget_exhaustion_keeps_partial_history_without_acceptance(tmp_path):
         assert result['status'] == 'budget_exhausted'
         assert len(result['history']) == 1
         assert runner.workflow.outcome is None
+    finally:
+        database.close()
+
+
+def test_correctness_and_performance_shortfall_are_separate(tmp_path):
+    runner, _, database = make(tmp_path, config_overrides=dict(
+        performance_seconds=1e-9,
+        commands={
+            'compile': [sys.executable, '-m', 'py_compile', 'solution.py'],
+            'test': [sys.executable, '{verifier}'],
+            'validation': [sys.executable, '{verifier}'],
+            'timing': [sys.executable, 'solution.py']}))
+    try:
+        result = runner.run()
+        assert result['status'] == 'rejected', result
+        assert result['correctness'] is True
+        assert result['performance'] == 'shortfall'
+        (runner.backend.project / 'solution.py').write_text('invalid source!')
+        reopened = runner.run()
+        assert reopened['status'] == 'suspended'
+        assert reopened['correctness'] is None
     finally:
         database.close()
