@@ -254,3 +254,39 @@ def test_baseline_evidence_cas_references_survive_bootstrap(tmp_path, inputs):
     assert not (copied / '.cache').exists()
     assert original == {str(p.relative_to(baseline)): p.read_bytes()
                         for p in baseline.rglob('*') if p.is_file()}
+
+
+def test_shared_repository_clone_survives_upstream_removal(tmp_path, inputs):
+    import shutil
+    upstream = tmp_path / 'upstream'
+    upstream.mkdir()
+    git(upstream, 'init', '-q')
+    git(upstream, 'config', 'user.email', 'test@example.com')
+    git(upstream, 'config', 'user.name', 'Test')
+    (upstream / 'main.py').write_text('print(42)')
+    git(upstream, 'add', '.')
+    git(upstream, 'commit', '-qm', 'source')
+    shared = tmp_path / 'shared'
+    subprocess.run(['git', 'clone', '--shared', str(upstream), str(shared)],
+                   check=True, capture_output=True)
+    assert (shared / '.git/objects/info/alternates').exists()
+    create_instance(tmp_path / 'independent', repository=shared, **inputs)
+    copied = tmp_path / 'independent/repository'
+    shutil.rmtree(upstream)
+    shutil.rmtree(shared)
+    assert not (copied / '.git/objects/info/alternates').exists()
+    git(copied, 'fsck', '--full')
+    assert git(copied, 'show', 'HEAD:main.py') == 'print(42)'
+
+
+def test_destination_parent_alias_into_baseline_rejected_before_staging(tmp_path, inputs, monkeypatch):
+    alias = tmp_path / 'folder-alias'
+    alias.symlink_to(inputs['baseline_skills'], target_is_directory=True)
+    before = sorted(inputs['baseline_skills'].iterdir())
+    def forbidden(*args, **kwargs):
+        pytest.fail('must reject baseline containment before staging')
+    monkeypatch.setattr('rsi.instances.tempfile.mkdtemp', forbidden)
+    with pytest.raises(ValueError, match='inside a baseline'):
+        create_instance(alias / 'new-instance', **inputs)
+    assert sorted(inputs['baseline_skills'].iterdir()) == before
+    assert not (alias / 'new-instance').exists()

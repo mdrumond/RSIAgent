@@ -145,7 +145,7 @@ def _clone(repository, revision, destination):
         parsed = urlsplit(source)
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError('repository URL must not contain credentials')
-    subprocess.run(['git', 'clone', '--no-hardlinks', '--no-checkout', '--', source,
+    subprocess.run(['git', 'clone', '--no-hardlinks', '--dissociate', '--no-checkout', '--', source,
                     str(destination)], check=True, capture_output=True)
     _git(destination, 'checkout', '--detach', revision or 'HEAD')
     pinned = _git(destination, 'rev-parse', 'HEAD').decode().strip()
@@ -156,11 +156,15 @@ def _clone(repository, revision, destination):
 def create_instance(destination, *, baseline_kdb, baseline_skills, skill_map,
                     repository=None, repository_revision=None):
     """Create a snapshot; return its manifest. Never merge into an existing path."""
-    destination = Path(destination).absolute()
+    destination = Path(destination).expanduser().absolute()
     if os.path.lexists(destination):
         raise FileExistsError(destination)
-    kdb, skills, mapping = (Path(p).expanduser().absolute()
-                            for p in (baseline_kdb, baseline_skills, skill_map))
+    inputs = tuple(Path(p).expanduser().absolute()
+                   for p in (baseline_kdb, baseline_skills, skill_map))
+    if any(source.is_symlink() for source in inputs):
+        raise ValueError('baseline symlinks are unsupported')
+    destination = destination.resolve()
+    kdb, skills, mapping = (source.resolve() for source in inputs)
     if not kdb.exists() or not skills.is_dir() or not mapping.is_file():
         raise ValueError('explicit existing KDB, skills directory and skill map are required')
     json.loads(mapping.read_text(encoding='utf-8'))
