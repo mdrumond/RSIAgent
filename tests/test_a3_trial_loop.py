@@ -324,230 +324,113 @@ def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
 
 
 def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):
-    class CompileFailure(FakeCandidate):
-        def compile(self, source, _workdir, **kw):
-            plan = self._plan(
-                source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"),
-                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-            )
-            return FailedEvidence.create(
-                plan, stage="compile", error_type="CompileError", detail="fixture",
-            )
-
-    result, prompts, _ = _run(
-        tmp_path,
-        [json.dumps({"action": "write_source", "source": SOURCE}),
-         '{"action":"compile"}', '{"action":"compile"}'],
-        candidate=CompileFailure(), budgets=TrialBudgets(max_seconds=3),
-    )
-    context = json.loads(prompts[2])
-    observation = context["observations"][-1]["candidate_failure"]
-    assert observation == {
-        "stage": "compile",
-        "error_type": "CompileError",
-        "diagnostic": "fixture",
-        "detail_truncated": False,
-        "source_fingerprint": observation["source_fingerprint"],
-        "execution_id": observation["execution_id"],
-        "attestation_sha256": observation["attestation_sha256"],
-        "next_action": "write_source",
-    }
-    assert all(len(observation[key]) == 64 for key in (
-        "source_fingerprint", "execution_id", "attestation_sha256",
-    ))
-    assert context["action_contract"]["trial_state"] == "rewrite-required"
-    assert context["action_contract"]["required_next_action"] == "write_source"
-    assert set(context["allowed_actions"]) == {"write_source"}
-    assert len(json.dumps(context["observations"][-1])) <= 2048
-    failure_entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    assert observation["attestation_sha256"] in {
-        entry.payload["failed_evidence"]["attestation_sha256"]
-        for entry in failure_entries if "failed_evidence" in entry.payload
-    }
-    assert result.failures == (
-        "compile failed: fixture",
-        "compile is not valid in rewrite-required",
-    )
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    candidate = recording_candidate(compile_failures=1)
+    owner, session = make_trial(tmp_path, candidate=candidate)
+    result = owner.run()
+    assert result.status == 'passed'
+    failures = [row.payload['failed_evidence'] for row in owner.evidence.entries if 'failed_evidence' in row.payload]
+    assert len(failures) == 1 and failures[0]['stage'] == 'compile'
+    assert failures[0]['error_type'] == 'CompileError'
+    assert len(failures[0]['attestation_sha256']) == 64
+    debug = [context for context in session.contexts if context['stage'] == 'debug']
+    assert debug and debug[0]['task']['domain']['observations']
+    feedback = next(row['candidate_failure'] for row in debug[0]['task']['domain']['observations']
+                    if 'candidate_failure' in row)
+    for key in ('stage', 'error_type', 'source_fingerprint', 'execution_id', 'attestation_sha256'):
+        assert feedback[key] == failures[0][key]
+    assert feedback['diagnostic'] == failures[0]['detail']
+    assert feedback['detail_truncated'] is False
+    assert feedback['next_action'] == 'write_source'
+    assert any(row.get('passed') is False for row in debug[0]['task']['domain']['observations'])
+    assert candidate.compiles == 2 and candidate.calls[0][1] != candidate.calls[1][1]
+    assert result.verified.passed and len(owner.memory.read()) == 1
 
 
 def test_deterministic_failure_requires_changed_source_without_backend_reentry(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
+    from canonical_a3_fixtures import A3Session, make_trial, recording_candidate
 
-    class FailOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_calls = []
+    class UnchangedThenRepair(A3Session):
+        attempted_unchanged = False
+        genuinely_edited = False
 
-        def compile(self, source, workdir, **kw):
-            self.compile_calls.append(source)
-            if len(self.compile_calls) == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="compile", error_type="CompileError",
-                    detail=(
-                        "noise one\nERROR: primary failure\n\n"
-                        " error:   primary   failure \nFatal: secondary\n"
-                        + '"\\\n' * 10000
-                    ),
-                )
-            return super().compile(source, workdir, **kw)
+        def next_action(self, context, allowed, **kwargs):
+            name, args = super().next_action(context, allowed, **kwargs)
+            if name == 'perform' and context['stage'] == 'debug' and not self.attempted_unchanged:
+                assert [name for name, _, _ in candidate.calls] == ['compile']
+                self.attempted_unchanged = True
+                args['edit']['source'] = context['source']['text']
+            elif name == 'perform' and self.attempted_unchanged and not self.genuinely_edited:
+                assert context['stage'] == 'implementation'
+                assert context['source']['text'] == SOURCE
+                assert [(name, source) for name, source, _ in candidate.calls] == [('compile', SOURCE)]
+                self.genuinely_edited = True
+                args['edit'] = dict(path=context['source']['path'], sha256=context['source']['sha256'],
+                                    source=self.repaired)
+            return name, args
 
-    candidate = FailOnce()
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-        '{"action":"compile"}',
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=candidate)
+    detail = ('noise one\nERROR: primary failure\n\n error:   primary   failure \nFatal: secondary\n'
+              + '\"\\\n' * 10000)
+    candidate = recording_candidate(compile_failures=1, compile_detail=detail)
+    session = UnchangedThenRepair(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, session = make_trial(tmp_path, candidate=candidate, session=session)
+    result = owner.run()
+    assert result.status == 'passed'
+    compiled = [source for name, source, _ in candidate.calls if name == 'compile']
+    assert len(compiled) == 2 and compiled[0] != compiled[1]
+    assert session.attempted_unchanged and session.genuinely_edited
+    assert compiled == [SOURCE, session.repaired]
+    assert candidate.runs == 2
+    assert any(context['stage'] == 'debug' for context in session.contexts)
+    assert len(owner.memory.read()) == 1
 
-    assert result.status == "passed"
-    assert candidate.compile_calls == [SOURCE, replacement]
-    assert "not valid in rewrite-required" in result.failures[1]
-    assert "source must change" in result.failures[2]
-    failed = json.loads(prompts[2])["observations"][-1]["candidate_failure"]
-    assert failed["diagnostic"] == (
-        "ERROR: primary failure\nerror: primary failure\nFatal: secondary"
-    )
-    assert failed["detail_truncated"] is True
-    assert len(failed["diagnostic"]) <= 2048
-    assert json.loads(prompts[2])["action_contract"] == {
-        "eligible_submit_supports": [],
-        "profile_metric": "PipeUtilization",
-        "required_next_action": "write_source",
-        "trial_state": "rewrite-required",
-    }
+    contexts = [context for context in session.contexts if context['stage'] == 'debug']
+    compact = next(row['candidate_failure'] for row in contexts[0]['task']['domain']['observations']
+                   if 'candidate_failure' in row)
+    assert compact['diagnostic'] == 'ERROR: primary failure\nerror: primary failure\nFatal: secondary'
+    assert compact['detail_truncated'] is True and len(compact['diagnostic']) <= 2048
 
 
 def test_changed_source_requires_compile_before_another_rewrite(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    later_rewrite = SOURCE.replace(" {}", " { uint32_t unused = count; }")
-
-    class FailOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_calls = []
-
-        def compile(self, source, workdir, **options):
-            self.compile_calls.append(source)
-            if len(self.compile_calls) == 1:
-                plan = self._plan(
-                    source, options["request_id"], options["attempt_id"],
-                    options["length"], options["project_id"],
-                    options.get("padded_length"), options.get("block_count", 1),
-                    options.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="compile", error_type="CompileError",
-                    detail="ordinary deterministic compile failure",
-                )
-            return super().compile(source, workdir, **options)
-
-    candidate = FailOnce()
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        json.dumps({"action": "write_source", "source": later_rewrite}),
-        json.dumps({"action": "write_source", "source": later_rewrite}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=candidate)
-
-    assert result.status == "passed"
-    assert candidate.compile_calls == [SOURCE, replacement]
-    post_rewrite = json.loads(prompts[3])
-    assert post_rewrite["action_contract"] == {
-        "eligible_submit_supports": [],
-        "profile_metric": "PipeUtilization",
-        "required_next_action": "compile",
-        "trial_state": "compile-required",
-    }
-    assert set(post_rewrite["allowed_actions"]) == {"compile"}
-    assert result.failures[-2:] == (
-        "write_source is not valid in compile-required",
-        "write_source is not valid in compile-required",
-    )
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+    candidate = recording_candidate()
+    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session)
+    result = owner.run()
+    assert result.status == 'passed'
+    assert [name for name, _, _ in candidate.calls] == ['compile', 'run', 'compile', 'run', 'run']
+    initial, revised = candidate.compiled_results
+    assert initial.plan.source_fingerprint != revised.plan.source_fingerprint
+    assert result.verified.source_fingerprint == revised.plan.source_fingerprint
+    assert len(owner.memory.read()) == 1
 
 
 def test_successful_compile_requires_run_before_another_rewrite(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    later_rewrite = SOURCE.replace(" {}", " { uint32_t unused = count; }")
-    candidate = FakeCandidate()
-
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        json.dumps({"action": "write_source", "source": later_rewrite}),
-        '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "fallback", "supports": [],
-        }),
-    ], candidate=candidate)
-
-    assert result.status == "passed"
-    assert candidate.source == SOURCE
-    post_compile = json.loads(prompts[2])
-    assert post_compile["action_contract"] == {
-        "eligible_submit_supports": [
-            post_compile["observations"][-1]["authoritative_evidence"][
-                "evidence_sha256"
-            ]
-        ],
-        "profile_metric": "PipeUtilization",
-        "required_next_action": "run",
-        "trial_state": "run-required",
-    }
-    assert set(post_compile["allowed_actions"]) == {"run"}
-    assert result.failures == (
-        "write_source is not valid in run-required",
-        "write_source is not valid in run-required",
-    )
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+    candidate = recording_candidate()
+    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session)
+    result = owner.run()
+    assert result.status == 'passed'
+    assert candidate.calls[0][0] == 'compile' and candidate.calls[1][0] == 'run'
+    assert candidate.calls[0][1] == candidate.calls[1][1]
+    assert candidate.calls[2][0] == 'compile' and candidate.calls[2][1] != candidate.calls[1][1]
+    assert all(source == candidate.calls[-1][1] for name, source, _ in candidate.calls[2:])
 
 
 def test_guided_candidate_requires_profile_then_allows_optimization_rewrite(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
-    profiler = FakeProfiler()
-
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"profile","metric":"PipeUtilization"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-        '{"action":"profile","metric":"PipeUtilization"}',
-        json.dumps({
-            "action": "submit", "interpretation": "profiled", "supports": [],
-        }),
-    ], cell=cell, profiler=profiler)
-
-    assert result.status == "passed"
-    assert len(profiler.requests) == 2
-    before_profile = json.loads(prompts[3])
-    assert before_profile["action_contract"]["required_next_action"] == "profile"
-    assert set(before_profile["allowed_actions"]) == {"profile"}
-    after_profile = json.loads(prompts[5])
-    assert after_profile["action_contract"]["required_next_action"] is None
-    assert set(after_profile["allowed_actions"]) == {"submit", "write_source"}
-    assert result.failures == ("write_source is not valid in profile-required",)
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+    candidate = recording_candidate()
+    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session,
+                        cell=_cell(profiling=ProfilingGuidance.WITH_GUIDANCE))
+    result = owner.run()
+    assert result.status == 'passed' and session.revised
+    request, = owner.profiler.requests
+    assert request.binding.source_fingerprint == candidate.compiled_results[-1].plan.source_fingerprint
+    assert request.binding.source_fingerprint != candidate.compiled_results[0].plan.source_fingerprint
+    assert result.profile_result.source_fingerprint == result.verified.source_fingerprint
+    assert result.profile_result.candidate_execution_id == result.verified.execution_id
 
 
 @pytest.mark.parametrize(
@@ -555,181 +438,80 @@ def test_guided_candidate_requires_profile_then_allows_optimization_rewrite(tmp_
     [ProfilingGuidance.WITHOUT_GUIDANCE, ProfilingGuidance.WITH_GUIDANCE],
 )
 def test_submit_ready_allows_equal_revision_opportunity(tmp_path, guidance):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    candidate = FakeCandidate()
-    cell = _cell(profiling=guidance)
-    actions = [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-    ]
-    if guidance is ProfilingGuidance.WITH_GUIDANCE:
-        actions.append('{"action":"profile","metric":"PipeUtilization"}')
-    post_evidence_turn = len(actions)
-    actions.extend([
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-    ])
-    if guidance is ProfilingGuidance.WITH_GUIDANCE:
-        actions.append('{"action":"profile","metric":"PipeUtilization"}')
-    actions.append(
-        json.dumps({
-            "action": "submit", "interpretation": "revised", "supports": [],
-        })
-    )
-    result, prompts, _ = _run(
-        tmp_path, actions, cell=cell, candidate=candidate,
-    )
-
-    assert result.status == "passed"
-    assert candidate.source == replacement
-    submit_ready = json.loads(prompts[post_evidence_turn])
-    assert submit_ready["action_contract"]["required_next_action"] is None
-    assert set(submit_ready["allowed_actions"]) == {"submit", "write_source"}
-    assert result.failures == ()
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+    candidate = recording_candidate()
+    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session, cell=_cell(profiling=guidance))
+    result = owner.run()
+    assert result.status == 'passed' and session.revised
+    assert candidate.compiles == 2 and len(owner.memory.read()) == 1
+    assert candidate.compiled_results[-1].plan.source_fingerprint == result.verified.source_fingerprint
+    assert bool(result.profile_result) == (guidance is ProfilingGuidance.WITH_GUIDANCE)
 
 
 def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-
-    class MismatchOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.runs = 0
-
-        def run(self, source, workdir, **kw):
-            self.runs += 1
-            if self.runs == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-                )
-                return VerifiedResult.from_receipt(
-                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
-                    max_abs_error=3.0,
-                )
-            return super().run(source, workdir, **kw)
-
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=MismatchOnce())
-
-    assert result.status == "passed"
-    assert "host verification failed" in result.failures[0]
-    context = json.loads(prompts[3])
-    assert context["action_contract"]["trial_state"] == "rewrite-required"
-    failure = context["observations"][-1]["failed_verification"]
-    assert failure["max_abs_error"] == 3.0
-    assert failure["tolerance"] == 1e-5
-    assert failure["next_action"] == "write_source"
-    assert failure["mismatch"] == {
-        "logical_index": 0,
-        "input_a": 1.0,
-        "input_b": 2.0,
-        "actual": 0.0,
-        "expected": 3.0,
-        "absolute_error": 3.0,
-    }
-    assert set(failure) == {
-        "diagnostic", "max_abs_error", "tolerance", "mismatch",
-        "source_fingerprint", "execution_id", "evidence_sha256",
-        "attestation_sha256", "next_action",
-    }
-    assert not any(
-        term in json.dumps(failure).lower()
-        for term in ("datacopy", "setflag", "waitflag", "queue", "query")
-    )
-    assert all(len(failure[key]) == 64 for key in (
-        "source_fingerprint", "execution_id", "evidence_sha256",
-        "attestation_sha256",
-    ))
-    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    assert any("failed_verification" in entry.payload for entry in entries)
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    candidate = recording_candidate(run_failures=1)
+    owner, session = make_trial(tmp_path, candidate=candidate)
+    result = owner.run()
+    assert result.status == 'passed' and result.verified.passed
+    failures = [row.payload['failed_verification'] for row in owner.evidence.entries if 'failed_verification' in row.payload]
+    assert len(failures) == 1 and failures[0]['passed'] is False
+    mismatch = failures[0]['mismatch']
+    assert mismatch['logical_index'] == 0
+    assert abs(mismatch['actual'] - mismatch['expected']) == mismatch['absolute_error'] == 1.0
+    assert failures[0]['max_abs_error'] == mismatch['absolute_error']
+    debug = next(context for context in session.contexts if context['stage'] == 'debug')
+    observed = next(row['failed_verification'] for row in debug['task']['domain']['observations']
+                    if 'failed_verification' in row)
+    assert observed['mismatch'] == mismatch
+    assert observed['evidence_sha256'] == failures[0]['evidence_sha256']
+    assert observed['tolerance'] == failures[0]['tolerance']
+    assert observed['next_action'] == 'write_source'
+    assert candidate.compiles == 2
+    sources = [source for name, source, _ in candidate.calls if name == 'compile']
+    assert sources[0] != sources[1]
+    assert any(context['stage'] == 'debug' for context in session.contexts)
+    assert len(owner.memory.read()) == 1
 
 
 def test_failed_verified_result_without_mismatch_reaches_actor_feedback(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-
-    class ProcessFailureOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.runs = 0
-
-        def run(self, source, workdir, **kw):
-            self.runs += 1
-            if self.runs == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1),
-                    kw.get("execution_profile", "gz-a3"),
-                )
-                return VerifiedResult.from_receipt(
-                    plan, ExecutionReceipt(2, stderr="runtime failed"),
-                    max_abs_error=None,
-                )
-            return super().run(source, workdir, **kw)
-
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=ProcessFailureOnce())
-
-    feedback = json.loads(prompts[3])["observations"][-1][
-        "failed_verification"
-    ]
-    assert result.status == "passed"
-    assert feedback["max_abs_error"] is None
-    assert feedback["mismatch"] is None
-    assert feedback["next_action"] == "write_source"
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    candidate = recording_candidate(run_failures=1, run_exit=1)
+    owner, session = make_trial(tmp_path, candidate=candidate)
+    result = owner.run()
+    assert result.status == 'passed' and result.verified.passed
+    debug = [context for context in session.contexts if context['stage'] == 'debug']
+    assert debug and debug[0]['task']['domain']['observations']
+    feedback = next(row['failed_verification'] for row in debug[0]['task']['domain']['observations']
+                    if 'failed_verification' in row)
+    failure, = [row.payload['failed_verification'] for row in owner.evidence.entries
+                if 'failed_verification' in row.payload]
+    assert failure['passed'] is False and failure['exit_code'] == 1
+    assert feedback['max_abs_error'] is None and feedback['mismatch'] is None
+    assert feedback['next_action'] == 'write_source'
+    assert feedback['evidence_sha256'] == failure['evidence_sha256']
+    assert feedback['source_fingerprint'] == failure['source_fingerprint']
+    compiled = [source for name, source, _ in candidate.calls if name == 'compile']
+    assert len(compiled) == 2 and compiled[0] != compiled[1]
+    assert result.failures and candidate.compiles == 2
+    assert len(owner.memory.read()) == 1
 
 
 def test_submit_supports_are_only_for_current_source_revision(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
-
-    def rewrite_from_context(context):
-        value = json.loads(context)
-        old = value["action_contract"]["eligible_submit_supports"]
-        assert len(old) == 3
-        return json.dumps({"action": "write_source", "source": replacement})
-
-    def submit_current(context):
-        value = json.loads(context)
-        supports = value["action_contract"]["eligible_submit_supports"]
-        assert len(supports) == 3
-        observations = value["observations"]
-        old = next(
-            item["authoritative_evidence"]["evidence_sha256"]
-            for item in observations
-            if isinstance(item, dict) and "authoritative_evidence" in item
-        )
-        assert old not in supports
-        return json.dumps({
-            "action": "submit", "interpretation": "current source only",
-            "supports": supports,
-        })
-
-    result, _, journal = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        '{"action":"profile","metric":"PipeUtilization"}', rewrite_from_context,
-        '{"action":"compile"}', '{"action":"run"}',
-        '{"action":"profile","metric":"PipeUtilization"}', submit_current,
-    ], cell=cell)
-    assert result.status == "passed"
-    assert len(journal.read()[0]["memory"]["agent_interpretations"][0]["supports"]) == 3
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+    candidate = recording_candidate()
+    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session,
+                        cell=_cell(profiling=ProfilingGuidance.WITH_GUIDANCE))
+    result = owner.run()
+    assert result.status == 'passed'
+    facts = owner.memory.read()[0]['memory']['host_facts']
+    digests = {row['evidence_sha256'] for row in facts}
+    assert candidate.compiled_results[0].attestation_sha256 not in digests
+    assert candidate.compiled_results[-1].attestation_sha256 in digests
+    assert result.verified.evidence_sha256 in digests and result.profile_result.evidence_sha256 in digests
+    assert owner.memory.read()[0]['memory']['source_revision'] == result.verified.source_fingerprint
 
 
 @pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence"])
@@ -845,41 +627,39 @@ def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_pa
 
 
 def test_verify_runtime_failure_is_deterministic_and_requires_rewrite(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-
+    from canonical_a3_fixtures import make_trial
     class VerifyFailure(FakeCandidate):
+        runs = 0
         def __init__(self):
             super().__init__()
-            self.runs = 0
-
-        def run(self, source, workdir, **kw):
+            self.run_sources = []
+        def run(self, source, workdir, **options):
             self.runs += 1
+            self.run_sources.append(source)
             if self.runs == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="verify", error_type="RuntimeError",
-                    detail="terminal verification failure",
-                )
-            return super().run(source, workdir, **kw)
-
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=VerifyFailure())
-
-    context = json.loads(prompts[3])
-    assert context["action_contract"]["trial_state"] == "rewrite-required"
-    assert context["observations"][-1]["candidate_failure"]["next_action"] == "write_source"
-    assert result.status == "passed"
+                plan = self._plan(source, options['request_id'], options['attempt_id'], options['length'],
+                    options['project_id'], options.get('padded_length'), options.get('block_count', 1),
+                    options.get('execution_profile', 'gz-a3'))
+                return FailedEvidence.create(plan, stage='verify', error_type='RuntimeError',
+                                            detail='host verifier rejected candidate')
+            return super().run(source, workdir, **options)
+    candidate = VerifyFailure()
+    owner, session = make_trial(tmp_path, candidate=candidate)
+    result = owner.run()
+    assert result.status == 'passed' and candidate.runs == 3
+    debug = next(context for context in session.contexts if context['stage'] == 'debug')
+    feedback = next(row['candidate_failure'] for row in debug['task']['domain']['observations']
+                    if 'candidate_failure' in row)
+    failure, = [row.payload['failed_evidence'] for row in owner.evidence.entries
+                if 'failed_evidence' in row.payload]
+    assert feedback['stage'] == failure['stage'] == 'verify'
+    assert feedback['error_type'] == failure['error_type'] == 'RuntimeError'
+    assert feedback['attestation_sha256'] == failure['attestation_sha256']
+    assert feedback['next_action'] == 'write_source'
+    assert candidate.run_sources[0] != candidate.run_sources[1]
+    assert candidate.run_sources[1] == candidate.run_sources[2]
+    assert result.verified.passed
+    assert len(owner.memory.read()) == 1
 
 
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
@@ -928,60 +708,50 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
 
 
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
-    second_source = SOURCE.replace(" {}", " { return; }")
-    third_source = SOURCE.replace(" {}", " { uint32_t unused = count; }")
-    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
-    class FailSecondCompile(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_calls = 0
+    from dataclasses import replace
+    from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
 
-        def compile(self, source, workdir, **options):
-            self.compile_calls += 1
-            if self.compile_calls == 2:
-                plan = self._plan(
-                    source, options["request_id"], options["attempt_id"],
-                    options["length"], options["project_id"],
-                    options.get("padded_length"), options.get("block_count", 1),
-                    options.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="compile", error_type="CompileError",
-                    detail="ordinary recompile failure",
-                )
-            return super().compile(source, workdir, **options)
+    class InspectFailedRecompile(RevisionSession):
+        prior_verified = None
+        inspected_failure = False
 
-    result, _, journal = _run(
-        tmp_path,
-        [
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-            '{"action":"profile","metric":"PipeUtilization"}',
-            json.dumps({"action": "write_source", "source": second_source}),
-            '{"action":"compile"}',
-            json.dumps({
-                "action": "submit", "interpretation": "stale result",
-                "supports": [],
-            }),
-            json.dumps({"action": "write_source", "source": third_source}),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-            '{"action":"profile","metric":"PipeUtilization"}',
-            json.dumps({
-                "action": "submit", "interpretation": "fresh host result",
-                "supports": [],
-            }),
-        ],
-        cell=cell,
-        candidate=FailSecondCompile(),
-        budgets=TrialBudgets(12, 2000),
-    )
+        def next_action(self, context, allowed, **kwargs):
+            host = self.runner.backend.host
+            if context['stage'] == 'optimisation' and host.verified is not None:
+                self.prior_verified = host.verified
+            if context['stage'] == 'debug' and candidate.compiles == 2:
+                assert isinstance(host.compilation, FailedEvidence)
+                assert host.compilation.stage == 'compile'
+                assert self.prior_verified is not None and self.prior_verified.passed
+                assert host.verified is None and host.profile is None
+                assert host.compilation.source_fingerprint != self.prior_verified.source_fingerprint
+                assert not host.accepted_checkpoint_valid()
+                assert owner._submit_gate(host.source, host.compilation, self.prior_verified, host.profile) is not None
+                assert self.runner.workflow.outcome != 'accepted'
+                assert owner.memory.read() == ()
+                self.inspected_failure = True
+            return super().next_action(context, allowed, **kwargs)
 
-    assert result.status == "passed"
-    assert any("ordinary recompile failure" in failure for failure in result.failures)
-    assert any("submit is not valid in rewrite-required" == failure for failure in result.failures)
-    assert len(journal.read()) == 1
+    candidate = recording_candidate(compile_failure_at=(2,))
+    session = InspectFailedRecompile(initial=SOURCE, repaired=SOURCE + '\n// repair after failed recompile')
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session,
+                        cell=_cell(profiling=ProfilingGuidance.WITH_GUIDANCE))
+    build = owner.canonical.build
+
+    def capture_runner(*args, **kwargs):
+        session.runner = build(*args, **kwargs)
+        return session.runner
+
+    owner.canonical = replace(owner.canonical, build=capture_runner)
+    result = owner.run()
+    assert session.inspected_failure
+    assert result.status == 'passed' and candidate.compiles == 3
+    assert any(row.payload.get('failed_evidence', {}).get('stage') == 'compile' for row in owner.evidence.entries)
+    assert candidate.compiled_results[-1].plan.source_fingerprint == result.verified.source_fingerprint
+    assert candidate.compiled_results[0].plan.source_fingerprint != result.verified.source_fingerprint
+    facts = owner.memory.read()[0]['memory']['host_facts']
+    assert candidate.compiled_results[0].attestation_sha256 not in {row['evidence_sha256'] for row in facts}
+    assert len(owner.memory.read()) == 1
 
 
 def test_elapsed_time_budget_is_terminal_and_isolated(tmp_path):
@@ -1001,23 +771,15 @@ def test_elapsed_time_budget_is_terminal_and_isolated(tmp_path):
 
 @pytest.mark.parametrize("guidance", list(ProfilingGuidance))
 def test_legacy_turn_and_token_counts_do_not_prevent_verified_submission(tmp_path, guidance):
-    actions = ['not json'] * 30 + [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-    ]
-    if guidance is ProfilingGuidance.WITH_GUIDANCE:
-        actions.append('{"action":"profile","metric":"PipeUtilization"}')
-    actions.append(json.dumps({"action": "submit", "interpretation": "done", "supports": []}))
-    result, prompts, _ = _run(tmp_path, actions, cell=_cell(profiling=guidance),
-        budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=100), completion_tokens=1000)
-    assert result.status == "passed" and result.tokens > 30000
-    assert result.completion_turns == 0
-    assert all('attempt_completion' not in json.loads(prompt) for prompt in prompts)
-    entries = EvidenceLedger(tmp_path / 'evidence.jsonl').entries
-    assert not any('attempt_completion_boundary' in entry.payload for entry in entries)
-    write = next(entry for entry in entries
-                 if entry.kind == 'action' and entry.payload['action'] == 'write_source')
-    assert write.payload['source_sha256'] == hashlib.sha256(SOURCE.encode()).hexdigest()
+    from canonical_a3_fixtures import make_trial, InvalidDecisionsSession
+    session = InvalidDecisionsSession(invalid=30, tokens=1000, initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, session=session, cell=_cell(profiling=guidance),
+                        budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=100))
+    result = owner.run()
+    assert result.status == 'passed' and result.tokens > 30000
+    assert session.invalid == 0 and result.completion_turns == 0
+    assert len(owner.memory.read()) == 1 and result.verified.passed
+    assert bool(result.profile_result) == (guidance is ProfilingGuidance.WITH_GUIDANCE)
 
 
 @pytest.mark.parametrize('backend_seconds, expected_calls', [(1, 2), (4, 1)])
@@ -1046,31 +808,55 @@ def test_provider_and_invalid_actions_can_recover_while_time_remains(tmp_path):
 
 
 @pytest.mark.parametrize('operation', ['compile', 'run'])
-def test_validation_failure_allows_changed_source_repair_within_time(tmp_path, operation):
-    replacement = SOURCE.replace(' {}', ' { return; }')
+@pytest.mark.parametrize('known_admission', [True, False])
+def test_validation_failure_allows_changed_source_repair_within_time(
+    tmp_path, operation, known_admission,
+):
+    from benchmarks.a3kernels.candidate import validate_candidate_source
+    from canonical_a3_fixtures import A3Session, make_trial
     class RejectOnce(FakeCandidate):
-        rejected = False
-        def invoke(self, name, source, workdir, **kwargs):
+        def __init__(self):
+            super().__init__()
+            self.rejected = False
+            self.calls = []
+        def invoke(self, name, source, workdir, **options):
+            self.calls.append((name, source))
             if name == operation and not self.rejected:
                 self.rejected = True
+                if known_admission:
+                    # The production validator rejects before planning or dispatch.
+                    validate_candidate_source(source)
+                    raise AssertionError('malformed source was admitted')
                 raise ValueError('candidate source rejected by fixture')
-            return getattr(super(), name)(source, workdir, **kwargs)
-        def compile(self, source, workdir, **kwargs):
-            return self.invoke('compile', source, workdir, **kwargs)
-        def run(self, source, workdir, **kwargs):
-            return self.invoke('run', source, workdir, **kwargs)
-    actions = [json.dumps({'action': 'write_source', 'source': SOURCE}), '{"action":"compile"}']
-    if operation == 'run':
-        actions.append('{"action":"run"}')
-    actions += [json.dumps({'action': 'write_source', 'source': replacement}),
-                '{"action":"compile"}', '{"action":"run"}',
-                json.dumps({'action': 'submit', 'interpretation': 'repaired', 'supports': []})]
-    result, prompts, _ = _run(tmp_path, actions, candidate=RejectOnce(),
-        budgets=TrialBudgets(max_turns=1, max_seconds=20))
-    assert result.status == 'passed'
-    after_failure = json.loads(prompts[3 if operation == 'run' else 2])
-    assert after_failure['action_contract']['trial_state'] == 'rewrite-required'
-    assert result.failures == ('candidate source rejected by fixture',)
+            return getattr(super(), name)(source, workdir, **options)
+        def compile(self, source, workdir, **options):
+            return self.invoke('compile', source, workdir, **options)
+        def run(self, source, workdir, **options):
+            return self.invoke('run', source, workdir, **options)
+    candidate = RejectOnce()
+    initial = SOURCE.replace('vector_add', 'invalid_entrypoint')
+    session = A3Session(initial=initial, repaired=SOURCE)
+    owner, session = make_trial(tmp_path, candidate=candidate, session=session,
+                                budgets=TrialBudgets(max_turns=1, max_seconds=20))
+    result = owner.run()
+    assert candidate.rejected
+    if not known_admission:
+        assert result.status == 'suspended' and result.verified is None
+        root = owner.canonical.build(owner).workflow
+        pending = root.state['pending']
+        assert pending and not owner.memory.read()
+        before = root.path.read_bytes()
+        calls = list(candidate.calls)
+        assert owner.run().status == 'suspended'
+        assert candidate.calls == calls
+        assert root.path.read_bytes() == before
+        assert root.state['pending'] == pending
+        return
+    assert result.status == 'passed' and result.verified.passed
+    assert any(context['stage'] == 'debug' for context in session.contexts)
+    compiled = [source for name, source in candidate.calls if name == 'compile']
+    assert len(compiled) == 2 and compiled[0] != compiled[1]
+    assert len(owner.memory.read()) == 1
 
 
 def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path):
@@ -1301,109 +1087,29 @@ def test_trial_protocol_versions_prepare_runtime_infrastructure_classification()
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
-    cell = _cell(model=BackendModel.DEEPSEEK_FLASH)
-
-    class FourMismatches(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.runs = 0
-
-        def run(self, source, workdir, **options):
-            self.runs += 1
-            if self.runs <= 4:
-                plan = self._plan(
-                    source, options["request_id"], options["attempt_id"],
-                    options["length"], options["project_id"],
-                    options.get("padded_length"), options.get("block_count", 1),
-                    options.get("execution_profile", "gz-a3"),
-                )
-                return VerifiedResult.from_receipt(
-                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
-                    max_abs_error=3.0,
-                )
-            return super().run(source, workdir, **options)
-
-    sources = [
-        SOURCE.replace(" {}", f" {{ uint32_t attempt = {attempt}; }}")
-        for attempt in range(5)
-    ]
-    actions = []
-    for source in sources:
-        actions.extend([
-            json.dumps({"action": "write_source", "source": source}),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-        ])
-    actions.append(json.dumps({
-        "action": "submit", "interpretation": "recovered", "supports": [],
-    }))
-
-    short, _, _ = _run(
-        tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
-        budgets=TrialBudgets(12, 65536, max_seconds=14),
-    )
-    recovered, _, _ = _run(
-        tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
-        model_default_budgets=True,
-    )
-
-    assert short.status == "budget-exhausted" and short.turns == 12
-    assert recovered.status == "passed" and recovered.turns == 16
-    assert len(recovered.failures) == 4
-    assert all("host verification failed" in item for item in recovered.failures)
+    from canonical_a3_fixtures import make_trial, InvalidDecisionsSession, recording_candidate
+    session = InvalidDecisionsSession(invalid=13, initial=SOURCE, repaired=SOURCE + '\n// repair')
+    candidate = recording_candidate(run_failures=4)
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session, cell=_cell(model=BackendModel.DEEPSEEK_FLASH))
+    result = owner.run()
+    assert result.status == 'passed' and result.verified.passed
+    assert session.invalid == 0 and candidate.compiles == 5 and candidate.runs == 6
+    assert len(owner.memory.read()) == 1
+    assert len([row for row in owner.evidence.entries if 'failed_verification' in row.payload]) == 4
+    assert owner.budgets == TrialBudgets.for_model(BackendModel.DEEPSEEK_FLASH)
 
 
 def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
-    cell = _cell(model=BackendModel.GPT_5_6_SOL)
-
-    class FourMismatches(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.runs = 0
-
-        def run(self, source, workdir, **options):
-            self.runs += 1
-            if self.runs <= 4:
-                plan = self._plan(
-                    source, options["request_id"], options["attempt_id"],
-                    options["length"], options["project_id"],
-                    options.get("padded_length"), options.get("block_count", 1),
-                    options.get("execution_profile", "gz-a3"),
-                )
-                return VerifiedResult.from_receipt(
-                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
-                    max_abs_error=3.0,
-                )
-            return super().run(source, workdir, **options)
-
-    sources = [
-        SOURCE.replace(" {}", f" {{ uint32_t attempt = {attempt}; }}")
-        for attempt in range(5)
-    ]
-    actions = []
-    for source in sources:
-        actions.extend([
-            json.dumps({"action": "write_source", "source": source}),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-        ])
-    actions.append(json.dumps({
-        "action": "submit", "interpretation": "recovered", "supports": [],
-    }))
-
-    short, _, _ = _run(
-        tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
-        budgets=TrialBudgets(12, 32768, max_seconds=14),
-    )
-    recovered, _, _ = _run(
-        tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
-        model_default_budgets=True,
-    )
-
-    assert short.status == "budget-exhausted" and short.turns == 12
-    assert recovered.status == "passed" and recovered.turns == 16
-    assert len(recovered.failures) == 4
-    assert all("host verification failed" in item for item in recovered.failures)
+    from canonical_a3_fixtures import make_trial, InvalidDecisionsSession, recording_candidate
+    session = InvalidDecisionsSession(invalid=13, initial=SOURCE, repaired=SOURCE + '\n// repair')
+    candidate = recording_candidate(run_failures=4)
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=session, cell=_cell(model=BackendModel.GPT_5_6_SOL))
+    result = owner.run()
+    assert result.status == 'passed' and result.verified.passed
+    assert session.invalid == 0 and candidate.compiles == 5 and candidate.runs == 6
+    assert len(owner.memory.read()) == 1
+    assert len([row for row in owner.evidence.entries if 'failed_verification' in row.payload]) == 4
+    assert owner.budgets == TrialBudgets.for_model(BackendModel.GPT_5_6_SOL)
 
 
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):

@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -257,15 +259,23 @@ def test_failed_profile_observer_is_terminal(tmp_path):
         CheckedTransport(config(tmp_path), run=run).execute(directory, ['true'])
 
 
-def test_remote_timeout_is_budget_boundary_without_compact_download(tmp_path):
+def test_legacy_remote_timeout_without_native_handle_remains_unknown(tmp_path):
     directory = tmp_path / 'op'
     directory.mkdir()
-    (directory / 'transport.json').write_text(json.dumps({'state': 'running', 'handle': 'bz-a3-1:abc'}))
+    legacy = 'bz-a3-1:abc'
+    (directory / 'transport.json').write_text(json.dumps({'state': 'running', 'handle': legacy}))
+    calls = []
     def run(argv, **kwargs):
+        calls.append(argv)
         return SimpleNamespace(returncode=124, stdout='BZ_A3_JOB_STATE=failed exit=124', stderr='')
-    with pytest.raises(WorkerStopped, match='budget exhausted'):
+    with pytest.raises(ObservationUnavailable):
         CheckedTransport(config(tmp_path), run=run).execute(directory, ['true'])
-    assert json.loads((directory / 'transport.json').read_text())['state'] == 'cancelled'
+    retained = json.loads((directory / 'transport.json').read_text())
+    assert retained['handle'] == legacy and not retained.get('native_handle')
+    assert retained['state'] != 'cancelled'
+    assert 'BZ_A3_JOB_STATE=failed exit=124' in (directory / 'transport.log').read_text()
+    assert len(calls) == 1 and '--resume' in calls[0]
+    assert not any('cancel' in argv or 'download' in argv for argv in calls)
 
 
 def test_exclusive_lock_rejects_second_worker(tmp_path):
@@ -431,15 +441,31 @@ def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_pat
             return {'status': 'available'}
     backend = LostProfile()
     agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast'), {'action': 'finish', 'summary': ''}])
-    with pytest.raises(ObservationUnavailable):
-        OptimizationLoop(store, job, agent, backend).run()
-    state = [e['payload'] for e in store.events(job) if e['kind'] == 'optimizer-state'][-1]
-    assert state['pending']['history_recorded']
+    agent.canonical_fixture = True
+    agent.profile = True
+    loop = OptimizationLoop(store, job, agent, backend)
+    with pytest.raises(ObservationUnavailable, match='pending exact handle'):
+        loop.run()
+    assert loop.fixture_runner.workflow.pending is not None
+    assert loop.fixture_runner.workflow.stage.value == 'optimisation'
+    interrupted = [row for row in loop.fixture_runner.events if row['type'] == 'domain-interrupted']
+    assert len(interrupted) == 1 and interrupted[0]['name'] == 'profile'
+    state = loop.state
     assert len(state['history']) == 1
-    assert OptimizationLoop(store, job, agent, backend).run()['status'] == 'completed'
-    state = [e['payload'] for e in store.events(job) if e['kind'] == 'optimizer-state'][-1]
-    assert len(state['history']) == 1
-    assert len(backend.evaluations) == 1
+    from canonical_optimizer_fixtures import retained_native, unresolved_authority
+    from rsi.runtime import WorkflowError
+    before, budget = retained_native(loop), store.get(job)
+    assert state['best']['speedup'] == 2
+    assert backend.profiles == ['lost']
+    resumed = OptimizationLoop(store, job, agent, backend)
+    with pytest.raises(WorkflowError, match='reconciliation'):
+        resumed.run()
+    assert unresolved_authority(retained_native(resumed)) == unresolved_authority(before)
+    after = store.get(job)
+    assert all(after[key] == budget[key] for key in ('max_seconds', 'max_attempts', 'attempts'))
+    assert after['elapsed_seconds'] >= budget['elapsed_seconds']
+    assert len(resumed.state['history']) == len(backend.evaluations) == 1
+    assert resumed.state['best']['speedup'] == 2 and backend.profiles == ['lost']
 
 
 def test_pending_download_observes_original_transfer_then_fetches(tmp_path):
@@ -471,6 +497,7 @@ def test_loop_preserves_recoverable_transport_state(tmp_path, error, status):
                        {'args': [{'shape': [5], 'dtype': 'float32'}]},
                        {**body, 'snapshot_id': sha(canonical(body))})['job_id']
     class Agent:
+        canonical_fixture = True
         identity = {'model': 'test'}
         def complete(self, stage, context, record):
             return {'action': 'cases', 'signatures': [], 'summary': 'test'}
@@ -496,7 +523,9 @@ def test_final_reserved_profile_respects_stop_and_elapsed_deadline(tmp_path, bou
                 store.account_time(job, 10)
             return result
     backend = BoundBackend()
-    OptimizationLoop(store, job, Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
+    agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')])
+    agent.canonical_fixture = True
+    OptimizationLoop(store, job, agent, backend).run()
     assert backend.profiles == []
 
 

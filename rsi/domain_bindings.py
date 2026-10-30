@@ -432,62 +432,65 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
     runner = continuation.runner
     admitted = dict(outcome.admitted_artifacts)
     admitted.update(admitted_artifacts or {})
-    payloads, remaining_bytes = {}, 64000
-    for ref in admitted:
-        data = runner.store.read_bytes(ref)
-        if len(data) <= min(8192, remaining_bytes):
-            payloads[ref] = data.decode(errors='replace')
-            remaining_bytes -= len(data)
-    from benchmarks.ascend.agent_context import WorkingContext
-    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    # Authenticate every admitted object before optional summary preparation;
+    # missing/corrupt evidence is never downgraded to a provider failure.
+    payloads = {reference:runner.store.read_bytes(reference) for reference in admitted}
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder, _EmptyTextCompletion
+    from benchmarks.ascend.agent_context import ContextBudgetError
+    from rsi.domain_distillation import terminal_budget, bounded_driver, terminal_context, bounded_message
     recorder = _ProviderEvidenceRecorder(runner.backend.host.control_root)
     host = runner.backend.host
-    # Reuse the existing direct-provider context policy for this noncoding task.
-    # Full host material remains in CAS; summaries never acquire host authority.
-    working = WorkingContext([dict(role='system', content=owner.system_prompt),
-        dict(role='user', content=continuation.instruction)])
-    for row in runner.workflow.state['history']:
-        working.append(dict(role='user', content=json.dumps(dict(workflow_step=row))))
-    for summary in host_summaries:
-        working.append(dict(role='user', content=json.dumps(dict(host_summary=summary))))
-    working.pinned = [dict(role=row['role'], content=row['content']) for row in host.feedback]
-    terminal = dict(role='user', content=DISTILLATION_PROMPT + '\n' + json.dumps(dict(
-        admitted_artifacts=admitted, artifact_payloads=payloads,
-        workflow_history=runner.workflow.state['history'][-1:])))
-    working.append(terminal)
+    budget = terminal_budget(owner.provider, continuation.profile)
+    def failed(failure, tokens):
+        recorder.failure(failure, stage='distillation', turn=turn)
+        ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
+            exception_type=type(failure).__name__, source_hash=host.project_hash(),
+            contract_ref=runner.contract_ref, host_outcome=outcome.status))
+        runner.append(dict(type='domain-distillation-failure', reference=ref))
+        return replace(outcome, tokens=tokens, distillation_failure=ref,
+                       wall_time_s=runner.workflow.accounting.seconds())
+    turn = 0
+    try:
+        working = terminal_context(owner, runner, continuation.profile, continuation.instruction,
+            admitted, payloads, host_summaries, budget, DISTILLATION_PROMPT)
+    except ContextBudgetError as failure:
+        return failed(failure, 0)
     tokens, turn = 0, 0
     while True:
         seconds = runner.actor._available()
-        driver = owner.with_time_budget(seconds)
+        driver = bounded_driver(owner, seconds, continuation.profile, budget)
+        original_complete = driver._complete
+        def observed_complete(*args, **kwargs):
+            nonlocal tokens
+            try:
+                completion = original_complete(*args, **kwargs)
+            except _EmptyTextCompletion as empty:
+                tokens += empty.completion_tokens
+                raise
+            tokens += completion.completion_tokens
+            return completion
+        driver._complete = observed_complete
         token = runner.workflow.accounting.start('thinking')
         try:
             try:
-                messages, summary_tokens = driver._prepare_context(
+                messages, _ = driver._prepare_context(
                     working, continuation.profile, recorder, turn=turn)
-                tokens += summary_tokens
                 driver._request(recorder, continuation.profile, messages, stage='distillation', turn=turn)
                 completion = driver._complete(recorder, continuation.profile, messages,
                                                stage='distillation', turn=turn)
             except Exception as failure:
-                recorder.failure(failure, stage='distillation', turn=turn)
-                ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-                    exception_type=type(failure).__name__, source_hash=host.project_hash(),
-                    contract_ref=runner.contract_ref, host_outcome=outcome.status))
-                runner.append(dict(type='domain-distillation-failure', reference=ref))
-                # The already verified host outcome survives a separate summary
-                # failure. No candidate or execution is replayed.
-                return replace(outcome, tokens=tokens, distillation_failure=ref,
-                               wall_time_s=runner.workflow.accounting.seconds())
+                return failed(failure, tokens)
         finally:
             runner.workflow.accounting.end(token)
-        tokens += completion.completion_tokens
         recorder.response(completion.text, stage='distillation', turn=turn)
         owner._trace('message', dict(role='assistant', content=completion.text))
         try:
             distilled = parse_agent_distillation(completion.text, admitted)
         except ValueError as exc:
-            working.append(dict(role='assistant', content=completion.text))
-            working.append(dict(role='user', content='Correct terminal JSON: ' + str(exc)))
+            limit = max(256, budget.target // 4)
+            working.append(bounded_message(runner.store, dict(role='assistant', content=completion.text), limit))
+            working.append(bounded_message(runner.store,
+                dict(role='user', content='Correct terminal JSON: ' + str(exc)), limit))
             turn += 1
             continue
         return replace(outcome, tokens=tokens, terminal_response=completion.text,
@@ -502,7 +505,8 @@ class A3Host(SourceHost):
         from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
         self.owner, self.runtime = owner, owner.candidate
         self.control_root = owner.workdir
-        self.store = ContentAddressedArtifacts(owner.workdir / 'canonical-artifacts')
+        self.store = ContentAddressedArtifacts(getattr(owner, 'canonical_artifact_root', owner.workdir / 'canonical-artifacts'))
+        self.canonical_prior_root = getattr(owner, 'canonical_prior_root', None)
         self.source_path = owner.workdir / 'canonical-source'
         self.source = self.source_path.read_text() if self.source_path.exists() else ''
         self.compilation = self.verified = self.profile = self.timing = None
@@ -558,9 +562,40 @@ class A3Host(SourceHost):
         return bool(isinstance(self.verified, VerifiedResult) and self.verified.passed and
             self.owner._submit_gate(self.source,self.compilation,self.verified,self.profile) is None)
 
+    def call(self, activity, name, category, callback):
+        from benchmarks.a3kernels.project_execution import RecoveryStarterEvidenceUnavailable
+        def observed(seconds):
+            try:
+                return callback(seconds)
+            except RecoveryStarterEvidenceUnavailable as carrier:
+                return carrier.failure
+        return super().call(activity, name, category, observed)
+
+    def activity_exception_terminal(self, name, error):
+        from benchmarks.a3kernels.candidate import CandidateSourceAdmissionError
+        return (name in ('compile', 'run') and isinstance(error, CandidateSourceAdmissionError)
+                or super().activity_exception_terminal(name, error))
+
+    def _candidate_call(self, activity, name, category, callback):
+        from benchmarks.a3kernels.candidate import CandidateSourceAdmissionError
+        try:
+            return self.call(activity, name, category, callback)
+        except CandidateSourceAdmissionError as error:
+            # This existing type is a source admission failure before native
+            # staging/dispatch, not proof about an arbitrary callback exception.
+            self.owner._retain_loop_failure(len(self.actions), error, self.failures, [])
+            self.observations.append(dict(action=name, passed=False, source=self.project_hash(),
+                error_type=type(error).__name__, detail=str(error)))
+            self.compilation = self.verified = self.profile = self.timing = None
+            return None
+
     def activity_observed_terminal(self, name, value):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence
         from benchmarks.a3kernels.trial import infrastructure_unavailable
+        from rsi.a3_recovery import known_prelaunch_failure
+        if known_prelaunch_failure(value):
+            return True  # Typed pre-launch failure, not an unknown original job.
+
         unavailable = isinstance(value, FailedEvidence) and (
             infrastructure_unavailable(value) or self.owner._retryable_failure(name, value))
         if unavailable:
@@ -617,7 +652,7 @@ class A3Host(SourceHost):
         passed = True
         if stage == Stage.TEST:
             self.actions.append('compile')
-            self.compilation = self.call(activity, 'compile', 'compilation', lambda seconds:
+            self.compilation = self._candidate_call(activity, 'compile', 'compilation', lambda seconds:
                 owner.candidate.compile(self.source, owner.workdir, request_id=owner.cell.cell_id,
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
@@ -628,7 +663,7 @@ class A3Host(SourceHost):
             if self.compilation is None:
                 raise ValueError('A3 validation requires its actual retained compilation')
             self.actions.append('run')
-            self.verified = self.call(activity, 'run', 'execution', lambda seconds:
+            self.verified = self._candidate_call(activity, 'run', 'execution', lambda seconds:
                 owner.candidate.run(self.source, owner.workdir, request_id=owner.cell.cell_id,
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
@@ -663,19 +698,21 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
-def a3_adoption(*, baseline_query=None):
+def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
         actor = getattr(owner.actor, 'canonical_actor', owner.actor)
         # Production A3Actor owns an existing registered Pi session. Preserve its
         # exact model/credential route instead of creating a new provider stack.
         session = getattr(actor, 'session', None)
-        if session is None:
+        if session_factory is None and session is None:
             raise CanonicalConfigurationError('A3 canonical binding needs the registered Pi actor session')
-        def session_factory():
+        def existing_session():
             return PiSessionAdapter.from_existing_session(session)
         root = owner.workdir / 'canonical'
-        injections = dict(query=host.query, backend_identity=fingerprint(host.identity), session_factory=session_factory)
+        injections = dict(query=host.query, backend_identity=fingerprint(host.identity),
+            session_factory=session_factory or existing_session, test_backend=test_backend,
+            **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             return DomainRunner(root, host, **injections)
         bundle, limits = baseline_contract(owner, owner.budgets.max_seconds)
@@ -723,6 +760,19 @@ class OptimizerHost(SourceHost):
 
     def boundary_reached(self, stage):
         return stage != Stage.TEST or self.value is None
+
+    def admit_tool(self, name, stage, args, operation):
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and name == 'optimisation_decision' and args['action'] == 'edit'):
+            raise StrategyRejected('This public attempt already evaluated its candidate. '
+                'Choose profile or noop for this source; a new candidate needs a new public attempt.')
+
+    def admit_proposal(self, stage, args, operation):
+        edit = args.get('edit')
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and edit is not None and edit['source'] != self.source):
+            raise StrategyRejected('The single-evaluation candidate is fixed after TEST. '
+                'Retain this source; use noop/profile, or start another public attempt for a new candidate.')
 
     def activity_exception_terminal(self, name, error):
         from optimizer.control import ObservedBudgetStop
@@ -941,6 +991,9 @@ class OptimizerHost(SourceHost):
                 summaries = filter_presentation(self.submission['memory_snapshot'], summaries)
         self.presentable_memory = summaries['memory_summary']
         value.update(summaries)
+        value['workload'] = dict(single_evaluation=bool(self.inputs.get('single_evaluation')),
+            evaluated=self.evaluation is not None,
+            candidate_locked=bool(self.inputs.get('single_evaluation') and self.evaluation is not None))
         value.update(baseline=self.baseline, history=self.owner.state['history'],
                      best=self.owner.state.get('best'))
         return value
@@ -992,6 +1045,8 @@ class OptimizerHost(SourceHost):
             owner._save()
         passed = True
         if stage == Stage.TEST:
+            if self.inputs.get('single_evaluation') and self.evaluation is not None:
+                raise WorkflowError('single-evaluation workload already consumed its candidate evaluation')
             candidate = json.loads(self.source)
             directory = owner.directory / fingerprint(candidate) / operation
             if stage == Stage.TEST:
@@ -1040,7 +1095,7 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
             owner._save()
         row = owner.store.get(owner.key)
         if row['status'] == 'queued':
-            owner.store.transition(owner.key, 'running')
+            row = owner.store.transition(owner.key, 'running')
         host = OptimizerHost(owner, inputs)
         agent = getattr(owner.agent, 'agent', owner.agent)
         if session_factory is None and not hasattr(agent, 'model'):
@@ -1058,7 +1113,14 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
                           test_backend=test_backend, **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             runner = DomainRunner(root, host, **injections)
-            if runner.workflow.state.pop('domain_boundary', None):
+            boundary = runner.workflow.state.pop('domain_boundary', None)
+            # JobStore.resume is the public control boundary. Preserve every
+            # pending operation/clock row: resume only removes the stop flag;
+            # normal canonical reconciliation still owns unresolved effects.
+            resumed = (runner.workflow.state['stopped'] and not row['stop_requested']
+                       and row['status'] == 'running' and any(event['kind'] == 'resumed'
+                           for event in owner.store.events(owner.key)))
+            if boundary or resumed:
                 runner.workflow.resume()
             return runner
         bundle, limits = baseline_contract(owner, max(0.001, row['max_seconds'] - row['elapsed_seconds']))

@@ -69,6 +69,7 @@ class DomainActivity:
     def __init__(self, runner, operation):
         self.runner, self.operation = runner, operation
         self.executions = []
+        self.terminal_failures = []
 
     def run(self, name, category, callback, *, execution=False, invocation=None):
         flow = self.runner.workflow
@@ -124,6 +125,8 @@ class DomainActivity:
                 if getattr(error, 'terminal_receipt', None) is not None:
                     failure['terminal_receipt'] = error.terminal_receipt
                 finish(failure, 'failed', True)
+                if execution:
+                    self.terminal_failures.append(name)
             else:
                 flow.accounting.unresolved.add(scope['token'])
                 self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
@@ -168,6 +171,10 @@ class DomainRunner(ProjectRunner):
         root = Path(root)
         if (root / 'domain.json').exists():
             raise FileExistsError('domain task already exists; reopen the same task')
+        prior = getattr(host, 'canonical_prior_root', None)
+        if prior is not None:
+            from rsi.a3_recovery import retry_spec
+            spec = retry_spec(host, spec, injections.get('clock', time.time))
         identity = cls.checked_identity(host)
         frozen = dict(kind='rsi-domain-contract-v2', test_backend=injections.get('test_backend', False),
             spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
@@ -175,7 +182,11 @@ class DomainRunner(ProjectRunner):
         reference = host.store.put_json(frozen)
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(root / 'domain.json', dict(contract=reference, store_root=os.path.relpath(host.store.root.resolve(), root.resolve())))
-        return cls(root, host, **injections)
+        runner = cls(root, host, **injections)
+        if prior is not None:
+            from rsi.a3_recovery import carry_retry_elapsed
+            carry_retry_elapsed(runner, prior)
+        return runner
 
     @staticmethod
     def checked_identity(host):
@@ -272,6 +283,9 @@ class DomainRunner(ProjectRunner):
         return dict(tools, **extra)
 
     def tool(self, name, stage, args, operation):
+        admission = getattr(self.backend, 'admit_tool', None)
+        if admission is not None:
+            admission(name, stage, args, operation)
         if name != 'query_kdb':
             return super().tool(name, stage, args, operation)
         call = uuid.uuid4().hex
@@ -306,6 +320,9 @@ class DomainRunner(ProjectRunner):
     def perform(self, stage, args, operation, seconds):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline changed during workflow')
+        admission = getattr(self.backend, 'admit_proposal', None)
+        if admission is not None:
+            admission(stage, args, operation)  # Pure: before intent/edit/reservation/command effects.
         selection = self.selection(operation) if stage in (Stage.DESIGN, Stage.OPTIMISATION) else None
         request = self.latest('actor-request', operation)
         intent = self.store.put_json(dict(kind='domain-stage-intent-v1', operation_id=operation,
@@ -335,7 +352,8 @@ class DomainRunner(ProjectRunner):
         observation = self.backend.execute(stage, args, operation, activity)
         if not isinstance(observation, DomainObservation):
             raise TypeError('domain host must return DomainObservation')
-        if stage in (Stage.TEST, Stage.VALIDATION) and not activity.executions:
+        if (stage in (Stage.TEST, Stage.VALIDATION) and not activity.executions
+                and not (observation.passed is False and activity.terminal_failures)):
             raise WorkflowError('domain test/validation requires a real admitted execution')
         for reference in observation.artifact_refs:
             self.store.read_bytes(reference)

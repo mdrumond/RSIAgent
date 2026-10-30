@@ -15,7 +15,7 @@ def main() -> int:
     environment = dict(os.environ)
     environment["RSIAGENT_ROOT"] = str(REPO)
     return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "tests"],
+        [sys.executable, "-m", "pytest", "-q", "tests", "dashboard/tests"],
         cwd=REPO, env=environment, check=False).returncode
 
 
