@@ -33,21 +33,22 @@ def register(commands):
 
 def _inheritance_flags(parser):
     parser.add_argument('--from-cycle')
-    parser.add_argument('--inheritance', choices=('auto', 'parent', 'baseline'), default='auto')
+    parser.add_argument('--inheritance', choices=('auto', 'parent', 'baseline'), default=None)
     parser.add_argument('--input-override', dest='input_overrides', action='append',
                         choices=('memory', 'skills', 'kdb'), default=[])
 
 
-def _inheritance_request(args):
-    if args.command == 'phase1':
-        if args.from_cycle is not None or args.inheritance == 'parent':
-            raise ValueError('phase1 always uses baseline inputs and cannot select a parent')
-        policy = 'baseline'
-    else:
-        policy = args.inheritance
-    if args.from_cycle is not None and policy == 'baseline':
+def _inheritance_request(args, previous_cycle=None):
+    parent, policy = args.from_cycle, args.inheritance
+    if args.action == 'revisit':
+        policy = policy or 'parent'
+        if parent is None and policy == 'parent':
+            parent = previous_cycle
+    elif policy is None:
+        policy = 'baseline' if args.command == 'phase1' and parent is None else 'auto'
+    if parent is not None and policy == 'baseline':
         raise ValueError('baseline inheritance cannot select a parent cycle')
-    return dict(from_cycle=args.from_cycle, inheritance=policy,
+    return dict(from_cycle=parent, inheritance=policy,
                 input_overrides=list(dict.fromkeys(args.input_overrides)))
 
 
@@ -78,5 +79,5 @@ def execute(args):
             request['previous_cycle'] = request['cycle_id']
             request['cycle_id'] = args.cycle
     if args.action in ('start', 'revisit'):
-        request.update(_inheritance_request(args))
+        request.update(_inheritance_request(args, request.get('previous_cycle')))
     return jobs.start(args.instance, request)

@@ -63,6 +63,20 @@ def _project(instance, reference):
 
 
 def execute(args):
+    if args.skill_action in ('get', 'export') and args.cycle is not None:
+        from .handoffs import published_skills
+        published = published_skills(args.instance, args.cycle)
+        if args.skill_action == 'export':
+            from .skill_delivery import export_bundle
+            return export_bundle(published.bundle, args.destination, source=dict(
+                kind='cycle', cycle_id=args.cycle, provenance_ref=published.provenance))
+        result = dict(published.bundle.to_dict(), bundle_ref=published.bundle_ref,
+                      bundle_hash=published.bundle.digest, cycle_id=args.cycle,
+                      provenance_ref=published.provenance)
+        if args.name is not None:
+            document = published.bundle.document(args.name)
+            result['documents'] = [row for row in result['documents'] if row['name'] == document.name]
+        return result
     if args.skill_action == 'export' and args.builtin:
         from .skill_delivery import export_bundle
         from .skills import builtin_bundle

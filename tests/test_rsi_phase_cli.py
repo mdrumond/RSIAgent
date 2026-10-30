@@ -45,7 +45,7 @@ def test_inference_project_and_recovery_flag_do_not_drop_parent_policy(instance,
 
 
 @pytest.mark.parametrize('flags', [[], ['--inheritance', 'baseline']])
-def test_phase1_always_requests_baseline(instance, monkeypatch, flags):
+def test_phase1_defaults_to_baseline(instance, monkeypatch, flags):
     calls = []
     monkeypatch.setattr(jobs, 'start', lambda root, request: calls.append(request) or {})
     assert main(['--instance', str(instance), 'phase1', 'start', *flags]) == 0
@@ -53,7 +53,7 @@ def test_phase1_always_requests_baseline(instance, monkeypatch, flags):
 
 
 @pytest.mark.parametrize('mode,flags', [
-    ('phase1', ['--from-cycle', 'old']), ('phase1', ['--inheritance', 'parent']),
+    ('phase1', ['--inheritance', 'baseline', '--from-cycle', 'old']),
     ('phase2', ['--inheritance', 'baseline', '--from-cycle', 'old'])])
 def test_invalid_inheritance_rejected_before_dispatch(instance, monkeypatch, mode, flags):
     calls = []
@@ -74,10 +74,33 @@ def test_revisit_selects_new_inputs_but_resume_preserves_original_request(instan
     assert calls[-1]['previous_cycle'] == 'old'
     assert main(['--instance', str(instance), 'phase2', 'revisit', '--job', identity,
         '--cycle', 'automatic']) == 0
-    assert calls[-1]['from_cycle'] is None and calls[-1]['inheritance'] == 'auto'
+    assert calls[-1]['from_cycle'] == 'old' and calls[-1]['inheritance'] == 'parent'
     assert calls[-1]['input_overrides'] == []
     assert main(['--instance', str(instance), 'phase2', 'resume', '--job', identity]) == 0
     assert calls[-1] == dict(old, action='resume', previous_job=identity)
     with pytest.raises(SystemExit) as error:
         main(['--instance', str(instance), 'phase2', 'resume', '--job', identity, '--from-cycle', 'new'])
     assert error.value.code == 2 and len(calls) == 3
+
+
+@pytest.mark.parametrize('mode', ['phase1', 'phase2', 'inference'])
+def test_revisit_preserves_previous_accepted_heads_unless_explicit_baseline(instance, monkeypatch, mode):
+    identity, _ = previous(instance, mode=mode)
+    calls = []
+    monkeypatch.setattr(jobs, 'start', lambda root, request: calls.append(request) or {})
+    assert main(['--instance', str(instance), mode, 'revisit', '--job', identity, '--cycle', 'again']) == 0
+    assert calls[-1]['from_cycle'] == 'old' and calls[-1]['inheritance'] == 'parent'
+    assert calls[-1]['input_overrides'] == []
+    assert main(['--instance', str(instance), mode, 'revisit', '--job', identity,
+        '--cycle', 'baseline-again', '--inheritance', 'baseline']) == 0
+    assert calls[-1]['from_cycle'] is None and calls[-1]['inheritance'] == 'baseline'
+    assert calls[-1]['input_overrides'] == []
+
+
+def test_phase1_explicit_parent_is_forwarded_without_restricting_source_mode(instance, monkeypatch):
+    calls = []
+    monkeypatch.setattr(jobs, 'start', lambda root, request: calls.append(request) or {})
+    assert main(['--instance', str(instance), 'phase1', 'start', '--from-cycle', 'accepted-inference',
+        '--inheritance', 'parent', '--input-override', 'kdb']) == 0
+    assert calls[-1]['from_cycle'] == 'accepted-inference'
+    assert calls[-1]['inheritance'] == 'parent' and calls[-1]['input_overrides'] == ['kdb']

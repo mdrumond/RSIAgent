@@ -74,7 +74,9 @@ values that cannot be established are omitted. Disabled caps are explicitly null
 
 Start/revisit accept --from-cycle CYCLE, --inheritance auto|parent|baseline and
 repeat --input-override memory|skills|kdb. Inputs enter a NEW cycle through the
-shared service. Phase1 always uses baselines and rejects parent inheritance.
+shared service. Phase1 defaults to baselines; explicit parent inheritance may use
+any accepted prior phase. Default revisit captures previous cycle accepted heads
+without carrying old baseline overrides. Explicit baseline starts fresh.
 Resume keeps the original frozen contract and accepts no new inheritance flags.
 Automatic Phase2 uses accepted Phase1 memory; inference uses published validated
 Phase2 heads. Explicit parent acknowledges inheritance; baseline ignores parents.
