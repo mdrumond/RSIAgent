@@ -217,7 +217,7 @@ def build_native_adaptive_phase1(
     from benchmarks.a5kernels.phase1_adaptive_production import _knowledge_action
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
-    from benchmarks.a5kernels.trial import _SYSTEM_PROMPT
+    from benchmarks.a5kernels.trial import actor_system_prompt
     from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
 
     if project_workers and reviewed_snapshot is not None:
@@ -331,7 +331,7 @@ def build_native_adaptive_phase1(
     provider = DirectCompletionProvider(environment, **(
         {"transport": provider_transport} if provider_transport is not None else {}
     ))
-    actor = PiActorDriver(provider, system_prompt=_SYSTEM_PROMPT.replace("one A5 kernel", "one A3 Ascend C kernel"))
+    actor = PiActorDriver(provider, system_prompt=actor_system_prompt("A3 Ascend C", typed=True))
     executor = None
     if not project_workers:
         backend = NativeProjectBackend(native_transport, root / "native-evidence",

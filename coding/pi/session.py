@@ -20,7 +20,7 @@ from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 4, "context_policy": "bounded-host-turn-history-v3",
+                   "adapter_version": 5, "context_policy": "canonical-host-conversation-v1",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
