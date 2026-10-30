@@ -107,58 +107,6 @@ def test_parked_wave_can_exceed_vm_capacity_without_losing_actor_context(tmp_pat
     assert len(_read_memory_tree(result.memory_dir)) == 5
 
 
-def test_ale_phase2_preserves_actor_learning_and_fresh_verifier_sessions(tmp_path, monkeypatch):
-    from benchmarks.ale import learning
-    from core import loop
-    from explore import target_learning, unified_evolution
-    from explore.practice_loop import PracticeHooks, _atomic_install_memory, _read_memory_tree
-    initial = tmp_path / 'initial'
-    _atomic_install_memory(str(initial), {'seed.md': b'phase1'})
-    work = tmp_path / 'phase2'; work.mkdir()
-    pools = []; session_ids = []; history_ids = []; learned_ids = []; reviews = []
-    class Pool:
-        def __init__(self, sandboxes, practice, reset_endpoint):
-            self.practice = practice; self.acquisitions = 0; self.closed = False
-            pools.append(self)
-        def acquire(self):
-            self.acquisitions += 1
-            return SimpleNamespace(close=lambda: None), SimpleNamespace(visible_roots=())
-        def close(self): self.closed = True
-    monkeypatch.setattr(learning, 'CleanPool', Pool)
-    monkeypatch.setattr(learning, 'hooks_for', lambda *a: PracticeHooks(push_memory=lambda *a: True))
-    def actor(direction, vm, cfg, sink, **kw):
-        session_ids.append(kw['verifier_sessions'])
-        history = [{'role': 'user', 'content': 'task'}, {'role': 'assistant', 'content': 'candidate'}]
-        history_ids.append(history)
-        kw['runtime_state']['active_history'] = history
-        if len(history_ids) == 1:
-            return loop.LoopResult(status='evolve', verifier_route='EVOLVE', verifier_report='VERDICT: FAIL\nMissing rows'), history
-        return loop.LoopResult(status='done', verifier_route='HANDOFF', verifier_report='VERDICT: PASS\nAll rows checked'), history
-    monkeypatch.setattr(loop, 'run_with_resume', actor)
-    def learn(**kw):
-        learned_ids.append(kw['actor_history'])
-        memory = {**kw['before_memory'], f'learn{len(learned_ids)}.md': kw['terminal_outcome'].encode()}
-        _atomic_install_memory(str(kw['memory_dir']), memory)
-        return memory, 'Improve row coverage', kw['actor_history']
-    monkeypatch.setattr(target_learning, '_promote_learning', learn)
-    def evolve(vm, root, direction, report, diagnosis, memory, *configs, **kw):
-        reviews.append((kw['triggering_outcome'], kw['session']))
-        destination = Path(root) / 'memory'
-        _atomic_install_memory(str(destination), memory)
-        return SimpleNamespace(status='ready_for_retry', memory_dir=str(destination),
-            projects=1 if len(reviews) == 1 else 0, reason='Ready')
-    monkeypatch.setattr(unified_evolution, 'evolve_until_ready', evolve)
-    result = learning.phase2({'work_dir': str(work), 'input_memory': memory_record(initial),
-        'sandbox': {}, 'practice_sandboxes': [{}], 'corpus': 'unused', 'instruction': 'public task', 'reset_endpoint': 'fake'})
-    assert result['transition_ready'] and result['official_evaluator_calls'] == 0
-    assert result['target_cycles'] == 2 and result['learning_updates'] == 2
-    assert session_ids[0] is not session_ids[1]
-    assert learned_ids[0] is history_ids[0] and learned_ids[1] is history_ids[1]
-    assert reviews[0][0] == 'FAIL' and reviews[1][0] == 'PASS'
-    assert reviews[0][1] is reviews[1][1]
-    assert _read_memory_tree(str(initial)) == {'seed.md': b'phase1'}
-    assert len(_read_memory_tree(result['memory']['path'])) == 3
-    assert all(p.closed for p in pools)
 
 
 def test_report_rejects_two_rsi_scores_for_the_same_task(tmp_path):
@@ -256,13 +204,69 @@ def test_audit_decodes_multiline_transcript_strings(tmp_path):
 def test_host_memory_and_instruction_protocol_match_rsiagent(tmp_path):
     from benchmarks.ale.protocol import instruction_shingles
     from explore.practice_loop import _manifest
-    from explore.target_learning import _memory_tree_sha256
+    from explore.memory_hash import memory_tree_sha256
     from explore.commit import _shingles
     memory = {'ü.md': b'hello', 'binary.bin': bytes(range(256))}
     for name, content in memory.items():
         (tmp_path / name).write_bytes(content)
     record = memory_record(tmp_path)
-    assert record['sha256'] == _memory_tree_sha256(memory)
+    assert record['sha256'] == memory_tree_sha256(memory)
     assert record['files'] == _manifest(memory)
     instruction = 'Create a table with at least ten rows, then save the UTF-8 output.'
     assert instruction_shingles(instruction) == _shingles(instruction)
+
+
+def test_ale_rsi_hands_frozen_phase1_memory_directly_to_evaluation(tmp_path):
+    from benchmarks.ale.host import rsi_lineage
+    bank = tmp_path / 'memory'; bank.mkdir()
+    (bank / 'lesson.md').write_bytes(b'verified broad learning')
+    memory = memory_record(bank)
+    calls = []
+    async def phase(entry, name, input_memory=None):
+        calls.append((entry, name, input_memory))
+        if name == 'phase1':
+            return dict(transition_ready=True, official_evaluator_calls=0, memory=memory)
+        assert input_memory is memory
+        return {'score': 0.8}
+    assert asyncio.run(rsi_lineage({'task': 'example'}, phase)) == {'score': 0.8}
+    assert [call[1] for call in calls] == ['phase1', 'phase3']
+    verify_memory(memory)
+
+
+@pytest.mark.parametrize('failure', ['not-ready', 'mutated-memory', 'grader-used'])
+def test_ale_rsi_rejects_invalid_learning_boundary_before_evaluation(tmp_path, failure):
+    from benchmarks.ale.host import rsi_lineage
+    bank = tmp_path / 'memory'; bank.mkdir()
+    (bank / 'lesson.md').write_bytes(b'original')
+    memory = memory_record(bank)
+    calls = []
+    async def phase(entry, name, input_memory=None):
+        calls.append(name)
+        if failure == 'mutated-memory':
+            (bank / 'lesson.md').write_bytes(b'changed')
+        return dict(transition_ready=failure != 'not-ready',
+                    official_evaluator_calls=int(failure == 'grader-used'), memory=memory)
+    with pytest.raises(RuntimeError):
+        asyncio.run(rsi_lineage({'task': 'example'}, phase))
+    assert calls == ['phase1']
+
+
+@pytest.mark.parametrize('schema,phase', [(2, 'phase1'), (3, 'phase2')])
+def test_ale_worker_rejects_obsolete_protocol_before_outputs(tmp_path, monkeypatch, schema, phase):
+    from benchmarks.ale import worker
+    output = tmp_path / 'not-created'
+    spec = tmp_path / 'worker.json'
+    spec.write_text(json.dumps(dict(schema_version=schema, phase=phase, work_dir=str(output))))
+    monkeypatch.setattr(worker.sys, 'argv', ['worker', str(spec)])
+    monkeypatch.setattr(worker, 'protocol', lambda: pytest.fail('must reject before protocol binding'))
+    with pytest.raises(ValueError):
+        worker.main()
+    assert not output.exists()
+
+
+def test_ale_host_rejects_old_manifest_before_provider_import_or_outputs(tmp_path):
+    from benchmarks.ale.host import run
+    output = tmp_path / 'not-created'
+    with pytest.raises(ValueError, match='Unsupported ALE manifest'):
+        asyncio.run(run(SimpleNamespace(output=str(output)), {'schema_version': 2}))
+    assert not output.exists()

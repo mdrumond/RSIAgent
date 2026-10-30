@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute a protocol's three phases with isolated caches and visible logs.
+# Execute a protocol's exploration and evaluation stages with isolated caches and visible logs.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -17,7 +17,7 @@ cd -- "$RSI_ROOT"
 # Use the same validator as the orchestrator before creating any run paths.
 RSI_NAME="$("$RSI_PYTHON" -c 'from pathlib import Path; import sys; from benchmarks.osworld.pipeline import load_protocol; print(load_protocol(Path(sys.argv[1]))["run_name"])' "$RSI_PROTOCOL")"
 mkdir -p -- "$RSI_ROOT/results/batch_logs/$RSI_NAME"
-for RSI_STAGE in 1 2 3; do
+for RSI_STAGE in 1 3; do
   export RSIAGENT_OSWORLD_CACHE_DIR="$RSI_ROOT/results/task_cache/$RSI_NAME/phase$RSI_STAGE"
   "$RSI_PYTHON" -u -m benchmarks.osworld.pipeline \
     --protocol "$RSI_PROTOCOL" --phase "phase$RSI_STAGE" \

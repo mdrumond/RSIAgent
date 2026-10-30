@@ -124,7 +124,7 @@ def build_plan(protocol_path):
     root = runner._safe_phase_root(protocol['run_name'])
     require((root.parent / 'protocol.json').read_bytes() == protocol_path.read_bytes(),
             'Protocol changed after launch')
-    require(not any((root.parent / name).exists() for name in ('phase2', 'phase3')),
+    require(not any((root.parent / name).exists() for name in ('phase3',)),
             'Later phase artifacts already exist')
     manifest, state, result = (load(root / name) for name in
                                ('manifest.json', 'state.json', 'result.json'))
@@ -262,7 +262,7 @@ def restore_branch(context, assignment, factory, hooks):
 def execute(context):
     from explore import phase1_wave as wave
     from explore.practice_loop import PracticeHooks, _manifest, _read_memory_tree
-    from explore.target_learning import _memory_tree_sha256
+    from explore.memory_hash import memory_tree_sha256
     from benchmarks.osworld.provider import prepare_checkpointable_docker_provider
     from desktop_env.desktop_env import DesktopEnv
     from env.vm import VM
@@ -354,7 +354,7 @@ def execute(context):
         result = {**context.result, 'status': status, 'projects': total,
                   'stop_reason': reason, 'memory_manifest': _manifest(memory),
                   'memory_files': len(memory), 'memory_bytes': sum(map(len, memory.values())),
-                  'memory_tree_sha256': _memory_tree_sha256(memory),
+                  'memory_tree_sha256': memory_tree_sha256(memory),
                   'infrastructure_recovery': str(audit / 'plan.json')}
         wave._atomic_json(root / 'state.json', state)
         wave._atomic_json(root / 'result.json', result)

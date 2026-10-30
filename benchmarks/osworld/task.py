@@ -104,7 +104,7 @@ def main():
     }
     if args.memory_dir:
         from explore.practice_loop import _manifest, _read_memory_tree  # noqa: E402
-        from explore.target_learning import _memory_tree_sha256       # noqa: E402
+        from explore.memory_hash import memory_tree_sha256       # noqa: E402
 
         raw_memory_path = Path(args.memory_dir).expanduser()
         if raw_memory_path.is_symlink():
@@ -124,7 +124,7 @@ def main():
             "source": str(memory_path),
             "files": len(frozen_memory),
             "bytes": sum(len(data) for data in frozen_memory.values()),
-            "tree_sha256": _memory_tree_sha256(frozen_memory),
+            "tree_sha256": memory_tree_sha256(frozen_memory),
             "manifest_sha256": hashlib.sha256(json.dumps(
                 manifest, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")).hexdigest(),

@@ -79,7 +79,7 @@ def test_resume_rejects_memory_drift_partial_learning_and_later_phases(tmp_path,
     elif fault == "partial":
         (root / "episodes/ep002/memory_distillation").mkdir(parents=True)
     elif fault == "later_phase":
-        (root.parent / "phase2").mkdir()
+        (root.parent / "phase3").mkdir()
     else:
         state = json.loads((root / "state.json").read_text())
         state["project_budget"] = 16

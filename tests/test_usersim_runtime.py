@@ -39,7 +39,8 @@ def make_study(tmp_path, monkeypatch, *, name="first", route=ROUTE):
     memory.mkdir(parents=True)
     (memory / "lesson.md").write_text("A practice lesson")
     pipeline._write_json_atomic(root / "phase1/result.json", {
-        "status": "budget_exhausted", "memory_frozen_path": str(memory)})
+        "status": "budget_exhausted", "memory_frozen_path": str(memory),
+        "official_evaluator_calls": 0})
     lock = root / "evaluation.lock.json"
     # Deliberately no evaluator model/credentials: learning needs only task setup.
     lock.write_text(json.dumps({
@@ -47,20 +48,18 @@ def make_study(tmp_path, monkeypatch, *, name="first", route=ROUTE):
         "evaluator": {"website_host_suffix": "site.invalid"},
         "user_simulator": route,
     }))
-    monkeypatch.setattr(pipeline, "BENCHMARK_PROVENANCE_PROFILES", {
-        "osworld-v2-2026.08.08": lock})
     return {
         "run_name": name,
         "task_release": "osworld-v2-2026.08.08",
-        "phase2": {"seed": 1},
+        "phase1": {"project_budget": 8, "checkpoints": [0, 4, 8]},
         "_resolved": {
             "run_root": root,
-            "development_tasks": ("task_024",),
-            "phase2_stop_policy": "verifier_pass",
+            "distribution": REPO / "config/target_queries/task_024.md",
+            "study_design": "target_conditioned_exploration",
             "configs": {
-                "phase2": {field: REPO / "config/roles/target.yaml" for field in (
-                    "target_config", "practice_actor_config",
-                    "practice_verifier_config", "curriculum_config", "memory_config")},
+                "phase1": {field: REPO / "config/roles/target.yaml" for field in (
+                    "actor_config", "verifier_config", "verifier_control_config",
+                    "curriculum_config", "memory_config")},
                 "phase3": {"benchmark_lock": lock},
             },
         },
@@ -69,19 +68,13 @@ def make_study(tmp_path, monkeypatch, *, name="first", route=ROUTE):
 
 def complete_child(spec):
     root = spec["_resolved"]["run_root"]
-    memory = root / "phase1/memory_frozen"
-    memory_hash = pipeline._memory_record(memory)["tree_sha256"]
-    pipeline._write_json_atomic(root / "phase2/task_024/attempt_0001/result.json", {
-        "status": "verifier_pass", "target_verifier_verdict": "PASS",
-        "phase2_stop_policy": "verifier_pass",
-        "official_evaluator_calls": 0,
-        "official_evaluator_feedback_entered_learning": False,
-        "initial_memory_tree_sha256": memory_hash,
-        "final_memory_path": str(memory), "final_memory_tree_sha256": memory_hash,
+    pipeline._write_json_atomic(root / "phase1/result.json", {
+        "status": "budget_exhausted", "official_evaluator_calls": 0,
+        "memory_frozen_path": str(root / "phase1/memory_frozen"),
     })
 
 
-def test_phase2_launch_passes_user_route_and_preserves_actor_input(
+def test_phase1_launch_passes_user_route_and_preserves_actor_input(
         tmp_path, monkeypatch):
     spec = make_study(tmp_path, monkeypatch)
     os.environ["TEST_USER_KEY"] = "synthetic-key"
@@ -102,14 +95,14 @@ def test_phase2_launch_passes_user_route_and_preserves_actor_input(
         assert child["TEST_USER_KEY"] == "synthetic-key"
         assert child["WEBSITE_HOST_SUFFIX"] == "site.invalid"
         assert not any(key.startswith("OSWORLD_EVAL_") for key in child)
-        assert argv[argv.index("--target-config") + 1] == str(
+        assert argv[argv.index("--verifier-control-config") + 1] == str(
             REPO / "config/roles/target.yaml")
         assert not any("synthetic-key" in argument for argument in argv)
         complete_child(spec)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(pipeline.subprocess, "run", launch)
-    assert pipeline.execute_phase2(spec)["status"] == "complete"
+    assert pipeline.execute_phase1(spec, resume_completed_boundary=True)["status"] == "budget_exhausted"
     assert len(calls) == 1
     assert dict(os.environ) == before
     assert {enabled: build_system(cfg, ask_enabled=enabled)
@@ -128,7 +121,7 @@ def test_successive_studies_do_not_inherit_previous_user_route(tmp_path, monkeyp
             return SimpleNamespace(returncode=0)
 
         monkeypatch.setattr(pipeline.subprocess, "run", launch)
-        pipeline.execute_phase2(spec)
+        pipeline.execute_phase1(spec, resume_completed_boundary=True)
     assert seen[0]["OSWORLD_USER_SIM_MODEL"] == ROUTE["model"]
     assert not any(key.startswith("OSWORLD_USER_SIM_") for key in seen[1])
     assert dict(os.environ) == before

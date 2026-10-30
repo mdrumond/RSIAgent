@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""HOST-SIDE ONLY (grader-diagnostic class): build the P2 silent-audit corpus —
+"""HOST-SIDE ONLY (grader-diagnostic class): build the practice silent-audit corpus —
 8-gram shingles over all 108 task instructions. The corpus file is consumed
 exclusively by explore/commit.silent_audit (host process); it never enters any
-agent context, and run_explore.py never imports THIS module or task_loader.
+agent context, and the learning runtime never imports this module or task_loader.
 """
 import hashlib
 import json

@@ -27,8 +27,12 @@ Agent Interfaces appendix:
 | Paper terminology | Runtime |
 | --- | --- |
 | Broad Recursive Self-exploration (BRS) | Phase 1: parallel experience acquisition, followed by ordered memory consolidation |
-| Deep Recursive Self-exploration (DRS) | Phase 2: sequential target attempts and practice selected by the Curriculum Agent |
+| Deep Recursive Self-exploration (DRS) | Original paper stage: sequential target attempts and practice selected by the Curriculum Agent; removed from the maintained runtime |
 | Test-time memory reuse | Phase 3: the Actor Agent and Verifier Agent use the shared framework with frozen memory and sealed evaluation |
+The maintained desktop runtime now connects broad exploration directly to frozen-memory
+evaluation. The original deep-exploration stage is historical method provenance,
+not an available execution mode; the manuscript results describe that original method.
+
 
 The failure-analysis summary follows the manuscript's Insufficiently Targeted
 Exploration, Incomplete Verification, and Unreliable Memory Consolidation sections.

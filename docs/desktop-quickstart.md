@@ -37,7 +37,7 @@ Prepare the benchmark assets and audit files, then check the VM:
 
 ```bash
 python tools/prepare_osworld_v2_release.py
-python tools/build_p2_corpus.py
+python tools/build_practice_corpus.py
 python tools/exam_fence.py build
 python tools/smoke_osworld.py --output results/smoke/osworld
 ```

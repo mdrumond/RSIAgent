@@ -30,34 +30,12 @@ not merged. Budget checks happen at complete-wave boundaries; the Curriculum Age
 declare saturation earlier. Distribution-guided exploration and target-conditioned
 prerequisite exploration are separate study designs.
 
-## Phase 2
+## Direct memory handoff
 
-Phase 2 begins with an actual development-target attempt. Both PASS and FAIL can
-ground learning by the Actor Agent that performed the attempt. Under the default
-`curriculum_review`, the Curriculum Agent reviews the learned experience even
-after a target PASS. It can request more
-practice or return readiness. If practice occurs, a fresh attempt on the unchanged
-target is required before successful natural completion. Readiness from the
-Curriculum Agent is not a task correctness verdict.
-
-The alternative `verifier_pass` policy stops after a target PASS and its memory
-commit. Neither policy turns an infrastructure error into a PASS or FAIL.
-`STALLED` and budget exits must remain distinguishable from successful convergence.
-
-The A5 Catlass attention runner keeps semantic attempts immutable. A first attempt
-receives no repair context. After a host-verified failure, the next attempt receives
-the immediately preceding candidate (bounded to 256 KiB), its candidate and evidence
-digests, and the admitted failure summary. The prompt asks for a focused repair of
-that candidate. This context exposes no host data beyond the already admitted
-diagnostic and mismatch summary and cannot override the host verifier; retained
-attempts are reauthenticated before the context is rebuilt.
-
-The Curriculum Agent's context persists within the target lineage. Its default
-direct memory view is read-only. The `none` comparison setting removes that direct
-view while retaining normal trajectory and Verifier Agent feedback. The Actor
-Agent's memory access remains enabled. The public protocol orchestrator currently
-uses the default view; the
-explicit comparison flag is available through `python -m benchmarks.osworld.phase2`.
+Desktop learning ends at the Phase 1 publication boundary. The orchestrator
+checks that learning completed without official evaluator calls and authenticates
+the frozen memory digest before starting Phase 3. There is no intermediate target
+practice stage. A changed snapshot blocks evaluation before a task starts.
 
 ## Phase 3
 
@@ -78,9 +56,8 @@ must be reported separately from unmodified official evaluation.
 | Path | Responsibility |
 | --- | --- |
 | `run_osworld.py`, `run_ale.py` | Public benchmark entrypoints |
-| `benchmarks/osworld/pipeline.py` | Protocol validation and three-stage orchestration |
+| `benchmarks/osworld/pipeline.py` | Protocol validation and exploration/evaluation orchestration |
 | `benchmarks/osworld/phase1.py`, `explore/phase1_wave.py` | Phase 1 exploration and wave barrier |
-| `benchmarks/osworld/phase2.py`, `core/self_evolving_loop.py` | Phase 2 target/practice lifecycle |
 | `benchmarks/osworld/task.py` | Frozen-memory task execution and sealed evaluation |
 | `benchmarks/osworld/evaluator_corrections.py` | Explicit, source-bound evaluator corrections |
 | `core/`, `llm/`, `env/` | Agent runtime, model transport, and guest interface |

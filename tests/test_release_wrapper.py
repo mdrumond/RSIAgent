@@ -37,8 +37,9 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("fail_at,expected,exit_code", [
-    (None, ["phase1", "phase2", "phase3"], 0),
-    ("phase2", ["phase1", "phase2"], 75),
+    (None, ["phase1", "phase3"], 0),
+    ("phase1", ["phase1"], 75),
+    ("phase3", ["phase1", "phase3"], 75),
 ])
 def test_wrapper_preserves_order_caches_logs_and_failures(tmp_path, fail_at, expected, exit_code):
     root = tmp_path / "checkout with spaces"
@@ -65,5 +66,5 @@ def test_wrapper_preserves_order_caches_logs_and_failures(tmp_path, fail_at, exp
         assert item["phase"] + " output" in process.stdout
         log = root / "results/batch_logs/wrapper_test" / (item["phase"] + ".log")
         assert item["phase"] + " output" in log.read_text()
-    if fail_at:
-        assert not (root / "results/batch_logs/wrapper_test/phase3.log").exists()
+    logs = root / "results/batch_logs/wrapper_test"
+    assert sorted(path.stem for path in logs.glob("*.log")) == sorted(expected)

@@ -43,7 +43,6 @@ targets and optimizer tasks in one run.
 | Inspect campaigns and retained evidence | `python -m dashboard serve` | [Dashboard](dashboard/README.md) |
 | Run OSWorld baseline and RSI batches | `python run_osworld.py` | [Desktop setup](docs/desktop-quickstart.md) · [Operations](docs/OPERATIONS.md) |
 | Prepare, run and report ALE batches | `python run_ale.py` | [ALE](docs/ALE.md) |
-| Inspect retained Phase 2 runs | Historical report/status commands | [Phase 2 retirement](docs/phase2-retirement.md) |
 
 ### Ascend subject curriculum
 
@@ -73,10 +72,10 @@ A3 validation does not establish A5 correctness, compiler compatibility or timin
 Product, compiler, CANN, dependency revisions and selected devices belong to the
 observed runtime configuration, rather than being inferred from a target name.
 
-New Ascend campaigns use `run_ascend_subjects.py`. Separate Phase 2 execution
-launches are retired. Historical Phase 2 reports, status and artifact collection
-remain available without relabeling old runs. The existing Phase 1 launcher also
-remains available; starting it never automatically starts another phase.
+Ascend campaigns use `run_ascend_subjects.py`. Phase 2 execution, historical
+readers, controllers and compatibility commands have been removed. The existing
+Phase 1 launcher remains available for standalone exploration; it does not start
+another stage.
 
 ### Standalone kernel optimization
 
@@ -114,11 +113,12 @@ flowchart TD
 The host distinguishes four questions: did execution complete, was the output
 correct, how did it perform, and did the proposed memory help? A model's claim or
 a completed process answers none of the other questions by itself. Retained
-observations and admission gates determine the corresponding outcomes.
+observations, independent verification and source-review decisions determine the
+corresponding outcomes.
 
 | Layer | Responsibility | Main implementation |
 | --- | --- | --- |
-| Orchestration | Subject selection, waves, repair, memory admission and elapsed budgets | `benchmarks/ascend/` |
+| Orchestration | Subject selection, waves, repair, memory publication and elapsed budgets | `benchmarks/ascend/` |
 | Agent runtime | Pi coding sessions, typed host actions, bounded context and provider gateway | `coding/pi/`, `integrations/pi/` |
 | Workload/reference | Deterministic cases, frozen reference bundles and comparison policy | `optimizer/cases.py`, `optimizer/reference.py` |
 | Execution | Target-specific compilation, launch, correctness checks and measurements | Ascend target bindings, `optimizer/native.py`, `optimizer/measurement.py` |
@@ -131,10 +131,11 @@ lifetime, transport and retained-operation recovery. This separates a proposal
 from execution and a measurement from its interpretation.
 
 The desktop framework shares the Curriculum/Actor/Verifier strategy but retains
-its own VM lifecycle and official evaluation fence. Its broad exploration, deep
-practice and frozen-memory test-time phases are described in
-[desktop architecture](docs/ARCHITECTURE.md). Official benchmark scores stay
-outside the learning loop.
+its own VM lifecycle and official evaluation fence. Phase 1 broad exploration
+feeds its authenticated frozen memory directly to Phase 3 evaluation. Baseline
+execution runs without learning. Stage numbers remain 1 and 3; there is no
+intermediate target-practice stage. See [desktop architecture](docs/ARCHITECTURE.md).
+Official benchmark scores stay outside the learning loop.
 
 ## Quickstart
 
@@ -165,7 +166,7 @@ There are separate configuration concerns:
 | Configuration | Owns |
 | --- | --- |
 | Subject file | Ordered subject IDs, objectives, minimum waves and optional target/optimizer tasks |
-| Campaign settings | Models, existing `phase1_arguments`, optional KDB, verifier and memory-admission settings |
+| Campaign settings | Models, existing `phase1_arguments`, optional KDB, verifier and memory-publication settings |
 | Execution settings | Local/remote mode, observed runtime/toolchain, workspace and physical device; compatible optimizer worker settings when used |
 | Provider environment | Credentials supplied outside source control and published artifacts |
 
@@ -254,10 +255,13 @@ python run_osworld.py --arm both --name osworld_run_01 --concurrency 1
   --runs results/ale/run_01 --output results/ale/report_01
 ```
 
-Use `baseline` for execution without RSI, `rsi` for learning followed by
-frozen-memory evaluation, or `both`. Use a new batch name/output directory for
-independent runs. Begin with one task lineage and increase concurrency only when
-the VM host has capacity.
+Use `baseline` for execution without RSI, `rsi` for Phase 1 learning followed
+directly by Phase 3 frozen-memory evaluation, or `both`. OSWorld protocols use
+schema version 2; ALE protocols, manifests and workers use version 3. Older
+three-stage inputs are rejected before execution. Use a fresh batch name/output
+directory; no historical Phase 2 migration or reporting interface remains.
+Begin with one task lineage and increase concurrency only when the VM host has
+capacity.
 
 ## Interfaces
 
@@ -306,8 +310,12 @@ The reference KDB and learned memory serve different purposes. The KDB supplies
 pinned source/document citations; learned memory supplies experience admitted
 from verified work. With KDB enabled, accepted memory versions have indexed
 collections and Actors retrieve against their frozen active-version view.
-Drafts do not enter ordinary accepted-memory retrieval. Reference-exposed
-benchmark material must remain labeled as such.
+Drafts do not enter ordinary accepted-memory retrieval. Source-approved lessons
+publish directly; no separate A/B admission experiment runs. Memory usage is
+recorded against immutable versions. Evidence from ordinary verified projects can
+challenge an existing lesson and drive source-reviewed correction or replacement;
+an in-progress Actor keeps its frozen view. Reference-exposed benchmark material
+must remain labeled as such.
 
 Inspect `subject-campaign.json`, project outcomes, accepted
 memory and their content-addressed evidence together. Optimizer jobs retain
@@ -315,8 +323,6 @@ immutable submissions, event chains, source and operation results. Missing metri
 and unavailable diagnostics are explicit. Budget exhaustion does not erase an earlier correct candidate or prove useful memory.
 Full profiler trees may remain on the execution host; compact records point to
 retained evidence rather than inventing missing reports.
-
-
 
 ### Dashboard
 
@@ -328,13 +334,12 @@ python -m dashboard serve --config /private/dashboard.json \
 
 The default listener is `http://127.0.0.1:8080`. Configure locally accessible
 campaign roots using [the example](dashboard/config.example.json). The viewer
-shows subject campaigns and historical phase artifacts, source, traces, host
-verification, memory decisions and timing/profiling evidence. Unavailable data
+shows supported subject campaigns, standalone exploration and optimizer jobs,
+source, traces, host verification, memory decisions and timing/profiling evidence. Unavailable data
 stays unavailable; cached snapshots are labeled stale when needed.
 
 Campaign controls are disabled by default; the optimizer has its own independent
-configuration. Enabling controls does not restore retired Phase 2 execution.
-Use the [dashboard guide](dashboard/README.md) for supported controls and loopback
+configuration. Use the [dashboard guide](dashboard/README.md) for supported controls and loopback
 requirements. A page refresh does not launch a replacement worker.
 
 ### Validation
@@ -363,7 +368,8 @@ The manuscript reports these mean partial-credit scores (%):
 | OSWorld 2.0 · 0808 offline · 82 tasks | 71.97 | **78.98** |
 | Agents' Last Exam · Near-term · 67 tasks | 83.75 | **84.82** |
 
-These are manuscript aggregates, not results of the current Ascend workflows.
+These are manuscript aggregates from the original method, not measurements of
+the current Ascend or direct exploration-to-evaluation desktop workflows.
 The RSI column uses 41 recorded OSWorld entries and 19 ALE entries, retaining
 baseline scores for the remaining 41 and 48 tasks respectively. ALE includes all
 67 Near-term tasks, including three completed GPU baselines. Selected retries and
@@ -384,7 +390,7 @@ Figure and reporting provenance are documented in the [paper guide](docs/PAPER.m
 | Topic | Guide |
 | --- | --- |
 | Current Ascend learning and memory publication | [Subject curriculum](docs/subject-curriculum.md) |
-| Historical phase compatibility | [Phase 2 retirement](docs/phase2-retirement.md) · [Phase 1 launcher](docs/ascend-campaigns.md) |
+| Standalone Ascend exploration | [Phase 1 launcher](docs/ascend-campaigns.md) |
 | Runtime and coding setup | [Local execution](docs/local-kernel-execution.md) · [Pi](docs/PI_CODING_RUNTIME.md) · [Target configuration](docs/ascend-target-launcher.md) |
 | Optimizer contracts | [Jobs](docs/optimizer.md) · [Reference](docs/optimizer-reference.md) · [Native ABI](docs/optimizer-native.md) · [Worker](docs/optimizer-worker.md) |
 | Knowledge retrieval | [Expanded reference KDB](docs/expanded-kdb.md) · [Adaptive librarian](docs/knowledge/adaptive-librarian.md) |

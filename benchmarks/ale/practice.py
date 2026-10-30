@@ -333,11 +333,9 @@ def hooks_for(pool, corpus, public_task=None):
         from explore import (
             phase1_wave,
             practice_loop,
-            target_learning,
-            unified_evolution,
         )
 
-        for module in (practice_loop, target_learning, phase1_wave, unified_evolution):
+        for module in (practice_loop, phase1_wave):
             for name, value in vars(module).copy().items():
                 if (
                     name.isupper()

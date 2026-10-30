@@ -124,7 +124,7 @@ def plan(args):
         instructions.append(meta["description"])
     corpus = sorted(set().union(*(instruction_shingles(text) for text in instructions)))
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "benchmark": "ale",
         "cohort": "full/near-term",
         "cohort_count": 67,
@@ -136,7 +136,6 @@ def plan(args):
         "actor_watchdog_active_seconds": 36000,
         "phase1_project_budget": 8,
         "phase1_parallelism": 4,
-        "phase2_stop_policy": "curriculum_review",
         "study_design": lock["study_design"],
         "image_revision": IMAGE_REVISION,
         "judge_base_url": args.judge_base_url,
@@ -176,7 +175,20 @@ def public_task_audit(task, card, instruction, visible_roots):
     }
 
 
+async def rsi_lineage(entry, phase):
+    """Learn broadly, then evaluate with that exact frozen memory."""
+    learned = await phase(entry, "phase1")
+    if not learned.get("transition_ready"):
+        raise RuntimeError("Phase 1 is not transition-ready")
+    if learned.get("official_evaluator_calls") != 0:
+        raise RuntimeError("Learning recorded an official evaluator call")
+    verify_memory(learned["memory"])
+    return await phase(entry, "phase3", learned["memory"])
+
+
 async def run(args, manifest):
+    if manifest.get("schema_version") != 3:
+        raise ValueError("Unsupported ALE manifest; start a fresh run")
     from ale_run.base_interface import SandboxSpec
     from ale_run.environments.env import ALEEnv
     from ale_run.environments.output_pull import pull_to_host
@@ -250,13 +262,15 @@ async def run(args, manifest):
         loop.add_signal_handler(sig, stop_all)
 
     async def phase(entry, name, input_memory=None):
+        if input_memory is not None:
+            verify_memory(input_memory)
         task = entry["task"]
         directory = root / task / name
         directory.mkdir(parents=True, exist_ok=False)
-        practice_count = 4 if name == "phase1" else 1 if name == "phase2" else 0
+        practice_count = 4 if name == "phase1" else 0
         count = practice_count + (name != "phase1")
         reserve = count * (
-            (2 if name in ("phase1", "phase2") else 1) * entry["memory_gb"] + 32
+            (2 if name == "phase1" else 1) * entry["memory_gb"] + 32
         )
         capacity = Capacity(args.pool_root, root, limit=args.vm_limit)
         publish(task, phase="waiting_capacity", active_phase=name)
@@ -317,7 +331,7 @@ async def run(args, manifest):
                     session_rebuilder=target_env.reset_session,
                 )
                 await driver.setup()
-            if name in ("phase1", "phase2"):
+            if name == "phase1":
                 from .lifecycle import ResetService
 
                 owned_sandboxes = {env.sandbox.id: env for env in environments}
@@ -364,6 +378,7 @@ async def run(args, manifest):
 
                 reset_service = ResetService(reset_sandbox)
             worker_spec = {
+                "schema_version": 3,
                 "phase": name,
                 "instruction": meta["description"],
                 "work_dir": str(directory / "rsiagent"),
@@ -373,7 +388,7 @@ async def run(args, manifest):
                     p for p in (data.input_dir, data.remote_output_dir) if p
                 ],
             }
-            if name in ("phase1", "phase2"):
+            if name == "phase1":
                 card = json.loads(
                     (Path(args.ale_root) / "tasks" / task / "task_card.json").read_text()
                 )
@@ -499,9 +514,7 @@ async def run(args, manifest):
                     result = await phase(entry, "baseline")
                     publish(task, baseline_score=result["score"], baseline="completed")
                 if args.arm in ("rsi", "both"):
-                    p1 = await phase(entry, "phase1")
-                    p2 = await phase(entry, "phase2", p1["memory"])
-                    p3 = await phase(entry, "phase3", p2["memory"])
+                    p3 = await rsi_lineage(entry, phase)
                     publish(task, rsi_score=p3["score"], rsi="completed")
                 publish(task, phase="completed")
             except BaseException as exc:

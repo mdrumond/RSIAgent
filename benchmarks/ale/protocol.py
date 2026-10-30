@@ -44,6 +44,8 @@ def sha(path):
 
 def protocol(ale_root=None):
     lock = json.loads(LOCK_PATH.read_text())
+    if lock.get("schema_version") != 3 or "phase2" in lock:
+        raise RuntimeError("Unsupported ALE protocol; start a fresh exploration/evaluation run")
     for relative, expected in lock["config_sha256"].items():
         if sha(RSIAGENT / relative) != expected:
             raise RuntimeError("Role configuration drift: " + relative)

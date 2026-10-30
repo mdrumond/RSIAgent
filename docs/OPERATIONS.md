@@ -23,15 +23,13 @@ Copy `config/osworld/rsi.example.json` and choose a unique
 `run_name`. Change task IDs and the matching public Phase 1 query before starting.
 Use a new protocol lineage for a different policy, model, memory seed, or budget.
 
-`curriculum_review` is the Phase 2 default. `verifier_pass` is the explicit
-alternative. Curriculum's direct-memory comparison setting is exposed by the
-direct runner, not by the public JSON orchestrator. Do not add an unsupported JSON
-field and assume it took effect.
+The current OSWorld protocol uses schema version 2 and contains only `phase1`
+and `phase3`. ALE uses protocol version 3. Older protocols are rejected; use new
+run roots. Stage numbers remain unchanged.
 
 The example has an eight-project Phase 1 boundary and four maximum concurrent
-branches. Its target Actor watchdog is 36,000 seconds per invocation; practice
-Actor and Curriculum profiles allow 86,400 seconds. A study can run much longer
-than any one invocation. There is no default two-practice Phase 2 limit.
+branches. Practice Actor and Curriculum profiles allow 86,400 seconds per
+invocation. Phase 3 consumes the authenticated frozen Phase 1 memory directly.
 
 ## Running and observing
 
@@ -39,16 +37,14 @@ Use `python run_osworld.py --arm both --name <batch_name>` for the full OSWorld
 cohort. `--dry-run` prints the plan, and `--concurrency N` controls independent
 task lineages. ALE runs through `run_ale.py`; see [ALE operations](ALE.md).
 
-`bash scripts/run_rsi.sh <protocol.json>` invokes the three phases sequentially,
+`bash scripts/run_rsi.sh <protocol.json>` invokes exploration and evaluation sequentially,
 uses a separate cache per phase, and records streamed logs. To inspect a finished
 phase, start with `results/recursive_improvement/<run_name>/phaseN/result.json`.
 Follow its recorded paths to the detailed target/project artifacts.
 
 Phase 1 wave authoring records are under `phase1/curriculum/wave_NNN/`. Check
 published projects, completed verdicts, and committed memory, not just a live PID.
-Phase 2 records distinguish target attempts, practice projects, Curriculum
-decisions, and learning commits. Phase 3 records official scores only after sealed
-evaluation succeeds. Preserve all draws and distinguish verifier verdicts from
+Phase 3 records official scores only after sealed evaluation succeeds. Preserve all draws and distinguish verifier verdicts from
 official scores.
 
 The wrapper performs no unattended recovery. It exits on failure. No monitoring
@@ -101,7 +97,7 @@ polling. Ordinary GET timeouts, rate limits, and server errors receive bounded
 backoff; terminal provider job states are never retried or hidden.
 
 For phase-level inspection, use `python -m benchmarks.osworld.pipeline --help`.
-The internal `phase1`, `phase2`, and `task` modules live in the same package;
+The internal `phase1` and `task` modules live in the same package;
 they are also invoked with `python -m benchmarks.osworld.<module>` from the
 checkout. The root entrypoints handle ordinary batch runs.
 
@@ -121,11 +117,9 @@ snapshot. Check for a live recovery first. Never reuse a quarantined lineage,
 turn an infrastructure error into a task verdict, or overwrite a sealed score.
 
 Phase 1 offers `--resume-completed-boundary` and `tools/recover_phase1_wave.py`
-for validated boundaries. Phase 2 recovery modules under `explore/` validate
-specific preserved checkpoints, including completed learning and guest-filesystem
-failures. They are strict internal APIs, not a universal resume command. Consult
-the matching module and tests before an isolated continuation. An absent candidate
-or missing preserved context cannot be reconstructed by relabeling a result.
+for validated Phase 1 boundaries. An absent candidate or missing preserved
+context cannot be reconstructed by relabeling a result. Target-practice recovery
+and its historical commands are no longer supported.
 
 If an evaluator defect is found, preserve the original result and identify the
 corrected evaluator revision in a separate measurement. Do not supply diagnostic

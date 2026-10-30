@@ -1,19 +1,15 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "benchmark": "ALE",
   "ale_commit": "d10fb61a14f9719774c3520c5763068b28ef5546",
   "cohort": "full/near-term",
   "cohort_sha256": "cd75d88808f06c164b0cbf298c0c66bcbfd66e04ad72299798da38f5a9c32f1c",
-  "study_design": "target_conditioned_adaptation",
+  "study_design": "target_conditioned_exploration",
   "phase1": {
     "project_budget": 8,
     "parallel_waves": true,
     "parallelism": 4,
     "budget_semantics": "check after complete waves; may exceed 8"
-  },
-  "phase2": {
-    "stop_policy": "curriculum_review",
-    "official_evaluator_calls": 0
   },
   "actor_watchdog_active_seconds": 36000,
   "config_sha256": {
@@ -23,7 +19,7 @@
     "config/osworld/baseline.lock.json": "981aba73ea4a86119dc867bf6d879d91421ea1e4addfd1dabe92e6bfa12296c9",
     "config/roles/actor.yaml": "b1b5c40f2e04830d247e4b36de456ead8b55b01e459d8e331adbac6ef9b665c9",
     "config/roles/practice_verifier.yaml": "59a67e1bb1b31fe1c5b349a68c05f9e05044909c0727d01d87aba601e605e338",
-    "config/roles/target.yaml": "23ea742c1458183cb0b4a42536f276efa1e9d649b4f72a6e7124f96bbfa02e63",
+    "config/roles/target.yaml": "7473402e6e9ed8f3188584aad08681ea012a35feac9043438f139b55122244a7",
     "config/roles/curriculum.yaml": "b06570ab77be096f1c78c2843f36795f67b92241d09947c66c6ba4969b63aed0"
   },
   "task_cards": {

@@ -14,7 +14,6 @@ import pytest
 
 from config.settings import load as load_config
 from explore import practice_loop
-from explore import target_learning
 from explore import provisioning
 from llm.client import DURABLE_IMAGES_FIELD, durable_user_message
 from tools.exam_fence import audit_text
@@ -533,24 +532,6 @@ def run(tmp_path, steps, audit_memory=None):
 
 
 
-def test_target_task_visible_asset_names_are_authorized_without_weakening_fence(monkeypatch):
-    from tools import exam_fence
-    inputs = ("/home/user/source_document.pdf", "/home/user/source_table.csv")
-    # This unit test exercises authorization, not external denylist extraction.
-    monkeypatch.setattr(exam_fence, "_load_constants", lambda: {
-        "056": list(inputs),
-    })
-    visible_names = " ".join(inputs)
-
-    assert audit_text(
-        visible_names, mode="exam", authorized_instruction=TARGET)
-    assert audit_text(
-        visible_names, mode="exam",
-        authorized_instruction=target_learning._target_audit_surface(TARGET, inputs)) == []
-    assert audit_text(
-        "/home/example/OSWorld-V2/evaluation_examples/task_class/task_056.py",
-        mode="exam",
-        authorized_instruction=target_learning._target_audit_surface(TARGET, inputs))
 
 
 
