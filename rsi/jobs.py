@@ -94,7 +94,14 @@ def _machinery(root):
     return machinery
 
 
-def _launch_owner_present(directory):
+def _launch_owner_present(directory, job_id):
+    # A retained replacement proves this launch relinquished ownership before
+    # admission. Its successor's instance lock cannot resurrect the old job.
+    for path in directory.glob('*.json'):
+        if path.stem != job_id:
+            successor = json.loads(path.read_text())
+            if successor['request'].get('previous_job') == job_id:
+                return False
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
@@ -111,7 +118,7 @@ def _observed_status(directory, job_id, *, owner_present=None):
     record = json.loads(path.read_text())
     if record['state'] == 'launching' and record.get('process') is None:
         if owner_present is None:
-            owner_present = _launch_owner_present(directory)
+            owner_present = _launch_owner_present(directory, job_id)
         # Startup may have published its identity/final result during the probe.
         record = json.loads(path.read_text())
         if record['state'] == 'launching' and record.get('process') is None and owner_present:
