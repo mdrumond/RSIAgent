@@ -432,62 +432,65 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
     runner = continuation.runner
     admitted = dict(outcome.admitted_artifacts)
     admitted.update(admitted_artifacts or {})
-    payloads, remaining_bytes = {}, 64000
-    for ref in admitted:
-        data = runner.store.read_bytes(ref)
-        if len(data) <= min(8192, remaining_bytes):
-            payloads[ref] = data.decode(errors='replace')
-            remaining_bytes -= len(data)
-    from benchmarks.ascend.agent_context import WorkingContext
-    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    # Authenticate every admitted object before optional summary preparation;
+    # missing/corrupt evidence is never downgraded to a provider failure.
+    payloads = {reference:runner.store.read_bytes(reference) for reference in admitted}
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder, _EmptyTextCompletion
+    from benchmarks.ascend.agent_context import ContextBudgetError
+    from rsi.domain_distillation import terminal_budget, bounded_driver, terminal_context, bounded_message
     recorder = _ProviderEvidenceRecorder(runner.backend.host.control_root)
     host = runner.backend.host
-    # Reuse the existing direct-provider context policy for this noncoding task.
-    # Full host material remains in CAS; summaries never acquire host authority.
-    working = WorkingContext([dict(role='system', content=owner.system_prompt),
-        dict(role='user', content=continuation.instruction)])
-    for row in runner.workflow.state['history']:
-        working.append(dict(role='user', content=json.dumps(dict(workflow_step=row))))
-    for summary in host_summaries:
-        working.append(dict(role='user', content=json.dumps(dict(host_summary=summary))))
-    working.pinned = [dict(role=row['role'], content=row['content']) for row in host.feedback]
-    terminal = dict(role='user', content=DISTILLATION_PROMPT + '\n' + json.dumps(dict(
-        admitted_artifacts=admitted, artifact_payloads=payloads,
-        workflow_history=runner.workflow.state['history'][-1:])))
-    working.append(terminal)
+    budget = terminal_budget(owner.provider, continuation.profile)
+    def failed(failure, tokens):
+        recorder.failure(failure, stage='distillation', turn=turn)
+        ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
+            exception_type=type(failure).__name__, source_hash=host.project_hash(),
+            contract_ref=runner.contract_ref, host_outcome=outcome.status))
+        runner.append(dict(type='domain-distillation-failure', reference=ref))
+        return replace(outcome, tokens=tokens, distillation_failure=ref,
+                       wall_time_s=runner.workflow.accounting.seconds())
+    turn = 0
+    try:
+        working = terminal_context(owner, runner, continuation.profile, continuation.instruction,
+            admitted, payloads, host_summaries, budget, DISTILLATION_PROMPT)
+    except ContextBudgetError as failure:
+        return failed(failure, 0)
     tokens, turn = 0, 0
     while True:
         seconds = runner.actor._available()
-        driver = owner.with_time_budget(seconds)
+        driver = bounded_driver(owner, seconds, continuation.profile, budget)
+        original_complete = driver._complete
+        def observed_complete(*args, **kwargs):
+            nonlocal tokens
+            try:
+                completion = original_complete(*args, **kwargs)
+            except _EmptyTextCompletion as empty:
+                tokens += empty.completion_tokens
+                raise
+            tokens += completion.completion_tokens
+            return completion
+        driver._complete = observed_complete
         token = runner.workflow.accounting.start('thinking')
         try:
             try:
-                messages, summary_tokens = driver._prepare_context(
+                messages, _ = driver._prepare_context(
                     working, continuation.profile, recorder, turn=turn)
-                tokens += summary_tokens
                 driver._request(recorder, continuation.profile, messages, stage='distillation', turn=turn)
                 completion = driver._complete(recorder, continuation.profile, messages,
                                                stage='distillation', turn=turn)
             except Exception as failure:
-                recorder.failure(failure, stage='distillation', turn=turn)
-                ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-                    exception_type=type(failure).__name__, source_hash=host.project_hash(),
-                    contract_ref=runner.contract_ref, host_outcome=outcome.status))
-                runner.append(dict(type='domain-distillation-failure', reference=ref))
-                # The already verified host outcome survives a separate summary
-                # failure. No candidate or execution is replayed.
-                return replace(outcome, tokens=tokens, distillation_failure=ref,
-                               wall_time_s=runner.workflow.accounting.seconds())
+                return failed(failure, tokens)
         finally:
             runner.workflow.accounting.end(token)
-        tokens += completion.completion_tokens
         recorder.response(completion.text, stage='distillation', turn=turn)
         owner._trace('message', dict(role='assistant', content=completion.text))
         try:
             distilled = parse_agent_distillation(completion.text, admitted)
         except ValueError as exc:
-            working.append(dict(role='assistant', content=completion.text))
-            working.append(dict(role='user', content='Correct terminal JSON: ' + str(exc)))
+            limit = max(256, budget.target // 4)
+            working.append(bounded_message(runner.store, dict(role='assistant', content=completion.text), limit))
+            working.append(bounded_message(runner.store,
+                dict(role='user', content='Correct terminal JSON: ' + str(exc)), limit))
             turn += 1
             continue
         return replace(outcome, tokens=tokens, terminal_response=completion.text,
@@ -502,7 +505,8 @@ class A3Host(SourceHost):
         from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
         self.owner, self.runtime = owner, owner.candidate
         self.control_root = owner.workdir
-        self.store = ContentAddressedArtifacts(owner.workdir / 'canonical-artifacts')
+        self.store = ContentAddressedArtifacts(getattr(owner, 'canonical_artifact_root', owner.workdir / 'canonical-artifacts'))
+        self.canonical_prior_root = getattr(owner, 'canonical_prior_root', None)
         self.source_path = owner.workdir / 'canonical-source'
         self.source = self.source_path.read_text() if self.source_path.exists() else ''
         self.compilation = self.verified = self.profile = self.timing = None
@@ -558,9 +562,22 @@ class A3Host(SourceHost):
         return bool(isinstance(self.verified, VerifiedResult) and self.verified.passed and
             self.owner._submit_gate(self.source,self.compilation,self.verified,self.profile) is None)
 
+    def call(self, activity, name, category, callback):
+        from benchmarks.a3kernels.project_execution import RecoveryStarterEvidenceUnavailable
+        def observed(seconds):
+            try:
+                return callback(seconds)
+            except RecoveryStarterEvidenceUnavailable as carrier:
+                return carrier.failure
+        return super().call(activity, name, category, observed)
+
     def activity_observed_terminal(self, name, value):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence
         from benchmarks.a3kernels.trial import infrastructure_unavailable
+        from rsi.a3_recovery import known_prelaunch_failure
+        if known_prelaunch_failure(value):
+            return True  # Typed pre-launch failure, not an unknown original job.
+
         unavailable = isinstance(value, FailedEvidence) and (
             infrastructure_unavailable(value) or self.owner._retryable_failure(name, value))
         if unavailable:
@@ -663,19 +680,21 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
-def a3_adoption(*, baseline_query=None):
+def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
         actor = getattr(owner.actor, 'canonical_actor', owner.actor)
         # Production A3Actor owns an existing registered Pi session. Preserve its
         # exact model/credential route instead of creating a new provider stack.
         session = getattr(actor, 'session', None)
-        if session is None:
+        if session_factory is None and session is None:
             raise CanonicalConfigurationError('A3 canonical binding needs the registered Pi actor session')
-        def session_factory():
+        def existing_session():
             return PiSessionAdapter.from_existing_session(session)
         root = owner.workdir / 'canonical'
-        injections = dict(query=host.query, backend_identity=fingerprint(host.identity), session_factory=session_factory)
+        injections = dict(query=host.query, backend_identity=fingerprint(host.identity),
+            session_factory=session_factory or existing_session, test_backend=test_backend,
+            **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             return DomainRunner(root, host, **injections)
         bundle, limits = baseline_contract(owner, owner.budgets.max_seconds)
