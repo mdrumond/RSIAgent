@@ -1,0 +1,13 @@
+#rsi-inputs { max-width: 1000px; }
+#rsi-inputs fieldset { border: 0; padding: 0; min-width: 0; }
+#rsi-inputs label { display: block; margin: 12px 0; }
+#rsi-inputs input:not([type=checkbox]), #rsi-inputs textarea { display: block; box-sizing: border-box; width: 100%; padding: 8px; background: var(--panel); color: inherit; border: 1px solid var(--line); }
+#rsi-inputs textarea { min-height: 90px; }
+#rsi-inputs button { margin: 4px; padding: 7px 12px; cursor: pointer; }
+#rsi-inputs :disabled { cursor: default; opacity: .7; }
+.project-editor { border-top: 1px solid var(--line); padding: 12px 0; }
+.budget-row { display: flex; align-items: center; gap: 16px; }
+.budget-row > label:first-child { flex: 1; }
+#folder-browser { max-width: 90vw; background: var(--panel); color: inherit; border: 1px solid var(--line); }
+#folder-list { display: flex; flex-direction: column; max-height: 40vh; overflow: auto; }
+#folder-status { overflow-wrap: anywhere; }
