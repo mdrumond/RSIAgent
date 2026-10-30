@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from rsi.actor import PiSessionAdapter, StageResult, WorkflowActor, SourceSnapshot
+# Snapshot transport compatibility; production native transport is tested separately.
+from rsi.actor import SnapshotPiSessionAdapter as PiSessionAdapter
+from rsi.actor import StageResult, WorkflowActor, SourceSnapshot
 from rsi.contracts import BudgetLimits, Stage
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import builtin_bundle
@@ -129,6 +131,38 @@ def test_preflight_is_host_only_and_does_not_start_model(tmp_path):
     assert not session.contexts and not called
     assert flow.accounting.seconds() == 0
     assert len([row for row in events if row[0]=='skill-usage' and row[1]['kind']=='read']) == 2
+
+
+def test_skill_names_are_rejected_then_real_read_references_can_be_selected(tmp_path):
+    from rsi.actor import EvidenceTool
+    from coding.pi.schema import obj, STRING
+    names = list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    actor, flow, session, called, _, events = harness(tmp_path, [
+        *reads(Stage.TASK_CONSTRUCTION),
+        ('select_strategy', {'skill_refs': names}),
+        ('select_strategy', {'skill_refs': []}),
+        ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = True
+    selected = []
+    tool = EvidenceTool(obj({'skill_refs': {'type': 'array', 'items': STRING}}, ['skill_refs']),
+                        lambda stage,args,*_: selected.append(args) or {})
+    actor.evidence_tools['select_strategy'] = tool
+    actor.schemas['select_strategy'] = tool.schema
+    original = session.next_action
+    def next_action(context, *args, **kwargs):
+        name, arguments = original(context, *args, **kwargs)
+        if name == 'select_strategy' and not arguments['skill_refs']:
+            arguments = {'skill_refs': [r['receipt_id'] for r in context['skill_receipts']]}
+        return name, arguments
+    session.next_action = next_action
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    assert len(selected) == 1
+    assert set(selected[0]['skill_refs']) == set(actor._reads)
+    assert set(selected[0]['skill_refs']).isdisjoint(names)
+    assert session.contexts[-2]['observation']['accepted'] is False
+    assert len([d for k,d in events if k == 'actor-invalid-action']) == 1
+    assert flow.accounting.seconds('thinking') == 10
 
 
 def test_design_does_not_get_fake_retrieval_or_retrospective(tmp_path):
@@ -332,7 +366,7 @@ def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
     actor.perform = late
     with pytest.raises(WorkflowError, match='budget'): actor.step({})
     assert flow.stage == Stage.TASK_CONSTRUCTION and flow.pending
-    results = [data for kind, data in events if kind == 'stage-result']
+    results = [data for kind, data in events if kind == 'stage-result-proposed']
     assert results[0]['result']['artifact_refs'] == ('host-artifact',)
     assert results[0]['operation_id'] == flow.pending['id']
 
@@ -820,3 +854,52 @@ def test_pre_dispatch_stage_edit_error_is_recoverable_when_enabled(tmp_path):
     assert flow.stage == Stage.DESIGN and len(called) == 1 and 'edit' not in called[0][1]
     assert session.contexts[-1]['observation']['event'] == 'invalid-action'
     assert session.contexts[-1]['observation']['accepted'] is False
+
+
+@pytest.mark.parametrize('recover', [False, True])
+@pytest.mark.parametrize('error_kind', ['strategy', 'io', 'value', 'query', 'workflow'])
+def test_evidence_tool_only_recovers_typed_strategy_rejection(tmp_path, recover, error_kind):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    from rsi.strategy import QueryUnavailable, StrategyRejected
+    errors = dict(strategy=StrategyRejected, io=OSError, value=ValueError,
+                  query=QueryUnavailable, workflow=WorkflowError)
+    error = errors[error_kind]('actual selection failure')
+    actor, flow, session, called, clock, events = harness(tmp_path,
+        reads(Stage.TASK_CONSTRUCTION) + [('select_strategy', {}),
+                                         ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = recover
+    attempts = []
+    def select(stage, args, operation, seconds):
+        attempts.append(operation)
+        clock.value += 3
+        raise error
+    actor.evidence_tools = {'select_strategy': EvidenceTool(obj(), select)}
+    actor.schemas['select_strategy'] = actor.evidence_tools['select_strategy'].schema
+    if recover and error_kind == 'strategy':
+        actor.step({})
+        assert len(called) == len(flow.state['history']) == 1
+        context = session.contexts[-1]
+        observation = context['observation']
+        assert observation['event'] == 'invalid-action'
+        assert observation['action'] == 'select_strategy'
+        assert observation['error'] == str(error)
+        assert observation['accepted'] is False
+        assert context['evidence'] == context['evidence_receipts'] == []
+        assert {row['receipt_id'] for row in context['skill_receipts']} == set(
+            flow.state['history'][0]['evidence']['skill_refs'])
+        assert attempts == [flow.state['history'][0]['evidence']['operation_id']]
+        assert flow.accounting.seconds('thinking') == 8
+        assert flow.accounting.seconds('retrieval') == 3
+        assert session.deadlines == [20, 18, 16, 11]
+        assert len([data for kind, data in events if kind == 'actor-invalid-action']) == 1
+    else:
+        with pytest.raises(type(error)) as raised:
+            actor.step({})
+        assert raised.value is error
+        assert not called and flow.pending and not flow.state['history']
+        assert attempts == [flow.pending['id']]
+        assert flow.accounting.seconds('thinking') == 6
+        assert flow.accounting.seconds('retrieval') == 3
+        assert not any(kind == 'actor-invalid-action' for kind, _ in events)
+    assert not any(kind == 'evidence-tool-result' for kind, _ in events)

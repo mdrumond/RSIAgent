@@ -6,7 +6,7 @@ from benchmarks.a5kernels.knowledge import KnowledgeDB
 from rsi.contracts import Stage
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillUsage, builtin_bundle
-from rsi.strategy import QueryUnavailable, StrategyEvidence, knowledge_db_query
+from rsi.strategy import QueryUnavailable, StrategyEvidence, StrategyRejected, knowledge_db_query
 
 
 class TestEmbedding:
@@ -93,7 +93,7 @@ def test_negative_reuse_requires_changed_applicability(setup):
     query, retro = prepare(service, skill)
     choices = decisions(service, query, reuse=True)
     del choices[-1]['redirection']
-    with pytest.raises(WorkflowError):
+    with pytest.raises(StrategyRejected):
         select(service, skill, query, retro, choices)
     choices[-1]['redirection'] = 'Replace the failed accumulation with compensation'
     ref = select(service, skill, query, retro, choices)
@@ -144,7 +144,7 @@ def test_exposure_and_omitted_negative_cannot_authorize_selection(setup):
     query, retro = prepare(service, skill)
     with pytest.raises(WorkflowError):
         select(service, exposure, query, retro)
-    with pytest.raises(WorkflowError):
+    with pytest.raises(StrategyRejected):
         select(service, skill, query, retro, decisions(service, query)[:-1])
     assert not service.resolve('skill', exposure, Stage.DESIGN, 'op1')
 
@@ -284,7 +284,7 @@ def test_negative_reuse_rejects_nonstring_or_blank_redirection_before_persist(se
     choices[-1]['redirection'] = redirection
     count = len(log)
     receipts = dict(service.receipts)
-    with pytest.raises(WorkflowError):
+    with pytest.raises(StrategyRejected):
         select(service, skill, query, retro, choices)
     assert len(log) == count
     assert service.receipts == receipts
@@ -330,3 +330,45 @@ def test_global_kdb_unavailability_is_not_a_miss(setup, stage):
     assert calls == [{'query': 'debug numeric issue'}]
     assert log[-1]['kind'] == 'query-unavailable'
     assert not service.resolve('retrieval', log[-1]['reference'], stage, 'global-unavailable-op')
+
+
+@pytest.mark.parametrize('method', ['read_json', 'put_json'])
+@pytest.mark.parametrize('failure', [OSError, ValueError])
+def test_selection_storage_failure_is_fatal_and_grants_no_receipt(setup, monkeypatch, method, failure):
+    service, _, _, log, store, skill, _ = setup
+    query, retro = prepare(service, skill)
+    choices = decisions(service, query)
+    refs = list(service._current_reads(service._context()))
+    receipts, events = dict(service.receipts), list(log)
+    error = failure('actual CAS failure')
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(store, method, fail)
+    with pytest.raises(failure) as raised:
+        service.select('Stable accumulation', query_ref=query, retrospective_ref=retro,
+                       skill_refs=refs, decisions=choices)
+    assert raised.value is error
+    assert not isinstance(raised.value, StrategyRejected)
+    assert service.receipts == receipts and log == events
+
+
+@pytest.mark.parametrize('change', ['proposal', 'duplicate', 'reason', 'missing'])
+def test_pure_selection_guard_rejects_without_persisting(setup, change):
+    service, _, _, log, _, skill, _ = setup
+    query, retro = prepare(service, skill)
+    choices = decisions(service, query)
+    proposal = 'Stable accumulation'
+    if change == 'proposal':
+        proposal = '  '
+    elif change == 'duplicate':
+        choices.append(dict(choices[0]))
+    elif change == 'reason':
+        choices[0]['reason'] = '  '
+    else:
+        choices.pop()
+    receipts, events = dict(service.receipts), list(log)
+    with pytest.raises(StrategyRejected):
+        service.select(proposal, query_ref=query, retrospective_ref=retro,
+                       skill_refs=service._current_reads(service._context()), decisions=choices)
+    assert service.receipts == receipts and log == events
+    assert not service.resolve('retrieval', query, Stage.DESIGN, 'op1')
