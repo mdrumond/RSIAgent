@@ -621,8 +621,9 @@ def test_rejected_request_retains_actual_byte_attempt_before_dispatch(monkeypatc
         assert url.startswith('http://127.0.0.1:')
         return original(url,*args,**kwargs)
     monkeypatch.setattr('coding.pi.gateway.requests.post',route)
-    with gateway:
-        result=requests.post(gateway.url+'/chat/completions',json=dict(model='deepseek-flash',
+    with gateway, requests.Session() as client:
+        client.trust_env=False
+        result=client.post(gateway.url+'/chat/completions',json=dict(model='deepseek-flash',
             messages=[dict(role='user',content='x'*1000)],max_tokens=6553),
             headers={'Authorization':'Bearer '+gateway.token},timeout=3)
     assert result.status_code==413 and gateway.calls==0 and gateway.records==[]
