@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from rsi.actor import PiSessionAdapter, StageResult, WorkflowActor, SourceSnapshot
+# Snapshot transport compatibility; production native transport is tested separately.
+from rsi.actor import SnapshotPiSessionAdapter as PiSessionAdapter
+from rsi.actor import StageResult, WorkflowActor, SourceSnapshot
 from rsi.contracts import BudgetLimits, Stage
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import builtin_bundle
@@ -87,6 +89,41 @@ def test_unknown_skill_is_not_synthesised(tmp_path):
     assert not any(row[1]['kind'] == 'read' for row in events if row[0] == 'skill-usage')
 
 
+@pytest.mark.parametrize('section', ['', '   '])
+def test_empty_optional_section_delivers_full_contract(tmp_path, section):
+    actions = [(name, dict(args, section=section))
+               for name, args in reads(Stage.TASK_CONSTRUCTION)]
+    actor, flow, session, called, _, events = harness(
+        tmp_path, actions+[('perform', {'proposal': 'construct'})])
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    delivered = session.contexts[-1]['read_skills']
+    assert len(delivered) == len(actions)
+    for row in delivered:
+        assert row['section'] is None
+        assert row['content'] == builtin_bundle().document(row['skill']).content
+
+
+@pytest.mark.parametrize('bad_read', [
+    {'name': 'invented'},
+    {'name': builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)[0],
+     'section': 'invented section'},
+])
+def test_invalid_skill_read_can_recover_without_fabricating_receipts(tmp_path, bad_read):
+    actor, flow, session, called, _, events = harness(tmp_path, [
+        ('read_skill', bad_read), *reads(Stage.TASK_CONSTRUCTION),
+        ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = True
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    assert session.contexts[1]['observation']['accepted'] is False
+    actual_reads = [data for kind, data in events
+                    if kind == 'skill-usage' and data['kind'] == 'read']
+    assert len(actual_reads) == len(reads(Stage.TASK_CONSTRUCTION))
+    assert flow.accounting.seconds('thinking') == 8
+    assert flow.accounting.seconds() == 11
+
+
 def test_preflight_is_host_only_and_does_not_start_model(tmp_path):
     actor, flow, session, called, _, events = harness(tmp_path, [], stage=Stage.PREFLIGHT)
     actor.step({})
@@ -94,6 +131,38 @@ def test_preflight_is_host_only_and_does_not_start_model(tmp_path):
     assert not session.contexts and not called
     assert flow.accounting.seconds() == 0
     assert len([row for row in events if row[0]=='skill-usage' and row[1]['kind']=='read']) == 2
+
+
+def test_skill_names_are_rejected_then_real_read_references_can_be_selected(tmp_path):
+    from rsi.actor import EvidenceTool
+    from coding.pi.schema import obj, STRING
+    names = list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    actor, flow, session, called, _, events = harness(tmp_path, [
+        *reads(Stage.TASK_CONSTRUCTION),
+        ('select_strategy', {'skill_refs': names}),
+        ('select_strategy', {'skill_refs': []}),
+        ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = True
+    selected = []
+    tool = EvidenceTool(obj({'skill_refs': {'type': 'array', 'items': STRING}}, ['skill_refs']),
+                        lambda stage,args,*_: selected.append(args) or {})
+    actor.evidence_tools['select_strategy'] = tool
+    actor.schemas['select_strategy'] = tool.schema
+    original = session.next_action
+    def next_action(context, *args, **kwargs):
+        name, arguments = original(context, *args, **kwargs)
+        if name == 'select_strategy' and not arguments['skill_refs']:
+            arguments = {'skill_refs': [r['receipt_id'] for r in context['skill_receipts']]}
+        return name, arguments
+    session.next_action = next_action
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    assert len(selected) == 1
+    assert set(selected[0]['skill_refs']) == set(actor._reads)
+    assert set(selected[0]['skill_refs']).isdisjoint(names)
+    assert session.contexts[-2]['observation']['accepted'] is False
+    assert len([d for k,d in events if k == 'actor-invalid-action']) == 1
+    assert flow.accounting.seconds('thinking') == 10
 
 
 def test_design_does_not_get_fake_retrieval_or_retrospective(tmp_path):
@@ -269,7 +338,7 @@ def test_adapter_deadline_is_assigned_after_setup_and_gateway_matches(monkeypatc
     clock = Clock()
     monkeypatch.setattr(module.time, 'monotonic', clock)
     captured = []
-    raw = SimpleNamespace(gateway=SimpleNamespace(deadline=1001), deadline=1001,
+    raw = SimpleNamespace(gateway=SimpleNamespace(deadline=1001), deadline=1001, schemas={},
         next_action=lambda *args, **kwargs: captured.append(kwargs) or ('perform', {'proposal':'edit'}))
     monkeypatch.setattr(module, 'PiCodingSession', lambda **kwargs: raw)
     adapter = PiSessionAdapter(model='deepseek-flash')
@@ -297,7 +366,7 @@ def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
     actor.perform = late
     with pytest.raises(WorkflowError, match='budget'): actor.step({})
     assert flow.stage == Stage.TASK_CONSTRUCTION and flow.pending
-    results = [data for kind, data in events if kind == 'stage-result']
+    results = [data for kind, data in events if kind == 'stage-result-proposed']
     assert results[0]['result']['artifact_refs'] == ('host-artifact',)
     assert results[0]['operation_id'] == flow.pending['id']
 
@@ -554,7 +623,7 @@ def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
     base = builtin_bundle()
     bundle = SkillBundle(tuple(SkillDocument(doc.name, doc.content+'\n'+('actual guidance ' * 500))
                                for doc in base.documents), base.mapping)
-    ready, requests, executed = [], [], []
+    ready, requests, executed, page_offsets = [], [], [], {}
     flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
     names = bundle.skills_for(Stage.TASK_CONSTRUCTION)
     actions = iter([*[('read_skill', {'name':name}) for name in names],
@@ -565,6 +634,9 @@ def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
         advertised = {tool['function']['name'] for tool in request['tools']}
         assert not advertised & {'select_idea', 'optimisation_decision'}
         assert 'query_kdb' in advertised
+        perform = next((t['function'] for t in request['tools'] if t['function']['name']=='perform'), None)
+        if perform:
+            assert 'edit' not in perform['parameters']['properties']
         assert ('perform' in advertised) == bool(ready)
         if ready:
             snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role']=='user'))['context']['host']
@@ -573,6 +645,17 @@ def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
             assert all(row['receipt_id'] for row in snapshot['skill_receipts'])
             assert snapshot['evidence_receipts'] == [{'name':'query_kdb','reference':'actual-query-receipt'}]
             assert snapshot['evidence_summaries']['query_kdb']['query_ref'] == 'actual-query-receipt'
+        if ready and snapshot['observation'].get('event') == 'skill-delivery-required':
+            for message in request['messages']:
+                if message['role']=='tool':
+                    page = json.loads(message['content'])
+                    if 'record' in page and 'next_offset' in page:
+                        page_offsets[page['record']] = page['next_offset']
+            for row in snapshot['observation']['reads'].values():
+                reference = row['content']['record']
+                if reference not in page_offsets or page_offsets[reference] is not None:
+                    return stream('read_context', dict(record=reference, offset=page_offsets.get(reference,0), limit=8192), len(requests))
+            return stream('perform', {'proposal':'construct'}, len(requests))
         name,args = next(actions)
         return stream(name,args,len(requests))
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
@@ -591,7 +674,8 @@ def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
         actor.step({})
         actor.step({'goal':'normal Python task construction'})
     finally: actor.close()
-    assert flow.stage == Stage.DESIGN and len(requests) == 4 and executed == [True]
+    expected_pages = sum((len(bundle.document(name).content.encode())+8191)//8192 for name in names)
+    assert flow.stage == Stage.DESIGN and len(requests) == 5+expected_pages and executed == [True]
 
 
 @pytest.mark.parametrize('first_name,first_args', [
@@ -721,3 +805,101 @@ def test_real_pi_recovers_invalid_arguments_without_phantom_reads(monkeypatch, t
     feedback = [data for kind,data in events if kind=='actor-invalid-action']
     assert feedback and all(data['accepted'] is False for data in feedback)
     assert {data['operation_id'] for kind,data in events if kind=='actor-request'} == {feedback[0]['operation_id']}
+
+
+def test_canonical_context_keeps_completed_small_skill_text_inline():
+    from rsi.actor import WorkflowContextRecords
+    from coding.pi.context import ContextRecords
+    text = 'actual skill body\n' * 80
+    read = dict(skill='mapped-skill', section=None, receipt_id='actual-read', content=text)
+    context = {'host':dict(observation=dict(executed=True, content=text), read_skills=[read]*5)}
+    default = ContextRecords().snapshot(context)['host']
+    assert default['observation']['content']['read_with'] == 'read_context'
+    canonical = WorkflowContextRecords().snapshot(context)['host']
+    assert canonical['observation']['content'] == text
+    assert canonical['current_skill_content']['mapped-skill'] == dict(receipt_id='actual-read',content=text)
+    assert canonical['read_skills']['read_with'] == 'read_context'
+
+
+def test_long_skill_delivery_requires_actual_forwarded_page_coverage():
+    from coding.pi.context import ContextRecords
+    from rsi.actor import SkillDelivery
+    text = 'actual long contract\n' * 500
+    pages, events = ContextRecords(), []
+    reference = pages.admit(text)['record']
+    delivery = SkillDelivery()
+    delivery.begin('operation')
+    delivery.expect('read-receipt', text)
+    record = lambda kind,data:events.append((kind,data))
+    delivery.observe({'messages':[{'content':json.dumps({'preview':text[:384]})}]}, record)
+    assert delivery.missing(['read-receipt'])
+    offset = 0
+    while offset is not None:
+        page = pages.read(reference, offset, 4096)
+        delivery.observe({'messages':[{'role':'tool','content':json.dumps(page)}]}, record)
+        offset = page['next_offset']
+        assert bool(delivery.missing(['read-receipt'])) == (offset is not None)
+    assert [kind for kind,_ in events] == ['skill-delivered']
+    assert events[0][1]['receipt_id'] == 'read-receipt'
+
+
+def test_pre_dispatch_stage_edit_error_is_recoverable_when_enabled(tmp_path):
+    source = SourceSnapshot('solution.py','x=1','project-v1')
+    actor, flow, session, called, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'inline edit in wrong stage', 'edit':dict(path=source.path,sha256=source.sha256,source='x=2')}),
+        ('perform', {'proposal':'construct without editing'})])
+    actor.source_snapshot = lambda:source
+    actor.recover_invalid_actions = True
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1 and 'edit' not in called[0][1]
+    assert session.contexts[-1]['observation']['event'] == 'invalid-action'
+    assert session.contexts[-1]['observation']['accepted'] is False
+
+
+@pytest.mark.parametrize('recover', [False, True])
+@pytest.mark.parametrize('error_kind', ['strategy', 'io', 'value', 'query', 'workflow'])
+def test_evidence_tool_only_recovers_typed_strategy_rejection(tmp_path, recover, error_kind):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    from rsi.strategy import QueryUnavailable, StrategyRejected
+    errors = dict(strategy=StrategyRejected, io=OSError, value=ValueError,
+                  query=QueryUnavailable, workflow=WorkflowError)
+    error = errors[error_kind]('actual selection failure')
+    actor, flow, session, called, clock, events = harness(tmp_path,
+        reads(Stage.TASK_CONSTRUCTION) + [('select_strategy', {}),
+                                         ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = recover
+    attempts = []
+    def select(stage, args, operation, seconds):
+        attempts.append(operation)
+        clock.value += 3
+        raise error
+    actor.evidence_tools = {'select_strategy': EvidenceTool(obj(), select)}
+    actor.schemas['select_strategy'] = actor.evidence_tools['select_strategy'].schema
+    if recover and error_kind == 'strategy':
+        actor.step({})
+        assert len(called) == len(flow.state['history']) == 1
+        context = session.contexts[-1]
+        observation = context['observation']
+        assert observation['event'] == 'invalid-action'
+        assert observation['action'] == 'select_strategy'
+        assert observation['error'] == str(error)
+        assert observation['accepted'] is False
+        assert context['evidence'] == context['evidence_receipts'] == []
+        assert {row['receipt_id'] for row in context['skill_receipts']} == set(
+            flow.state['history'][0]['evidence']['skill_refs'])
+        assert attempts == [flow.state['history'][0]['evidence']['operation_id']]
+        assert flow.accounting.seconds('thinking') == 8
+        assert flow.accounting.seconds('retrieval') == 3
+        assert session.deadlines == [20, 18, 16, 11]
+        assert len([data for kind, data in events if kind == 'actor-invalid-action']) == 1
+    else:
+        with pytest.raises(type(error)) as raised:
+            actor.step({})
+        assert raised.value is error
+        assert not called and flow.pending and not flow.state['history']
+        assert attempts == [flow.pending['id']]
+        assert flow.accounting.seconds('thinking') == 6
+        assert flow.accounting.seconds('retrieval') == 3
+        assert not any(kind == 'actor-invalid-action' for kind, _ in events)
+    assert not any(kind == 'evidence-tool-result' for kind, _ in events)

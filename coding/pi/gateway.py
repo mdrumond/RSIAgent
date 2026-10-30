@@ -6,6 +6,7 @@ HTTP. The host can retain request evidence; credentials never enter that evidenc
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import secrets
 import threading
 import time
@@ -13,6 +14,20 @@ import time
 import requests
 
 from .context import ContextLimitError
+
+
+class RequestContextLimit(ContextLimitError):
+    """Rejected prepared request sizes; no upstream dispatch or ledger entry."""
+    def __init__(self, request, raw, hard_bytes):
+        super().__init__('provider request exceeds context hard byte budget')
+        size = lambda value:len(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode())
+        messages = request.get('messages',request.get('input',[]))
+        self.details = dict(hard_bytes=hard_bytes, request_bytes=len(raw),
+            request_sha256=hashlib.sha256(raw).hexdigest(), summary_request=not bool(request.get('tools')),
+            messages_bytes=size(messages),tools_bytes=size(request.get('tools',[])),
+            message_count=len(messages),tool_count=len(request.get('tools',[])),
+            message_sizes=[dict(role=message.get('role',message.get('type')),bytes=size(message)) for message in messages],
+            max_output_tokens=request.get('max_tokens',request.get('max_output_tokens',request.get('max_completion_tokens'))))
 
 
 PROVIDERS = {
@@ -82,6 +97,17 @@ class Gateway:
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages are required")
         output_limit = self.spec["max_tokens"]
+        if not payload.get("tools"):
+            # Pi's native compactor supplies its own history/prefix output budget.
+            # Respect it without exceeding the host's registered profile ceiling.
+            # The loopback provider uses OpenAI compatibility naming even for
+            # DeepSeek; translate either SDK chat key to the real provider key.
+            keys = ("max_output_tokens",) if responses else ("max_completion_tokens", "max_tokens")
+            requested = next((payload[key] for key in keys if key in payload),None)
+            if requested is not None:
+                if type(requested) is not int or requested <= 0:
+                    raise ValueError("invalid requested summary output limit")
+                output_limit = min(output_limit,requested)
         if responses:
             if self.provider != "openai":
                 raise ValueError("Responses API is configured only for OpenAI")
@@ -99,7 +125,7 @@ class Gateway:
             request = self.request_projector(request, responses=responses, hard_bytes=self.hard_bytes)
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > self.hard_bytes:
-            raise ValueError("provider request exceeds context hard byte budget")
+            raise RequestContextLimit(request,encoded,self.hard_bytes)
         return request
 
     def __enter__(self):
@@ -140,7 +166,7 @@ class Gateway:
                 except (ValueError, TypeError, AttributeError) as error:
                     if isinstance(error, ContextLimitError) or "hard byte" in str(error):
                         owner.stop_reason = "context-limit"
-                        owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes})
+                        owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes, **getattr(error,"details",{})})
                         return self.error(413, "request context exceeds the configured byte limit")
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}

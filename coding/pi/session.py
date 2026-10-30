@@ -205,7 +205,10 @@ class PiCodingSession:
                     raise ValueError("source edit maps to an unavailable host write action")
                 validate(args, self.schemas[name])
             self.pending = (name, args)
-            return {"status": "queued", "executed": False, "action": name}
+            result = {"status": "queued", "executed": False, "action": name}
+            if self.first_action_only:
+                result["observe_result_in"] = "next_host_snapshot"
+            return result
 
     def _start(self):
         if self.rpc is not None:
@@ -214,9 +217,10 @@ class PiCodingSession:
         directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="rsi-pi-")))
         directory.chmod(0o700)
         (directory / "schemas.json").write_bytes(encoded(self.schemas))
-        (directory / "settings.json").write_bytes(encoded({
-            "retry": {"enabled": False}, "compaction": {"enabled": False},
-            "cacheWarming": "off", "quietStartup": True}))
+        settings = {"retry": {"enabled": False}, "compaction": {"enabled": False},
+                    "cacheWarming": "off", "quietStartup": True}
+        settings.update(getattr(self, "settings_override", {}))
+        (directory / "settings.json").write_bytes(encoded(settings))
         spec = self.gateway.spec
         (directory / "models.json").write_bytes(encoded({"providers": {"rsi-host": {
             "baseUrl": self.gateway.url,
@@ -224,7 +228,7 @@ class PiCodingSession:
             "apiKey": "${RSI_PI_GATEWAY_TOKEN}",
             "models": [{"id": spec["model"], "name": spec["model"],
                         "reasoning": self.gateway.provider == "openai", "input": ["text"],
-                        "contextWindow": 65536, "maxTokens": spec["max_tokens"],
+                        "contextWindow": getattr(self, "context_window", 65536), "maxTokens": spec["max_tokens"],
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}],
         }}}))
         owner = self

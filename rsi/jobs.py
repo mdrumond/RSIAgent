@@ -87,13 +87,36 @@ def _machinery(root):
     return machinery
 
 
-def status(instance, job_id):
-    _, directory = _directory(instance)
-    record = json.loads(_path(directory, job_id).read_text())
+def _launch_owner_present(directory):
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _observed_status(directory, job_id, *, owner_present=None):
+    path = _path(directory, job_id)
+    record = json.loads(path.read_text())
+    if record['state'] == 'launching' and record.get('process') is None:
+        if owner_present is None:
+            owner_present = _launch_owner_present(directory)
+        # Startup may have published its identity/final result during the probe.
+        record = json.loads(path.read_text())
+        if record['state'] == 'launching' and record.get('process') is None and owner_present:
+            return record  # Ownership is retained; no PID or terminal failure is invented.
     if record['state'] not in _TERMINAL and not _alive(record.get('process')):
-        # Read-only observation. Retained request and pending service evidence remain intact.
         record['state'] = 'interrupted'
     return record
+
+
+def status(instance, job_id):
+    _, directory = _directory(instance)
+    return _observed_status(directory, job_id)
 
 
 def list_jobs(instance):
@@ -121,7 +144,9 @@ def start(instance, request):
         _, verified_source, interpreter, environment = launch_context(root, required=True)
         if verified_source != machinery:
             raise ValueError('job source changed during runtime selection')
-        previous_jobs = list_jobs(root)
+        # This dispatcher's newly acquired lock is not ownership of an older launch.
+        previous_jobs = [_observed_status(directory, path.stem, owner_present=False)
+                         for path in sorted(directory.glob('*.json'))]
         superseded = {item['request'].get('previous_job') for item in previous_jobs}
         for previous in previous_jobs:
             if previous['state'] == 'interrupted' and previous['job_id'] not in superseded:
