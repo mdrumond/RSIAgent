@@ -225,6 +225,8 @@ class DomainRunner(ProjectRunner):
         self.restore_checkpoint(host, persisted)
         self.workflow = Workflow(state_path, self.resolve,
             source_hash=persisted['source'] if persisted else host.project_hash(), limits=self.spec.budgets, clock=clock)
+        from rsi.domain_allocations import restore_grants
+        restore_grants(self)
         self.workflow.state['created'] = frozen['created']
         self.workflow._save()
         self.service = StrategyEvidence(self.store, self.append, lambda: self.workflow.state,
@@ -471,6 +473,52 @@ class DomainRunner(ProjectRunner):
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise WorkflowError('native completed-effect evidence is unavailable or corrupt') from error
 
+    def grant_actor_seconds(self, key, seconds, authority):
+        """Host-only explicit allocation, independent of task inputs/identity."""
+        row = dict(kind='actor-allocation-grant-v1', contract=self.contract_ref,
+                   key=key, seconds=seconds, authority=authority)
+        reference = self.store.put_json(row)
+        existing = [event for event in self.events if event['type']=='actor-allocation-grant'
+                    and self.store.read_json(event['reference'])['key']==key]
+        if existing and any(event['reference'] != reference for event in existing):
+            raise WorkflowError('actor allocation authority changed on reopen')
+        if not existing:
+            self.append(dict(type='actor-allocation-grant', reference=reference))
+        self.workflow.grant_actor_seconds(key, seconds, reference)
+
+    def recover_exhausted_admission(self):
+        """Reject a proven closed, effect-free old stage after an explicit grant.
+
+        Uses the shared failed-operation mechanism, retaining iteration counts
+        and all thinking intervals. Unknown provider/command/timing stays pending.
+        """
+        flow = self.workflow
+        pending = flow.pending
+        if (not pending or not flow.state.get('actor_grants')
+                or any(value is not None and value <= 0 for value in flow.remaining().values())):
+            return False
+        exhausted = [self.store.read_json(event['reference'])['result'] for event in self.events
+                     if event['type']=='project-run-outcome']
+        if not any(result['status']=='budget_exhausted' and result['pending']==pending
+                   and result['source_hash']==self.backend.project_hash() for result in exhausted):
+            return False
+        event = self.latest('actor-closure')
+        if event is None or not self.no_host_effects(pending['id']):
+            return False
+        closure = self.store.read_json(event['reference'])
+        observed = closure['observation']
+        if (closure['contract_ref'] != self.contract_ref or closure['pending'] != pending
+                or closure['source_hash'] != self.backend.project_hash()
+                or observed.get('provider_settled') is not True
+                or not (observed.get('actor_closed') is True or observed.get('actor_absent') is True)):
+            return False
+        self._completed_effects()
+        proof = dict(observed, handle=closure['handle'], no_host_effects=True)
+        reference = self.record_admission_failure(pending['id'], controller_proof=proof,
+                                                  observed_source_hash=closure['source_hash'])
+        flow.reject_operation(pending['id'], reference, closure['source_hash'])
+        return True
+
     def export_task(self, destination):
         self._completed_effects()
         from rsi.domain_evidence import export_domain_task
@@ -512,6 +560,8 @@ class DomainRunner(ProjectRunner):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline changed during workflow')
         return dict(project=self.spec.to_dict(), contract=self.contract_ref,
+            allocation=dict(actor_seconds=self.workflow.actor_allocation(),
+                grants=self.workflow.state.get('actor_grants', {})),
             editable_files=list(self.config.editable_files), domain=self.backend.context(),
             strategy_protocol='Read mapped skills; query_kdb and retrospect; select_strategy '
                 'with every result decision. Optimisation also requires optimisation_decision.')
