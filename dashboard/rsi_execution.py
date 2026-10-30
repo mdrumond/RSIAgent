@@ -9,6 +9,7 @@ from pathlib import Path
 from flask import abort, jsonify, render_template, request
 
 from .control import ControlError
+from .rsi_ledger import inspection as _inspection
 
 
 CAPABILITIES = {'manual_tuning': False, 'skill_content_editing': False}
@@ -39,28 +40,36 @@ def _public_job(row):
             'result_state': (row.get('result') or {}).get('state')}
 
 
-def _inspection(value):
-    # Only an authoritative CLI inspection is displayed. No invented zero costs,
-    # wall estimates, category sums, remote timestamp subtraction or CAS reads.
-    inspection = value.get('inspection')
-    if not isinstance(inspection, dict):
-        return {'available': False, 'reason': 'The CLI has not supplied a task time/skill inspection.'}
-    return {'available': True, 'tasks': [
-        {key: task[key] for key in ('task_id', 'charged_seconds', 'excluded_seconds',
-         'actor_union_seconds', 'remaining', 'accounting_state', 'skills_ref', 'candidate_ref')
-         if key in task}
-        for task in inspection.get('tasks', []) if isinstance(task, dict)]}
-
-
 def register_rsi_execution(app, controls, csrf_token, cli):
+    def capabilities():
+        try:
+            value = cli('capabilities')
+            if not isinstance(value, dict):
+                return dict(CAPABILITIES)
+            return {key: value.get(key) is True for key in CAPABILITIES}
+        except (ValueError, TypeError, OSError, subprocess.SubprocessError):
+            return dict(CAPABILITIES)
+
     def validate(payload):
         if not _local():
             raise PermissionError('Instance execution requires loopback.')
         if not isinstance(payload, dict):
             raise ControlError('A structured command is required.')
         action = payload.get('action')
-        if action in ('manual-tuning', 'skill-content'):
-            raise ControlError(UNAVAILABLE)
+        if action in ('manual-tuning', 'skill-content', 'skill-map'):
+            capability = 'manual_tuning' if action == 'manual-tuning' else 'skill_content_editing'
+            if not capabilities()[capability]:
+                raise ControlError(UNAVAILABLE)
+            if action == 'manual-tuning':
+                for key in ('project_id', 'guidance'):
+                    _text(payload, key)
+            else:
+                _text(payload, 'revision')
+                if action == 'skill-content':
+                    _text(payload, 'name'); _text(payload, 'content')
+                elif not isinstance(payload.get('step_map'), dict):
+                    raise ControlError('A complete workflow mapping is required.')
+            return 'rsi-instance-execution'
         if action == 'phase':
             if payload.get('mode') not in ('phase1', 'phase2', 'inference'):
                 raise ControlError('Unknown phase.')
@@ -89,6 +98,20 @@ def register_rsi_execution(app, controls, csrf_token, cli):
 
     def execute(payload):
         action = payload['action']
+        if action in ('manual-tuning', 'skill-content', 'skill-map'):
+            with tempfile.TemporaryDirectory(prefix='rsi-skills-') as directory:
+                path = Path(directory) / 'input'
+                if action == 'manual-tuning':
+                    return _public_job(cli('skills', 'tune', '--project', payload['project_id'],
+                                           '--guidance', payload['guidance']))
+                if action == 'skill-content':
+                    path.write_text(payload['content'], encoding='utf-8')
+                    args = ['skills', 'set', payload['name']]
+                else:
+                    path.write_text(json.dumps(payload['step_map'], allow_nan=False), encoding='utf-8')
+                    args = ['skills', 'map', 'set']
+                result = cli(*args, '--file', str(path), '--expect-bundle', payload['revision'])
+                return {key: result[key] for key in ('bundle_ref', 'configuration_revision') if key in result}
         if action == 'phase':
             operation = payload['operation']
             args = [payload['mode'], operation]
@@ -123,7 +146,27 @@ def register_rsi_execution(app, controls, csrf_token, cli):
     @app.get('/rsi/execution')
     def rsi_execution_page():
         return render_template('rsi_execution.html', csrf_token=csrf_token,
-                               enabled=controls.enabled, capabilities=CAPABILITIES)
+                               enabled=controls.enabled, capabilities=capabilities())
+
+    @app.get('/api/rsi/capabilities')
+    def rsi_capabilities():
+        if not _local():
+            abort(403)
+        return jsonify(capabilities())
+
+    @app.get('/api/rsi/skills')
+    def rsi_skills():
+        if not _local():
+            abort(403)
+        try:
+            if not capabilities()['skill_content_editing']:
+                raise ControlError(UNAVAILABLE)
+            value = cli('skills', 'get')
+            return jsonify(revision=value['bundle_ref'],
+                           skills={row['name']: row['content'] for row in value['documents']},
+                           step_map=value['mapping'])
+        except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
+            return jsonify(error='Immutable baseline skill editing is unavailable in this pinned CLI.'), 409
 
     @app.get('/api/rsi/jobs')
     def rsi_jobs():
@@ -131,7 +174,7 @@ def register_rsi_execution(app, controls, csrf_token, cli):
             abort(403)
         try:
             return jsonify(jobs=[_public_job(row) for row in cli('job', 'list')],
-                           capabilities=CAPABILITIES)
+                           capabilities=capabilities())
         except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
             return jsonify(error='Instance job CLI unavailable; check the pinned instance release.'), 409
 

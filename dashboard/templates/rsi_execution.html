@@ -17,7 +17,7 @@
 <label><input name="recover" type="checkbox" checked>Enable inference recovery</label>
 <button>Submit phase command</button></fieldset></form>
 <section class="control-panel"><h2>Retained jobs and evidence</h2><button type="button" id="refresh-jobs">Refresh jobs</button><div id="jobs-list"></div>
-<h3>Time and skill inspection</h3><p>Charged categories: thinking, retrieval, implementation, debug, compilation, execution and profiling. Setup and transfer are excluded. Category durations can overlap; the actor total must be the host’s interval union. Unknown timing is never shown as zero. Wall remaining includes all elapsed time.</p><pre id="job-inspection">Select a retained job to inspect.</pre></section>
+<h3>Time and skill inspection</h3><p>Charged categories: thinking, retrieval, implementation, debug, compilation, execution and profiling. Setup and transfer are excluded. Category durations can overlap; the actor total must be the host’s interval union. Unknown timing is never shown as zero. Wall remaining includes all elapsed time.</p><div id="time-ledger"></div><details><summary>Retained inspection details</summary><pre id="job-inspection">Select a retained job to inspect.</pre></details></section>
 <form id="repo-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Add repository to existing KDB</legend>
 <p>Indexes committed source and preserves supplied negative outcomes. Indexed material is not automatically a known-good idea. Select folders in the input editor and paste their node paths here.</p>
 {% for name,label in [('source','Local repository folder'),('database','Existing database path'),('embedding_cache','Pinned embedding cache folder'),('collection','Collection'),('repository','Credential-free repository identity'),('negative_records','Existing negative-outcome JSON snapshot'),('evidence_store','Evidence store folder')] %}<label>{{ label }}<input name="{{ name }}" required></label>{% endfor %}
@@ -25,7 +25,23 @@
 <form id="export-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Export retained task evidence for SFT</legend>
 <p>The task must be quiescent. The CLI verifies artifacts and writes a deterministic manifest; no training labels or missing transcripts are invented.</p>
 <label>Canonical task folder<input name="task" required></label><label>New export destination<input name="destination" required></label><button>Export evidence</button></fieldset></form>
-<section class="control-panel"><h2>Manual skill fine tuning</h2><p>Unavailable: the CLI has no registered manual-tuning command yet. Periodic evaluation remains controlled by the canonical cycle. Project evidence and user guidance must enter that evaluator through a real CLI binding.</p><label>Project evidence identity<input disabled></label><label>Writer guidance<textarea disabled></textarea></label><button disabled>Fine tune skills</button>
-<h3>Skill content</h3><p>Baseline paths and skill mappings can be edited in input settings. Editing skill content requires an immutable revision command; this release does not mutate active bundles.</p></section>
+<form id="tune-form" class="control-panel"><h2>Manual skill fine tuning</h2>
+<p id="tuning-capability">Checking the pinned CLI for canonical evaluator support…</p>
+<fieldset id="tuning-fields" disabled><legend>Freeze tuning inputs</legend>
+<label>Project evidence identity<input name="project_id" required></label>
+<label>User guidance<textarea name="guidance" rows="6" required></textarea></label>
+<p>Runs the existing evaluator with retained project evidence. Candidate creation does not imply promotion.</p>
+<button>Request skill fine tuning</button></fieldset></form>
+<section class="control-panel"><h2>Baseline skill content and workflow map</h2>
+<p>Save captures a new immutable baseline for future cycles. Running projects and accepted learned bundles retain their revisions. Save a skill or save the complete step map separately; each operation captures its own immutable revision.</p>
+<p id="skills-capability">Checking immutable revision support…</p>
+<button type="button" id="reload-skills" disabled>Reload baseline revision</button>
+<form id="skills-form"><fieldset id="skills-fields" disabled><legend>Baseline revision</legend>
+<p id="skills-revision"></p><label>Skill<select id="skill-selector"></select></label>
+<label>Full SKILL.md content<textarea id="skill-content" rows="16" spellcheck="false"></textarea></label>
+<label>New skill ID<input id="new-skill-id"></label><button type="button" id="add-skill">Add skill</button>
+<label>Workflow step → skill IDs (JSON)<textarea id="skill-map" rows="10" spellcheck="false"></textarea></label>
+<p>Map values are arrays of skill IDs. Every referenced skill must exist; the CLI validates the canonical workflow and skill metadata.</p>
+<button type="button" id="save-skill">Save selected skill revision</button><button>Save workflow map revision</button></fieldset></form></section>
 </section><script src="{{ url_for('static', filename='rsi_execution.js') }}" defer></script>
 {% endblock %}

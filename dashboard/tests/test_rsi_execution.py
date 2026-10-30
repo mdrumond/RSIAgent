@@ -21,9 +21,21 @@ def execution(tmp_path):
         calls.append((args, options))
         if '--job' in args and args[args.index('--job') + 1] == 'missing':
             return SimpleNamespace(returncode=2, stdout='', stderr='API_KEY=private')
-        if '--project' in args:
+        if args[:2] == ['inference', 'start'] and '--project' in args:
             calls[-1] += (json.loads(Path(args[args.index('--project') + 1]).read_text()),)
-        if args == ['job', 'list']:
+        if '--guidance-file' in args:
+            calls[-1] += (Path(args[args.index('--guidance-file') + 1]).read_text(),)
+        if '--file' in args:
+            content = Path(args[args.index('--file') + 1]).read_text()
+            calls[-1] += (json.loads(content) if args[:3] == ['skills', 'map', 'set'] else content,)
+        if args == ['capabilities']:
+            result = app.config.get('TEST_CAPABILITIES', {})
+        elif args == ['skills', 'get']:
+            result = {'bundle_ref': 'baseline1', 'documents': [{'name': 'test', 'content': 'original content'}],
+                      'mapping': {'test': ['test']}}
+        elif args[:2] == ['skills', 'set'] or args[:3] == ['skills', 'map', 'set']:
+            result = {'bundle_ref': 'baseline2', 'configuration_revision': 'config2'}
+        elif args == ['job', 'list']:
             result = [retained]
         elif args[:2] == ['job', 'evidence']:
             result = {'job': retained, 'events': [{'prompt': 'private'}], 'log': 'private'}
@@ -107,7 +119,7 @@ def test_guards_apply_to_direct_and_generic_queue(execution):
     app.extensions['dashboard_controls'].enabled = False
     assert client.post('/api/rsi/execute', json=payload, headers=headers).status_code == 403
     assert client.get('/rsi/execution').status_code == 200
-    assert not calls
+    assert all(call[0] == ['capabilities'] for call in calls)
 
 
 def test_real_ingestion_and_export_arguments_are_forwarded(execution):
@@ -148,3 +160,61 @@ def test_inspection_preserves_host_union_and_unknown_budgets():
     assert observed['tasks'][0]['excluded_seconds'] == {'setup': 2, 'transfer': 3}
     assert observed['tasks'][0]['remaining']['actor_seconds'] is None
     assert 'environment' not in observed['tasks'][0]
+
+
+
+def test_capability_gated_manual_tuning_freezes_user_guidance(execution):
+    app, client, calls, headers = execution
+    app.config['TEST_CAPABILITIES'] = {'manual_tuning': True}
+    response = client.post('/api/rsi/execute', headers=headers,
+        json=dict(action='manual-tuning', cycle_id='cycle-one', project_id='sha256:project',
+                  guidance='Keep numerical error detection; investigate prior failures.'))
+    assert settle(app, response)['status'] == 'succeeded'
+    args, _ = calls[-1]
+    assert args[:4] == ['skills', 'tune', '--project', 'sha256:project']
+    assert args[args.index('--guidance') + 1] == 'Keep numerical error detection; investigate prior failures.'
+
+
+def test_immutable_skill_editor_revision_and_mapping_boundary(execution):
+    app, client, calls, headers = execution
+    app.config['TEST_CAPABILITIES'] = {'skill_content_editing': True}
+    baseline = client.get('/api/rsi/skills').json
+    assert baseline['revision'] == 'baseline1'
+    draft = dict(action='skill-content', revision=baseline['revision'],
+                 name='test', content='revised complete SKILL.md')
+    operation = settle(app, client.post('/api/rsi/execute', json=draft, headers=headers))
+    assert operation['status'] == 'succeeded'
+    assert operation['result']['bundle_ref'] == 'baseline2'
+    args, _, captured = calls[-1]
+    assert args[:3] == ['skills', 'set', 'test']
+    assert args[args.index('--expect-bundle') + 1] == 'baseline1'
+    assert captured == draft['content']
+    assert not Path(args[args.index('--file') + 1]).exists()
+    mapping = {'test': ['test']}
+    operation = settle(app, client.post('/api/rsi/execute', headers=headers,
+        json=dict(action='skill-map', revision='baseline2', step_map=mapping)))
+    assert operation['status'] == 'succeeded'
+    args, _, captured = calls[-1]
+    assert args[:3] == ['skills', 'map', 'set']
+    assert args[args.index('--expect-bundle') + 1] == 'baseline2'
+    assert captured == mapping
+
+
+def test_ledger_closed_intervals_union_latest_snapshot_and_unresolved():
+    from dashboard.rsi_ledger import inspection
+    snapshot = dict(type='workflow-accounting', task_id='sum', clock_domain='controller',
+        intervals={'a': ['thinking', 10, 20], 'b': ['execution', 15, 23],
+                   'c': ['setup', 5, 9], 'd': ['transfer', 6, 8]},
+        remaining={'actor_seconds': 7, 'wall_seconds': 60}, skills_ref='sha256:baseline')
+    value = inspection({'events': [dict(snapshot, intervals={'a': ['thinking', 10, 15]}), snapshot]})
+    task = value['tasks'][0]
+    assert task['charged_seconds'] == {'thinking': 10, 'execution': 8}
+    assert task['excluded_seconds'] == {'setup': 4, 'transfer': 2}
+    assert task['actor_union_seconds'] == 13
+    assert len(value['tasks']) == 1
+    snapshot['intervals']['e'] = ['profiling', 24, None]
+    task = inspection({'events': [snapshot]})['tasks'][0]
+    assert task['accounting_state'] == 'unresolved'
+    assert task['actor_union_seconds'] is None
+    snapshot['clock_domain'] = 'remote-epoch'
+    assert inspection({'events': [snapshot]})['tasks'][0]['accounting_state'] == 'invalid-clock-domain'
