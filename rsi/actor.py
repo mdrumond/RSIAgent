@@ -16,7 +16,7 @@ import time
 import uuid
 
 from coding.pi.schema import STRING, obj, validate
-from coding.pi.session import PiCodingSession
+from coding.pi.session import ActionError, PiCodingSession
 from rsi.contracts import Stage, StepEvidence
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillUsage
@@ -142,17 +142,18 @@ class WorkflowActor:
     """
     def __init__(self, workflow, bundle, session_factory, *, perform, preflight,
                  emit, source_snapshot=None, host_category='implementation', setup_timeout=60,
-                 evidence_tools=None, skill_reference=None, managed_executions=False, perform_ready=None):
+                 evidence_tools=None, skill_reference=None, managed_executions=False, perform_ready=None, recover_invalid_actions=False):
         self.workflow, self.bundle = workflow, bundle
         self.session_factory, self.session = session_factory, None
         self.perform, self.preflight, self.emit = perform, preflight, emit
         self.source_snapshot, self.host_category = source_snapshot, host_category
         self.setup_timeout = setup_timeout
         self.managed_executions = managed_executions
+        self.recover_invalid_actions = recover_invalid_actions
         self.perform_ready = perform_ready or (lambda stage, operation: True)
         self.skill_reference = skill_reference or (lambda reference: reference)
         self.evidence_tools = dict(evidence_tools or {})
-        if self.evidence_tools.keys() & (SCHEMAS.keys() | {'read_context', 'edit_source', 'snapshot'}):
+        if self.evidence_tools.keys() & (SCHEMAS.keys() | {'read_context', 'edit_source', 'snapshot', 'propose_batch', 'execute_call'}):
             raise ValueError('evidence tool shadows a core action')
         self.schemas = dict(SCHEMAS, **{name: tool.schema for name, tool in self.evidence_tools.items()})
         self._usage = None
@@ -236,6 +237,7 @@ class WorkflowActor:
         names, refs, read_names = usage.expose(), [], set()
         self._reads = {}
         read_material, evidence_material = [], []
+        skill_inventory, evidence_inventory, evidence_summaries = {}, {}, {}
         scope = dict(operation_id=operation, stage=stage.value)
         record = lambda kind, data: self.emit(kind, dict(data, **scope))
         observation = None
@@ -264,17 +266,31 @@ class WorkflowActor:
                         lambda: self.perform_ready(stage, operation)):
                     allowed.append('perform')
                 seconds = self._available()
+                inventory = dict(skill_receipts=list(skill_inventory.values()),
+                                 evidence_receipts=list(evidence_inventory.values()))
+                if any(len(json.dumps(rows).encode()) > 3500 for rows in inventory.values()):
+                    raise WorkflowError('receipt inventory exceeds visible context capacity')
                 payload = dict(task=context, stage=stage.value, operation_id=operation,
                     skills=list(names), read_skill_names=[name for name in names if name in read_names],
                     unread_skills=[name for name in names if name not in read_names],
                     read_skills=list(read_material), evidence=list(evidence_material),
+                    **inventory, evidence_summaries=dict(evidence_summaries),
                     observation=observation,
                     source={'path': source.path, 'text': source.text, 'sha256': source.sha256,
                             'project_hash': source.project_hash} if source else None)
                 scope['request_id'] = uuid.uuid4().hex
                 record('actor-request', {'timestamp': flow.clock()})
-                name, args = self._timed('thinking', lambda: self.session.next_action(
-                    payload, allowed, seconds=seconds, record=record, source=source))
+                try:
+                    name, args = self._timed('thinking', lambda: self.session.next_action(
+                        payload, allowed, seconds=seconds, record=record, source=source))
+                except ActionError as error:
+                    if not self.recover_invalid_actions:
+                        raise
+                    self._available()
+                    observation = dict(event='invalid-action', error=str(error)[:500],
+                                       accepted=False, allowed=list(allowed))
+                    record('actor-invalid-action', observation)
+                    continue
                 self._available()
                 if name == 'perform' and read_names != set(names):
                     raise WorkflowError('read every mapped skill before performing stage')
@@ -290,6 +306,10 @@ class WorkflowActor:
                     refs.append(reference)
                     read_material.append(dict(skill=args['name'], section=args.get('section'),
                         content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id']))
+                    if (args.get('section') is None or args['name'] not in skill_inventory
+                            or skill_inventory[args['name']]['section'] is not None):
+                        skill_inventory[args['name']] = dict(skill=args['name'],
+                            section=args.get('section'), receipt_id=reference)
                     if args.get('section') is None:
                         read_names.add(args['name'])
                     observation = dict(content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
@@ -300,6 +320,10 @@ class WorkflowActor:
                         stage, args, operation, seconds))
                     material = {'name': name, 'result': observation}
                     evidence_material.append(material)
+                    if isinstance(observation, dict) and isinstance(observation.get('reference'), str):
+                        evidence_inventory[name] = dict(name=name, reference=observation['reference'])
+                        if 'summary' in observation:
+                            evidence_summaries[name] = observation['summary']
                     record('evidence-tool-result', material)
                     continue
                 if 'edit' in args:

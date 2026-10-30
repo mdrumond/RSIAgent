@@ -96,7 +96,7 @@ class ProjectRunner:
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
         # Always use the durable authority, including skill reads on the live path.
         self.workflow.resolver = self.resolve
 
@@ -197,6 +197,7 @@ class ProjectRunner:
             for name, schema in definitions.items()}
 
     def tool(self, name, stage, args, operation):
+        read_error = False
         if name == 'query_kdb':
             ref = self.service.query(args)
         elif name == 'retrospect':
@@ -211,16 +212,58 @@ class ProjectRunner:
             ref = self.store.put_json(dict(reason=args['reason'], operation_id=operation,
                 stage=stage.value, source_hash=self.workflow.source_hash, contract_ref=self.contract_ref))
         elif name == 'read_project_file':
-            row = self.backend.read(args['path'])
-            self.selected_file = args['path']
-            ref = self.store.put_json(dict(path=self.selected_file, **row))
+            try:
+                row = self.backend.read(args['path'])
+            except (FileNotFoundError, ValueError) as exc:
+                read_error = True
+                ref = self.store.put_json(dict(status='error', path=args['path'],
+                    error_type=type(exc).__name__, message=str(exc),
+                    editable_files=list(self.config.editable_files),
+                    hint='Choose a project path; KDB citation paths are not project files.'))
+            else:
+                self.selected_file = args['path']
+                ref = self.store.put_json(dict(path=self.selected_file, **row))
         else:
             if stage != Stage.OPTIMISATION or not args['reason'].strip():
                 raise WorkflowError('reasoned optimisation decision requires optimisation stage')
             ref = self.store.put_json(args)
         self.append(dict(type='project-tool', operation_id=operation, stage=stage.value,
-                         name=name, reference=ref))
-        return dict(reference=ref, evidence=self.store.read_json(ref))
+                         name=name, reference=ref, status='error' if read_error else 'ok'))
+        evidence = self.store.read_json(ref)
+        return dict(reference=ref, evidence=evidence, summary=self.evidence_summary(name, ref, evidence),
+                    status='error' if read_error else 'ok')
+
+    def evidence_summary(self, name, reference, record):
+        """Small actual inventory for the actor's always-visible receipt index.
+
+        Full CAS records stay in result.evidence for existing context paging;
+        these summaries never stand in for considering the retained row content.
+        """
+        pending, stage = self.workflow.pending, self.workflow.stage
+        summary = dict(tool=name, reference=reference, stage=stage.value,
+            operation_id=pending['id'] if pending else None,
+            host_perform_ready=bool(pending and self.perform_ready(stage, pending['id'])),
+            mapped_skill_reads_required=list(self.bundle.skills_for(stage)))
+        if name == 'query_kdb':
+            payload = record['payload']
+            response = payload['response']
+            groups = ('results', 'negative_records')
+            summary.update(query_ref=reference, query=payload['request']['query'],
+                counts={group: len(response[group]) for group in groups},
+                decision_indexes={group: list(range(len(response[group]))) for group in groups},
+                requirements='Select with query_ref, retrospective_ref, mapped skill_refs; '
+                    'every group/index needs used/rejected and reason; negative used needs redirection.')
+        elif name == 'retrospect':
+            payload = record['payload']
+            summary.update(retrospective_ref=reference, history_count=len(payload['history']),
+                failure_indexes=payload['failures'], redirection_indexes=payload['redirections'],
+                requirements='Use this operation-scoped retrospective_ref in select_strategy.')
+        elif name == 'select_strategy':
+            payload = record['payload']
+            summary.update(selection_ref=reference, query_ref=payload['query_ref'],
+                retrospective_ref=payload['retrospective_ref'], decision_count=len(payload['decisions']),
+                requirements='Selection recorded; optimisation also needs optimisation_decision before perform.')
+        return summary
 
     def latest(self, kind, operation=None):
         return next((e for e in reversed(self.events) if e['type'] == kind and

@@ -288,7 +288,7 @@ def test_copy_consumes_wall_budget_but_not_actor_budget(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('error_type,classification', [
-    ('ActionError', 'malformed_action'), ('PiProviderError', 'provider_failure'),
+    ('PiProviderError', 'provider_failure'),
     ('PiDeadlineError', 'provider_timeout'), ('PiCancelled', 'actor_cancelled'),
     ('PiError', 'actor_failure')])
 def test_known_pi_failure_is_durable_charged_and_never_replayed(tmp_path, error_type, classification):
@@ -452,5 +452,155 @@ def test_explicit_redesign_has_scoped_cas_reason_and_new_design_evidence(tmp_pat
         from rsi.runtime import WorkflowError
         with pytest.raises(WorkflowError, match='redesign requires'):
             runner.tool('request_redesign', Stage.ACCEPTANCE, {'reason': 'skip stage'}, 'unknown')
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('requested_path', ['guidance.md', '../guidance.md'])
+def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path):
+    class CorrectPath(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                rows = context['evidence']
+                if not any(r['name'] == 'query_kdb' for r in rows):
+                    return 'query_kdb', dict(query='stable sum')
+                reads = [r['result'] for r in rows if r['name'] == 'read_project_file']
+                if not reads:
+                    return 'read_project_file', dict(path=requested_path)
+                assert reads[0]['status'] == 'error'
+                assert reads[0]['evidence']['path'] == requested_path
+                assert 'content' not in reads[0]['evidence']
+                if len(reads) == 1:
+                    assert context['source']['path'] == 'solution.py'
+                    return 'read_project_file', dict(path='helper.py')
+                assert reads[1]['status'] == 'ok'
+                assert reads[1]['evidence']['content'] == 'value = 1\n'
+                # Select solution again before numeric debug needs to edit it.
+                if len(reads) == 2:
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, CorrectPath())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        errors = [e for e in runner.events if e['type'] == 'project-tool' and e['status'] == 'error']
+        assert len(errors) == 1
+        payload = runner.store.read_json(errors[0]['reference'])
+        assert payload['error_type'] in ('ValueError', 'FileNotFoundError')
+        assert payload['editable_files'] == ['solution.py', 'helper.py']
+        assert result['pending'] is None
+    finally:
+        database.close()
+
+
+def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
+    runner, _, database = make(tmp_path)
+    try:
+        def denied(_):
+            raise PermissionError('unreadable protected input')
+        monkeypatch.setattr(runner.backend, 'read', denied)
+        with pytest.raises(PermissionError):
+            runner.tool('read_project_file', Stage.PREFLIGHT, dict(path='solution.py'), 'unused')
+        assert runner.events == []
+    finally:
+        database.close()
+
+
+def test_evidence_inventory_is_compact_and_full_records_remain_available(tmp_path):
+    import json
+    runner, _, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        callback = runner.service.query_backend
+        def with_large_manifest(payload):
+            response = callback(payload)  # Real configured KnowledgeDB query.
+            response['provenance']['test_large_manifest'] = 'x' * 10000
+            return response
+        runner.service.query_backend = with_large_manifest
+        retrieval = runner.tool('query_kdb', Stage.DESIGN, dict(query='stable sum'), operation)
+        summary = retrieval['summary']
+        full = runner.store.read_json(retrieval['reference'])
+        assert retrieval['evidence'] == full
+        assert summary['query_ref'] == retrieval['reference']
+        assert summary['operation_id'] == operation and summary['stage'] == Stage.DESIGN.value
+        assert summary['host_perform_ready'] is False
+        assert summary['mapped_skill_reads_required'] == list(runner.bundle.skills_for(Stage.DESIGN))
+        for group in ('results', 'negative_records'):
+            count = len(full['payload']['response'][group])
+            assert summary['counts'][group] == count
+            assert summary['decision_indexes'][group] == list(range(count))
+        assert len(json.dumps(summary)) < 2048
+        assert len(full['payload']['response']['provenance']['test_large_manifest']) == 10000
+        retro = runner.tool('retrospect', Stage.DESIGN, dict(supplement='Consider actual history'), operation)
+        payload = runner.store.read_json(retro['reference'])['payload']
+        assert retro['summary']['retrospective_ref'] == retro['reference']
+        assert retro['summary']['history_count'] == len(payload['history']) == 2
+        assert retro['summary']['failure_indexes'] == payload['failures']
+        assert retro['summary']['redirection_indexes'] == payload['redirections']
+        assert retro['evidence']['payload'] == payload
+    finally:
+        runner.actor.close()
+        database.close()
+
+
+def test_repeated_malformed_actions_recover_until_original_actor_budget(tmp_path):
+    from coding.pi.session import ActionError
+    clock = Clock()
+    class Malformed(Session):
+        def next_action(self, *args, **kwargs):
+            self.calls += 1
+            clock.value += 2
+            raise ActionError('select_strategy missing required query_ref')
+    session = Malformed()
+    runner, injections, database = make(tmp_path, session, clock=clock,
+                                       budgets=BudgetLimits(actor_seconds=5))
+    try:
+        result = runner.run()
+        assert result['status'] == 'budget_exhausted', result
+        assert runner.workflow.accounting.seconds('thinking') == 6
+        assert session.calls == 3 and result['pending']
+        assert runner.workflow.outcome is None
+        feedback = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(feedback) == 2 and all(e['accepted'] is False for e in feedback)
+        assert not any(e['type'] == 'host-dispatch' for e in runner.events)
+        reopened = ProjectRunner(runner.root, **injections).run()
+        assert reopened['pending'] == result['pending'] and session.calls == 3
+    finally:
+        database.close()
+
+
+def test_malformed_model_arguments_and_missing_read_are_corrected_in_same_operation(tmp_path):
+    from coding.pi.session import ActionError
+    class CorrectArguments(Session):
+        rejected = False
+        observed_feedback = False
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                if not self.rejected:
+                    self.rejected = True
+                    raise ActionError('read_project_file requires path')
+                if not self.observed_feedback:
+                    assert context['observation']['event'] == 'invalid-action'
+                    assert context['observation']['accepted'] is False
+                    self.observed_feedback = True
+                    return 'read_project_file', dict(path='guidance.md')
+                reads = [r for r in context['evidence'] if r['name'] == 'read_project_file']
+                if len(reads) == 1:
+                    assert reads[0]['result']['status'] == 'error'
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    session = CorrectArguments()
+    runner, _, database = make(tmp_path, session)
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        assert session.observed_feedback
+        failures = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(failures) == 1
+        completed = [r for r in result['history'] if r.get('evidence', {}).get('operation_id')
+                     == failures[0]['operation_id']]
+        assert len(completed) == 1 and completed[0]['passed']
     finally:
         database.close()
