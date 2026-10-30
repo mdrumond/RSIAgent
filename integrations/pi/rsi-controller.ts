@@ -44,7 +44,12 @@ export default function (pi: ExtensionAPI) {
     if (event.outcome !== "completed") return;
     const state = await host("snapshot", {});
     pi.setActiveTools(state.allowed);
-    if (!state.done) return { continue: true };
+    if (!state.done) return { continue: true, entries: event.context.canContinue ? [] : [{
+      type: "custom_message", customType: "rsi-stage-pending", display: false,
+      content: JSON.stringify({ stage: state.stage, operation_id: state.operation_id,
+        allowed: state.allowed, unread_skills: state.unread_skills,
+        instruction: "The host stage remains pending. Use the allowed tools; only a successful host perform completes it." }),
+    }] };
   });
   pi.on("session_before_compact", async (event, ctx) => {
     const p = event.preparation;

@@ -140,9 +140,11 @@ def test_actual_project_runner_cancel_retains_late_actual_ledger_once(monkeypatc
         runner.actor.close()
         intents=[row for row in runner.events if row['type']=='pi-provider-request']
         ledger=[row for row in runner.events if row['type']=='pi-provider']
-        assert len(calls)==len(intents)==len(ledger)==2
+        # Native continuation may already have admitted another request before
+        # RPC abort is observed. Every actual intent must still have one row.
+        assert len(calls)==len(intents)==len(ledger)>=2
         assert {row['reservation_id'] for row in intents}=={row['reservation_id'] for row in ledger}
-        assert len({row['reservation_id'] for row in ledger})==2
+        assert len({row['reservation_id'] for row in ledger})==len(ledger)
         assert any(row['usage'] is None and row.get('close_snapshot') for row in ledger)
         assert runner.workflow.pending and runner.workflow.stage==Stage.TASK_CONSTRUCTION
         assert holders[0].gateway.finished.is_set()
@@ -180,3 +182,33 @@ def test_actual_pi_close_reaps_child_when_host_leaves_accounting_unknown(monkeyp
     assert {row['reservation_id'] for row in session.gateway.records}=={
         row['reservation_id'] for kind,row in events if kind=='pi-provider'}
     actor.close()  # Cleanup remains idempotent without reconciling unknown clocks.
+
+
+def test_actual_pi_text_only_turn_continues_pending_stage_and_commits_once(monkeypatch,tmp_path):
+    from rsi.skills import builtin_bundle
+    events,calls,effects=[],[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        request=json.loads(kwargs['data']);calls.append(request)
+        if len(calls)==1:
+            return response([],len(calls),summary='I will construct the task now.')
+        if len(calls)==2:
+            # The official boundary draft is actual provider-visible context.
+            pending=[m for m in request['messages'] if m['role']=='user' and
+                     flow.pending['id'] in json.dumps(m.get('content'))]
+            assert pending
+            assert all(name in json.dumps(pending[-1]) for name in names)
+            return response([('read_skill',{'name':name}) for name in names],len(calls))
+        assert len(calls)==3
+        return response([('perform',{'proposal':'construct after actual skill reads'})],len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    def perform(*args):effects.append(args);return StageResult()
+    actor,flow=native_actor(tmp_path,events,perform)
+    try:
+        actor.step({'goal':'text alone cannot finish host stage'})
+        actor.step({'goal':'text alone cannot finish host stage'})
+        assert flow.stage==Stage.DESIGN and flow.pending is None
+        assert len(effects)==1 and len(calls)==3
+        assert len(flow.state['history'])==2
+        assert len([1 for kind,row in events if kind=='pi-event' and row['event']['type']=='agent_settled'])==1
+    finally:actor.close()
