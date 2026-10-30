@@ -13,7 +13,7 @@ import sys
 import time
 import zipfile
 
-from .configuration import _bytes, _locations, _publish, show_configuration
+from .configuration import _bytes, _locations, _publish, show_configuration, set_configuration
 
 
 def machinery(instance):
@@ -158,6 +158,12 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             receipt['versions'] = json.loads(subprocess.check_output(
                 [str(host), '-I', '-c', probe], cwd=runtime, env=env, text=True,
                 timeout=min(30, max(.01, timeout - (time.monotonic() - started)))))
+            if roles:
+                current = show_configuration(root)
+                if not current['payload'].get('roles_python'):
+                    payload = dict(current['payload'], roles_python=str(runtime / 'roles/bin/python'))
+                    revision = set_configuration(root, payload, expect_revision=current['revision'])
+                    receipt['configuration_revision'] = revision['revision']
             receipt.update(state='ready', python=str(host),
                            roles_python=str(runtime / 'roles/bin/python') if roles else None)
         except BaseException as exc:

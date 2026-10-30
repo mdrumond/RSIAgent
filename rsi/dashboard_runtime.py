@@ -70,7 +70,10 @@ def start(instance, *, port=0, wait_seconds=15):
                 subprocess.Popen([str(interpreter), '-I', '-c', bootstrap, str(source),
                                   str(root), launch_id, str(lock)], cwd=source,
                                  stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                 start_new_session=True, pass_fds=(lock,))
+                                 start_new_session=True, pass_fds=(lock,),
+                                 env=dict(os.environ, PATH=str(Path(setup['node']).parent) +
+                                          os.pathsep + os.environ.get('PATH', os.defpath),
+                                          PYTHONNOUSERSITE='1'))
         except OSError:
             record['state'] = 'failed'
             _publish(directory / 'process.json', _bytes(record))
