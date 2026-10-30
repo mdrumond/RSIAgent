@@ -41,6 +41,13 @@ class ProposalRejected(ValueError):
     """Proven semantic invalidity, never a storage/provider/timing failure."""
 
 
+class RejectedOperation(RuntimeError):
+    """Known completed semantic rejection; retry only with a fresh operation ID."""
+    def __init__(self, rejection):
+        self.rejection = rejection
+        super().__init__('known rejected operation requires a fresh writer identity')
+
+
 def _skill_metadata(bundle):
     for doc in bundle.documents:
         import yaml  # Existing legacy dependency; no new parser or YAML subset.
@@ -174,7 +181,7 @@ class Learning:
             if existing['request'] != request:
                 raise ValueError('operation identity reused with different inputs')
             if 'rejection' in existing:
-                raise RuntimeError('rejected operation requires a fresh writer identity')
+                raise RejectedOperation(RejectedSkillUpdate(**existing['rejection']))
             if 'result' not in existing:
                 raise RuntimeError('unknown work: reconcile before retry')
             return existing['result']
@@ -196,7 +203,8 @@ class Learning:
         Validation callbacks use the same idempotency ID to recover host receipts.
         """
         operation = self.state['operations'][operation_id]
-        if 'result' in operation or not not_dispatched:
+        if ('result' in operation or operation.get('proposal') or operation.get('role_finished')
+                or operation.get('rejection') or not not_dispatched):
             raise RuntimeError('authoritative undispatched confirmation required')
         del self.state['operations'][operation_id]
         self._save()
@@ -516,7 +524,7 @@ class Learning:
         if 'result' in operation:
             return SnapshotUpdate(**operation['result'])
         if 'rejection' in operation:
-            raise RuntimeError('rejected operation requires a fresh writer identity')
+            raise RejectedOperation(RejectedSkillUpdate(**operation['rejection']))
         request = operation['request']
         if request['kind'] != 'skill':
             raise ValueError('not a writer operation')

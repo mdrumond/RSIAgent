@@ -189,9 +189,10 @@ def test_failed_role_requires_reconciliation_and_stop_blocks_new_work(env):
     learner.stop()
     with pytest.raises(RuntimeError, match='reconcile'):
         make().skill_update(bundle, baseline, row, ctx)
-    learner.reconcile(ctx['operation_id'], not_dispatched=True)
+    with pytest.raises(RuntimeError, match='undispatched'):
+        learner.reconcile(ctx['operation_id'], not_dispatched=True)
     with pytest.raises(RuntimeError, match='stopped'):
-        learner.skill_update(bundle, baseline, row, ctx)
+        learner.skill_update(bundle, baseline, row, dict(ctx, operation_id='fresh'))
     assert role.calls == 1
 
 
@@ -614,7 +615,8 @@ def test_valid_proposal_cannot_be_rejected_or_published_as_validation_probe(env,
     assert not learner.state['candidates']
 
 
-def test_rejection_does_not_misclassify_storage_errors_or_mismatched_output(env, monkeypatch):
+@pytest.mark.parametrize('error', [OSError('CAS unavailable'), ValueError('CAS digest mismatch')])
+def test_rejection_does_not_misclassify_storage_errors_or_mismatched_output(env, monkeypatch, error):
     store, role, bundle, memory, baseline, packets, make, project = env
     from rsi.learning import ProposalRejected
     row, ctx = project()
@@ -628,11 +630,13 @@ def test_rejection_does_not_misclassify_storage_errors_or_mismatched_output(env,
     reader = store.read_json
     def broken(ref):
         if ref == op['proposal']:
-            raise OSError('CAS temporarily unavailable')
+            raise error
         return reader(ref)
     monkeypatch.setattr(store, 'read_json', broken)
-    with pytest.raises(OSError):
+    with pytest.raises(type(error)) as caught:
         learner.reject_observed_proposal(ctx['operation_id'], op['proposal'])
+    assert caught.value is error
+    assert not isinstance(caught.value, ProposalRejected)
     assert 'rejection' not in op
 
 
@@ -654,3 +658,33 @@ def test_legacy_rejection_requires_host_namespace_and_revalidates_project(env):
     assert store.read_json(rejected.rejection_ref)['observed_project']['project_id'] == row['original_id']
     with pytest.raises(ValueError, match='namespace'):
         learner.reject_observed_proposal(ctx['operation_id'], op['proposal'], namespace='other-cycle')
+
+
+def test_rejected_operation_cannot_revive_but_fresh_append_uses_same_inputs(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    from rsi.learning import ProposalRejected, RejectedOperation
+    row, ctx = project()
+    role.proposal = SkillProposal('bad', (row['artifact_ref'],), (SkillEdit('debug', 'replace', 'bad'),))
+    learner = make()
+    with pytest.raises(ProposalRejected):
+        learner.skill_update(bundle, baseline, row, ctx)
+    op = learner.state['operations'][ctx['operation_id']]
+    rejected = learner.reject_observed_proposal(ctx['operation_id'], op['proposal'])
+    with pytest.raises(RejectedOperation) as cached:
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert cached.value.rejection == rejected
+    with pytest.raises(RejectedOperation):
+        learner.reconcile_proposal(ctx['operation_id'], op['proposal'], 2)
+    with pytest.raises(RuntimeError, match='undispatched'):
+        learner.reconcile(ctx['operation_id'], not_dispatched=True)
+    with pytest.raises(ValueError, match='exact retained'):
+        learner.reject_observed_proposal(ctx['operation_id'], row['artifact_ref'])
+    role.proposal = SkillProposal('new addition', (row['artifact_ref'],), (SkillEdit('debug', 'append', 'Retest cancellation.'),))
+    update = learner.skill_update(bundle, baseline, row, dict(ctx, operation_id='fresh-append',
+        previous_skill_rejections=[{'rejection_ref': rejected.rejection_ref}]))
+    assert update.reference != bundle
+    assert update.actor_seconds == rejected.actor_seconds == 2
+    assert role.calls == 2
+    assert learner.active == bundle
+    assert len(learner.state['candidates']) == 1
+    assert learner.reject_observed_proposal(ctx['operation_id'], op['proposal']) == rejected
