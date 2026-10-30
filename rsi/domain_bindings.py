@@ -724,8 +724,23 @@ class OptimizerHost(SourceHost):
     def boundary_reached(self, stage):
         return stage != Stage.TEST or self.value is None
 
+    def activity_exception_terminal(self, name, error):
+        from optimizer.control import ObservedBudgetStop
+        if name == 'profile' and isinstance(error, ObservedBudgetStop):
+            error.validate(self.owner.directory)
+            return True
+        return super().activity_exception_terminal(name, error)
+
     def refresh_public_result(self, retained):
-        return self.owner.store.get(self.owner.key)
+        row = self.owner.store.get(self.owner.key)
+        # CanonicalAdoption invokes this only for an authenticated accepted
+        # checkpoint. A normal run settles the current job, whereas explicit
+        # single-evaluation calls leave it available for another public attempt.
+        if (row['status'] == 'running' and not row['stop_requested']
+                and not self.inputs.get('single_evaluation') and not self.inputs.get('prepare_only')):
+            self.owner.store.transition(self.owner.key, 'completed', stage=Stage.ACCEPTANCE.value)
+            row = self.owner.store.get(self.owner.key)
+        return row
 
     def on_actor_event(self, kind, data):
         observer = self.owner.memory_observer
@@ -993,9 +1008,17 @@ class OptimizerHost(SourceHost):
             passed = self.value is not None
         if stage == Stage.OPTIMISATION and args['optimisation_decision']['action'] == 'profile':
             candidate = json.loads(self.source)
-            report = self.call(activity, 'profile', 'profiling', lambda seconds:
-                owner.backend.profile(candidate['source'], owner.directory / fingerprint(candidate) / 'profile',
-                                      block_count=candidate['block_count']))
+            from optimizer.control import ObservedBudgetStop
+            try:
+                report = self.call(activity, 'profile', 'profiling', lambda seconds:
+                    owner.backend.profile(candidate['source'], owner.directory / fingerprint(candidate) / 'profile',
+                                          block_count=candidate['block_count']))
+            except ObservedBudgetStop as error:
+                if owner.store.get(owner.key)['stop_requested'] or self.value is None:
+                    raise
+                proof = error.validate(owner.directory)
+                report = dict(status='unavailable', reason='observed elapsed stop', terminal_receipt=proof)
+                owner.store.add_event(owner.key, 'profiling-unavailable', report)
             owner.state['history'].append(dict(tool={'action': 'profile'}, content=report,
                                               result=owner._artifact('profiling', report)))
             owner._save()

@@ -120,7 +120,10 @@ class DomainActivity:
             terminal = isinstance(error, Exception) and getattr(self.runner.backend,
                 'activity_exception_terminal', lambda *_: False)(name, error) is True
             if terminal:
-                finish(dict(error_type=type(error).__name__, message=str(error)), 'failed', True)
+                failure = dict(error_type=type(error).__name__, message=str(error))
+                if getattr(error, 'terminal_receipt', None) is not None:
+                    failure['terminal_receipt'] = error.terminal_receipt
+                finish(failure, 'failed', True)
             else:
                 flow.accounting.unresolved.add(scope['token'])
                 self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
