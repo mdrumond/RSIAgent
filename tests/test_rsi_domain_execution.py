@@ -399,3 +399,44 @@ def test_nested_native_receipts_keep_closed_own_intervals_and_union_elapsed(tmp_
     assert len(proof['command_receipts'])==2
     assert proof['actor_seconds_total']==6
     assert runner.workflow.state['executions']==2
+
+
+def test_domain_refresh_supersedes_inflight_host_action_after_actual_feedback_receipt(tmp_path):
+    from copy import deepcopy
+    from benchmarks.ascend.actor_control import ActorControl
+    from rsi.domain_bindings import SourceHost
+    runner, host, session, _, _ = make(tmp_path)
+    host.control_root, host.feedback, host.observations = tmp_path/'control', [], []
+    host.instruction = 'Use the existing frozen CPU oracle'
+    host.workflow = runner.workflow
+    host.context = SourceHost.context.__get__(host)
+    host.context_refresh = SourceHost.context_refresh.__get__(host)
+    inbox = ActorControl(host.control_root)
+    decisions, sent = [], []
+    original_decision = session.next_action
+    def decide(context, allowed, **kwargs):
+        decisions.append(deepcopy(context))
+        selected = original_decision(context, allowed, **kwargs)
+        if context['stage'] == 'test' and selected[0] == 'perform' and not sent:
+            sent.append(inbox.send('during-selection', 'Review the numeric direction before host work'))
+        return selected
+    session.next_action = decide
+    original_execute = host.execute
+    def execute(stage, args, operation, activity):
+        if stage == Stage.TEST:
+            assert inbox.status()['messages'][0]['consumed'] is not None
+            assert any(sent[0]['id'] in [row['feedback_id'] for row in
+                context['task']['domain']['feedback']] for context in decisions
+                if context['operation_id'] == operation)
+        return original_execute(stage, args, operation, activity)
+    host.execute = execute
+    result = runner.run()
+    assert result['status'] == 'accepted' and result['correctness'] is True
+    superseded = [event for event in runner.events if event['type'] == 'actor-action-superseded']
+    assert len(superseded) == 1 and superseded[0]['executed'] is False
+    operation = superseded[0]['operation_id']
+    contexts = [row for row in decisions if row['operation_id'] == operation]
+    assert contexts[0]['task']['domain']['feedback'] == []
+    assert contexts[-1]['task']['domain']['feedback'][0]['feedback_id'] == sent[0]['id']
+    assert host.calls.count(Stage.TEST) == 2  # Original numeric failure plus genuine repair.
+    assert len([row for row in result['history'] if row.get('evidence', {}).get('operation_id') == operation]) == 1

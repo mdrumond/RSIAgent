@@ -107,6 +107,10 @@ class OptimizationLoop:
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         from rsi.domain_execution import require_adoption
+        # A settled user stop needs no provider admission or actor dispatch.
+        # Unknown native work is still reconciled by the worker before settlement.
+        if getattr(self, 'store', None) is not None and self.store.get(self.key)['status'] == 'stopped':
+            return self.store.get(self.key)
         # Preparation and single-evaluation are explicit workload boundaries,
         # not permission to dispatch the previous independent search loop.
         try:

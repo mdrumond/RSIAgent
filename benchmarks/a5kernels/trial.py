@@ -172,6 +172,7 @@ class ActorOutcome:
     distillation: object | None = None
     admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
     continuation: object | None = None
+    distillation_failure: str | None = None
 
 
 class ActorDriver(Protocol):

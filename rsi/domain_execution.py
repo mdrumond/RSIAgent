@@ -221,17 +221,31 @@ class DomainRunner(ProjectRunner):
             observed_close._rsi_original_close = original_close
             session.close = observed_close
             return session
+        host.runner = self
         self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True,
+            context_refresh=self.context_refresh)
         self.workflow.resolver = self.resolve
         host.workflow = self.workflow
         # Public result/reconciliation fields use the same frozen domain contract.
         self.backend = _HostView(host, self.contract_ref)
         if not persisted:
             self.capture_checkpoint(None, scope='initial')
+
+    def context_refresh(self, delivered):
+        callback = getattr(self.backend, 'context_refresh', None)
+        if callback is None:
+            return None
+        domain = callback(delivered.get('domain', {}))
+        if domain is None:
+            return None
+        # Rebuild the complete authoritative envelope and validate its baseline,
+        # rather than returning just feedback or patching the delivered request.
+        fresh = self.context()
+        return fresh
 
     def actor_event(self, kind, data):
         super().actor_event(kind, data)
@@ -295,6 +309,11 @@ class DomainRunner(ProjectRunner):
             raise WorkflowError('domain source changed outside current stage')
         if 'edit' in args:
             edit = args['edit']
+            before_edit = getattr(self.backend, 'before_edit', None)
+            if before_edit is not None:
+                before_edit(stage, edit, operation, activity)
+                if self.backend.project_hash() != old_hash:
+                    raise WorkflowError('domain pre-edit activity changed the current source')
             activity.run('edit', 'implementation', lambda _: self.backend.edit(edit['path'], edit['source'],
                 expected_file_hash=edit['sha256'], expected_project_hash=old_hash))
         observation = self.backend.execute(stage, args, operation, activity)
@@ -440,7 +459,8 @@ class DomainRunner(ProjectRunner):
             def step(self, context):
                 stage = runner.workflow.stage
                 result = actor.step(context)
-                if stage == boundary:
+                reached = getattr(runner.backend, 'boundary_reached', lambda stage: True)
+                if stage == boundary and reached(stage):
                     runner.workflow.state['domain_boundary'] = boundary.value
                     runner.workflow.stop()
                     raise WorkflowError('requested domain workload boundary reached')
@@ -483,7 +503,9 @@ class CanonicalAdoption:
             row = runner.store.read_json(event['reference'])
             if row['contract_ref'] != runner.contract_ref or row['source_hash'] != runner.backend.project_hash():
                 raise WorkflowError('retained native public result scope differs')
-            return decode(row['value'])
+            value = decode(row['value'])
+            refresh = getattr(runner.backend, 'refresh_public_result', None)
+            return refresh(value) if refresh is not None else value
         value = self.finish(owner, runner, result, inputs)
         if runner.workflow.outcome == 'accepted' and not getattr(value,'continuation',None):
             ref = runner.store.put_json(dict(contract_ref=runner.contract_ref,
