@@ -205,8 +205,9 @@ class BoundCycle(TuningBindings):
                 self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
         try:
-            self.memory = services._memory(memory_root, self.binding['initial'].encode())
-            self.learning = self.make_learning(learning_path)
+            with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
+                self.memory = services._memory(memory_root, self.binding['initial'].encode())
+                self.learning = self.make_learning(learning_path)
             if self.learning.active is None:
                 self.learning.state['active'] = self.spec.baseline_skills
                 self.learning._save()
@@ -584,7 +585,8 @@ class BoundCycle(TuningBindings):
                 return dict(decision='skipped', evidence_ref=ref)
             if not any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due') for e in events):
                 self.tuning_settings()
-                self.tuning_project(due) if due['kind'] == 'manual_tuning' else self.tuning_candidate(due)
+                self.tuning_project(due)
+
         return self.tuning.step()
 
     def run_project(self, operation_id):

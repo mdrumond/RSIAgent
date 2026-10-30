@@ -57,7 +57,9 @@ class TuningBindings:
             return SkillEvaluation(path, artifacts=self.store, runner_factory=self.trial)
         settings, cases = self.tuning_settings()
         memory, incumbent = self.scheduler.state['memory'], self.scheduler.state['skills']
-        if event['kind'] == 'manual_tuning':
+        matching = [ref for ref, record in self.learning.state['candidates'].items()
+                    if record['incumbent'] == incumbent and not record['quarantined']]
+        if event['kind'] == 'manual_tuning' or not matching:
             # User guidance steers a real writer on admitted project evidence.
             row = self.tuning_project(event)
             writer_id = operation + '-writer'
@@ -73,7 +75,7 @@ class TuningBindings:
             self.scheduler.complete_extension(writer_id, update.reference, actor_seconds=update.actor_seconds)
             candidate = update.reference
         else:
-            candidate = self.tuning_candidate(event)
+            candidate = matching[-1]
         training = []
         admitted = {r['project']['project_id']: r for r in self.scheduler.state['originals']}
         for i, project in enumerate(self.spec.projects):
