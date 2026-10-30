@@ -453,3 +453,104 @@ def test_collection_identity_includes_actual_sources_and_negative_provenance():
     assert bindings.fingerprint(bindings.knowledge_identity(knowledge)) != original
     with pytest.raises(bindings.CanonicalConfigurationError):
         bindings.knowledge_identity(lambda *_: [])
+
+
+def _optimizer_read_case(tmp_path, monkeypatch, *, memory=False, corrupt=None, strict=False):
+    import base64
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Backend
+    data=b'actual frozen memory document'
+    digest=sha(data)
+    files={'docs/contract.txt':dict(base64=base64.b64encode(data).decode(),sha256=digest)} if memory else {}
+    body=dict(files=files,memory_entries=[])
+    snapshot=dict(body,snapshot_id=sha(canonical(body)))
+    store=JobStore(tmp_path/'jobs')
+    key=store.create('def forward(x): return x','forward',dict(args=[dict(shape=[5],dtype='float32')]),
+        snapshot,max_seconds=120)['job_id']
+    jobref=store.put_artifact(key,'frozen-contract.txt',b'actual admitted job document')['sha256']
+    reads=[]
+    original=store.read_artifact
+    def read(job,reference):
+        reads.append(reference)
+        return original(job,reference)
+    monkeypatch.setattr(store,'read_artifact',read)
+    class ScopeSession(CanonicalSession):
+        requested=False
+        valid=False
+        unknown=None
+        denied=None
+        payload=None
+        def next_action(self,context,allowed,**kwargs):
+            if context['unread_skills']:return super().next_action(context,allowed,**kwargs)
+            if context['stage']=='task_construction':
+                if not self.requested:
+                    if not corrupt:
+                        queries=[row for row in context['evidence'] if row['name']=='query_kdb']
+                        if not queries:return 'query_kdb',dict(query='frozen admitted artifact scope')
+                        self.unknown=queries[-1]['result']['reference']
+                    self.requested=True
+                    return 'read_artifact',dict(sha256=(digest if memory else jobref) if corrupt else self.unknown)
+                if not corrupt and not self.valid:
+                    self.denied=context['observation']
+                    assert reads==[]  # Scope check did not touch any host artifact.
+                    self.valid=True
+                    return 'read_artifact',dict(sha256=digest if memory else jobref)
+                material=next(row['result'] for row in context['evidence'] if row['name']=='read_artifact')
+                self.payload=material['text']
+            return super().next_action(context,allowed,**kwargs)
+    session=ScopeSession(initial=json.dumps(dict(source='fast',block_count=1)),
+                         repaired=json.dumps(dict(source='fast',block_count=1)))
+    monkeypatch.setattr(bindings,'PiSessionAdapter',lambda **_:session)
+    backend=Backend()
+    owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'TEST'},model='TEST'),backend,knowledge=lambda _:[])
+    runner=owner.canonical.build(owner,prepare_only=False,single_evaluation=False,memory_snapshot=None,context=None)
+    # The session deliberately requests its actual delivered canonical KDB receipt
+    # through the wrong artifact endpoint. It must not expose global CAS.
+    if corrupt=='missing':store.artifact_path(key,jobref).unlink()
+    elif corrupt=='job':store.artifact_path(key,jobref).write_bytes(b'corrupt stored evidence')
+    elif corrupt=='memory':
+        runner.backend.host.submission['memory_snapshot']['files']['docs/contract.txt']['base64']=base64.b64encode(b'changed memory bytes').decode()
+    runner.actor.recover_invalid_actions=not strict
+    return runner,session,backend,reads,jobref,digest
+
+
+def test_optimizer_unknown_artifact_feedback_then_admitted_job_read_and_real_stages(tmp_path,monkeypatch):
+    runner,session,backend,reads,ref,_=_optimizer_read_case(tmp_path,monkeypatch)
+    result=runner.run()
+    assert result['status']=='accepted' and result['correctness'] is True
+    assert session.denied['accepted'] is False and session.denied['executed'] is False
+    assert session.payload=='actual admitted job document' and ref in reads
+    assert session.unknown not in reads
+    assert backend.prepares==1 and backend.evaluations==['fast']
+    assert {h['evidence']['stage'] for h in result['history']}=={stage.value for stage in Stage}
+    assert any(e['type']=='actor-invalid-action' for e in runner.events)
+
+
+def test_optimizer_path_keyed_frozen_memory_is_readable_by_actual_content_digest(tmp_path,monkeypatch):
+    runner,session,backend,reads,_,digest=_optimizer_read_case(tmp_path,monkeypatch,memory=True)
+    assert 'docs/contract.txt' in runner.backend.host.submission['memory_snapshot']['files']
+    assert digest not in runner.backend.host.submission['memory_snapshot']['files']
+    result=runner.run()
+    assert result['status']=='accepted' and session.payload=='actual frozen memory document'
+    assert digest not in reads  # Memory stays in authenticated snapshot namespace.
+    assert backend.prepares==1
+
+
+@pytest.mark.parametrize('corrupt',['missing','job','memory'])
+def test_optimizer_admitted_evidence_loss_and_corruption_remain_fatal(tmp_path,monkeypatch,corrupt):
+    runner,session,backend,reads,ref,_=_optimizer_read_case(tmp_path,monkeypatch,
+        memory=corrupt=='memory',corrupt=corrupt)
+    result=runner.run()
+    assert result['status']=='suspended' and runner.workflow.pending['stage']=='task_construction'
+    assert not any(e['type']=='actor-invalid-action' for e in runner.events)
+    assert backend.prepares==0 and backend.evaluations==[]
+    assert (ref in reads) is (corrupt!='memory')
+
+
+def test_optimizer_unknown_artifact_strict_mode_does_not_recover(tmp_path,monkeypatch):
+    runner,_,backend,reads,_,_=_optimizer_read_case(tmp_path,monkeypatch,strict=True)
+    result=runner.run()
+    assert result['status']=='suspended' and runner.workflow.pending
+    assert reads==[] and backend.prepares==0
+    assert not any(e['type']=='actor-invalid-action' for e in runner.events)
