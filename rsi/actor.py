@@ -21,6 +21,7 @@ from coding.pi.session import ActionError, PiCodingSession
 from rsi.contracts import Stage, StepEvidence
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillUsage
+from rsi.strategy import StrategyRejected
 
 
 SCHEMAS = {
@@ -63,6 +64,12 @@ class StageResult:
     retrospective_ref: str | None = None
     new_source_hash: str | None = None
     redesign: bool = False
+
+
+@dataclass(frozen=True)
+class _StageProposal:
+    result: StageResult
+    evidence: StepEvidence
 
 
 @dataclass(frozen=True)
@@ -172,7 +179,7 @@ class SkillDelivery:
                 for ref in dict.fromkeys(references) if ref not in self.delivered]
 
 
-class PiSessionAdapter:
+class SnapshotPiSessionAdapter:
     """Reuse Pi's schemas, loopback gateway, context paging and exact edits.
 
     Eager startup + get_state handshake exclude process readiness from charged
@@ -352,6 +359,40 @@ class WorkflowActor:
             raise
 
     def step(self, context):
+        dispatcher = self._stage(context)
+        try:
+            turn = next(dispatcher)
+        except StopIteration as done:
+            return self._commit(done.value)
+        if hasattr(self.session, 'run_stage'):
+            return self._commit(self.session.run_stage(dispatcher, turn, self))
+        while True:
+            payload, allowed, source, record = turn
+            try:
+                action = self._timed('thinking', lambda: self.session.next_action(
+                    payload, allowed, seconds=self._available(), record=record, source=source))
+            except ActionError as error:
+                try:
+                    turn = dispatcher.throw(error)
+                except StopIteration as done:
+                    return self._commit(done.value)
+                continue
+            try:
+                turn = dispatcher.send(action)
+            except StopIteration as done:
+                return self._commit(done.value)
+
+    def _commit(self, proposal):
+        self._available()
+        result, evidence = proposal.result, proposal.evidence
+        self.emit('stage-result', dict(result=asdict(result), evidence=evidence.to_dict(),
+            stage=evidence.stage.value, operation_id=evidence.operation_id,
+            settlement='host' if evidence.stage == Stage.PREFLIGHT else 'transport'))
+        self.workflow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
+                               redesign=result.redesign)
+        return result
+
+    def _stage(self, context):
         flow = self.workflow
         operation = flow.begin()
         stage = flow.stage
@@ -404,8 +445,7 @@ class WorkflowActor:
                 scope['request_id'] = uuid.uuid4().hex
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
-                    name, args = self._timed('thinking', lambda: self.session.next_action(
-                        payload, allowed, seconds=seconds, record=record, source=source))
+                    name, args = yield payload, allowed, source, record
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -421,6 +461,26 @@ class WorkflowActor:
                     raise WorkflowError('actor action unavailable in this stage or readiness state')
                 validate(args, self.schemas[name])
                 if name == 'read_skill':
+                    # Optional empty sections from tool callers mean a full read.
+                    # Check model arguments before emitting any usage receipt;
+                    # storage, delivery and timing failures must still propagate.
+                    args = dict(args)
+                    if not args.get('section', '').strip():
+                        args.pop('section', None)
+                    error = None
+                    if args['name'] not in names:
+                        error = 'skill must be exposed before read'
+                    elif ('section' in args and args['section'] not in
+                          self.bundle.document(args['name']).sections):
+                        error = 'unknown skill section'
+                    if error is not None:
+                        if not self.recover_invalid_actions:
+                            raise ValueError(error)
+                        observation = dict(event='invalid-action', action=name,
+                                           error=error, accepted=False,
+                                           allowed=list(allowed))
+                        record('actor-invalid-action', observation)
+                        continue
                     text = self._timed('retrieval', lambda: usage.read(args['name'], args.get('section')))
                     receipt = usage.last_read_receipt
                     # A section read is genuine evidence, but does not replace the
@@ -442,9 +502,28 @@ class WorkflowActor:
                         receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
+                    if ('skill_refs' in args and
+                            any(ref not in self._reads for ref in args['skill_refs'])):
+                        error = 'skill_refs must contain current host read receipt IDs, not skill names'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', action=name, error=error,
+                                           accepted=False, skill_receipts=inventory['skill_receipts'])
+                        record('actor-invalid-action', observation)
+                        continue
                     seconds = self._available()
-                    observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
-                        stage, args, operation, seconds))
+                    try:
+                        observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
+                            stage, args, operation, seconds))
+                    except StrategyRejected as error:
+                        if not self.recover_invalid_actions:
+                            raise
+                        self._available()
+                        observation = dict(event='invalid-action', action=name,
+                            error=str(error)[:500], accepted=False, executed=False,
+                            **inventory)
+                        record('actor-invalid-action', observation)
+                        continue
                     observation = (dict(observation, action=name, executed=True) if isinstance(observation, dict)
                                    else dict(result=observation, action=name, executed=True))
                     material = {'name': name, 'result': observation}
@@ -473,6 +552,17 @@ class WorkflowActor:
                         observation = dict(event='invalid-action', error=error, accepted=False, allowed=list(allowed))
                         record('actor-invalid-action', observation)
                         continue
+                if stage == Stage.OPTIMISATION:
+                    decisions = [row['result'].get('evidence', {}) for row in evidence_material
+                                 if row['name'] == 'optimisation_decision']
+                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args):
+                        error = 'optimisation decision does not match edit; noop/profile must omit edit'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', error=error, accepted=False,
+                                           optimisation_decision=decisions[-1])
+                        record('actor-invalid-action', observation)
+                        continue
                 seconds = self._available()
                 if stage in (Stage.TEST, Stage.VALIDATION):
                     if self.managed_executions:
@@ -490,13 +580,42 @@ class WorkflowActor:
         evidence = StepEvidence(stage=stage, operation_id=operation, source_hash=flow.source_hash,
             skill_refs=tuple(refs), artifact_refs=result.artifact_refs,
             retrieval_refs=result.retrieval_refs, retrospective_ref=result.retrospective_ref)
-        record('stage-result', dict(result=asdict(result), evidence=evidence.to_dict()))
+        record('stage-result-proposed', dict(result=asdict(result), evidence=evidence.to_dict()))
         self._available()
-        flow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
-                      redesign=result.redesign)
-        return result
+        return _StageProposal(result, evidence)
 
     def close(self):
         if self.session is not None:
             self.session.close()
             self.session = None
+
+
+class PiSessionAdapter(SnapshotPiSessionAdapter):
+    """Canonical Pi-native controller; Pi owns conversation and compaction."""
+    system_prompt = (
+            'You execute the canonical RSI workflow through completed host tools. '
+            'Read all mapped skills, query real evidence, and follow the authoritative stage. '
+            'Tool results are actual host observations. Read paged resources with read_context. '
+            'Only perform completes a stage; model assertions do not establish success. '
+            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.')
+
+    def __init__(self, **kwargs):
+        from coding.pi.controller import ControllerSession
+        self.delivery = SkillDelivery()
+        self.session = ControllerSession(schemas=SCHEMAS,system_prompt=self.system_prompt,**kwargs)
+        self.session.gateway.request_projector = self._project_tools
+
+    @classmethod
+    def from_existing_session(cls, session, *, wall_deadline=None):
+        from coding.pi.controller import ControllerSession
+        controller = ControllerSession.from_existing_session(session,wall_deadline=wall_deadline)
+        adapter = cls.__new__(cls)
+        adapter.delivery = SkillDelivery()
+        adapter.session = controller
+        controller.schemas.update(SCHEMAS)
+        controller.system_prompt = cls.system_prompt
+        controller.gateway.request_projector = adapter._project_tools
+        return adapter
+
+    def run_stage(self, dispatcher, turn, actor):
+        return self.session.run_stage(dispatcher, turn, actor, self.delivery)
