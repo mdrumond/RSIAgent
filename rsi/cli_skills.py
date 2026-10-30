@@ -14,7 +14,14 @@ def register(commands):
     actions = skills.add_subparsers(dest='skill_action', required=True)
     get = actions.add_parser('get')
     get.add_argument('name', nargs='?')
-    get.add_argument('--builtin', action='store_true')
+    selection = get.add_mutually_exclusive_group()
+    selection.add_argument('--builtin', action='store_true')
+    selection.add_argument('--cycle')
+    export = actions.add_parser('export', help='deliver a reusable accepted baseline folder')
+    selection = export.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--cycle')
+    selection.add_argument('--builtin', action='store_true')
+    export.add_argument('--destination', type=Path, required=True)
     update = actions.add_parser('set')
     update.add_argument('name')
     update.add_argument('--file', type=Path, required=True)
@@ -56,6 +63,24 @@ def _project(instance, reference):
 
 
 def execute(args):
+    if args.skill_action in ('get', 'export') and args.cycle is not None:
+        from .handoffs import published_skills
+        published = published_skills(args.instance, args.cycle)
+        if args.skill_action == 'export':
+            from .skill_delivery import export_bundle
+            return export_bundle(published.bundle, args.destination, source=dict(
+                kind='cycle', cycle_id=args.cycle, provenance_ref=published.provenance))
+        result = dict(published.bundle.to_dict(), bundle_ref=published.bundle_ref,
+                      bundle_hash=published.bundle.digest, cycle_id=args.cycle,
+                      provenance_ref=published.provenance)
+        if args.name is not None:
+            document = published.bundle.document(args.name)
+            result['documents'] = [row for row in result['documents'] if row['name'] == document.name]
+        return result
+    if args.skill_action == 'export' and args.builtin:
+        from .skill_delivery import export_bundle
+        from .skills import builtin_bundle
+        return export_bundle(builtin_bundle(), args.destination, source={'kind': 'builtin'})
     if args.skill_action == 'get':
         return inspect_skills(args.instance, args.name, builtin=args.builtin)
     if args.skill_action == 'map' and args.map_action == 'inspect':
