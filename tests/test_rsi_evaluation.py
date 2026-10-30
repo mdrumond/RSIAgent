@@ -48,11 +48,12 @@ def comparison(tmp_path, env, request):
     def create(**kwargs):
         remaining = kwargs.pop('remaining_parent', {'actor_seconds': 30})
         repetitions = kwargs.pop('repetitions', 1)
+        limits = kwargs.pop('joint_limits', BudgetLimits(6, 4, 40, 30))
         return SkillEvaluation.create(tmp_path / 'evaluation.json', checkpoints=[heldout],
             training=[case_identity(training)], artifacts=store, memory_ref=memory,
             kdb_ref=store.put_bytes(b'baseline knowledge'), model_config={'model': 'TEST'},
             incumbent=incumbent, candidate=candidate, runner_factory=factory,
-            joint_limits=BudgetLimits(6, 4, 40, 30), remaining_parent=remaining,
+            joint_limits=limits, remaining_parent=remaining,
             case_count=1, repetitions=repetitions, **kwargs)
     yield create, learner, calls, store, heldout, training, factory
     heldout_db.close()
@@ -311,7 +312,10 @@ def test_actual_correctness_pass_cannot_promote_performance_shortfall(comparison
 def test_provider_only_variance_cannot_promote_even_alongside_task_benefit(comparison, repetitions):
     from coding.pi.rpc import PiDeadlineError
     create, learner, _, store, _, _, _ = comparison
-    evaluation = create(repetitions=repetitions)
+    # This tests provider variance, not exhaustion: retain a declared 60-second
+    # arm allowance even on slower registered CPUs and across repetitions.
+    evaluation = create(repetitions=repetitions, joint_limits=BudgetLimits(6, 4, 40, 120),
+                        remaining_parent={'actor_seconds': 120 * repetitions})
     learner.validate = evaluation.validation
     factory = evaluation.factory
     failed_once = False
