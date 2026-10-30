@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import json
 import pytest
 
@@ -16,6 +18,7 @@ def fixture(tmp_path, attempts=3, seconds=7200):
 
 
 class Agent:
+    canonical_fixture = True
     identity = {'model': 'fake-fixed'}
 
     def __init__(self, actions):
