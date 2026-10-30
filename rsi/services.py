@@ -360,7 +360,14 @@ class BoundCycle(TuningBindings):
             raise ValueError('accepted memory snapshot required')
         ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
         records = snapshot['memories']
-        negatives = [r for r in records if r['proposal']['kind'] != 'correctness']
+        negatives = []
+        for record in records:
+            if record['proposal']['kind'] != 'correctness':
+                negative = dict(record)
+                reference = record.get('provenance', {}).get('packet')
+                if reference:
+                    negative['observed_evidence'] = self.store.read_json(reference)['evidence']
+                negatives.append(negative)
         if self.services.test:
             adapter = self.services.test.query
         else:
@@ -426,6 +433,9 @@ class BoundCycle(TuningBindings):
         with self.services.setup.measure('project-open' if reopen else 'project-snapshot-copy-and-bind', str(root)):
             runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
                 root, spec, bundle, config, **injections)
+            # Query provenance must remain exportable from the owning task CAS.
+            for reference in (*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref):
+                runner.store.put_bytes(self.store.read_bytes(reference))
         context = runner.context
         runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
                                       configuration_ref=configuration_ref)
