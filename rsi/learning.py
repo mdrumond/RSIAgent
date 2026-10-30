@@ -272,7 +272,9 @@ class Learning:
             'Retrieval frequency is not usefulness. Negative results and rejected negative ideas '
             'can demonstrate valuable avoidance. Cite admitted outcome evidence. '
             'replace sets Learned guidance and must preserve existing guidance unless deletion is authorised. '
-            'Routine replace content is the section body only, preserving existing body and appending additions. '
+            'Use operation append for routine additions: content contains ONLY the new body fragment. '
+            'The host preserves the existing section body verbatim and appends that fragment. '
+            'replace sets the entire section body and must preserve existing guidance unless deletion is authorised. '
             'Do not include a Learned guidance heading, any other heading, or YAML frontmatter in routine fragments. '
             'The host creates the section heading when absent; never create it yourself. '
             'Routine remove content identifies one exact body fragment. '
@@ -416,12 +418,15 @@ class Learning:
                 if section.count(edit.content) != 1:
                     raise ValueError('remove must identify one exact learned fragment')
                 replacement = section.replace(edit.content, '', 1)
+            elif edit.operation == 'append':
+                replacement = section + ('' if not section or section.endswith('\n') else '\n') + edit.content + '\n'
             else:
                 replacement = edit.content + '\n'
             if (section.strip() and section.strip() not in replacement and not protected
                     and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True, document=doc)):
                 raise ValueError('replacement deletes guidance without removal authorisation')
-            if re.search(r'^#{1,2} |^---$', replacement, re.MULTILINE):
+            fragment = edit.content if edit.operation == 'append' else replacement
+            if re.search(r'^#{1,2} |^---$', fragment, re.MULTILINE):
                 raise ValueError('learned fragment cannot change document structure')
             marker = '## Learned guidance\n'
             if learned:

@@ -406,3 +406,15 @@ def test_isolated_wall_projection_exhaustion_never_spawns(monkeypatch, tmp_path)
         adapter.review('review', [], deadline=110, wall_deadline=105)
     assert captured == []
     assert events == []
+
+
+def test_skillwriter_real_predict_accepts_typed_append_without_normalisation():
+    roles, calls, events, _ = make_roles([{
+        'rationale': 'prevent recurrence', 'evidence_ids': ['numeric-failure'],
+        'edits': [{'skill': 'debug', 'operation': 'append', 'content': 'Retest cancellation.'}]}])
+    proposal = roles.skillwriter('Improve detection', [AdmittedEvidence('numeric-failure', {})], deadline=110)
+    assert proposal.edits[0].operation == 'append'
+    assert proposal.edits[0].content == 'Retest cancellation.'
+    assert len(calls) == 1
+    emitted = [payload for event, payload in events if event == 'role_proposal']
+    assert emitted[0]['proposal']['edits'] == [dict(skill='debug', operation='append', content='Retest cancellation.')]

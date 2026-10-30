@@ -527,3 +527,42 @@ def test_parent_wall_exhausted_in_preparation_never_dispatches_role(env):
         learner.skill_update(bundle, baseline, row, ctx)
     assert role.calls == 0
     assert learner.state['operations'][ctx['operation_id']]['not_dispatched']
+
+
+def test_append_preserves_exact_guidance_metadata_mapping_and_proposal_wire(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    fragment = 'Measure cancellation against an independent reference.'
+    role.proposal = SkillProposal('detect numeric failures', (row['artifact_ref'],),
+                                 (SkillEdit('debug', 'append', fragment),))
+    learner = make()
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    before, after = learner._bundle(bundle), learner._bundle(candidate)
+    old = before.document('debug')
+    new = after.document('debug')
+    assert new.read('learned-guidance') == old.read('learned-guidance') + fragment + '\n'
+    assert after.mapping == before.mapping
+    assert new.content[:new.content.index('## Learned guidance\n')] == old.content[:old.content.index('## Learned guidance\n')]
+    stored = store.read_json(learner.state['candidates'][candidate]['proposal'])
+    assert stored['edits'] == [{'skill': 'debug', 'operation': 'append', 'content': fragment}]
+    assert learner.active == bundle
+
+
+@pytest.mark.parametrize('skill, operation, fragment', [
+    ('debug', 'append', '## Learned guidance\nExtra advice.'),
+    ('debug', 'append', '---\nname: debug\ndescription: Advice\n---\nExtra advice.'),
+    ('unknown-skill', 'append', 'Extra advice.'),
+    ('debug', 'unsupported', 'Extra advice.'),
+])
+def test_append_rejects_invalid_fragments_and_wire_without_reinterpreting(env, skill, operation, fragment):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    role.proposal = SkillProposal('advice', (row['artifact_ref'],), (SkillEdit(skill, operation, fragment),))
+    learner = make()
+    with pytest.raises(ValueError):
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert not learner.state['candidates']
+    retained = store.read_json(learner.state['operations'][ctx['operation_id']]['proposal'])
+    assert retained['edits'][0]['operation'] == operation
+    assert retained['edits'][0]['content'] == fragment
+    assert store.read_json(bundle) == builtin_bundle().to_dict()
