@@ -81,6 +81,28 @@ def test_phase2_required_hook_and_coalesced_due_events(tmp_path):
     s.close()
 
 
+def test_every_failed_original_is_simplified_after_prior_recovery_exhaustion(tmp_path):
+    calls = []
+    def run(project, memory, skills, ctx):
+        calls.append(('run', project.project_id))
+        return HostTaskResult('failed', 'observed-failure', 1)
+    def simplify(project, result, ctx):
+        calls.append(('simplify', project.project_id))
+        return SimplificationResult(replace(project, project_id=project.project_id+'-small'),
+                                    0, 'host-simplification-receipt')
+    scheduler = CycleScheduler(tmp_path/'state', spec(), run,
+        lambda *_: SnapshotUpdate('updated-memory'), simplify=simplify, recovery_limit=1)
+    try:
+        finish(scheduler)
+        assert calls == [('run', '0'), ('run', '1'), ('simplify', '0'),
+                         ('run', '0-small'), ('simplify', '1'), ('run', '1-small')]
+        assert [r['original_id'] for r in scheduler.state['recoveries']] == ['0', '1']
+        assert len([e for e in scheduler.state['events'] if e['kind']=='recovery_exhausted']) == 2
+        assert scheduler.state['spent'] == 4
+    finally:
+        scheduler.close()
+
+
 @pytest.mark.parametrize('kind', ['original', 'memory', 'skill'])
 def test_crash_pending_hook_is_reconciled_never_redispatched(tmp_path, kind):
     calls = []
