@@ -49,7 +49,11 @@ class RejectedOperation(RuntimeError):
 
 
 def _skill_metadata(bundle):
+<<<<<<< HEAD
     import yaml  # Missing host dependency is not a semantic proposal rejection.
+=======
+    import yaml  # Missing host dependency is not a semantic rejection.
+>>>>>>> codex/rsi-cli-skills
     validate_metadata(bundle)
     return bundle
 
