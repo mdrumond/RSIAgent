@@ -1127,6 +1127,8 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
             if boundary or resumed:
                 runner.workflow.resume()
             return runner
+        from rsi.domain_allocations import optimizer_allocation_anchor
+        row, host.allocation_anchor = optimizer_allocation_anchor(owner)
         bundle, limits = baseline_contract(owner, max(0.001, row['max_seconds'] - row['elapsed_seconds']))
         return DomainRunner.create(root, ProjectSpec(owner.key, host.instruction, ('optimizer-host',),
             budgets=limits), bundle, host, **injections)
