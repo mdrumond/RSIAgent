@@ -179,6 +179,8 @@ class DomainRunner(ProjectRunner):
         frozen = dict(kind='rsi-domain-contract-v2', test_backend=injections.get('test_backend', False),
             spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
             backend_identity=injections['backend_identity'], created=injections.get('clock', time.time)())
+        if getattr(host, 'allocation_anchor', None) is not None:
+            frozen['actor_allocation_anchor'] = host.allocation_anchor
         reference = host.store.put_json(frozen)
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(root / 'domain.json', dict(contract=reference, store_root=os.path.relpath(host.store.root.resolve(), root.resolve())))

@@ -71,7 +71,8 @@ def _allocation_owner(tmp_path, *, unknown=False):
             if not unknown and context['stage']=='implementation' and not context['unread_skills'] and not self.expired:
                 self.expired=True;clock.value+=4
             return super().next_action(context,allowed,**kwargs)
-    backend=Host();model=Model(initial=json.dumps(dict(source='fast',block_count=1)))
+    backend=Host();model=Model(initial=json.dumps(dict(source='fast',block_count=1)),
+                             repaired=json.dumps(dict(source='fast',block_count=1)))
     adoption=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True,clock=clock)
     def owner():
         return OptimizationLoop(store,key,SimpleNamespace(identity={'model':'CPU decisions'}),backend,
@@ -231,3 +232,82 @@ def test_grant_with_no_finite_base_allocation_is_refused_before_persistence(tmp_
     with pytest.raises(ValueError):runner.grant_actor_seconds('controller-grant',2,dict(controller='CPU'))
     assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
     assert DomainRunner(runner.root,host,**injections).workflow.actor_allocation() is None
+
+
+def test_resume_before_first_contract_creation_is_already_in_frozen_base_budget(tmp_path,monkeypatch):
+    from rsi.domain_execution import DomainRunner
+    store,key,backend,model,owner=_allocation_owner(tmp_path)
+    first=owner()
+    def crash_before_contract(cls,*args,**kwargs):
+        raise RuntimeError('Actual canonical_active saved, but domain contract not created')
+    with monkeypatch.context() as scoped:
+        scoped.setattr(DomainRunner,'create',classmethod(crash_before_contract))
+        with pytest.raises(RuntimeError):first.run()
+    assert first.state['canonical_active']['index']==1
+    assert not (first.directory/'canonical-1/domain.json').exists()
+    assert backend.prepares==0 and backend.evaluations==[] and model.contexts==[]
+    store.transition(key,'failed')
+    store.resume(key,additional_seconds=10)
+    resumed=owner()
+    created=resumed.canonical.build(resumed)
+    assert created.workflow.limits.actor_seconds==13
+    # Reopen the still-unexecuted real contract: the old active-marker anchor
+    # incorrectly imported this same pre-contract +10 on precisely this path.
+    runner=resumed.canonical.build(resumed)
+    assert runner.workflow.actor_allocation()==13
+    assert resumed.run()['status']=='completed'
+    runner=resumed.canonical.build(resumed)
+    contract=runner.store.read_json(runner.contract_ref)
+    assert contract['spec']['budgets']['actor_seconds']==13
+    assert contract['actor_allocation_anchor']['max_seconds']==13
+    assert runner.workflow.actor_allocation()==13 and runner.workflow.remaining()['actor_seconds']==9
+    assert not runner.workflow.state.get('actor_grants')
+    assert backend.prepares==1 and backend.evaluations==['fast'] and store.get(key)['attempts']==1
+    calls=(backend.prepares,list(backend.evaluations),len(model.contexts))
+    reopened=resumed.canonical.build(resumed)
+    assert reopened.workflow.actor_allocation()==13 and not reopened.workflow.state.get('actor_grants')
+    assert (backend.prepares,backend.evaluations,len(model.contexts))==calls
+
+
+@pytest.mark.parametrize('additional_seconds',[0,10],ids=['zero-increase-resume','positive-needs-anchor'])
+def test_legacy_unanchored_contract_resume_uses_only_unambiguous_frozen_time(tmp_path,monkeypatch,additional_seconds):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture,Backend
+    from test_rsi_domain_execution import Clock
+    from rsi.domain_execution import DomainRunner
+    from rsi.runtime import WorkflowError
+    store,key=fixture(tmp_path,seconds=13);backend=Backend();clock=Clock()
+    model=CanonicalSession(initial=json.dumps(dict(source='bad',block_count=1)),
+                           repaired=json.dumps(dict(source='fast',block_count=1)))
+    create=DomainRunner.create.__func__
+    def legacy_create(cls,root,spec,bundle,host,**kwargs):
+        del host.allocation_anchor  # Actual frozen historical shape, before contract creation.
+        return create(cls,root,spec,bundle,host,**kwargs)
+    monkeypatch.setattr(DomainRunner,'create',classmethod(legacy_create))
+    adoption=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True,clock=clock)
+    def owner():
+        return OptimizationLoop(store,key,SimpleNamespace(identity={'model':'CPU decisions'}),backend,
+            knowledge=lambda _:[],canonical=adoption)
+    first=owner();first.run(single_evaluation=True)
+    store.stop(key);assert owner().run()['status']=='stopped'
+    path=first.directory/'canonical-1/workflow.json';before=path.read_bytes()
+    calls=(backend.prepares,list(backend.evaluations),len(model.contexts))
+    if additional_seconds:
+        store.resume(key,additional_seconds=additional_seconds)
+    else:
+        # Exercise the retained zero-increase control-event schema through the
+        # actual JobStore hash-chain commit, not an invented allocation receipt.
+        store._update(key,'resumed',lambda row:row.update(stop_requested=False,status='queued',stage='queued'))
+    current=owner()
+    if additional_seconds:
+        with pytest.raises(WorkflowError):current.run()
+        assert path.read_bytes()==before
+        assert (backend.prepares,backend.evaluations,len(model.contexts))==calls
+        assert not json.loads(path.read_text()).get('actor_grants')
+    else:
+        assert current.run()['status']=='completed'
+        runner=current.canonical.build(current)
+        assert 'actor_allocation_anchor' not in runner.store.read_json(runner.contract_ref)
+        assert runner.workflow.actor_allocation()==13 and not runner.workflow.state.get('actor_grants')
+        assert store.get(key)['max_seconds']==13 and backend.evaluations==['bad','fast']
+        assert all(runner.workflow.state['intervals'][key]==value for key,value in json.loads(before)['intervals'].items())
