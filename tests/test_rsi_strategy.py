@@ -289,3 +289,44 @@ def test_negative_reuse_rejects_nonstring_or_blank_redirection_before_persist(se
     assert len(log) == count
     assert service.receipts == receipts
     assert not service.resolve('retrieval', query, Stage.DESIGN, 'op1')
+
+
+@pytest.mark.parametrize('stage', [Stage.TASK_CONSTRUCTION, Stage.DEBUG])
+def test_global_kdb_query_and_retrospective_available_outside_strategy(setup, stage):
+    service, make, state, log, store, _, _ = setup
+    state.update(stage=stage.value, pending={'id': 'global-query-op'})
+    calls = []
+    backend = service.query_backend
+    def counted(payload):
+        calls.append(payload.copy())
+        return backend(payload)
+    service.query_backend = counted
+    query = service.query({'query': 'stable sum'})
+    retro = service.retrospect()
+    assert calls == [{'query': 'stable sum'}]
+    assert store.read_json(query)['payload']['response']['results']
+    assert service.resolve('retrieval', query, stage, 'global-query-op')
+    assert service.resolve('retrospective', retro, stage, 'global-query-op')
+    assert make().resolve('retrieval', query, stage, 'global-query-op')
+    assert store.read_json(retro)['payload']['history'] == state['history']
+    before = len(log)
+    with pytest.raises(WorkflowError):
+        service.select('Out-of-stage proposal', query_ref=query,
+                       retrospective_ref=retro, skill_refs=[], decisions=[])
+    assert len(log) == before
+
+
+@pytest.mark.parametrize('stage', [Stage.TASK_CONSTRUCTION, Stage.DEBUG])
+def test_global_kdb_unavailability_is_not_a_miss(setup, stage):
+    service, _, state, log, _, _, _ = setup
+    state.update(stage=stage.value, pending={'id': 'global-unavailable-op'})
+    calls = []
+    def unavailable(payload):
+        calls.append(payload.copy())
+        raise TimeoutError('backend unavailable')
+    service.query_backend = unavailable
+    with pytest.raises(QueryUnavailable):
+        service.query({'query': 'debug numeric issue'})
+    assert calls == [{'query': 'debug numeric issue'}]
+    assert log[-1]['kind'] == 'query-unavailable'
+    assert not service.resolve('retrieval', log[-1]['reference'], stage, 'global-unavailable-op')

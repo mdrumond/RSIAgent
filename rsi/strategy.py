@@ -121,7 +121,7 @@ class StrategyEvidence:
         return context
 
     def query(self, payload):
-        context = self._strategy_context()
+        context = self._context()
         # Freeze arguments before invoking a callback that may mutate its input.
         request = json.loads(_bytes(payload))
         if not isinstance(request.get('query'), str) or not request['query'].strip():
@@ -145,7 +145,7 @@ class StrategyEvidence:
                              backend=self.backend_identity, test_backend=self.test_backend), context)
 
     def retrospect(self, *, supplement=None):
-        context = self._strategy_context()
+        context = self._context()
         history = json.loads(_bytes(self.snapshot()['history']))
         if _digest(history) != context['history']:
             raise WorkflowError('history changed during retrospective')
@@ -207,7 +207,7 @@ class StrategyEvidence:
                 and record['payload']['kind'] == 'read']
 
     def resolve(self, kind, reference, stage, operation_id):
-        """Workflow.resolver-compatible; strategy completion requires selection."""
+        """All stages may retrieve; design/optimisation require selection."""
         try:
             context = self._context(stage, operation_id)
             if kind == 'skill':
@@ -217,6 +217,8 @@ class StrategyEvidence:
             if kind not in ('retrieval', 'retrospective'):
                 return False
             self._load(kind, reference, context)
+            if Stage(context['stage']) not in (Stage.DESIGN, Stage.OPTIMISATION):
+                return True
             field = 'query_ref' if kind == 'retrieval' else 'retrospective_ref'
             for ref, receipt_kind in self.receipts.items():
                 if receipt_kind == 'selection':
