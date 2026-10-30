@@ -272,7 +272,8 @@ class WorkflowActor:
     """
     def __init__(self, workflow, bundle, session_factory, *, perform, preflight,
                  emit, source_snapshot=None, host_category='implementation', setup_timeout=60,
-                 evidence_tools=None, skill_reference=None, managed_executions=False, perform_ready=None, recover_invalid_actions=False):
+                 evidence_tools=None, skill_reference=None, managed_executions=False, perform_ready=None,
+                 recover_invalid_actions=False, context_refresh=None):
         self.workflow, self.bundle = workflow, bundle
         self.session_factory, self.session = session_factory, None
         self.perform, self.preflight, self.emit = perform, preflight, emit
@@ -280,6 +281,9 @@ class WorkflowActor:
         self.setup_timeout = setup_timeout
         self.managed_executions = managed_executions
         self.recover_invalid_actions = recover_invalid_actions
+        # Return a fresh task context only when a new host input supersedes the
+        # selected action. The current operation and its read receipts survive.
+        self.context_refresh = context_refresh
         self.perform_ready = perform_ready or (lambda stage, operation: True)
         self.skill_reference = skill_reference or (lambda reference: reference)
         self.evidence_tools = dict(evidence_tools or {})
@@ -455,6 +459,17 @@ class WorkflowActor:
                     record('actor-invalid-action', observation)
                     continue
                 self._available()
+                if self.context_refresh is not None:
+                    refreshed = self._timed('retrieval', lambda: self.context_refresh(context))
+                    self._available()
+                    if refreshed is not None:
+                        if not isinstance(refreshed, dict):
+                            raise TypeError('context refresh must return a task object or None')
+                        context = refreshed
+                        observation = dict(event='action-superseded', action=name,
+                                           accepted=False, executed=False)
+                        record('actor-action-superseded', observation)
+                        continue
                 if name == 'perform' and read_names != set(names):
                     raise WorkflowError('read every mapped skill before performing stage')
                 if name not in allowed:
