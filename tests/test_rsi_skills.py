@@ -68,6 +68,14 @@ def test_full_read_authorises_section_citation(tmp_path):
     usage = SkillUsage(baseline(tmp_path), 'op', Stage.TEST, lambda event: None)
     usage.expose()
     usage.read('design')
+    receipt_id = usage.last_read_receipt['receipt_id']
+    resolved = usage.resolve_read(receipt_id, stage=Stage.TEST,
+                                  skill='design', section='evidence')
+    assert resolved['receipt_id'] == receipt_id
+    assert resolved['section'] is None
+    with pytest.raises(ValueError, match='unknown section'):
+        usage.resolve_read(receipt_id, stage=Stage.TEST,
+                           skill='design', section='does-not-exist')
     usage.cite('design', 'evidence', 'decision')
 
 
