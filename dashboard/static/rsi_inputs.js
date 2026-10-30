@@ -79,6 +79,16 @@
       });
     }
   }
+  function moveExecution(previous, value) {
+    const configurations = payload.project_configs;
+    if (!configurations || previous === value || !Object.hasOwn(configurations, previous)) return;
+    const execution = configurations[previous];
+    const shared = [payload.phase1_projects || [], payload.phase2_projects || []]
+      .some(rows => rows.some(project => project.project_id === previous));
+    configurations[value] = shared ? copy(execution) : execution;
+    if (!shared) delete configurations[previous];
+    return configurations[value];
+  }
   const trainingLists = () => [payload.phase1_projects || [], payload.phase2_projects || []];
   const referenced = id => trainingLists().some(rows => rows.some(row => row.project_id === id));
   function executionFields(card, project, execution) {
@@ -124,8 +134,7 @@
         if (!heldout && value !== project.project_id && Object.hasOwn(payload.project_configs, value)) throw new Error('execution ID exists');
       }, changed: (value, previous) => {
         if (!heldout && previous !== value) {
-          payload.project_configs[value] = referenced(previous) ? copy(execution) : execution;
-          if (!referenced(previous)) delete payload.project_configs[previous];
+          execution = moveExecution(previous, value) || execution;
         }
       }});
       for (const [key, title] of [['goal', 'Goal'], ['starting_folder', 'Starting folder'], ['repository_ref', 'Repository reference'],
@@ -135,7 +144,7 @@
           changed: value => { if (key === 'starting_folder') execution.source = value; }});
       }
       executionFields(card, project, execution);
-      project.budgets ||= copy(payload.budgets);
+      project.budgets ||= {};
       const detail = element('details'); detail.append(element('summary', 'Project budgets')); card.append(detail); budgets(detail, project.budgets);
       card.append(button('Remove project', () => {
         entries.splice(index, 1);
