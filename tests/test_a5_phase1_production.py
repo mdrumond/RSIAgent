@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from canonical_kernel_fixtures import canonical_kernel
+from test_rsi_production_domain_bindings import CanonicalSession
+
 import run_a5_phase1
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
@@ -26,7 +29,7 @@ from benchmarks.a5kernels.phase1_production import (
     load_direct_environment,
 )
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
+from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider, DISTILLATION_PROMPT
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.production import ProductionPaths
@@ -205,7 +208,7 @@ def test_dependency_builder_fails_closed_then_wires_read_only_kdb(tmp_path):
     ],
 )
 def test_executor_binds_direct_model_and_profiling_treatment(
-    tmp_path, model, profiling, guidance, proposal, expected_commands,
+    tmp_path, canonical_kernel, monkeypatch, model, profiling, guidance, proposal, expected_commands,
 ):
     guidance_payload = f"Profiling treatment supplied for {tmp_path}"
     guidance = guidance_payload if guidance is not None else None
@@ -219,42 +222,47 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         and cell.knowledge is KnowledgeMode.WITHOUT_KDB
         and cell.profiling is profiling
     )
-    replies = iter([
-        json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
-        '{"run":{}}',
-        '{"request-profile":{}}',
-        '{"submit":{}}',
-    ])
+    from coding.pi.actor import PiActorDriver
+    from rsi.domain_bindings import kernel_adoption
+    case = canonical_kernel
+    # Production's constructor factory receives a genuine configured baseline;
+    # the treatment's experience KnowledgeAgent stays disabled below.
+    monkeypatch.setattr('benchmarks.a5kernels.phase1_production.PiActorDriver',
+        lambda *args, **kwargs: PiActorDriver(*args, **dict(kwargs,
+            canonical=kernel_adoption(baseline_query=case.baseline_query))))
+    case.session.initial = case.session.repaired = SOURCE
+    def select(context, allowed):
+        action = CanonicalSession.next_action(case.session, context, allowed)
+        if guidance is not None and action[0] == 'optimisation_decision':
+            return 'optimisation_decision', dict(action='profile', reason='Measure verified current source')
+        return action
+    case.select = select
     provider_calls = []
-
     def transport(**kwargs):
         provider_calls.append(kwargs)
-        try:
-            response = next(replies)
-        except StopIteration:
-            prompt = kwargs["request"]["messages"][-1]["content"]
-            context = json.loads(prompt.rsplit("\n", 1)[-1])
-            admitted = context["admitted_artifacts"]
-            performance = [digest for digest, role in admitted.items()
-                           if role == "performance-study"]
-            category = "performance" if performance else "correctness"
-            evidence = performance[0] if performance else next(
-                digest for digest, role in admitted.items()
-                if role == "host-verification")
-            response = json.dumps({"distillation": {
-                "no_new_knowledge": False,
-                "lessons": [{
-                    "category": category,
-                    "claim": "The retained study supports this bounded lesson.",
-                    "applicability": "The exact registered vector-add dimensions.",
-                    "preconditions": "Use the retained source and host contract.",
-                    "limitations": "This does not generalize to other shapes.",
-                    "evidence_artifact_sha256": [evidence],
-                    "failure_signature": None,
-                    "repair": None,
-                    "confidence": "high",
-                }],
-            }})
+        prompt = kwargs["request"]["messages"][-1]["content"]
+        context = json.loads(prompt.rsplit("\n", 1)[-1])
+        admitted = context["admitted_artifacts"]
+        performance = [digest for digest, role in admitted.items()
+                       if role == "performance-study"]
+        category = "performance" if performance else "correctness"
+        evidence = performance[0] if performance else next(
+            digest for digest, role in admitted.items()
+            if role == "host-verification")
+        response = json.dumps({"distillation": {
+            "no_new_knowledge": False,
+            "lessons": [{
+                "category": category,
+                "claim": "The retained study supports this bounded lesson.",
+                "applicability": "The exact registered vector-add dimensions.",
+                "preconditions": "Use the retained source and host contract.",
+                "limitations": "This does not generalize to other shapes.",
+                "evidence_artifact_sha256": [evidence],
+                "failure_signature": None,
+                "repair": None,
+                "confidence": "high",
+            }],
+        }})
         return DirectCompletion(response, 2)
 
     profile_backend = TrialProfileBackend()
@@ -311,25 +319,18 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
-    prior_messages = provider_calls[-2]["request"]["messages"]
-    # Coding uses typed tools, while distillation keeps its noncoding contract.
-    # Both stages must receive the same original project task.
-    assert distillation_messages[1] == prior_messages[1]
-    assert distillation_messages[0]["role"] == prior_messages[0]["role"] == "system"
-    host_prefix = "Host-owned current state:\n"
-    def host_state(messages):
-        states = [json.loads(message["content"].removeprefix(host_prefix))
-                  for message in messages if message["content"].startswith(host_prefix)]
-        assert len(states) == 1
-        return states[0]
-    submitted_state = host_state(distillation_messages)
-    assert submitted_state["submitted"] == {"passed": True}
-    assert submitted_state["source_sha256"] == hashlib.sha256(SOURCE.encode()).hexdigest()
-    # Pi history is not replayed into the noncoding distiller. The latest
-    # authoritative observation and admitted evidence remain available.
-    submitted = json.loads(distillation_messages[-2]["content"])["host"]
-    assert submitted["event"] == "submitted" and submitted["passed"] is True
-    assert len(bytes.fromhex(submitted["attestation_sha256"])) == 32
+    presented = [context['task']['domain']['instruction'] for context in case.contexts]
+    assert any(message['role'] == 'user' and message['content'] in presented
+               for message in distillation_messages)
+    terminal = next(message for message in distillation_messages
+                    if message['content'].startswith(DISTILLATION_PROMPT))
+    context = json.loads(terminal['content'].rsplit('\n', 1)[-1])
+    assert context['workflow_history'][-1]['passed'] is True
+    assert case.runner.workflow.outcome == 'accepted'
+    assert case.runner.backend.host.actions.final_run.verified.passed
+    submitted = case.runner.backend.host.actions.final_run.verified
+    assert submitted.source_fingerprint == case.runner.backend.host.actions.final_run.plan.source_fingerprint
+    assert len(bytes.fromhex(submitted.attestation_sha256)) == 32
     attempt = next(memory_path.glob("provider-attempts/attempt-*"))
     artifacts = ContentAddressedArtifacts(attempt / "artifacts")
     retained_requests = [artifacts.read_json(entry.payload["sha256"])
@@ -339,7 +340,7 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     if expected_category == "performance":
         study = next(
             digest for digest in memory.admitted_artifact_sha256
-            if digest in distillation_messages[-1]["content"]
+            if digest in terminal["content"]
             and memory.lessons[0].evidence_artifact_sha256 == (digest,)
         )
         retained = ContentAddressedArtifacts(
@@ -347,9 +348,20 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         )
         study_payload = retained.read_json(study)
         assert study_payload["timing"]
-        context = json.loads(distillation_messages[-1]["content"].rsplit("\n", 1)[-1])
-        assert context["artifact_payloads"][study]["payload"] == study_payload
-        assert context["host_summaries"][0]["category"] == "host-verification"
+        context = json.loads(terminal["content"].rsplit("\n", 1)[-1])
+        payload = context["artifact_payloads"][study]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert payload == study_payload
+        summaries = []
+        for message in distillation_messages:
+            try:
+                value = json.loads(message['content'])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict) and 'host_summary' in value:
+                summaries.append(value['host_summary'])
+        assert any(row['category'] == 'host-verification' for row in summaries)
 
 
 def test_project_executes_registered_logical_and_padded_dimensions(tmp_path):

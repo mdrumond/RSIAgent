@@ -258,11 +258,7 @@ def knowledge_query(config, directory):
 
 
 def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
-    from .agent import OptimizerAgent
-    from .loop import OptimizationLoop
-    from .provider import BoundedAgent
-    from benchmarks.a3_experiments import BackendModel
-    from benchmarks.ascend.execution import apply_worker_config, execution_mode, preflight_local
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode, local_identity, preflight_local
     config = apply_worker_config(config)
     is_local = execution_mode(config) == 'local'
     if is_local and transport_factory is not None:
@@ -287,8 +283,23 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
         identity['guide_sha256'] = sha(guide.encode())
         identity['max_cases'] = config.get('max_cases', 24)
         identity['knowledge'] = config.get('knowledge')
+        stopping = store.get(job_id)['stop_requested']
+        previous = next((event['payload'] for event in reversed(store.events(job_id))
+                         if event['kind'] == 'worker-configuration'), None)
         if is_local:
-            identity.update(preflight_local(config))
+            if stopping:
+                # Cleanup must not launch a new runtime probe. Validate the
+                # host/config identity, retaining previously probed metadata.
+                local = local_identity(config)
+                if previous is not None:
+                    if not local['cann_version']:
+                        local['cann_version'] = previous.get('cann_version', '')
+                    for key in ('compiler_version', 'profiler_version', 'torch_version', 'product'):
+                        if key in previous:
+                            identity[key] = previous[key]
+                identity.update(local)
+            else:
+                identity.update(preflight_local(config))
         # Separate custom execution routes from the default on resume. The
         # caller pins a versioned identity; callable names are not stable IDs.
         if transport_factory is not None:
@@ -297,18 +308,20 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
         if 'profiling' in config:
             from .profile_policy import policy
             identity['profiling'] = policy(config['profiling'])
-        previous = next((event['payload'] for event in store.events(job_id)
-                         if event['kind'] == 'worker-configuration'), None)
-        if previous is not None and previous != identity:
+        # A first invocation may only perform local cleanup. Its identity has
+        # no device probe metadata yet; a later active resume adds that evidence.
+        unprobed_local = (is_local and not stopping and previous is not None
+                          and 'compiler_version' not in previous)
+        compared = ({key: identity.get(key) for key in previous}
+                    if unprobed_local else identity)
+        if unprobed_local and not previous.get('cann_version'):
+            compared['cann_version'] = previous.get('cann_version')
+        if previous is not None and previous != compared:
             raise ValueError('worker runtime, device, workspace or guide changed on resume')
-        if previous is None:
+        if previous is None or unprobed_local:
             store.add_event(job_id, 'worker-configuration', identity)
-        agent = agent or OptimizerAgent(guide=guide,
-                                        model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
         backend = (LocalBackend(store, job_id, config) if is_local else
                    RemoteBackend(store, job_id, config, transport_factory=transport_factory))
-        agent = BoundedAgent(agent, deadline=backend.deadline,
-                             stopped=lambda: store.get(job_id)['stop_requested'])
         store.add_event(job_id, 'worker-started', {'pid': os.getpid(), 'profile': config['profile'], 'device': config['physical_device']})
         try:
             if store.get(job_id)['stop_requested']:
@@ -316,6 +329,17 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
                 # retained operations before the loop can mark the job stopped.
                 for marker in sorted((directory / 'execution').rglob('transport.json')):
                     backend.transport.cancel_pending(marker.parent)
+                if store.get(job_id)['status'] in {'queued', 'running'}:
+                    store.transition(job_id, 'stopped')
+                return store.get(job_id)
+            from .agent import OptimizerAgent
+            from .loop import OptimizationLoop
+            from .provider import BoundedAgent
+            from benchmarks.a3_experiments import BackendModel
+            agent = agent or OptimizerAgent(guide=guide,
+                                            model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
+            agent = BoundedAgent(agent, deadline=backend.deadline,
+                                 stopped=lambda: store.get(job_id)['stop_requested'])
             return OptimizationLoop(store, job_id, agent, backend,
                                     knowledge=knowledge_query(config, directory),
                                     max_cases=config.get('max_cases', 24)).run()

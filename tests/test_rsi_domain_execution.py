@@ -440,3 +440,29 @@ def test_domain_refresh_supersedes_inflight_host_action_after_actual_feedback_re
     assert contexts[-1]['task']['domain']['feedback'][0]['feedback_id'] == sent[0]['id']
     assert host.calls.count(Stage.TEST) == 2  # Original numeric failure plus genuine repair.
     assert len([row for row in result['history'] if row.get('evidence', {}).get('operation_id') == operation]) == 1
+
+
+def test_context_budget_error_retains_typed_abort_and_durable_closure_before_transport_or_host(tmp_path):
+    from benchmarks.ascend.agent_context import ContextBudget, ContextBudgetError
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    runner,host,session,_,_=make(tmp_path)
+    profile=direct_profile(MODEL_IDENTITIES[0])
+    transports=[]
+    def transport(**kwargs):
+        transports.append(kwargs)
+        pytest.fail('oversized request reached transport')
+    provider=DirectCompletionProvider({'OPENAI_API_KEY':'CPU-only','DEEPSEEK_API_KEY':'CPU-only'},
+        transport=transport,context_budgets={profile.identity.backend_model.value:ContextBudget(5000,3500,6000)})
+    def decision(context,allowed,**kwargs):
+        provider.complete(profile,[dict(role='user',content='oversized frozen input '*1000)])
+    session.next_action=decision
+    with pytest.raises(ContextBudgetError):runner.run()
+    assert transports==[] and host.calls==[]
+    assert runner.workflow.pending['stage']=='task_construction'
+    assert any(row['type']=='project-failure' and row['classification']=='context_budget_exhausted'
+               for row in runner.events)
+    outcome=runner.store.read_json(runner.latest('project-run-outcome')['reference'])
+    assert outcome['result']['classification']=='context_budget_exhausted'
+    assert outcome['closure_ref']
+    assert runner.store.read_json(outcome['closure_ref'])['observation']['provider_settled'] is True
