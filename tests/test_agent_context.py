@@ -2,10 +2,12 @@ import json
 
 import pytest
 
+from canonical_kernel_fixtures import canonical_kernel
+from test_rsi_production_domain_bindings import CanonicalSession
+
 from benchmarks.ascend.agent_context import ContextBudget, ContextBudgetError, WorkingContext, request_bytes
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletion, DirectCompletionProvider, direct_profile
-from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
 
 
 ENV = {"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"}
@@ -61,41 +63,34 @@ def test_impossible_fixed_task_never_calls_summarizer():
                         lambda _: pytest.fail("cannot summarize away task"))
 
 
-def test_actor_compaction_usage_requests_raw_trace_and_distillation(tmp_path):
-    calls, events = [], []
-    action_count = 0
-    def transport(**kw):
-        nonlocal action_count
-        messages = kw["request"]["messages"]
-        calls.append(kw["request"])
-        if messages[0]["content"].startswith("Update a compact working log"):
-            return DirectCompletion("Remember repair and source hashes; verify with host.", 7)
-        if "The host has now returned" in messages[-1]["content"]:
-            return DirectCompletion('{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 2)
-        action_count += 1
-        return DirectCompletion('{"submit":{}}' if action_count == 8 else '{"run":{}}', 2)
-    provider = DirectCompletionProvider(ENV, transport=transport,
-        context_budgets={MODEL_IDENTITIES[0].backend_model.value: BUDGET})
-    actor = DirectActorDriver(provider, max_turns=8, system_prompt="system",
-        trace_event=lambda kind, payload: events.append((kind, payload))).with_trace(
-            lambda kind, payload: events.append((kind, payload)))
-    workspace = tmp_path / "project/actor"
-    workspace.mkdir(parents=True)
-    def execute(action):
-        return ActionOutcome(json.dumps({"host": {"event": "host-run", "passed": False,
-            "source_sha256": "a" * 64, "detail": "diagnostic" * 100}}), terminal=action.kind == "submit")
-    outcome = actor("task", profile=direct_profile(MODEL_IDENTITIES[0]), workspace=workspace,
-                    context=None, turn_parser=parse_trial_action, action_executor=execute)
-    assert outcome.iterations == 8
-    assert outcome.tokens > 16
-    result = actor.distill(outcome)
-    assert result.iterations == 8 and result.tokens > outcome.tokens
-    request_events = [p["request"] for kind, p in events if kind == "tool" and p["name"] == "provider-request"]
-    assert request_events == calls
-    assert all(request_bytes(call) <= BUDGET.hard for call in calls)
-    assert sum(kind == "message" and p["role"] == "assistant" for kind, p in events) == 9
-    assert any(kind == "tool" and p["name"] == "context-compaction" for kind, p in events)
-    assert "compaction" in (tmp_path / "project/evidence.jsonl").read_text()
+def test_actor_compaction_usage_requests_raw_trace_and_distillation(canonical_kernel):
+    case = canonical_kernel
+    case.enable_native()
+    # Repeated evidence pages force the actual Pi history to compact; Python
+    # never edits that history or substitutes host verification with a summary.
+    digest = case.actions.artifacts.put_bytes(('retained compiler diagnostic\n' * 150).encode())
+    reads = []
+    def select(context, allowed):
+        if context['stage'] == 'task_construction' and not context['unread_skills'] and len(reads) < 9:
+            reads.append(digest)
+            return 'read_artifact', dict(sha256=digest)
+        return CanonicalSession.next_action(case.session, context, allowed)
+    case.select = select
+    case.provider._transport = lambda **_: DirectCompletion(
+        '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 2)
+    outcome = case.run(case.make_driver('pi'))
+    assert outcome.status == 'host-verified'
+    summaries = [wire for wire in case.wires if not wire.get('tools')]
+    assert summaries and len(reads) == 9
+    assert all(request_bytes(wire) <= 48 * 1024 for wire in case.wires)
+    retained = [event['request'] for event in case.runner.events if event['type'] == 'pi-provider-request']
+    assert retained == case.wires
+    native = [event['event'] for event in case.runner.events if event['type'] == 'pi-native-event']
+    assert any(event.get('successful') for event in native)
+    calls = list(case.calls)
+    learned = case.driver.distill(outcome)
+    assert learned.distillation is not None and learned.tokens == 2
+    assert case.calls == calls and case.actions.latest.evidence.verified
 
 
 def test_compaction_transport_failure_is_explicit_noninfra(tmp_path):
@@ -110,7 +105,7 @@ def test_compaction_transport_failure_is_explicit_noninfra(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["compaction", "distillation"])
-def test_provider_retry_preserves_compaction_and_distillation_requests(tmp_path, stage):
+def test_provider_retry_preserves_compaction_and_distillation_requests(tmp_path, canonical_kernel, stage):
     from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
     calls, actions, delays = [], [], []
     class Rejected(Exception):
@@ -138,14 +133,20 @@ def test_provider_retry_preserves_compaction_and_distillation_requests(tmp_path,
         working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
         actor._prepare_context(working, profile, _ProviderEvidenceRecorder(workspace), turn=3)
     else:
-        def execute(action):
-            actions.append(action.kind)
-            return ActionOutcome('{"host":{"event":"done"}}', terminal=True)
-        outcome = actor("task", profile=profile, workspace=workspace, context=None,
-            turn_parser=parse_trial_action, action_executor=execute)
+        case = canonical_kernel
+        case.provider = provider
+        actor = DirectActorDriver(provider, system_prompt="kernel actions",
+            clock=lambda: case.now, max_seconds=3600)
+        outcome = case.run(actor)
+        assert outcome.status == 'host-verified'
+        actions.extend(case.calls)
         actor.distill(outcome)
+        assert case.calls == actions
     assert delays == [120] and stage_calls[0] == stage_calls[1]
-    assert actions == ([] if stage == "compaction" else ["submit"])
+    if stage == "compaction":
+        assert not actions
+    else:
+        assert actions.count("run") >= 2
     rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
     stage_rows = [row for row in rows if row.get("stage") == stage]
     requests = [row for row in stage_rows if row["role"] == "provider-request"]
@@ -154,25 +155,31 @@ def test_provider_retry_preserves_compaction_and_distillation_requests(tmp_path,
     assert sum(row["role"] == "provider-attempt-rejection" for row in stage_rows) == 1
 
 
-def test_distillation_large_host_data_and_correction_are_bounded(tmp_path):
-    calls = []
+def test_distillation_large_host_data_and_correction_are_bounded(canonical_kernel):
+    case = canonical_kernel
+    case.profile = direct_profile(MODEL_IDENTITIES[1])
+    calls, distill_calls, usage = [], [], []
     def transport(**kw):
-        calls.append(kw["request"])
-        if len(calls) == 1:
-            return DirectCompletion('{"submit":{}}', 1)
-        if len(calls) == 2:
-            return DirectCompletion("invalid distillation", 1)
-        return DirectCompletion('{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
-    provider = DirectCompletionProvider(ENV, transport=transport)
-    events = []
-    actor = DirectActorDriver(provider, trace_event=lambda kind, payload: events.append((kind, payload)))
-    workspace = tmp_path / "project/actor"
-    workspace.mkdir(parents=True)
-    outcome = actor("task", profile=direct_profile(MODEL_IDENTITIES[1]), workspace=workspace,
-        context=None, turn_parser=parse_trial_action,
-        action_executor=lambda _: ActionOutcome('{"host":{"event":"done"}}', terminal=True))
-    result = actor.distill(outcome, host_summaries=[{"tensor": list(range(10000))}] * 16)
-    assert result.tokens == 3
+        request = kw['request']
+        calls.append(request)
+        if request['messages'][0]['content'].startswith('Update a compact working log'):
+            usage.append(7)
+            return DirectCompletion('Retain source identity and actual host facts.', 7)
+        distill_calls.append(request)
+        usage.append(1)
+        return DirectCompletion('invalid distillation' if len(distill_calls) == 1 else
+            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
+    case.provider = DirectCompletionProvider(ENV, transport=transport,
+        context_budgets={case.profile.identity.backend_model.value:
+                         ContextBudget(44 * 1024, 32 * 1024, 48 * 1024)})
+    actor = case.make_driver()
+    outcome = case.run(actor)
+    assert outcome.status == 'host-verified'
+    host_calls = list(case.calls)
+    result = actor.distill(outcome, host_summaries=[{'tensor': list(range(10000))}] * 16)
+    assert result.distillation is not None and len(distill_calls) == 2
+    assert result.tokens == sum(usage)
+    assert case.calls == host_calls and case.actions.latest.evidence.verified
     assert all(request_bytes(call) <= 48 * 1024 for call in calls)
 
 
@@ -194,61 +201,102 @@ def test_legacy_written_and_run_observations_pin_only_current_candidate():
     assert "run" not in working.host_state
 
 
-def test_distillation_schema_and_citation_map_survive_correction_compaction(tmp_path):
-    calls, distill_calls = [], []
-    def transport(**kw):
-        request = kw["request"]
-        calls.append(request)
-        if request["messages"][0]["content"].startswith("Update a compact working log"):
-            return DirectCompletion("Retain host verification and citation identity.", 7)
-        if len(calls) == 1:
-            return DirectCompletion('{"submit":{}}', 1)
-        distill_calls.append(request)
-        return DirectCompletion("x" * 3500 if len(distill_calls) == 1 else
-            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
-    profile = direct_profile(MODEL_IDENTITIES[0])
-    provider = DirectCompletionProvider(ENV, transport=transport,
-        context_budgets={profile.identity.backend_model.value: BUDGET})
-    actor = DirectActorDriver(provider, system_prompt="kernel actions only")
-    workspace = tmp_path / "project/actor"
-    workspace.mkdir(parents=True)
-    outcome = actor("task", profile=profile, workspace=workspace, context=None,
-        turn_parser=parse_trial_action, action_executor=lambda _: ActionOutcome(
-            json.dumps({"host": {"event": "done", "detail": "terminal" * 10}}), terminal=True,
-            admitted_artifacts={"a" * 64: "host-verification"}))
-    outcome.continuation.working_context.recent[:0] = [
-        {"role": "assistant", "content": "old repair" * 40},
-        {"role": "user", "content": "old diagnostic" * 40},
-    ]
-    actor.distill(outcome)
-    assert len(distill_calls) == 2
-    for request in distill_calls:
-        text = json.dumps(request)
-        assert "no_new_knowledge" in text and "a" * 64 in text
-
-
-def test_distillation_infrastructure_failure_retains_summary_usage(tmp_path):
+def test_distillation_schema_and_citation_map_survive_correction_compaction(canonical_kernel):
+    case = canonical_kernel
     calls = []
     def transport(**kw):
-        calls.append(kw["request"])
-        if len(calls) == 1:
-            return DirectCompletion('{"submit":{}}', 1)
-        if kw["request"]["messages"][0]["content"].startswith("Update a compact working log"):
-            return DirectCompletion("Host terminal result retained.", 7)
+        request = kw['request']
+        calls.append(request)
+        if request['messages'][0]['content'].startswith('Update a compact working log'):
+            return DirectCompletion('Retain host verification and citation identity.', 7)
+        return DirectCompletion('x' * 3500 if len(distill_calls) == 0 else
+            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
+    distill_calls = []
+    def observed_transport(**kw):
+        result = transport(**kw)
+        if not kw['request']['messages'][0]['content'].startswith('Update a compact working log'):
+            distill_calls.append(kw['request'])
+        return result
+    profile = case.profile
+    case.provider = DirectCompletionProvider(ENV, transport=observed_transport,
+        context_budgets={profile.identity.backend_model.value: BUDGET})
+    actor = DirectActorDriver(case.provider, system_prompt="kernel actions only",
+        clock=lambda: case.now, max_seconds=3600)
+    outcome = case.run(actor)
+    assert outcome.status == 'host-verified'
+    admitted = dict(outcome.admitted_artifacts)
+    verified = next(ref for ref, role in admitted.items() if role == 'host-verification')
+    calls_before = list(case.calls)
+    learned = actor.distill(outcome)
+    assert learned.distillation.no_new_knowledge and len(distill_calls) == 2
+    assert case.calls == calls_before
+    for request in distill_calls:
+        # The same actual host artifact remains available after correcting the model.
+        assert any(verified in message['content'] for message in request['messages'])
+        assert request_bytes(request) <= BUDGET.hard
+    assert case.runner.store.read_bytes(verified)
+
+
+def test_distillation_infrastructure_failure_retains_summary_usage(canonical_kernel):
+    case = canonical_kernel
+    case.enable_native()
+    ref = case.actions.artifacts.put_bytes(('retained host diagnostic\n' * 150).encode())
+    reads = []
+    def select(context, allowed):
+        if context['stage'] == 'task_construction' and not context['unread_skills'] and len(reads) < 9:
+            reads.append(ref)
+            return 'read_artifact', dict(sha256=ref)
+        return CanonicalSession.next_action(case.session, context, allowed)
+    case.select = select
+    outcome = case.run(case.make_driver('pi'))
+    assert outcome.status == 'host-verified'
+    assert any(not wire.get('tools') for wire in case.wires)
+    ledgers = [row for row in case.runner.events if row['type'] == 'pi-provider']
+    pi_tokens = sum(row.get('usage', {}).get('completion_tokens', 0) for row in ledgers)
+    assert pi_tokens > 0
+    calls = list(case.calls)
+    requests, summary_usage = [], []
+    summary = 'Retain the verified source and exact host evidence references.'
+    def failed_transport(**kwargs):
+        request = kwargs['request']
+        requests.append(request)
+        if request['messages'][0]['content'].startswith('Update a compact working log'):
+            summary_usage.append(7)
+            return DirectCompletion(summary, 7)
         raise TimeoutError()
-    profile = direct_profile(MODEL_IDENTITIES[0])
-    provider = DirectCompletionProvider(ENV, transport=transport,
-        context_budgets={profile.identity.backend_model.value: ContextBudget(5000, 3500, 15000)})
-    actor = DirectActorDriver(provider, system_prompt="system")
-    workspace = tmp_path / "project/actor"
-    workspace.mkdir(parents=True)
-    outcome = actor("task", profile=profile, workspace=workspace, context=None,
-        turn_parser=parse_trial_action, action_executor=lambda _: ActionOutcome(
-            json.dumps({"host": {"event": "done", "detail": "x" * 2400}}), terminal=True))
-    # Additional earlier exchange forces a successful work-log update before timeout.
-    outcome.continuation.working_context.recent.insert(0, {"role": "user", "content": "old repair" * 30})
-    result = actor.distill(outcome)
-    assert result.tokens >= 8
+    case.provider._transport = failed_transport
+    # Compact early, while retaining the native terminal schema/citation cap.
+    terminal_budget = ContextBudget(BUDGET.high, BUDGET.target, 48 * 1024)
+    case.provider.context_budgets[case.profile.identity.backend_model.value] = terminal_budget
+    learned = case.driver.distill(outcome,
+        host_summaries=[{'detail': 'retained host diagnostic ' * 30, 'page': page}
+                        for page in range(8)])
+    assert learned.status == 'host-verified'
+    assert summary_usage and len(requests) == len(summary_usage) + 1
+    assert all(request_bytes(request) <= terminal_budget.hard for request in requests)
+    assert requests[-1]['messages'][0]['content'] == case.driver.system_prompt
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    records = [json.loads(line)['payload'] for line in
+               (case.workspace.parent / 'evidence.jsonl').read_text().splitlines()]
+    summaries = [row for row in records if row.get('stage') == 'compaction'
+                 and row.get('role') == 'provider-response']
+    artifacts = ContentAddressedArtifacts(case.workspace.parent / 'artifacts')
+    assert len(summaries) == len(summary_usage)
+    assert all(artifacts.read_bytes(row['sha256']) == summary.encode() for row in summaries)
+    assert learned.tokens == sum(summary_usage)
+    assert learned.terminal_response is None and learned.distillation is None
+    assert learned.distillation_failure is not None
+    proof = case.runner.store.read_json(learned.distillation_failure)
+    assert proof == dict(kind='domain-distillation-failure-v1',
+        exception_type='InfrastructureFailure', source_hash=case.runner.backend.project_hash(),
+        contract_ref=case.runner.contract_ref, host_outcome='host-verified')
+    assert any(row['type'] == 'domain-distillation-failure'
+               and row['reference'] == learned.distillation_failure for row in case.runner.events)
+    assert [row for row in case.runner.events if row['type'] == 'pi-provider'] == ledgers
+    retained_pi_tokens = sum(row.get('usage', {}).get('completion_tokens', 0)
+                             for row in case.runner.events if row['type'] == 'pi-provider')
+    assert retained_pi_tokens + learned.tokens == pi_tokens + sum(summary_usage)
+    assert case.calls == calls and case.actions.latest.evidence.verified
 
 
 def test_recorded_oversized_work_log_corrects_from_original_input():

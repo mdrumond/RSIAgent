@@ -189,24 +189,17 @@ def a3_test_adoption(session, baseline):
     from dataclasses import asdict
     import json
     from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
-    from rsi.domain_bindings import A3Host, a3_adoption
+    from rsi.domain_bindings import a3_adoption
     def query(payload):
         rows = baseline.query(KnowledgeQuery(payload['query'], payload.get('limit', 5)))
         return dict(results=[asdict(row) for row in rows], negative_records=[],
                     provenance=dict(manifest=json.loads(baseline.manifest.to_json())))
     query.canonical_identity = lambda: dict(manifest=json.loads(baseline.manifest.to_json()))
-    adoption = a3_adoption(baseline_query=query)
+    options = dict(baseline_query=query, session_factory=lambda: session, test_backend=True)
+    adoption = a3_adoption(**options)
     def build(owner, **inputs):
-        host = A3Host(owner, baseline_query=query)
-        bundle, limits = baseline_contract(owner, owner.budgets.max_seconds)
-        spec = ProjectSpec(owner.proposal.project_id, host.instruction, ('A3-host-candidate',), budgets=limits)
-        directory = owner.workdir / 'canonical'
-        injections = dict(query=host.query, backend_identity=fingerprint(host.identity),
-            session_factory=lambda: session, test_backend=True, clock=owner.clock)
-        if (directory / 'domain.json').exists():
-            return DomainRunner(directory, host, **injections)
-        return DomainRunner.create(directory, spec, bundle, host, **injections)
-    return CanonicalAdoption(build, adoption.finish)
+        return a3_adoption(**options, clock=owner.clock).build(owner, **inputs)
+    return CanonicalAdoption(build, adoption.finish, adoption.distill)
 
 
 def a3_knowledge(root, *, enabled, collection):

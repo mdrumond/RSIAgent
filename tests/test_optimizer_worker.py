@@ -441,6 +441,7 @@ def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_pat
             return {'status': 'available'}
     backend = LostProfile()
     agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast'), {'action': 'finish', 'summary': ''}])
+    agent.canonical_fixture = True
     agent.profile = True
     loop = OptimizationLoop(store, job, agent, backend)
     with pytest.raises(ObservationUnavailable, match='pending exact handle'):
@@ -522,7 +523,9 @@ def test_final_reserved_profile_respects_stop_and_elapsed_deadline(tmp_path, bou
                 store.account_time(job, 10)
             return result
     backend = BoundBackend()
-    OptimizationLoop(store, job, Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
+    agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')])
+    agent.canonical_fixture = True
+    OptimizationLoop(store, job, agent, backend).run()
     assert backend.profiles == []
 
 
