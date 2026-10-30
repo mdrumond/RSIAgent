@@ -139,8 +139,24 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
     actions = iter(actual_reads+[('perform', {'proposal':'construct'})])
     def provider(*_, **kwargs):
         calls.append(json.loads(kwargs['data']))
-        name, args = next(actions)
-        return stream(name, args, len(calls))
+        action = next(actions, None)
+        if action is not None:
+            return stream(*action, len(calls))
+        # Native Pi reports the unavailable tool and asks the provider again.
+        # End that request without selecting another action; do not fake a read.
+        response = stream('perform', {}, len(calls), finish='stop')
+        original = response.iter_lines
+        def lines():
+            for line in original():
+                if line.startswith(b'data: {'):
+                    body = json.loads(line[6:])
+                    delta = body['choices'][0]['delta']
+                    if delta.pop('tool_calls', None):
+                        delta['content'] = 'No further action selected.'
+                    line = b'data: ' + json.dumps(body).encode()
+                yield line
+        response.iter_lines = lines
+        return response
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     flow = Workflow(tmp_path/'state.json', lambda *_: False, source_hash='v1')
     actor = WorkflowActor(flow, builtin_bundle(),
@@ -152,11 +168,11 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
         if read_all:
             actor.step({'goal':'write Python'})
         else:
-            from coding.pi.rpc import PiError
-            with pytest.raises((WorkflowError, PiError)):
+            from coding.pi.session import ActionError
+            with pytest.raises(ActionError):
                 actor.step({'goal':'write Python'})
     finally: actor.close()
-    assert len(calls) == len(actual_reads)+1
+    assert len(calls) == len(actual_reads)+(1 if read_all else 2)
     if read_all:
         assert flow.stage == Stage.DESIGN and len(executed) == 1
         assert len(flow.state['history'][-1]['evidence']['skill_refs']) == 2
