@@ -66,7 +66,7 @@ def execute(args):
             raise ValueError('tuning guidance must not be blank')
         cycle, mode, ref = _project(args.instance, args.project)
         return jobs.start(args.instance, dict(action='tune', mode=mode, cycle_id=cycle,
-            project_ref=ref, user_guidance=args.guidance))
+            steering={'project_ref': ref, 'user_guidance': args.guidance}))
     values = dict(mapping=json.loads(args.file.read_text())) if args.skill_action == 'map' else dict(
         name=args.name, content=args.file.read_text())
     return update_skills(args.instance, expect_bundle=args.expect_bundle, **values)

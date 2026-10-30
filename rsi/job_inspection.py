@@ -42,7 +42,7 @@ def inspect_task(path, *, clock=time.time):
     result = dict(task_id=path.name, charged_seconds={k: category(k) for k in sorted(ActorClock.BILLABLE)},
         excluded_seconds={k: category(k) for k in sorted(ActorClock.EXCLUDED)},
         actor_union_seconds=union, remaining=remaining, accounting_state=condition,
-        intervals=intervals, timing_uncertainties=state.get('timing_uncertainties', {}),
+        intervals=intervals, clock_domain='controller', timing_uncertainties=state.get('timing_uncertainties', {}),
         source_hash=state['source'], stage=state['stage'])
     manifest = path / 'runner.json'
     if manifest.exists():

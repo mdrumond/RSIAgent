@@ -107,8 +107,27 @@ def test_manual_tune_resolves_retained_host_project_and_guidance(baseline, monke
         assert main(['--instance', str(root), 'skills', 'tune', '--project', value,
                      '--guidance', 'Avoid previous numeric cancellation']) == 0
     assert captured == [dict(action='tune', mode='phase2', cycle_id='application',
-        project_ref=reference, user_guidance='Avoid previous numeric cancellation')] * 2
+        steering={'project_ref': reference, 'user_guidance': 'Avoid previous numeric cancellation'})] * 2
     wrong = store.put_json(dict(root=str(task), operation_id='some-other-operation'))
     assert main(['--instance', str(root), 'skills', 'tune', '--project', wrong,
                  '--guidance', 'no invented receipts']) == 2
     assert len(captured) == 2
+
+
+def test_new_skill_can_be_added_then_mapped_without_changing_original(baseline):
+    root, original = baseline
+    content = '---\nname: numeric-proof\ndescription: Independent numeric evidence.\n---\n## Contract\nCheck Decimal.\n'
+    update_skills(root, name='numeric-proof', content=content)
+    mapping = original.to_dict()['mapping']
+    mapping['debug'].append('numeric-proof')
+    update_skills(root, mapping=mapping)
+    assert inspect_skills(root)['mapping']['debug'][-1] == 'numeric-proof'
+    assert len(original.documents) + 1 == len(inspect_skills(root)['documents'])
+
+
+def test_capability_discovery_enables_implemented_editor_and_tuning_routes(baseline, capsys):
+    root, _ = baseline
+    assert main(['--instance', str(root), 'capabilities']) == 0
+    capabilities = json.loads(capsys.readouterr().out)
+    assert capabilities['manual_tuning'] and capabilities['skill_content_editing']
+    assert capabilities['job_accounting']

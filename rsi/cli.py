@@ -35,6 +35,7 @@ def main(argv=None):
     register_jobs(commands)
     register_evidence(commands)
     register_skills(commands)
+    commands.add_parser("capabilities", help="discover supported instance interfaces")
     validate = commands.add_parser("validate-spec", help="validate and normalise a JSON specification")
     validate.add_argument("path", type=Path)
     validate.add_argument("--kind", choices=("cycle", "project"), default="cycle")
@@ -57,6 +58,10 @@ def main(argv=None):
             result = dispatch(args.instance, list(sys.argv[1:] if argv is None else argv))
             if result is not None:
                 return result
+        if args.command == "capabilities":
+            print(json.dumps(dict(manual_tuning=True, skill_content_editing=True,
+                                  skill_map_editing=True, job_accounting=True)))
+            return 0
         if args.command == "skills":
             print(json.dumps(execute_skills(args), indent=2, allow_nan=False))
             return 0

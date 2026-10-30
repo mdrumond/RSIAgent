@@ -130,7 +130,10 @@ class SkillBundle:
 
 def validate_metadata(bundle: SkillBundle) -> None:
     """Apply the same metadata contract to edited baselines and learned skills."""
-    import yaml  # Existing legacy dependency; keep ordinary skill reads dependency-free.
+    try:
+        import yaml  # Existing legacy dependency; ordinary reads remain dependency-free.
+    except ImportError as exc:
+        raise ValueError("Skill editing requires PyYAML from the existing rsi[legacy] environment") from exc
     for document in bundle.documents:
         header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)',
                           document.content, re.DOTALL)

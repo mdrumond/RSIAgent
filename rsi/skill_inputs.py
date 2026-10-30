@@ -46,9 +46,11 @@ def update_skills(instance, *, name=None, content=None, mapping=None, expect_bun
     if mapping is not None:
         bundle = SkillBundle(bundle.documents, tuple(_mapping(mapping).items()))
     else:
-        bundle.document(name)  # Editing a known baseline skill, never implicit removal.
         replacement = SkillDocument(name, content)
-        bundle = SkillBundle(tuple(replacement if d.name == name else d for d in bundle.documents), bundle.mapping)
+        documents = [replacement if d.name == name else d for d in bundle.documents]
+        if not any(d.name == name for d in bundle.documents):
+            documents.append(replacement)
+        bundle = SkillBundle(tuple(documents), bundle.mapping)
     validate_metadata(bundle)
     reference = ContentAddressedArtifacts(root / 'artifacts').put_json(bundle.to_dict())
     directory = config / 'skill-bundles' / reference
