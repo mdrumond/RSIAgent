@@ -283,6 +283,9 @@ def test_copy_consumes_wall_budget_but_not_actor_budget(tmp_path, monkeypatch):
         assert runner.workflow.remaining() == dict(actor_seconds=30., wall_seconds=0.)
         assert result['history'] == [] and result['pending'] is None
         assert session.calls == 0
+        proof = runner.terminal_failure_proof()
+        assert proof['actor_seconds_total'] == 0
+        assert proof['pending'] is None
     finally:
         database.close()
 
@@ -562,6 +565,9 @@ def test_repeated_malformed_actions_recover_until_original_actor_budget(tmp_path
         assert runner.workflow.accounting.seconds('thinking') == 6
         assert session.calls == 3 and result['pending']
         assert runner.workflow.outcome is None
+        proof = runner.terminal_failure_proof()
+        assert proof['classification'] == 'budget_exhausted' and proof['actor_seconds_total'] == 6
+        assert proof['pending'] == result['pending']
         feedback = [e for e in runner.events if e['type'] == 'actor-invalid-action']
         assert len(feedback) == 2 and all(e['accepted'] is False for e in feedback)
         assert not any(e['type'] == 'host-dispatch' for e in runner.events)
@@ -602,5 +608,187 @@ def test_malformed_model_arguments_and_missing_read_are_corrected_in_same_operat
         completed = [r for r in result['history'] if r.get('evidence', {}).get('operation_id')
                      == failures[0]['operation_id']]
         assert len(completed) == 1 and completed[0]['passed']
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('declared', [True, False])
+def test_generated_output_configuration_controls_source_identity(tmp_path, declared):
+    compile_script = (
+        "import py_compile; from pathlib import Path; "
+        "py_compile.compile('solution.py', doraise=True); "
+        "Path('results.json').write_text('{}'); "
+        "Path('build').mkdir(exist_ok=True); Path('build/coverage.json').write_text('{}')")
+    runner, injections, database = make(tmp_path,
+        source_text='from math import fsum\ndef solve(xs): return fsum(xs)\n',
+        config_overrides=dict(generated_paths=['results.json', 'build'] if declared else [],
+            commands={'compile': [sys.executable, '-c', compile_script],
+                      'test': [sys.executable, '{verifier}'],
+                      'validation': [sys.executable, '{verifier}']}))
+    try:
+        initial = runner.backend.project_hash()
+        result = runner.run()
+        assert (runner.backend.project / 'results.json').read_text() == '{}'
+        assert (runner.backend.project / 'build/coverage.json').read_text() == '{}'
+        assert runner.config.generated_paths == (('results.json', 'build') if declared else ())
+        if declared:
+            assert result['status'] == 'accepted', result
+            assert result['source_hash'] == initial
+            assert runner.backend.contract['generated_paths'] == ['build', 'results.json']
+            reopened = ProjectRunner(runner.root, **injections)
+            assert reopened.config.generated_paths == runner.config.generated_paths
+            assert reopened.backend.project_hash() == initial
+            (reopened.backend.project / 'unlisted.json').write_text('{}')
+            assert reopened.backend.project_hash() != initial
+        else:
+            assert result['status'] == 'suspended', result
+            assert result['source_hash'] != initial
+            assert runner.workflow.outcome is None
+            rows = runner.latest('command-results')['receipts']
+            assert rows[0]['classification'] == 'source_changed'
+            proof = runner.terminal_failure_proof()
+            assert proof['source_hash'] == result['source_hash']
+            assert proof['stage_initial_source'] == initial != proof['source_hash']
+    finally:
+        database.close()
+
+
+def failed_after_query(tmp_path, *, after_commands=False):
+    from coding.pi.rpc import PiDeadlineError
+    class Terminal(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if (context['stage'] == (Stage.DEBUG.value if after_commands else Stage.DESIGN.value)
+                    and (after_commands or any(r['name'] == 'query_kdb' for r in context['evidence']))):
+                raise PiDeadlineError('observed terminal provider deadline')
+            return super().next_action(context, allowed, **kwargs)
+    runner, injections, database = make(tmp_path, Terminal())
+    result = runner.run()
+    assert result['status'] == 'suspended' and result['actor_closure_ref']
+    return runner, injections, database, result
+
+
+@pytest.mark.parametrize('after_commands', [False, True])
+def test_terminal_failure_proof_preserves_pending_and_completed_effects(tmp_path, after_commands):
+    import json
+    runner, injections, database, result = failed_after_query(tmp_path, after_commands=after_commands)
+    try:
+        before_state = (runner.root / 'workflow.json').read_bytes()
+        before_index = runner.event_path.read_bytes()
+        before_objects = set(runner.store.objects.rglob('*'))
+        proof = runner.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
+        assert proof['outcome'] == 'failed' and proof['classification'] == 'provider_timeout'
+        assert proof['pending'] == result['pending']
+        assert proof['stage_completion_claim'] is False and proof['replay_allowed'] is False
+        assert proof['retrieval_receipts']
+        assert len(proof['command_receipts']) == (2 if after_commands else 0)
+        assert proof['actor_seconds_total'] == runner.workflow.accounting.seconds()
+        assert before_state == (runner.root / 'workflow.json').read_bytes()
+        assert before_index == runner.event_path.read_bytes()
+        assert before_objects == set(runner.store.objects.rglob('*'))
+        reopened = ProjectRunner(runner.root, **injections)
+        assert reopened.terminal_failure_proof() == proof
+        reopened.run()  # Observing the retained pending work never replays it.
+        assert reopened.terminal_failure_proof() == proof
+        assert reopened.workflow.outcome is None and reopened.workflow.pending == proof['pending']
+    finally:
+        database.close()
+
+
+def test_unobserved_restart_requires_explicit_terminal_observation(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, injections, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        runner.workflow.dispatched(operation, 'pi:actually-closed-test-session')
+        # The host observed this test session close; reopening alone has no receipt.
+        session = Session()
+        session.close()
+        reopened = ProjectRunner(runner.root, **injections)
+        result = reopened.run()
+        with pytest.raises(WorkflowError, match='closure receipt'):
+            reopened.terminal_failure_proof()
+        pending = dict(reopened.workflow.pending)
+        controller_proof = dict(handle=pending['handle'], actor_closed=True, provider_settled=True,
+            observation='Host observed the owned test session close without running commands/queries',
+            completed_query_refs=[])
+        reopened.record_terminal_observation(result, controller_proof=controller_proof,
+                                              observed_source_hash=reopened.backend.project_hash())
+        proof = reopened.terminal_failure_proof()
+        assert proof['pending'] == pending and reopened.workflow.pending == pending
+        assert proof['command_receipts'] == [] and proof['retrieval_receipts'] == []
+    finally:
+        database.close()
+
+
+def test_failure_proof_refuses_pending_execution_reservation(tmp_path, monkeypatch):
+    from rsi.runtime import WorkflowError
+    runner, _, database = make(tmp_path)
+    def disconnected(operation, *args, **kwargs):
+        runner.workflow.reserve_execution(operation)
+        raise WorkflowError('execution disconnected before receipt')
+    monkeypatch.setattr(runner.backend, 'run', disconnected)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended' and result['actor_closure_ref']
+        with pytest.raises(WorkflowError, match='complete receipt'):
+            runner.terminal_failure_proof()
+        assert runner.workflow.pending == result['pending']
+    finally:
+        database.close()
+
+
+def test_unknown_query_cannot_admit_failure(tmp_path):
+    from rsi.runtime import WorkflowError
+    def unavailable(_):
+        raise OSError('query lifecycle unknown')
+    runner, _, database = make(tmp_path, query=unavailable)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended'
+        with pytest.raises(WorkflowError, match='query'):
+            runner.terminal_failure_proof()
+    finally:
+        database.close()
+
+
+def test_failure_proof_refuses_changed_source_manifest_and_clock(tmp_path):
+    from rsi.runtime import WorkflowError
+    import json
+    runner, _, database, _ = failed_after_query(tmp_path)
+    try:
+        path = runner.backend.project / 'solution.py'
+        original = path.read_text()
+        path.write_text(original + '\n# unexplained change\n')
+        with pytest.raises(WorkflowError):
+            runner.terminal_failure_proof()
+        path.write_text(original)
+        manifest = runner.root / 'manifest.json'
+        original_manifest = manifest.read_bytes()
+        manifest.write_text(json.dumps({'contract': 'changed'}))
+        with pytest.raises(WorkflowError, match='manifest'):
+            runner.terminal_failure_proof()
+        manifest.write_bytes(original_manifest)
+        token = runner.workflow.accounting.start('execution')
+        with pytest.raises(WorkflowError):
+            runner.terminal_failure_proof()
+        runner.workflow.accounting.end(token)
+        assert runner.workflow.pending is not None
+    finally:
+        database.close()
+
+
+def test_unknown_session_close_does_not_certify_production_provider_settled(tmp_path):
+    from coding.pi.rpc import PiDeadlineError
+    from rsi.runtime import WorkflowError
+    class Unobserved(Session):
+        def next_action(self, *args, **kwargs):
+            raise PiDeadlineError('provider lifecycle unobserved')
+    runner, _, database = make(tmp_path, Unobserved(), test_backend=False)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended'
+        with pytest.raises(WorkflowError, match='closure was not observed'):
+            runner.terminal_failure_proof()
     finally:
         database.close()
