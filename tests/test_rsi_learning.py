@@ -10,6 +10,7 @@ from rsi.skills import builtin_bundle
 class Role:
     calls = 0
     proposal = None
+    receipt = {'role': 'skillwriter', 'success': True, 'elapsed_seconds': 2.0}
 
     def skillwriter(self, prompt, evidence, *, deadline):
         self.calls += 1
@@ -28,10 +29,11 @@ def env(tmp_path):
     def load(row):
         return packets[row['original_id']]
     suite = store.put_json({'host_suite': 'passed'})
-    def make(mode='phase2', validate=None):
+    def make(mode='phase2', validate=None, **kwargs):
         validate = validate or (lambda *args: Validation(True, True, suite))
         return Learning(tmp_path / 'learning.json', store, memory, role,
-                        load_project=load, validate=validate, mode=mode)
+                        load_project=load, validate=validate, mode=mode,
+                        role_elapsed=lambda op: role.receipt['elapsed_seconds'] if role.receipt else None, **kwargs)
     def project(name='p', recovery=False):
         ref = store.put_json({'result': 'numeric failure', 'project': name})
         packets[name] = dict(project_id=name, outcome='correctness_failure',
@@ -141,17 +143,17 @@ def test_remove_only_exact_fragment_after_unique_exposures(env):
     assert changed.read('contract') == builtin_bundle().document('debug').read('contract')
 
 
-def test_citation_is_not_observable_use_but_application_is(env):
+def test_negative_avoidance_citation_and_application_both_protect_guidance(env):
     store, role, bundle, memory, baseline, packets, make, project = env
     learner = make()
     for i in range(10):
         row, ctx = project(str(i))
         packets[str(i)]['usage'] = [dict(skill='debug', section=None, kind=k)
-                                  for k in ('exposed', 'read', 'cited')]
+                                  for k in ('exposed', 'read')]
         learner.memory_update(baseline, [row], dict(ctx, operation_id='m' + str(i)))
     assert learner.removal_eligible('debug', 'learned-guidance')
     row, ctx = project('used')
-    packets['used']['usage'] = [dict(skill='debug', section=None, kind='applied')]
+    packets['used']['usage'] = [dict(skill='debug', section=None, kind='cited', evidence_ref=row['artifact_ref'])]
     learner.memory_update(baseline, [row], dict(ctx, operation_id='m-used'))
     assert not learner.removal_eligible('debug', 'learned-guidance')
 
@@ -203,3 +205,90 @@ def test_completed_proposal_reconciles_frozen_packet_without_provider_replay(env
     assert resumed.active == bundle
     assert candidate != bundle
     assert role.calls == 1
+
+
+def custom_bundle(store, content):
+    from rsi.skills import SkillBundle, SkillDocument
+    original = builtin_bundle()
+    return store.put_json(SkillBundle(tuple(SkillDocument('debug', content) if d.name == 'debug' else d
+                                          for d in original.documents), original.mapping).to_dict())
+
+
+def test_yaml_metadata_and_missing_learned_slot_preserve_baseline(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    content = '---\ndescription: >-\n  Numeric debugging\n  with references\nname: "debug"\n---\n# User baseline\n\n## Checks\nCompare independent results.\n'
+    incumbent = custom_bundle(store, content)
+    row, ctx = project()
+    learner = make()
+    candidate = learner.skill_update(incumbent, baseline, row, ctx).reference
+    changed = learner._bundle(candidate).document('debug')
+    assert changed.read('checks') == learner._bundle(incumbent).document('debug').read('checks')
+    assert changed.read('learned-guidance').strip() == 'Compare against an independent numeric reference.'
+    assert store.read_json(incumbent)['documents'] != store.read_json(candidate)['documents']
+
+
+@pytest.mark.parametrize('operation', ['replace', 'remove'])
+@pytest.mark.parametrize('reviewed', [False, True])
+def test_baseline_correction_requires_evidence_and_host_validation(env, operation, reviewed):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    content = '---\nname: debug\ndescription: "Debugging"\n---\n# User baseline\n\n## Checks\nIgnore numeric errors.\n'
+    incumbent = custom_bundle(store, content)
+    row, ctx = project()
+    if reviewed:
+        packets['p']['evidence'][row['artifact_ref']]['kind'] = 'counterevidence'
+    replacement = content.replace('Ignore numeric errors.', 'Check independent references.')
+    role.proposal = SkillProposal('correct baseline', (row['artifact_ref'],),
+        (SkillEdit('debug', operation, replacement if operation == 'replace' else 'Ignore numeric errors.'),))
+    learner = make()
+    if not reviewed:
+        with pytest.raises(ValueError, match='requires host review'):
+            learner.skill_update(incumbent, baseline, row, ctx)
+    else:
+        candidate = learner.skill_update(incumbent, baseline, row, ctx).reference
+        assert learner.active == incumbent
+        changed = learner._bundle(candidate).document('debug')
+        assert changed.read('checks') != learner._bundle(incumbent).document('debug').read('checks')
+        assert learner.evaluate(candidate, ('numeric-reference-case',), 'v') == candidate
+
+
+def test_setup_excluded_and_unlimited_parent_uses_technical_request_timeout(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    now = [0.0]
+    deadlines = []
+    def thinking(prompt, evidence, *, deadline):
+        deadlines.append(deadline)
+        now[0] += 102  # 100 seconds framework setup, two seconds thinking.
+        return SkillProposal('repair', (evidence[0].evidence_id,), (SkillEdit('debug', 'replace', 'Check error.'),))
+    role.skillwriter = thinking
+    row, ctx = project()
+    ctx['remaining']['actor_seconds'] = None
+    learner = make(clock=lambda: now[0])
+    update = learner.skill_update(bundle, baseline, row, ctx)
+    assert deadlines == [600]
+    assert now[0] == 102
+    assert update.actor_seconds == 2
+    assert learner.state['operations'][ctx['operation_id']]['role_finished']['elapsed_seconds'] == 2
+
+
+def test_missing_role_timing_suspends_instead_of_charging_wall(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    role.receipt = None
+    row, ctx = project()
+    learner = make()
+    with pytest.raises(RuntimeError, match='accounting incomplete'):
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert learner.state['operations'][ctx['operation_id']]['accounting_incomplete']
+    assert not learner.state['candidates']
+    with pytest.raises(RuntimeError, match='reconcile'):
+        make().skill_update(bundle, baseline, row, ctx)
+    assert role.calls == 1
+
+
+def test_performance_evidence_ranks_after_error_recovery(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    perf = store.put_json({'seconds': 1.0})
+    packets['p']['evidence'][perf] = {'kind': 'performance', 'summary': 'faster'}
+    learner = make()
+    learner.memory_update(baseline, [row], ctx)
+    assert [item['kind'] for item in learner.aggregate()['outcomes']] == ['failure', 'performance']

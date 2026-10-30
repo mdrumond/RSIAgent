@@ -5,7 +5,10 @@ return project_id, outcome, evidence {CAS ID: {kind, summary}}, queries (verifie
 StrategyEvidence retrieval CAS IDs), usage (verified SkillUsage events), raw_refs.
 It must resolve the owning run log and verify receipt scope and observable action
 links; CAS existence alone is NOT admission. Copy cross-store artifacts first.
-Evidence kinds: correctness, failure, recovery, avoidance, counterevidence, review.
+Evidence kinds: correctness, failure, recovery, avoidance, counterevidence, review, performance.
+role_elapsed(operation_id) must read elapsed_seconds from the trusted host
+role_finished ledger for that operation; elapsed_seconds excludes role setup.
+Missing/malformed receipts suspend accounting and leave provider work pending.
 Only this adapter can admit evidence; model proposals cannot introduce facts.
 
 Callbacks match CycleScheduler. Validation receives immutable incumbent/candidate
@@ -15,6 +18,7 @@ Raw instrumentation remains in CAS and its source logs for later SFT.
 """
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -41,18 +45,24 @@ class Validation:
 
 class Learning:
     def __init__(self, path, artifacts, memory, roles, *, load_project, validate,
-                 mode='phase2', unused_window=10, context_chars=24000, clock=time.monotonic):
+                 mode='phase2', unused_window=10, context_chars=24000, clock=time.monotonic,
+                 role_elapsed=None, request_seconds=600):
         if not callable(validate) or not callable(load_project):
             raise ValueError('host loader and validator required')
         if type(unused_window) is not int or unused_window <= 0 or context_chars < 1024:
             raise ValueError('invalid learning policy')
+        if Mode(mode) != Mode.PHASE1 and not callable(role_elapsed):
+            raise ValueError('required role_elapsed callback missing')
+        if type(request_seconds) not in (int, float) or not math.isfinite(request_seconds) or request_seconds <= 0:
+            raise ValueError('technical request timeout must be positive finite seconds')
+        self.role_elapsed, self.request_seconds = role_elapsed, request_seconds
         self.path, self.store, self.memory, self.roles = Path(path), artifacts, memory, roles
         self.load_project, self.validate, self.clock = load_project, validate, clock
         self.mode, self.window, self.context_chars = Mode(mode), unused_window, context_chars
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.state = json.loads(self.path.read_text()) if self.path.exists() else dict(
             active=None, versions=[], candidates={}, projects={}, operations={}, stopped=False)
-        policy = dict(mode=self.mode.value, window=unused_window, context_chars=context_chars)
+        policy = dict(mode=self.mode.value, window=unused_window, context_chars=context_chars, request_seconds=request_seconds)
         if self.state.setdefault('policy', policy) != policy:
             raise ValueError('retained learning policy differs')
         self._save()
@@ -106,8 +116,15 @@ class Learning:
     def _bundle(self, ref):
         bundle = SkillBundle.from_dict(self.store.read_json(ref))
         for doc in bundle.documents:
-            header = re.match(r'\A---\nname: ([^\n]+)\ndescription: ([^\n]+)\n---\n', doc.content)
-            if not header or header[1] != doc.name or not header[2].strip():
+            import yaml  # Existing legacy dependency; no new parser or YAML subset.
+            header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)', doc.content, re.DOTALL)
+            try:
+                metadata = yaml.safe_load(header[1]) if header else None
+            except yaml.YAMLError as exc:
+                raise ValueError('invalid skill metadata') from exc
+            if (not isinstance(metadata, dict) or metadata.get('name') != doc.name
+                    or not isinstance(metadata.get('description'), str)
+                    or not metadata['description'].strip()):
                 raise ValueError('invalid skill metadata')
         return bundle
 
@@ -117,7 +134,7 @@ class Learning:
             raise ValueError('host evidence/project identity required')
         for ref, info in packet['evidence'].items():
             self.store.read_bytes(ref)
-            if info['kind'] not in ('correctness', 'failure', 'recovery', 'avoidance', 'counterevidence', 'review'):
+            if info['kind'] not in ('correctness', 'failure', 'recovery', 'avoidance', 'counterevidence', 'review', 'performance'):
                 raise ValueError('unsupported evidence kind')
         for ref in packet['queries']:
             if self.store.read_json(ref)['kind'] != 'retrieval':
@@ -159,7 +176,7 @@ class Learning:
                 if event['skill'] == skill and event.get('section') in (None, section):
                     if event['kind'] == 'exposed':
                         exposed.add(project)
-                    if event['kind'] == 'applied':
+                    if event['kind'] in ('cited', 'applied'):
                         used.add(project)
         return (len(exposed) >= self.window and not used
                 and (not safety or counterevidence or reviewed))
@@ -176,7 +193,7 @@ class Learning:
             packets[current['project_id']] = current
         queries, sections, outcomes = {}, {}, []
         priority = {'counterevidence': 0, 'failure': 1, 'avoidance': 1, 'recovery': 2,
-                    'correctness': 3, 'review': 3}
+                    'correctness': 3, 'review': 3, 'performance': 4}
         for project, packet in packets.items():
             for ref, info in packet['evidence'].items():
                 outcomes.append(dict(project=project, reference=ref, kind=info['kind'],
@@ -221,7 +238,9 @@ class Learning:
             'Retrieval frequency is not usefulness. Negative results and rejected negative ideas '
             'can demonstrate valuable avoidance. Cite admitted outcome evidence. '
             'replace sets only Learned guidance; remove deletes one exact learned fragment, '
-            'never an entire mandatory skill or contract. Preserve safety/recovery unless '
+            'Add the section when absent. A complete YAML-frontmatter document replacement, '
+            'or exact removal outside Learned guidance, requires cited host review/counterevidence. '
+            'Never delete a mapped skill. Preserve safety/recovery unless '
             'counterevidence or explicit review supports removal.\n')
         context = dict(bundle=incumbent, memory=memory_ref, packet=packet_ref,
                        skills={d.name: d.read('learned-guidance') if 'learned-guidance' in d.sections else ''
@@ -236,12 +255,28 @@ class Learning:
         if len(encoded) + len(prompt) + len(json.dumps([asdict(e) for e in evidence])) > self.context_chars:
             raise ValueError('learning context exceeds bound; host must summarise admitted inputs')
         remaining = ctx['remaining']['actor_seconds']
-        if remaining is None:
-            raise ValueError('writer requires finite host actor allocation')
-        started = self.clock()
-        proposal = self.roles.skillwriter(prompt + encoded, evidence, deadline=started + remaining)
+        allowance = self.request_seconds if remaining is None else min(remaining, self.request_seconds)
+        if allowance <= 0:
+            raise TimeoutError('actor allocation exhausted')
+        proposal = self.roles.skillwriter(prompt + encoded, evidence,
+                                          deadline=self.clock() + allowance)
         proposal_ref = self.store.put_json(asdict(proposal))
-        return self.reconcile_proposal(identity, proposal_ref, self.clock() - started)
+        operation = self.state['operations'][identity]
+        operation['proposal'] = proposal_ref
+        self._save()  # Retain provider output before reading host accounting.
+        try:
+            elapsed = self.role_elapsed(identity)
+        except Exception:
+            elapsed = None
+        if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+            operation['accounting_incomplete'] = True
+            self._save()
+            raise RuntimeError('accounting incomplete: role_finished receipt required; reconcile')
+        operation['role_finished'] = dict(operation_id=identity, elapsed_seconds=elapsed)
+        self._save()
+        if elapsed > allowance:
+            raise TimeoutError('measured actor allocation exceeded; reconcile retained receipt')
+        return self.reconcile_proposal(identity, proposal_ref, elapsed)
 
     def reconcile_proposal(self, identity, proposal_ref, actor_seconds):
         SnapshotUpdate(proposal_ref, actor_seconds)  # validates elapsed accounting
@@ -264,7 +299,21 @@ class Learning:
             if edit.skill not in docs or not edit.content.strip():
                 raise ValueError('known skill and nonempty learned fragment required')
             doc = docs[edit.skill]
-            section = doc.read('learned-guidance')
+            learned = 'learned-guidance' in doc.sections
+            section = doc.read('learned-guidance') if learned else ''
+            full_document = edit.operation == 'replace' and edit.content.startswith('---')
+            outside = edit.operation == 'remove' and edit.content not in section
+            if full_document or outside:
+                if not protected:
+                    raise ValueError('baseline correction requires host review/counterevidence')
+                if full_document:
+                    content = edit.content
+                else:
+                    if doc.content.count(edit.content) != 1:
+                        raise ValueError('remove must identify one exact baseline fragment')
+                    content = doc.content.replace(edit.content, '', 1)
+                docs[edit.skill] = SkillDocument(edit.skill, content)
+                continue
             if edit.operation == 'remove':
                 if not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
                                              counterevidence=protected):
@@ -277,8 +326,14 @@ class Learning:
             if re.search(r'^#{1,2} |^---$', replacement, re.MULTILINE):
                 raise ValueError('learned fragment cannot change document structure')
             marker = '## Learned guidance\n'
-            before, after = doc.content.split(marker, 1)
-            docs[edit.skill] = SkillDocument(edit.skill, before + marker + replacement + after[len(section):])
+            if learned:
+                # Resolve by parsed section content, independent of heading spelling.
+                heading = next(m for m in re.finditer(r'^## ([^\n]+)\n', doc.content, re.MULTILINE)
+                    if re.sub(r'[^a-z0-9]+', '-', m[1].lower()).strip('-') == 'learned-guidance')
+                content = doc.content[:heading.end()] + replacement + doc.content[heading.end() + len(section):]
+            else:
+                content = doc.content + ('' if doc.content.endswith('\n') else '\n') + marker + replacement
+            docs[edit.skill] = SkillDocument(edit.skill, content)
         candidate = SkillBundle(tuple(docs.values()), bundle.mapping)
         reference = self.store.put_json(candidate.to_dict())
         self._bundle(reference)
