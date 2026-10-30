@@ -595,9 +595,9 @@ class PiSessionAdapter(SnapshotPiSessionAdapter):
         self.session.gateway.request_projector = self._project_tools
 
     @classmethod
-    def from_existing_session(cls, session):
+    def from_existing_session(cls, session, *, wall_deadline=None):
         from coding.pi.controller import ControllerSession
-        controller = ControllerSession.from_existing_session(session)
+        controller = ControllerSession.from_existing_session(session,wall_deadline=wall_deadline)
         adapter = cls.__new__(cls)
         adapter.delivery = SkillDelivery()
         adapter.session = controller

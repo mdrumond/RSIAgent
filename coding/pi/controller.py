@@ -19,9 +19,10 @@ from .session import ActionError, PiCodingSession, ROOT
 
 
 class ControllerSession(PiCodingSession):
-    def __init__(self, **kwargs):
+    def __init__(self, *, wall_deadline=None, **kwargs):
         super().__init__(**kwargs)
-        self.enclosing_deadline = kwargs.get('deadline')
+        self.request_deadline_provenance = dict(session=self.deadline, gateway=self.gateway.deadline)
+        self.enclosing_deadline = wall_deadline
         self._configure_controller()
 
     def _configure_controller(self):
@@ -37,11 +38,13 @@ class ControllerSession(PiCodingSession):
         self.gateway.on_record = lambda kind,data:self.record(kind,data)
 
     @classmethod
-    def from_existing_session(cls, session):
+    def from_existing_session(cls, session, *, wall_deadline=None):
         """Transfer one unstarted registered route; never reopen a live session.
 
         No provider client is constructed and no process starts here. Closing the
         old raw owner becomes a no-op; this controller exclusively owns cleanup.
+        wall_deadline is an explicitly supplied monotonic parent-wall deadline;
+        legacy request deadlines are never inferred to be wall constraints.
         """
         if not isinstance(session, PiCodingSession):
             raise TypeError('expected a registered PiCodingSession')
@@ -50,10 +53,10 @@ class ControllerSession(PiCodingSession):
         controller = cls.__new__(cls)
         controller.__dict__ = session.__dict__.copy()
         controller.schemas = dict(session.schemas)
-        # This inherited absolute limit belongs to the external parent wall.
-        # Native charged deadlines are recomputed from actor.remaining after
-        # every host callback, so excluded transfers never freeze actor time.
-        controller.enclosing_deadline = min(session.deadline,session.gateway.deadline)
+        # Legacy A3 deadlines represent actor allocation, not a parent wall.
+        # Preserve them as provenance only; explicit wall limits are separate.
+        controller.request_deadline_provenance = dict(session=session.deadline,gateway=session.gateway.deadline)
+        controller.enclosing_deadline = wall_deadline
         controller._configure_controller()
         session.closed = True
         session.stack = ExitStack()

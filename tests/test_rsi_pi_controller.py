@@ -462,7 +462,8 @@ def test_existing_registered_route_transfers_to_real_native_controller(monkeypat
         assert isinstance(adapter.session,ControllerSession)
         assert raw.closed and not adapter.session.closed and adapter.session.rpc is None
         assert adapter.session.gateway is gateway and adapter.session.profile is profile
-        assert adapter.session.deadline==deadline==adapter.session.enclosing_deadline
+        assert adapter.session.deadline==deadline and adapter.session.enclosing_deadline is None
+        assert adapter.session.request_deadline_provenance==dict(session=deadline,gateway=deadline)
         assert adapter.session.own_process_group is False
         raw.close()
         assert not adapter.session.closed
@@ -493,6 +494,8 @@ def test_adopted_registered_route_runs_native_tools_without_new_provider_client(
                         [('perform',{'proposal':'use original route'})],len(calls))
     monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
     raw=PiCodingSession(model='deepseek-flash',schemas={},environ={'DEEPSEEK_API_KEY':'fake-provider-secret'})
+    import time
+    raw.deadline=raw.gateway.deadline=time.monotonic()-1
     gateway=raw.gateway
     flow=Workflow(tmp_path/'state.json',lambda *_:False,source_hash='v1')
     actor=WorkflowActor(flow,builtin_bundle(),lambda:PiSessionAdapter.from_existing_session(raw),
@@ -502,3 +505,14 @@ def test_adopted_registered_route_runs_native_tools_without_new_provider_client(
         assert actor.session.session.gateway is gateway
     finally:actor.close()
     assert raw.closed and flow.stage==Stage.DESIGN and len(calls)==2
+
+
+def test_only_explicit_wall_deadline_bounds_adopted_route(monkeypatch):
+    import time
+    import coding.pi.session as module
+    monkeypatch.setattr(module,'runtime_preflight',lambda:None)
+    raw=module.PiCodingSession(model='deepseek-flash',schemas={},environ={'DEEPSEEK_API_KEY':'fake-provider-secret'})
+    wall=time.monotonic()+30
+    adapter=PiSessionAdapter.from_existing_session(raw,wall_deadline=wall)
+    try:assert adapter.session.enclosing_deadline==wall
+    finally:adapter.close()
