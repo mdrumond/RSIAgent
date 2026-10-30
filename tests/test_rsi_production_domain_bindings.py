@@ -330,3 +330,26 @@ def test_native_terminal_status_inspection_does_not_reclassify_diagnostic_histor
     assert has_pending_result({'result':{'status':'running','handle':'native-owned'}})
     assert not has_pending_result({'status':'verified','history':[{'status':'running'}],
                                   'diagnostics':{'status':'queued'}})
+
+
+def test_local_native_source_rejection_has_observed_failure_receipt_and_export(tmp_path,monkeypatch):
+    from test_optimizer_loop import fixture, Backend
+    from optimizer.loop import OptimizationLoop
+    from rsi.evidence_io import export_task
+    store,key=fixture(tmp_path)
+    class BadEdit(CanonicalSession):
+        def next_action(self,context,allowed,**kwargs):
+            if context['stage']=='implementation' and not context['unread_skills']:
+                return 'perform',dict(proposal='invalid local candidate document',edit=dict(
+                    path='candidate.json',sha256=context['source']['sha256'],source='{'))
+            return super().next_action(context,allowed,**kwargs)
+    monkeypatch.setattr(bindings,'PiSessionAdapter',lambda **_:BadEdit())
+    owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'TEST'},model='TEST'),Backend(),knowledge=lambda _:[])
+    runner=owner.canonical.build(owner,prepare_only=False,single_evaluation=False,memory_snapshot=None,context=None)
+    result=runner.run()
+    assert result['status']=='suspended' and result['stage']=='implementation'
+    proof=runner.terminal_failure_proof()
+    assert proof['pending']==runner.workflow.pending
+    rows=[runner.store.read_json(e['reference']) for e in runner.events if e['type']=='domain-result']
+    assert any(row['status']=='failed' and row['observed_terminal'] is True for row in rows)
+    assert export_task(runner.root,tmp_path/'local-native-failure')['task_contract']==runner.contract_ref
