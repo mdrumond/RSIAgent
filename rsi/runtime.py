@@ -239,6 +239,25 @@ class Workflow:
                 self.state["stage"] = Stage.TEST.value
             self._save()
 
+    def reject_operation(self, operation, hostfailure_ref, observed_source_hash):
+        """Close a proven terminal admission failure, retaining all consumed budget.
+
+        This is not an absence/refund receipt. The trusted resolver must establish
+        actor closure and no host effects; unknown work must remain pending.
+        """
+        if (not self.pending or self.pending['id'] != operation or self.outcome
+                or observed_source_hash != self.source_hash):
+            raise WorkflowError('failed operation or observed source mismatch')
+        if not self.resolver('failed-operation', hostfailure_ref, self.stage, operation):
+            raise WorkflowError('untrusted failed-operation closure proof')
+        self.accounting.seconds()  # Unresolved work/timing cannot be discarded.
+        self.state['history'].append(dict(operation=operation, stage=self.stage.value,
+            source_hash=self.source_hash, passed=False, rejected_operation=True,
+            host_failure_ref=hostfailure_ref))
+        self.state['pending'] = None
+        self._needs_reconciliation = False
+        self._save()
+
     def reconcile(self, operation, evidence=None, *, not_dispatched=False, **result):
         if not_dispatched:
             if not self.pending or self.pending["id"] != operation or evidence is not None:
