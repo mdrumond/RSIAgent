@@ -978,19 +978,19 @@ def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
 
 
 def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):
-    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
-    early_submit = json.dumps({
-        "action": "submit", "interpretation": "too early", "supports": [],
-    })
-    result, _, journal = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        early_submit, early_submit, early_submit, early_submit, early_submit,
-    ], cell=cell, budgets=TrialBudgets(max_seconds=8))
-    assert result.status == "budget-exhausted"
-    assert result.completion_turns == 0
-    assert "profile" in result.failures[-1]
-    assert journal.read() == ()
+    # Test the retained host gate directly. Canonical programming control has a
+    # separate real default-binding proof; no unstructured actor loop is needed.
+    owner = object.__new__(A3TrialLoop)
+    owner.cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+    candidate = FakeCandidate()
+    options = dict(request_id=owner.cell.cell_id, attempt_id='gate', length=32, project_id=DEFAULT_PROPOSALS[0].project_id)
+    compilation = candidate.compile(SOURCE, tmp_path, **options)
+    verified = candidate.run(SOURCE, tmp_path, **options)
+    assert owner._submit_gate(None, None, None, None)
+    assert owner._submit_gate(SOURCE, compilation, verified, None)
+    assert owner._submit_gate(SOURCE, compilation, verified, object()) is None
+    other = candidate.compile(SOURCE + '\n// different revision', tmp_path, **options)
+    assert owner._submit_gate(SOURCE, other, verified, object())
 
 
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):

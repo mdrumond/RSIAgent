@@ -57,7 +57,8 @@ class SourceHost:
         self.read(path)
         if self.project_hash() != expected_file_hash or self.project_hash() != expected_project_hash:
             raise ValueError('stale domain source edit')
-        self.write(text)
+        if text != self.source:
+            self.write(text)
         return self.project_hash()
 
     def context(self):
@@ -459,6 +460,8 @@ class OptimizerHost(SourceHost):
         self.source = self.source_path.read_text() if self.source_path.exists() else json.dumps(
             dict(source='', block_count=1))
         self.spec = owner._read(owner.state['spec']) if 'spec' in owner.state else owner._spec(self.submission)
+        if len(self.spec['signatures']) > owner.max_cases:
+            raise ValueError('supplied representatives exceed configured case budget')
         self.baseline = owner._read(owner.state['baseline']) if 'baseline' in owner.state else None
         self.evaluation, self.value = None, None
         self.instruction = json.dumps(dict(submission=self.spec, memory=snapshot,

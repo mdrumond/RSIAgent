@@ -168,11 +168,15 @@ class DomainRunner(ProjectRunner):
         self.service = StrategyEvidence(self.store, self.append, lambda: self.workflow.state,
             self.bundle, query, workflow_id=self.contract_ref, backend_identity=backend_identity,
             events=self.events, test_backend=test_backend)
-        self.actor = WorkflowActor(self.workflow, self.bundle, session_factory,
+        self._factory_attempted = False
+        def tracked_factory():
+            self._factory_attempted = True
+            return session_factory()
+        self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
         self.workflow.resolver = self.resolve
         host.workflow = self.workflow
         # Public result/reconciliation fields use the same frozen domain contract.
