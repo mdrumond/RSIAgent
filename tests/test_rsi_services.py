@@ -58,7 +58,10 @@ class Roles:
     prompts = []
     def __init__(self, observer):
         self.observer = observer
-    def skillwriter(self, prompt, evidence, *, deadline):
+    def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
+        now = time.monotonic()
+        assert wall_deadline is not None and now < wall_deadline <= now + 600
+        assert now < deadline <= now + 600
         type(self).prompts.append(prompt)
         self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=0.25))
         return SkillProposal('No supported changes', (evidence[0].evidence_id,), ())
@@ -726,7 +729,10 @@ def test_generated_paths_flow_through_service_and_preserve_actual_verification(i
 def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trace(instance):
     from rsi.roles import SkillEdit
     class Writer(Roles):
-        def skillwriter(self, prompt, evidence, *, deadline):
+        def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
+            now = time.monotonic()
+            assert wall_deadline is not None and now < wall_deadline <= now + 600
+            assert now < deadline <= now + 600
             self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
             return SkillProposal('Use observed failure context before selecting strategy',
                 (evidence[0].evidence_id,), (SkillEdit('design', 'replace',
