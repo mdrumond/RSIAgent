@@ -631,6 +631,14 @@ class ClosedFailureAfterQuery(Decisions):
         return super().next_action(context, allowed, **kwargs)
 
 
+class ClosedBudgetAfterQuery(Decisions):
+    def next_action(self, context, allowed, **kwargs):
+        if context['stage'] == 'design' and any(r['name'] == 'query_kdb' for r in context['evidence']):
+            # Consume real actor thinking allocation; no fabricated exhaustion error.
+            time.sleep(kwargs['seconds'] + .02)
+        return super().next_action(context, allowed, **kwargs)
+
+
 def test_closed_failed_actor_enters_phase1_memory_and_fresh_recovery_without_clearing_pending(instance):
     sessions = iter([ClosedFailureAfterQuery(), Decisions()])
     instance.test = Bindings(instance.test.query, lambda: next(sessions), Roles, instance.test.identity)
@@ -722,13 +730,15 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
             self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
             return SkillProposal('Use observed failure context before selecting strategy',
                 (evidence[0].evidence_id,), (SkillEdit('design', 'replace',
-                    'Review completed retrieval and retained provider-failure evidence before selecting strategy.'),))
-    sessions = iter([ClosedFailureAfterQuery(), ClosedFailureAfterQuery(), Decisions()])
+                    builtin_bundle().document('design').read('learned-guidance') +
+                    '\nReview retained evidence promptly and preserve time for execution/verification.'),))
+    sessions = iter([ClosedBudgetAfterQuery(), ClosedBudgetAfterQuery(), Decisions()])
     instance.test = Bindings(instance.test.query, lambda: next(sessions), Writer, instance.test.identity)
     config = show_configuration(instance.root)['payload']
     config['recovery']['enabled'] = True
+    config['phase2_projects'][0]['budgets']['actor_seconds'] = 1.0
     config['recovery']['budgets'] = BudgetLimits(design_iterations=6, implementation_iterations=6,
-        execution_tries=20, actor_seconds=30).to_dict()
+        execution_tries=20, actor_seconds=6).to_dict()
     config['tuning'].update(every_projects=None, at_wave_end=False)
     set_configuration(instance.root, config)
     cycle = instance.create_cycle('paired-failed', 'phase2')
