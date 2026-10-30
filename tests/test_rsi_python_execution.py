@@ -353,25 +353,36 @@ def test_minimal_installed_wheel_executes_cpu_backend(tmp_path):
     install = subprocess.run([str(python), '-m', 'pip', 'install', '--no-deps', '--no-index', str(wheel)],
                              capture_output=True, text=True)
     assert install.returncode == 0, install.stdout + install.stderr
-    proof = '''
+    proof = r'''
 import json, sys
 from pathlib import Path
 from rsi.python_execution import PythonExecution
 from rsi.runtime import Workflow
+try:
+    import requests
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError('minimal environment unexpectedly has requests')
 root = Path.cwd()
 source = root / 'input'
 source.mkdir()
-(source / 'solution.py').write_text('value = 42\\n')
+(source / 'solution.py').write_text('def stable_sum(xs):\n    total = 0.0\n    for x in xs:\n        total += x\n    return total\n')
 verifier = root / 'verify.py'
-verifier.write_text('from solution import value\\nassert value == 42\\n')
+verifier.write_text('from decimal import Decimal\nfrom solution import stable_sum\nxs = [1e16, 1., -1e16]\nexpected = float(sum(map(Decimal.from_float, xs), Decimal(0)))\nassert stable_sum(xs) == expected\n')
 runner = PythonExecution.snapshot(root / 'task', source, verifier,
     commands={'test': [sys.executable, '{verifier}']})
 runner.workflow = Workflow(root / 'workflow.json', lambda *a: True, source_hash=runner.project_hash())
-result = runner.run('minimal-wheel', 'test')
+failed = runner.numeric('minimal-wheel-bug')
+assert failed['classification'] == 'numeric_failure', failed
+file = runner.read('solution.py')
+runner.edit('solution.py', 'import math\ndef stable_sum(xs):\n    return math.fsum(xs)\n',
+            expected_file_hash=file['file_hash'], expected_project_hash=file['project_hash'])
+result = runner.numeric('minimal-wheel-repair')
 assert result['classification'] == 'passed', result
 print(json.dumps({'classification': result['classification'], 'tries': runner.workflow.state['executions']}))
 '''
     run = subprocess.run([str(python), '-I', '-c', proof], cwd=tmp_path,
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert json.loads(run.stdout) == {'classification': 'passed', 'tries': 1}
+    assert json.loads(run.stdout) == {'classification': 'passed', 'tries': 2}
