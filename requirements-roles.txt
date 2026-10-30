@@ -1,0 +1,2 @@
+# Install in a separate task/instance-owned Python environment, not with legacy.
+nooa==0.0.10; python_version >= "3.12" and python_version < "3.14"
