@@ -43,6 +43,10 @@
       value.project = JSON.parse(value.project);
       value.recover = Boolean(value.recover);
     } else { delete value.project; delete value.recover; }
+    const inherited = ['start', 'revisit'].includes(value.operation);
+    value.input_overrides = inherited ? new FormData($('phase-form')).getAll('input_override') : [];
+    if (!inherited) { delete value.from_cycle; delete value.inheritance; }
+    delete value.input_override;
     return value;
   });
   bind('tune-form', 'manual-tuning');
@@ -51,6 +55,45 @@
     return {...value, revision: snapshot.revision};
   });
   bind('export-form', 'export');
+  bind('skill-export-form', 'skill-export');
+  const phaseForm = $('phase-form');
+  phaseForm.elements.operation.addEventListener('change', () => {
+    $('inheritance-fields').disabled = !editable || !['start', 'revisit'].includes(phaseForm.elements.operation.value);
+  });
+  $('published-skills-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      const cycle = new FormData($('published-skills-form')).get('cycle_id');
+      const result = await api('/api/rsi/published-skills?cycle=' + encodeURIComponent(cycle));
+      $('published-skills').textContent = JSON.stringify(result, null, 2);
+    } catch (error) { status(error.message); }
+  });
+  let destinationParent, folderGeneration = 0;
+  async function browseDestination(path) {
+    const generation = ++folderGeneration; destinationParent = undefined;
+    $('use-skill-parent').disabled = true;
+    try {
+      const listing = await api('/api/rsi/folders' + (path ? '?path=' + encodeURIComponent(path) : ''));
+      if (generation !== folderGeneration) return;
+      destinationParent = listing.path; $('skill-folder-status').textContent = listing.path;
+      $('skill-folder-list').replaceChildren();
+      for (const row of [...listing.roots.map(path => ({path, name: path})), ...listing.folders]) {
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = row.name;
+        button.addEventListener('click', () => browseDestination(row.path)); $('skill-folder-list').append(button);
+      }
+      $('use-skill-parent').disabled = false;
+    } catch (error) { if (generation === folderGeneration) $('skill-folder-status').textContent = error.message; }
+  }
+  $('browse-skill-parent').addEventListener('click', () => {
+    $('skill-destination-browser').showModal(); browseDestination();
+  });
+  $('close-skill-parent').addEventListener('click', () => { folderGeneration++; $('skill-destination-browser').close(); });
+  $('use-skill-parent').addEventListener('click', () => {
+    if (!destinationParent) return;
+    const input = $('skill-export-destination'), name = input.value.split('/').filter(Boolean).pop() || 'accepted-skills';
+    input.value = destinationParent.replace(/\/$/, '') + '/' + name;
+    folderGeneration++; $('skill-destination-browser').close();
+  });
   function renderLedger(inspection) {
     const ledger = $('time-ledger'); ledger.replaceChildren();
     const add = (tag, text, parent = ledger) => {

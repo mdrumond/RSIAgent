@@ -13,13 +13,13 @@ def _union(intervals):
 
 def task_inspection(task):
     result = {key: task[key] for key in ('task_id', 'remaining', 'skills_ref', 'candidate_ref') if key in task}
-    if 'intervals' not in task:
+    if 'actor_union_seconds' in task or 'intervals' not in task:
         return {**result, **{key: task[key] for key in ('charged_seconds', 'excluded_seconds',
                 'actor_union_seconds', 'accounting_state') if key in task}}
     if task.get('clock_domain') != 'controller' or not isinstance(task['intervals'], dict):
         return dict(result, accounting_state='invalid-clock-domain')
     groups = {}
-    unresolved = False
+    unresolved = bool(task.get('timing_uncertainties'))
     for interval in task['intervals'].values():
         if not isinstance(interval, list) or len(interval) != 3:
             return dict(result, accounting_state='invalid-interval')

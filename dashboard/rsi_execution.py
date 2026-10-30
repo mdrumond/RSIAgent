@@ -73,12 +73,22 @@ def register_rsi_execution(app, controls, csrf_token, cli):
         if action == 'phase':
             if payload.get('mode') not in ('phase1', 'phase2', 'inference'):
                 raise ControlError('Unknown phase.')
-            if payload.get('operation') not in ('start', 'stop', 'resume', 'revisit'):
+            if payload.get('operation') not in ('start', 'stop', 'resume', 'revisit', 'adopt'):
                 raise ControlError('Unknown phase operation.')
             if payload['operation'] != 'start':
                 _text(payload, 'job_id')
             if payload['operation'] == 'revisit':
                 _text(payload, 'cycle_id')
+            policy = payload.get('inheritance', '')
+            parent = _text(payload, 'from_cycle', required=False)
+            overrides = payload.get('input_overrides', [])
+            if (policy not in ('', 'auto', 'parent', 'baseline') or not isinstance(overrides, list)
+                    or any(value not in ('memory', 'skills', 'kdb') for value in overrides)):
+                raise ControlError('Invalid inheritance selection.')
+            if payload['operation'] not in ('start', 'revisit') and (policy or parent or overrides):
+                raise ControlError('Inheritance inputs apply only to start or revisit.')
+            if policy == 'baseline' and parent:
+                raise ControlError('Baseline inheritance cannot select a parent cycle.')
             if payload['operation'] == 'start':
                 _text(payload, 'cycle_id', required=False)
                 if payload['mode'] == 'inference':
@@ -91,6 +101,12 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                 _text(payload, key, required=False)
             if any(key in payload for key in ('database', 'database_kind', 'embedding_cache', 'evidence_store')):
                 raise ControlError('Instance ingestion uses its configured KDB, embeddings and evidence store.')
+        elif action == 'skill-export':
+            _text(payload, 'destination')
+            if payload.get('selection') == 'cycle':
+                _text(payload, 'cycle_id')
+            elif payload.get('selection') != 'builtin':
+                raise ControlError('Select accepted cycle skills or builtin templates.')
         elif action == 'export':
             _text(payload, 'task'); _text(payload, 'destination')
         else:
@@ -120,6 +136,13 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                 args += ['--job', payload['job_id']]
             if operation in ('start', 'revisit') and payload.get('cycle_id'):
                 args += ['--cycle', payload['cycle_id']]
+            if operation in ('start', 'revisit'):
+                if payload.get('from_cycle'):
+                    args += ['--from-cycle', payload['from_cycle']]
+                if payload.get('inheritance'):
+                    args += ['--inheritance', payload['inheritance']]
+                for value in dict.fromkeys(payload.get('input_overrides', [])):
+                    args += ['--input-override', value]
             if payload['mode'] == 'inference' and operation == 'start':
                 with tempfile.TemporaryDirectory(prefix='rsi-inference-') as directory:
                     project = Path(directory) / 'project.json'
@@ -129,6 +152,10 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                         args += ['--no-recovery']
                     return _public_job(cli(*args))
             return _public_job(cli(*args))
+        if action == 'skill-export':
+            selection = ['--cycle', payload['cycle_id']] if payload['selection'] == 'cycle' else ['--builtin']
+            result = cli('skills', 'export', *selection, '--destination', payload['destination'])
+            return {key: result[key] for key in ('destination', 'baseline_skills', 'skill_map', 'bundle_ref', 'bundle_hash') if key in result}
         if action == 'export':
             cli('evidence-export', payload['task'], payload['destination'], timeout=300)
             return {'exported': True, 'destination': payload['destination']}
@@ -172,6 +199,18 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                            step_map=value['mapping'])
         except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
             return jsonify(error='Immutable baseline skill editing is unavailable in this pinned CLI.'), 409
+
+    @app.get('/api/rsi/published-skills')
+    def rsi_published_skills():
+        if not _local():
+            abort(403)
+        try:
+            cycle = _text({'cycle_id': request.args.get('cycle', '')}, 'cycle_id')
+            value = cli('skills', 'get', '--cycle', cycle)
+            return jsonify({key: value[key] for key in ('bundle_ref', 'bundle_hash', 'cycle_id',
+                            'provenance_ref', 'documents', 'mapping') if key in value})
+        except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
+            return jsonify(error='Accepted published skills are unavailable for this cycle.'), 409
 
     @app.get('/api/rsi/jobs')
     def rsi_jobs():

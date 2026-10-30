@@ -4,20 +4,35 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='rsi_inputs.css') }}">
 <section id="rsi-execution" data-enabled="{{ 'true' if enabled else 'false' }}">
 <h1>RSI execution</h1><p><a href="{{ url_for('rsi_inputs_page') }}">Edit curriculum, prompts, baselines, skill mappings and project settings</a></p>
-<p>Start and revisit use current saved inputs. Resume observes the same retained cycle and preserves its budgets. A revisit needs a new cycle identity.</p>
+<p>Start and revisit use current saved inputs. Resume observes the same retained cycle and preserves its budgets. A revisit needs a new cycle identity and inherits its previous cycle’s accepted state by default. Adopt applies current saved inputs to upcoming work at a safe boundary; resume retains frozen inputs.</p>
 {% if not enabled %}<p>Read-only view. Execution controls are disabled.</p>{% endif %}
 <p id="execution-status" role="status" aria-live="polite"></p>
 <form id="phase-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}>
 <legend>Phase or inference project</legend>
 <label>Mode<select name="mode"><option>phase1</option><option>phase2</option><option>inference</option></select></label>
-<label>Operation<select name="operation"><option>start</option><option>stop</option><option>resume</option><option>revisit</option></select></label>
+<label>Operation<select name="operation"><option>start</option><option>stop</option><option>resume</option><option>revisit</option><option>adopt</option></select></label>
 <label>Retained job<select name="job_id" id="retained-job"><option value="">Select a job for stop, resume or revisit</option></select></label>
 <label>Cycle identity (optional for start; new identity required for revisit)<input name="cycle_id"></label>
+<fieldset id="inheritance-fields"><legend>Starting inputs (start and revisit only)</legend>
+<label>Parent cycle, optional<input name="from_cycle"></label>
+<label>Inheritance policy<select name="inheritance"><option value="">CLI default (revisit preserves accepted parent)</option><option value="auto">Automatic accepted parent selection</option><option value="parent">Require accepted parent</option><option value="baseline">Use configured baselines</option></select></label>
+<p>Phase 1 starts from baseline by default. Later modes use CLI automatic selection. Choose a parent explicitly to inherit its published accepted memory, skills and KDB. Candidates are never treated as accepted.</p>
+<p>Override selected parent inputs with current configured baselines:</p>
+{% for name in ['memory','skills','kdb'] %}<label><input type="checkbox" name="input_override" value="{{ name }}">{{ name }}</label>{% endfor %}
+</fieldset>
 <label>Inference ProjectSpec JSON<textarea name="project" rows="6" spellcheck="false">{}</textarea></label>
 <label><input name="recover" type="checkbox" checked>Enable inference recovery</label>
 <button>Submit phase command</button></fieldset></form>
 <section class="control-panel"><h2>Retained jobs and evidence</h2><button type="button" id="refresh-jobs">Refresh jobs</button><div id="jobs-list"></div>
 <h3>Time and skill inspection</h3><p>Charged categories: thinking, retrieval, implementation, debug, compilation, execution and profiling. Setup and transfer are excluded. Category durations can overlap; the actor total must be the host’s interval union. Unknown timing is never shown as zero. Wall remaining includes all elapsed time.</p><div id="time-ledger"></div><details><summary>Retained inspection details</summary><pre id="job-inspection">Select a retained job to inspect.</pre></details></section>
+<section class="control-panel"><h2>Accepted skill output</h2><p>Inspect a cycle’s published validated skill bundle, including an inference cycle. This is separate from editing baseline inputs.</p>
+<form id="published-skills-form"><label>Cycle identity<input name="cycle_id" required></label><button>Read accepted skills</button></form><pre id="published-skills">No cycle selected.</pre>
+<form id="skill-export-form"><fieldset {% if not enabled %}disabled{% endif %}><legend>Export reusable skill folders</legend>
+<label>Source<select name="selection"><option value="cycle">Published accepted cycle</option><option value="builtin">Builtin templates</option></select></label>
+<label>Cycle identity (for accepted output)<input name="cycle_id"></label>
+<label>New destination folder (must not exist)<input name="destination" id="skill-export-destination" required></label><button type="button" id="browse-skill-parent">Choose destination parent</button>
+<p>Writes SKILL.md folders, map.json, bundle.json and an export manifest with exact hashes. Existing folders are never overwritten.</p><button>Export reusable skills</button></fieldset></form></section>
+<dialog id="skill-destination-browser"><h2>Choose destination parent</h2><p id="skill-folder-status" role="status"></p><div id="skill-folder-list"></div><button type="button" id="use-skill-parent">Use this parent</button><button type="button" id="close-skill-parent">Cancel</button></dialog>
 <form id="repo-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Add repository to this instance’s KDB</legend>
 <p>Indexes committed source into a new immutable baseline copy. Previously admitted cycles keep their baseline. Configured embeddings and this instance’s evidence store are used automatically. Indexed material is not automatically a known-good idea. Select folders in the input editor and paste their node paths here.</p>
 {% for name,label in [('source','Local repository folder'),('collection','New collection name'),('repository','Credential-free repository identity')] %}<label>{{ label }}<input name="{{ name }}" required></label>{% endfor %}

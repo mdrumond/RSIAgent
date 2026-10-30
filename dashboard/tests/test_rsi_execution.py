@@ -31,6 +31,13 @@ def execution(tmp_path):
             calls[-1] += (json.loads(content) if args[:3] == ['skills', 'map', 'set'] else content,)
         if args == ['capabilities']:
             result = app.config.get('TEST_CAPABILITIES', {})
+        elif args[:3] == ['skills', 'get', '--cycle']:
+            result = {'bundle_ref': 'accepted1', 'bundle_hash': 'hash1', 'cycle_id': args[3],
+                      'provenance_ref': 'proof1', 'documents': [{'name': 'test', 'content': 'accepted content'}],
+                      'mapping': {'test': ['test']}}
+        elif args[:2] == ['skills', 'export']:
+            result = {'destination': args[args.index('--destination') + 1],
+                      'baseline_skills': 'output/skills', 'skill_map': 'output/map.json', 'bundle_ref': 'accepted1'}
         elif args == ['skills', 'get']:
             result = {'bundle_ref': 'baseline1', 'documents': [{'name': 'test', 'content': 'original content'}],
                       'mapping': {'test': ['test']}}
@@ -68,7 +75,7 @@ def settle(app, response):
 
 
 @pytest.mark.parametrize('mode', ['phase1', 'phase2'])
-@pytest.mark.parametrize('operation', ['start', 'stop', 'resume', 'revisit'])
+@pytest.mark.parametrize('operation', ['start', 'stop', 'resume', 'revisit', 'adopt'])
 def test_phase_argv_and_idempotency(execution, mode, operation):
     app, client, calls, headers = execution
     payload = dict(action='phase', mode=mode, operation=operation,
@@ -243,3 +250,62 @@ def test_execution_without_idempotency_key_never_dispatches(execution):
         json=dict(action='phase', mode='phase1', operation='start'))
     assert response.status_code == 409
     assert calls == []
+
+
+
+@pytest.mark.parametrize('operation', ['start', 'revisit'])
+def test_phase_inheritance_arguments_and_default_preservation(execution, operation):
+    app, client, calls, headers = execution
+    payload = dict(action='phase', mode='phase2', operation=operation,
+                   job_id='prior-job', cycle_id='new-cycle')
+    assert settle(app, client.post('/api/rsi/execute', json=payload,
+                                  headers=mutation_headers(headers)))['status'] == 'succeeded'
+    assert not set(calls[-1][0]) & {'--inheritance', '--from-cycle', '--input-override'}
+    payload.update(from_cycle='accepted-parent', inheritance='parent', input_overrides=['kdb', 'skills'])
+    assert settle(app, client.post('/api/rsi/execute', json=payload,
+                                  headers=mutation_headers(headers)))['status'] == 'succeeded'
+    args = calls[-1][0]
+    assert args[args.index('--from-cycle') + 1] == 'accepted-parent'
+    assert args[args.index('--inheritance') + 1] == 'parent'
+    assert [args[i + 1] for i, arg in enumerate(args) if arg == '--input-override'] == ['kdb', 'skills']
+
+
+@pytest.mark.parametrize('operation', ['stop', 'resume', 'adopt'])
+def test_retained_operations_reject_new_inheritance(execution, operation):
+    _, client, calls, headers = execution
+    response = client.post('/api/rsi/execute', headers=mutation_headers(headers),
+        json=dict(action='phase', mode='phase2', operation=operation, job_id='prior-job',
+                  from_cycle='another-parent', inheritance='parent'))
+    assert response.status_code == 409
+    assert calls == []
+
+
+def test_accepted_skill_read_and_folder_export(execution):
+    app, client, calls, headers = execution
+    value = client.get('/api/rsi/published-skills', query_string={'cycle': 'inference-one'}).json
+    assert calls[-1][0] == ['skills', 'get', '--cycle', 'inference-one']
+    assert value['documents'][0]['content'] == 'accepted content'
+    assert value['bundle_ref'] == 'accepted1'
+    for selection in ['cycle', 'builtin']:
+        operation = settle(app, client.post('/api/rsi/execute', headers=mutation_headers(headers),
+            json=dict(action='skill-export', selection=selection, cycle_id='inference-one',
+                      destination='/node/output with spaces')))
+        assert operation['status'] == 'succeeded'
+        args, options = calls[-1]
+        expected = ['--cycle', 'inference-one'] if selection == 'cycle' else ['--builtin']
+        assert args == ['skills', 'export', *expected, '--destination', '/node/output with spaces']
+        assert options['shell'] is False
+        assert operation['result']['bundle_ref'] == 'accepted1'
+    assert client.get('/api/rsi/published-skills?cycle=inference-one',
+        environ_base={'REMOTE_ADDR': '192.0.2.1'}).status_code == 403
+
+
+def test_ledger_keeps_authoritative_uncertainty():
+    from dashboard.rsi_ledger import task_inspection
+    task = dict(task_id='numeric', clock_domain='controller',
+        intervals={'run': ['execution', 10, 12]}, timing_uncertainties={'remote': 'overlap unresolved'},
+        actor_union_seconds=None, accounting_state='uncertain', charged_seconds={'execution': 2})
+    assert task_inspection(task)['actor_union_seconds'] is None
+    assert task_inspection(task)['accounting_state'] == 'uncertain'
+    del task['actor_union_seconds']
+    assert task_inspection(task)['actor_union_seconds'] is None
