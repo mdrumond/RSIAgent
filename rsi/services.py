@@ -726,15 +726,15 @@ class BoundCycle(TuningBindings):
         """Delegate one dispatch to the shared controller; no service driver loop."""
         events = self.scheduler.extension_events()
         due = next((e for e in events if e['kind'] in ('tuning_due', 'manual_tuning')), None)
-        if due is not None and not self.tuning.state['pending']:
+        recovery_due = any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due') for e in events)
+        if due is not None and not self.tuning.state['pending'] and not recovery_due:
             if (due['kind'] == 'tuning_due' and due.get('reasons') == ['wave_end']
                     and not self.config.get('tuning', {}).get('at_wave_end', True)):
                 ref = self.store.put_json(dict(event=due['id'], decision='skipped', reason='wave_end_disabled'))
                 self.scheduler.complete_extension(due['id'], ref)
                 return dict(decision='skipped', evidence_ref=ref)
-            if not any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due') for e in events):
-                self.tuning_settings()
-                self.tuning_project(due)
+            self.tuning_settings()
+            self.tuning_project(due)
 
         return self.tuning.step()
 
