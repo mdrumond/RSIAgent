@@ -827,7 +827,7 @@ def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path, m
     assert result.status == 'infrastructure-unverified'
     assert trial.candidate.compile_calls == 1
     assert result.verified is None and result.memory_entry_sha256 is None
-    assert trial.memory.read() == () or not trial.memory.read()
+    assert not trial.memory.read()
     assert session.contexts[-1]['stage'] == 'test'
     assert not any(context['stage'] == 'debug' for context in session.contexts)
     state = json.loads((trial.workdir / 'canonical' / 'workflow.json').read_text())

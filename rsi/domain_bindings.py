@@ -432,7 +432,8 @@ def a3_adoption():
         from benchmarks.a3kernels.phase1_protocol import VerifiedResult
         return TrialResult('passed' if result['status'] == 'accepted' else
             host.failure_classification or result['status'], len(result['history']),
-            sum(e.get('completion_tokens', 0) for e in runner.events),
+            getattr(getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None),
+                'completion_tokens', sum((e.get('usage') or {}).get('completion_tokens', 0) or 0 for e in runner.events)),
             host.verified if isinstance(host.verified, VerifiedResult) else None,
             host.profile, host.queries, tuple(host.failures), entry_ref)
     return CanonicalAdoption(build, finish)
