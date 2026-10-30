@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}RSI inputs{% endblock %}
+{% block body %}
+<link rel="stylesheet" href="{{ url_for('static', filename='rsi_inputs.css') }}">
+<section id="rsi-inputs" data-enabled="{{ 'true' if enabled else 'false' }}">
+<h1>RSI inputs</h1>
+<p>Edit the inputs for future projects. Running projects keep their existing settings.</p>
+{% if not enabled %}<p>Read-only view. Editing is disabled.</p>{% endif %}
+<p id="input-status" role="status" aria-live="polite">Loading settings…</p>
+<button id="reload-inputs" type="button">Reload settings</button>
+<form id="inputs-form"><fieldset id="input-fields" disabled>
+<section class="control-panel"><h2>Preparation prompts</h2><div id="prompt-fields"></div></section>
+<section class="control-panel"><h2>Baselines</h2><p>Choose baseline folders or enter file references. Provider credentials stay in external configuration.</p><div id="baseline-fields"></div></section>
+<section class="control-panel"><h2>Actors and providers</h2><div id="actor-fields"></div></section>
+<section class="control-panel"><h2>Project budgets</h2><p>Actor time includes thinking, compilation, execution and profiling. Setup and remote copying are excluded. Wall time includes all elapsed time.</p><div id="budget-fields"></div></section>
+<section class="control-panel"><h2>Phase 1 projects</h2><p>Small experiments, demonstrations and microbenchmarks.</p><div id="phase1-projects"></div><button type="button" data-add="phase1_projects">Add project</button></section>
+<section class="control-panel"><h2>Phase 2 projects</h2><p>End-to-end projects with performance goals.</p><div id="phase2-projects"></div><button type="button" data-add="phase2_projects">Add project</button></section>
+<section class="control-panel"><h2>Recovery and skill evaluation</h2><div id="policy-fields"></div></section>
+<details class="control-panel"><summary>Advanced settings</summary><p>Additional settings, skill overrides and mappings are preserved. Use references rather than credentials.</p><label>Complete configuration JSON<textarea id="advanced-settings" rows="18" spellcheck="false"></textarea></label><button type="button" id="apply-advanced">Apply JSON to form</button></details>
+<button type="submit">Save settings</button>
+</fieldset></form>
+<dialog id="folder-browser"><h2>Choose a node folder</h2><p id="folder-status" role="status"></p><div id="folder-roots"></div><div id="folder-list"></div><button type="button" id="select-folder">Use this folder</button><button type="button" id="close-folders">Cancel</button></dialog>
+</section>
+<script src="{{ url_for('static', filename='rsi_inputs.js') }}" defer></script>
+{% endblock %}
