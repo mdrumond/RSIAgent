@@ -44,12 +44,13 @@ def comparison(tmp_path, env, request):
         return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
     def create(**kwargs):
         remaining = kwargs.pop('remaining_parent', {'actor_seconds': 30})
+        repetitions = kwargs.pop('repetitions', 1)
         return SkillEvaluation.create(tmp_path / 'evaluation.json', checkpoints=[heldout],
             training=[case_identity(training)], artifacts=store, memory_ref=memory,
             kdb_ref=store.put_bytes(b'baseline knowledge'), model_config={'model': 'TEST'},
             incumbent=incumbent, candidate=candidate, runner_factory=factory,
             joint_limits=BudgetLimits(6, 4, 40, 30), remaining_parent=remaining,
-            case_count=1, repetitions=1, **kwargs)
+            case_count=1, repetitions=repetitions, **kwargs)
     yield create, learner, calls, store, heldout, training, factory
     heldout_db.close()
     training_db.close()
@@ -72,6 +73,12 @@ def test_real_pairs_promote_only_after_entire_frozen_suite(comparison):
     result = finish(evaluation)
     assert result['decision'] == 'benefit'
     assert result['actor_seconds'] > 0
+    pair = store.read_json(result['pairs'][0])
+    assert pair['decision'] == 'benefit'
+    assert pair['arms']['incumbent']['task_failure'] is True
+    proof = store.read_json(pair['arms']['incumbent']['terminal_failure_ref'])
+    assert any(store.read_json(ref)['classification'] == 'numeric_failure'
+               for ref in proof['command_receipts'])
     assert calls == [('incumbent', False), ('candidate', False)]
     assert evaluation.promote(learner) == evaluation.plan['candidate']
     assert learner.active == evaluation.plan['candidate']
@@ -296,3 +303,43 @@ def test_actual_correctness_pass_cannot_promote_performance_shortfall(comparison
     assert result['decision'] == 'inconclusive'
     assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'forced-validation') == evaluation.plan['incumbent']
     assert learner.active == evaluation.plan['incumbent']
+
+
+@pytest.mark.parametrize('repetitions', [1, 2])
+def test_provider_only_variance_cannot_promote_even_alongside_task_benefit(comparison, repetitions):
+    from coding.pi.rpc import PiDeadlineError
+    create, learner, _, store, _, _, _ = comparison
+    evaluation = create(repetitions=repetitions)
+    learner.validate = evaluation.validation
+    factory = evaluation.factory
+    failed_once = False
+    class ClosedProvider(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'design' and any(e['name'] == 'query_kdb' for e in context['evidence']):
+                raise PiDeadlineError('Observed closed provider before any task command')
+            return super().next_action(context, allowed, **kwargs)
+    def trial(request, *, reopen):
+        nonlocal failed_once
+        runner = factory(request, reopen=reopen)
+        if not reopen and request.arm == 'incumbent' and not failed_once:
+            failed_once = True
+            runner.actor.session_factory = lambda: ClosedProvider()
+        return runner
+    evaluation.factory = trial
+    result = finish(evaluation)
+    raw = [store.read_json(ref) for ref in result['pairs']]
+    assert raw[0]['decision'] == 'inconclusive'
+    old, new = raw[0]['arms']['incumbent'], raw[0]['arms']['candidate']
+    assert old['classification'] == 'provider_timeout' and old['task_failure'] is False
+    assert new['outcome'] == 'accepted' and new['correctness'] is True
+    proof = store.read_json(old['terminal_failure_ref'])
+    assert proof['pending'] and proof['retrieval_receipts'] and not proof['command_receipts']
+    assert result['actor_seconds'] == sum(arm['actor_seconds'] for pair in raw for arm in pair['arms'].values()) > 0
+    assert result['actor_seconds'] <= evaluation.plan['parent']['actor_seconds']
+    if repetitions == 2:
+        assert raw[1]['decision'] == 'benefit'
+        assert raw[1]['arms']['incumbent']['task_failure'] is True
+    assert result['decision'] == 'inconclusive'
+    assert evaluation.promote(learner) == evaluation.plan['incumbent']
+    # Even direct Learning validation cannot reinterpret a provider-only failure.
+    assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'provider-validation') == evaluation.plan['incumbent']
