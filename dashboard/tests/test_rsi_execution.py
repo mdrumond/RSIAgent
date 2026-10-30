@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import time
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,10 @@ def execution(tmp_path):
     app.extensions['dashboard_controls'].close()
 
 
+def mutation_headers(headers):
+    return {**headers, 'Idempotency-Key': uuid.uuid4().hex}
+
+
 def settle(app, response):
     assert response.status_code == 202, response.data
     for _ in range(500):
@@ -86,7 +91,7 @@ def test_phase_argv_and_idempotency(execution, mode, operation):
 def test_inference_project_is_real_temp_file_and_recovery_is_explicit(execution, recover):
     app, client, calls, headers = execution
     project = {'project_id': 'sum', 'goal': 'numeric', 'command': ['python', 'verify.py']}
-    response = client.post('/api/rsi/execute', headers=headers,
+    response = client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(action='phase', mode='inference', operation='start', project=project,
                   recover=recover))
     assert settle(app, response)['status'] == 'succeeded'
@@ -112,12 +117,12 @@ def test_guards_apply_to_direct_and_generic_queue(execution):
     app, client, calls, headers = execution
     payload = dict(action='phase', mode='phase1', operation='start')
     assert client.post('/api/rsi/execute', json=payload).status_code == 403
-    assert client.post('/api/control/rsi-execute', json=payload, headers=headers,
+    assert client.post('/api/control/rsi-execute', json=payload, headers=mutation_headers(headers),
                        environ_base={'REMOTE_ADDR': '192.0.2.1'}).status_code == 403
-    assert client.post('/api/rsi/execute', json={'action': 'manual-tuning'}, headers=headers).status_code == 409
-    assert client.post('/api/rsi/execute', json=dict(payload, mode='shell'), headers=headers).status_code == 409
+    assert client.post('/api/rsi/execute', json={'action': 'manual-tuning'}, headers=mutation_headers(headers)).status_code == 409
+    assert client.post('/api/rsi/execute', json=dict(payload, mode='shell'), headers=mutation_headers(headers)).status_code == 409
     app.extensions['dashboard_controls'].enabled = False
-    assert client.post('/api/rsi/execute', json=payload, headers=headers).status_code == 403
+    assert client.post('/api/rsi/execute', json=payload, headers=mutation_headers(headers)).status_code == 403
     assert client.get('/rsi/execution').status_code == 200
     assert all(call[0] == ['capabilities'] for call in calls)
 
@@ -126,21 +131,21 @@ def test_real_ingestion_and_export_arguments_are_forwarded(execution):
     app, client, calls, headers = execution
     payload = dict(action='add-repo', source='/node/repo with spaces', collection='new-code',
         repository='local-repo', negative_records='/node/negatives.json', revision='config-before-ingestion')
-    assert settle(app, client.post('/api/rsi/execute', json=payload, headers=headers))['status'] == 'succeeded'
+    assert settle(app, client.post('/api/rsi/execute', json=payload, headers=mutation_headers(headers)))['status'] == 'succeeded'
     args, options = calls[-1]
     assert args[:2] == ['kdb-add-repo', payload['source']]
     assert args[args.index('--negative-records') + 1] == payload['negative_records']
     assert args[args.index('--expect-revision') + 1] == 'config-before-ingestion'
     assert not set(args) & {'--database', '--database-kind', '--embedding-cache', '--evidence-store'}
     assert options['timeout'] == 1800
-    assert settle(app, client.post('/api/rsi/execute', headers=headers,
+    assert settle(app, client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(action='export', task='/node/task', destination='/node/export')))['status'] == 'succeeded'
     assert calls[-1][0] == ['evidence-export', '/node/task', '/node/export']
 
 
 def test_unavailable_cli_fails_queue_without_echoing_stderr(execution):
     app, client, _, headers = execution
-    result = settle(app, client.post('/api/rsi/execute', headers=headers,
+    result = settle(app, client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(action='phase', mode='phase2', operation='stop', job_id='missing')))
     assert result['status'] == 'failed'
     assert result['result'] is None
@@ -167,7 +172,7 @@ def test_inspection_preserves_host_union_and_unknown_budgets():
 def test_capability_gated_manual_tuning_freezes_user_guidance(execution):
     app, client, calls, headers = execution
     app.config['TEST_CAPABILITIES'] = {'manual_tuning': True}
-    response = client.post('/api/rsi/execute', headers=headers,
+    response = client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(action='manual-tuning', cycle_id='cycle-one', project_id='sha256:project',
                   guidance='Keep numerical error detection; investigate prior failures.'))
     assert settle(app, response)['status'] == 'succeeded'
@@ -183,7 +188,7 @@ def test_immutable_skill_editor_revision_and_mapping_boundary(execution):
     assert baseline['revision'] == 'baseline1'
     draft = dict(action='skill-content', revision=baseline['revision'],
                  name='test', content='revised complete SKILL.md')
-    operation = settle(app, client.post('/api/rsi/execute', json=draft, headers=headers))
+    operation = settle(app, client.post('/api/rsi/execute', json=draft, headers=mutation_headers(headers)))
     assert operation['status'] == 'succeeded'
     assert operation['result']['bundle_ref'] == 'baseline2'
     args, _, captured = calls[-1]
@@ -192,7 +197,7 @@ def test_immutable_skill_editor_revision_and_mapping_boundary(execution):
     assert captured == draft['content']
     assert not Path(args[args.index('--file') + 1]).exists()
     mapping = {'test': ['test']}
-    operation = settle(app, client.post('/api/rsi/execute', headers=headers,
+    operation = settle(app, client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(action='skill-map', revision='baseline2', step_map=mapping)))
     assert operation['status'] == 'succeeded'
     args, _, captured = calls[-1]
@@ -225,8 +230,16 @@ def test_ledger_closed_intervals_union_latest_snapshot_and_unresolved():
 def test_instance_ingestion_retains_defaults_and_rejects_standalone_overrides(execution):
     app, client, calls, headers = execution
     payload = dict(action='add-repo', source='/node/repo', collection='new-code', repository='local')
-    assert settle(app, client.post('/api/rsi/execute', json=payload, headers=headers))['status'] == 'succeeded'
+    assert settle(app, client.post('/api/rsi/execute', json=payload, headers=mutation_headers(headers)))['status'] == 'succeeded'
     assert calls[-1][0] == ['kdb-add-repo', '/node/repo', '--collection', 'new-code', '--repository', 'local']
-    assert client.post('/api/rsi/execute', headers=headers,
+    assert client.post('/api/rsi/execute', headers=mutation_headers(headers),
         json=dict(payload, database='/old/baseline.sqlite3')).status_code == 409
     assert len(calls) == 1
+
+
+def test_execution_without_idempotency_key_never_dispatches(execution):
+    _, client, calls, headers = execution
+    response = client.post('/api/rsi/execute', headers=headers,
+        json=dict(action='phase', mode='phase1', operation='start'))
+    assert response.status_code == 409
+    assert calls == []
