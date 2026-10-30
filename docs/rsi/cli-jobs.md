@@ -69,3 +69,26 @@ charged/excluded durations, the canonical actor union, remaining allocations and
 skill references. Category durations can overlap: use actor_union_seconds for the
 charged total. Active or uncertain actor totals remain null; bounded remaining
 values that cannot be established are omitted. Disabled caps are explicitly null.
+
+## Phase inputs and delivered skills
+
+Start/revisit accept --from-cycle CYCLE, --inheritance auto|parent|baseline and
+repeat --input-override memory|skills|kdb. Inputs enter a NEW cycle through the
+shared service. Phase1 always uses baselines and rejects parent inheritance.
+Resume keeps the original frozen contract and accepts no new inheritance flags.
+Automatic Phase2 uses accepted Phase1 memory; inference uses published validated
+Phase2 heads. Explicit parent acknowledges inheritance; baseline ignores parents.
+A component override uses the current baseline for that component. The service
+records immutable choice/provenance. New curriculum/execution/prompts stay current.
+
+skills get --cycle CYCLE reads published validated skills, optionally one NAME.
+skills export --cycle CYCLE --destination NEWDIR delivers a reusable baseline.
+skills export --builtin --destination NEWDIR delivers starter templates without
+an instance. Read/export dispatch no actor and need no model setup receipt;
+pinned instance machinery integrity is still verified.
+
+The destination must be new. It contains NAME/SKILL.md, map.json, exact bundle.json
+and export.json inventory/provenance/CAS reference/SkillBundle hash. Pending or
+quarantined candidates are not selected. Atomic publication cannot replace an
+existing destination. Use the folder as --baseline-skills and its map.json as
+--skill-map in fresh instance creation, without opaque-CAS manual reconstruction.

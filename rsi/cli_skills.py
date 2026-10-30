@@ -63,6 +63,10 @@ def _project(instance, reference):
 
 
 def execute(args):
+    if args.skill_action == 'export' and args.builtin:
+        from .skill_delivery import export_bundle
+        from .skills import builtin_bundle
+        return export_bundle(builtin_bundle(), args.destination, source={'kind': 'builtin'})
     if args.skill_action == 'get':
         return inspect_skills(args.instance, args.name, builtin=args.builtin)
     if args.skill_action == 'map' and args.map_action == 'inspect':

@@ -76,3 +76,12 @@ def test_write_failure_retains_no_delivery_and_cleans_only_own_staging(tmp_path,
         export_bundle(builtin_bundle(), destination)
     assert not destination.exists()
     assert not list(tmp_path.glob('.failed-*'))
+
+
+def test_builtin_cli_delivery_needs_no_instance_or_model_setup(tmp_path, capsys):
+    from rsi.cli import main
+    destination = tmp_path / 'starter-baseline'
+    assert main(['skills', 'export', '--builtin', '--destination', str(destination)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['bundle_hash'] == builtin_bundle().digest
+    assert capture(destination) == builtin_bundle()
