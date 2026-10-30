@@ -82,7 +82,7 @@ class DomainActivity:
         self.runner.append(dict(type='domain-dispatch', operation_id=self.operation,
             name=name, category=category, execution=execution))
         from rsi.domain_timing import CURRENT
-        scope = dict(flow=flow, category=category, token=flow.accounting.start(category), excluded=False)
+        scope = dict(flow=flow, category=category, token=flow.accounting.start(category))
         context = CURRENT.set(scope)
         try:
             value = callback(seconds)
@@ -129,6 +129,7 @@ class DomainRunner(ProjectRunner):
         frozen = dict(spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
             backend_identity=injections['backend_identity'], created=injections.get('clock', time.time)())
         reference = host.store.put_json(frozen)
+        root.mkdir(parents=True, exist_ok=True)
         atomic_json(root / 'domain.json', dict(contract=reference))
         return cls(root, host, **injections)
 

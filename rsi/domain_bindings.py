@@ -279,6 +279,7 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
 class A3Host(SourceHost):
     def __init__(self, owner):
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
         self.owner, self.runtime = owner, owner.candidate
         self.control_root = owner.workdir
         self.store = ContentAddressedArtifacts(owner.workdir / 'canonical-artifacts')
@@ -293,7 +294,7 @@ class A3Host(SourceHost):
         self.feedback, self.observations, self.queries, self.actions = [], [], 0, []
         self.instruction = json.dumps(dict(proposal=asdict(owner.proposal),
             profile=owner.profile.as_dict(), execution_profile=owner.execution_profile,
-            source_contract=__import__('benchmarks.a3kernels.candidate', fromlist=['CANDIDATE_SOURCE_CONTRACT']).CANDIDATE_SOURCE_CONTRACT.as_dict(),
+            source_contract=CANDIDATE_SOURCE_CONTRACT.as_dict(),
             memory=json.loads(owner.memory.project_context())), default=str)
         self.identity = dict(target=owner.execution_profile, provider=owner.profile.as_dict(),
             kdb=fingerprint(dict(collection=getattr(owner.knowledge, 'collection', None),
