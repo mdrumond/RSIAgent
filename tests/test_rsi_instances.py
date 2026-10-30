@@ -201,3 +201,27 @@ def test_installed_wheel_bootstraps_outside_checkout(tmp_path, inputs):
         [sys.executable, '-m', 'rsi', 'instance', 'inspect', str(destination)],
         cwd=tmp_path, env=environment, check=True, capture_output=True, text=True)
     assert json.loads(inspected.stdout) == manifest
+
+
+def test_file_url_repository_clone_is_pinned(tmp_path, inputs):
+    repo = tmp_path / 'url-source'
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test')
+    (repo / 'main.py').write_text('print(1)')
+    git(repo, 'add', 'main.py')
+    git(repo, 'commit', '-qm', 'first')
+    pinned = git(repo, 'rev-parse', 'HEAD')
+    (repo / 'main.py').write_text('print(2)')
+    git(repo, 'commit', '-qam', 'second')
+    manifest = create_instance(tmp_path / 'url-instance', repository=repo.as_uri(),
+                               repository_revision=pinned, **inputs)
+    clone = tmp_path / 'url-instance/repository'
+    assert manifest['repository']['revision'] == pinned
+    assert git(clone, 'rev-parse', 'HEAD') == pinned
+    assert (clone / 'main.py').read_text() == 'print(1)'
+    assert git(repo, 'status', '--porcelain') == ''
+    assert git(clone, 'remote') == ''
+    assert not (clone / '.git/objects/info/alternates').exists()
+    assert not any('.git' in Path(name).parts for name in manifest['files'])
