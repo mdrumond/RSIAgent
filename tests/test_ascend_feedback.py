@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend, retained_native
+
 import json
 from pathlib import Path
 
@@ -491,7 +493,7 @@ def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, 
                                    retries=[records[True]['feedback_id']])
 
 
-@pytest.mark.parametrize('window', ['result-event', 'pending-evaluation'])
+@pytest.mark.parametrize('window', ['result-event', 'retained-evaluation'])
 def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, monkeypatch, window):
     from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from optimizer.loop import OptimizationLoop
@@ -518,8 +520,11 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
         original = OptimizationLoop._save
         def crash(loop):
             original(loop)
-            pending = loop.state.get('pending', {})
-            if pending.get('evaluation') and not pending.get('history_recorded'):
+            evaluated = [row for row in loop.state.get('history', [])
+                         if row.get('domain_operation') and row.get('result')]
+            # Interrupt only after the real runner has closed its actor and
+            # settled every stage. History alone is not publication authority.
+            if evaluated and loop.state.get('canonical_active', {}).get('status') == 'accepted':
                 raise RuntimeError('checkpoint crash')
         monkeypatch.setattr(OptimizationLoop, '_save', crash)
     with pytest.raises(RuntimeError, match='checkpoint crash'):
@@ -538,6 +543,11 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
         monkeypatch.setattr(execution.store, 'add_event', original)
     else:
         monkeypatch.setattr(OptimizationLoop, '_save', original)
+        from rsi.optimizer_settlement import require_settled_candidate
+        native = retained_native(execution)
+        assert native.workflow['pending'] is None
+        assert any(row['type'] == 'actor-closure' for row in native.events)
+        require_settled_candidate(execution.job_directory/'execution', execution._state(), stop_requested=False)
     assert execution.attempt('attempt-001')['verified'] is True
     assert (len(agent.contexts), len(backend.evaluations)) == calls
     assert store.import_task_results(root)['imported'] == 1
