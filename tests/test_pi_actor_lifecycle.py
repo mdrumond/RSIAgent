@@ -78,6 +78,10 @@ def test_direct_terminal_distillation_separates_host_result_from_user_feedback(c
     terminal_message = next(message for message in requests[-1]['messages']
                             if message['content'].startswith(DISTILLATION_PROMPT))
     context = json.loads(terminal_message['content'].split('\n')[-1])
-    assert context['workflow_history'][-1] == terminal_history[-1]
+    runner = outcome.continuation.runner
+    assert runner.store.read_json(context['history_ref']) == terminal_history
+    final = context['workflow_history'][-1]
+    assert final['passed'] is True
+    assert final['evidence']['operation_id'] == terminal_history[-1]['evidence']['operation_id']
+    assert final['evidence']['source_hash'] == terminal_history[-1]['evidence']['source_hash']
     assert feedback in json.dumps(requests[-1]['messages'])
-    assert context['workflow_history'] != feedback
