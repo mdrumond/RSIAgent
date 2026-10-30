@@ -87,6 +87,41 @@ def test_unknown_skill_is_not_synthesised(tmp_path):
     assert not any(row[1]['kind'] == 'read' for row in events if row[0] == 'skill-usage')
 
 
+@pytest.mark.parametrize('section', ['', '   '])
+def test_empty_optional_section_delivers_full_contract(tmp_path, section):
+    actions = [(name, dict(args, section=section))
+               for name, args in reads(Stage.TASK_CONSTRUCTION)]
+    actor, flow, session, called, _, events = harness(
+        tmp_path, actions+[('perform', {'proposal': 'construct'})])
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    delivered = session.contexts[-1]['read_skills']
+    assert len(delivered) == len(actions)
+    for row in delivered:
+        assert row['section'] is None
+        assert row['content'] == builtin_bundle().document(row['skill']).content
+
+
+@pytest.mark.parametrize('bad_read', [
+    {'name': 'invented'},
+    {'name': builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)[0],
+     'section': 'invented section'},
+])
+def test_invalid_skill_read_can_recover_without_fabricating_receipts(tmp_path, bad_read):
+    actor, flow, session, called, _, events = harness(tmp_path, [
+        ('read_skill', bad_read), *reads(Stage.TASK_CONSTRUCTION),
+        ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = True
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    assert session.contexts[1]['observation']['accepted'] is False
+    actual_reads = [data for kind, data in events
+                    if kind == 'skill-usage' and data['kind'] == 'read']
+    assert len(actual_reads) == len(reads(Stage.TASK_CONSTRUCTION))
+    assert flow.accounting.seconds('thinking') == 8
+    assert flow.accounting.seconds() == 11
+
+
 def test_preflight_is_host_only_and_does_not_start_model(tmp_path):
     actor, flow, session, called, _, events = harness(tmp_path, [], stage=Stage.PREFLIGHT)
     actor.step({})
@@ -94,6 +129,38 @@ def test_preflight_is_host_only_and_does_not_start_model(tmp_path):
     assert not session.contexts and not called
     assert flow.accounting.seconds() == 0
     assert len([row for row in events if row[0]=='skill-usage' and row[1]['kind']=='read']) == 2
+
+
+def test_skill_names_are_rejected_then_real_read_references_can_be_selected(tmp_path):
+    from rsi.actor import EvidenceTool
+    from coding.pi.schema import obj, STRING
+    names = list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    actor, flow, session, called, _, events = harness(tmp_path, [
+        *reads(Stage.TASK_CONSTRUCTION),
+        ('select_strategy', {'skill_refs': names}),
+        ('select_strategy', {'skill_refs': []}),
+        ('perform', {'proposal': 'construct'})])
+    actor.recover_invalid_actions = True
+    selected = []
+    tool = EvidenceTool(obj({'skill_refs': {'type': 'array', 'items': STRING}}, ['skill_refs']),
+                        lambda stage,args,*_: selected.append(args) or {})
+    actor.evidence_tools['select_strategy'] = tool
+    actor.schemas['select_strategy'] = tool.schema
+    original = session.next_action
+    def next_action(context, *args, **kwargs):
+        name, arguments = original(context, *args, **kwargs)
+        if name == 'select_strategy' and not arguments['skill_refs']:
+            arguments = {'skill_refs': [r['receipt_id'] for r in context['skill_receipts']]}
+        return name, arguments
+    session.next_action = next_action
+    actor.step({})
+    assert flow.stage == Stage.DESIGN and len(called) == 1
+    assert len(selected) == 1
+    assert set(selected[0]['skill_refs']) == set(actor._reads)
+    assert set(selected[0]['skill_refs']).isdisjoint(names)
+    assert session.contexts[-2]['observation']['accepted'] is False
+    assert len([d for k,d in events if k == 'actor-invalid-action']) == 1
+    assert flow.accounting.seconds('thinking') == 10
 
 
 def test_design_does_not_get_fake_retrieval_or_retrospective(tmp_path):

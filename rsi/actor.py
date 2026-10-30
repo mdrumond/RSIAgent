@@ -421,6 +421,26 @@ class WorkflowActor:
                     raise WorkflowError('actor action unavailable in this stage or readiness state')
                 validate(args, self.schemas[name])
                 if name == 'read_skill':
+                    # Optional empty sections from tool callers mean a full read.
+                    # Check model arguments before emitting any usage receipt;
+                    # storage, delivery and timing failures must still propagate.
+                    args = dict(args)
+                    if not args.get('section', '').strip():
+                        args.pop('section', None)
+                    error = None
+                    if args['name'] not in names:
+                        error = 'skill must be exposed before read'
+                    elif ('section' in args and args['section'] not in
+                          self.bundle.document(args['name']).sections):
+                        error = 'unknown skill section'
+                    if error is not None:
+                        if not self.recover_invalid_actions:
+                            raise ValueError(error)
+                        observation = dict(event='invalid-action', action=name,
+                                           error=error, accepted=False,
+                                           allowed=list(allowed))
+                        record('actor-invalid-action', observation)
+                        continue
                     text = self._timed('retrieval', lambda: usage.read(args['name'], args.get('section')))
                     receipt = usage.last_read_receipt
                     # A section read is genuine evidence, but does not replace the
@@ -442,6 +462,15 @@ class WorkflowActor:
                         receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
+                    if ('skill_refs' in args and
+                            any(ref not in self._reads for ref in args['skill_refs'])):
+                        error = 'skill_refs must contain current host read receipt IDs, not skill names'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', action=name, error=error,
+                                           accepted=False, skill_receipts=inventory['skill_receipts'])
+                        record('actor-invalid-action', observation)
+                        continue
                     seconds = self._available()
                     observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
                         stage, args, operation, seconds))
@@ -471,6 +500,17 @@ class WorkflowActor:
                         if not self.recover_invalid_actions:
                             raise WorkflowError(error)
                         observation = dict(event='invalid-action', error=error, accepted=False, allowed=list(allowed))
+                        record('actor-invalid-action', observation)
+                        continue
+                if stage == Stage.OPTIMISATION:
+                    decisions = [row['result'].get('evidence', {}) for row in evidence_material
+                                 if row['name'] == 'optimisation_decision']
+                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args):
+                        error = 'optimisation decision does not match edit; noop/profile must omit edit'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', error=error, accepted=False,
+                                           optimisation_decision=decisions[-1])
                         record('actor-invalid-action', observation)
                         continue
                 seconds = self._available()
