@@ -191,5 +191,54 @@ def test_stop_never_signals_reused_or_dead_process_identity(tmp_path, monkeypatc
     monkeypatch.setattr(jobs, '_alive', lambda _: False)
     def forbidden(*_):
         pytest.fail('must never open or signal a reused process identity')
-    monkeypatch.setattr(dashboard_runtime.os, 'pidfd_open', forbidden)
+    monkeypatch.setattr(jobs, '_pidfd_open', forbidden)
     assert dashboard_runtime.stop(root)['state'] == 'interrupted'
+
+
+def test_owned_dashboard_processes_get_distinct_ports_and_stop(tmp_path):
+    import shutil
+    import time
+    import urllib.request
+    from rsi.instances import create_instance
+    kdb = tmp_path / 'kdb.json'
+    kdb.write_text('{}')
+    skills = tmp_path / 'skills'
+    skills.mkdir()
+    mapping = tmp_path / 'map.json'
+    mapping.write_text('{}')
+    first = tmp_path / 'first'
+    create_instance(first, baseline_kdb=kdb, baseline_skills=skills, skill_map=mapping)
+    # Use this test's existing Python dependencies, without installing or networking.
+    # The owned executable is explicit test support, not a successful setup claim.
+    interpreter = first / 'runtime/python/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    import shlex
+    interpreter.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
+    interpreter.chmod(0o755)
+    _, _, digest = instance_setup.machinery(first)
+    (first / 'runtime/setup.json').write_text(json.dumps(
+        {'state': 'ready', 'machinery_hash': digest, 'node': shutil.which('node') or '/usr/bin/node'}))
+    second = tmp_path / 'second'
+    shutil.copytree(first, second)
+    records = []
+    try:
+        for root in (first, second):
+            receipt = dashboard_runtime.start(root)
+            records.append(receipt)
+            assert receipt['state'] == 'running', receipt
+            assert urllib.request.urlopen(receipt['url'], timeout=5).status == 200
+        assert records[0]['port'] != records[1]['port']
+        for root in (first, second):
+            dashboard_runtime.stop(root)
+            deadline = time.monotonic() + 5
+            while dashboard_runtime.status(root)['state'] == 'running' and time.monotonic() < deadline:
+                time.sleep(.05)
+            assert dashboard_runtime.status(root)['state'] == 'stopped'
+    finally:
+        for root in (first, second):
+            dashboard_runtime.stop(root)
+        for record in records:
+            try:
+                os.waitpid(record['process']['pid'], 0)
+            except (ChildProcessError, KeyError):
+                pass

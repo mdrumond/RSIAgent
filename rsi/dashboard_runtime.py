@@ -91,7 +91,7 @@ def start(instance, *, port=0, wait_seconds=15):
 
 
 def stop(instance):
-    from .jobs import _alive
+    from .jobs import _alive, _pidfd_open
     _, _, _, directory = _paths(instance)
     record = status(instance)
     if record['state'] in ('not_started', 'stopped', 'failed', 'interrupted'):
@@ -112,7 +112,7 @@ def stop(instance):
         return record
     if identity:
         try:
-            descriptor = os.pidfd_open(identity['pid'])
+            descriptor = _pidfd_open(identity['pid'])
         except ProcessLookupError:
             return status(instance)
         try:
