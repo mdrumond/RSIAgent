@@ -184,3 +184,60 @@ function change(input,value) {input.value=value;input.dispatchEvent({type:'input
 '''
     subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/rsi_inputs.js')],
                    check=True, capture_output=True, text=True, timeout=20)
+
+
+
+def test_existing_project_omitted_budgets_keep_contract_defaults_after_prompt_edit():
+    from pathlib import Path
+    import shutil
+    import subprocess
+    from rsi.contracts import ProjectSpec
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is unavailable')
+    original = dict(project_id='existing-numeric', goal='Preserve existing limits',
+                    command=['python', 'verify.py'])
+    script = r"""
+const assert=require('node:assert/strict'),vm=require('node:vm');
+class Element {
+ constructor(tag){this.tagName=tag;this.children=[];this.listeners={};this.dataset={};this.value='';}
+ append(...items){this.children.push(...items);} replaceChildren(...items){this.children=items;}
+ setAttribute(k,v){this[k]=v;} setCustomValidity(v){this.invalid=v;}
+ addEventListener(k,f){this.listeners[k]=f;} dispatchEvent(e){this.listeners[e.type]?.(e);}
+ showModal(){} close(){}
+}
+const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);};
+get('rsi-inputs').dataset.enabled='true';get('rsi-inputs').querySelectorAll=()=>[];
+const original=JSON.parse(process.argv[2]);
+const baseline={prompts:{actor:'original guidance'},budgets:{design_iterations:99},
+ phase1_projects:[original],phase2_projects:[],project_configs:{'existing-numeric':{
+ source:'/old/source',verifier:'/old/verifier.py',editable_files:['solution.py'],commands:{
+ compile:['python','-m','py_compile','solution.py'],test:['python','verify.py'],validation:['python','verify.py']}}}};
+let posted;
+const context={document:{getElementById:get,createElement:tag=>new Element(tag),body:{dataset:{csrf:'token'}}},
+ Event:class{constructor(type){this.type=type;}},crypto:{randomUUID:()=> 'roundtrip'},
+ setTimeout:fn=>fn(),console,fetch:async(url,options)=>{
+ let value;
+ if(url==='/api/rsi/config'&&options){posted=JSON.parse(options.body);value={operation_id:'saved'};}
+ else if(url.startsWith('/api/operations/'))value={status:'succeeded',result:{revision:'new',payload:posted.payload}};
+ else value={revision:'old',payload:baseline};
+ return {ok:true,json:async()=>value};
+}};
+vm.runInNewContext(require('node:fs').readFileSync(process.argv[1],'utf8'),context);
+const flatten=n=>[n,...n.children.filter(c=>typeof c==='object').flatMap(flatten)];
+(async()=>{
+ await new Promise(resolve=>setImmediate(resolve));
+ const prompt=flatten(get('prompt-fields')).find(n=>n['aria-label']==='Actor instructions');
+ prompt.value='Changed only actor instructions';prompt.dispatchEvent({type:'input'});
+ await get('inputs-form').onsubmit({preventDefault(){}});
+ assert.ok(posted);assert.equal(posted.payload.budgets.design_iterations,99);
+ assert.equal(posted.payload.prompts.actor,'Changed only actor instructions');
+ process.stdout.write(JSON.stringify(posted.payload));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+    completed = subprocess.run([node, '-e', script,
+        str(Path(__file__).parents[1] / 'static/rsi_inputs.js'), json.dumps(original)],
+        check=True, capture_output=True, text=True, timeout=20)
+    saved = json.loads(completed.stdout)
+    assert ProjectSpec.from_dict(saved['phase1_projects'][0]).budgets == ProjectSpec.from_dict(original).budgets
+    assert saved['budgets']['design_iterations'] == 99

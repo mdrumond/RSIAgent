@@ -82,7 +82,7 @@
         field(card, title, project, key, {json: key === 'command', array: key === 'command', fallback: [], multiline: key === 'goal',
           folder: key === 'starting_folder', nullable: ['starting_folder', 'repository_ref', 'correctness_ref', 'performance_goal'].includes(key)});
       }
-      project.budgets ||= copy(payload.budgets);
+      project.budgets ||= {};
       const detail = element('details'); detail.append(element('summary', 'Project budgets')); card.append(detail); budgets(detail, project.budgets);
       card.append(button('Remove project', () => { payload[name].splice(index, 1); render(); }));
     });
