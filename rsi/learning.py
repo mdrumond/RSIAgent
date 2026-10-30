@@ -426,7 +426,8 @@ class Learning:
                     and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True, document=doc)):
                 raise ValueError('replacement deletes guidance without removal authorisation')
             fragment = edit.content if edit.operation == 'append' else replacement
-            if re.search(r'^#{1,2} |^---$', fragment, re.MULTILINE):
+            pattern = r'^#{1,6}(?:[ \t]|$)|^---[ \t]*$' if edit.operation == 'append' else r'^#{1,2} |^---$'
+            if re.search(pattern, fragment, re.MULTILINE):
                 raise ValueError('learned fragment cannot change document structure')
             marker = '## Learned guidance\n'
             if learned:

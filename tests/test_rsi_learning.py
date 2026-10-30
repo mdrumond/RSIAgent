@@ -550,6 +550,7 @@ def test_append_preserves_exact_guidance_metadata_mapping_and_proposal_wire(env)
 
 @pytest.mark.parametrize('skill, operation, fragment', [
     ('debug', 'append', '## Learned guidance\nExtra advice.'),
+    ('debug', 'append', '### Numeric guidance\nExtra advice.'),
     ('debug', 'append', '---\nname: debug\ndescription: Advice\n---\nExtra advice.'),
     ('unknown-skill', 'append', 'Extra advice.'),
     ('debug', 'unsupported', 'Extra advice.'),
