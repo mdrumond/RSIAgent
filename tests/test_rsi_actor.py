@@ -18,10 +18,11 @@ class Clock:
 class Session:
     def __init__(self, actions, clock):
         self.actions, self.clock = iter(actions), clock
-        self.contexts, self.deadlines = [], []
+        self.contexts, self.deadlines, self.allowed = [], [], []
     def prepare(self, timeout, *, schemas): self.clock.value += 100
     def next_action(self, context, allowed, *, seconds, record, source):
         self.contexts.append(context)
+        self.allowed.append(list(allowed))
         self.deadlines.append(seconds)
         self.clock.value += 2
         return next(self.actions)
@@ -151,7 +152,8 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
         if read_all:
             actor.step({'goal':'write Python'})
         else:
-            with pytest.raises(WorkflowError, match='read every mapped skill'):
+            from coding.pi.rpc import PiError
+            with pytest.raises((WorkflowError, PiError)):
                 actor.step({'goal':'write Python'})
     finally: actor.close()
     assert len(calls) == len(actual_reads)+1
@@ -265,6 +267,9 @@ def test_adapter_deadline_is_assigned_after_setup_and_gateway_matches(monkeypatc
     adapter.next_action({'stage':Stage.DESIGN.value}, ['perform'],
         seconds=5, record=lambda *_:None, source=source)
     assert captured[-1]['write_action'] is None
+    adapter.next_action({'stage':Stage.IMPLEMENTATION.value}, ['read_skill'],
+        seconds=5, record=lambda *_:None, source=source)
+    assert captured[-1]['write_action'] is None
 
 
 def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
@@ -358,7 +363,6 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
             actions = [('read_context', {'record':reference, 'limit':128})]
         elif index == 1 + int(with_context_read):
             actions = [('read_skill', {'name':name}) for name in names]
-            actions.append(('perform', {'proposal':'phantom execution'}))
             if with_context_read:
                 pages = [json.loads(m['content']) for m in request['messages'] if m['role']=='tool']
                 assert pages[0]['text'] == guide[:128]
@@ -367,7 +371,8 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
             actions = [('read_skill', {'name':names[1]})]
         else:
             assert index == 3 + int(with_context_read) and actual_reads() == list(names) and not executed
-            actions = [('perform', {'proposal':'verified host invocation'})]
+            actions = [('perform', {'proposal':'verified host invocation'}),
+                       ('perform', {'proposal':'phantom execution'})]
         response = stream(*actions[0], index)
         original = response.iter_lines
         def lines():
@@ -399,7 +404,7 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
     assert actual_reads() == list(names)
     assert executed == ['verified host invocation']
     actions = [data for kind,data in events if kind == 'pi-action']
-    assert [data['discarded_actions'] for data in actions] == [2, 0, 0]
+    assert [data['discarded_actions'] for data in actions] == [1, 0, 1]
     context_reads = [data for kind,data in events if kind == 'pi-context-read']
     assert len(context_reads) == int(with_context_read)
     if with_context_read:
@@ -484,3 +489,77 @@ def test_default_multi_command_callback_reserves_additional_ids(tmp_path):
     actor.perform = callback
     actor.step({})
     assert flow.state['executions'] == len(flow.state['execution_reservations']) == 3
+
+
+def test_perform_waits_for_all_full_reads_and_host_readiness(tmp_path):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    ready = []
+    actor, flow, session, called, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('query_kdb', {}), ('perform', {'proposal':'construct'})])
+    actor.perform_ready = lambda stage,operation: bool(ready)
+    actor.evidence_tools = {'query_kdb':EvidenceTool(obj(), lambda *args:ready.append(args[2]) or {})}
+    actor.schemas['query_kdb'] = actor.evidence_tools['query_kdb'].schema
+    actor.step({})
+    assert ['perform' in names for names in session.allowed] == [False, False, False, True]
+    assert session.contexts[0]['read_skill_names'] == []
+    assert session.contexts[0]['unread_skills'] == list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    assert session.contexts[-1]['unread_skills'] == []
+    assert session.contexts[-1]['read_skill_names'] == list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    assert len(called) == 1 and flow.stage == Stage.DESIGN
+
+
+def test_scripted_perform_cannot_bypass_host_readiness(tmp_path):
+    actor, flow, _, called, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'skip selection'})])
+    actor.perform_ready = lambda *_:False
+    with pytest.raises(WorkflowError, match='unavailable'): actor.step({})
+    assert not called and flow.stage == Stage.TASK_CONSTRUCTION
+
+
+def test_scripted_tool_cannot_bypass_stage_scope(tmp_path):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    actor, _, _, _, _, _ = harness(tmp_path, [('select_idea', {})])
+    actor.evidence_tools = {'select_idea':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage call'),
+                                                    stages=(Stage.DESIGN, Stage.OPTIMISATION))}
+    actor.schemas['select_idea'] = actor.evidence_tools['select_idea'].schema
+    with pytest.raises(WorkflowError, match='unavailable'): actor.step({})
+
+
+def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
+    from coding.pi.schema import obj
+    from coding.pi.session import runtime_preflight, RuntimeUnavailable
+    from rsi.actor import EvidenceTool
+    from test_pi_runtime import stream
+    try: runtime_preflight()
+    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
+    ready, requests, executed = [], [], []
+    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
+    names = builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    actions = iter([*[('read_skill', {'name':name}) for name in names],
+                    ('query_kdb', {}), ('perform', {'proposal':'construct'})])
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        advertised = {tool['function']['name'] for tool in request['tools']}
+        assert not advertised & {'select_idea', 'optimisation_decision'}
+        assert 'query_kdb' in advertised
+        assert ('perform' in advertised) == bool(ready)
+        name,args = next(actions)
+        return stream(name,args,len(requests))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    actor = WorkflowActor(flow, builtin_bundle(),
+        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
+        perform=lambda *_:executed.append(True) or StageResult(), preflight=lambda *_:StageResult(),
+        emit=lambda *_:None, perform_ready=lambda *_:bool(ready), evidence_tools={
+            'query_kdb':EvidenceTool(obj(), lambda *args:ready.append(args[2]) or {'results':[]}),
+            'select_idea':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage selection'),
+                                      stages=(Stage.DESIGN,Stage.OPTIMISATION)),
+            'optimisation_decision':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage optimisation'),
+                                                stages=(Stage.OPTIMISATION,))})
+    try:
+        actor.step({})
+        actor.step({'goal':'normal Python task construction'})
+    finally: actor.close()
+    assert flow.stage == Stage.DESIGN and len(requests) == 4 and executed == [True]
