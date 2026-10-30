@@ -9,6 +9,7 @@ description = "RSI programming workflows and shared contracts"
 requires-python = ">=3.10"
 dynamic = ["optional-dependencies"]
 
+
 [project.scripts]
 rsi = "rsi.cli:main"
 
@@ -27,3 +28,4 @@ dashboard = ["templates/*.html", "static/*"]
 
 [tool.setuptools.dynamic.optional-dependencies]
 legacy = {file = ["requirements.txt"]}
+roles = {file = ["requirements-roles.txt"]}
