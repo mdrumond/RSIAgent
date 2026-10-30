@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import RLock
 import time
 from types import SimpleNamespace
+from typing import Protocol
 
 from rsi.actor import StageResult, WorkflowActor
 from rsi.contracts import Stage
@@ -18,6 +19,18 @@ from rsi.project_runner import ProjectRunner
 from rsi.python_execution import atomic_json
 from rsi.runtime import Workflow, WorkflowError
 from rsi.strategy import StrategyEvidence
+
+
+class DomainExecutionProtocol(Protocol):
+    identity: dict
+    editable_files: tuple[str, ...]
+    store: object
+    def project_hash(self) -> str: ...
+    def read(self, path: str) -> dict: ...
+    def edit(self, path: str, text: str, expected_file_hash: str, expected_project_hash: str) -> str: ...
+    def preflight(self, context: dict): ...
+    def execute(self, stage: Stage, args: dict, operation: str, activity) -> 'DomainObservation': ...
+    def context(self) -> dict: ...
 
 
 class CanonicalConfigurationError(ValueError):
@@ -68,17 +81,21 @@ class DomainActivity:
                 raise WorkflowError('domain operation already reserved; observe before resuming')
         self.runner.append(dict(type='domain-dispatch', operation_id=self.operation,
             name=name, category=category, execution=execution))
-        token = flow.accounting.start(category)
+        from rsi.domain_timing import CURRENT
+        scope = dict(flow=flow, category=category, token=flow.accounting.start(category), excluded=False)
+        context = CURRENT.set(scope)
         try:
             value = callback(seconds)
         except BaseException:
-            flow.accounting.unresolved.add(token)
+            flow.accounting.unresolved.add(scope['token'])
             # An exception does not prove a remote operation stopped. Keep the
             # interval unresolved until this host observes authoritative closure.
             self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
-                name=name, interval=token))
+                name=name, interval=scope['token']))
             raise
-        flow.accounting.end(token)
+        finally:
+            CURRENT.reset(context)
+        flow.accounting.end(scope['token'])
         if execution:
             self.executions.append(name)
         self.runner.actor._available()
@@ -104,7 +121,7 @@ class DomainRunner(ProjectRunner):
     use DomainActivity for compilation/execution/profiling and remote copying.
     """
     @classmethod
-    def create(cls, root, spec, bundle, host, **injections):
+    def create(cls, root, spec, bundle, host: DomainExecutionProtocol, **injections):
         root = Path(root)
         if (root / 'domain.json').exists():
             raise FileExistsError('domain task already exists; reopen the same task')
@@ -156,8 +173,22 @@ class DomainRunner(ProjectRunner):
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
             managed_executions=True, perform_ready=self.perform_ready)
         self.workflow.resolver = self.resolve
+        host.workflow = self.workflow
         # Public result/reconciliation fields use the same frozen domain contract.
         self.backend = _HostView(host, self.contract_ref)
+
+    def actor_event(self, kind, data):
+        super().actor_event(kind, data)
+        observer = getattr(self.backend, 'on_actor_event', None)
+        if observer is not None:
+            observer(kind, data)
+
+    def tools(self):
+        tools = super().tools()
+        extra = getattr(self.backend, 'evidence_tools', lambda: {})()
+        if tools.keys() & extra.keys():
+            raise ValueError('domain evidence tool shadows canonical action')
+        return dict(tools, **extra)
 
     def preflight(self, operation, context):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
@@ -232,6 +263,29 @@ class DomainRunner(ProjectRunner):
         if not self.workflow.pending and self.backend.project_hash() != self.workflow.source_hash:
             raise WorkflowError('domain source changed outside workflow; explicit reconciliation required')
         return super().reconcile()
+
+    def run(self):
+        boundary = getattr(self.backend, 'boundary_stage', None)
+        if boundary is None:
+            return super().run()
+        actor = self.actor
+        runner = self
+        class BoundaryActor:
+            def __getattr__(self, name):
+                return getattr(actor, name)
+            def step(self, context):
+                stage = runner.workflow.stage
+                result = actor.step(context)
+                if stage == boundary:
+                    runner.workflow.state['domain_boundary'] = boundary.value
+                    runner.workflow.stop()
+                    raise WorkflowError('requested domain workload boundary reached')
+                return result
+        self.actor = BoundaryActor()
+        try:
+            return super().run()
+        finally:
+            self.actor = actor
 
     def context(self):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:

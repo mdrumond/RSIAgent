@@ -289,6 +289,8 @@ def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
             1,
             {"profile_sha256": profile.fingerprint},
         )
+    wrapped.canonical_actor = actor
+    wrapped.canonical_recovery_source = recovery.source
     return wrapped
 
 

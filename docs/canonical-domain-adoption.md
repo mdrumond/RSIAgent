@@ -61,3 +61,40 @@ been migrated or validated.
 CPU stub-host tests exercise the real canonical workflow, numerical repair,
 actual skill/KDB receipt admission, elapsed accounting and pending-operation
 behavior. They establish no device/compiler/profiler capability.
+
+## Default production bindings
+
+DirectActorDriver/PiActorDriver now select the shared kernel-action binding by
+default. It calls the existing ordinary/adaptive host compile/run/measurement/
+submit handlers per canonical stage, preserving their admission and numerical
+verification gates. It uses the configured Knowledge Agent through its existing
+action protocol and retains both its full result index and actual failures.
+Terminal learning uses the existing registered provider and distillation parser,
+with provider work charged to the same canonical allocation.
+
+A3TrialLoop defaults to its native candidate/compiler, profiler, Knowledge Agent
+and memory journal binding. The existing registered Pi session supplies canonical
+actions. Prepared oracle and host verification remain target-owned. Explicit
+recovery-policy wrappers expose the same underlying actor and starting source.
+
+OptimizationLoop defaults to frozen-reference preparation, its existing bounded
+backend evaluation/profile methods, score verification, and existing job/history
+store. Prepare-only pauses at the task-construction boundary. A subsequent
+programming project links the existing frozen suite and carries the remaining
+parent allocation. Single-evaluation projects perform one backend candidate
+evaluation and validate the retained result against the frozen suite locally;
+they keep the enclosing job available for its next explicitly requested project.
+Cumulative canonical elapsed receipts are idempotent across resume.
+
+These defaults replace the previous requirement that every production caller
+inject a factory. Custom CanonicalAdoption remains supported. An enabled baseline
+KDB is required by the new mandatory retrieval contract; a legacy KDB-disabled
+treatment fails clearly rather than being relabeled as a successful empty query.
+CoreAttemptDriver has no active production constructor and still requires an
+explicit provider/baseline binding.
+
+Existing transport upload/copy operations now expose controller-local excluded
+phase scopes. They pause only their own enclosing operation interval; another
+concurrent billable interval remains charged by the canonical union clock.
+Historical transport evidence and independent bounded transport wall guards are
+preserved. No remote-device validation is implied by these source adapters.

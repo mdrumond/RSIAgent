@@ -12,6 +12,7 @@ import time
 
 from .jobs import atomic, canonical
 from .control import ObservationUnavailable, WorkerStopped
+from rsi.domain_timing import transfer_phase
 
 CLIENT_TIMEOUT = 120
 CANCEL_TIMEOUT = 30
@@ -101,6 +102,7 @@ class CheckedTransport:
         state['state'] = 'cancelled'
         atomic(path, canonical(state))
 
+    @transfer_phase
     def transfer(self, action, source, destination):
         # Transfer sentinels also prevent duplicate uncertain submission.
         local = Path(source if action == 'upload' else destination)

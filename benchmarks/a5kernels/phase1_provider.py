@@ -446,7 +446,7 @@ class DirectActorDriver:
     def __init__(
         self, provider: DirectCompletionProvider, *, max_turns: int = 40, max_seconds: float = 3600, clock=None,
         trace_event: Callable[[str, Mapping[str, object]], None] | None = None,
-        system_prompt: str = _SYSTEM_PROMPT, canonical=None,
+        system_prompt: str = _SYSTEM_PROMPT, canonical=None, canonical_skills=None, canonical_budgets=None,
     ):
         from benchmarks.ascend.time_budget import deadline_after
         deadline_after(max_seconds)
@@ -458,7 +458,11 @@ class DirectActorDriver:
             raise TypeError("trace_event must be callable")
         self.trace_event = trace_event
         self.system_prompt = system_prompt
+        if canonical is None:
+            from rsi.domain_bindings import kernel_adoption
+            canonical = kernel_adoption()
         self.canonical = canonical
+        self.canonical_skills, self.canonical_budgets = canonical_skills, canonical_budgets
 
     def _trace(self, kind: str, payload: Mapping[str, object]) -> None:
         if self.trace_event is not None:
@@ -467,7 +471,8 @@ class DirectActorDriver:
     def with_trace(self, trace_event):
         """Bind a project-local observer without mutating this shared driver."""
         return type(self)(self.provider, max_turns=self.max_turns, max_seconds=self.max_seconds, clock=self.clock,
-                          trace_event=trace_event, system_prompt=self.system_prompt, canonical=self.canonical)
+                          trace_event=trace_event, system_prompt=self.system_prompt, canonical=self.canonical,
+                          canonical_skills=self.canonical_skills, canonical_budgets=self.canonical_budgets)
 
     def with_time_budget(self, seconds):
         """Bind provider calls to one request without mutating a shared driver."""

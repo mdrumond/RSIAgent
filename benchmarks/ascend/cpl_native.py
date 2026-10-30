@@ -64,6 +64,13 @@ class CplNativeCandidateBackend:
         return error
 
     def _timed(self, stage, callback, *, key=None):
+        if stage == 'upload':
+            from rsi.domain_timing import excluded_phase
+            with excluded_phase():
+                return self._timed_record(stage, callback, key=key)
+        return self._timed_record(stage, callback, key=key)
+
+    def _timed_record(self, stage, callback, *, key=None):
         started, epoch = self.clock(), self.wall_clock()
         try:
             return callback()

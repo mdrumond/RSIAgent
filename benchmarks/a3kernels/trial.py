@@ -227,7 +227,7 @@ class A3TrialLoop:
         timing_dimensions: StudyDimensions | None = None,
         execution_profile: str = "gz-a3",
         infrastructure_attempt_ordinal: int = 0,
-        clock=None, canonical=None,
+        clock=None, canonical=None, canonical_skills=None, canonical_budgets=None,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -257,7 +257,11 @@ class A3TrialLoop:
         if timing_dimensions is not None and not isinstance(timing_dimensions, StudyDimensions):
             raise TypeError("timing_dimensions must be StudyDimensions")
         self.timing_dimensions = timing_dimensions
+        if canonical is None:
+            from rsi.domain_bindings import a3_adoption
+            canonical = a3_adoption()
         self.canonical = canonical
+        self.canonical_skills, self.canonical_budgets = canonical_skills, canonical_budgets
 
     def run(self) -> TrialResult:
         from rsi.domain_execution import require_adoption

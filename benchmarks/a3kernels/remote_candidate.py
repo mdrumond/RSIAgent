@@ -150,8 +150,10 @@ class GZA3RemoteCandidateBackend:
                 bundle = self.build_bundle(plan, local_directory / f"{plan.execution_id}.tar")
                 remote_archive = self._remote_archive_destination(plan)
                 remote_directory = self.remote_candidate_directory(plan)
-                transfer_id = self._upload(bundle.path, remote_archive)
-                self._poll_transfer(transfer_id)
+                from rsi.domain_timing import excluded_phase
+                with excluded_phase():
+                    transfer_id = self._upload(bundle.path, remote_archive)
+                    self._poll_transfer(transfer_id)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 return FailedEvidence.create(
                     plan, stage="prepare", error_type=type(exc).__name__, detail=str(exc)
