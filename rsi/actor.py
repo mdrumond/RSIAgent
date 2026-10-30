@@ -66,6 +66,12 @@ class StageResult:
 
 
 @dataclass(frozen=True)
+class _StageProposal:
+    result: StageResult
+    evidence: StepEvidence
+
+
+@dataclass(frozen=True)
 class EvidenceTool:
     """Host-owned PR6 tool; invoke(stage, args, operation, seconds) returns data."""
     schema: dict
@@ -172,7 +178,7 @@ class SkillDelivery:
                 for ref in dict.fromkeys(references) if ref not in self.delivered]
 
 
-class PiSessionAdapter:
+class SnapshotPiSessionAdapter:
     """Reuse Pi's schemas, loopback gateway, context paging and exact edits.
 
     Eager startup + get_state handshake exclude process readiness from charged
@@ -181,27 +187,10 @@ class PiSessionAdapter:
     """
     def __init__(self, **kwargs):
         kwargs.setdefault('context_factory', WorkflowContextRecords)
-        session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
-                                       first_action_only=True, **kwargs)
-        self._bind_session(session)
-
-    @classmethod
-    def from_existing_session(cls, session):
-        """Adopt a registered Pi session without changing its provider route."""
-        adapter = cls.__new__(cls)
-        adapter._bind_session(session, context_factory=WorkflowContextRecords)
-        return adapter
-
-    def _bind_session(self, session, *, context_factory=None):
         self.delivery = SkillDelivery()
-        self.session = session
-        session.schemas.update(SCHEMAS)
-        if context_factory is not None:
-            session.context_factory = context_factory
-            session.context = context_factory()
-        session.system_prompt = SYSTEM
-        session.first_action_only = True
-        session.gateway.request_projector = self._project_tools
+        self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
+                                       first_action_only=True, **kwargs)
+        self.session.gateway.request_projector = self._project_tools
 
     def _project_tools(self, request, **_kwargs):
         # Keep the provider-visible and host-validated perform schema identical.
@@ -369,6 +358,40 @@ class WorkflowActor:
             raise
 
     def step(self, context):
+        dispatcher = self._stage(context)
+        try:
+            turn = next(dispatcher)
+        except StopIteration as done:
+            return self._commit(done.value)
+        if hasattr(self.session, 'run_stage'):
+            return self._commit(self.session.run_stage(dispatcher, turn, self))
+        while True:
+            payload, allowed, source, record = turn
+            try:
+                action = self._timed('thinking', lambda: self.session.next_action(
+                    payload, allowed, seconds=self._available(), record=record, source=source))
+            except ActionError as error:
+                try:
+                    turn = dispatcher.throw(error)
+                except StopIteration as done:
+                    return self._commit(done.value)
+                continue
+            try:
+                turn = dispatcher.send(action)
+            except StopIteration as done:
+                return self._commit(done.value)
+
+    def _commit(self, proposal):
+        self._available()
+        result, evidence = proposal.result, proposal.evidence
+        self.emit('stage-result', dict(result=asdict(result), evidence=evidence.to_dict(),
+            stage=evidence.stage.value, operation_id=evidence.operation_id,
+            settlement='host' if evidence.stage == Stage.PREFLIGHT else 'transport'))
+        self.workflow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
+                               redesign=result.redesign)
+        return result
+
+    def _stage(self, context):
         flow = self.workflow
         operation = flow.begin()
         stage = flow.stage
@@ -421,8 +444,7 @@ class WorkflowActor:
                 scope['request_id'] = uuid.uuid4().hex
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
-                    name, args = self._timed('thinking', lambda: self.session.next_action(
-                        payload, allowed, seconds=seconds, record=record, source=source))
+                    name, args = yield payload, allowed, source, record
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -547,13 +569,42 @@ class WorkflowActor:
         evidence = StepEvidence(stage=stage, operation_id=operation, source_hash=flow.source_hash,
             skill_refs=tuple(refs), artifact_refs=result.artifact_refs,
             retrieval_refs=result.retrieval_refs, retrospective_ref=result.retrospective_ref)
-        record('stage-result', dict(result=asdict(result), evidence=evidence.to_dict()))
+        record('stage-result-proposed', dict(result=asdict(result), evidence=evidence.to_dict()))
         self._available()
-        flow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
-                      redesign=result.redesign)
-        return result
+        return _StageProposal(result, evidence)
 
     def close(self):
         if self.session is not None:
             self.session.close()
             self.session = None
+
+
+class PiSessionAdapter(SnapshotPiSessionAdapter):
+    """Canonical Pi-native controller; Pi owns conversation and compaction."""
+    system_prompt = (
+            'You execute the canonical RSI workflow through completed host tools. '
+            'Read all mapped skills, query real evidence, and follow the authoritative stage. '
+            'Tool results are actual host observations. Read paged resources with read_context. '
+            'Only perform completes a stage; model assertions do not establish success. '
+            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.')
+
+    def __init__(self, **kwargs):
+        from coding.pi.controller import ControllerSession
+        self.delivery = SkillDelivery()
+        self.session = ControllerSession(schemas=SCHEMAS,system_prompt=self.system_prompt,**kwargs)
+        self.session.gateway.request_projector = self._project_tools
+
+    @classmethod
+    def from_existing_session(cls, session, *, wall_deadline=None):
+        from coding.pi.controller import ControllerSession
+        controller = ControllerSession.from_existing_session(session,wall_deadline=wall_deadline)
+        adapter = cls.__new__(cls)
+        adapter.delivery = SkillDelivery()
+        adapter.session = controller
+        controller.schemas.update(SCHEMAS)
+        controller.system_prompt = cls.system_prompt
+        controller.gateway.request_projector = adapter._project_tools
+        return adapter
+
+    def run_stage(self, dispatcher, turn, actor):
+        return self.session.run_stage(dispatcher, turn, actor, self.delivery)
