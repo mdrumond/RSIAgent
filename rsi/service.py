@@ -26,7 +26,9 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         if snapshot is None:
             raise ValueError('dispatcher frozen configuration required')
         cycle = services.create_cycle(cycle_id, request['mode'],
-            projects=request.get('projects'), configuration=snapshot, recover=request.get('recover'))
+            projects=request.get('projects'), configuration=snapshot, recover=request.get('recover'),
+            from_cycle=request.get('from_cycle'), inheritance=request.get('inheritance', 'auto'),
+            input_overrides=request.get('input_overrides', ()))
     else:
         cycle = services.open_cycle(cycle_id)
     done = threading.Event()

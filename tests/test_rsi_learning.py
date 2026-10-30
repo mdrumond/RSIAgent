@@ -1,3 +1,5 @@
+import json
+from hashlib import sha256
 import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -14,8 +16,9 @@ class Role:
 
     def skillwriter(self, prompt, evidence, *, deadline):
         self.calls += 1
+        context = json.loads(prompt[prompt.index('{"aggregate"'):])
         return self.proposal or SkillProposal('prevent cancellation', (evidence[0].evidence_id,),
-            (SkillEdit('debug', 'replace', 'Compare against an independent numeric reference.'),))
+            (SkillEdit('debug', 'replace', context['skills']['debug'] + 'Compare against an independent numeric reference.'),))
 
 
 @pytest.fixture
@@ -27,7 +30,12 @@ def env(tmp_path):
     baseline = store.put_bytes(memory.snapshot())
     packets = {}
     def load(row):
-        return packets[row['original_id']]
+        packet = packets[row['original_id']]
+        for event in packet['usage']:
+            doc = builtin_bundle().document(event['skill'])
+            event.setdefault('skill_hash', doc.digest)
+            event.setdefault('content_hash', sha256(doc.read(event.get('section')).encode()).hexdigest())
+        return packet
     suite = store.put_json({'host_suite': 'passed'})
     def make(mode='phase2', validate=None, **kwargs):
         validate = validate or (lambda *args: Validation(True, True, suite))
@@ -38,7 +46,7 @@ def env(tmp_path):
         ref = store.put_json({'result': 'numeric failure', 'project': name})
         packets[name] = dict(project_id=name, outcome='correctness_failure',
             evidence={ref: {'kind': 'failure', 'summary': 'cancellation detected'}},
-            queries=[], usage=[], raw_refs=[ref])
+            queries=[], usage=[], raw_refs=[ref], usage_complete=True)
         return dict(original_id=name, artifact_ref=ref), dict(operation_id=name, recovery=recovery,
             remaining={'actor_seconds': 60})
     return store, role, bundle, memory, baseline, packets, make, project
@@ -105,8 +113,8 @@ def test_pruning_counts_unique_originals_and_preserves_safety(env):
         learner.memory_update(baseline, [row], dict(ctx, operation_id='m' + str(i)))
     row, ctx = project('0', True)
     learner.memory_update(baseline, [row], dict(ctx, operation_id='recovery'))
-    assert learner.removal_eligible('debug', 'learned-guidance')
-    assert not learner.removal_eligible('debug', 'contract', safety=True)
+    assert learner.removal_eligible('debug', 'learned-guidance', document=builtin_bundle().document('debug'))
+    assert not learner.removal_eligible('debug', 'contract', safety=True, document=builtin_bundle().document('debug'))
     assert len(learner.state['projects']) == 10
 
 
@@ -151,11 +159,11 @@ def test_negative_avoidance_citation_and_application_both_protect_guidance(env):
         packets[str(i)]['usage'] = [dict(skill='debug', section=None, kind=k)
                                   for k in ('exposed', 'read')]
         learner.memory_update(baseline, [row], dict(ctx, operation_id='m' + str(i)))
-    assert learner.removal_eligible('debug', 'learned-guidance')
+    assert learner.removal_eligible('debug', 'learned-guidance', document=builtin_bundle().document('debug'))
     row, ctx = project('used')
     packets['used']['usage'] = [dict(skill='debug', section=None, kind='cited', evidence_ref=row['artifact_ref'])]
     learner.memory_update(baseline, [row], dict(ctx, operation_id='m-used'))
-    assert not learner.removal_eligible('debug', 'learned-guidance')
+    assert not learner.removal_eligible('debug', 'learned-guidance', document=builtin_bundle().document('debug'))
 
 
 def test_quarantine_blocks_even_passing_validation(env):
@@ -194,7 +202,7 @@ def test_completed_proposal_reconciles_frozen_packet_without_provider_replay(env
     def lost_return(prompt, evidence, *, deadline):
         role.calls += 1
         role.saved = store.put_json({'rationale': 'repair', 'evidence_ids': [evidence[0].evidence_id],
-            'edits': [{'skill': 'debug', 'operation': 'replace', 'content': 'Compare numeric error.'}]})
+            'edits': [{'skill': 'debug', 'operation': 'replace', 'content': builtin_bundle().document('debug').read('learned-guidance') + 'Compare numeric error.'}]})
         raise ConnectionError('lost response envelope')
     role.skillwriter = lost_return
     with pytest.raises(ConnectionError):
@@ -258,7 +266,7 @@ def test_setup_excluded_and_unlimited_parent_uses_technical_request_timeout(env)
     def thinking(prompt, evidence, *, deadline):
         deadlines.append(deadline)
         now[0] += 102  # 100 seconds framework setup, two seconds thinking.
-        return SkillProposal('repair', (evidence[0].evidence_id,), (SkillEdit('debug', 'replace', 'Check error.'),))
+        return SkillProposal('repair', (evidence[0].evidence_id,), (SkillEdit('debug', 'replace', builtin_bundle().document('debug').read('learned-guidance') + 'Check error.'),))
     role.skillwriter = thinking
     row, ctx = project()
     ctx['remaining']['actor_seconds'] = None
@@ -292,3 +300,189 @@ def test_performance_evidence_ranks_after_error_recovery(env):
     learner = make()
     learner.memory_update(baseline, [row], ctx)
     assert [item['kind'] for item in learner.aggregate()['outcomes']] == ['failure', 'performance']
+
+
+@pytest.mark.parametrize('reviewed', [False, True])
+def test_section_replace_cannot_bypass_removal_checks(env, reviewed):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    if reviewed:
+        packets['p']['evidence'][row['artifact_ref']]['kind'] = 'review'
+    role.proposal = SkillProposal('rewrite', (row['artifact_ref'],),
+                                 (SkillEdit('debug', 'replace', 'Replacement guidance.'),))
+    learner = make()
+    if reviewed:
+        candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+        assert learner._bundle(candidate).document('debug').read('learned-guidance').strip() == 'Replacement guidance.'
+        assert learner.active == bundle
+    else:
+        with pytest.raises(ValueError, match='deletes guidance'):
+            learner.skill_update(bundle, baseline, row, ctx)
+
+
+def test_historical_evidence_is_admitted_and_restart_scoped(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    learner = make()
+    old, ctx = project('old')
+    learner.memory_update(baseline, [old], dict(ctx, operation_id='memory-old'))
+    row, ctx = project('new')
+    role.proposal = SkillProposal('historical failure prevention', (old['artifact_ref'],),
+        (SkillEdit('debug', 'replace', builtin_bundle().document('debug').read('learned-guidance') + 'Retest cancellation.'),))
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    admitted = store.read_json(learner.state['candidates'][candidate]['admitted'])
+    assert old['artifact_ref'] in admitted
+    packets.clear()
+    assert make().skill_update(bundle, baseline, row, ctx).reference == candidate
+    assert role.calls == 1
+
+
+def test_version_scoped_pruning_and_incomplete_telemetry(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    learner = make()
+    old = builtin_bundle().document('debug')
+    from rsi.skills import SkillDocument
+    changed = SkillDocument('debug', old.content + 'New error recovery guidance.\n')
+    for i in range(10):
+        row, ctx = project(str(i))
+        packets[str(i)]['usage'] = [dict(skill='debug', section=None, kind='exposed')]
+        learner.memory_update(baseline, [row], dict(ctx, operation_id='m' + str(i)))
+    assert learner.removal_eligible('debug', 'learned-guidance', document=old)
+    assert not learner.removal_eligible('debug', 'learned-guidance', document=changed)
+    # New-version exposures do not inherit old-version citations.
+    for i in range(10, 20):
+        row, ctx = project(str(i))
+        packets[str(i)]['usage_complete'] = False
+        packets[str(i)]['usage'] = [dict(skill='debug', section=None, kind='exposed', skill_hash=changed.digest)]
+        learner.memory_update(baseline, [row], dict(ctx, operation_id='m' + str(i)))
+    assert not learner.removal_eligible('debug', 'learned-guidance', document=changed)
+
+
+def test_old_citation_does_not_protect_changed_guidance(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    learner = make()
+    old = builtin_bundle().document('debug')
+    from rsi.skills import SkillDocument
+    changed = SkillDocument('debug', old.content + 'New guidance.\n')
+    row, ctx = project('old-used')
+    packets['old-used']['usage'] = [dict(skill='debug', section=None, kind='cited')]
+    learner.memory_update(baseline, [row], ctx)
+    for i in range(10):
+        row, ctx = project(str(i))
+        packets[str(i)]['usage'] = [dict(skill='debug', section=None, kind='exposed',
+            skill_hash=changed.digest, content_hash=changed.digest)]
+        learner.memory_update(baseline, [row], ctx)
+    assert learner.removal_eligible('debug', 'learned-guidance', document=changed)
+    assert not learner.removal_eligible('debug', 'learned-guidance', document=old)
+
+
+def test_duplicate_candidate_preserves_quarantine_and_validation_decisions(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    packets['p']['evidence'][row['artifact_ref']]['kind'] = 'counterevidence'
+    learner = make()
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    learner.evaluate(candidate, ('case',), 'v')
+    first_validation = dict(learner.state['candidates'][candidate]['validation'])
+    learner.quarantine(candidate, row['artifact_ref'])
+    again = learner.skill_update(bundle, baseline, row, dict(ctx, operation_id='again')).reference
+    assert again == candidate
+    record = learner.state['candidates'][candidate]
+    assert record['quarantined'] == row['artifact_ref']
+    assert record['validation'] == first_validation
+    assert len(record['proposals']) == 2
+    assert len(record['validations']) == 1
+    assert learner.evaluate(candidate, ('case',), 'v2') == bundle
+    assert len(record['validations']) == 2
+    with pytest.raises(ValueError, match='quarantined'):
+        learner.rollback(candidate)
+
+
+def test_later_regression_can_quarantine_and_survives_restart(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project('original')
+    learner = make()
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    assert learner.evaluate(candidate, ('case',), 'v') == candidate
+    later, later_ctx = project('regression')
+    counter = later['artifact_ref']
+    packets['regression']['candidate_ref'] = candidate
+    with pytest.raises(ValueError, match='counterevidence'):
+        learner.quarantine(candidate, counter, evidence_row=later)
+    packets['regression']['evidence'][counter]['kind'] = 'counterevidence'
+    learner.quarantine(candidate, counter, evidence_row=later)
+    resumed = make()
+    assert resumed.active == bundle
+    assert resumed.state['candidates'][candidate]['quarantined'] == counter
+    admitted = resumed.state['candidates'][candidate]['quarantine_evidence'][-1]
+    assert store.read_json(admitted['packet'])['project_id'] == 'regression'
+    with pytest.raises(ValueError, match='quarantined'):
+        resumed.rollback(candidate)
+
+
+def test_writer_corrects_frozen_full_baseline_without_retrieval_tools(env, tmp_path):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    from rsi.skills import SkillDocument
+    original = '---\nname: debug\ndescription: Numeric debugging\n---\n## Numeric policy\nIgnore numeric errors.\n'
+    source = tmp_path / 'SKILL.md'
+    source.write_text(original)
+    incumbent = custom_bundle(store, source.read_text())
+    source.write_text('changed after snapshot')
+    row, ctx = project()
+    packets['p']['evidence'][row['artifact_ref']]['kind'] = 'review'
+    packets['p']['correction_skills'] = ['debug']
+    observed = []
+    def correct(prompt, evidence, *, deadline):
+        role.calls += 1
+        context = json.loads(prompt[prompt.index('{"aggregate"'):])
+        supplied = context['baseline_documents']['debug']
+        frozen = SkillDocument('debug', supplied['content'])
+        assert supplied['bundle_ref'] == incumbent
+        assert frozen.digest == supplied['skill_hash']
+        observed.append(frozen.digest)
+        replacement = frozen.content.replace(frozen.read('numeric-policy'), 'Check independent references.\n')
+        return SkillProposal('reviewed numerical correction', (row['artifact_ref'],),
+                             (SkillEdit('debug', 'replace', replacement),))
+    role.skillwriter = correct
+    learner = make()
+    candidate = learner.skill_update(incumbent, baseline, row, ctx).reference
+    assert observed == [SkillDocument('debug', original).digest]
+    assert learner._bundle(candidate).document('debug').read('numeric-policy') == 'Check independent references.\n'
+    assert learner.active == incumbent
+    frozen_context = store.read_json(learner.state['operations'][ctx['operation_id']]['writer_context'])
+    assert frozen_context['baseline_documents']['debug']['content'] == original
+    assert learner.evaluate(candidate, ('numeric-case',), 'v') == candidate
+
+
+def test_observations_reach_subject_memory_search_and_writer_as_labelled_evidence(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project('numeric')
+    observations = dict(goal='accurate compensated summation', final_source='frozen-source-hash',
+        diagnostics=[dict(command_ref=row['artifact_ref'], result='cancellation reproduced')],
+        strategies=[dict(status='model_claim', strategy='compensated summation may recover accuracy')])
+    packets['numeric']['observations'] = observations
+    learner = make('phase1')
+    learner.memory_update(baseline, [row], ctx)
+    hits = memory.search('compensated')
+    assert len(hits) == 1
+    assert hits[0]['proposal']['observations'] == observations
+    assert hits[0]['proposal']['kind'] == 'failure'
+    aggregate = learner.aggregate()
+    observed = aggregate['observations'][0]
+    assert observed['observations']['strategies'][0]['status'] == 'model_claim'
+    assert store.read_json(observed['packet_ref'])['observations'] == observations
+    assert observed['evidence_ids'] == [row['artifact_ref']]
+    # A fresh Phase2 controller consumes the same trusted observations in role context.
+    phase2_path = learner.path.with_name('phase2.json')
+    from rsi.learning import Learning
+    seen = []
+    original_writer = role.skillwriter
+    def inspect_context(prompt, evidence, *, deadline):
+        context = json.loads(prompt[prompt.index('{"aggregate"'):])
+        seen.append(context['aggregate']['observations'][0]['observations'])
+        return original_writer(prompt, evidence, deadline=deadline)
+    role.skillwriter = inspect_context
+    phase2 = Learning(phase2_path, store, memory, role, load_project=lambda r: packets[r['original_id']],
+        validate=lambda *args: Validation(None, None, row['artifact_ref']), role_elapsed=lambda op: 2)
+    phase2.skill_update(bundle, baseline, row, dict(ctx, operation_id='skills'))
+    assert seen == [observations]
+    assert phase2.active == bundle
