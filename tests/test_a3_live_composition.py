@@ -733,7 +733,11 @@ def test_retained_noninfrastructure_outcome_stops_without_retry(tmp_path):
     assert calls == sleeps == []
 
 
-def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path, canonical_live_trials):
+def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path, canonical_live_trials, monkeypatch):
+    from test_a3_trial_loop import FakeClock
+    from rsi.a3_recovery import observed_prelaunch_root
+    from rsi.runtime import ActorClock
+
     proposal = DEFAULT_PROPOSALS[0]
     cell = next(
         item for item in foundation_cells()
@@ -746,42 +750,78 @@ def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path, canoni
         cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
         proposals=(proposal,),
     ).paths(cell)
-    evidence = EvidenceLedger(paths.evidence)
-    LiveComposition._append_retry_event(
-        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
-        event="started", ordinal=0,
-    )
-    LiveComposition._append_attempt_outcome(
-        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
-        ordinal=0, trial=TrialResult(
-            "infrastructure-unverified", 0, 0, None, None, 0,
-            ("route unavailable before any actor/candidate dispatch",),
-        ),
-    )
+    clock = FakeClock()
     attempt_ids, sleeps = [], []
+    candidates = []
 
     class RecordingCandidate(FakeCandidate):
         def compile(self, source, workdir, **options):
             attempt_ids.append(options["attempt_id"])
+            clock.advance(1)
+            if self is candidates[0]:
+                plan = self.base.plan(source, **options)
+                return FailedEvidence.create(plan, stage="prepare", error_type="RuntimeError",
+                    detail="route unavailable before launch")
             return super().compile(source, workdir, **options)
 
+    def candidate_factory(*_):
+        candidate = RecordingCandidate(proposal)
+        candidates.append(candidate)
+        return candidate
+
+    def timed_actor_factory(*args):
+        actor = actor_factory(*args)
+        actor.canonical_clock = clock
+        return actor
+
     deps = LiveDependencies(
-        actor_factory=actor_factory,
-        candidate_factory=lambda *args: RecordingCandidate(proposal),
+        actor_factory=timed_actor_factory,
+        candidate_factory=candidate_factory,
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
         profiler_factory=lambda *_: FakeProfiler(False, []),
         execution_profile="bz-a3-1",
     )
 
-    result = LiveComposition(
+    composition = LiveComposition(
         cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
-    ).execute(cell, paths)
+    )
+    original = LiveComposition._append_retry_event
+    def stop_before_schedule(evidence, **kwargs):
+        if kwargs['event'] == 'scheduled':
+            raise KeyboardInterrupt
+        return original(evidence, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(LiveComposition, '_append_retry_event', staticmethod(stop_before_schedule))
+        with pytest.raises(KeyboardInterrupt):
+            composition.execute(cell, paths)
+
+    first, = canonical_live_trials
+    prior_root = first.owner.workdir / 'canonical'
+    assert observed_prelaunch_root(prior_root)
+    prior_bytes = (prior_root / 'workflow.json').read_bytes()
+    prior = json.loads(prior_bytes)
+    intervals = {key: value for key, value in prior['intervals'].items()
+                 if value[0] in ActorClock.BILLABLE}
+    assert ActorClock(intervals, lambda: None, clock).seconds() == 1
+    outcome = LiveComposition._retry_entries(EvidenceLedger(paths.evidence))[-1].payload['infrastructure_retry']
+    assert outcome['event'] == 'outcome' and outcome['trial_status'] == 'infrastructure-unverified'
+    assert len(attempt_ids) == 1 and sleeps == []
+
+    result = composition.execute(cell, paths)
 
     assert result["status"] == "passed"
     assert result["infrastructure_retries_used"] == 1
     assert sleeps == [120]
     assert attempt_ids and len(attempt_ids) == len(set(attempt_ids))
-    assert all(session.owner.infrastructure_attempt_ordinal == 1 for session in canonical_live_trials)
+    assert [session.owner.infrastructure_attempt_ordinal for session in canonical_live_trials] == [0, 1]
+    resumed = canonical_live_trials[1].owner.canonical.build(canonical_live_trials[1].owner)
+    imported, = [event for event in resumed.events if event['type'] == 'domain-elapsed-import']
+    proof = resumed.store.read_json(imported['reference'])
+    assert proof['actor_seconds'] == 1
+    assert sorted(proof['intervals'].values()) == sorted(intervals.values())
+    assert resumed.workflow.limits.actor_seconds == prior['limits']['actor_seconds']
+    assert (prior_root / 'workflow.json').read_bytes() == prior_bytes
 
 
 def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path, canonical_live_trials):
