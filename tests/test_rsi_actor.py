@@ -69,8 +69,9 @@ def test_reads_are_real_operation_scoped_and_setup_is_excluded(tmp_path):
     assert session.contexts[-1]['observation']['receipt_id'] in evidence['skill_refs']
 
 
-def test_model_cannot_perform_without_reads(tmp_path):
-    actor, flow, _, called, _, _ = harness(tmp_path, [('perform', {'proposal':'skip'})])
+@pytest.mark.parametrize('skill_actions', [[], reads(Stage.TASK_CONSTRUCTION)[-1:]])
+def test_model_cannot_perform_without_reads(tmp_path, skill_actions):
+    actor, flow, _, called, _, _ = harness(tmp_path, [*skill_actions, ('perform', {'proposal':'skip'})])
     with pytest.raises(WorkflowError, match='read'):
         actor.step({})
     assert flow.pending and not called and not flow.state['history']
@@ -124,13 +125,15 @@ def test_source_snapshot_supports_python_paths_and_project_hash(tmp_path):
     assert called[0][1]['edit']['source'] == 'answer = 43\n'
 
 
-def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp_path):
+@pytest.mark.parametrize('read_all', [True, False])
+def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp_path, read_all):
     from coding.pi.session import runtime_preflight, RuntimeUnavailable
     from test_pi_runtime import stream
     try: runtime_preflight()
     except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
-    calls = []
-    actions = iter(reads(Stage.TASK_CONSTRUCTION)+[('perform', {'proposal':'construct'})])
+    calls, executed = [], []
+    actual_reads = reads(Stage.TASK_CONSTRUCTION) if read_all else reads(Stage.TASK_CONSTRUCTION)[-1:]
+    actions = iter(actual_reads+[('perform', {'proposal':'construct'})])
     def provider(*_, **kwargs):
         calls.append(json.loads(kwargs['data']))
         name, args = next(actions)
@@ -139,13 +142,23 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
     flow = Workflow(tmp_path/'state.json', lambda *_: False, source_hash='v1')
     actor = WorkflowActor(flow, builtin_bundle(),
         lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
-        perform=lambda *_: StageResult(), preflight=lambda *_: StageResult(), emit=lambda *_: None)
+        perform=lambda *args: executed.append(args) or StageResult(),
+        preflight=lambda *_: StageResult(), emit=lambda *_: None)
     try:
         actor.step({})
-        actor.step({'goal':'write Python'})
+        if read_all:
+            actor.step({'goal':'write Python'})
+        else:
+            with pytest.raises(WorkflowError, match='read every mapped skill'):
+                actor.step({'goal':'write Python'})
     finally: actor.close()
-    assert flow.stage == Stage.DESIGN and len(calls) == 3
-    assert len(flow.state['history'][-1]['evidence']['skill_refs']) == 2
+    assert len(calls) == len(actual_reads)+1
+    if read_all:
+        assert flow.stage == Stage.DESIGN and len(executed) == 1
+        assert len(flow.state['history'][-1]['evidence']['skill_refs']) == 2
+    else:
+        assert flow.stage == Stage.TASK_CONSTRUCTION and not executed
+        assert flow.pending['handle'] is None
     assert 'fake-provider-secret' not in json.dumps(calls)
 
 
