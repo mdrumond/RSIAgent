@@ -916,3 +916,123 @@ def test_phase1_explicit_revisit_inherits_accepted_head_and_never_writes_skills(
             assert (parent.root / name).read_bytes() == data
     finally:
         revisited.close()
+
+
+class RejectThenAppend(Roles):
+    calls = 0
+    def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
+        from rsi.roles import SkillEdit
+        type(self).calls += 1
+        self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
+        # First output is genuinely invalid: it deletes the admitted old body.
+        return SkillProposal('Preserve independent verification', (evidence[0].evidence_id,),
+            (SkillEdit('test', 'replace' if type(self).calls == 1 else 'append',
+                       'Re-run the frozen independent verifier after source changes.'),))
+
+
+def rejected_writer_cycle(instance):
+    RejectThenAppend.calls = 0
+    instance.test = Bindings(instance.test.query, Decisions, RejectThenAppend, instance.test.identity)
+    cycle = instance.create_cycle('writer-rejection', 'phase2')
+    cycle.step()  # One real canonical project, including actual Python host commands.
+    cycle.step()  # Memory retains that accepted project.
+    return cycle
+
+
+def test_known_writer_rejection_charges_once_then_normal_step_appends_without_actor_replay(instance):
+    from rsi.cycles import RejectedSkillUpdate
+    cycle = rejected_writer_cycle(instance)
+    try:
+        original = json.loads(json.dumps(cycle.scheduler.state['originals']))
+        actor_calls = Decisions.calls
+        task_spent = cycle.scheduler.state['spent']
+        rejection = cycle.step()
+        assert isinstance(rejection, RejectedSkillUpdate)
+        assert cycle.scheduler.state['pending'] is None and cycle.scheduler.state['phase'] == 'skill'
+        assert not cycle.scheduler.state['candidates'] and not cycle.learning.state['candidates']
+        assert cycle.scheduler.state['spent'] == task_spent + .25
+        assert cycle.learning.state['operations'][rejection.operation_id]['status'] == 'rejected'
+        cycle.scheduler.reconcile_rejected_skill(rejection)  # Retained host replay is charge-once.
+        assert cycle.scheduler.state['spent'] == task_spent + .25
+        update = cycle.step()  # NEW identity through the normal canonical scheduler step.
+        assert RejectThenAppend.calls == 2 and Decisions.calls == actor_calls
+        assert cycle.scheduler.state['originals'] == original
+        assert cycle.scheduler.state['spent'] == task_spent + .5
+        candidate = cycle.scheduler.state['candidates'][0]
+        assert candidate['operation_id'] != rejection.operation_id and candidate['reference'] == update.reference
+        operation = cycle.learning.state['operations'][candidate['operation_id']]
+        context = cycle.store.read_json(operation['writer_context'])
+        assert context['previous_skill_rejections'][0]['rejection_ref'] == rejection.rejection_ref
+        before = builtin_bundle().document('test').read('learned-guidance')
+        after = cycle.learning._bundle(update.reference).document('test').read('learned-guidance')
+        assert after.startswith(before) and len(after) > len(before)
+        assert cycle.learning.active == cycle.scheduler.state['skills']
+    finally:
+        cycle.close()
+
+
+def test_writer_rejection_crash_before_cycle_charge_reconciles_on_reopen_without_dispatch(instance, monkeypatch):
+    cycle = rejected_writer_cycle(instance)
+    spent, actor_calls = cycle.scheduler.state['spent'], Decisions.calls
+    def crash(_):
+        raise OSError('simulated Cycle commit interruption')
+    monkeypatch.setattr(cycle.scheduler, 'reconcile_rejected_skill', crash)
+    with pytest.raises(OSError):
+        cycle.step()
+    pending = cycle.scheduler.state['pending']['id']
+    assert cycle.learning.state['operations'][pending]['status'] == 'rejected'
+    assert cycle.scheduler.state['spent'] == spent
+    cycle.close()
+    resumed = instance.open_cycle('writer-rejection')
+    try:
+        resumed.step()  # Observe retained rejection only; no model or project dispatch.
+        assert RejectThenAppend.calls == 1 and Decisions.calls == actor_calls
+        assert resumed.scheduler.state['spent'] == spent + .25
+        assert resumed.scheduler.state['pending'] is None and not resumed.scheduler.state['candidates']
+        assert resumed.scheduler.state['completed_operations'][pending] == 'skill_rejected'
+        resumed.step()  # Only this subsequent step is the fresh writer.
+        assert RejectThenAppend.calls == 2 and Decisions.calls == actor_calls
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize('fault', ['provider', 'timing', 'cas'])
+def test_unknown_writer_failure_keeps_pending_and_never_auto_replays(instance, monkeypatch, fault):
+    from rsi.roles import SkillEdit
+    class Unknown(Roles):
+        calls = 0
+        def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
+            type(self).calls += 1
+            if fault == 'provider':
+                raise RuntimeError('provider settlement unknown')
+            if fault != 'timing':
+                self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
+            return SkillProposal('Scoped new guidance', (evidence[0].evidence_id,),
+                                 (SkillEdit('test', 'append', 'Preserve independent cases.'),))
+    instance.test = Bindings(instance.test.query, Decisions, Unknown, instance.test.identity)
+    cycle = instance.create_cycle('unknown-writer', 'phase2')
+    try:
+        cycle.step()
+        cycle.step()
+        spent, actor_calls = cycle.scheduler.state['spent'], Decisions.calls
+        if fault == 'cas':
+            read = cycle.store.read_json
+            def unreadable_proposal(ref):
+                value = read(ref)
+                if isinstance(value, dict) and 'edits' in value:
+                    raise OSError('proposal CAS unavailable')
+                return value
+            monkeypatch.setattr(cycle.store, 'read_json', unreadable_proposal)
+        with pytest.raises((RuntimeError, OSError)):
+            cycle.step()
+        pending = json.loads(json.dumps(cycle.scheduler.state['pending']))
+        assert pending['kind'] == 'skill' and not cycle.scheduler.state.get('rejected_skill_updates')
+        with pytest.raises((RuntimeError, OSError)):
+            cycle.step()
+        with pytest.raises((RuntimeError, OSError)):
+            cycle.reconcile()
+        assert Unknown.calls == 1 and Decisions.calls == actor_calls
+        assert cycle.scheduler.state['pending'] == pending and cycle.scheduler.state['spent'] == spent
+        assert not cycle.scheduler.state['candidates'] and not cycle.learning.state['candidates']
+    finally:
+        cycle.close()
