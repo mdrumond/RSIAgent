@@ -111,6 +111,10 @@ class InstanceServices:
             for component, names in keys.items():
                 if component not in input_overrides:
                     for name in names:
+                        # Collection selection is a current query input under auto;
+                        # explicit parent policy also acknowledges its inherited selector.
+                        if name == 'kdb_collections' and inheritance == 'auto':
+                            continue
                         if name in source:
                             config[name] = source[name]
                         else:
