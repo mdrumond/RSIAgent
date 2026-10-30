@@ -23,7 +23,7 @@ from rsi.actor import PiSessionAdapter
 from rsi.configuration import _snapshot, show_configuration
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec, Stage
 from rsi.cycles import CycleScheduler, HostTaskResult
-from rsi.learning import Learning, Validation
+from rsi.learning import Learning, ProposalRejected, RejectedOperation, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
@@ -660,6 +660,19 @@ class BoundCycle(TuningBindings):
         reference = self.store.put_json(dict(operation=operation, cases=cases, valid=valid))
         return Validation(True if valid else None, True if valid else None, reference)
 
+    def reject_writer(self):
+        """Consume only the producer's retained, observed semantic rejection."""
+        pending = self.scheduler.state['pending']
+        if not pending or pending['kind'] != 'skill':
+            raise ValueError('matching pending writer operation required')
+        operation = self.learning.state['operations'].get(pending['id'], {})
+        if 'proposal' not in operation:
+            raise RuntimeError('retained observed proposal required; unknown work stays pending')
+        rejection = self.learning.reject_observed_proposal(pending['id'], operation['proposal'],
+            namespace=self.scheduler.state['namespace'])
+        self.scheduler.reconcile_rejected_skill(rejection)
+        return rejection
+
     def reconcile(self):
         """Observe existing project completion; no new provider dispatch."""
         if self.tuning.state['pending']:
@@ -676,6 +689,8 @@ class BoundCycle(TuningBindings):
         if self.controller.state['pending']:
             return self.controller.reconcile()
         pending = self.scheduler.state['pending']
+        if pending and pending['kind'] == 'skill':
+            return self.reject_writer()
         if not pending or pending['kind'] not in ('original', 'recovery'):
             raise ValueError('explicit learning/absence reconciliation required')
         runner = self.open_project(pending['id'])
@@ -725,6 +740,10 @@ class BoundCycle(TuningBindings):
 
     def step(self):
         """Delegate one dispatch to the shared controller; no service driver loop."""
+        pending = self.scheduler.state['pending']
+        if (pending and pending['kind'] == 'skill' and
+                'rejection' in self.learning.state['operations'].get(pending['id'], {})):
+            return self.reject_writer()  # Crash after Learning commit, before Cycle charge.
         events = self.scheduler.extension_events()
         due = next((e for e in events if e['kind'] in ('tuning_due', 'manual_tuning')), None)
         recovery_due = any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due') for e in events)
@@ -737,7 +756,12 @@ class BoundCycle(TuningBindings):
             self.tuning_settings()
             self.tuning_project(due)
 
-        return self.tuning.step()
+        try:
+            return self.tuning.step()
+        except (ProposalRejected, RejectedOperation):
+            # The producer revalidates exact scope, semantic invalidity and genuine
+            # role timing. Provider/storage/unknown failures never enter this path.
+            return self.reject_writer()
 
     def run_project(self, operation_id):
         pending = self.scheduler.state['pending']
