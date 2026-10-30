@@ -205,7 +205,12 @@ class OptimizerTaskExecutor:
             # recovered from optimizer history without another model/native call.
             evaluated = [row for row in loop.state.get('history', []) if 'candidate_sha256' in row and 'result' in row]
             evaluations_completed = sum(row.get('result') is not None for row in results)
-            if len(evaluated) <= evaluations_completed or 'pending' in loop.state:
+            from rsi.optimizer_settlement import canonical_evaluation_pending
+            if (len(evaluated) <= evaluations_completed or 'pending' in loop.state
+                    or canonical_evaluation_pending(loop.directory, loop.state)):
+                # The canonical controller authenticates retained terminal CAS
+                # outcomes before committing the stage; history alone is not
+                # publication authority, and unknown work still cannot replay.
                 loop.run(single_evaluation=True, memory_snapshot=memory_snapshot,
                          context={'optimizer_task': {'single_evaluation': True, 'feedback': feedback}})
                 evaluated = [row for row in loop.state.get('history', []) if 'candidate_sha256' in row and 'result' in row]
