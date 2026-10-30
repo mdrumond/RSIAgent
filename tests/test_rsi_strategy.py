@@ -250,3 +250,83 @@ def test_runtime_completion_requires_all_mapped_reads(setup, tmp_path):
                    skill_refs=[design, kdb], decisions=decisions(service, query))
     workflow.complete(evidence)
     assert workflow.stage == Stage.IMPLEMENTATION
+
+
+@pytest.mark.parametrize('identity, test_backend, valid', [
+    ('TEST@1', True, True),
+    ('production@2', True, False),
+    ('TEST@1', False, False),
+    ('production@2', False, False),
+])
+def test_selected_receipts_cannot_cross_backend_declarations(setup, identity, test_backend, valid):
+    service, _, state, log, store, skill, _ = setup
+    query, retro = prepare(service, skill)
+    select(service, skill, query, retro)
+    reopened = StrategyEvidence(store, log.append, lambda: state, service.bundle,
+                                service.query_backend, workflow_id='project1',
+                                backend_identity=identity, test_backend=test_backend, events=log)
+    for kind, ref in [('skill', skill), ('retrieval', query), ('retrospective', retro)]:
+        assert reopened.resolve(kind, ref, Stage.DESIGN, 'op1') is valid
+    if valid:
+        select(reopened, skill, query, retro)
+    else:
+        count = len(log)
+        with pytest.raises(WorkflowError):
+            select(reopened, skill, query, retro, decisions(service, query))
+        assert len(log) == count
+
+
+@pytest.mark.parametrize('redirection', [None, [], {}, '', '  \n\t'])
+def test_negative_reuse_rejects_nonstring_or_blank_redirection_before_persist(setup, redirection):
+    service, _, _, log, _, skill, _ = setup
+    query, retro = prepare(service, skill)
+    choices = decisions(service, query, reuse=True)
+    choices[-1]['redirection'] = redirection
+    count = len(log)
+    receipts = dict(service.receipts)
+    with pytest.raises(WorkflowError):
+        select(service, skill, query, retro, choices)
+    assert len(log) == count
+    assert service.receipts == receipts
+    assert not service.resolve('retrieval', query, Stage.DESIGN, 'op1')
+
+
+@pytest.mark.parametrize('stage', [Stage.TASK_CONSTRUCTION, Stage.DEBUG])
+def test_global_kdb_query_and_retrospective_available_outside_strategy(setup, stage):
+    service, make, state, log, store, _, _ = setup
+    state.update(stage=stage.value, pending={'id': 'global-query-op'})
+    calls = []
+    backend = service.query_backend
+    def counted(payload):
+        calls.append(payload.copy())
+        return backend(payload)
+    service.query_backend = counted
+    query = service.query({'query': 'stable sum'})
+    retro = service.retrospect()
+    assert calls == [{'query': 'stable sum'}]
+    assert store.read_json(query)['payload']['response']['results']
+    assert service.resolve('retrieval', query, stage, 'global-query-op')
+    assert service.resolve('retrospective', retro, stage, 'global-query-op')
+    assert make().resolve('retrieval', query, stage, 'global-query-op')
+    assert store.read_json(retro)['payload']['history'] == state['history']
+    before = len(log)
+    with pytest.raises(WorkflowError):
+        service.select('Out-of-stage proposal', query_ref=query,
+                       retrospective_ref=retro, skill_refs=[], decisions=[])
+    assert len(log) == before
+
+
+@pytest.mark.parametrize('stage', [Stage.TASK_CONSTRUCTION, Stage.DEBUG])
+def test_global_kdb_unavailability_is_not_a_miss(setup, stage):
+    service, _, state, log, _, _, _ = setup
+    state.update(stage=stage.value, pending={'id': 'global-unavailable-op'})
+    calls = []
+    def unavailable(payload):
+        calls.append(payload.copy())
+        raise TimeoutError('backend unavailable')
+    service.query_backend = unavailable
+    with pytest.raises(QueryUnavailable):
+        service.query({'query': 'debug numeric issue'})
+    assert calls == [{'query': 'debug numeric issue'}]
+    assert log[-1]['kind'] == 'query-unavailable'
+    assert not service.resolve('retrieval', log[-1]['reference'], stage, 'global-unavailable-op')

@@ -18,20 +18,22 @@ class Clock:
 class Session:
     def __init__(self, actions, clock):
         self.actions, self.clock = iter(actions), clock
-        self.contexts, self.deadlines = [], []
+        self.contexts, self.deadlines, self.allowed = [], [], []
     def prepare(self, timeout, *, schemas): self.clock.value += 100
     def next_action(self, context, allowed, *, seconds, record, source):
         self.contexts.append(context)
+        self.allowed.append(list(allowed))
         self.deadlines.append(seconds)
         self.clock.value += 2
         return next(self.actions)
     def close(self): pass
 
 
-def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20):
+def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20,
+            execution_cap=20, managed_executions=False):
     clock, events = Clock(), []
     workflow = Workflow(tmp_path/'state.json', lambda *_: False, source_hash='project-v1',
-                        limits=BudgetLimits(actor_seconds=limit), clock=clock)
+                        limits=BudgetLimits(actor_seconds=limit, execution_tries=execution_cap), clock=clock)
     workflow.state['stage'] = stage.value
     workflow._save()
     session = Session(actions, clock)
@@ -44,7 +46,8 @@ def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20):
         return StageResult()
     actor = WorkflowActor(workflow, builtin_bundle(), lambda: session,
                           perform=perform, preflight=lambda *_: StageResult(),
-                          emit=lambda kind, data: events.append((kind, data)))
+                          emit=lambda kind, data: events.append((kind, data)),
+                          managed_executions=managed_executions)
     return actor, workflow, session, called, clock, events
 
 
@@ -149,7 +152,8 @@ def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp
         if read_all:
             actor.step({'goal':'write Python'})
         else:
-            with pytest.raises(WorkflowError, match='read every mapped skill'):
+            from coding.pi.rpc import PiError
+            with pytest.raises((WorkflowError, PiError)):
                 actor.step({'goal':'write Python'})
     finally: actor.close()
     assert len(calls) == len(actual_reads)+1
@@ -263,6 +267,9 @@ def test_adapter_deadline_is_assigned_after_setup_and_gateway_matches(monkeypatc
     adapter.next_action({'stage':Stage.DESIGN.value}, ['perform'],
         seconds=5, record=lambda *_:None, source=source)
     assert captured[-1]['write_action'] is None
+    adapter.next_action({'stage':Stage.IMPLEMENTATION.value}, ['read_skill'],
+        seconds=5, record=lambda *_:None, source=source)
+    assert captured[-1]['write_action'] is None
 
 
 def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
@@ -356,7 +363,6 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
             actions = [('read_context', {'record':reference, 'limit':128})]
         elif index == 1 + int(with_context_read):
             actions = [('read_skill', {'name':name}) for name in names]
-            actions.append(('perform', {'proposal':'phantom execution'}))
             if with_context_read:
                 pages = [json.loads(m['content']) for m in request['messages'] if m['role']=='tool']
                 assert pages[0]['text'] == guide[:128]
@@ -365,7 +371,8 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
             actions = [('read_skill', {'name':names[1]})]
         else:
             assert index == 3 + int(with_context_read) and actual_reads() == list(names) and not executed
-            actions = [('perform', {'proposal':'verified host invocation'})]
+            actions = [('perform', {'proposal':'verified host invocation'}),
+                       ('perform', {'proposal':'phantom execution'})]
         response = stream(*actions[0], index)
         original = response.iter_lines
         def lines():
@@ -397,9 +404,162 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
     assert actual_reads() == list(names)
     assert executed == ['verified host invocation']
     actions = [data for kind,data in events if kind == 'pi-action']
-    assert [data['discarded_actions'] for data in actions] == [2, 0, 0]
+    assert [data['discarded_actions'] for data in actions] == [1, 0, 1]
     context_reads = [data for kind,data in events if kind == 'pi-context-read']
     assert len(context_reads) == int(with_context_read)
     if with_context_read:
         assert context_reads[0]['record'] == hashlib.sha256(guide.encode()).hexdigest()
         assert context_reads[0]['bytes'] == 128
+
+
+@pytest.mark.parametrize('stage', [Stage.TEST, Stage.VALIDATION])
+@pytest.mark.parametrize('managed', [False, True])
+def test_exhausted_execution_cap_refuses_stage_callback(tmp_path, stage, managed):
+    actor, flow, _, called, _, events = harness(tmp_path, reads(stage)+[
+        ('perform', {'proposal':'run command'})], stage=stage, execution_cap=1,
+        managed_executions=managed)
+    flow.state['executions'] = 1
+    flow._save()
+    with pytest.raises(WorkflowError, match='execution cap'): actor.step({})
+    assert not called and flow.state['executions'] == 1
+    assert not any(kind == 'host-dispatch' for kind,_ in events)
+    assert len([data for kind,data in events if kind == 'skill-usage' and data['kind'] == 'read']) == len(reads(stage))
+
+
+@pytest.mark.parametrize('stage', [Stage.TEST, Stage.VALIDATION])
+def test_default_callback_reserves_one_execution(tmp_path, stage):
+    actor, flow, _, called, _, _ = harness(tmp_path, reads(stage)+[
+        ('perform', {'proposal':'run command'})], stage=stage, execution_cap=1)
+    actor.step({})
+    assert len(called) == 1 and flow.state['executions'] == 1
+    operation = flow.state['history'][-1]['evidence']['operation_id']
+    assert flow.state['execution_reservations'][operation]['stage_operation'] == operation
+
+
+def test_reads_without_admitted_perform_do_not_reserve_execution(tmp_path):
+    actor, flow, _, called, _, _ = harness(tmp_path, [reads(Stage.TEST)[-1],
+        ('perform', {'proposal':'skip step skill'})], stage=Stage.TEST)
+    with pytest.raises(WorkflowError, match='read every mapped skill'): actor.step({})
+    assert not called and flow.state['executions'] == 0
+    assert not flow.state.get('execution_reservations')
+
+
+@pytest.mark.parametrize('managed', [False, True])
+def test_disabled_execution_cap_allows_additional_work(tmp_path, managed):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'run command'})], stage=Stage.TEST, execution_cap=None,
+        managed_executions=managed)
+    flow.state['executions'] = 100
+    flow._save()
+    if managed:
+        def backend(stage, args, operation, seconds):
+            assert flow.reserve_execution(operation+':command')
+            return StageResult()
+        actor.perform = backend
+    actor.step({})
+    assert flow.state['executions'] == 101
+
+
+def test_managed_backend_reserves_commands_without_stage_double_count(tmp_path):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'compile test profile'})], stage=Stage.TEST,
+        execution_cap=3, managed_executions=True)
+    commands = []
+    def backend(stage, args, operation, seconds):
+        for command in ('compile', 'test', 'profile'):
+            command_id = operation+':'+command
+            assert flow.reserve_execution(command_id)
+            assert not flow.reserve_execution(command_id)  # retry cannot admit replay
+            commands.append(command_id)
+        return StageResult()
+    actor.perform = backend
+    actor.step({})
+    assert len(commands) == flow.state['executions'] == 3
+    assert set(flow.state['execution_reservations']) == set(commands)
+
+
+def test_default_multi_command_callback_reserves_additional_ids(tmp_path):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'three commands'})], stage=Stage.TEST, execution_cap=3)
+    def callback(stage, args, operation, seconds):
+        assert flow.state['executions'] == 1
+        for suffix in ('extra-test', 'profile'):
+            assert flow.reserve_execution(operation+':'+suffix)
+        return StageResult()
+    actor.perform = callback
+    actor.step({})
+    assert flow.state['executions'] == len(flow.state['execution_reservations']) == 3
+
+
+def test_perform_waits_for_all_full_reads_and_host_readiness(tmp_path):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    ready = []
+    actor, flow, session, called, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('query_kdb', {}), ('perform', {'proposal':'construct'})])
+    actor.perform_ready = lambda stage,operation: bool(ready)
+    actor.evidence_tools = {'query_kdb':EvidenceTool(obj(), lambda *args:ready.append(args[2]) or {})}
+    actor.schemas['query_kdb'] = actor.evidence_tools['query_kdb'].schema
+    actor.step({})
+    assert ['perform' in names for names in session.allowed] == [False, False, False, True]
+    assert session.contexts[0]['read_skill_names'] == []
+    assert session.contexts[0]['unread_skills'] == list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    assert session.contexts[-1]['unread_skills'] == []
+    assert session.contexts[-1]['read_skill_names'] == list(builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION))
+    assert len(called) == 1 and flow.stage == Stage.DESIGN
+
+
+def test_scripted_perform_cannot_bypass_host_readiness(tmp_path):
+    actor, flow, _, called, _, _ = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'skip selection'})])
+    actor.perform_ready = lambda *_:False
+    with pytest.raises(WorkflowError, match='unavailable'): actor.step({})
+    assert not called and flow.stage == Stage.TASK_CONSTRUCTION
+
+
+def test_scripted_tool_cannot_bypass_stage_scope(tmp_path):
+    from coding.pi.schema import obj
+    from rsi.actor import EvidenceTool
+    actor, _, _, _, _, _ = harness(tmp_path, [('select_idea', {})])
+    actor.evidence_tools = {'select_idea':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage call'),
+                                                    stages=(Stage.DESIGN, Stage.OPTIMISATION))}
+    actor.schemas['select_idea'] = actor.evidence_tools['select_idea'].schema
+    with pytest.raises(WorkflowError, match='unavailable'): actor.step({})
+
+
+def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
+    from coding.pi.schema import obj
+    from coding.pi.session import runtime_preflight, RuntimeUnavailable
+    from rsi.actor import EvidenceTool
+    from test_pi_runtime import stream
+    try: runtime_preflight()
+    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
+    ready, requests, executed = [], [], []
+    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
+    names = builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    actions = iter([*[('read_skill', {'name':name}) for name in names],
+                    ('query_kdb', {}), ('perform', {'proposal':'construct'})])
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        advertised = {tool['function']['name'] for tool in request['tools']}
+        assert not advertised & {'select_idea', 'optimisation_decision'}
+        assert 'query_kdb' in advertised
+        assert ('perform' in advertised) == bool(ready)
+        name,args = next(actions)
+        return stream(name,args,len(requests))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    actor = WorkflowActor(flow, builtin_bundle(),
+        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
+        perform=lambda *_:executed.append(True) or StageResult(), preflight=lambda *_:StageResult(),
+        emit=lambda *_:None, perform_ready=lambda *_:bool(ready), evidence_tools={
+            'query_kdb':EvidenceTool(obj(), lambda *args:ready.append(args[2]) or {'results':[]}),
+            'select_idea':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage selection'),
+                                      stages=(Stage.DESIGN,Stage.OPTIMISATION)),
+            'optimisation_decision':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage optimisation'),
+                                                stages=(Stage.OPTIMISATION,))})
+    try:
+        actor.step({})
+        actor.step({'goal':'normal Python task construction'})
+    finally: actor.close()
+    assert flow.stage == Stage.DESIGN and len(requests) == 4 and executed == [True]

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import time
+from threading import RLock
 
 from coding.pi.rpc import PiError, PiProviderError, PiDeadlineError, PiCancelled
 from coding.pi.session import ActionError
@@ -74,6 +75,7 @@ class ProjectRunner:
         self.spec = ProjectSpec.from_dict(frozen['spec'])
         self.bundle = SkillBundle.from_dict(frozen['skills'])
         self.config = ProjectConfig.from_dict(frozen['config'])
+        self.event_lock = RLock()
         self.event_path = self.root / 'events.json'
         self.event_refs = json.loads(self.event_path.read_text()) if self.event_path.exists() else []
         self.events = [self.store.read_json(ref) for ref in self.event_refs]
@@ -93,15 +95,17 @@ class ProjectRunner:
         self.actor = WorkflowActor(self.workflow, self.bundle, session_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
-            evidence_tools=self.tools(), skill_reference=self.service.read_receipt)
+            evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
+            managed_executions=True, perform_ready=self.perform_ready)
         # Always use the durable authority, including skill reads on the live path.
         self.workflow.resolver = self.resolve
 
     def append(self, event):
-        ref = self.store.put_json(event)
-        atomic_json(self.event_path, [*self.event_refs, ref])
-        self.event_refs.append(ref)
-        self.events.append(event)
+        with self.event_lock:
+            ref = self.store.put_json(event)
+            atomic_json(self.event_path, [*self.event_refs, ref])
+            self.event_refs.append(ref)
+            self.events.append(event)
 
     def actor_event(self, kind, data):
         if kind == 'skill-usage':
@@ -109,7 +113,62 @@ class ProjectRunner:
         self.append(dict(type=kind, **data))
 
     def resolve(self, kind, reference, stage, operation):
+        if kind == 'failed-operation':
+            with self.event_lock:
+                if not any(e['type'] == 'failed-operation-closure' and e['reference'] == reference
+                           for e in self.events):
+                    return False
+                row = self.store.read_json(reference)
+                pending = self.workflow.pending
+                proof = row['controller_proof']
+                return bool(proof.get('actor_closed') is True and proof.get('no_host_effects') is True
+                    and isinstance(proof.get('observation'), str) and proof['observation'].strip()
+                    and pending and proof.get('handle') == pending['handle']
+                    and pending['id'] == operation and row == dict(
+                    operation_id=operation, stage=stage.value, source_hash=self.workflow.source_hash,
+                    contract_ref=self.contract_ref, handle=pending['handle'],
+                    controller_proof=row['controller_proof'])
+                    and self.backend.project_hash() == self.workflow.source_hash
+                    and self.no_host_effects(operation))
         return self.service.resolve(kind, reference, stage, operation)
+
+    def no_host_effects(self, operation):
+        unsafe = {'host-dispatch', 'host-result', 'stage-result', 'command-results'}
+        return not (any(e.get('operation_id') == operation and e['type'] in unsafe
+                        for e in self.events) or any(
+            row.get('stage_operation') == operation for row in
+            self.workflow.state.get('execution_reservations', {}).values()) or any(
+            e['type'] == 'strategy-evidence' and e['kind'] in ('retrieval', 'query-unavailable')
+            and self.store.read_json(e['reference'])['context']['operation'] == operation
+            for e in self.events))
+
+    def record_admission_failure(self, operation, *, controller_proof, observed_source_hash):
+        """Host-only API: attest observed terminal Pi closure, never an actor tool.
+
+        controller_proof must retain handle, actor_closed=True, no_host_effects=True,
+        and a nonempty observation describing the controller's closure evidence.
+        Local receipts can veto that observation. This records proof only; call
+        workflow.reject_operation(operation, returned_ref, observed_source_hash)
+        explicitly to release pending state without refunding thinking/counts.
+        """
+        with self.event_lock:
+            pending = self.workflow.pending
+            if (not pending or pending['id'] != operation or not pending['handle']
+                    or self.actor.session is not None
+                    or observed_source_hash != self.workflow.source_hash
+                    or observed_source_hash != self.backend.project_hash()
+                    or controller_proof.get('handle') != pending['handle']
+                    or controller_proof.get('actor_closed') is not True
+                    or controller_proof.get('no_host_effects') is not True
+                    or not isinstance(controller_proof.get('observation'), str)
+                    or not controller_proof['observation'].strip()
+                    or not self.no_host_effects(operation)):
+                raise WorkflowError('admission failure requires observed closure and no host effects')
+            ref = self.store.put_json(dict(operation_id=operation, stage=self.workflow.stage.value,
+                source_hash=observed_source_hash, contract_ref=self.contract_ref,
+                handle=pending['handle'], controller_proof=controller_proof))
+            self.append(dict(type='failed-operation-closure', operation_id=operation, reference=ref))
+            return ref
 
     def snapshot(self):
         row = self.backend.read(self.selected_file)
@@ -129,8 +188,11 @@ class ProjectRunner:
             'optimisation_decision': obj(dict(action={'type': 'string',
                 'enum': ['noop', 'edit', 'profile']}, reason=STRING)),
         }
+        scopes = {'select_strategy': (Stage.DESIGN, Stage.OPTIMISATION),
+                  'optimisation_decision': (Stage.OPTIMISATION,)}
         return {name: EvidenceTool(schema, lambda stage, args, op, seconds, name=name:
-            self.tool(name, stage, args, op)) for name, schema in definitions.items()}
+            self.tool(name, stage, args, op), stages=scopes.get(name))
+            for name, schema in definitions.items()}
 
     def tool(self, name, stage, args, operation):
         if name == 'query_kdb':
@@ -178,6 +240,17 @@ class ProjectRunner:
                    for kind, field in (('retrieval', 'query_ref'), ('retrospective', 'retrospective_ref'))):
             raise WorkflowError('strategy selection is no longer valid for this operation')
         return rows[-1]['payload']
+
+    def perform_ready(self, stage, operation):
+        if stage not in (Stage.DESIGN, Stage.OPTIMISATION):
+            return True
+        try:
+            self.selection(operation)
+        except WorkflowError:
+            return False
+        return stage != Stage.OPTIMISATION or any(
+            e['type'] == 'project-tool' and e['operation_id'] == operation
+            and e['name'] == 'optimisation_decision' for e in self.events)
 
     @contextmanager
     def charged_host(self):
