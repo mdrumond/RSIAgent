@@ -17,7 +17,9 @@ def main(argv=None):
     validate.add_argument("--kind", choices=("cycle", "project"), default="cycle")
     instance = commands.add_parser("instance", help="create or inspect an independent RSI instance")
     actions = instance.add_subparsers(dest="action", required=True)
-    create = actions.add_parser("create")
+    create = actions.add_parser(
+        "create", description="Snapshot committed HEAD or the installed release. "
+        "Requires Linux renameat2 for atomic publication; does not start a dashboard.")
     create.add_argument("path", type=Path)
     for name in ("baseline-kdb", "baseline-skills", "skill-map"):
         create.add_argument("--" + name, type=Path, required=True)

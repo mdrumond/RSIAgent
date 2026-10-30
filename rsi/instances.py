@@ -1,4 +1,13 @@
-"""Atomic, independent snapshots of RSI machinery and explicit baseline inputs."""
+"""Atomic, independent snapshots of RSI machinery and explicit baseline inputs.
+
+Bootstrap requires Linux with libc renameat2(RENAME_NOREPLACE). Publication
+fails cleanly when this operation is unavailable; no weaker rename is used.
+
+From a Git checkout, machinery is copied from committed HEAD, including this
+module. Commit machinery changes before bootstrapping; uncommitted and untracked
+files are intentionally absent. Installed wheels use their release inventory.
+No dashboard is started by bootstrap.
+"""
 from __future__ import annotations
 
 import ctypes

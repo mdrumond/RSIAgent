@@ -45,6 +45,8 @@ def test_independent_instances(tmp_path, inputs):
     manifest = inspect_instance(first)
     assert manifest['machinery']['revision']
     assert manifest['files']['machinery/rsi/cli.py']
+    assert manifest['files']['machinery/rsi/instances.py']
+    assert (first / 'machinery/rsi/instances.py').is_file()
     assert json.loads((first / 'config/instance.json').read_text())['dashboard']['port'] == 0
 
 
