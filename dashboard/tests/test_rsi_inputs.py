@@ -136,12 +136,13 @@ class Element {
 }
 const get=id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);};
 const add=new Element('button');add.dataset.add='phase2_projects';
-get('rsi-inputs').dataset.enabled='true';get('rsi-inputs').querySelectorAll=()=>[add];
+const addHeldout=new Element('button');addHeldout.dataset.add='heldout_cases';
+get('rsi-inputs').dataset.enabled='true';get('rsi-inputs').querySelectorAll=()=>[add,addHeldout];
 const baseline={prompts:{curriculum:'learn',actor:'work',waves:'wave',skillwriter:'write'},
  kdb:'seed',skills:'skills',skill_map:'map',provider:{profile_id:'deepseek',model:'model'},
  roles:{},budgets:{design_iterations:3,implementation_iterations:5,execution_tries:20,actor_seconds:1800,wall_seconds:null},
  recovery:{enabled:true,future:'keep'},tuning:{every_projects:5,heldout_projects:5,runs_per_arm:2,at_wave_end:true},
- phase1_projects:[],phase2_projects:[],future:{opaque:42}};
+ phase1_projects:[],phase2_projects:[],project_configs:{unlisted:{unknown:'keep'}},future:{opaque:42}};
 let posted;
 const context={document:{getElementById:get,createElement:tag=>new Element(tag),body:{dataset:{csrf:'token'}}},
  console,Event:class{constructor(type){this.type=type;}},crypto:{randomUUID:()=> 'key'},
@@ -163,10 +164,26 @@ function change(input,value) {input.value=value;input.dispatchEvent({type:'input
  add.onclick();
  change(field('phase2-projects','Project ID'),'stable-sum');
  change(field('phase2-projects','Goal'),'Accurate sum');
- change(field('phase2-projects','Command arguments (JSON array)'),'["python","main.py"]');
+ await get('inputs-form').onsubmit({preventDefault(){}});
+ assert.equal(posted,undefined); // Missing host execution contract cannot publish silently.
+ flatten(get('phase2-projects')).find(n=>n.tagName==='button'&&n.textContent==='Use CPU Python template commands').listeners.click();
+ change(field('phase2-projects','Test arguments (JSON array)'),'["python","verify.py"]');
  // Actual folder response populates the source input through the picker.
  const sourceLabel=flatten(get('phase2-projects')).find(n=>n.children.includes(field('phase2-projects','Starting folder')));
  sourceLabel.children.find(n=>n.tagName==='button').listeners.click();await tick();get('select-folder').onclick();
+ change(field('phase2-projects','Frozen verifier file path'),'/root/selected/verify.py');
+ change(field('phase2-projects','Project ID'),'renamed-sum');
+ change(field('phase2-projects','Performance threshold seconds, optional'),'0.05');
+ await get('inputs-form').onsubmit({preventDefault(){}});
+ assert.equal(posted,undefined); // Performance threshold needs a real timing argv.
+ change(field('phase2-projects','Timing arguments, optional (JSON array)'),'["python","benchmark.py"]');
+ // Configure an actual independent held-out project and execution contract.
+ addHeldout.onclick();
+ change(field('heldout-projects','Project ID'),'heldout-numeric');
+ change(field('heldout-projects','Goal'),'Independent cancellation cases');
+ change(field('heldout-projects','Starting folder'),'/root/heldout');
+ flatten(get('heldout-projects')).find(n=>n.tagName==='button'&&n.textContent==='Use CPU Python template commands').listeners.click();
+ change(field('policy-fields','Held-out case count'),'1');
  // Disable an actor cap and ensure null reaches the backend.
  const budgetInput=field('budget-fields','Actor seconds');
  const budgetRow=get('budget-fields').children.find(row=>flatten(row).includes(budgetInput));
@@ -175,11 +192,24 @@ function change(input,value) {input.value=value;input.dispatchEvent({type:'input
  assert.equal(posted.revision,'old');assert.equal(posted.payload.future.opaque,42);
  assert.equal(posted.payload.recovery.future,'keep');assert.equal(posted.payload.budgets.actor_seconds,null);
  assert.equal(posted.payload.phase2_projects[0].starting_folder,'/root/selected');
- assert.deepEqual(posted.payload.phase2_projects[0].command,['python','main.py']);
+ assert.deepEqual(posted.payload.phase2_projects[0].command,['python','verify.py']);
+ assert.equal(posted.payload.project_configs['renamed-sum'].source,'/root/selected');
+ assert.equal(posted.payload.project_configs['renamed-sum'].verifier,'/root/selected/verify.py');
+ assert.equal(posted.payload.project_configs['renamed-sum'].performance_seconds,0.05);
+ assert.deepEqual(posted.payload.project_configs['renamed-sum'].commands.timing,['python','benchmark.py']);
+ assert.deepEqual(posted.payload.project_configs['renamed-sum'].commands.test,posted.payload.phase2_projects[0].command);
+ assert.equal(posted.payload.project_configs['stable-sum'],undefined);
+ assert.equal(posted.payload.project_configs.unlisted.unknown,'keep');
+ assert.equal(posted.payload.tuning.heldout_cases[0].project.project_id,'heldout-numeric');
+ assert.equal(posted.payload.tuning.heldout_cases[0].execution.verifier,'/root/heldout/verify.py');
+ assert.equal(posted.payload.project_configs['heldout-numeric'],undefined);
  // Removing the project persists the deletion with the newly returned revision.
  flatten(get('phase2-projects')).find(n=>n.tagName==='button'&&n.textContent==='Remove project').listeners.click();
  await get('inputs-form').onsubmit({preventDefault(){}});
  assert.equal(posted.revision,'new');assert.equal(posted.payload.phase2_projects.length,0);
+ assert.equal(posted.payload.project_configs['renamed-sum'],undefined);
+ assert.equal(posted.payload.project_configs.unlisted.unknown,'keep');
+ assert.equal(posted.payload.tuning.heldout_cases.length,1);
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
     subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/rsi_inputs.js')],
