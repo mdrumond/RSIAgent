@@ -382,3 +382,20 @@ def test_failed_admission_is_terminal_even_with_zero_clock_and_all_caps_disabled
         assert factories==[] and session.calls==0
     else:
         assert len(factories)==1 and session.calls==len(builtin_bundle().skills_for(failed_stage))+1
+
+
+def test_nested_native_receipts_keep_closed_own_intervals_and_union_elapsed(tmp_path):
+    from rsi.domain_execution import DomainActivity
+    runner,host,_,_,_=make(tmp_path)
+    operation=runner.workflow.begin()
+    runner.workflow.dispatched(operation,'CPU-local-host')
+    activity=DomainActivity(runner,operation)
+    def outer(seconds):
+        host.advance(3)
+        activity.run('inner','execution',lambda _:host.advance(2),execution=True)
+        host.advance(1)
+    activity.run('outer','compilation',outer,execution=True)
+    proof=runner._completed_effects()
+    assert len(proof['command_receipts'])==2
+    assert proof['actor_seconds_total']==6
+    assert runner.workflow.state['executions']==2

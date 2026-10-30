@@ -92,6 +92,7 @@ class DomainActivity:
         self.runner.append(dict(type='domain-dispatch', operation_id=self.operation,
             activity_id=activity, reference=dispatch_ref))
         from rsi.domain_timing import CURRENT
+        prior_intervals = set(flow.accounting.records)
         scope = dict(flow=flow, category=category, token=flow.accounting.start(category))
         context = CURRENT.set(scope)
         from rsi.domain_checkpoint import encode, has_pending_result
@@ -100,7 +101,8 @@ class DomainActivity:
             receipt = dict(kind='rsi-domain-result-v1', activity_id=activity, dispatch_ref=dispatch_ref,
                 operation_id=self.operation, stage=flow.stage.value, contract_ref=self.runner.contract_ref,
                 source_hash=self.runner.backend.project_hash(), observed_terminal=terminal, status=status,
-                result=encode(value), accounting_ref=self.runner.store.put_json(flow.state['intervals']))
+                result=encode(value), accounting_ref=self.runner.store.put_json({key:record for key,record in flow.state['intervals'].items()
+                    if key not in prior_intervals and record[2] is not None}))
             self.runner.append(dict(type='domain-result', operation_id=self.operation,
                 activity_id=activity, reference=self.runner.store.put_json(receipt)))
             self.runner.capture_checkpoint(self.operation, scope='activity')
