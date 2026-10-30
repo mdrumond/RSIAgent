@@ -69,6 +69,9 @@ class PairedRecovery:
     joint_limits is a NEW allocation bounded by remaining_parent, not a reset
     of the original workflow. Integer joint caps split evenly (odd remainder
     unused); None disables a cap. Original consumption is retained as provenance.
+    terminal_failure_ref may name an exact public terminal_failure_proof packet
+    retained in artifacts. It admits a known-closed failed checkpoint without
+    clearing pending or claiming stage completion. Unknown work remains blocked.
     One writer owns path, as for the canonical runner and Learning.
     """
     @classmethod
@@ -82,8 +85,9 @@ class PairedRecovery:
             raise ValueError('canonical checkpoint required')
         failure = None
         if terminal_failure_ref is not None:
-            failure = checkpoint.terminal_failure_proof()
-            if artifacts.read_json(terminal_failure_ref) != failure:
+            retained = artifacts.read_json(terminal_failure_ref)
+            failure = checkpoint.terminal_failure_proof(closure_ref=retained['closure_ref'])
+            if retained != failure:
                 raise ValueError('terminal failure reference differs from authoritative checkpoint')
             for obj in checkpoint.store.objects.glob('*/*'):
                 artifacts.put_bytes(checkpoint.store.read_bytes(obj.parent.name + obj.name))
@@ -204,7 +208,7 @@ class PairedRecovery:
         if terminal is None and flow.outcome:
             terminal = flow.outcome
         failure = None
-        if flow.pending or terminal == 'suspended':
+        if flow.outcome not in ('accepted', 'rejected'):
             failure = runner.terminal_failure_proof()
             terminal = 'failed'
             for obj in runner.store.objects.glob('*/*'):
@@ -221,17 +225,24 @@ class PairedRecovery:
         # but do not establish completed stages or substitute for skill reads.
         stages = {h['evidence']['stage'] for h in flow.state['history'] if 'evidence' in h}
         complete = {s.value for s in Stage} <= stages
-        correctness = validation['correctness'] if validation else None
+        correctness = failure['correctness'] if failure else validation['correctness'] if validation else None
         workflow = complete and flow.verified_source == flow.source_hash if flow.outcome == 'accepted' else bool(stages)
         seconds = flow.accounting.seconds()
         cap = request.spec.budgets.actor_seconds
         if failure is not None or cap is not None and seconds > cap:
             workflow = False
+        classification = failure['classification'] if failure else terminal
+        # Provider/setup-only differences do not demonstrate better programming
+        # skills. A current-source failed command is independent task evidence.
+        task_failure = classification in ('budget_exhausted', 'rejected') or bool(failure and any(
+            (command := self.store.read_json(ref))['current_hash'] == runner.backend.project_hash()
+            and command['classification'] in ('numeric_failure', 'compile_failure', 'execution_failure')
+            for ref in failure['command_receipts']))
         receipt = dict(operation_id=request.operation_id, frozen=request.frozen_ref,
             arm=arm, root=str(request.root), skill_bundle_hash=runner.bundle.digest,
             workflow=workflow, correctness=correctness,
-            performance=validation['performance'] if validation else 'not_measured',
-            outcome=terminal, actor_seconds=seconds,
+            performance=failure['performance'] if failure else validation['performance'] if validation else 'not_measured',
+            outcome=terminal, classification=classification, task_failure=task_failure, actor_seconds=seconds,
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
             terminal_failure_ref=self.store.put_json(failure) if failure else None,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
@@ -248,8 +259,11 @@ class PairedRecovery:
         success = {name: r['workflow'] is True and r['correctness'] is True
                    and r['outcome'] == 'accepted' and r['performance'] not in ('shortfall', 'not_measured')
                    for name, r in rows.items()}
-        decision = ('benefit' if success['candidate'] and not success['incumbent'] else
-                    'regression' if success['incumbent'] and not success['candidate'] else 'inconclusive')
+        decision = ('benefit' if success['candidate'] and not success['incumbent']
+                    and rows['incumbent'].get('task_failure', rows['incumbent']['outcome'] in ('budget_exhausted', 'rejected')) else
+                    'regression' if success['incumbent'] and not success['candidate']
+                    and rows['candidate'].get('task_failure', rows['candidate']['outcome'] in ('budget_exhausted', 'rejected'))
+                    else 'inconclusive')
         return dict(decision=decision, frozen=self.state['frozen'], arms=rows,
                     actor_seconds=sum(r['actor_seconds'] for r in rows.values()),
                     evidence_ref=self.store.put_json(dict(frozen=self.state['frozen'], arms=rows, decision=decision)))

@@ -792,3 +792,139 @@ def test_unknown_session_close_does_not_certify_production_provider_settled(tmp_
             runner.terminal_failure_proof()
     finally:
         database.close()
+
+
+@pytest.mark.parametrize('error', [OSError('dependency readiness failed'), TimeoutError('readiness timed out')])
+def test_prepare_failure_retains_closed_session_proof_before_dispatch(tmp_path, error):
+    class Startup(Session):
+        closed = 0
+        def prepare(self, timeout, *, schemas):
+            raise error
+        def close(self):
+            self.closed += 1
+    session = Startup()
+    runner, injections, database = make(tmp_path, session)
+    try:
+        result = runner.run()
+        assert result['status'] == 'suspended' and result['actor_closure_ref']
+        assert result['pending']['handle'] is None and session.closed == 1 and session.calls == 0
+        proof = runner.terminal_failure_proof()
+        assert proof['outcome'] == 'failed' and proof['pending'] == result['pending']
+        assert proof['actor_seconds_total'] == 0
+        reopened = ProjectRunner(runner.root, **injections)
+        assert reopened.terminal_failure_proof() == proof
+        assert runner.workflow.pending == result['pending'] and runner.workflow.outcome is None
+    finally:
+        database.close()
+
+
+def test_real_rpc_setup_close_and_provider_settlement_are_observed(tmp_path):
+    from pathlib import Path
+    from threading import Event
+    from types import SimpleNamespace
+    from coding.pi.rpc import PiRPC
+    from rsi.actor import PiSessionAdapter
+    class StartingPi(PiSessionAdapter):
+        def __init__(self):
+            rpc = PiRPC([sys.executable, '-c', 'import sys; sys.stdin.readline()'],
+                        cwd=Path(tmp_path), env=None)
+            settled = Event()
+            settled.set()  # No provider request was dispatched during failed setup.
+            self.session = SimpleNamespace(rpc=rpc, gateway=SimpleNamespace(finished=settled), close=rpc.close)
+        def prepare(self, timeout, *, schemas):
+            raise TimeoutError('handshake readiness timeout')
+    sessions = []
+    def factory():
+        session = StartingPi()
+        sessions.append(session)
+        return session
+    runner, _, database = make(tmp_path, session_factory=factory, test_backend=False)
+    try:
+        result = runner.run()
+        assert sessions[0].session.rpc.process.poll() is not None
+        assert result['pending']['handle'] is None
+        closure = runner.store.read_json(result['actor_closure_ref'])['observation']
+        assert closure['actor_closed'] is True and closure['provider_settled'] is True
+        assert runner.terminal_failure_proof()['outcome'] == 'failed'
+    finally:
+        for session in sessions:
+            session.session.rpc.close()
+        database.close()
+
+
+def test_raising_factory_partial_start_needs_scoped_explicit_observation(tmp_path):
+    import subprocess
+    from rsi.runtime import WorkflowError
+    processes = []
+    def factory():
+        processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        raise OSError('factory raised after partially starting a child')
+    runner, injections, database = make(tmp_path, session_factory=factory)
+    try:
+        result = runner.run()
+        assert result['actor_closure_ref'] is None and result['pending']['handle'] is None
+        assert processes[0].poll() is None
+        with pytest.raises(WorkflowError, match='closure receipt'):
+            runner.terminal_failure_proof()
+        reopened = ProjectRunner(runner.root, **injections)
+        observed = reopened.run()
+        assert len(processes) == 1 and observed['actor_closure_ref'] is None
+        # The host now actually terminates/reaps the child it owns. No provider ran.
+        processes[0].terminate()
+        processes[0].wait(timeout=3)
+        pending = reopened.workflow.pending
+        proof = dict(operation_id=pending['id'], handle=None, no_actor_dispatched=True,
+            actor_closed=True, provider_settled=True,
+            observation='Host terminated/reaped its partially started child; no Pi/provider dispatch occurred')
+        with pytest.raises(WorkflowError):
+            reopened.record_terminal_observation(observed, controller_proof=dict(proof, operation_id='other'),
+                                                  observed_source_hash=reopened.backend.project_hash())
+        reopened.record_terminal_observation(observed, controller_proof=proof,
+                                              observed_source_hash=reopened.backend.project_hash())
+        admitted = reopened.terminal_failure_proof()
+        assert admitted['pending'] == pending and reopened.workflow.pending == pending
+        # The narrow no-effect API also permits explicitly observed None handles,
+        # but releases only after reject_operation and keeps consumed allocations.
+        failure = reopened.record_admission_failure(pending['id'],
+            controller_proof=dict(proof, no_host_effects=True), observed_source_hash=reopened.backend.project_hash())
+        charged, limits = reopened.workflow.accounting.seconds(), dict(reopened.workflow.state['limits'])
+        reopened.workflow.reject_operation(pending['id'], failure, reopened.backend.project_hash())
+        assert reopened.workflow.pending is None
+        assert reopened.workflow.accounting.seconds() == charged and reopened.workflow.state['limits'] == limits
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+        database.close()
+
+
+def test_unfinished_query_dispatch_vetoes_admission_record_and_old_rejection(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, injections, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        runner.workflow.dispatched(operation, 'pi:closed-before-observation')
+        runner.actor.close()
+        source = runner.backend.project_hash()
+        proof = dict(handle=runner.workflow.pending['handle'], actor_closed=True, no_host_effects=True,
+                     observation='Host observed owned Pi closed; callback status must be checked separately')
+        old_reference = runner.record_admission_failure(operation, controller_proof=proof, observed_source_hash=source)
+        token = runner.workflow.accounting.start('retrieval')
+        runner.append(dict(type='query-dispatch', operation_id=operation, call_id='unknown-callback',
+                           request_ref=runner.store.put_json(dict(query='stable sum'))))
+        observed_end = runner.workflow.clock()
+        # Crash/reopen: reconcile only observed elapsed time, not callback completion.
+        reopened = ProjectRunner(runner.root, **injections)
+        reopened.workflow.accounting.reconcile(token, observed_end)
+        assert reopened.no_host_effects(operation) is False
+        with pytest.raises(WorkflowError, match='no host effects'):
+            reopened.record_admission_failure(operation, controller_proof=proof, observed_source_hash=source)
+        with pytest.raises(WorkflowError, match='untrusted'):
+            reopened.workflow.reject_operation(operation, old_reference, source)
+        assert reopened.workflow.pending['id'] == operation
+    finally:
+        database.close()
