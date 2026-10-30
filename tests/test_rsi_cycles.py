@@ -1,9 +1,11 @@
 from dataclasses import replace
+import hashlib
+import json
 
 import pytest
 
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
-from rsi.cycles import CycleScheduler, HostTaskResult, SnapshotUpdate
+from rsi.cycles import CycleScheduler, HostTaskResult, IsolationSnapshot, SnapshotUpdate
 from rsi.runtime import WorkflowError
 
 
@@ -147,6 +149,16 @@ def test_recovery_caps_and_disabled_recovery(tmp_path):
         s.close()
 
 
+def isolation(root, memory, skills, namespace):
+    (root / 'memory').mkdir(parents=True)
+    (root / 'memory/active.json').write_text('{}')
+    (root / 'learning.json').write_text('{}')
+    data = json.dumps(dict(namespace=namespace, memory=memory, skills=skills,
+                           parent=str(root.parent / 'parent-memory'))).encode()
+    (root / 'isolation.json').write_bytes(data)
+    return IsolationSnapshot(namespace, memory, skills, str(root), hashlib.sha256(data).hexdigest())
+
+
 def test_inference_isolation_and_recovery_disabled(tmp_path):
     seen = []
 
@@ -157,10 +169,11 @@ def test_inference_isolation_and_recovery_disabled(tmp_path):
     s = CycleScheduler(tmp_path / 'state', spec(Mode.INFERENCE, 1), run,
                        lambda *a: SnapshotUpdate('isolated-memory1'),
                        skill_update=lambda *a: SnapshotUpdate('isolated-candidate'),
-                       isolate=lambda m, sk, ctx: ('isolated-memory0', 'isolated-skills0'),
+                       isolate=lambda m, sk, ctx: isolation(tmp_path / 'fork', m, sk, ctx['namespace']),
                        recover=False)
     finish(s)
-    assert seen[0][:2] == ('isolated-memory0', 'isolated-skills0')
+    assert seen[0][:2] == ('memory0', 'skills0')
+    assert s.state['isolation']['branch_root'] == str(tmp_path / 'fork')
     assert seen[0][2].startswith('inference:')
     assert not any(e['kind'] == 'paired_recovery_due' for e in s.state['events'])
     s.close()
@@ -179,3 +192,74 @@ def test_single_writer_stop_resume_and_wave_limit(tmp_path):
     finish(s)
     assert s.state['phase'] == 'wave_limit' and len(s.state['originals']) == 1
     s.close()
+
+
+def test_isolation_requires_receipt_and_valid_namespace(tmp_path):
+    s = CycleScheduler(tmp_path / 'state', spec(Mode.INFERENCE, 1), None, None,
+                       skill_update=lambda *a: None,
+                       isolate=lambda *a: ('different-memory', 'different-skills'))
+    with pytest.raises(ValueError):
+        s.step()
+    operation = s.state['pending']['id']
+    receipt = isolation(tmp_path / 'fork', 'memory0', 'skills0', 'wrong-namespace')
+    with pytest.raises(ValueError):
+        s.reconcile(operation, receipt)
+    assert s.state['phase'] == 'isolate'
+    assert s.state['pending']['id'] == operation
+    s.close()
+
+
+def test_extensions_persist_and_charge_once_without_promoting_candidates(tmp_path):
+    path, cycle = tmp_path / 'state', spec(Mode.PHASE2, 1)
+    kwargs = dict(runner=lambda *a: HostTaskResult('accepted', 'r', 1),
+                  memory_update=lambda *a: SnapshotUpdate('m1'),
+                  skill_update=lambda *a: SnapshotUpdate('candidate'), actor_seconds=20)
+    s = CycleScheduler(path, cycle, **kwargs)
+    finish(s)
+    events = s.extension_events()
+    validation = next(e for e in events if e['kind'] == 'candidate_validation_due')
+    assert validation['incumbent'] == 'skills0' and validation['candidate'] == 'candidate'
+    s.enqueue_tuning('manual', {'user_guidance': 'prioritise numeric diagnostics'})
+    s.enqueue_tuning('manual', {'user_guidance': 'prioritise numeric diagnostics'})
+    with pytest.raises(ValueError):
+        s.enqueue_tuning('manual', {'project_ref': 'different'})
+    s.complete_extension(validation['id'], 'retained-evaluation', actor_seconds=3, recovery=True)
+    s.complete_extension(validation['id'], 'retained-evaluation', actor_seconds=3, recovery=True)
+    assert s.state['skills'] == 'skills0'
+    assert s.remaining()['actor_seconds'] == 16
+    assert s.state['recovery_spent'] == 3
+    with pytest.raises(ValueError):
+        s.complete_extension(validation['id'], 'different')
+    s.publish_validated_skills('skills0', 'validated')
+    s.publish_validated_skills('skills0', 'validated')
+    with pytest.raises(WorkflowError):
+        s.publish_validated_skills('stale', 'other')
+    s.close()
+    s = CycleScheduler(path, cycle, **kwargs)
+    assert s.state['skills'] == 'validated'
+    assert s.remaining()['actor_seconds'] == 16
+    assert validation['id'] not in {e['id'] for e in s.extension_events()}
+    assert sum(e['id'] == 'manual' for e in s.extension_events()) == 1
+    s.close()
+
+
+def test_phase1_refuses_skill_extensions(tmp_path):
+    s = CycleScheduler(tmp_path / 'state', spec(), None, None)
+    with pytest.raises(WorkflowError):
+        s.enqueue_tuning('manual', {})
+    with pytest.raises(WorkflowError):
+        s.publish_validated_skills('skills0', 'other')
+    assert s.state['skills'] == 'skills0'
+    s.close()
+
+
+def test_isolation_receipt_rejects_parent_mutable_head_reuse(tmp_path):
+    receipt = isolation(tmp_path / 'fork', 'memory0', 'skills0', 'namespace')
+    proof_path = tmp_path / 'fork/isolation.json'
+    proof = json.loads(proof_path.read_text())
+    proof['parent'] = str(tmp_path / 'fork/memory')
+    data = json.dumps(proof).encode()
+    proof_path.write_bytes(data)
+    receipt = replace(receipt, receipt_ref=hashlib.sha256(data).hexdigest())
+    with pytest.raises(ValueError):
+        receipt.verify()
