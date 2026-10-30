@@ -42,7 +42,11 @@ class Decisions:
                 return 'select_strategy', dict(proposal='Preserve verified result',
                     query_ref=evidence['query_kdb']['reference'],
                     retrospective_ref=evidence['retrospect']['reference'],
-                    skill_refs=[r['receipt_id'] for r in context['read_skills']], decisions=[])
+                    skill_refs=[r['receipt_id'] for r in context['read_skills']],
+                    decisions=[dict(group=group, index=i, action='used' if group == 'results' else 'rejected',
+                        reason='Use observed guidance' if group == 'results' else 'Avoid retained failed approach')
+                        for group in ('results', 'negative_records') for i in range(len(
+                            evidence['query_kdb']['evidence']['payload']['response'][group]))])
             if context['stage'] == 'optimisation' and 'optimisation_decision' not in evidence:
                 return 'optimisation_decision', dict(action='noop', reason='Correctness before speed')
         return 'perform', {'proposal': 'Preserve verified result'}
@@ -548,3 +552,72 @@ def test_explicit_project_continue_resumes_only_after_authoritative_pending_reco
         assert cycle.scheduler.state['originals'][0]['outcome'] == 'accepted'
     finally:
         cycle.close()
+
+
+def test_ingested_and_accepted_memory_negatives_reach_real_actor_queries(instance, tmp_path):
+    import subprocess
+    from benchmarks.ascend.subject_memory import SubjectMemory
+    from rsi.instance_ingestion import ingest_instance
+    from test_rsi_instance_ingestion import source_repo
+    observed = subprocess.run([sys.executable, '-c', 'assert 1 == 0, "observed prior failure"'],
+                              capture_output=True, text=True)
+    assert observed.returncode != 0
+    failure = instance.store.put_json(dict(returncode=observed.returncode, stderr=observed.stderr))
+    memory = SubjectMemory(instance.root / 'baseline-memory')
+    memory.accept('observed-failure', dict(base_versions=[], kind='failure', project_id='earlier',
+        summary='independently observed assertion failure', evidence=[failure]), {'observed': failure})
+    baseline = memory.snapshot()
+    (instance.root / 'memory-snapshot.json').write_bytes(baseline)
+    config = show_configuration(instance.root)['payload']
+    config.update(memory_snapshot='memory-snapshot.json', memory_sha256=hashlib.sha256(baseline).hexdigest())
+    set_configuration(instance.root, config)
+    source, revision = source_repo(tmp_path)
+    negative = dict(id='ingested-negative', outcome='failed', source_revision=revision)
+    ingestion = ingest_instance(instance.root, source, collection='negative-baseline',
+        repository='fixture/negative', negative_records=[negative], test_embeddings=Embedding())
+    cycle = instance.create_cycle('negative-actor', 'phase1')
+    try:
+        result = cycle.step()
+        assert result.outcome == 'accepted'
+        runner = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+        refs = [e['reference'] for e in runner.events
+                if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert len(refs) >= 2  # Actual design and optimisation retrieval, no synthesized success.
+        for ref in refs:
+            response = runner.store.read_json(ref)['payload']['response']
+            assert negative in response['negative_records']
+            assert any(r.get('proposal', {}).get('kind') == 'failure' for r in response['negative_records'])
+            assert response['provenance']['ingestions'][0]['reference'] == ingestion['reference']
+        selections = [runner.store.read_json(e['reference'])['payload'] for e in runner.events
+                      if e['type'] == 'project-tool' and e['name'] == 'select_strategy']
+        assert all(sum(d['group'] == 'negative_records' for d in row['decisions']) == 2 for row in selections)
+    finally:
+        cycle.close()
+
+
+def test_ingestion_missing_or_wrong_baseline_receipt_cannot_be_empty_query_success(instance, tmp_path):
+    from rsi.instance_ingestion import ingest_instance
+    from test_rsi_instance_ingestion import source_repo
+    source, _ = source_repo(tmp_path)
+    result = ingest_instance(instance.root, source, collection='verified-index',
+        repository='fixture/index', negative_records=[{'id': 'failure'}], test_embeddings=Embedding())
+    original = show_configuration(instance.root)['payload']
+    altered = json.loads(json.dumps(original))
+    altered['kdb_ingestion_refs'] = ['f' * 64]
+    set_configuration(instance.root, altered)
+    missing = instance.create_cycle('missing-ingestion', 'phase1')
+    try:
+        with pytest.raises(FileNotFoundError):
+            missing.query(missing.spec.baseline_kdb)
+    finally:
+        missing.close()
+    receipt = instance.store.read_json(result['reference'])
+    receipt['kdb_sha256'] = '0' * 64
+    altered['kdb_ingestion_refs'] = [instance.store.put_json(receipt)]
+    set_configuration(instance.root, altered)
+    foreign = instance.create_cycle('foreign-ingestion', 'phase1')
+    try:
+        with pytest.raises(ValueError, match='baseline checksum'):
+            foreign.query(foreign.spec.baseline_kdb)
+    finally:
+        foreign.close()

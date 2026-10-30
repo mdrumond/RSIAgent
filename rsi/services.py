@@ -34,6 +34,7 @@ from rsi.strategy import knowledge_db_query
 from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.service_tuning import TuningBindings
+from rsi.instance_ingestion import load_ingestion_records
 from rsi.evaluation import SkillEvaluation, TuningController, case_identity
 
 
@@ -332,33 +333,59 @@ class BoundCycle(TuningBindings):
         finally:
             self.role_operation = None
 
+    def ingestion_evidence(self):
+        refs = self.config.get('kdb_ingestion_refs', [])
+        evidence = load_ingestion_records(self.store, refs)
+        previous = None
+        for i, reference in enumerate(refs):
+            receipt = self.store.read_json(reference)
+            if not self.services.test and receipt.get('test_backend') is not False:
+                raise ValueError('production query requires production ingestion provenance')
+            if (receipt.get('previous_ingestion_refs') != refs[:i]
+                    or previous is not None and receipt.get('previous_kdb_sha256') != previous
+                    or receipt['manifest'].get('collection') not in self.config.get('kdb_collections', [])):
+                raise ValueError('ingestion chain differs from frozen KDB configuration')
+            if self.database is not None and json.loads(self.database.manifest(
+                    receipt['manifest']['collection']).to_json()) != receipt['manifest']:
+                raise ValueError('ingestion source manifest differs from frozen KDB')
+            previous = receipt.get('kdb_sha256')
+        if refs and previous != self.config.get('kdb_sha256'):
+            raise ValueError('ingestion baseline checksum differs from frozen configuration')
+        return evidence
+
     def query(self, memory_ref):
         snapshot = self.store.read_json(memory_ref)
         if snapshot.get('schema') != 'subject-memory-snapshot-v1':
             raise ValueError('accepted memory snapshot required')
-        if self.services.test:
-            return self.services.test.query
-        if self.database is None:
-            from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
-            from benchmarks.a5kernels.knowledge import KnowledgeDB
-            path = self.root / 'knowledge.sqlite3'
-            if hashlib.sha256(path.read_bytes()).hexdigest() != self.binding['kdb']:
-                raise ValueError('frozen KDB changed')
-            settings = dict(self.config.get('embeddings', {}))
-            if settings.get('cache_dir'):
-                settings['cache_dir'] = self.services.path(settings['cache_dir'])
-            embeddings = PinnedBGEEmbeddings(**settings)
-            with self.services.setup.measure('bge-dependency-model-load', self.spec.cycle_id):
-                embeddings._load()  # Setup excluded from actor, retained as telemetry.
-            self.database = KnowledgeDB.open_read_only(path, embeddings)
+        ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
         records = snapshot['memories']
-        adapter = knowledge_db_query(self.database, tuple(self.config['kdb_collections']),
-            negative_query=lambda _: [r for r in records if r['proposal']['kind'] != 'correctness'])
+        negatives = [r for r in records if r['proposal']['kind'] != 'correctness']
+        if self.services.test:
+            adapter = self.services.test.query
+        else:
+            if self.database is None:
+                from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+                from benchmarks.a5kernels.knowledge import KnowledgeDB
+                path = self.root / 'knowledge.sqlite3'
+                if hashlib.sha256(path.read_bytes()).hexdigest() != self.binding['kdb']:
+                    raise ValueError('frozen KDB changed')
+                settings = dict(self.config.get('embeddings', {}))
+                if settings.get('cache_dir'):
+                    settings['cache_dir'] = self.services.path(settings['cache_dir'])
+                embeddings = PinnedBGEEmbeddings(**settings)
+                with self.services.setup.measure('bge-dependency-model-load', self.spec.cycle_id):
+                    embeddings._load()
+                self.database = KnowledgeDB.open_read_only(path, embeddings)
+            self.ingestion_evidence()  # Authenticate each indexed source manifest as well.
+            adapter = knowledge_db_query(self.database, tuple(self.config['kdb_collections']),
+                                         negative_query=lambda _: [])
         def query(payload):
-            result = adapter(payload)
+            result = json.loads(json.dumps(adapter(payload), allow_nan=False))
+            result['negative_records'].extend([*negatives, *ingestion['negative_records']])
             result['results'].extend(dict(memory=r, provenance={'snapshot': memory_ref})
                 for r in records if r['proposal']['kind'] == 'correctness')
-            result['provenance']['memory_snapshot'] = memory_ref
+            result['provenance'].update(memory_snapshot=memory_ref,
+                                        ingestions=ingestion['provenance'])
             return result
         return query
 
