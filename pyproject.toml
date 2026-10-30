@@ -14,7 +14,7 @@ rsi = "rsi.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rsi*", "core*", "coding*", "config*", "env*", "llm*", "optimizer*", "explore*", "benchmarks*", "dashboard*", "integrations*"]
+include = ["rsi*", "core*", "coding*", "config*", "env*", "llm*", "optimizer*", "explore*", "benchmarks*", "dashboard*", "integrations*", "tools*"]
 namespaces = true
 exclude = ["*.node_modules", "*.node_modules.*", "tests", "tests.*", "*.tests", "*.tests.*", "build", "build.*", "*.build", "*.build.*", "*.dist", "*.dist.*", "*.__pycache__", "*.__pycache__.*"]
 
