@@ -599,6 +599,11 @@ class BoundCycle(TuningBindings):
 
     def run_project(self, operation_id):
         runner = self.open_project(operation_id)
+        # Observation may finish a durable receipt, but must never replay unknown work.
+        runner.reconcile()
+        if runner.workflow.pending:
+            raise ValueError('reconcile pending operation before explicit continuation')
+        runner.workflow.resume()
         return self.finish_project(runner, operation_id, self.execute(runner))
 
     def close(self):

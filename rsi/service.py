@@ -33,12 +33,29 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     monitor = None
     previous = None
     dispatching = False
+    manual = action == 'tune' or action == 'resume' and request.get('origin_action') == 'tune'
+    event_id = request.get('request_id') if manual else None
+    was_stopped = cycle.scheduler.state['stopped']
+    def manual_result():
+        receipt = cycle.scheduler.state.get('extension_receipts', {}).get(event_id)
+        if not manual or receipt is None:
+            return None
+        result = cycle.store.read_json(receipt['reference'])
+        return dict(status='tuned', cycle_id=cycle_id, event_id=event_id,
+                    evidence_ref=receipt['reference'], result=result,
+                    active_skills_ref=cycle.scheduler.state['skills'])
     try:
         if request.get('mode') not in (None, cycle.spec.mode.value):
             raise ValueError('request mode differs from retained cycle')
         if action == 'tune':
-            event_id = cycle.request_tuning(request.get('steering', {}))
+            if cycle.scheduler.state['phase'] not in ('original', 'complete', 'wave_limit'):
+                raise ValueError('manual tuning requires an idle task/wave boundary')
+            if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
+                return dict(status='suspended', cycle_id=cycle_id,
+                    pending=cycle.scheduler.state['pending'], tuning_pending=cycle.tuning.state['pending'])
+            event_id = cycle.request_tuning(request.get('steering', {}), request_id=request.get('request_id'))
             emit(dict(event='tuning_requested', cycle_id=cycle_id, event_id=event_id))
+            cycle.scheduler.resume()
         if action == 'adopt':
             if snapshot is None:
                 raise ValueError('explicit frozen adoption revision required')
@@ -46,6 +63,9 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             emit(dict(event='configuration_adopted', cycle_id=cycle_id, **result))
             return dict(status='adopted', cycle_id=cycle_id, **result)
         if action == 'resume':
+            if manual and not any(e.get('id') == event_id for e in cycle.scheduler.state['events']):
+                return dict(status='suspended', cycle_id=cycle_id,
+                    error='manual request has no retained admission; inspect before a new explicit request')
             # Retained work is observed first. No pending provider/host work is replayed.
             if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
                 try:
@@ -68,11 +88,17 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         monitor = threading.Thread(target=watch, name='rsi-owned-stop', daemon=True)
         monitor.start()
         while not should_stop():
+            completed = manual_result()
+            if completed is not None:
+                return completed
             dispatching = True
             try:
                 cycle.step()  # Existing controllers are the sole policy drivers.
             finally:
                 dispatching = False
+            completed = manual_result()
+            if completed is not None:
+                return completed
             state = cycle.scheduler.state
             emit(dict(event='cycle_observed', cycle_id=cycle_id, phase=state['phase'],
                       cursor=state['cursor'], wave=state['wave'], spent=state['spent']))
@@ -109,4 +135,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             monitor.join()
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
-        cycle.close()
+        try:
+            if manual and was_stopped:
+                cycle.scheduler.stop()
+        finally:
+            cycle.close()
