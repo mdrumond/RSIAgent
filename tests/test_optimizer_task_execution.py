@@ -97,11 +97,63 @@ def test_prepare_and_single_attempts_reuse_baseline_and_authenticated_results(tm
     assert sha(source.encode()) == passed['source_sha256']
 
 
-def test_compile_repairs_do_not_charge_candidate_budget(tmp_path):
+@pytest.mark.parametrize('capability', ['absent', None, 'not callable'])
+def test_real_pi_omits_unsupported_compile_and_completes_all_stages(tmp_path, monkeypatch, capability):
+    from types import SimpleNamespace
+    from rsi.contracts import Stage
+    execution, agent, backend = executor(tmp_path, [candidate('good')])
+    # Keep the existing CPU host effects; expose no callable compile capability.
+    runtime = SimpleNamespace(prepare=backend.prepare, evaluate=backend.evaluate, profile=backend.profile)
+    if capability != 'absent':
+        runtime.compile = capability
+    execution._backend = runtime
+    http = scripted_optimizer_http(monkeypatch, agent, compile_if_offered=True)
+    result = execution.attempt('target-001')
+    assert result['verified'] and result['speedup'] == 2
+    assert http.requests and all('compile' not in {tool['function']['name']
+        for tool in wire.get('tools', [])} for wire in http.requests)
+    assert backend.prepares == 1 and backend.compilations == []
+    assert [source for source, _ in backend.evaluations] == ['good']
+    assert execution.store.get(execution.job_id)['attempts'] == 1
+    native = retained_native(execution)
+    assert native.workflow['pending'] is None
+    assert {row['evidence']['stage'] for row in native.workflow['history']} == {stage.value for stage in Stage}
+    assert execution._state()['canonical_active']['status'] == 'accepted'
+    assert native.store.verify()
+    source = json.loads(execution.store.read_artifact(execution.job_id, result['candidate']['sha256']))
+    assert source == 'good' and sha(source.encode()) == result['source_sha256']
+    baseline = execution.prepare()
+    assert baseline['cases'][0]['case'] == 'case-000'
+    assert baseline['suite_sha256'] == result['result']['suite_sha256']
+    runner = http.session.owner.fixture_runner
+    for row in native.workflow['history']:
+        operation = row['evidence']['operation_id']
+        reads = [event for event in native.events if event.get('operation_id') == operation
+                 and event['type'] == 'skill-usage' and event.get('kind') == 'read']
+        assert {event['skill'] for event in reads} == set(runner.bundle.skills_for(Stage(row['evidence']['stage'])))
+        receipts = [native.store.read_json(ref) for ref in row['evidence']['skill_refs']]
+        assert {receipt['payload']['receipt_id'] for receipt in receipts} == {event['receipt_id'] for event in reads}
+        assert all(receipt['context']['operation'] == operation for receipt in receipts)
+    queries = [event for event in native.events if event['type'] == 'query-dispatch']
+    assert queries
+    finished = [event for event in native.events if event['type'] == 'query-finished']
+    assert {event['call_id'] for event in queries} == {event['call_id'] for event in finished}
+    assert all(event['status'] == 'complete' for event in finished)
+    for event in finished:
+        receipt = native.store.read_json(event['reference'])
+        assert receipt['context']['operation'] == event['operation_id']
+        assert receipt['payload']['response']['results']
+    assert result['result']['candidate_sha256'] == result['source_sha256']
+    assert [case['case'] for case in result['result']['cases']] == [case['case'] for case in baseline['cases']]
+
+
+def test_compile_repairs_do_not_charge_candidate_budget(tmp_path, monkeypatch):
     execution, agent, backend = executor(tmp_path, [candidate('bad', 'compile'),
         candidate('good', 'compile'), candidate('good')])
+    http = scripted_optimizer_http(monkeypatch, agent)
     result = execution.attempt('target-001')
     assert result['verified']
+    assert any(tool['function']['name'] == 'compile' for wire in http.requests for tool in wire.get('tools', []))
     assert backend.compilations == ['bad', 'good']
     assert len(backend.evaluations) == 1
     assert execution.store.get(execution.job_id)['attempts'] == 1
