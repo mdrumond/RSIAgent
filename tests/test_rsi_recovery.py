@@ -13,13 +13,15 @@ from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillBundle, SkillDocument
-from test_rsi_project_runner import Session, make
+from test_rsi_project_runner import Session, Clock, make
 from test_rsi_learning import env
 from rsi.learning import Validation
 
 
-def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, wrap=None):
-    original, injected, database = make(tmp_path)
+def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, wrap=None,
+               original_session=None, clock=None, checkpoint_hook=None, config_overrides=None):
+    original, injected, database = make(tmp_path, original_session, config_overrides=config_overrides,
+                                        **({'clock': clock} if clock else {}))
     store = ContentAddressedArtifacts(tmp_path / 'shared')
     incumbent = store.put_json(original.bundle.to_dict())
     documents = list(original.bundle.documents)
@@ -37,7 +39,9 @@ def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, 
             return ProjectRunner(request.root, **kwargs)
         return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
 
+    failure_ref = checkpoint_hook(original, injected, store) if checkpoint_hook else None
     pair = PairedRecovery.create(tmp_path / 'pair.json', original, artifacts=store,
+        terminal_failure_ref=failure_ref,
         memory_ref=store.put_bytes(b'memory'), kdb_ref=store.put_bytes(b'kdb'),
         model_config={'model': 'TEST', 'temperature': 0}, incumbent=incumbent, candidate=candidate,
         joint_limits=limits or BudgetLimits(design_iterations=6, implementation_iterations=4,
@@ -68,7 +72,8 @@ def test_equal_frozen_inputs_new_allocation_and_source_isolation(tmp_path):
         result = run_pair(pair)
         assert result['decision'] == 'benefit', result
         assert result['arms']['candidate']['correctness'] is True
-        assert result['arms']['incumbent']['outcome'] == 'budget_exhausted'
+        assert result['arms']['incumbent']['outcome'] == 'failed'
+        assert result['arms']['incumbent']['classification'] == 'budget_exhausted'
         assert result['arms']['candidate']['source_hash'] != result['arms']['incumbent']['source_hash']
         assert (original.backend.project / 'solution.py').read_bytes() == before
         assert original.workflow.accounting.seconds() == spent
@@ -288,5 +293,158 @@ def test_admission_failure_history_is_not_a_completed_stage(tmp_path):
         result = run_pair(pair)
         assert result['decision'] == 'inconclusive'
         assert all(r['workflow'] is True and r['correctness'] is True for r in result['arms'].values())
+    finally:
+        db.close()
+
+
+class ClosedBudget(Session):
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+
+    def next_action(self, *args, **kwargs):
+        from coding.pi.session import ActionError
+        self.calls += 1
+        self.clock.value += 4000
+        raise ActionError('numeric strategy arguments could not be constructed')
+
+
+def test_closed_budget_checkpoint_pending_preserved_and_new_arms_scope(tmp_path):
+    clock = Clock()
+    captured = {}
+    def freeze_failure(original, injections, store):
+        result = original.run()
+        assert result['status'] == 'budget_exhausted' and result['pending']
+        proof = original.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
+        captured.update(proof=proof, state=(original.root / 'workflow.json').read_bytes(),
+            events=original.event_path.read_bytes(), files=(original.backend.project / 'solution.py').read_bytes())
+        return store.put_json(proof)
+    def trial(request, reopen, injections):
+        if request.arm == 'incumbent':
+            injections['session_factory'] = lambda: ClosedBudget(clock)
+        return ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, original, store, _, db = setup_pair(tmp_path, original_session=ClosedBudget(clock),
+        clock=clock, checkpoint_hook=freeze_failure, wrap=trial)
+    try:
+        frozen = pair.frozen
+        assert store.read_json(frozen['terminal_failure_ref']) == captured['proof']
+        assert frozen['original_spent'] == captured['proof']['actor_seconds_total']
+        left, right = pair.request('incumbent'), pair.request('candidate')
+        assert left.spec == right.spec and left.memory_ref == right.memory_ref and left.kdb_ref == right.kdb_ref
+        assert left.model_config == right.model_config and left.backend_identity == right.backend_identity
+        assert left.operation_id != right.operation_id != original.workflow.pending['id']
+        assert (left.root.parent / 'inputs/solution.py').read_bytes() == captured['files']
+        result = run_pair(pair)
+        assert result['decision'] == 'benefit'
+        failed = result['arms']['incumbent']
+        proof = store.read_json(failed['terminal_failure_ref'])
+        state = store.read_json(failed['workflow_receipt'])
+        assert failed['workflow'] is False and failed['classification'] == 'budget_exhausted'
+        assert state['pending'] == proof['pending'] and proof['stage_completion_claim'] is False
+        assert store.read_json(proof['accounting_snapshot']) == state
+        assert result['arms']['candidate']['outcome'] == 'accepted'
+        assert captured['state'] == (original.root / 'workflow.json').read_bytes()
+        assert captured['events'] == original.event_path.read_bytes()
+        assert original.workflow.pending == captured['proof']['pending']
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize('fault', ['forged_proof', 'unknown_query', 'unknown_command'])
+def test_checkpoint_failure_proof_veto_blocks_pair_creation(tmp_path, fault):
+    from coding.pi.rpc import PiDeadlineError
+    class Failed(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'design' and any(e['name'] == 'query_kdb' for e in context['evidence']):
+                raise PiDeadlineError('provider callback closed')
+            return super().next_action(context, allowed, **kwargs)
+    def hook(original, injections, store):
+        result = original.run()
+        proof = original.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
+        if fault == 'forged_proof':
+            proof['actor_seconds_total'] += 1
+        elif fault == 'unknown_query':
+            original.append(dict(type='query-dispatch', call_id='unknown', operation_id=original.workflow.pending['id']))
+        else:
+            original.workflow.reserve_execution('unsettled-command')
+        return store.put_json(proof)
+    with pytest.raises((WorkflowError, ValueError)):
+        setup_pair(tmp_path, original_session=Failed(), checkpoint_hook=hook)
+    assert not (tmp_path / 'pair.json').exists()
+
+
+@pytest.mark.parametrize('provider_arm', ['incumbent', 'candidate', 'both'])
+def test_provider_only_arm_difference_remains_inconclusive(tmp_path, provider_arm):
+    from coding.pi.rpc import PiDeadlineError
+    class Failed(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'design' and any(e['name'] == 'query_kdb' for e in context['evidence']):
+                raise PiDeadlineError('observed closed provider deadline')
+            return super().next_action(context, allowed, **kwargs)
+    def trial(request, reopen, injections):
+        if provider_arm in (request.arm, 'both'):
+            injections['session_factory'] = lambda: Failed()
+        return ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, _, store, _, db = setup_pair(tmp_path, repairs=(True, True), wrap=trial)
+    try:
+        result = run_pair(pair)
+        assert result['decision'] == 'inconclusive'
+        for arm, metrics in result['arms'].items():
+            if provider_arm in (arm, 'both'):
+                assert metrics['classification'] == 'provider_timeout'
+                assert metrics['task_failure'] is False and metrics['workflow'] is False
+                proof = store.read_json(metrics['terminal_failure_ref'])
+                assert proof['pending'] and proof['retrieval_receipts']
+                assert all(store.read_json(ref)['kind'] == 'retrieval' for ref in proof['retrieval_receipts'])
+    finally:
+        db.close()
+
+
+def test_unknown_arm_query_never_becomes_a_completed_failure(tmp_path):
+    def trial(request, reopen, injections):
+        def unavailable(query):
+            raise OSError('backend completion not observed')
+        injections['query'] = unavailable
+        return ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, _, _, calls, db = setup_pair(tmp_path, wrap=trial)
+    try:
+        with pytest.raises(WorkflowError):
+            pair.step()
+        assert pair.state['arms']['incumbent']['status'] == 'pending'
+        assert pair.result() is None
+        with pytest.raises(WorkflowError):
+            pair.step()
+        assert len(calls) == 1
+    finally:
+        db.close()
+
+
+def test_failed_command_changed_source_is_frozen_from_public_proof(tmp_path):
+    import sys
+    captured = {}
+    def checkpoint(original, injections, store):
+        result = original.run()
+        proof = original.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
+        assert proof['source_hash'] != proof['stage_initial_source']
+        captured.update(proof=proof, state=(original.root / 'workflow.json').read_bytes())
+        return store.put_json(proof)
+    commands = {'compile': [sys.executable, '-c',
+        "from pathlib import Path; Path('new_input.json').write_text('{}')"],
+        'test': [sys.executable, '{verifier}'], 'validation': [sys.executable, '{verifier}']}
+    pair, original, store, _, db = setup_pair(tmp_path, checkpoint_hook=checkpoint,
+        config_overrides={'commands': commands})
+    try:
+        proof = captured['proof']
+        assert pair.frozen['original_source'] == proof['source_hash']
+        assert pair.frozen['stage_initial_source'] == proof['stage_initial_source']
+        assert store.read_json(pair.frozen['original_workflow_ref'])['pending'] == original.workflow.pending
+        for arm in ('incumbent', 'candidate'):
+            request = pair.request(arm)
+            assert (request.root.parent / 'inputs/new_input.json').read_bytes() == b'{}'
+            assert request.spec.goal == original.spec.goal
+        assert captured['state'] == (original.root / 'workflow.json').read_bytes()
     finally:
         db.close()
