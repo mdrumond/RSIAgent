@@ -7,6 +7,9 @@ import copy
 
 import pytest
 
+from canonical_kernel_fixtures import canonical_kernel
+from test_rsi_production_domain_bindings import CanonicalSession
+
 from benchmarks.a5kernels.evidence import EvidenceLedger, canonical_digest
 from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
 from benchmarks.a5kernels.knowledge_agent import Citation
@@ -268,11 +271,11 @@ def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp
     assert (request.branch_root / "artifacts" / "objects" / digest[:2] / digest[2:]).is_file()
 
 
-def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
+def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path, canonical_kernel):
     from benchmarks.ascend.agent_context import ContextBudget, ContextBudgetError
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.sft_dataset import _read_trace
 
     identity = MODEL_IDENTITIES[0]
@@ -281,13 +284,20 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
         transport=lambda **_: pytest.fail("oversized request must not reach transport"),
         context_budgets={identity.backend_model.value: ContextBudget(2000, 1024, 3000)},
     )
-    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
-    request = _request(tmp_path, executor)
-    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(identity),
+    case = canonical_kernel
+    # Exercise the actual provider's byte admission from the scripted session
+    # boundary; no provider dispatch or host command is allowed after rejection.
+    def reject_oversize(context, allowed):
+        provider.complete(case.profile, [dict(role='user', content=context['task']['domain']['instruction'])])
+    case.before_select = reject_oversize
+    request = case.request
+    driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
+        query_knowledge=case.knowledge,
         trace_recorder_factory=recorder_factory(phase="phase1", round_id="context-limit",
             model="fixture", source_manifest_sha256="a" * 64))
     with pytest.raises(ContextBudgetError):
         driver(request)
+    assert case.calls == []
     trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
     validations = [row["payload"] for row in trace if row["kind"] == "validation"]
     assert validations[-1]["status"] == "failed"
@@ -295,12 +305,11 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
     assert all(row["status"] != "infrastructure-failure" for row in validations)
 
 
-def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path):
+def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path, canonical_kernel):
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.a5kernels.phase1_provider import (
-        DirectActorDriver, DirectCompletion, DirectCompletionProvider, ProviderRejectionError, direct_profile,
+        DirectCompletionProvider, ProviderRejectionError,
     )
     from benchmarks.a5kernels.sft_dataset import _read_trace
     import base64
@@ -311,21 +320,41 @@ def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path)
         status_code, code, request_id = 400, "invalid_prompt", "req_fixture"
     def transport(**kwargs):
         calls.append(kwargs["request"])
-        if len(calls) == 1:
-            return DirectCompletion(json.dumps({"read-artifact": {"sha256": digest}}), 1)
         raise Rejected("credential must not appear")
+    elapsed, delays = [0.0], []
+    def sleep(seconds):
+        delays.append(seconds)
+        elapsed[0] += seconds
     provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
-        transport=transport, sleeper=lambda _: None,
-        clock=lambda: max(0, len(calls)-2)*120)
-    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
-    request = _request(tmp_path, executor)
-    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(MODEL_IDENTITIES[0]),
+        transport=transport, sleeper=sleep, clock=lambda: elapsed[0])
+    case = canonical_kernel
+    request = case.request
+    # Native read_artifact is dispatched by the canonical engine. Subsequent
+    # provider attempts exercise its real rejection/retry/credential redaction.
+    delivered = []
+    def select(context, allowed):
+        if not delivered:
+            delivered.append(True)
+            return 'read_artifact', dict(sha256=digest)
+        return CanonicalSession.next_action(case.session, context, allowed)
+    def after_select(context, selected):
+        events = [row for row in case.runner.events if row['type'] == 'evidence-tool-result'
+                  and row['name'] == 'read_artifact']
+        if events:
+            page = events[-1]['result']
+            assert page['text'].encode() == raw
+            provider.complete(case.profile, [dict(role='user', content=json.dumps(dict(host=page)))])
+    case.select, case.after_select = select, after_select
+    driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
+        query_knowledge=case.knowledge,
         trace_recorder_factory=recorder_factory(phase="phase1", round_id="provider-rejection",
             model="fixture", source_manifest_sha256="a" * 64))
     with pytest.raises(ProviderRejectionError):
         driver(request)
-    assert len(calls) == 5 and calls[1:] == [calls[1]] * 4
-    view = json.loads(calls[1]["messages"][-1]["content"])["host"]
+    assert case.calls == []
+    assert len(calls) == 4 and calls == [calls[0]] * 4
+    assert delays == [120, 120, 120] and elapsed[0] == 360
+    view = json.loads(calls[0]["messages"][-1]["content"])["host"]
     assert view["text"].encode() == raw and "base64" not in view
     store = ContentAddressedArtifacts(request.branch_root / "artifacts")
     raw_page = store.read_json(view["full_observation_sha256"])
@@ -910,65 +939,55 @@ def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_pat
     assert explanation["code"] == "observed-compile"
 
 
-def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(tmp_path):
-    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(canonical_kernel):
     from benchmarks.a5kernels.evidence import canonical_bytes
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    from benchmarks.a5kernels.phase1_provider import (
-        DirectActorDriver, DirectCompletion, DirectCompletionProvider, direct_profile,
-    )
-    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
-
-    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / 'evidence.jsonl'))
-    request = _request(tmp_path, executor)
-    store = ContentAddressedArtifacts(request.branch_root / 'artifacts')
-    # The production curriculum eagerly copies only reachable historical objects
-    # into this branch's CAS; the reader must not discover unrelated shared data.
+    from benchmarks.ascend.agent_context import request_bytes
+    case = canonical_kernel
+    case.enable_native()
+    store = case.actions.artifacts
     source_bytes = b'out = max(x, 0)\n'
     source = store.put_bytes(source_bytes)
     proposal = dict(summary='Clamp negatives before storing', applicability='float32 relu',
-                    preconditions='Padded input', expectations='Nonnegative logical output',
-                    limitations='No timing evidence', before=None,
-                    after=dict(sha256=source, start_line=1, end_line=1, text=source_bytes.decode()),
-                    evidence=[source])
+        preconditions='Padded input', expectations='Nonnegative logical output',
+        limitations='No timing evidence', before=None,
+        after=dict(sha256=source, start_line=1, end_line=1, text=source_bytes.decode()), evidence=[source])
     record = dict(memory_id='relu', proposal=proposal, provenance={'trace': 'z' * 76665})
     raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='Use host checks',
-                               memories=[record]))
-    request = replace(request, pre_wave_memory=raw, publish_learning=False)
-    calls, pages = [], []
-    def transport(**kwargs):
-        wire = kwargs['request']
-        assert request_bytes(wire) <= 48 * 1024
-        calls.append(wire)
-        if len(calls) == 1:
-            instruction = wire['messages'][-1]['content']
-            start = instruction.index('{"bytes":')
-            view, _ = json.JSONDecoder().raw_decode(instruction[start:])
+                              memories=[record]))
+    request = replace(case.request, pre_wave_memory=raw, publish_learning=False)
+    selected, pages = [], []
+    def select(context, allowed):
+        if not selected:
+            instruction = context['task']['domain']['instruction']
+            marker = 'Pre-wave memory (immutable, readable index): '
+            view, _ = json.JSONDecoder().raw_decode(instruction.split(marker, 1)[1])
             row = view['memories'][0]
-            assert row['summary'] == proposal['summary']
-            assert row['after'] == proposal['after']
+            assert row['summary'] == proposal['summary'] and row['after'] == proposal['after']
             assert store.read_json(row['memory_document_sha256']) == record
-            action = {'read-artifact': {'sha256': row['proposal_sha256']}}
-        else:
-            host = json.loads(wire['messages'][-1]['content'])['host']
-            if len(calls) <= 3:
-                pages.append(host['text'])
-            actions = [ {'read-artifact': {'sha256': source}},
-                        {'write': {'slot': 'kernel', 'content': 'fixed source'}},
-                        {'run': {}}, {'submit': {}} ]
-            action = actions[len(calls) - 2]
-        return DirectCompletion(json.dumps(action), 1)
-    identity = MODEL_IDENTITIES[0]
-    provider = DirectCompletionProvider({'OPENAI_API_KEY': 'test', 'DEEPSEEK_API_KEY': 'test'},
-        transport=transport, context_budgets={identity.backend_model.value:
-            ContextBudget(44 * 1024, 32 * 1024, 48 * 1024)})
-    result = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(identity))(request)
-    assert json.loads(pages[0]) == proposal
-    assert pages[1].encode() == source_bytes
-    assert result.memory.host_facts
-    assert not result.memory.lessons
-    assert result.memory.source_revision == hashlib.sha256(b"fixed source").hexdigest()
-    assert len(calls) == 5
+            selected.extend([row['proposal_sha256'], source])
+        read_events = [event for event in case.runner.events if event['type'] == 'evidence-tool-result'
+                       and event['name'] == 'read_artifact']
+        if len(read_events) < len(selected):
+            return 'read_artifact', dict(sha256=selected[len(read_events)])
+        return CanonicalSession.next_action(case.session, context, allowed)
+    case.select = select
+    result = AdaptiveActorProjectExecutor(case.executor, case.make_driver('pi'), case.profile,
+        query_knowledge=case.knowledge)(request)
+    for event in case.runner.events:
+        if event['type'] == 'evidence-tool-result' and event['name'] == 'read_artifact':
+            pages.append(event['result'])
+    assert json.loads(pages[0]['text']) == proposal
+    assert pages[1]['text'].encode() == source_bytes
+    assert result.memory.host_facts and not result.memory.lessons
+    assert result.memory.source_revision == hashlib.sha256(case.session.repaired.encode()).hexdigest()
+    host = case.runner.backend.host
+    assert case.runner.workflow.outcome == 'accepted'
+    assert host.actions.latest.evidence.verified
+    assert host.actions.latest_source_sha256 == result.memory.source_revision
+    assert 'compile' in case.calls and 'run' in case.calls
+    assert case.wires and all(request_bytes(wire) <= 48 * 1024 for wire in case.wires)
+    # The large provenance document remains readable without replaying it into model context.
+    assert not any('z' * 76665 in json.dumps(wire) for wire in case.wires)
 
 
 @pytest.mark.parametrize('durable_turn',[None,43])
