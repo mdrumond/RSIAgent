@@ -475,13 +475,30 @@ class DomainRunner(ProjectRunner):
 
     def grant_actor_seconds(self, key, seconds, authority):
         """Host-only explicit allocation, independent of task inputs/identity."""
+        import math
+        from hashlib import sha256
+        from core.artifacts import canonical_bytes
+        if (not isinstance(key, str) or not key.strip()
+                or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0
+                or self.workflow.limits.actor_seconds is None
+                or not isinstance(authority, dict) or not authority):
+            raise ValueError('nonempty grant key/authority and finite positive applicable allocation required')
+        key, seconds = key.strip(), float(seconds)
         row = dict(kind='actor-allocation-grant-v1', contract=self.contract_ref,
                    key=key, seconds=seconds, authority=authority)
-        reference = self.store.put_json(row)
+        # Canonicalize once before any durable write: the receipt and persisted
+        # bytes must describe exactly the same detached, validated authority.
+        raw = canonical_bytes(row)
+        reference = sha256(raw).hexdigest()
+        grant = dict(seconds=seconds, receipt=reference)
+        cached = self.workflow.state.get('actor_grants', {}).get(key)
+        if cached is not None and cached != grant:
+            raise WorkflowError('actor allocation authority changed on reopen')
         existing = [event for event in self.events if event['type']=='actor-allocation-grant'
                     and self.store.read_json(event['reference'])['key']==key]
         if existing and any(event['reference'] != reference for event in existing):
             raise WorkflowError('actor allocation authority changed on reopen')
+        self.store.put_bytes(raw)
         if not existing:
             self.append(dict(type='actor-allocation-grant', reference=reference))
         self.workflow.grant_actor_seconds(key, seconds, reference)

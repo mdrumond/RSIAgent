@@ -2,6 +2,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import rsi.domain_bindings as bindings
 from test_rsi_production_domain_bindings import CanonicalSession
 
@@ -174,3 +176,58 @@ def test_interrupted_grant_cache_save_recovers_committed_authority_once_without_
     assert again.workflow.state['actor_grants']==runner.workflow.state['actor_grants']
     assert len([row for row in again.events if row['type']=='actor-allocation-grant'])==1
     assert (backend.prepares,backend.evaluations,len(model.contexts),store.get(key)['attempts'])==calls
+
+
+@pytest.mark.parametrize('changed',[
+    dict(seconds=0),dict(seconds=-1),dict(seconds=float('inf')),dict(seconds=float('nan')),
+    dict(key=''),dict(key='  '),dict(authority={}),dict(authority=None),
+])
+def test_invalid_domain_grant_leaves_no_durable_effect_and_same_key_can_be_corrected(tmp_path,changed):
+    from test_rsi_domain_execution import make
+    from rsi.domain_execution import DomainRunner
+    runner,host,_,_,injections=make(tmp_path)
+    arguments=dict(key='controller-grant',seconds=2,authority=dict(controller='CPU'))
+    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),
+            set(runner.store.objects.glob('*/*')))
+    with pytest.raises(ValueError):runner.grant_actor_seconds(**dict(arguments,**changed))
+    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),
+            set(runner.store.objects.glob('*/*')))==before
+    reopened=DomainRunner(runner.root,host,**injections)
+    reopened.grant_actor_seconds(**arguments)
+    assert reopened.workflow.actor_allocation()==502
+    events=reopened.event_path.read_bytes()
+    # Integer/float input normalize to the same receipt and authority key.
+    reopened.grant_actor_seconds(**dict(arguments,seconds=2.0))
+    assert reopened.event_path.read_bytes()==events
+    assert DomainRunner(runner.root,host,**injections).workflow.actor_allocation()==502
+
+
+@pytest.mark.parametrize('changed',[dict(seconds=0),dict(seconds=3),dict(authority={}),
+                                    dict(authority=dict(controller='different'))])
+def test_invalid_duplicate_cannot_poison_existing_grant_or_prevent_reopen(tmp_path,changed):
+    from test_rsi_domain_execution import make
+    from rsi.domain_execution import DomainRunner
+    from rsi.runtime import WorkflowError
+    runner,host,_,_,injections=make(tmp_path)
+    arguments=dict(key='controller-grant',seconds=2,authority=dict(controller='CPU'))
+    runner.grant_actor_seconds(**arguments)
+    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
+    with pytest.raises((ValueError,WorkflowError)):runner.grant_actor_seconds(**dict(arguments,**changed))
+    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
+    reopened=DomainRunner(runner.root,host,**injections)
+    reopened.grant_actor_seconds(**arguments)
+    assert reopened.workflow.actor_allocation()==502 and reopened.event_path.read_bytes()==before[0]
+
+
+def test_grant_with_no_finite_base_allocation_is_refused_before_persistence(tmp_path):
+    from test_rsi_domain_execution import make
+    from rsi.domain_execution import DomainRunner
+    from rsi.contracts import ProjectSpec,BudgetLimits
+    from rsi.skills import builtin_bundle
+    _,host,_,_,injections=make(tmp_path)
+    runner=DomainRunner.create(tmp_path/'unlimited',ProjectSpec('unlimited','CPU test',('CPU',),
+        budgets=BudgetLimits(actor_seconds=None)),builtin_bundle(),host,**injections)
+    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
+    with pytest.raises(ValueError):runner.grant_actor_seconds('controller-grant',2,dict(controller='CPU'))
+    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
+    assert DomainRunner(runner.root,host,**injections).workflow.actor_allocation() is None
