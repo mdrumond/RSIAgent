@@ -33,6 +33,8 @@ class ControllerSession(PiCodingSession):
         self.thinking = None
         self.control = {}
         self.batches = {}
+        self.retained_reservations = set()
+        self.active_actor = self.active_record = None
         self.record = lambda kind, data: self._enqueue(('record', kind, data))
         self.gateway.on_record = lambda kind,data:self.record(kind,data)
 
@@ -62,10 +64,14 @@ class ControllerSession(PiCodingSession):
         return controller
 
     def _enqueue(self, request):
+        if self.closed and request[:2] == ('record','pi-provider'):
+            return None  # Main-thread close retains the actual gateway row.
         done, response = threading.Event(), {}
         self.requests.put((request, done, response))
         while not done.wait(.05):
             if self.closed:
+                if request[:2] == ('record','pi-provider'):
+                    return None
                 raise ValueError('controller transport closed; pending work requires reconciliation')
         if 'error' in response:
             raise ValueError(response['error'])
@@ -78,6 +84,7 @@ class ControllerSession(PiCodingSession):
         current, completed = turn, []
         delivery.begin(turn[0]['operation_id'])
         record = turn[3]
+        self.active_actor, self.active_record = actor, record
         def remaining():
             seconds = actor._available()
             if self.enclosing_deadline is not None:
@@ -162,6 +169,9 @@ class ControllerSession(PiCodingSession):
                 return dict(observation=dict(host_completed=True, workflow_committed=False, result=asdict(result.value.result)), terminate=True, state={'allowed':[]})
             return dict(observation=resource(current[0]['observation']), terminate=False, state=status())
         def handle(name, args):
+            if name == 'native_event':
+                record('pi-native-event', dict(event=args))
+                return {}
             if name == 'snapshot':
                 return status()
             if name == 'propose_batch':
@@ -205,6 +215,8 @@ class ControllerSession(PiCodingSession):
                     if name == 'pi-provider-request':
                         delivery.observe(data['request'],record)
                     record(name,data)
+                    if name == 'pi-provider':
+                        self.retained_reservations.add(data['reservation_id'])
                     response['value'] = None
                 else:
                     pause()
@@ -232,9 +244,30 @@ class ControllerSession(PiCodingSession):
             pause()
 
     def close(self):
-        # Wake blocked HTTP handlers before the inherited RPC/server cleanup.
-        while not self.requests.empty():
-            _, done, response = self.requests.get_nowait()
-            response['error'] = 'controller closed; reconcile pending work'
-            done.set()
-        super().close()
+        if self.closed:
+            return
+        actor, record = self.active_actor, self.active_record
+        token = actor.workflow.accounting.start('thinking') if actor else None
+        try:
+            # Wake blocked callbacks before inherited process/server cleanup.
+            while not self.requests.empty():
+                _, done, response = self.requests.get_nowait()
+                response['error'] = 'controller closed; reconcile pending work'
+                done.set()
+            super().close()
+            # No network-abort mechanism: bounded observation of actual final rows.
+            left = [] if actor is None else [v for v in actor.workflow.remaining().values() if v is not None]
+            end = time.monotonic()+min([2.0, *left])
+            while not self.gateway.finished.is_set() and time.monotonic() < end:
+                self.gateway.finished.wait(timeout=min(.02,max(0,end-time.monotonic())))
+            settled = self.gateway.finished.is_set()
+            if record:
+                for row in list(self.gateway.records):
+                    if row['reservation_id'] not in self.retained_reservations:
+                        record('pi-provider', dict(row, close_snapshot=True, provider_settled=settled))
+                        self.retained_reservations.add(row['reservation_id'])
+                record('pi-ledger-closure', dict(provider_settled=settled,
+                    request_count=len(self.gateway.records), retained_count=len(self.retained_reservations)))
+        finally:
+            if token:
+                actor.workflow.accounting.end(token)

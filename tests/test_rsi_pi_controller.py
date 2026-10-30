@@ -75,6 +75,8 @@ def test_native_completed_tools_keep_conversation_and_main_thread(monkeypatch, t
     finally:actor.close()
     assert flow.stage==Stage.DESIGN and len(called)==1 and len(requests)==2
     assert len([row for kind,row in events if kind=='skill-delivered'])==2
+    ids=[row['reservation_id'] for kind,row in events if kind=='pi-provider']
+    assert len(ids)==len(set(ids))==2
     assert any(kind=='pi-event' and row['event']['type']=='agent_settled' for kind,row in events)
 
 
@@ -560,20 +562,20 @@ def test_real_project_runner_durably_records_native_pi_event_envelopes(monkeypat
         database.close()
 
 
-def test_native_long_summary_uses_sdk_budget_and_recovers_one_length_failure(monkeypatch,tmp_path):
+def test_native_concise_summary_covers_long_history_and_recovers_length_failure(monkeypatch,tmp_path):
     events,requests,recalls,summaries=[],[],[],[]
     names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
-    long_summary='# Actual checkpoint\n'+('Retain current stage, evidence receipts and guarded actions. '*175)
+    long_summary='# Actual checkpoint\n'+('Retain current stage, source hash and current receipts. '*45)
     def provider(*_,**kwargs):
         request=json.loads(kwargs['data']);requests.append(request)
         assert len(kwargs['data'])<=49152
         if not request.get('tools'):
             summaries.append(request)
-            assert request['max_tokens'] in (4096,6553)
+            assert request['max_tokens']==1536
             if len(summaries)==1:
                 return response([],len(requests),len(kwargs['data'])//4,summary=long_summary[:7000],
                                 finish='length',completion_tokens=request['max_tokens'])
-            return response([],len(requests),len(kwargs['data'])//4,summary=long_summary,completion_tokens=3000)
+            return response([],len(requests),len(kwargs['data'])//4,summary=long_summary,completion_tokens=900)
         read=[row['skill'] for kind,row in events if kind=='skill-usage' and row['kind']=='read'
               and row['stage']==Stage.TASK_CONSTRUCTION.value]
         missing=[name for name in names if name not in read]
@@ -591,9 +593,12 @@ def test_native_long_summary_uses_sdk_budget_and_recovers_one_length_failure(mon
         actor.step({});actor.step({'goal':'long native summaries under original wire cap'})
     finally:actor.close()
     compactions=[row['event'] for kind,row in events if kind=='pi-event' and row['event']['type']=='compaction_end']
-    assert any(row.get('errorMessage') and not row.get('result') for row in compactions)
+    attempts=[row['event'] for kind,row in events if kind=='pi-native-event' and row['event']['kind']=='compaction-summary']
+    assert any(not row['successful'] and row.get('stopReason')=='length' for row in attempts)
+    assert any(not row.get('result') for row in compactions)
     successful=[row for row in compactions if row.get('result')]
-    assert successful and any(row['result']['usage']['output']>2048 for row in successful)
+    assert successful and all(row['result']['usage']['output']<=1000 for row in successful)
+    assert all(len(row['result']['summary'].encode())<=6144 for row in successful)
     assert any(long_summary in row['result']['summary'] for row in successful)
     assert flow.stage==Stage.DESIGN and len(recalls)==18
 
@@ -627,6 +632,7 @@ def test_rejected_request_retains_actual_byte_attempt_before_dispatch(monkeypatc
             messages=[dict(role='user',content='x'*1000)],max_tokens=6553),
             headers={'Authorization':'Bearer '+gateway.token},timeout=3)
     assert result.status_code==413 and gateway.calls==0 and gateway.records==[]
+    assert result.json()['error']['code']=='context_length_exceeded'
     rejected=next(data for kind,data in records if kind=='pi-context-limit')
     assert rejected['request_bytes']>rejected['hard_bytes']==700
     assert rejected['messages_bytes']>1000 and rejected['message_count']==1
