@@ -25,6 +25,17 @@ import time
 from typing import Any, Literal, Mapping
 
 
+def _wall_remaining(clock, deadline):
+    if deadline is None:
+        return None
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise ValueError('wall_deadline must be finite monotonic seconds or None')
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError('noncoding role wall deadline exhausted')
+    return remaining
+
+
 @dataclass(frozen=True)
 class AdmittedEvidence:
     evidence_id: str
@@ -41,7 +52,7 @@ class ProjectIdea:
 @dataclass(frozen=True)
 class SkillEdit:
     skill: str
-    operation: Literal['replace', 'remove']
+    operation: Literal['replace', 'remove', 'append']
     content: str
 
 
@@ -100,7 +111,7 @@ def _framework():
     class Edit(BaseModel):
         model_config = ConfigDict(extra='forbid', strict=True)
         skill: str = Field(min_length=1)
-        operation: Literal['replace', 'remove']
+        operation: Literal['replace', 'remove', 'append']
         content: str
 
     class Finding(BaseModel):
@@ -198,16 +209,17 @@ class NoncodingRoles:
             raise TimeoutError('noncoding role actor time exhausted')
         return remaining
 
-    def curriculum(self, role_prompt, evidence, *, deadline):
-        return self._run('curriculum', role_prompt, evidence, deadline)
+    def curriculum(self, role_prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('curriculum', role_prompt, evidence, deadline, wall_deadline)
 
-    def skillwriter(self, role_prompt, evidence, *, deadline):
-        return self._run('skillwriter', role_prompt, evidence, deadline)
+    def skillwriter(self, role_prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('skillwriter', role_prompt, evidence, deadline, wall_deadline)
 
-    def review(self, role_prompt, evidence, *, deadline):
-        return self._run('review', role_prompt, evidence, deadline)
+    def review(self, role_prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('review', role_prompt, evidence, deadline, wall_deadline)
 
-    def _run(self, role, prompt, evidence, deadline):
+    def _run(self, role, prompt, evidence, deadline, wall_deadline=None):
+        _wall_remaining(self.clock, wall_deadline)
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError('role prompt must be nonempty')
         if type(deadline) not in (int, float) or not math.isfinite(deadline):
@@ -230,7 +242,8 @@ class NoncodingRoles:
         client = Client(self, deadline)
         agent = Roles(llm=client)
         started = self.clock()
-        deadline = client.deadline = started + allowance
+        _wall_remaining(self.clock, wall_deadline)
+        deadline = client.deadline = min(started + allowance, wall_deadline) if wall_deadline is not None else started + allowance
         success = False
         self.observer('role_started', {'role': role, 'provider_identity': self.profile.identity.as_dict(),
                                        'prompt': prompt, 'evidence': rows})
@@ -269,7 +282,7 @@ def _proposal(role, data, admitted):
             raise ValueError('invalid proposal entry fields')
         if any(type(v) is not str or (not v.strip() and k != 'content') for k, v in row.items()):
             raise ValueError('invalid proposal entry value')
-        if role == 'skillwriter' and row['operation'] not in ('replace', 'remove'):
+        if role == 'skillwriter' and row['operation'] not in ('replace', 'remove', 'append'):
             raise ValueError('invalid skill operation')
         if role == 'review' and row['severity'] not in ('P0', 'P1', 'P2', 'P3'):
             raise ValueError('invalid finding severity')
@@ -282,7 +295,7 @@ _MACHINERY_PACKAGES = ('rsi', 'core', 'coding', 'config', 'env', 'llm', 'optimiz
 
 
 @contextmanager
-def _machinery_projection():
+def _machinery_projection(check=lambda: None):
     """Copy only this revision's owned machinery, never host site-packages.
 
     A wheel's distribution inventory is authoritative. Source and copied-instance
@@ -291,13 +304,23 @@ def _machinery_projection():
     """
     from importlib.metadata import distribution, PackageNotFoundError
     machinery = Path(__file__).resolve().parent.parent
+    check()
     with tempfile.TemporaryDirectory(prefix='rsi-roles-') as temporary:
         root = Path(temporary)
+        def copy(source, target):
+            check()
+            with open(source, 'rb') as src, open(target, 'wb') as dst:
+                while chunk := src.read(65536):
+                    check()
+                    dst.write(chunk)
+            shutil.copystat(source, target)
+            check()
+            return target
         if (machinery / 'pyproject.toml').is_file():
             for name in _MACHINERY_PACKAGES:
                 source = machinery / name
                 if source.is_dir():
-                    shutil.copytree(source, root / name, ignore=shutil.ignore_patterns(
+                    shutil.copytree(source, root / name, copy_function=copy, ignore=shutil.ignore_patterns(
                         '__pycache__', '*.pyc', '.git', 'node_modules', '.venv', 'build', 'dist'))
         else:
             try:
@@ -313,10 +336,12 @@ def _machinery_projection():
                 if source.is_file() and source.suffix != '.pyc':
                     target = root.joinpath(*entry.parts)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, target)
+                    copy(source, target)
         if not (root / 'rsi' / 'roles.py').is_file():
             raise RuntimeError('RSI machinery inventory lacks roles worker')
+        check()
         yield root
+    check()
 
 
 class IsolatedRoles:
@@ -349,16 +374,17 @@ class IsolatedRoles:
         self.roles_python, self.profile = str(executable), profile
         self.observer, self.setup_seconds, self.clock = observer, setup_seconds, clock
 
-    def curriculum(self, prompt, evidence, *, deadline):
-        return self._run('curriculum', prompt, evidence, deadline)
+    def curriculum(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('curriculum', prompt, evidence, deadline, wall_deadline)
 
-    def skillwriter(self, prompt, evidence, *, deadline):
-        return self._run('skillwriter', prompt, evidence, deadline)
+    def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('skillwriter', prompt, evidence, deadline, wall_deadline)
 
-    def review(self, prompt, evidence, *, deadline):
-        return self._run('review', prompt, evidence, deadline)
+    def review(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('review', prompt, evidence, deadline, wall_deadline)
 
-    def _run(self, role, prompt, evidence, deadline):
+    def _run(self, role, prompt, evidence, deadline, wall_deadline=None):
+        _wall_remaining(self.clock, wall_deadline)
         if type(deadline) not in (float, int) or not math.isfinite(deadline):
             raise ValueError('invalid actor deadline')
         allowance = deadline - self.clock()
@@ -371,15 +397,19 @@ class IsolatedRoles:
                for e in evidence) or len({e.evidence_id for e in evidence}) != len(evidence):
             raise ValueError('admitted evidence requires unique nonempty IDs')
         request = {'role': role, 'prompt': prompt, 'evidence': [asdict(e) for e in evidence],
-                   'backend_model': self.profile.identity.backend_model.value, 'seconds': allowance}
+                   'backend_model': self.profile.identity.backend_model.value, 'seconds': allowance,
+                   'wall_deadline': wall_deadline}
         wire = json.dumps(request, allow_nan=False)
         secret = self.environment[self.profile.identity.credential_env]
         if secret in wire:
             raise ValueError('credential cannot appear in role JSON')
-        with _machinery_projection() as root:
-            return self._dispatch(role, wire, allowance, evidence, secret, root)
+        with _machinery_projection(lambda: _wall_remaining(self.clock, wall_deadline)) as root:
+            result = self._dispatch(role, wire, allowance, evidence, secret, root, wall_deadline)
+        _wall_remaining(self.clock, wall_deadline)
+        return result
 
-    def _dispatch(self, role, wire, allowance, evidence, secret, root):
+    def _dispatch(self, role, wire, allowance, evidence, secret, root, wall_deadline=None):
+        _wall_remaining(self.clock, wall_deadline)
         started = self.clock()
         cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
         process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
@@ -393,7 +423,8 @@ class IsolatedRoles:
                 selector.register(process.stdout, selectors.EVENT_READ)
                 pending = b''
                 while True:
-                    remaining = cutoff - self.clock()
+                    effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
+                    remaining = effective - self.clock()
                     ready = selector.select(max(0, remaining))
                     if remaining <= 0 or not ready:
                         raise TimeoutError('roles worker deadline exhausted')
@@ -451,7 +482,9 @@ class IsolatedRoles:
                             raise ValueError('unordered or unknown worker receipt')
                         if event != 'role_finished':
                             self.observer(event, payload)
-            process.wait(timeout=max(0.001, cutoff - self.clock()))
+            _wall_remaining(self.clock, wall_deadline)
+            effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
+            process.wait(timeout=max(0.001, effective - self.clock()))
             if process.returncode or not finished or proposal is None or pending:
                 raise RuntimeError('roles worker missing completion receipts')
             return proposal
@@ -493,7 +526,8 @@ def _worker():
             if request['role'] not in _PROPOSALS:
                 raise ValueError('unknown role')
             result = getattr(roles, request['role'])(request['prompt'], evidence,
-                                                    deadline=time.monotonic() + request['seconds'])
+                                                    deadline=time.monotonic() + request['seconds'],
+                                                    wall_deadline=request.get('wall_deadline'))
         emit('result', asdict(result))
         return 0
     except Exception:
