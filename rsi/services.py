@@ -292,7 +292,7 @@ class BoundCycle(TuningBindings):
                     **self.config.get('roles', {}))
         return self._roles
 
-    def skillwriter(self, prompt, evidence, *, deadline):
+    def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
         guidance = {key: self.config.get('prompts', {}).get(key, '')
                     for key in ('skillwriter', 'curriculum', 'waves')}
         allowance = deadline - time.monotonic()
@@ -301,7 +301,8 @@ class BoundCycle(TuningBindings):
             roles = self.roles()
             deadline = time.monotonic() + allowance
             return roles.skillwriter(prompt + '\nUser guidance:\n' + json.dumps(guidance)
-                + '\nTuning steering:\n' + json.dumps(self.tuning_guidance), evidence, deadline=deadline)
+                + '\nTuning steering:\n' + json.dumps(self.tuning_guidance), evidence, deadline=deadline,
+                wall_deadline=wall_deadline)
         finally:
             self.finish_role_setup()
 

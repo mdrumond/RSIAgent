@@ -45,7 +45,8 @@ def source_repo(tmp_path):
     return root, git('rev-parse', 'HEAD').decode().strip()
 
 
-def test_new_revision_preserves_baseline_and_frozen_sqlite_snapshot(instance, tmp_path):
+@pytest.mark.parametrize('explicit_baseline', [False, True])
+def test_new_revision_preserves_baseline_and_frozen_sqlite_snapshot(instance, tmp_path, explicit_baseline):
     root = instance
     baseline = root / 'memory/base.db'
     original = baseline.read_bytes()
@@ -56,6 +57,10 @@ def test_new_revision_preserves_baseline_and_frozen_sqlite_snapshot(instance, tm
         with sqlite3.connect(frozen) as target:
             original_db.backup(target)
     old_db = frozen.read_bytes()
+    if explicit_baseline:
+        payload = show_configuration(root)['payload']
+        payload['baseline_kdb'] = payload.pop('kdb')
+        set_configuration(root, payload)
     before = show_configuration(root)
     source, head = source_repo(tmp_path)
     negative = {'id': 'prior-failure', 'outcome': 'numeric_failure', 'source_revision': head}
@@ -65,7 +70,7 @@ def test_new_revision_preserves_baseline_and_frozen_sqlite_snapshot(instance, tm
     assert baseline.read_bytes() == original
     assert (root / 'instance.json').read_bytes() == inventory
     assert frozen.read_bytes() == old_db
-    assert before['payload']['kdb'] == 'memory/base.db'
+    assert before['payload']['baseline_kdb' if explicit_baseline else 'kdb'] == 'memory/base.db'
     config = show_configuration(root)
     assert config['payload']['kdb_collections'] == ['added-repo']
     assert config['payload']['kdb_ingestion_refs'] == [result['reference']]
