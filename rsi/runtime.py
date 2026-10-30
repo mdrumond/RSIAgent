@@ -35,8 +35,10 @@ class ActorClock:
                 "compilation", "execution", "profiling"}
     EXCLUDED = {"setup", "transfer", "wait", "pause"}
 
-    def __init__(self, records, save, clock):
+    def __init__(self, records, save, clock, uncertainties=None, receipts=None):
         self.records, self.save, self.clock = records, save, clock
+        self.uncertainties = {} if uncertainties is None else uncertainties
+        self.receipts = {} if receipts is None else receipts
         self.unresolved = {key for key, value in records.items() if value[2] is None}
 
     def now(self):
@@ -48,7 +50,7 @@ class ActorClock:
         return now
 
     def start(self, category):
-        if self.unresolved or category not in self.BILLABLE | self.EXCLUDED:
+        if self.unresolved or self.uncertainties or category not in self.BILLABLE | self.EXCLUDED:
             raise WorkflowError("unresolved accounting or unknown activity")
         token = uuid.uuid4().hex
         self.records[token] = [category, self.now(), None]
@@ -70,8 +72,8 @@ class ActorClock:
         self.save()
 
     def seconds(self, category=None):
-        if self.unresolved:
-            raise WorkflowError("active intervals require reconciliation")
+        if self.unresolved or self.uncertainties:
+            raise WorkflowError("active or uncertain intervals require reconciliation")
         now = self.now()
         intervals = sorted((start, now if end is None else end)
                            for kind, start, end in self.records.values()
@@ -107,7 +109,9 @@ class Workflow:
             self._save()
         self._needs_reconciliation = self.pending is not None
         self.limits = BudgetLimits.from_dict(self.state["limits"])
-        self.accounting = ActorClock(self.state["intervals"], self._save, clock)
+        self.accounting = ActorClock(self.state["intervals"], self._save, clock,
+                                     self.state.setdefault("timing_uncertainties", {}),
+                                     self.state.setdefault("timing_receipts", {}))
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,6 +182,34 @@ class Workflow:
                                       counts_before=before)
         self._save()
         return operation
+
+    def reserve_execution(self, operation):
+        """Durably admit one command; False means already reserved, never replay.
+
+        A legacy begin(execution=True) supplies credit for its first command.
+        Reservations survive failure/restart; only authoritative absence may
+        justify release by a reconciliation adapter.
+        """
+        reservations = self.state.setdefault("execution_reservations", {})
+        if operation in reservations:
+            return False
+        if self.state["stopped"] or self.outcome or self._needs_reconciliation:
+            raise WorkflowError("stopped, terminal or unreconciled operation")
+        if any(value is not None and value <= 0 for value in self.remaining().values()):
+            raise WorkflowError("time budget exhausted")
+        pending = self.state["pending"]
+        credit = pending and "executions" in pending.get("counts_before", {})
+        if not credit:
+            cap = self.limits.execution_tries
+            if cap is not None and self.state["executions"] >= cap:
+                raise WorkflowError("execution cap exhausted")
+            self.state["executions"] += 1
+        else:
+            # Once assigned, stage absence cannot refund a command that may run.
+            del pending["counts_before"]["executions"]
+        reservations[operation] = {"stage_operation": pending["id"] if pending else None}
+        self._save()
+        return True
 
     def dispatched(self, operation, handle):
         if (self._needs_reconciliation or self.state["stopped"] or not self.pending
