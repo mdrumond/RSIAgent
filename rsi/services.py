@@ -66,6 +66,14 @@ class InstanceServices:
         path = Path(value).expanduser()
         return (path if path.is_absolute() else self.root / path).resolve(strict=True)
 
+    def executable(self, value):
+        # Preserve venv interpreter symlink path: resolving changes sys.prefix.
+        path = Path(value).expanduser()
+        path = path if path.is_absolute() else self.root / path
+        if not path.is_file():
+            raise ValueError('configured executable does not exist')
+        return path.absolute()
+
     def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None):
         created = time.time()
         mode = Mode(mode)
@@ -252,7 +260,7 @@ class BoundCycle(TuningBindings):
                 profile = direct_profile(identity)
                 if profile.model != provider['model']:
                     raise ValueError('registered role model mismatch')
-                self._roles = IsolatedRoles(str(self.services.path(self.config['roles_python'])),
+                self._roles = IsolatedRoles(str(self.services.executable(self.config['roles_python'])),
                     profile, observer=self.observe_role, environment=self.services.environment,
                     **self.config.get('roles', {}))
         return self._roles
