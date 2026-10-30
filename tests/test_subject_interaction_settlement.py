@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import json
 import hashlib
 from types import SimpleNamespace
@@ -164,18 +166,31 @@ def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligati
     assert scheduler.state()['repairs']['paired']['status'] == 'resolved'
 
 
-def test_unfinished_optimizer_attempt_retains_its_identity_in_manual_worker(tmp_path):
+def test_unfinished_optimizer_attempt_retains_its_identity_in_manual_worker(tmp_path, monkeypatch):
     from test_optimizer_task_execution import executor, candidate, snapshot
     from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
-    from optimizer.control import ObservationUnavailable
+    from rsi.domain_execution import DomainRunner
+    from canonical_optimizer_fixtures import retained_native
     config, root, directory, scheduler, artifacts = setup(tmp_path)
     template, agent, backend = executor(tmp_path/'template', [candidate('good')])
     durable = OptimizerTaskExecutor(directory, template.task, snapshot(), template.config,
                                    agent=agent, backend=backend)
     durable.prepare()
-    backend.interrupt = True
-    with pytest.raises(ObservationUnavailable):
+    original = DomainRunner.append
+    def interrupted(runner, event):
+        original(runner, event)
+        if event['type'] == 'domain-result':
+            observed = runner.store.read_json(event['reference'])
+            dispatch = runner.store.read_json(observed['dispatch_ref'])
+            if dispatch['name'] == 'evaluate' and observed['observed_terminal']:
+                raise RuntimeError('crash after authenticated evaluation observation')
+    monkeypatch.setattr(DomainRunner, 'append', interrupted)
+    with pytest.raises(RuntimeError, match='authenticated evaluation observation'):
         durable.attempt('original-unfinished')
+    native = retained_native(durable)
+    assert native.workflow['pending'] is not None and native.workflow['stage'] == 'test'
+    replies = len(agent.contexts)
+    monkeypatch.setattr(DomainRunner, 'append', original)
     state = json.loads((root/'subject-campaign.json').read_bytes())
     state['projects']['one']['plan'] = dict(project_id='one', task={'kind': 'optimizer', 'task': template.task})
     atomic(root/'subject-campaign.json', canonical(state))
@@ -185,14 +200,20 @@ def test_unfinished_optimizer_attempt_retains_its_identity_in_manual_worker(tmp_
         assert attempt == 'original-unfinished'
         result = durable.attempt(attempt)
         assert result['verified']
-        source = artifacts.put_bytes(b'verified durable candidate')
-        return SubjectOutcome(True, source, {'source': source}, {}, artifacts.root)
+        source = artifacts.put_bytes(json.loads(durable.store.read_artifact(
+            durable.job_id, result['candidate']['sha256'])).encode())
+        assert source == result['source_sha256']
+        evidence = artifacts.put_bytes(durable.store.read_artifact(
+            durable.job_id, result['result_artifact']['sha256']))
+        return SubjectOutcome(result['verified'], source, {'source': source, 'result': evidence},
+                              {'optimizer_result': result}, artifacts.root)
     operation = request(config)
     result = interaction.run_request(config, 'campaign', operation['id'],
         builder=real_builder(root, scheduler, artifacts, execution=execute))
     assert result['status'] == 'succeeded'
     assert len(backend.evaluations) == 1
     assert durable.store.get(durable.job_id)['attempts'] == 1
+    assert len(agent.contexts) == replies
 
 
 def test_successful_probe_keeps_repair_open_until_linked_control_accepts(tmp_path):

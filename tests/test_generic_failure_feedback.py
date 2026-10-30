@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend, retained_native
+
 import json
 
 import pytest
@@ -5,6 +7,14 @@ import pytest
 from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.ascend.failure_curriculum import FailureCurriculum
 from optimizer.jobs import JobStore, canonical, sha
+from test_optimizer_loop import Agent as ScriptedOptimizerAgent
+
+
+class FeedbackAgent(ScriptedOptimizerAgent):
+    """Script model decisions, including the canonical optimisation decision."""
+    canonical_fixture = True
+    optimize = True
+    identity = {'model': 'scripted-feedback-cpu'}
 
 
 def write(path, value):
@@ -366,7 +376,7 @@ def test_curriculum_discovers_and_pages_only_selected_failure_cases(tmp_path, mo
 @pytest.mark.parametrize('historical_sources', [False, True])
 def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path, historical_sources):
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent, Backend, candidate
+    from test_optimizer_loop import Backend, candidate
     body = dict(files={}, memory_entries=[{'lesson': 'Retained context'}],
                 source_identity=dict(target='a3', language='ascend-c'))
     jobs = JobStore(tmp_path / 'jobs')
@@ -381,6 +391,9 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
             return {'status': 'compile-error', 'stderr': 'Observed compile diagnostic'}
         def evaluate(self, source, directory, *, block_count):
             self.evaluations.append(source)
+            if source == 'repaired':
+                return dict(status='verified', suite_sha256='suite', candidate_sha256=sha(source.encode()),
+                    cases=[dict(case='case-000', timing=dict(ascendc=dict(latency_us=5)))])
             if historical_sources:
                 return dict(status='compile-error', suite_sha256='suite',
                     candidate_sha256=sha(source.encode()), cases=[dict(case='case-000',
@@ -399,8 +412,9 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
         dict(action='compile', source='compile probe', block_count=1, summary='Read compiler error'),
         candidate('bad-one'), dict(action='query-knowledge', query='Second retrieval'),
         candidate('bad-two'), dict(action='read-memory', index=0),
+        candidate('repaired'),
         dict(action='finish', summary='Retained failed candidates')]
-    loop = OptimizationLoop(jobs, key, Agent(actions), backend)
+    loop = OptimizationLoop(jobs, key, FeedbackAgent(actions), backend)
     if historical_sources:
         # The old producer retained canonical source artifacts and current
         # candidate state, but not the additive history.source reference.
@@ -411,10 +425,15 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
             jobs.add_event(key, 'optimizer-state', state)
         loop._save = save_legacy_state
     result = loop.run()
-    assert result['status'] == 'completed' and backend.evaluations == ['bad-one', 'bad-two']
-    history = OptimizationLoop(jobs, key, Agent([]), backend).state['history']
-    assert [row.get('tool', {}).get('action') for row in history if 'tool' in row] == [
-        'read-memory', 'read-artifact', 'query-knowledge', 'compile', 'query-knowledge', 'read-memory']
+    assert result['status'] == 'completed' and backend.evaluations == ['bad-one', 'bad-two', 'repaired']
+    history = OptimizationLoop(jobs, key, FeedbackAgent([]), backend).state['history']
+    assert [row['tool']['action'] for row in history if 'tool' in row] == ['compile']
+    native = retained_native(loop)
+    tools = [row for row in native.events if row['type'] == 'evidence-tool-result']
+    assert [row['result']['lesson'] for row in tools if row['name'] == 'read_memory'] == [
+        'Retained context', 'Retained context']
+    assert [row['result']['text'] for row in tools if row['name'] == 'read_artifact'] == ['Actual context bytes']
+    assert sum(row['name'] == 'query_kdb' for row in tools) >= 2
     store = FeedbackStore(tmp_path / 'feedback')
     report = store.import_optimizer(jobs.root)
     assert report['imported'] == 3 and report['warnings'] == []
@@ -486,7 +505,7 @@ def test_identity_normalization_keeps_unknown_schemas_and_existing_aliases(tmp_p
 def test_standalone_retry_remeasurement_preserves_original_acceptance(
         tmp_path, candidate_us, change, fixed):
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent, Backend, candidate
+    from test_optimizer_loop import Backend, candidate
 
     jobs = JobStore(tmp_path / 'jobs')
     suite = sha(b'frozen-case-suite')
@@ -507,6 +526,7 @@ def test_standalone_retry_remeasurement_preserves_original_acceptance(
 
         def evaluate(self, source, directory, *, block_count):
             return dict(status='incorrect' if self.native_us is None else 'verified',
+                candidate_sha256=sha(source.encode()),
                 suite_sha256=suite, cases=[] if self.native_us is None else [dict(
                     case='case-000', correctness={},
                     timing=dict(ascendc=dict(latency_us=self.native_us)))])
@@ -523,7 +543,13 @@ def test_standalone_retry_remeasurement_preserves_original_acceptance(
         actions = [dict(action='cases', signatures=[], summary='Frozen input'),
                    candidate('retry kernel' if retry else 'failed kernel'),
                    dict(action='finish', summary='Retain measured outcome')]
-        assert OptimizationLoop(jobs, key, Agent(actions), backend).run()['status'] == 'completed'
+        loop = OptimizationLoop(jobs, key, FeedbackAgent(actions), backend)
+        if retry:
+            assert loop.run()['status'] == 'completed'
+        else:
+            loop.run(single_evaluation=True)
+            jobs.stop(key)
+            assert loop.run()['status'] == 'stopped'
     store = FeedbackStore(tmp_path / 'feedback')
     assert store.import_optimizer(jobs.root)['warnings'] == []
     records = {row['outcome']['attempt_id']: row for row in store.records()}
@@ -541,7 +567,7 @@ def test_standalone_retry_remeasurement_preserves_original_acceptance(
 @pytest.mark.parametrize('terminal', ['stopped', 'budget-exhausted'])
 def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_path, terminal):
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent, Backend, candidate
+    from test_optimizer_loop import Backend, candidate
 
     jobs = JobStore(tmp_path / 'jobs')
     snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
@@ -550,23 +576,42 @@ def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_
         dict(args=[dict(shape=[5], dtype='float32')]), snapshot)
     key = job['job_id']
 
+    class Clock:
+        now = 0.0
+        def __call__(self):
+            return self.now
+    clock = Clock()
+
+    class TimedFeedbackAgent(FeedbackAgent):
+        canonical_clock = clock
+        expire = False
+        def complete(self, stage, context, record):
+            action = super().complete(stage, context, record)
+            if self.expire and stage == 'optimize':
+                # Spend time inside an actual canonical model decision. Merely
+                # charging the JobStore cannot expire the workflow's clock.
+                clock.now += job['max_seconds'] + 1
+            return action
+
     class FrozenBackend(Backend):
         def prepare(self, spec, directory):
             value = super().prepare(spec, directory)
             value.update(suite_sha256=sha(b'resume-suite'), manifest=dict(submission=spec, policy=dict(rtol=.01)))
             return value
-        def evaluate(self, *args, **kwargs):
-            return dict(super().evaluate(*args, **kwargs), suite_sha256=sha(b'resume-suite'))
+        def evaluate(self, source, *args, **kwargs):
+            return dict(super().evaluate(source, *args, **kwargs), suite_sha256=sha(b'resume-suite'),
+                candidate_sha256=sha(source.encode()))
 
     backend = FrozenBackend()
-    first = OptimizationLoop(jobs, key, Agent([
+    first = OptimizationLoop(jobs, key, TimedFeedbackAgent([
         dict(action='cases', signatures=[], summary='Frozen cases'), candidate('bad')]), backend)
     first.run(single_evaluation=True)
     if terminal == 'stopped':
         jobs.stop(key)
-    else:
-        jobs.account_time(key, job['max_seconds'])
-    assert OptimizationLoop(jobs, key, Agent([]), backend).run()['status'] == terminal
+    stopping = TimedFeedbackAgent([candidate('must-not-dispatch')])
+    stopping.expire = terminal == 'budget-exhausted'
+    assert OptimizationLoop(jobs, key, stopping, backend).run()['status'] == terminal
+    assert backend.evaluations == ['bad']
     store = FeedbackStore(tmp_path / 'feedback')
     assert store.import_optimizer(jobs.root)['warnings'] == []
     original = next(row for row in store.records() if row['outcome']['attempt_id'] == key)
@@ -576,7 +621,7 @@ def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_
                 for row in store.records()}
     assert len(retained) == 2  # Terminal failure and its failed candidate.
     jobs.resume(key, additional_seconds=60)
-    assert OptimizationLoop(jobs, key, Agent([candidate('fast'),
+    assert OptimizationLoop(jobs, key, TimedFeedbackAgent([candidate('fast'),
         dict(action='finish', summary='Retained repaired outcome')]), backend).run()['status'] == 'completed'
     report = store.import_optimizer(jobs.root)
     assert report['imported'] == 1 and report['warnings'] == []
@@ -597,7 +642,7 @@ def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_
 @pytest.mark.parametrize('change', [None, 'source', 'signatures', 'policy', 'result'])
 def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp_path, change):
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent, Backend, candidate
+    from test_optimizer_loop import Backend, candidate
 
     jobs = JobStore(tmp_path / 'jobs')
     snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
@@ -615,8 +660,9 @@ def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp
                 timing=dict(torch=dict(latency_us=10))) for index in range(len(spec['signatures']))]
             return dict(suite_sha256=self.suite, cases=self.cases, manifest=dict(submission=spec,
                 policy=dict(rtol=.1 if self.retry and change == 'policy' else .01)))
-        def evaluate(self, *args, **kwargs):
+        def evaluate(self, source, *args, **kwargs):
             return dict(status='verified' if self.retry else 'incorrect', suite_sha256=self.suite,
+                candidate_sha256=sha(source.encode()),
                 cases=[dict(case=row['case'], correctness={}, timing=dict(ascendc=dict(latency_us=5)))
                        for row in self.cases] if self.retry else [])
 
@@ -630,7 +676,13 @@ def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp
         keys.append(job['job_id'])
         actions = [dict(action='cases', signatures=[] if retry else [expanded], summary='Representative cases'),
                    candidate('fast' if retry else 'bad'), dict(action='finish', summary='Retain outcome')]
-        assert OptimizationLoop(jobs, job['job_id'], Agent(actions), ExpandedBackend(retry)).run()['status'] == 'completed'
+        loop = OptimizationLoop(jobs, job['job_id'], FeedbackAgent(actions), ExpandedBackend(retry))
+        if retry:
+            assert loop.run()['status'] == 'completed'
+        else:
+            loop.run(single_evaluation=True)
+            jobs.stop(job['job_id'])
+            assert loop.run()['status'] == 'stopped'
     store = FeedbackStore(tmp_path / 'feedback')
     assert store.import_optimizer(jobs.root)['warnings'] == []
     records = {row['outcome']['attempt_id']: row for row in store.records()}
@@ -648,7 +700,7 @@ def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp
 @pytest.mark.parametrize('damage', ['missing', 'corrupt'])
 def test_optimizer_import_preserves_observations_when_optional_artifacts_are_unavailable(tmp_path, role, damage):
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent, Backend, candidate
+    from test_optimizer_loop import Backend, candidate
 
     jobs = JobStore(tmp_path/'jobs')
     snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
@@ -660,7 +712,7 @@ def test_optimizer_import_preserves_observations_when_optional_artifacts_are_una
                 manifest=dict(submission=spec, policy=dict(exact=True)))
         def evaluate(self, source, directory, *, block_count):
             result = dict(super().evaluate(source, directory, block_count=block_count),
-                          suite_sha256=sha(b'retained-suite'))
+                          suite_sha256=sha(b'retained-suite'), candidate_sha256=sha(source.encode()))
             if source == 'bad':
                 result['failure_case'] = dict(schema='failure-case-v1', classification='host-mismatch',
                     description='Actual zero differs from the original oracle.', inputs=dict(x=[1]),
@@ -676,7 +728,7 @@ def test_optimizer_import_preserves_observations_when_optional_artifacts_are_una
         if failed:
             actions.append(candidate('bad'))
         actions += [candidate('fast'), dict(action='finish', summary='Retain final outcome')]
-        assert OptimizationLoop(jobs, job['job_id'], Agent(actions), RetainedBackend()).run()['status'] == 'completed'
+        assert OptimizationLoop(jobs, job['job_id'], FeedbackAgent(actions), RetainedBackend()).run()['status'] == 'completed'
     key, healthy_key = keys
     state = next(event['payload'] for event in reversed(jobs.events(key)) if event['kind'] == 'optimizer-state')
     failed = next(row for row in state['history'] if row['content']['status'] == 'incorrect')

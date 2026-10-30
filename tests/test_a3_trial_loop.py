@@ -183,67 +183,28 @@ class FakeClock:
     def advance(self, seconds): self.now += seconds
 
 
-def _run(
-    tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
-    candidate=None, budgets=None, completion_tokens=1,
-    execution_profile="gz-a3", evidence=None, model_default_budgets=False,
-    clock=None, actor_seconds=1, backend_seconds=.25,
-):
-    clock = clock or FakeClock()
+def _run(tmp_path, *, cell=None, knowledge=None, candidate=None):
+    """Exercise admission rejection without a provider or baseline configuration."""
     selected = cell or _cell()
-    profile = load_a3_model_profile(selected.backend_model)
-    resolver = Resolver()
-    queue = list(actions)
-    prompts = []
-    def actor(actual_profile, context):
-        assert actual_profile == profile
-        prompts.append(context)
-        clock.advance(actor_seconds)
-        action = queue.pop(0)
-        if isinstance(action, BaseException):
-            raise action
-        if callable(action):
-            action = action(context)
-        if isinstance(action, A3Completion):
-            return action
-        return A3Completion(
-            action, completion_tokens,
-            {"profile_sha256": profile.fingerprint},
-        )
+
+    def actor(*_args, **_kwargs):
+        pytest.fail("admission rejection must precede provider dispatch")
+
     journal = Phase1LearningJournal(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
-        evidence_resolver=resolver,
+        evidence_resolver=Resolver(),
         trial_protocol_sha256=trial_protocol_sha256(),
     )
-    selected_candidate = candidate or FakeCandidate(resolver)
-    selected_profiler = profiler or FakeProfiler(resolver)
-    if hasattr(selected_candidate, "resolver"):
-        selected_candidate.resolver = resolver
-    if hasattr(selected_profiler, "resolver"):
-        selected_profiler.resolver = resolver
-    def timed(operation):
-        def invoke(*args, **kwargs):
-            clock.advance(backend_seconds)
-            return operation(*args, **kwargs)
-        return invoke
-    for name in ('compile', 'run'):
-        setattr(selected_candidate, name, timed(getattr(selected_candidate, name)))
-    selected_profiler.profile = timed(selected_profiler.profile)
-    budget_options = (
-        {} if model_default_budgets
-        else {"budgets": budgets or TrialBudgets(10, 2000)}
-    )
     loop = A3TrialLoop(
-        cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
-        candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
-        profiler=selected_profiler,
-        evidence=evidence or EvidenceLedger(tmp_path / "evidence.jsonl"),
+        cell=selected, proposal=DEFAULT_PROPOSALS[0],
+        profile=load_a3_model_profile(selected.backend_model), actor=actor,
+        candidate=candidate or FakeCandidate(),
+        knowledge=knowledge or FakeKnowledge(False), profiler=FakeProfiler(),
+        evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work",
-        execution_profile=execution_profile, clock=clock,
-        **budget_options,
     )
-    return loop.run(), prompts, journal
+    return loop.run()
 
 
 def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_path):
@@ -254,7 +215,7 @@ def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_
         def run(self, *args, **kwargs):
             pytest.fail('target runner ran without mandatory canonical configuration')
     with pytest.raises(CanonicalConfigurationError):
-        _run(tmp_path, [], candidate=NoTargetDispatch())
+        _run(tmp_path, candidate=NoTargetDispatch())
     # The former KDB-disabled/unstructured actor success case is intentionally
     # invalid under the new mandatory baseline/provider contract. The actual
     # canonical default-path success/memory proof lives in production binding tests.
@@ -514,62 +475,49 @@ def test_submit_supports_are_only_for_current_source_revision(tmp_path):
     assert owner.memory.read()[0]['memory']['source_revision'] == result.verified.source_fingerprint
 
 
-@pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence"])
+@pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence", "pending", "unknown"])
 def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pending):
-    class PendingOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.attempts = []
-
-        def compile(self, source, workdir, **kw):
-            self.attempts.append(kw["attempt_id"])
-            if len(self.attempts) == 1:
-                if pending == "observation":
-                    raise RuntimeError("observation unavailable; retry retained handle")
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan,
-                    stage="prepare" if pending == "prepare" else "compile",
-                    error_type=(
-                        "TransferPending" if pending == "prepare" else "RuntimeError"
-                    ),
-                    detail="retry retained handle",
-                )
-            return super().compile(source, workdir, **kw)
-
-    candidate = PendingOnce()
-    result, prompts, _ = _run(
-        tmp_path,
-        [
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}',
-            json.dumps({
-                "action": "write_source",
-                "source": SOURCE.replace(" {}", " { return; }"),
-            }),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-            json.dumps({
-                "action": "submit", "interpretation": "host facts",
-                "supports": [],
-            }),
-        ],
-        candidate=candidate,
-    )
-
-    assert result.status == "passed"
-    assert candidate.attempts == ["infra-0-turn-2", "infra-0-turn-2"]
-    context = json.loads(prompts[2])
-    assert context["action_contract"]["trial_state"] == "compile-retry"
-    assert context["action_contract"]["required_next_action"] is None
-    assert set(context["allowed_actions"]) == {"compile"}
-    assert result.failures[-1] == "write_source is not valid in compile-retry"
-    if pending != "observation":
-        assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
+    from canonical_a3_fixtures import make_trial
+    from rsi.runtime import WorkflowError
+    class Pending(FakeCandidate):
+        calls = 0
+        def compile(self, source, workdir, **options):
+            self.calls += 1
+            if pending in ('pending', 'unknown'):
+                return dict(status=pending, attempt_id=options['attempt_id'])
+            if pending == 'observation':
+                raise OSError('retained handle is not observable')
+            plan = self._plan(source, options['request_id'], options['attempt_id'], options['length'],
+                options['project_id'], options.get('padded_length'), options.get('block_count', 1),
+                options.get('execution_profile', 'gz-a3'))
+            return FailedEvidence.create(plan, stage='prepare' if pending == 'prepare' else 'compile',
+                error_type='TransferPending' if pending == 'prepare' else 'RuntimeError',
+                detail='retained handle is not observable')
+    candidate = Pending()
+    clock = FakeClock()
+    owner, session = make_trial(tmp_path, candidate=candidate, clock=clock)
+    result = owner.run()
+    assert result.status in ('suspended', 'infrastructure-unverified')
+    assert candidate.calls == 1 and not owner.memory.read()
+    runner = owner.canonical.build(owner)
+    original_pending = dict(runner.workflow.pending)
+    original_intervals = json.loads(json.dumps(runner.workflow.state['intervals']))
+    original_uncertainties = dict(runner.workflow.state['timing_uncertainties'])
+    with pytest.raises(WorkflowError):
+        runner.workflow.accounting.seconds()
+    source = (owner.workdir / 'canonical-source').read_bytes()
+    before = [row for row in runner.events if row['type'] == 'domain-dispatch']
+    resumed = owner.run()
+    fresh = owner.canonical.build(owner)
+    assert resumed.status in ('suspended', 'infrastructure-unverified')
+    assert candidate.calls == 1 and fresh.workflow.pending == original_pending
+    assert fresh.workflow.state['intervals'] == original_intervals
+    assert fresh.workflow.state['timing_uncertainties'] == original_uncertainties
+    with pytest.raises(WorkflowError):
+        fresh.workflow.accounting.seconds()
+    assert (owner.workdir / 'canonical-source').read_bytes() == source
+    assert not owner.memory.read()
+    assert [row for row in fresh.events if row['type'] == 'domain-dispatch'] == before
 
 
 def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path, monkeypatch):
@@ -586,44 +534,26 @@ def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path, m
 
 
 def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
-    class PendingRun(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.attempts = []
-
-        def run(self, source, workdir, **kw):
-            self.attempts.append(kw["attempt_id"])
-            if len(self.attempts) == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="execute", error_type="RuntimeError",
-                    detail="retained operation observation unavailable",
-                )
-            return super().run(source, workdir, **kw)
-
-    candidate = PendingRun()
-    replacement = SOURCE.replace(" {}", " { return; }")
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "write_source", "source": replacement}),
-        '{"action":"run"}',
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
-    ], candidate=candidate)
-
-    context = json.loads(prompts[3])
-    assert context["action_contract"]["trial_state"] == "run-retry"
-    assert set(context["allowed_actions"]) == {"run"}
-    assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
-    assert candidate.attempts == ["infra-0-turn-3", "infra-0-turn-3"]
-    assert result.status == "passed"
-    assert result.failures[-1] == "write_source is not valid in run-retry"
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    candidate = recording_candidate(exception=OSError('lost execution observation'), exception_stage='run')
+    clock = FakeClock()
+    owner, session = make_trial(tmp_path, candidate=candidate, clock=clock)
+    first = owner.run()
+    assert first.status == 'suspended' and not owner.memory.read()
+    calls = list(candidate.calls)
+    runner = owner.canonical.build(owner)
+    pending = dict(runner.workflow.pending)
+    intervals = json.loads(json.dumps(runner.workflow.state['intervals']))
+    source = (owner.workdir / 'canonical-source').read_bytes()
+    assert [name for name, _, _ in calls] == ['compile', 'run']
+    second = owner.run()
+    assert second.status == 'suspended' and candidate.calls == calls
+    fresh = owner.canonical.build(owner)
+    assert fresh.workflow.pending == pending
+    assert fresh.workflow.state['intervals'] == intervals
+    assert (owner.workdir / 'canonical-source').read_bytes() == source
+    assert not owner.memory.read()
+    assert not any(context['stage'] == 'debug' for context in session.contexts)
 
 
 def test_verify_runtime_failure_is_deterministic_and_requires_rewrite(tmp_path):
@@ -755,18 +685,22 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
 
 
 def test_elapsed_time_budget_is_terminal_and_isolated(tmp_path):
-    result, prompts, journal = _run(
-        tmp_path, ['{"action":"compile"}'] * 5,
-        budgets=TrialBudgets(max_seconds=2),
-    )
-    assert result.status == "budget-exhausted" and len(prompts) == 2
-    assert journal.read() == ()
-    independent, _, other_journal = _run(tmp_path / "other", [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
-    ], budgets=TrialBudgets(max_seconds=10))
-    assert independent.status == "passed" and len(other_journal.read()) == 1
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    clock = FakeClock()
+    candidate = recording_candidate(clock=clock, seconds=3)
+    owner, session = make_trial(tmp_path, candidate=candidate, clock=clock,
+                               budgets=TrialBudgets(max_seconds=2))
+    result = owner.run()
+    assert result.status == 'budget_exhausted' and not owner.memory.read()
+    assert candidate.compiles == 1 and candidate.runs == 0
+    before = list(candidate.calls)
+    resumed = owner.run()
+    assert resumed.status in ('budget_exhausted', 'suspended') and candidate.calls == before
+    exhausted = owner.canonical.build(owner)
+    assert exhausted.workflow.remaining()['actor_seconds'] == 0
+    assert exhausted.workflow.accounting.seconds() == 3
+    independent, _ = make_trial(tmp_path / 'other')
+    assert independent.run().status == 'passed' and len(independent.memory.read()) == 1
 
 
 @pytest.mark.parametrize("guidance", list(ProfilingGuidance))
@@ -784,27 +718,67 @@ def test_legacy_turn_and_token_counts_do_not_prevent_verified_submission(tmp_pat
 
 @pytest.mark.parametrize('backend_seconds, expected_calls', [(1, 2), (4, 1)])
 def test_slow_backend_work_spends_elapsed_allocation(tmp_path, backend_seconds, expected_calls):
-    actions = [json.dumps({"action": "write_source", "source": SOURCE}),
-               '{"action":"compile"}', '{"action":"run"}',
-               json.dumps({"action": "submit", "interpretation": "done", "supports": []})]
-    candidate = FakeCandidate()
-    result, prompts, journal = _run(tmp_path, actions, candidate=candidate,
-        budgets=TrialBudgets(max_seconds=5), backend_seconds=backend_seconds)
-    assert result.status == 'budget-exhausted' and journal.read() == ()
-    assert len(prompts) == expected_calls + 1
-    assert result.completion_turns == 0
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    clock = FakeClock()
+    candidate = recording_candidate(clock=clock, seconds=backend_seconds * 3)
+    owner, session = make_trial(tmp_path, candidate=candidate, clock=clock,
+                               budgets=TrialBudgets(max_seconds=5))
+    result = owner.run()
+    assert result.status == 'budget_exhausted' and not owner.memory.read()
+    assert len(candidate.calls) == expected_calls
+    runner = owner.canonical.build(owner)
+    assert runner.workflow.accounting.seconds() >= 5
 
 
 def test_provider_and_invalid_actions_can_recover_while_time_remains(tmp_path):
-    actions = [A3ProviderResponseError('invalid-content-or-usage'), 'not json'] * 5 + [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "submit", "interpretation": "done", "supports": []})]
-    result, _, journal = _run(tmp_path, actions,
-        budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=30))
-    assert result.status == 'passed' and len(journal.read()) == 1
-    assert len(result.failures) == 10
-    assert result.completion_turns == 0
+    from canonical_a3_fixtures import make_trial, A3Session
+    from coding.pi.rpc import PiProviderError
+    from coding.pi.session import ActionError
+    clock = FakeClock()
+    class ScriptedSession(A3Session):
+        provider_failures = invalid = 0
+        def next_action(self, context, allowed, **kwargs):
+            clock.advance(.1)
+            if not self.provider_failures:
+                self.provider_failures += 1
+                raise PiProviderError('provider failed before admitting an action')
+            if self.invalid < 10:
+                self.invalid += 1
+                raise ActionError('malformed decision')
+            return super().next_action(context, allowed, **kwargs)
+    session = ScriptedSession(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, _ = make_trial(tmp_path, session=session, clock=clock,
+                         budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=30))
+    assert owner.run().status == 'suspended'
+    runner = owner.canonical.build(owner)
+    pending = dict(runner.workflow.pending)
+    outcome = runner.store.read_json(runner.latest('project-run-outcome')['reference'])
+    closure = runner.store.read_json(outcome['closure_ref'])
+    assert outcome['result']['classification'] == 'provider_failure'
+    assert closure['pending'] == pending and closure['contract_ref'] == runner.contract_ref
+    assert closure['observation']['method'] == 'observed-session-close'
+    assert closure['observation']['actor_closed'] and closure['observation']['provider_settled']
+    terminal = runner.terminal_failure_proof()
+    assert terminal['classification'] == 'provider_failure' and terminal['pending'] == pending
+    assert terminal['closure_ref'] == outcome['closure_ref']
+    assert runner.no_host_effects(pending['id'])
+    proof = dict(closure['observation'], handle=closure['handle'],
+                 no_host_effects=runner.no_host_effects(pending['id']))
+    source = runner.backend.project_hash()
+    charged = runner.workflow.accounting.seconds()
+    reference = runner.record_admission_failure(pending['id'], controller_proof=proof,
+                                               observed_source_hash=source)
+    runner.workflow.reject_operation(pending['id'], reference, source)
+    assert runner.workflow.accounting.seconds() == charged and runner.workflow.pending is None
+    result = owner.run()
+    fresh = owner.canonical.build(owner)
+    assert result.status == 'passed' and len(owner.memory.read()) == 1
+    assert session.provider_failures == 1 and session.invalid == 10
+    assert fresh.workflow.accounting.seconds() > charged
+    rejected, = [row for row in fresh.workflow.state['history'] if row.get('rejected_operation')]
+    assert rejected['operation'] == pending['id'] and rejected['host_failure_ref'] == reference
+    assert len([row for row in fresh.events if row['type'] == 'actor-invalid-action']) == 10
+    assert len([row for row in fresh.events if row['type'] == 'project-failure']) == 1
 
 
 @pytest.mark.parametrize('operation', ['compile', 'run'])
@@ -859,150 +833,210 @@ def test_validation_failure_allows_changed_source_repair_within_time(
     assert len(owner.memory.read()) == 1
 
 
-def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path):
-    result, prompts, journal = _run(
-        tmp_path,
-        [
-            A3ProviderResponseError("invalid-content-or-usage"),
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}',
-            '{"action":"run"}',
-            json.dumps({
-                "action": "submit", "interpretation": "host facts",
-                "supports": [],
-            }),
-        ],
-    )
-
-    assert result.status == "passed" and result.turns == 5
-    assert result.tokens == 4
-    assert result.failures == ("provider response failure: invalid-content-or-usage",)
-    assert len(prompts) == 5 and journal.resume_state().completed_projects == 1
-    failure = EvidenceLedger(tmp_path / "evidence.jsonl").entries[0]
-    assert failure.kind == "failure"
-    assert failure.payload["provider_response_failure"] == {
-        "code": "invalid-content-or-usage",
-        "completion_tokens": None,
-    }
-
-
-def test_provider_failure_usage_is_recorded_until_time_expires(tmp_path):
-    calls = []
-
-    def malformed(_context):
-        calls.append("provider")
-        raise A3ProviderResponseError(
-            "invalid-content-or-usage", completion_tokens=7,
-        )
-
-    result, _, journal = _run(
-        tmp_path, [malformed, malformed, malformed],
-        budgets=TrialBudgets(3, 10, max_seconds=3),
-    )
-
-    assert result.status == "budget-exhausted"
-    assert result.turns == 3 and result.tokens == 21
-    assert result.failures == (
-        "provider response failure: invalid-content-or-usage",
-        "provider response failure: invalid-content-or-usage",
-        "provider response failure: invalid-content-or-usage",
-    )
-    assert calls == ["provider", "provider", "provider"]
-    assert journal.read() == ()
-    failures = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    assert [
-        entry.payload["provider_response_failure"]["completion_tokens"]
-        for entry in failures
-    ] == [7, 7, 7]
+def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path, monkeypatch):
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    from rsi.actor import PiSessionAdapter
+    from test_rsi_pi_controller import response
+    clock, requests = FakeClock(), []
+    def provider(*_, **kwargs):
+        requests.append(json.loads(kwargs['data']))
+        clock.advance(1)
+        return response([], len(requests), finish='content_filter', completion_tokens=7)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    adapter = PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'})
+    candidate = recording_candidate()
+    owner, _ = make_trial(tmp_path, session=adapter, candidate=candidate, clock=clock,
+                         cell=_cell(model=BackendModel.DEEPSEEK_FLASH))
+    result = owner.run()
+    runner = owner.canonical.build(owner)
+    pending = runner.workflow.pending
+    failure, = [row for row in runner.events if row['type'] == 'project-failure']
+    assert failure['classification'] == 'provider_failure'
+    assert failure['error_type'] == 'PiProviderError' and failure['pending'] == pending
+    assert result.status == 'suspended' and result.tokens == 7 and len(requests) == 1
+    requested, = [row for row in runner.events if row['type'] == 'pi-provider-request']
+    retained, = [row for row in runner.events if row['type'] == 'pi-provider']
+    assert requested['operation_id'] == retained['operation_id'] == pending['id']
+    assert requested['reservation_id'] == retained['reservation_id']
+    assert retained['dispatch_attempted'] and retained['usage']['completion_tokens'] == 7
+    assert adapter.session.gateway.records[0]['usage'] == retained['usage']
+    native = [row['event'] for row in runner.events if row['type'] == 'pi-event']
+    assert any(row.get('message', {}).get('stopReason') == 'error' for row in native)
+    assert adapter.session.rpc.process.poll() is not None
+    outcome = runner.store.read_json(runner.latest('project-run-outcome')['reference'])
+    terminal = runner.terminal_failure_proof()
+    assert terminal['classification'] == 'provider_failure' and terminal['pending'] == pending
+    assert terminal['closure_ref'] == outcome['closure_ref']
+    assert runner.workflow.accounting.seconds('thinking') == 1
+    assert not any(row['type'] == 'actor-invalid-action' for row in runner.events)
+    assert not candidate.calls and not owner.memory.read()
+    assert not any(row['type'] == 'stage-result' and row['operation_id'] == pending['id']
+                   for row in runner.events)
 
 
-def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
-    tmp_path,
-):
+def test_provider_failure_usage_is_recorded_until_time_expires(tmp_path, monkeypatch):
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    from rsi.actor import PiSessionAdapter
+    from rsi.contracts import BudgetLimits
+    from test_rsi_pi_controller import response
+    for reported in (7, None):
+        clock, requests = FakeClock(), []
+        def provider(*_, **kwargs):
+            requests.append(json.loads(kwargs['data']))
+            clock.advance(1)
+            wire = response([], len(requests), finish='content_filter', completion_tokens=7)
+            if reported is None:
+                original = wire.iter_lines
+                def without_usage():
+                    for line in original():
+                        if line.startswith(b'data: {'):
+                            chunk = json.loads(line[6:])
+                            chunk.pop('usage', None)
+                            line = b'data: ' + json.dumps(chunk).encode()
+                        yield line
+                wire.iter_lines = without_usage
+            return wire
+        monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+        root = tmp_path / ('known' if reported is not None else 'unknown')
+        candidate = recording_candidate()
+        def build():
+            adapter = PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'})
+            owner, _ = make_trial(root, session=adapter, candidate=candidate, clock=clock,
+                cell=_cell(model=BackendModel.DEEPSEEK_FLASH),
+                budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=3))
+            owner.canonical_budgets = BudgetLimits(actor_seconds=3, wall_seconds=3)
+            return owner, adapter
+        owner, adapter = build()
+        result = owner.run()
+        runner = owner.canonical.build(owner)
+        pending = dict(runner.workflow.pending)
+        intervals = json.loads(json.dumps(runner.workflow.state['intervals']))
+        failure, = [row for row in runner.events if row['type'] == 'project-failure']
+        retained, = [row for row in runner.events if row['type'] == 'pi-provider']
+        usage = retained['usage']
+        assert (usage['completion_tokens'] if usage is not None else None) == reported
+        assert (usage is None) == (reported is None)
+        assert adapter.session.gateway.records[0]['usage'] == usage
+        assert failure['classification'] == 'provider_failure' and result.status == 'suspended'
+        assert len(requests) == 1 and runner.workflow.accounting.seconds('thinking') == 1
+        if reported is not None:
+            assert result.tokens == reported
+        clock.advance(2)
+        reopened, fresh_adapter = build()
+        resumed = reopened.run()
+        fresh = reopened.canonical.build(reopened)
+        assert resumed.status == 'suspended' and len(requests) == 1
+        assert fresh_adapter.session.rpc is None and not fresh_adapter.session.gateway.records
+        assert fresh.workflow.pending == pending and fresh.workflow.state['intervals'] == intervals
+        assert fresh.workflow.remaining()['wall_seconds'] == 0
+        assert fresh.workflow.accounting.seconds('thinking') == 1
+        assert [row for row in fresh.events if row['type'] == 'pi-provider'] == [retained]
+        assert [row for row in fresh.events if row['type'] == 'project-failure'] == [failure]
+        if reported is not None:
+            assert resumed.tokens == reported
+        assert not candidate.calls and not reopened.memory.read()
+
+
+def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(tmp_path, monkeypatch):
+    from canonical_a3_fixtures import make_trial, recording_candidate
+    from rsi.actor import PiSessionAdapter
+    from rsi.domain_execution import DomainRunner
+    from test_rsi_pi_controller import response
+    clock, requests, observed = FakeClock(), [], []
+    def provider(*_, **kwargs):
+        requests.append(json.loads(kwargs['data']))
+        clock.advance(1)
+        return response([], len(requests), finish='content_filter', completion_tokens=7)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     class InjectedCrash(RuntimeError):
         pass
-
-    class CrashAfterFirstProviderFailure(EvidenceLedger):
-        def append(self, kind, payload):
-            entry = super().append(kind, payload)
-            if "provider_response_failure" in payload:
-                raise InjectedCrash("after retained provider failure")
-            return entry
-
-    calls = []
-
-    def malformed(_context):
-        calls.append("provider")
-        raise A3ProviderResponseError(
-            "invalid-content-or-usage", completion_tokens=3,
-        )
-
-    path = tmp_path / "evidence.jsonl"
-    with pytest.raises(InjectedCrash, match="after retained"):
-        _run(
-            tmp_path, [malformed], budgets=TrialBudgets(2, 100, max_seconds=2),
-            evidence=CrashAfterFirstProviderFailure(path),
-        )
-
-    result, prompts, journal = _run(
-        tmp_path, [malformed], budgets=TrialBudgets(2, 100, max_seconds=2),
-    )
-
-    assert result.status == "budget-exhausted"
-    assert result.turns == 2 and result.tokens == 6
-    assert calls == ["provider", "provider"]
-    assert len(prompts) == 1 and journal.read() == ()
-    elapsed = json.loads((tmp_path / 'work/time-budget.json').read_text())
-    assert elapsed['elapsed_seconds'] == 2 and elapsed['active_since'] is None
-    repeated, repeated_prompts, _ = _run(tmp_path, [], budgets=TrialBudgets(max_seconds=2))
-    assert repeated == result and repeated_prompts == []
-    assert calls == ['provider', 'provider']
-    recovered = json.loads(prompts[0])["observations"]
-    assert recovered == [{
-        "provider_response_failure": {
-            "code": "invalid-content-or-usage",
-            "completion_tokens": 3,
-        }
-    }]
-    entries = EvidenceLedger(path).entries
-    assert [entry.payload["turn"] for entry in entries] == [1, 2]
-    assert all(entry.kind == "failure" for entry in entries)
-
-    reference_calls = []
-
-    def reference_malformed(_context):
-        reference_calls.append("provider")
-        raise A3ProviderResponseError(
-            "invalid-content-or-usage", completion_tokens=3,
-        )
-
-    reference, _, _ = _run(
-        tmp_path / "reference", [reference_malformed, reference_malformed],
-        budgets=TrialBudgets(2, 100, max_seconds=2),
-    )
-    assert reference_calls == ["provider", "provider"]
-    assert result == reference
-    assert path.read_bytes() == (
-        tmp_path / "reference" / "evidence.jsonl"
-    ).read_bytes()
+    append = DomainRunner.append
+    def crash_after_receipt(runner, event):
+        append(runner, event)
+        if event['type'] == 'project-failure' and event['classification'] == 'provider_failure':
+            reference = runner.event_refs[-1]
+            assert runner.store.read_json(reference) == event
+            observed.append((reference, dict(runner.workflow.pending)))
+            raise InjectedCrash('after authenticated provider failure, before public outcome')
+    candidate = recording_candidate()
+    def build():
+        adapter = PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'})
+        owner, _ = make_trial(tmp_path, session=adapter, candidate=candidate, clock=clock,
+            cell=_cell(model=BackendModel.DEEPSEEK_FLASH), budgets=TrialBudgets(max_seconds=5))
+        return owner, adapter
+    owner, adapter = build()
+    with monkeypatch.context() as patch:
+        patch.setattr(DomainRunner, 'append', crash_after_receipt)
+        with pytest.raises(InjectedCrash):
+            owner.run()
+    reference, pending = observed[0]
+    runner = owner.canonical.build(owner)
+    assert runner.latest('project-run-outcome') is None
+    retained, = [row for row in runner.events if row['type'] == 'pi-provider']
+    assert retained['usage']['completion_tokens'] == 7
+    assert adapter.session.rpc.process.poll() is not None
+    assert len(requests) == 1 and runner.workflow.pending == pending
+    intervals = json.loads(json.dumps(runner.workflow.state['intervals']))
+    events = list(runner.events)
+    reopened, fresh_adapter = build()
+    resumed = reopened.run()
+    fresh = reopened.canonical.build(reopened)
+    assert resumed.status == 'suspended' and resumed.tokens == 7
+    assert fresh.workflow.pending == pending and len(requests) == 1 and not candidate.calls
+    assert fresh_adapter.session.rpc is None and not fresh_adapter.session.gateway.records
+    assert fresh.workflow.state['intervals'] == intervals
+    assert fresh.workflow.accounting.seconds('thinking') == 1
+    assert fresh.store.read_json(reference)['pending'] == pending
+    kinds = ('actor-request', 'domain-dispatch', 'project-failure', 'pi-provider-request', 'pi-provider')
+    assert [row for row in fresh.events if row['type'] in kinds] == [
+        row for row in events if row['type'] in kinds]
+    assert not reopened.memory.read()
 
 
 def test_provider_failure_recovery_does_not_hide_mixed_partial_state(tmp_path):
-    _run(
-        tmp_path, [A3ProviderResponseError("invalid-content-or-usage")],
-        budgets=TrialBudgets(1, 100, max_seconds=1),
-    )
-    cell = _cell()
-    EvidenceLedger(tmp_path / "evidence.jsonl").append(EvidenceKind.ACTION, {
-        "target": "Ascend910B4", "language": "ascend-c",
-        "execution_profile": "gz-a3", "runtime": "native-ascend-c",
-        "cell_id": cell.cell_id,
-        "project_id": DEFAULT_PROPOSALS[0].project_id,
-        "turn": 2, "action": "compile",
-    })
-
-    with pytest.raises(ValueError, match="only leading retained failures"):
-        _run(tmp_path, [], budgets=TrialBudgets(max_seconds=1))
+    from canonical_a3_fixtures import make_trial, A3Session, recording_candidate
+    from coding.pi.rpc import PiProviderError
+    from rsi.domain_checkpoint import decode
+    from rsi.runtime import WorkflowError
+    clock = FakeClock()
+    class ScriptedSession(A3Session):
+        failures = 0
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == 'debug':
+                self.failures += 1
+                clock.advance(1)
+                raise PiProviderError('provider unavailable after retained host mismatch')
+            return super().next_action(context, allowed, **kwargs)
+    session = ScriptedSession(initial=SOURCE)
+    candidate = recording_candidate(run_failures=1)
+    owner, _ = make_trial(tmp_path, session=session, candidate=candidate, clock=clock)
+    assert owner.run().status == 'suspended'
+    runner = owner.canonical.build(owner)
+    pending = dict(runner.workflow.pending)
+    calls = list(candidate.calls)
+    assert [name for name, _, _ in calls] == ['compile', 'run']
+    failure, = [row for row in runner.events if row['type'] == 'project-failure']
+    assert failure['classification'] == 'provider_failure' and failure['pending'] == pending
+    receipts = [runner.store.read_json(row['reference']) for row in runner.events
+                if row['type'] == 'domain-result']
+    verification = [decode(row['result']) for row in receipts
+                    if runner.store.read_json(row['dispatch_ref'])['name'] == 'run']
+    assert len(verification) == 1 and not verification[0].passed
+    assert all(row['observed_terminal'] for row in receipts)
+    source = (owner.workdir / 'canonical-source').read_bytes()
+    intervals = json.loads(json.dumps(runner.workflow.state['intervals']))
+    assert owner.run().status == 'suspended'
+    fresh = owner.canonical.build(owner)
+    assert fresh.workflow.pending == pending and candidate.calls == calls and session.failures == 1
+    assert fresh.workflow.state['intervals'] == intervals
+    assert (owner.workdir / 'canonical-source').read_bytes() == source
+    assert [row for row in fresh.events if row['type'] == 'domain-result'] == [
+        row for row in runner.events if row['type'] == 'domain-result']
+    assert not owner.memory.read()
+    (owner.workdir / 'canonical-source').write_text(SOURCE + '\n// changed outside actor')
+    with pytest.raises(WorkflowError):
+        owner.run()
+    assert candidate.calls == calls and session.failures == 1 and not owner.memory.read()
 
 
 @pytest.mark.parametrize("error", [ValueError("actor bug"), RuntimeError("actor bug")])
@@ -1115,7 +1149,7 @@ def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_p
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
     with pytest.raises(ValueError, match="Knowledge Agent"):
-        _run(tmp_path, [], cell=cell, knowledge=FakeKnowledge(False))
+        _run(tmp_path, cell=cell, knowledge=FakeKnowledge(False))
 
 
 def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):

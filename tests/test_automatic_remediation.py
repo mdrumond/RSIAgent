@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend, evidence_results, optimizer_inputs, retained_native, unresolved_authority
+
 import json
 
 import pytest
@@ -178,9 +180,9 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         assert type(bound['attempt_seconds']) is int and bound['attempt_seconds'] == 30
         assert bound['max_cases'] == 2
         backend = FrozenBackend(12, failed=failed_retry, native_latency=retry_latency)
-        backend.interrupt = not children
         child = OptimizerTaskExecutor(directory, task, memory, bound,
-            agent=Agent([candidate('good')]), backend=backend, **kwargs)
+            agent=Agent([dict(action='cases', signatures=[], summary='Retain original frozen cases'),
+                         dict(action='read-memory', index=0), candidate('good')]), backend=backend, **kwargs)
         prepare = child.prepare
         def charged_prepare():
             value = prepare()
@@ -192,18 +194,29 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     monkeypatch.setattr('benchmarks.ascend.optimizer_execution.OptimizerTaskExecutor', factory)
     runner = SimpleNamespace(root=source, initial_memory=b'', clock=lambda: now[0])
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
-    from optimizer.control import ObservationUnavailable, WorkerStopped
-    with pytest.raises(ObservationUnavailable):
-        retry(row, tmp_path/'retried', 30.75)
+    from optimizer.control import WorkerStopped
+    retry(row, tmp_path/'retried', 30.75)
+    assert children[0]._backend.prepares == 1
+    assert len(children[0]._backend.evaluations) == 1
+    inputs = optimizer_inputs(children[0]._agent.contexts[-1][1])
+    assert inputs['memory']['snapshot_id'] == received[0]['snapshot_id']
+    assert inputs['memory']['snapshot_id'] != snapshot()['snapshot_id']
+    reads = evidence_results(children[0]._agent.contexts[-1][1], 'read_memory')
+    assert reads == [dict(received[0]['memory_entries'][0],
+                          action='read_memory', executed=True)]
+    native = retained_native(children[0])
+    queries = [row['result']['evidence']['payload']['response'] for row in native.events
+               if row['type'] == 'evidence-tool-result' and row['name'] == 'query_kdb']
+    assert queries and all(query['results'] for query in queries)
+    baseline = children[0]._read(children[0]._state()['baseline'])
+    assert baseline['manifest']['submission']['signatures'] == task['submission']['signatures']
     # Older retained children have no allocation receipt; recover their immutable submission.
     (tmp_path/'retried/retry-allocation.json').unlink()
     retry(row, tmp_path/'retried', 20.5)
     assert children[1].job_id == children[0].job_id
     assert children[1]._backend.prepares == 0
     assert children[1]._agent.contexts == []
-    assert len(children[1]._backend.evaluations) == 1
-    import time
-    assert 0 < children[1].deadline - time.monotonic() <= 18.5
+    assert children[1]._backend.evaluations == []
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
     linked = store.link_original_retry(row['feedback_id'], retried['feedback_id'])
     # Remeasuring the reference at 12us cannot relax original optimizer acceptance at 10us.
@@ -226,7 +239,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
             assert json.loads(feedback.read(case['artifacts'][role]['sha256'])['text']) == expected_value
     assert received[0]['phase'] == 'committed-phase1'
     assert len(received[0]['memory_entries']) == 1
-    # The same pending child survives a lower parent allowance and changed memory.
+    # The settled child survives a lower parent allowance without refreezing memory.
     monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', lambda *args: pytest.fail('snapshot refrozen'))
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
     retry(row, tmp_path/'retried', 12.5)
@@ -247,6 +260,63 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     with pytest.raises(WorkerStopped, match='elapsed-time'):
         slow_retry(row, tmp_path/'setup-expired', 30.75)
     assert len(children) == 3
+
+
+def test_unknown_optimizer_retry_preserves_original_dispatch_and_open_feedback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from test_optimizer_task_execution import executor, Agent, Backend, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
+    from benchmarks.ascend.automatic_remediation import optimizer_retry_adapter
+    from benchmarks.ascend.feedback import FeedbackStore
+    from optimizer.control import ObservationUnavailable
+    from optimizer.jobs import atomic, canonical
+    from rsi.runtime import WorkflowError
+
+    original, _, _ = executor(tmp_path/'original', [dict(
+        action='candidate', source='bad', block_count=1, summary='host failure')])
+    class FrozenBackend(Backend):
+        def prepare(self, spec, directory):
+            return dict(super().prepare(spec, directory),
+                manifest=dict(submission=spec, policy=dict(exact=True)))
+    original._backend = FrozenBackend()
+    failed = original.attempt('failed')
+    attempt = dict(attempt_id='failed', task=original.task, result=failed, execution_directory='')
+    atomic(original.directory/'state.json', canonical(dict(phase='optimizer-task', attempts=[attempt])))
+    atomic(original.directory/'campaign-identity.json', canonical(dict(target='a3', language='ascend-c')))
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_task_results(original.directory)
+    row, = store.records()
+    children = []
+    def factory(directory, task, memory, bound, **kwargs):
+        backend = FrozenBackend()
+        backend.interrupt = True
+        child = OptimizerTaskExecutor(directory, task, memory, bound,
+            agent=Agent([dict(action='cases', signatures=[], summary='Retain original frozen cases'),
+                         dict(action='read-memory', index=0),
+                         dict(action='candidate', source='good', block_count=1, summary='repair')]),
+            backend=backend, **kwargs)
+        children.append(child)
+        return child
+    memory = snapshot([dict(lesson='Repair the original failed candidate')])
+    monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', lambda *args: memory)
+    monkeypatch.setattr('benchmarks.ascend.optimizer_execution.OptimizerTaskExecutor', factory)
+    retry = optimizer_retry_adapter(SimpleNamespace(root=tmp_path/'learning', initial_memory=b''),
+        store, original.config)
+    directory = tmp_path/'retry'
+    with pytest.raises(ObservationUnavailable):
+        retry(row, directory, 30)
+    before = retained_native(children[0])
+    assert before.workflow['pending'] is not None
+    with pytest.raises(WorkflowError, match='reconciliation'):
+        retry(row, directory, 20)
+    assert children[1].job_id == children[0].job_id
+    assert unresolved_authority(retained_native(children[1])) == unresolved_authority(before)
+    assert children[1]._backend.prepares == 0
+    assert children[1]._backend.evaluations == []
+    assert children[1]._agent.contexts == []
+    assert children[1]._event('task-attempt-result') is None
+    assert children[1].store.submission(children[1].job_id)['memory_snapshot'] == memory
+    assert store.records() == [row]
 
 
 def test_original_retry_propagates_only_remaining_failure_seconds(tmp_path):

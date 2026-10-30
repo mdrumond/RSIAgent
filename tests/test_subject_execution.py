@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend, optimizer_inputs, evidence_results
+
 """Real production adapters with injected compiler/provider boundaries."""
 from dataclasses import replace
 import json
@@ -152,7 +154,7 @@ def optimizer(tmp_path, *, times=None):
             record('response', result)
             return result
     model = RecordingAgent([{'action': 'cases', 'signatures': [], 'summary': 'representative'},
-                   candidate('bad'), candidate('good')])
+                   candidate('bad'), {'action': 'read-memory', 'index': 0}, candidate('good')])
     backend = Backend()
     config = {'target': 'registered-a3', 'physical_device': 0,
               'validation_wrapper': str(tmp_path / 'validation.sh'), 'max_cases': 1}
@@ -177,7 +179,12 @@ def test_optimizer_reuses_real_job_baseline_and_publishes_no_learning(tmp_path):
     events = json.loads(passed.read_artifact(passed.artifacts['log:optimizer-events']))
     assert any(event['kind'] == 'model-request' for event in events)
     assert backend.prepares == 1 and [s for s, _ in backend.evaluations] == ['bad', 'good']
-    assert actor.contexts[-1][1]['optimizer_task']['feedback'] == {'repair': 'tails'}
+    inputs = optimizer_inputs(actor.contexts[-1][1])
+    assert inputs['optimizer_context']['optimizer_task']['feedback'] == {'repair': 'tails'}
+    assert inputs['memory']['snapshot_id'] == snapshot['snapshot_id']
+    memory_reads = evidence_results(actor.contexts[-1][1], 'read_memory')
+    assert len(memory_reads) == 1
+    assert memory_reads[0]['claim'] == snapshot['memory_entries'][0]['claim']
     assert not (tmp_path / 'state.json').exists()
 
 
@@ -206,8 +213,9 @@ def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job
     assert second.host_verified
     assert backend.prepares == 1
     assert [source for source, _ in backend.evaluations] == ['bad', 'good']
-    assert actor.contexts[-1][1]['memory_summary'] == [
-        {'index': 0, 'summary': str(current['memory_entries'][0])}]
+    assert optimizer_inputs(actor.contexts[-1][1])['memory']['snapshot_id'] == current['snapshot_id']
+    memory_reads = evidence_results(actor.contexts[-1][1], 'read_memory')
+    assert len(memory_reads) == 1 and memory_reads[0]['claim'] == current['memory_entries'][0]['claim']
     assert json.loads((directory / 'subject-optimizer-initial-memory.json').read_bytes()) == initial
     events = json.loads(second.read_artifact(second.artifacts['log:optimizer-events']))
     requests = [row['payload'] for row in events if row['kind'] == 'task-attempt-request']

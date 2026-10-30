@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import base64
 import json
 from dataclasses import replace
@@ -148,13 +150,24 @@ def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_pat
     frozen = dict(execution.task['submission'])
     expected = dict(frozen_submission=frozen, suite_sha256='suite', policy={'name':'frozen'})
     original = backend.prepare
-    backend.prepare = lambda spec, directory: {**original(spec, directory), 'manifest': {'policy': expected['policy']}}
+    backend.prepare = lambda spec, directory: {**original(spec, directory),
+        'manifest': {'policy': expected['policy'], 'submission': spec}}
     execution.expected_baseline = expected
-    execution.prepare()
-    assert not agent.contexts  # No fresh Actor case proposal.
+    baseline = execution.prepare()
+    assert baseline['manifest']['submission']['signatures'] == frozen['signatures']
+    assert baseline['manifest']['submission']['source'] == frozen['source']
+    proposals = [row['payload'] for row in execution.store.events(execution.job_id)
+                 if row['kind'] == 'case-proposals']
+    assert len(proposals) == 1
+    assert proposals[0]['accepted'] == [] and proposals[0]['rejected'] == []
+    contexts = list(agent.contexts)
+    assert backend.prepares == 1
+    assert execution.prepare() == execution._read(execution._state()['baseline'])
+    assert backend.prepares == 1 and agent.contexts == contexts
     execution.expected_baseline = dict(expected, suite_sha256='other')
     with pytest.raises(ValueError, match='suite'):
         execution.prepare()
+    assert backend.prepares == 1 and backend.evaluations == []
 
 
 def test_retry_reads_actual_retained_baseline_and_refuses_missing_original(tmp_path):
