@@ -578,6 +578,14 @@ class OptimizerHost(SourceHost):
 
 def optimizer_adoption():
     def build(owner, **inputs):
+        if owner.state.get('pending') and not owner.state.get('canonical_active'):
+            raise CanonicalConfigurationError('retained legacy native operation needs explicit canonical checkpoint migration; observe original handles first')
+        identity = owner.agent.identity
+        if 'model' in owner.state and owner.state['model'] != identity:
+            raise CanonicalConfigurationError('optimizer model identity changed')
+        if 'model' not in owner.state:
+            owner.state['model'] = json.loads(json.dumps(identity))
+            owner._save()
         row = owner.store.get(owner.key)
         if row['status'] == 'queued':
             owner.store.transition(owner.key, 'running')

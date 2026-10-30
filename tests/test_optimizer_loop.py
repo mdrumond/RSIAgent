@@ -241,7 +241,7 @@ def test_whole_suite_score_and_missing_timing():
     assert score(base, result) is None
 
 
-def test_pending_candidate_recovery_reuses_directory_and_charge(tmp_path):
+def test_retained_legacy_candidate_requires_checkpoint_migration_without_replay(tmp_path):
     store, key = fixture(tmp_path)
     backend = Backend()
     loop = OptimizationLoop(store, key, Agent([]), backend)
@@ -254,10 +254,14 @@ def test_pending_candidate_recovery_reuses_directory_and_charge(tmp_path):
         pending={**source, 'sha256': digest, 'attempt': 1})
     loop._save()
     store.record_attempt(key, candidate_sha256=digest, result='evaluating')
-    result = OptimizationLoop(store, key, Agent([{'action': 'finish', 'summary': ''}]), backend).run()
-    assert result['status'] == 'completed'
-    assert result['attempts'] == 1
-    assert backend.evaluations == ['fast']
+    from rsi.domain_execution import CanonicalConfigurationError
+    before = dict(loop.state['pending'])
+    with pytest.raises(CanonicalConfigurationError, match='checkpoint migration'):
+        OptimizationLoop(store, key, Agent([]), backend).run()
+    resumed = OptimizationLoop(store, key, Agent([]), backend)
+    assert resumed.state['pending'] == before
+    assert store.get(key)['attempts'] == 1
+    assert backend.evaluations == []
 
 
 def test_rejected_cases_visible_and_profile_failure_preserves_best(tmp_path):
