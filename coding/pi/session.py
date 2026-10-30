@@ -205,7 +205,10 @@ class PiCodingSession:
                     raise ValueError("source edit maps to an unavailable host write action")
                 validate(args, self.schemas[name])
             self.pending = (name, args)
-            return {"status": "queued", "executed": False, "action": name}
+            result = {"status": "queued", "executed": False, "action": name}
+            if self.first_action_only:
+                result["observe_result_in"] = "next_host_snapshot"
+            return result
 
     def _start(self):
         if self.rpc is not None:
