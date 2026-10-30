@@ -63,13 +63,14 @@ class SkillEvaluation:
         if any(not isinstance(v, str) for v in steering.values()):
             raise ValueError('steering values must be strings')
         count = case_count * repetitions
-        actor_cap = _bounded(remaining_parent.get('actor_seconds'), remaining_parent.get('recovery_seconds'))
+        actor_cap = remaining_parent.get('actor_seconds')
         for value in (actor_cap, remaining_parent.get('wall_seconds')):
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
                 raise WorkflowError('parent elapsed allocation exhausted or invalid')
         limits = replace(joint_limits,
             actor_seconds=_bounded(joint_limits.actor_seconds, actor_cap / count if actor_cap is not None else None),
-            wall_seconds=_bounded(joint_limits.wall_seconds, remaining_parent.get('wall_seconds')))
+            wall_seconds=_bounded(joint_limits.wall_seconds, remaining_parent.get('wall_seconds') / count
+                                  if remaining_parent.get('wall_seconds') is not None else None))
         BudgetLimits.from_dict(limits.to_dict())
         plan = dict(incumbent=incumbent, candidate=candidate, training=list(training), cases=identities,
             case_count=case_count, repetitions=repetitions, steering=steering,
@@ -81,7 +82,8 @@ class SkillEvaluation:
                 pair = PairedRecovery.create(pair_path, checkpoint, artifacts=artifacts,
                     memory_ref=memory_ref, kdb_ref=kdb_ref, model_config=model_config,
                     incumbent=incumbent, candidate=candidate, joint_limits=limits,
-                    remaining_parent=remaining_parent, runner_factory=runner_factory)
+                    remaining_parent={k: remaining_parent.get(k) for k in ('actor_seconds', 'wall_seconds')},
+                    runner_factory=runner_factory)
                 plan['pairs'].append(dict(path=str(pair_path.resolve()), frozen=pair.state['frozen'],
                                           case=i, repetition=repetition))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +97,19 @@ class SkillEvaluation:
 
     def pair(self, index):
         row = self.plan['pairs'][index]
-        pair = PairedRecovery(row['path'], artifacts=self.store, runner_factory=self.factory)
+        def factory(request, *, reopen):
+            def check_wall():
+                wall = self.plan['parent'].get('wall_seconds')
+                if not reopen and wall is not None:
+                    elapsed = self.clock() - self.plan['created']
+                    reserve = request.spec.budgets.wall_seconds
+                    if elapsed < 0 or not math.isfinite(elapsed) or elapsed + reserve > wall:
+                        raise WorkflowError('insufficient parent wall allocation for frozen arm')
+            check_wall()
+            runner = self.factory(request, reopen=reopen)
+            check_wall()  # Includes factory/setup, before PairedRecovery calls run().
+            return runner
+        pair = PairedRecovery(row['path'], artifacts=self.store, runner_factory=factory)
         if pair.state['frozen'] != row['frozen']:
             raise WorkflowError('retained paired inputs changed')
         return pair
@@ -152,7 +166,7 @@ class SkillEvaluation:
         evidence = dict(plan=self.state['plan'], pairs=[p['evidence_ref'] for p in pairs],
             decision=decision, steering=self.plan['steering'],
             actor_seconds=sum(p['actor_seconds'] for p in pairs))
-        cap = _bounded(self.plan['parent'].get('actor_seconds'), self.plan['parent'].get('recovery_seconds'))
+        cap = self.plan['parent'].get('actor_seconds')
         if cap is not None and evidence['actor_seconds'] > cap:
             evidence['decision'] = 'inconclusive'
         return dict(evidence, evidence_ref=self.store.put_json(evidence))
