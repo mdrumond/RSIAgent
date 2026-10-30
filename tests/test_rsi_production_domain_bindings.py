@@ -151,7 +151,7 @@ def test_existing_transfer_scope_excludes_actual_copy_without_remote_clock_math(
     assert runner.workflow.accounting.seconds('transfer') == 30
 
 
-def test_default_a3_trial_preserves_typed_host_verification_and_memory(tmp_path, monkeypatch):
+def canonical_a3_fixture(tmp_path, monkeypatch, *, prepare_failure=False):
     from test_a3_trial_loop import (_cell, FakeCandidate, FakeKnowledge, FakeProfiler, Resolver, SOURCE)
     from benchmarks.a3_experiments import KnowledgeMode
     from benchmarks.a3_model_profiles import load_a3_model_profile
@@ -173,13 +173,28 @@ def test_default_a3_trial_preserves_typed_host_verification_and_memory(tmp_path,
     memory = Phase1LearningJournal(tmp_path / 'memory.jsonl', (DEFAULT_PROPOSALS[0],),
         cell_id=cell.cell_id, lineage_id='canonical-test', evidence_resolver=resolver,
         trial_protocol_sha256=trial_protocol_sha256())
+    class Candidate(FakeCandidate):
+        compile_calls = 0
+        def compile(self, source, workdir, **kw):
+            self.compile_calls += 1
+            if prepare_failure:
+                from benchmarks.a3kernels.phase1_protocol import FailedEvidence
+                plan = self._plan(source, kw['request_id'], kw['attempt_id'], kw['length'], kw['project_id'],
+                    kw['padded_length'], kw['block_count'], kw['execution_profile'])
+                return FailedEvidence.create(plan, stage='prepare', error_type='RuntimeError', detail='CPU TEST unavailable route')
+            return super().compile(source, workdir, **kw)
     actor = SimpleNamespace(session=session, close=lambda: None)
     trial = A3TrialLoop(cell=cell, proposal=DEFAULT_PROPOSALS[0],
         profile=load_a3_model_profile(cell.backend_model), actor=actor,
-        candidate=FakeCandidate(resolver), knowledge=FakeKnowledge(True), profiler=FakeProfiler(resolver),
+        candidate=Candidate(resolver), knowledge=FakeKnowledge(True), profiler=FakeProfiler(resolver),
         evidence=EvidenceLedger(tmp_path / 'evidence.jsonl'), memory=memory, workdir=tmp_path / 'work')
     trial._run = lambda: pytest.fail('old A3 trial loop ran')
     result = trial.run()
+    return result, session, trial
+
+
+def test_default_a3_trial_preserves_typed_host_verification_and_memory(tmp_path, monkeypatch):
+    result, session, trial = canonical_a3_fixture(tmp_path, monkeypatch)
     assert result.status == 'passed' and result.verified.passed
     assert result.memory_entry_sha256
     assert result.knowledge_queries == 2

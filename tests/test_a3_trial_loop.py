@@ -821,33 +821,17 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
         assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
 
 
-def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path):
-    class PrepareFailure(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_calls = 0
-
-        def compile(self, source, workdir, **kw):
-            self.compile_calls += 1
-            plan = self._plan(
-                source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"),
-                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-            )
-            return FailedEvidence.create(
-                plan, stage="prepare", error_type="RuntimeError",
-                detail="VPN route unavailable",
-            )
-
-    candidate = PrepareFailure()
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-    ], candidate=candidate)
-
-    assert result.status == "infrastructure-unverified"
-    assert candidate.compile_calls == 1
-    assert len(prompts) == 2
+def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path, monkeypatch):
+    from test_rsi_production_domain_bindings import canonical_a3_fixture
+    result, session, trial = canonical_a3_fixture(tmp_path, monkeypatch, prepare_failure=True)
+    assert result.status == 'infrastructure-unverified'
+    assert trial.candidate.compile_calls == 1
+    assert result.verified is None and result.memory_entry_sha256 is None
+    assert trial.memory.read() == () or not trial.memory.read()
+    assert session.contexts[-1]['stage'] == 'test'
+    assert not any(context['stage'] == 'debug' for context in session.contexts)
+    state = json.loads((trial.workdir / 'canonical' / 'workflow.json').read_text())
+    assert state['pending'] and state['executions'] == 1
 
 
 def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
