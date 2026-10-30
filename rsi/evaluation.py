@@ -160,8 +160,19 @@ class SkillEvaluation:
                                recovered, row['performance'] == 'met')
                 if arm == 'candidate':
                     eligible &= accepted and all(scores[arm][:3]) and row['performance'] not in ('not_measured', 'shortfall')
-            comparisons.append((scores['candidate'] > scores['incumbent']) -
-                               (scores['candidate'] < scores['incumbent']))
+            comparison = ((scores['candidate'] > scores['incumbent']) -
+                          (scores['candidate'] < scores['incumbent']))
+            if pair['decision'] == 'inconclusive':
+                # A closed provider/setup failure is not evidence against skills.
+                # A genuine both-pass tie may coexist with another beneficial
+                # case, but an unobserved comparator must block round promotion.
+                comparison = 0
+                eligible &= all(row['outcome'] == 'accepted' and all(scores[arm][:3])
+                    and row['performance'] not in ('not_measured', 'shortfall')
+                    for arm, row in pair['arms'].items())
+            elif pair['decision'] == 'regression':
+                comparison = -1
+            comparisons.append(comparison)
         decision = ('regression' if any(c < 0 for c in comparisons) else
                     'benefit' if eligible and any(c > 0 for c in comparisons) else 'inconclusive')
         evidence = dict(plan=self.state['plan'], pairs=[p['evidence_ref'] for p in pairs],
