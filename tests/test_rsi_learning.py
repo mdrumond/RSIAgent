@@ -14,7 +14,7 @@ class Role:
     proposal = None
     receipt = {'role': 'skillwriter', 'success': True, 'elapsed_seconds': 2.0}
 
-    def skillwriter(self, prompt, evidence, *, deadline):
+    def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
         self.calls += 1
         context = json.loads(prompt[prompt.index('{"aggregate"'):])
         return self.proposal or SkillProposal('prevent cancellation', (evidence[0].evidence_id,),
@@ -199,7 +199,7 @@ def test_completed_proposal_reconciles_frozen_packet_without_provider_replay(env
     store, role, bundle, memory, baseline, packets, make, project = env
     row, ctx = project()
     learner = make()
-    def lost_return(prompt, evidence, *, deadline):
+    def lost_return(prompt, evidence, *, deadline, wall_deadline=None):
         role.calls += 1
         role.saved = store.put_json({'rationale': 'repair', 'evidence_ids': [evidence[0].evidence_id],
             'edits': [{'skill': 'debug', 'operation': 'replace', 'content': builtin_bundle().document('debug').read('learned-guidance') + 'Compare numeric error.'}]})
@@ -263,7 +263,7 @@ def test_setup_excluded_and_unlimited_parent_uses_technical_request_timeout(env)
     store, role, bundle, memory, baseline, packets, make, project = env
     now = [0.0]
     deadlines = []
-    def thinking(prompt, evidence, *, deadline):
+    def thinking(prompt, evidence, *, deadline, wall_deadline=None):
         deadlines.append(deadline)
         now[0] += 102  # 100 seconds framework setup, two seconds thinking.
         return SkillProposal('repair', (evidence[0].evidence_id,), (SkillEdit('debug', 'replace', builtin_bundle().document('debug').read('learned-guidance') + 'Check error.'),))
@@ -431,7 +431,7 @@ def test_writer_corrects_frozen_full_baseline_without_retrieval_tools(env, tmp_p
     packets['p']['evidence'][row['artifact_ref']]['kind'] = 'review'
     packets['p']['correction_skills'] = ['debug']
     observed = []
-    def correct(prompt, evidence, *, deadline):
+    def correct(prompt, evidence, *, deadline, wall_deadline=None):
         role.calls += 1
         context = json.loads(prompt[prompt.index('{"aggregate"'):])
         supplied = context['baseline_documents']['debug']
@@ -476,13 +476,54 @@ def test_observations_reach_subject_memory_search_and_writer_as_labelled_evidenc
     from rsi.learning import Learning
     seen = []
     original_writer = role.skillwriter
-    def inspect_context(prompt, evidence, *, deadline):
+    def inspect_context(prompt, evidence, *, deadline, wall_deadline=None):
         context = json.loads(prompt[prompt.index('{"aggregate"'):])
         seen.append(context['aggregate']['observations'][0]['observations'])
-        return original_writer(prompt, evidence, deadline=deadline)
+        return original_writer(prompt, evidence, deadline=deadline, wall_deadline=wall_deadline)
     role.skillwriter = inspect_context
     phase2 = Learning(phase2_path, store, memory, role, load_project=lambda r: packets[r['original_id']],
         validate=lambda *args: Validation(None, None, row['artifact_ref']), role_elapsed=lambda op: 2)
     phase2.skill_update(bundle, baseline, row, dict(ctx, operation_id='skills'))
     assert seen == [observations]
     assert phase2.active == bundle
+
+
+def test_parent_wall_reaches_role_and_failure_receipt_is_consumed_once(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    now = [100.0]
+    seen = []
+    def timeout(prompt, evidence, *, deadline, wall_deadline):
+        seen.append((deadline, wall_deadline))
+        now[0] += 5  # setup 3, actual role work 2; host role_finished measured 2.
+        raise TimeoutError('wall expired')
+    role.skillwriter = timeout
+    learner = make(clock=lambda: now[0])
+    row, ctx = project()
+    ctx['remaining']['wall_seconds'] = 5
+    receipts = []
+    learner.role_elapsed = lambda identity: receipts.append(identity) or 2.0
+    with pytest.raises(TimeoutError):
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert seen == [(160, 105)]
+    assert learner.state['operations'][ctx['operation_id']]['role_finished']['elapsed_seconds'] == 2
+    assert not learner.state['candidates']
+    with pytest.raises(RuntimeError, match='reconcile'):
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert receipts == [ctx['operation_id']]
+
+
+def test_parent_wall_exhausted_in_preparation_never_dispatches_role(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    now = [0.0]
+    learner = make(clock=lambda: now[0])
+    row, ctx = project()
+    ctx['remaining']['wall_seconds'] = 1
+    loader = learner.load_project
+    def prepare(row):
+        now[0] += 2
+        return loader(row)
+    learner.load_project = prepare
+    with pytest.raises(TimeoutError, match='before role dispatch'):
+        learner.skill_update(bundle, baseline, row, ctx)
+    assert role.calls == 0
+    assert learner.state['operations'][ctx['operation_id']]['not_dispatched']

@@ -246,6 +246,12 @@ class Learning:
     def skill_update(self, incumbent, memory_ref, row, ctx):
         if self.mode == Mode.PHASE1:
             return SnapshotUpdate(incumbent)
+        wall_started = self.clock()
+        remaining_wall = ctx['remaining'].get('wall_seconds')
+        if remaining_wall is not None:
+            if type(remaining_wall) not in (int, float) or not math.isfinite(remaining_wall) or remaining_wall < 0:
+                raise ValueError('remaining wall time must be finite nonnegative seconds')
+        parent_wall = None if remaining_wall is None else wall_started + remaining_wall
         identity = ctx['operation_id']
         request = dict(kind='skill', incumbent=incumbent, memory=memory_ref, row=row)
         cached = self._begin(identity, request)
@@ -317,12 +323,39 @@ class Learning:
         allowance = self.request_seconds if remaining is None else min(remaining, self.request_seconds)
         if allowance <= 0:
             raise TimeoutError('actor allocation exhausted')
-        proposal = self.roles.skillwriter(prompt + encoded, evidence,
-                                          deadline=self.clock() + allowance)
+        wall_deadline = self.clock() + self.request_seconds
+        if parent_wall is not None:
+            wall_deadline = min(wall_deadline, parent_wall)
+        operation['wall_deadline'] = wall_deadline
+        if wall_deadline <= self.clock():
+            operation['not_dispatched'] = True
+            self._save()
+            raise TimeoutError('parent wall allocation exhausted before role dispatch')
+        self._save()
+        try:
+            proposal = self.roles.skillwriter(prompt + encoded, evidence,
+                deadline=self.clock() + allowance, wall_deadline=wall_deadline)
+        except BaseException as exc:
+            operation['failure'] = type(exc).__name__
+            self._record_role_elapsed(identity)
+            raise
         proposal_ref = self.store.put_json(asdict(proposal))
-        operation = self.state['operations'][identity]
         operation['proposal'] = proposal_ref
         self._save()  # Retain provider output before reading host accounting.
+        elapsed = self._record_role_elapsed(identity)
+        if elapsed is None:
+            raise RuntimeError('accounting incomplete: role_finished receipt required; reconcile')
+        if elapsed > allowance or self.clock() >= wall_deadline:
+            operation['failure'] = 'TimeoutError'
+            self._save()
+            raise TimeoutError('actor or wall allocation exceeded; reconcile retained receipt')
+        return self.reconcile_proposal(identity, proposal_ref, elapsed)
+
+    def _record_role_elapsed(self, identity):
+        """Consume the scoped host receipt once on success, failure or timeout."""
+        operation = self.state['operations'][identity]
+        if 'role_finished' in operation:
+            return operation['role_finished']['elapsed_seconds']
         try:
             elapsed = self.role_elapsed(identity)
         except Exception:
@@ -330,12 +363,11 @@ class Learning:
         if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
             operation['accounting_incomplete'] = True
             self._save()
-            raise RuntimeError('accounting incomplete: role_finished receipt required; reconcile')
+            return None
         operation['role_finished'] = dict(operation_id=identity, elapsed_seconds=elapsed)
+        operation['accounting_incomplete'] = False
         self._save()
-        if elapsed > allowance:
-            raise TimeoutError('measured actor allocation exceeded; reconcile retained receipt')
-        return self.reconcile_proposal(identity, proposal_ref, elapsed)
+        return elapsed
 
     def reconcile_proposal(self, identity, proposal_ref, actor_seconds):
         SnapshotUpdate(proposal_ref, actor_seconds)  # validates elapsed accounting
