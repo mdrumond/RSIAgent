@@ -421,6 +421,26 @@ class WorkflowActor:
                     raise WorkflowError('actor action unavailable in this stage or readiness state')
                 validate(args, self.schemas[name])
                 if name == 'read_skill':
+                    # Optional empty sections from tool callers mean a full read.
+                    # Check model arguments before emitting any usage receipt;
+                    # storage, delivery and timing failures must still propagate.
+                    args = dict(args)
+                    if not args.get('section', '').strip():
+                        args.pop('section', None)
+                    error = None
+                    if args['name'] not in names:
+                        error = 'skill must be exposed before read'
+                    elif ('section' in args and args['section'] not in
+                          self.bundle.document(args['name']).sections):
+                        error = 'unknown skill section'
+                    if error is not None:
+                        if not self.recover_invalid_actions:
+                            raise ValueError(error)
+                        observation = dict(event='invalid-action', action=name,
+                                           error=error, accepted=False,
+                                           allowed=list(allowed))
+                        record('actor-invalid-action', observation)
+                        continue
                     text = self._timed('retrieval', lambda: usage.read(args['name'], args.get('section')))
                     receipt = usage.last_read_receipt
                     # A section read is genuine evidence, but does not replace the

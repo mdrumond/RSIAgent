@@ -4,7 +4,7 @@ import fcntl
 import json
 import os
 
-from rsi.configuration import _snapshot, validate_configuration
+from rsi.configuration import checked_snapshot
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
 from rsi.python_execution import atomic_json
 
@@ -12,12 +12,7 @@ from rsi.python_execution import atomic_json
 EDITABLE = {'prompts', 'phase1_projects', 'phase2_projects', 'project_configs', 'budgets', 'tuning'}
 
 
-def checked(snapshot):
-    validate_configuration(snapshot['payload'])
-    if _snapshot(snapshot['payload']) != snapshot:
-        raise ValueError('configuration revision integrity failure')
-    return copy.deepcopy(snapshot)
-
+checked = checked_snapshot
 
 def projects(config, mode, rows=None):
     rows = config['phase1_projects' if mode == Mode.PHASE1 else 'phase2_projects'] if rows is None else rows
