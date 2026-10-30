@@ -66,6 +66,14 @@ class InstanceServices:
         path = Path(value).expanduser()
         return (path if path.is_absolute() else self.root / path).resolve(strict=True)
 
+    def executable(self, value):
+        # Preserve venv interpreter symlink path: resolving changes sys.prefix.
+        path = Path(value).expanduser()
+        path = path if path.is_absolute() else self.root / path
+        if not path.is_file():
+            raise ValueError('configured executable does not exist')
+        return path.absolute()
+
     def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None):
         created = time.time()
         mode = Mode(mode)
@@ -205,8 +213,9 @@ class BoundCycle(TuningBindings):
                 self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
         try:
-            self.memory = services._memory(memory_root, self.binding['initial'].encode())
-            self.learning = self.make_learning(learning_path)
+            with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
+                self.memory = services._memory(memory_root, self.binding['initial'].encode())
+                self.learning = self.make_learning(learning_path)
             if self.learning.active is None:
                 self.learning.state['active'] = self.spec.baseline_skills
                 self.learning._save()
@@ -251,7 +260,7 @@ class BoundCycle(TuningBindings):
                 profile = direct_profile(identity)
                 if profile.model != provider['model']:
                     raise ValueError('registered role model mismatch')
-                self._roles = IsolatedRoles(str(self.services.path(self.config['roles_python'])),
+                self._roles = IsolatedRoles(str(self.services.executable(self.config['roles_python'])),
                     profile, observer=self.observe_role, environment=self.services.environment,
                     **self.config.get('roles', {}))
         return self._roles
@@ -584,7 +593,8 @@ class BoundCycle(TuningBindings):
                 return dict(decision='skipped', evidence_ref=ref)
             if not any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due') for e in events):
                 self.tuning_settings()
-                self.tuning_project(due) if due['kind'] == 'manual_tuning' else self.tuning_candidate(due)
+                self.tuning_project(due)
+
         return self.tuning.step()
 
     def run_project(self, operation_id):

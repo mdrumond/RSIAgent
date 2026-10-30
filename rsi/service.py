@@ -52,7 +52,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
                     cycle.reconcile()
                 except (ValueError, RuntimeError) as exc:
                     return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
-                                pending=cycle.scheduler.state['pending'])
+                                pending=cycle.scheduler.state['pending'], tuning_pending=cycle.tuning.state['pending'])
             cycle.scheduler.resume()
         def interrupt(*_args):
             if dispatching:
@@ -94,7 +94,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             emit(dict(event='cycle_suspended', cycle_id=cycle_id, error=str(exc)))
             return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
                         pending=cycle.scheduler.state['pending'],
-                        controller_pending=cycle.controller.state['pending'])
+                        controller_pending=cycle.controller.state['pending'], tuning_pending=cycle.tuning.state['pending'])
         raise
     except KeyboardInterrupt:
         # ProjectRunner/PythonExecution/IsolatedRoles have unwound and reaped first.
@@ -102,7 +102,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         emit(dict(event='cycle_stopped', cycle_id=cycle_id,
                   pending=cycle.scheduler.state['pending'], controller=cycle.controller.state['pending']))
         return dict(status='stopped', cycle_id=cycle_id, pending=cycle.scheduler.state['pending'],
-                    controller_pending=cycle.controller.state['pending'])
+                    controller_pending=cycle.controller.state['pending'], tuning_pending=cycle.tuning.state['pending'])
     finally:
         done.set()
         if monitor is not None:

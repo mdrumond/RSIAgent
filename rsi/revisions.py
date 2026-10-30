@@ -63,11 +63,12 @@ def recover(root, store, *, locked=False):
         history = root / 'revisions'
         history.mkdir(exist_ok=True)
         os.replace(journal, history / (transaction['reference'] + '.json'))
-        descriptor_sync = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor_sync)
-        finally:
-            os.close(descriptor_sync)
+        for directory in (root, history):
+            descriptor_sync = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor_sync)
+            finally:
+                os.close(descriptor_sync)
     finally:
         if descriptor is not None:
             os.close(descriptor)
