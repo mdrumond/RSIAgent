@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import fcntl
 import ctypes
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,12 +81,6 @@ def _machinery(root):
     machinery = root / 'machinery'
     if machinery.resolve() != machinery:
         raise ValueError('machinery directory must be the instance snapshot')
-    for relative, expected in manifest['files'].items():
-        if not relative.startswith('machinery/'):
-            continue
-        source = root / relative
-        if source.is_symlink() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
-            raise ValueError(f'pinned machinery integrity failure: {relative}')
     for relative in ('rsi/jobs.py', 'rsi/job_worker.py', 'rsi/services.py', 'rsi/service.py'):
         if f'machinery/{relative}' not in manifest['files']:
             raise ValueError('instance release lacks CLI job support; bootstrap an updated instance')
@@ -124,6 +117,10 @@ def start(instance, request):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('instance already has an owned running job') from None
+        from .instance_dispatch import launch_context
+        _, verified_source, interpreter, environment = launch_context(root, required=True)
+        if verified_source != machinery:
+            raise ValueError('job source changed during runtime selection')
         previous_jobs = list_jobs(root)
         superseded = {item['request'].get('previous_job') for item in previous_jobs}
         for previous in previous_jobs:
@@ -144,10 +141,10 @@ def start(instance, request):
         with (directory / f'{job_id}.log').open('ab', buffering=0) as output:
             try:
                 process = subprocess.Popen(
-                    [sys.executable, '-I', '-c', bootstrap, str(machinery),
+                    [interpreter, '-I', '-c', bootstrap, str(machinery),
                      str(root), job_id, str(lock)], cwd=machinery,
                     stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                    start_new_session=True, pass_fds=(lock,))
+                    start_new_session=True, pass_fds=(lock,), env=environment)
                 # Worker alone publishes state, avoiding parent/worker write races.
             except OSError as exc:
                 record.update(state='failed', error=str(exc))

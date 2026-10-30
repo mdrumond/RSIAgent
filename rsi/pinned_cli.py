@@ -1,6 +1,6 @@
 """Dispatch instance commands through that instance's immutable machinery."""
-import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,19 +12,15 @@ def dispatch(instance, argv):
     if 'machinery' not in manifest:
         # Configuration-only legacy records have no executable snapshot.
         return None
-    machinery = root / 'machinery'
-    if machinery.resolve() != machinery:
-        raise ValueError('pinned machinery directory changed')
-    if Path(__file__).resolve().parent.parent == machinery:
-        return None
-    for relative, expected in manifest['files'].items():
-        if relative.startswith('machinery/'):
-            path = root / relative
-            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                raise ValueError(f'pinned machinery integrity failure: {relative}')
+    from .instance_dispatch import launch_context, command_policy
+    required, repair = command_policy(argv)
+    root, machinery, interpreter, env = launch_context(root, required=required, repair=repair)
     if 'machinery/rsi/cli.py' not in manifest['files']:
         raise ValueError('instance does not include a CLI release')
+    if (Path(__file__).resolve().parent.parent == machinery and
+            interpreter == sys.executable and env.get('PATH') == os.environ.get('PATH')):
+        return None
     bootstrap = ('import sys; sys.path.insert(0, sys.argv.pop(1)); '
                  'from rsi.cli import main; raise SystemExit(main())')
-    return subprocess.run([sys.executable, '-I', '-c', bootstrap,
-                           str(machinery), *argv], cwd=Path.cwd()).returncode
+    return subprocess.run([interpreter, '-I', '-c', bootstrap,
+                           str(machinery), *argv], cwd=Path.cwd(), env=env).returncode
