@@ -127,17 +127,22 @@ class WorkflowActor:
     the controller checks consumption again before releasing the result. Its
     default interval covers host work; an executor owning transfer/compile/run
     intervals must set host_category=None and instrument every interval itself.
+    TEST/VALIDATION callbacks reserve one execution by default. Multi-command
+    callbacks reserve additional command IDs with Workflow.reserve_execution.
+    managed_executions=True delegates all command reservations to the callback;
+    production bindings must use the guarded backend for every actual command.
     emit must durably retain events. Exceptions preserve pending operations for
     explicit host reconciliation; no receipt is reconstructed or invented.
     """
     def __init__(self, workflow, bundle, session_factory, *, perform, preflight,
                  emit, source_snapshot=None, host_category='implementation', setup_timeout=60,
-                 evidence_tools=None, skill_reference=None):
+                 evidence_tools=None, skill_reference=None, managed_executions=False):
         self.workflow, self.bundle = workflow, bundle
         self.session_factory, self.session = session_factory, None
         self.perform, self.preflight, self.emit = perform, preflight, emit
         self.source_snapshot, self.host_category = source_snapshot, host_category
         self.setup_timeout = setup_timeout
+        self.managed_executions = managed_executions
         self.skill_reference = skill_reference or (lambda reference: reference)
         self.evidence_tools = dict(evidence_tools or {})
         if self.evidence_tools.keys() & (SCHEMAS.keys() | {'read_context', 'edit_source', 'snapshot'}):
@@ -289,6 +294,13 @@ class WorkflowActor:
                             or edit['sha256'] != source.sha256):
                         raise WorkflowError('source edit is unavailable or stale')
                 seconds = self._available()
+                if stage in (Stage.TEST, Stage.VALIDATION):
+                    if self.managed_executions:
+                        cap = flow.limits.execution_tries
+                        if cap is not None and flow.state['executions'] >= cap:
+                            raise WorkflowError('execution cap exhausted')
+                    elif not flow.reserve_execution(operation):
+                        raise WorkflowError('stage execution already reserved; reconcile before dispatch')
                 record('host-dispatch', {'timestamp': flow.clock()})
                 result = self._timed(self.host_category,
                     lambda: self.perform(stage, args, operation, seconds))

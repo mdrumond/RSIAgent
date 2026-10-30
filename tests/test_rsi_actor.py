@@ -28,10 +28,11 @@ class Session:
     def close(self): pass
 
 
-def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20):
+def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20,
+            execution_cap=20, managed_executions=False):
     clock, events = Clock(), []
     workflow = Workflow(tmp_path/'state.json', lambda *_: False, source_hash='project-v1',
-                        limits=BudgetLimits(actor_seconds=limit), clock=clock)
+                        limits=BudgetLimits(actor_seconds=limit, execution_tries=execution_cap), clock=clock)
     workflow.state['stage'] = stage.value
     workflow._save()
     session = Session(actions, clock)
@@ -44,7 +45,8 @@ def harness(tmp_path, actions, *, stage=Stage.TASK_CONSTRUCTION, limit=20):
         return StageResult()
     actor = WorkflowActor(workflow, builtin_bundle(), lambda: session,
                           perform=perform, preflight=lambda *_: StageResult(),
-                          emit=lambda kind, data: events.append((kind, data)))
+                          emit=lambda kind, data: events.append((kind, data)),
+                          managed_executions=managed_executions)
     return actor, workflow, session, called, clock, events
 
 
@@ -403,3 +405,82 @@ def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_p
     if with_context_read:
         assert context_reads[0]['record'] == hashlib.sha256(guide.encode()).hexdigest()
         assert context_reads[0]['bytes'] == 128
+
+
+@pytest.mark.parametrize('stage', [Stage.TEST, Stage.VALIDATION])
+@pytest.mark.parametrize('managed', [False, True])
+def test_exhausted_execution_cap_refuses_stage_callback(tmp_path, stage, managed):
+    actor, flow, _, called, _, events = harness(tmp_path, reads(stage)+[
+        ('perform', {'proposal':'run command'})], stage=stage, execution_cap=1,
+        managed_executions=managed)
+    flow.state['executions'] = 1
+    flow._save()
+    with pytest.raises(WorkflowError, match='execution cap'): actor.step({})
+    assert not called and flow.state['executions'] == 1
+    assert not any(kind == 'host-dispatch' for kind,_ in events)
+    assert len([data for kind,data in events if kind == 'skill-usage' and data['kind'] == 'read']) == len(reads(stage))
+
+
+@pytest.mark.parametrize('stage', [Stage.TEST, Stage.VALIDATION])
+def test_default_callback_reserves_one_execution(tmp_path, stage):
+    actor, flow, _, called, _, _ = harness(tmp_path, reads(stage)+[
+        ('perform', {'proposal':'run command'})], stage=stage, execution_cap=1)
+    actor.step({})
+    assert len(called) == 1 and flow.state['executions'] == 1
+    operation = flow.state['history'][-1]['evidence']['operation_id']
+    assert flow.state['execution_reservations'][operation]['stage_operation'] == operation
+
+
+def test_reads_without_admitted_perform_do_not_reserve_execution(tmp_path):
+    actor, flow, _, called, _, _ = harness(tmp_path, [reads(Stage.TEST)[-1],
+        ('perform', {'proposal':'skip step skill'})], stage=Stage.TEST)
+    with pytest.raises(WorkflowError, match='read every mapped skill'): actor.step({})
+    assert not called and flow.state['executions'] == 0
+    assert not flow.state.get('execution_reservations')
+
+
+@pytest.mark.parametrize('managed', [False, True])
+def test_disabled_execution_cap_allows_additional_work(tmp_path, managed):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'run command'})], stage=Stage.TEST, execution_cap=None,
+        managed_executions=managed)
+    flow.state['executions'] = 100
+    flow._save()
+    if managed:
+        def backend(stage, args, operation, seconds):
+            assert flow.reserve_execution(operation+':command')
+            return StageResult()
+        actor.perform = backend
+    actor.step({})
+    assert flow.state['executions'] == 101
+
+
+def test_managed_backend_reserves_commands_without_stage_double_count(tmp_path):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'compile test profile'})], stage=Stage.TEST,
+        execution_cap=3, managed_executions=True)
+    commands = []
+    def backend(stage, args, operation, seconds):
+        for command in ('compile', 'test', 'profile'):
+            command_id = operation+':'+command
+            assert flow.reserve_execution(command_id)
+            assert not flow.reserve_execution(command_id)  # retry cannot admit replay
+            commands.append(command_id)
+        return StageResult()
+    actor.perform = backend
+    actor.step({})
+    assert len(commands) == flow.state['executions'] == 3
+    assert set(flow.state['execution_reservations']) == set(commands)
+
+
+def test_default_multi_command_callback_reserves_additional_ids(tmp_path):
+    actor, flow, _, _, _, _ = harness(tmp_path, reads(Stage.TEST)+[
+        ('perform', {'proposal':'three commands'})], stage=Stage.TEST, execution_cap=3)
+    def callback(stage, args, operation, seconds):
+        assert flow.state['executions'] == 1
+        for suffix in ('extra-test', 'profile'):
+            assert flow.reserve_execution(operation+':'+suffix)
+        return StageResult()
+    actor.perform = callback
+    actor.step({})
+    assert flow.state['executions'] == len(flow.state['execution_reservations']) == 3
