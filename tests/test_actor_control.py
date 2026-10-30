@@ -90,12 +90,25 @@ def test_direct_actor_receives_feedback_and_resumes_without_repeating_action(can
             case.after_host = None
     case.after_host = stop_after_compile
     assert case.run().status == 'user-stopped'
-    compiled = case.calls.count('compile')
+    def compile_dispatches():
+        dispatches = [(row['reference'], case.runner.store.read_json(row['reference']))
+                      for row in case.runner.events if row['type'] == 'domain-dispatch']
+        return [(ref, row) for ref, row in dispatches if row['name'] == 'compile']
+    def identity(row):
+        return row['operation_id'], row['stage'], row['source_hash'], row['name']
+    completed = [case.runner.store.read_json(row['reference'])
+                 for row in case.runner.events if row['type'] == 'domain-result']
+    settled_refs = {row['dispatch_ref'] for row in completed
+                    if row['observed_terminal'] and row['status'] == 'complete'}
+    settled = {identity(row) for ref, row in compile_dispatches() if ref in settled_refs}
+    assert settled
     control.stop(False)
     control.send('second', 'submit after review')
     assert case.run(case.make_driver()).status == 'host-verified'
-    # A settled compile is retained; a numerical mismatch may legitimately recompile.
-    assert case.calls.count('compile') >= compiled
+    # Repaired source or later stages may compile; the settled operation cannot replay.
+    after = [identity(row) for _, row in compile_dispatches()]
+    assert all(after.count(key) == 1 for key in settled)
+    assert any(key not in settled for key in after)
     domain_views = [context['task']['domain'] for context in case.contexts]
     feedback = [row['content'] for view in domain_views for row in view['feedback']]
     assert 'inspect masks' in feedback and 'submit after review' in feedback

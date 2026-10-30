@@ -33,12 +33,15 @@ def test_pi_resume_uses_retained_conversation_and_requires_fresh_host_evidence(c
     assert case.run(actor).status == 'user-stopped'
     retained_source = case.actions.source
     retained_runs = case.calls.count('run')
+    context_boundary = len(case.contexts)
     control.stop(False)
     # Reconstruct the public driver; retained workflow and host checkpoint own recovery.
     result = case.run(case.make_driver('pi'))
     assert result.status == 'host-verified'
     assert case.calls.count('run') > retained_runs
-    assert any(context['source']['text'] == retained_source for context in case.contexts)
+    resumed_contexts = case.contexts[context_boundary:]
+    assert resumed_contexts
+    assert resumed_contexts[0]['source']['text'] == retained_source
     assert case.actions.latest.evidence.verified
     assert case.actions.source == case.session.repaired
 
