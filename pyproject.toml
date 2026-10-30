@@ -12,6 +12,9 @@ dynamic = ["optional-dependencies"]
 [project.scripts]
 rsi = "rsi.cli:main"
 
+[tool.setuptools]
+py-modules = ["run_a3kernels", "run_a3_phase1", "run_a5_baseline_archive", "run_a5_fireworks_sft", "run_a5kernels", "run_a5_phase1_adaptive", "run_a5_phase1", "run_a5_sft_experiment", "run_ale", "run_ascend_campaign", "run_ascend_subjects", "run_catlass_dsl_harness", "run_osworld"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rsi*", "core*", "coding*", "config*", "env*", "llm*", "optimizer*", "explore*", "benchmarks*", "dashboard*", "integrations*", "tools*"]
