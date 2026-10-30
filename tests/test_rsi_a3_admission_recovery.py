@@ -121,3 +121,34 @@ def test_source_admission_repairs_only_authentic_typed_validation(tmp_path,opera
         before=list(calls);raw=(root/'workflow.json').read_bytes()
         assert owner.run().status=='suspended'
         assert calls==before and (root/'workflow.json').read_bytes()==raw
+
+
+def test_observed_source_admission_failure_cannot_satisfy_passing_test(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from canonical_a3_fixtures import make_trial, A3Session
+    from test_a3_trial_loop import FakeCandidate, Resolver, SOURCE
+    from benchmarks.a3kernels.candidate import validate_candidate_source
+    from rsi.domain_bindings import A3Host
+    from rsi.contracts import Stage
+    calls=[]
+    class Candidate(FakeCandidate):
+        def compile(self,source,workdir,**options):
+            calls.append(source)
+            validate_candidate_source(source)
+            return super().compile(source,workdir,**options)
+    original=A3Host.execute
+    def wrong_passing_claim(self,stage,*args):
+        observation=original(self,stage,*args)
+        if stage==Stage.TEST and observation.passed is False:
+            return replace(observation,passed=True)
+        return observation
+    monkeypatch.setattr(A3Host,'execute',wrong_passing_claim)
+    malformed=SOURCE.replace('vector_add','wrong_signature')
+    owner,session=make_trial(tmp_path,candidate=Candidate(Resolver()),
+        session=A3Session(initial=malformed,repaired=SOURCE))
+    owner.canonical=official(owner,session)
+    result=owner.run()
+    state=json.loads((owner.workdir/'canonical/workflow.json').read_text())
+    assert result.status=='suspended' and state['pending']['stage']=='test'
+    assert calls==[malformed] and not owner.memory.read()
+    assert not any(row['evidence']['stage']=='test' for row in state['history'])
