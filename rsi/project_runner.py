@@ -99,9 +99,18 @@ class ProjectRunner:
             events=self.events, test_backend=test_backend)
         self.selected_file = self.config.editable_files[0]
         self._factory_attempted = False
+        self._session_closure_ref = None
         def tracked_factory():
             self._factory_attempted = True
-            return session_factory()
+            self._session_closure_ref = None
+            session = session_factory()  # A raising factory may have unknown partial effects.
+            original_close = getattr(session.close, '_rsi_original_close', session.close)
+            def observed_close():
+                original_close()
+                self._session_closure_ref = self._observe_session_close(session)
+            observed_close._rsi_original_close = original_close
+            session.close = observed_close
+            return session
         self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
@@ -131,7 +140,7 @@ class ProjectRunner:
                 row = self.store.read_json(reference)
                 pending = self.workflow.pending
                 proof = row['controller_proof']
-                return bool(proof.get('actor_closed') is True and proof.get('no_host_effects') is True
+                return bool(self._valid_controller_closure(pending, proof) and proof.get('no_host_effects') is True
                     and isinstance(proof.get('observation'), str) and proof['observation'].strip()
                     and pending and proof.get('handle') == pending['handle']
                     and pending['id'] == operation and row == dict(
@@ -143,7 +152,7 @@ class ProjectRunner:
         return self.service.resolve(kind, reference, stage, operation)
 
     def no_host_effects(self, operation):
-        unsafe = {'host-dispatch', 'host-result', 'stage-result', 'command-results'}
+        unsafe = {'host-dispatch', 'host-result', 'stage-result', 'command-results', 'query-dispatch'}
         return not (any(e.get('operation_id') == operation and e['type'] in unsafe
                         for e in self.events) or any(
             row.get('stage_operation') == operation for row in
@@ -152,23 +161,35 @@ class ProjectRunner:
             and self.store.read_json(e['reference'])['context']['operation'] == operation
             for e in self.events))
 
+    def _valid_controller_closure(self, pending, proof):
+        if not pending or proof.get('handle') != pending['handle']:
+            return False
+        if pending['handle'] is None:
+            if (proof.get('operation_id') != pending['id']
+                    or proof.get('no_actor_dispatched') is not True
+                    or any(e['type'] == 'actor-dispatch' and e.get('operation_id') == pending['id']
+                           for e in self.events)):
+                return False
+            return proof.get('actor_closed') is True or proof.get('actor_absent') is True
+        return proof.get('actor_closed') is True
+
     def record_admission_failure(self, operation, *, controller_proof, observed_source_hash):
         """Host-only API: attest observed terminal Pi closure, never an actor tool.
 
-        controller_proof must retain handle, actor_closed=True, no_host_effects=True,
-        and a nonempty observation describing the controller's closure evidence.
+        controller_proof must retain handle, observed closure, no_host_effects=True,
+        and a nonempty observation. Before dispatch, a None handle additionally
+        requires operation_id, no_actor_dispatched=True and actor_closed/actor_absent.
         Local receipts can veto that observation. This records proof only; call
         workflow.reject_operation(operation, returned_ref, observed_source_hash)
         explicitly to release pending state without refunding thinking/counts.
         """
         with self.event_lock:
             pending = self.workflow.pending
-            if (not pending or pending['id'] != operation or not pending['handle']
+            if (not pending or pending['id'] != operation
                     or self.actor.session is not None
                     or observed_source_hash != self.workflow.source_hash
                     or observed_source_hash != self.backend.project_hash()
-                    or controller_proof.get('handle') != pending['handle']
-                    or controller_proof.get('actor_closed') is not True
+                    or not self._valid_controller_closure(pending, controller_proof)
                     or controller_proof.get('no_host_effects') is not True
                     or not isinstance(controller_proof.get('observation'), str)
                     or not controller_proof['observation'].strip()
@@ -444,6 +465,25 @@ class ProjectRunner:
         elif actual != flow.source_hash:
             flow.source_changed(actual)
 
+    def _observe_session_close(self, session):
+        """Called only after this actual session's close returned successfully.
+
+        Wrapping the returned session preserves observations when actor setup
+        closes/clears its slot before propagating a readiness error to run().
+        A factory which raises before returning any session produces no proof.
+        """
+        known_pi = isinstance(session, PiSessionAdapter)
+        rpc = session.session.rpc if known_pi else None
+        absent = known_pi and rpc is None
+        closed = (rpc is not None and rpc.process.poll() is not None) if known_pi else self.service.test_backend
+        settled = session.session.gateway.finished.is_set() if known_pi else self.service.test_backend
+        pending = self.workflow.pending
+        return self._closure(dict(method='observed-session-close', actor_closed=closed,
+            actor_absent=absent, provider_settled=settled,
+            operation_id=pending['id'] if pending else None,
+            no_actor_dispatched=bool(pending and pending['handle'] is None),
+            observation='Owned session close returned; actual RPC exit/absence and provider settlement observed'))
+
     def _closure(self, observation):
         pending = self.workflow.pending
         dispatch = self.latest('actor-dispatch')
@@ -544,12 +584,13 @@ class ProjectRunner:
 
         The host must actually observe terminal Pi/provider closure and all query
         callbacks; merely reopening a runner is insufficient. Pending is retained.
+        A pre-dispatch None handle requires the explicit operation_id and
+        no_actor_dispatched=True plus observed actor closure or absence.
         """
         with self.event_lock:
             pending = self.workflow.pending
             if (not pending or self.actor.session is not None
-                    or controller_proof.get('handle') != pending['handle']
-                    or not pending['handle'] or controller_proof.get('actor_closed') is not True
+                    or not self._valid_controller_closure(pending, controller_proof)
                     or controller_proof.get('provider_settled') is not True
                     or not isinstance(controller_proof.get('observation'), str)
                     or not controller_proof['observation'].strip()
@@ -596,9 +637,11 @@ class ProjectRunner:
                     or self.store.read_json(outcome['workflow_state_ref']) != self.workflow.state):
                 raise WorkflowError('failed run/closure no longer matches current checkpoint')
             observed = closure['observation']
-            absent = (observed.get('method') == 'host-no-actor-dispatch'
+            pending = closure['pending']
+            absent = (observed.get('method') in ('host-no-actor-dispatch', 'observed-session-close', 'trusted-controller')
                 and observed.get('actor_absent') is True
-                and not any(e['type'] == 'actor-dispatch' for e in self.events))
+                and not any(e['type'] == 'actor-dispatch' and
+                    (pending is None or e.get('operation_id') == pending['id']) for e in self.events))
             if (not absent and observed.get('actor_closed') is not True
                     or observed.get('provider_settled') is not True):
                 raise WorkflowError('actor/provider closure was not observed')
@@ -635,17 +678,12 @@ class ProjectRunner:
             error = str(exc)
             status = 'budget_exhausted' if 'exhausted' in error else 'suspended'
         finally:
-            session = self.actor.session
             try:
                 self.actor.close()
-                if session is not None:
-                    known_pi = isinstance(session, PiSessionAdapter)
-                    rpc = session.session.rpc if known_pi else None
-                    closed = (rpc is None or rpc.process.poll() is not None) if known_pi else self.service.test_backend
-                    settled = session.session.gateway.finished.is_set() if known_pi else self.service.test_backend
-                    closure_ref = self._closure(dict(method='in-process-session-close',
-                        actor_closed=closed, provider_settled=settled,
-                        observation='Known live session close returned; actual RPC/provider terminal state observed'))
+                if self._session_closure_ref is not None:
+                    row = self.store.read_json(self._session_closure_ref)
+                    if row['pending'] == self.workflow.pending and row['stage'] == self.workflow.stage.value:
+                        closure_ref = self._session_closure_ref
                 elif (entry_pending is None and not self._factory_attempted
                         and not any(e['type'] == 'actor-dispatch' for e in self.events)
                         and not self.workflow.state.get('execution_reservations')
