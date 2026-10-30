@@ -269,7 +269,7 @@ class CycleScheduler:
                     or remaining['recovery_seconds'] is not None and remaining['recovery_seconds'] <= 0):
                 s['events'].append(dict(kind='recovery_exhausted', original_id=item['original_id']))
                 s['recovery_queue'].pop(0)
-                s['phase'] = 'recovery'
+                s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
                 self._save()
                 return None
             operation.update(spec=item['spec'], original_id=item['original_id'])
