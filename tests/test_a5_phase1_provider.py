@@ -417,8 +417,10 @@ def test_distillation_correction_is_bounded_and_does_not_rerun_actions(canonical
     assert learned.distillation is not None and len(requests) == 2
     original = requests[0]['messages']
     corrected = requests[1]['messages']
-    assert corrected[:len(original)] == original
-    assert corrected[len(original)] == dict(role='assistant', content='not-json')
+    assert corrected[:-3] == original[:-1]
+    assert corrected[-3] == dict(role='assistant', content='not-json')
+    # The current terminal contract stays pinned after correction feedback.
+    assert corrected[-1] == original[-1]
     assert len(corrected) == len(original) + 2
     assert corrected[-1]['role'] == 'user'
     assert case.calls == calls
