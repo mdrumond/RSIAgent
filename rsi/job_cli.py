@@ -76,6 +76,8 @@ def execute(args):
         if args.action == 'revisit':
             if args.cycle == request['cycle_id']:
                 raise ValueError('revisit requires a new cycle identity')
+            request.pop('origin_action', None)
+            request.pop('steering', None)
             request['previous_cycle'] = request['cycle_id']
             request['cycle_id'] = args.cycle
     if args.action in ('start', 'revisit'):

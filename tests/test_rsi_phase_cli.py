@@ -104,3 +104,17 @@ def test_phase1_explicit_parent_is_forwarded_without_restricting_source_mode(ins
         '--inheritance', 'parent', '--input-override', 'kdb']) == 0
     assert calls[-1]['from_cycle'] == 'accepted-inference'
     assert calls[-1]['inheritance'] == 'parent' and calls[-1]['input_overrides'] == ['kdb']
+
+
+def test_revisit_does_not_turn_later_resume_into_old_manual_tuning(instance, monkeypatch):
+    identity, request = previous(instance)
+    request.update(action='resume', origin_action='tune', steering={'user_guidance': 'old request'})
+    path = jobs._path(instance / 'runs/jobs', identity)
+    value = json.loads(path.read_text())
+    value['request'] = request
+    _publish(path, _bytes(value))
+    calls = []
+    monkeypatch.setattr(jobs, 'start', lambda root, request: calls.append(request) or {})
+    assert main(['--instance', str(instance), 'phase2', 'revisit', '--job', identity, '--cycle', 'new']) == 0
+    assert 'origin_action' not in calls[0] and 'steering' not in calls[0]
+    assert calls[0]['from_cycle'] == 'old' and calls[0]['inheritance'] == 'parent'
