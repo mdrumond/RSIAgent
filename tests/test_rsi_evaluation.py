@@ -1,5 +1,7 @@
 """Trusted comparisons execute canonical runners, never fabricate arm receipts."""
 from dataclasses import asdict, replace
+from pathlib import Path
+import sys
 
 import pytest
 
@@ -12,11 +14,10 @@ from test_rsi_project_runner import Session, make
 from test_rsi_learning import env
 
 
-def checkpoint(path, name, marker):
+def checkpoint(path, name, marker, **overrides):
     path.mkdir()
-    template, injected, database = make(path)
+    template, injected, database = make(path, **overrides)
     source = template.config.source
-    from pathlib import Path
     solution = Path(source) / 'solution.py'
     solution.write_text(solution.read_text() + '\n# ' + marker + '\n')
     runner = ProjectRunner.create(path / 'checkpoint',
@@ -25,13 +26,14 @@ def checkpoint(path, name, marker):
 
 
 @pytest.fixture
-def comparison(tmp_path, env):
+def comparison(tmp_path, env, request):
     store, _, incumbent, _, memory, _, make_learning, project = env
     learner = make_learning()
     row, ctx = project()
     candidate = learner.skill_update(incumbent, memory, row, ctx).reference
     training, _, training_db = checkpoint(tmp_path / 'training', 'training', 'training')
-    heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout')
+    heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout',
+        **getattr(request, 'param', {}))
     calls = []
     def factory(request, *, reopen):
         calls.append((request.arm, reopen))
@@ -234,3 +236,63 @@ def test_wave_end_coalesces_with_every_five_originals(tmp_path):
         assert set(events[0]['reasons']) == {'cadence', 'wave_end'}
     finally:
         scheduler.close()
+
+
+def test_real_admission_closure_remains_in_evidence_and_cost(comparison):
+    create, learner, _, store, _, _, _ = comparison
+    evaluation = create()
+    learner.validate = evaluation.validation
+    factory = evaluation.factory
+    charged = []
+    def with_closed_admission(request, *, reopen):
+        runner = factory(request, reopen=reopen)
+        if reopen:
+            return runner
+        normal_session = runner.actor.session_factory
+        execute = runner.run
+        def run():
+            runner.actor.session_factory = lambda: Session(missing_query=True)
+            interrupted = execute()
+            assert interrupted['status'] == 'suspended'
+            pending = runner.workflow.pending
+            proof = runner.record_admission_failure(pending['id'], controller_proof=dict(
+                handle=pending['handle'], actor_closed=True, no_host_effects=True,
+                observation='Controller observed closed scripted session before host dispatch'),
+                observed_source_hash=runner.workflow.source_hash)
+            runner.workflow.reject_operation(pending['id'], proof, runner.workflow.source_hash)
+            charged.append(runner.workflow.accounting.seconds())
+            runner.actor.session_factory = normal_session
+            return execute()
+        runner.run = run
+        return runner
+    evaluation.factory = with_closed_admission
+    result = finish(evaluation)
+    assert result['decision'] == 'benefit'
+    assert result['actor_seconds'] >= sum(charged) > 0
+    for pair_ref in result['pairs']:
+        for arm in store.read_json(pair_ref)['arms'].values():
+            history = store.read_json(arm['workflow_receipt'])['history']
+            closure = next(h for h in history if h.get('rejected_operation'))
+            assert 'evidence' not in closure
+            arm_store = ContentAddressedArtifacts(Path(arm['root']) / 'artifacts')
+            assert arm_store.read_json(closure['host_failure_ref'])['controller_proof']['actor_closed'] is True
+    assert evaluation.promote(learner) == evaluation.plan['candidate']
+
+
+@pytest.mark.parametrize('comparison', [dict(config_overrides=dict(
+    performance_seconds=1e-9, commands={
+        'compile': [sys.executable, '-m', 'py_compile', 'solution.py'],
+        'test': [sys.executable, '{verifier}'],
+        'validation': [sys.executable, '{verifier}'],
+        'timing': [sys.executable, 'solution.py']}))], indirect=True)
+def test_actual_correctness_pass_cannot_promote_performance_shortfall(comparison):
+    create, learner, _, store, _, _, _ = comparison
+    evaluation = create()
+    learner.validate = evaluation.validation
+    result = finish(evaluation)
+    candidate = store.read_json(result['pairs'][0])['arms']['candidate']
+    assert candidate['correctness'] is True
+    assert candidate['performance'] == 'shortfall'
+    assert result['decision'] == 'inconclusive'
+    assert learner.evaluate(evaluation.plan['candidate'], [result['evidence_ref']], 'forced-validation') == evaluation.plan['incumbent']
+    assert learner.active == evaluation.plan['incumbent']

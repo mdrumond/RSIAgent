@@ -149,7 +149,8 @@ class SkillEvaluation:
             scores = {}
             for arm, row in pair['arms'].items():
                 accepted = row['outcome'] == 'accepted'
-                history = self.store.read_json(row['workflow_receipt'])['history']
+                history = [h for h in self.store.read_json(row['workflow_receipt'])['history']
+                           if h.get('evidence')]
                 failures = [i for i, h in enumerate(history) if not h['passed'] and h['evidence']['stage']
                             in ('implementation', 'test', 'debug', 'optimisation')]
                 recovered = row['correctness'] is True and all(any(
