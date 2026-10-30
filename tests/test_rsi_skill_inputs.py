@@ -131,3 +131,22 @@ def test_capability_discovery_enables_implemented_editor_and_tuning_routes(basel
     capabilities = json.loads(capsys.readouterr().out)
     assert capabilities['manual_tuning'] and capabilities['skill_content_editing']
     assert capabilities['job_accounting']
+
+
+def test_resuming_manual_tuning_preserves_scope_and_durable_request_identity(baseline, monkeypatch):
+    import uuid
+    root, _ = baseline
+    from rsi import jobs
+    from rsi.configuration import _publish, _bytes
+    _, directory = jobs._directory(root)
+    identity = str(uuid.uuid4())
+    value = dict(job_id=identity, state='failed', process=None, configuration=show_configuration(root),
+        request=dict(action='tune', mode='phase2', cycle_id='application', request_id=identity,
+                     steering={'project_ref': 'retained', 'user_guidance': 'recover'}))
+    _publish(jobs._path(directory, identity), _bytes(value))
+    requests = []
+    monkeypatch.setattr(jobs, 'start', lambda instance, request: requests.append(request) or {})
+    assert main(['--instance', str(root), 'phase2', 'resume', '--job', identity]) == 0
+    assert requests[0]['request_id'] == identity
+    assert requests[0]['origin_action'] == 'tune'
+    assert requests[0]['cycle_id'] == 'application'

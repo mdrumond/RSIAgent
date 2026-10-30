@@ -33,11 +33,12 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     monitor = None
     previous = None
     dispatching = False
-    event_id = None
+    manual = action == 'tune' or action == 'resume' and request.get('origin_action') == 'tune'
+    event_id = request.get('request_id') if manual else None
     was_stopped = cycle.scheduler.state['stopped']
     def manual_result():
         receipt = cycle.scheduler.state.get('extension_receipts', {}).get(event_id)
-        if action != 'tune' or receipt is None:
+        if not manual or receipt is None:
             return None
         result = cycle.store.read_json(receipt['reference'])
         return dict(status='tuned', cycle_id=cycle_id, event_id=event_id,
@@ -62,6 +63,9 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             emit(dict(event='configuration_adopted', cycle_id=cycle_id, **result))
             return dict(status='adopted', cycle_id=cycle_id, **result)
         if action == 'resume':
+            if manual and not any(e.get('id') == event_id for e in cycle.scheduler.state['events']):
+                return dict(status='suspended', cycle_id=cycle_id,
+                    error='manual request has no retained admission; inspect before a new explicit request')
             # Retained work is observed first. No pending provider/host work is replayed.
             if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
                 try:
@@ -132,7 +136,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
         try:
-            if action == 'tune' and was_stopped:
+            if manual and was_stopped:
                 cycle.scheduler.stop()
         finally:
             cycle.close()

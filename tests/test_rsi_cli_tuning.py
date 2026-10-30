@@ -34,5 +34,8 @@ def test_manual_request_drains_actual_pair_restores_pause_and_is_idempotent(boun
     original_role_count = len(Roles.prompts)
     again = rsi.service.run_job(services.root, request, should_stop=lambda: False, emit=events.append)
     assert again == result
+    resumed = rsi.service.run_job(services.root, dict(request, action='resume', origin_action='tune'),
+        should_stop=lambda: False, emit=events.append)
+    assert resumed == result
     assert services.status('steered')['cycle.json']['spent'] == original_spent
     assert len(Roles.prompts) == original_role_count
