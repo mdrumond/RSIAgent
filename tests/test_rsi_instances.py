@@ -225,3 +225,32 @@ def test_file_url_repository_clone_is_pinned(tmp_path, inputs):
     assert git(clone, 'remote') == ''
     assert not (clone / '.git/objects/info/alternates').exists()
     assert not any('.git' in Path(name).parts for name in manifest['files'])
+
+
+def test_baseline_evidence_cas_references_survive_bootstrap(tmp_path, inputs):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    baseline = tmp_path / 'memory-baseline'
+    artifacts = ContentAddressedArtifacts(baseline / 'artifacts')
+    digest = artifacts.put_bytes(b'compiler error and numeric diagnosis')
+    (baseline / 'memory.json').write_text(json.dumps({'evidence_sha256': digest}))
+    for directory in ('logs', 'history', 'runs'):
+        (baseline / directory).mkdir()
+        (baseline / directory / 'evidence.txt').write_text('prior failure')
+    (baseline / 'logs/compile-journal').write_text('ordinary evidence, not SQLite')
+    (baseline / '.ssh').mkdir()
+    (baseline / '.ssh/id_rsa').write_text('private credential')
+    (baseline / '.cache').mkdir()
+    (baseline / '.cache/stale').write_text('cache')
+    original = {str(p.relative_to(baseline)): p.read_bytes()
+                for p in baseline.rglob('*') if p.is_file()}
+    create_instance(tmp_path / 'evidence-instance', **{**inputs, 'baseline_kdb': baseline})
+    copied = tmp_path / 'evidence-instance/memory/memory-baseline'
+    reference = json.loads((copied / 'memory.json').read_text())['evidence_sha256']
+    assert ContentAddressedArtifacts(copied / 'artifacts').read_bytes(reference) == artifacts.read_bytes(digest)
+    for directory in ('logs', 'history', 'runs'):
+        assert (copied / directory / 'evidence.txt').read_text() == 'prior failure'
+    assert (copied / 'logs/compile-journal').read_text() == 'ordinary evidence, not SQLite'
+    assert not (copied / '.ssh').exists()
+    assert not (copied / '.cache').exists()
+    assert original == {str(p.relative_to(baseline)): p.read_bytes()
+                        for p in baseline.rglob('*') if p.is_file()}

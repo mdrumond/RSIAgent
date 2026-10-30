@@ -23,17 +23,30 @@ import subprocess
 import tempfile
 
 
-_EXCLUDED = {
-    '.git', '.env', '.ssh', '.aws', '.agent-state', '.venv', 'venv',
-    '__pycache__', '.cache', '.pytest_cache', 'node_modules', 'runs',
-    'artifacts', 'logs', 'history', 'credentials', 'credentials.json',
-    '.credentials', 'secrets', 'secrets.json', 'secrets.yaml', '.codex', '.agents',
+_BASELINE_EXCLUDED = {
+    '.git', '.env', '.ssh', '.aws', '.venv', 'venv', '__pycache__',
+    '.cache', '.pytest_cache', 'node_modules', 'credentials', 'credentials.json',
+    '.credentials', 'secrets', 'secrets.json', 'secrets.yaml',
+}
+_RELEASE_EXCLUDED = _BASELINE_EXCLUDED | {
+    '.agent-state', '.codex', '.agents', 'runs', 'artifacts', 'logs', 'history',
 }
 
 
-def _allowed(path: Path) -> bool:
-    return not any(part in _EXCLUDED or part.startswith('.env.')
+def _allowed(path: Path, *, baseline=False) -> bool:
+    excluded = _BASELINE_EXCLUDED if baseline else _RELEASE_EXCLUDED
+    return not any(part in excluded or part.startswith('.env.')
                    or part.endswith(('.pem', '.key', '.pyc')) for part in path.parts)
+
+
+def _sqlite_sidecar(path: Path) -> bool:
+    for suffix in ('-wal', '-shm', '-journal'):
+        if path.name.endswith(suffix):
+            database = path.with_name(path.name[:-len(suffix)])
+            if database.is_file():
+                with database.open('rb') as stream:
+                    return stream.read(16) == b'SQLite format 3\x00'
+    return False
 
 
 def _git(root, *args):
@@ -64,11 +77,13 @@ def _copy_input(source: Path, destination: Path):
     destination.mkdir(parents=True)
     for path in sorted(source.rglob('*')):
         relative = path.relative_to(source)
-        if not _allowed(relative):
+        if not _allowed(relative, baseline=True):
             continue
         if path.is_symlink():
             raise ValueError(f'baseline symlink is unsupported: {relative}')
-        if path.is_file() and not path.name.endswith(('-wal', '-shm', '-journal')):
+        if path.is_dir():
+            (destination / relative).mkdir(parents=True, exist_ok=True)
+        elif path.is_file() and not _sqlite_sidecar(path):
             _copy_file(path, destination / relative)
 
 
