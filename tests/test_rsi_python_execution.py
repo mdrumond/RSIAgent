@@ -202,7 +202,7 @@ def test_generated_cache_does_not_invalidate_but_declared_inputs_do(tmp_path):
                         'Path(".pytest_cache/log").write_text("generated")\n'
                         'Path("output.log").write_text("run output")\n')
     runner = PythonExecution.snapshot(tmp_path / 'task', source, verifier,
-        commands={'test': [sys.executable, '{verifier}']})
+        commands={'test': [sys.executable, '{verifier}']}, generated_paths=['output.log'])
     runner.workflow = Workflow(tmp_path / 'state.json', lambda *a: True,
                                source_hash=runner.project_hash())
     original = runner.project_hash()
@@ -238,3 +238,154 @@ def test_partial_overlap_cannot_invent_execution_placement(tmp_path):
                    observed_execution_start=100., observed_execution_end=110.)
     assert workflow.accounting.seconds() == 20.
     assert workflow.accounting.receipts['receipt:compile']['placement'] == 'authoritative_host_interval'
+
+
+@pytest.mark.parametrize('stage', [Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION])
+def test_pending_edit_compile_check_then_complete_preserves_stage_identity(tmp_path, stage):
+    from rsi.contracts import StepEvidence
+    runner = backend(tmp_path)
+    flow = runner.workflow
+    flow.state['stage'] = stage.value
+    flow._save()
+    operation = flow.begin()
+    original = flow.source_hash
+    file = runner.read('solution.py')
+    changed = runner.edit('solution.py', 'import math\ndef stable_sum(xs):\n    return math.fsum(xs)\n',
+                          expected_file_hash=file['file_hash'], expected_project_hash=original)
+    for command in ('compile', 'test'):
+        result = runner.run(command + '-during-stage', command)
+        assert result['classification'] == 'passed'
+        assert result['source_hash'] == changed
+        assert result['stage_source_hash'] == original
+        assert result['stage_operation'] == operation
+        assert flow.source_hash == original
+    flow.complete(StepEvidence(stage, operation, source_hash=original, skill_refs=('read',),
+                               retrieval_refs=('query',), retrospective_ref='retro'),
+                  new_source_hash=changed)
+    assert flow.source_hash == changed
+    assert flow.pending is None
+    assert flow.verified_source is None
+
+
+def test_noneditable_and_new_inputs_invalidate_receipts_and_validation(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    for name, text in {'main.py': 'pass\n', 'helper.py': 'value = 1\n',
+                       'config.json': '{"value":1}'}.items():
+        (source / name).write_text(text)
+    verifier = tmp_path / 'verify.py'
+    verifier.write_text('pass\n')
+    runner = PythonExecution.snapshot(tmp_path / 'task', source, verifier,
+        commands={'test': [sys.executable, '{verifier}']}, editable_files=['main.py'],
+        generated_paths=['results'])
+    flow = runner.workflow = Workflow(tmp_path / 'state.json', lambda *a: True,
+                                      source_hash=runner.project_hash())
+    for index, name in enumerate(('helper.py', 'config.json', 'new_input.data')):
+        before = runner.project_hash()
+        receipt = runner.run(str(index), 'test')
+        assert receipt['classification'] == 'passed'
+        flow.state.update(stage=Stage.ACCEPTANCE.value, tested=before, verified=before)
+        flow._save()
+        with pytest.raises(ValueError):
+            runner.edit(name, 'changed', expected_file_hash=None, expected_project_hash=before)
+        (runner.project / name).write_text('changed')
+        assert runner.project_hash() != before
+        with pytest.raises(WorkflowError):
+            runner.run(str(index), 'test')
+        runner.sync_source()
+        assert flow.verified_source is None
+        assert flow.stage == Stage.TEST
+    before = runner.project_hash()
+    (runner.project / 'results').mkdir()
+    (runner.project / 'results' / 'output.json').write_text('{"timing":1}')
+    assert runner.project_hash() == before
+
+
+def test_interrupt_reaps_owned_child_and_retains_charged_receipt(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import time
+    runner = backend(tmp_path)
+    original = subprocess.Popen
+    owned = []
+
+    class InterruptOnce(original):
+        interrupted = False
+
+        def communicate(self, *args, **kwargs):
+            if not self.interrupted:
+                self.interrupted = True
+                # Let the real sleep process execute before cancellation.
+                time.sleep(.08)
+                owned.append(self)
+                raise KeyboardInterrupt('user stop')
+            return super().communicate(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', InterruptOnce)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run('cancelled', 'slow')
+    assert len(owned) == 1
+    assert owned[0].poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(owned[0].pid, 0)
+    receipt = runner.receipt('cancelled')
+    assert receipt['classification'] == 'interrupted'
+    assert receipt['elapsed'] >= .08
+    assert runner.workflow.accounting.seconds('execution') >= .08
+    assert runner.run('cancelled', 'slow') == receipt
+    assert runner.workflow.state['executions'] == 1
+    assert len(owned) == 1
+
+
+def test_minimal_installed_wheel_executes_cpu_backend(tmp_path):
+    import subprocess
+    import venv
+    repository = Path(__file__).resolve().parents[1]
+    wheels = tmp_path / 'wheels'
+    build = subprocess.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps',
+                            '--no-build-isolation', '--no-index', '--wheel-dir', str(wheels),
+                            str(repository)], capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    environment = tmp_path / 'venv'
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / 'bin/python'
+    wheel, = wheels.glob('rsi-*.whl')
+    site = subprocess.check_output([str(python), '-I', '-c',
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])'], text=True).strip()
+    install = subprocess.run([str(python), '-m', 'pip', '--isolated', 'install',
+        '--no-deps', '--no-index', '--ignore-installed', '--target', site, str(wheel)],
+        capture_output=True, text=True)
+    assert install.returncode == 0, install.stdout + install.stderr
+    proof = r'''
+import json, sys
+from pathlib import Path
+from rsi.python_execution import PythonExecution
+from rsi.runtime import Workflow
+try:
+    import requests
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError('minimal environment unexpectedly has requests')
+root = Path.cwd()
+source = root / 'input'
+source.mkdir()
+(source / 'solution.py').write_text('def stable_sum(xs):\n    total = 0.0\n    for x in xs:\n        total += x\n    return total\n')
+verifier = root / 'verify.py'
+verifier.write_text('from decimal import Decimal\nfrom solution import stable_sum\nxs = [1e16, 1., -1e16]\nexpected = float(sum(map(Decimal.from_float, xs), Decimal(0)))\nassert stable_sum(xs) == expected\n')
+runner = PythonExecution.snapshot(root / 'task', source, verifier,
+    commands={'test': [sys.executable, '{verifier}']})
+runner.workflow = Workflow(root / 'workflow.json', lambda *a: True, source_hash=runner.project_hash())
+failed = runner.numeric('minimal-wheel-bug')
+assert failed['classification'] == 'numeric_failure', failed
+file = runner.read('solution.py')
+runner.edit('solution.py', 'import math\ndef stable_sum(xs):\n    return math.fsum(xs)\n',
+            expected_file_hash=file['file_hash'], expected_project_hash=file['project_hash'])
+result = runner.numeric('minimal-wheel-repair')
+assert result['classification'] == 'passed', result
+print(json.dumps({'classification': result['classification'], 'tries': runner.workflow.state['executions']}))
+'''
+    run = subprocess.run([str(python), '-I', '-c', proof], cwd=tmp_path,
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert json.loads(run.stdout) == {'classification': 'passed', 'tries': 2}

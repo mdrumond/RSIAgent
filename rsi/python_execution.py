@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from core.artifacts import ContentAddressedArtifacts
 from rsi.contracts import Stage
 from rsi.runtime import WorkflowError
 
@@ -129,7 +129,8 @@ class PythonExecution:
         self.contract = self.store.read_json(self.manifest['contract'])
 
     @classmethod
-    def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None, editable_files=None):
+    def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None, editable_files=None,
+                 generated_paths=()):
         root, source, verifier = Path(root).absolute(), Path(source).resolve(), Path(verifier).resolve()
         if root.exists() or root.resolve().is_relative_to(source):
             raise ValueError('task must be new and outside the input folder')
@@ -150,15 +151,22 @@ class PythonExecution:
         if any(path.is_symlink() for path in source.rglob('*')):
             raise ValueError('snapshot inputs must not contain symlinks')
         verifier_name = verifier.relative_to(source).as_posix() if verifier.is_relative_to(source) else None
-        if editable_files is None:
-            editable_files = [p.relative_to(source).as_posix() for p in source.rglob('*')
-                              if p.is_file() and not any(part in {'.git', '__pycache__', '.pytest_cache'}
-                                                        for part in p.relative_to(source).parts)
-                              and p.relative_to(source).as_posix() != verifier_name]
-        editable_files = sorted(set(editable_files))
+        generated_paths = sorted(set(generated_paths))
+        for name in generated_paths:
+            if not name or Path(name).is_absolute() or '..' in Path(name).parts or name == '.':
+                raise ValueError('generated paths must be explicit project-relative paths')
+        def generated(name):
+            return (any(part in {'__pycache__', '.pytest_cache'} for part in Path(name).parts)
+                    or any(name == item or name.startswith(item.rstrip('/') + '/')
+                           for item in generated_paths))
+        execution_inputs = sorted(p.relative_to(source).as_posix() for p in source.rglob('*')
+                                  if p.is_file() and '.git' not in p.relative_to(source).parts
+                                  and p.relative_to(source).as_posix() != verifier_name
+                                  and not generated(p.relative_to(source).as_posix()))
+        editable_files = execution_inputs if editable_files is None else sorted(set(editable_files))
         for name in editable_files:
             if (not name or Path(name).is_absolute() or '..' in Path(name).parts
-                    or name == verifier_name):
+                    or name == verifier_name or generated(name)):
                 raise ValueError('invalid editable file manifest')
         root.mkdir(parents=True)
         try:
@@ -170,7 +178,9 @@ class PythonExecution:
             (root / 'receipts').mkdir()
             store = ContentAddressedArtifacts(root / 'artifacts')
             contract = dict(commands={key: list(value) for key, value in commands.items()},
-                            editable_files=editable_files, verifier=digest(verifier.read_bytes()),
+                            editable_files=editable_files, execution_inputs=execution_inputs,
+                            generated_paths=generated_paths, verifier_name=verifier_name,
+                            verifier=digest(verifier.read_bytes()),
                             performance_seconds=performance_seconds)
             atomic_json(root / 'manifest.json', {'contract': store.put_json(contract)})
             return cls(root)
@@ -180,7 +190,19 @@ class PythonExecution:
 
     def project_hash(self):
         entries = []
-        for name in self.contract['editable_files']:
+        names = set(self.contract.get('execution_inputs', self.contract['editable_files']))
+        names.update(self.contract['editable_files'])
+        # New code/data counts too. Only explicitly generated outputs and narrow
+        # interpreter/test caches may be ignored; edit rights are independent.
+        for path in self.project.rglob('*'):
+            name = path.relative_to(self.project).as_posix()
+            if (any(part in {'__pycache__', '.pytest_cache'} for part in Path(name).parts)
+                    or any(name == item or name.startswith(item.rstrip('/') + '/')
+                           for item in self.contract.get('generated_paths', ()))):
+                continue
+            if path.is_file() or path.is_symlink():
+                names.add(name)
+        for name in sorted(names):
             path = self._file(name)
             entries.append([name, digest(path.read_bytes()) if path.is_file() else None])
         return digest(json.dumps(entries, separators=(',', ':')).encode())
@@ -188,12 +210,14 @@ class PythonExecution:
     def sync_source(self):
         current = self.project_hash()
         if self.workflow and current != self.workflow.source_hash:
-            self.workflow.source_changed(current)
+            if not (self.workflow.pending and self.workflow.stage in
+                    (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)):
+                self.workflow.source_changed(current)
         return current
 
     def _file(self, name):
-        if name not in self.contract['editable_files']:
-            raise ValueError('file is not in the frozen editable manifest')
+        if name == self.contract.get('verifier_name'):
+            raise ValueError('frozen verifier is outside editable project')
         path = self.project / name
         if Path(name).is_absolute() or '..' in Path(name).parts or not name:
             raise ValueError('file must be inside editable project')
@@ -206,6 +230,8 @@ class PythonExecution:
         return dict(content=data.decode(), file_hash=digest(data), project_hash=self.project_hash())
 
     def edit(self, name, content, *, expected_file_hash, expected_project_hash):
+        if name not in self.contract['editable_files']:
+            raise ValueError('file is not in the frozen editable manifest')
         path = self._file(name)
         actual = digest(path.read_bytes()) if path.exists() else None
         if actual != expected_file_hash or self.project_hash() != expected_project_hash:
@@ -271,7 +297,9 @@ class PythonExecution:
         env = dict(os.environ, PYTHONPATH=str(self.project),
                    PYTHONPYCACHEPREFIX=str(self.root / 'cache'))
         record = dict(operation_id=operation, source_hash=source_hash, command=command,
-                      argv=argv, status='pending', category=category, numeric=numeric, profiling=profile)
+                      argv=argv, status='pending', category=category, numeric=numeric, profiling=profile,
+                      stage_source_hash=self.workflow.source_hash,
+                      stage_operation=self.workflow.pending['id'] if self.workflow.pending else None)
         if not self.workflow.reserve_execution(operation):
             raise WorkflowError('reserved command has no receipt; reconcile before dispatch')
         self._save(operation, record)
@@ -280,6 +308,7 @@ class PythonExecution:
         self._save(operation, record)
         started = time.monotonic()
         process, timed_out, stdout, stderr, returncode = None, False, b'', b'', None
+        interrupted = None
         try:
             process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, start_new_session=True)
@@ -298,6 +327,17 @@ class PythonExecution:
             returncode = process.returncode
         except OSError as exc:
             stderr = str(exc).encode()
+        except BaseException as exc:
+            interrupted = exc
+            # Only this live Popen instance establishes process-group ownership.
+            # Never act on a persisted PID after restart.
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+                returncode = process.returncode
         finally:
             elapsed = time.monotonic() - started
             # Producer elapsed is authoritative, never a subtraction of wall epochs.
@@ -310,7 +350,7 @@ class PythonExecution:
             # Composition must reconcile pending Workflow source edits itself.
             if not self.workflow.pending:
                 self.workflow.source_changed(current)
-        classification = ('timeout' if timed_out else 'source_changed' if current != source_hash
+        classification = ('interrupted' if interrupted else 'timeout' if timed_out else 'source_changed' if current != source_hash
                           else ('compile_failure' if command == 'compile' else
                                 'numeric_failure' if numeric else 'execution_failure')
                           if returncode != 0 else 'passed')
@@ -325,4 +365,6 @@ class PythonExecution:
             result['profile'] = self.store.put_bytes(profile_path.read_bytes())
         artifact = self.store.put_json(result)
         self._save(operation, dict(status='complete', artifact=artifact))
+        if interrupted is not None:
+            raise interrupted
         return result

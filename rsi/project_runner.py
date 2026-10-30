@@ -96,7 +96,7 @@ class ProjectRunner:
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
         # Always use the durable authority, including skill reads on the live path.
         self.workflow.resolver = self.resolve
 
@@ -185,33 +185,85 @@ class ProjectRunner:
                 retrospective_ref=STRING, skill_refs={'type': 'array', 'items': STRING},
                 decisions={'type': 'array', 'items': decision})),
             'read_project_file': obj({'path': STRING}),
+            'request_redesign': obj({'reason': STRING}),
             'optimisation_decision': obj(dict(action={'type': 'string',
                 'enum': ['noop', 'edit', 'profile']}, reason=STRING)),
         }
         scopes = {'select_strategy': (Stage.DESIGN, Stage.OPTIMISATION),
-                  'optimisation_decision': (Stage.OPTIMISATION,)}
+                  'optimisation_decision': (Stage.OPTIMISATION,),
+                  'request_redesign': (Stage.DEBUG, Stage.VALIDATION)}
         return {name: EvidenceTool(schema, lambda stage, args, op, seconds, name=name:
             self.tool(name, stage, args, op), stages=scopes.get(name))
             for name, schema in definitions.items()}
 
     def tool(self, name, stage, args, operation):
+        read_error = False
         if name == 'query_kdb':
             ref = self.service.query(args)
         elif name == 'retrospect':
             ref = self.service.retrospect(**args)
         elif name == 'select_strategy':
             ref = self.service.select(**args)
+        elif name == 'request_redesign':
+            if (stage not in (Stage.DEBUG, Stage.VALIDATION) or stage != self.workflow.stage
+                    or not self.workflow.pending or self.workflow.pending['id'] != operation
+                    or not args['reason'].strip()):
+                raise WorkflowError('redesign requires current debug/validation operation and reason')
+            ref = self.store.put_json(dict(reason=args['reason'], operation_id=operation,
+                stage=stage.value, source_hash=self.workflow.source_hash, contract_ref=self.contract_ref))
         elif name == 'read_project_file':
-            row = self.backend.read(args['path'])
-            self.selected_file = args['path']
-            ref = self.store.put_json(dict(path=self.selected_file, **row))
+            try:
+                row = self.backend.read(args['path'])
+            except (FileNotFoundError, ValueError) as exc:
+                read_error = True
+                ref = self.store.put_json(dict(status='error', path=args['path'],
+                    error_type=type(exc).__name__, message=str(exc),
+                    editable_files=list(self.config.editable_files),
+                    hint='Choose a project path; KDB citation paths are not project files.'))
+            else:
+                self.selected_file = args['path']
+                ref = self.store.put_json(dict(path=self.selected_file, **row))
         else:
             if stage != Stage.OPTIMISATION or not args['reason'].strip():
                 raise WorkflowError('reasoned optimisation decision requires optimisation stage')
             ref = self.store.put_json(args)
         self.append(dict(type='project-tool', operation_id=operation, stage=stage.value,
-                         name=name, reference=ref))
-        return dict(reference=ref, evidence=self.store.read_json(ref))
+                         name=name, reference=ref, status='error' if read_error else 'ok'))
+        evidence = self.store.read_json(ref)
+        return dict(reference=ref, evidence=evidence, summary=self.evidence_summary(name, ref, evidence),
+                    status='error' if read_error else 'ok')
+
+    def evidence_summary(self, name, reference, record):
+        """Small actual inventory for the actor's always-visible receipt index.
+
+        Full CAS records stay in result.evidence for existing context paging;
+        these summaries never stand in for considering the retained row content.
+        """
+        pending, stage = self.workflow.pending, self.workflow.stage
+        summary = dict(tool=name, reference=reference, stage=stage.value,
+            operation_id=pending['id'] if pending else None,
+            host_perform_ready=bool(pending and self.perform_ready(stage, pending['id'])),
+            mapped_skill_reads_required=list(self.bundle.skills_for(stage)))
+        if name == 'query_kdb':
+            payload = record['payload']
+            response = payload['response']
+            groups = ('results', 'negative_records')
+            summary.update(query_ref=reference, query=payload['request']['query'],
+                counts={group: len(response[group]) for group in groups},
+                decision_indexes={group: list(range(len(response[group]))) for group in groups},
+                requirements='Select with query_ref, retrospective_ref, mapped skill_refs; '
+                    'every group/index needs used/rejected and reason; negative used needs redirection.')
+        elif name == 'retrospect':
+            payload = record['payload']
+            summary.update(retrospective_ref=reference, history_count=len(payload['history']),
+                failure_indexes=payload['failures'], redirection_indexes=payload['redirections'],
+                requirements='Use this operation-scoped retrospective_ref in select_strategy.')
+        elif name == 'select_strategy':
+            payload = record['payload']
+            summary.update(selection_ref=reference, query_ref=payload['query_ref'],
+                retrospective_ref=payload['retrospective_ref'], decision_count=len(payload['decisions']),
+                requirements='Selection recorded; optimisation also needs optimisation_decision before perform.')
+        return summary
 
     def latest(self, kind, operation=None):
         return next((e for e in reversed(self.events) if e['type'] == kind and
@@ -296,6 +348,24 @@ class ProjectRunner:
                 passed = False
                 break
         with self.charged_host():
+            redesign = False
+            cap = self.workflow.limits.implementation_iterations
+            design_cap = self.workflow.limits.design_iterations
+            if (stage == Stage.DEBUG and self.workflow.state['tested'] != self.workflow.source_hash
+                    and cap is not None and self.workflow.state['implementation'] >= cap
+                    and (design_cap is None or self.workflow.state['design'] < design_cap)):
+                self.tool('request_redesign', stage, dict(reason=
+                    'Implementation iteration cap reached; revise design using retained failures'), operation)
+            request = next((e for e in reversed(self.events) if e['type'] == 'project-tool'
+                and e['operation_id'] == operation and e['name'] == 'request_redesign'), None)
+            if request:
+                proof = self.store.read_json(request['reference'])
+                if (stage not in (Stage.DEBUG, Stage.VALIDATION) or proof['stage'] != stage.value
+                        or proof['operation_id'] != operation or proof['source_hash'] != self.workflow.source_hash
+                        or proof['contract_ref'] != self.contract_ref or not proof['reason'].strip()):
+                    raise WorkflowError('redesign request scope mismatch')
+                refs.append(request['reference'])
+                redesign = True
             if stage == Stage.TASK_CONSTRUCTION:
                 refs.append(self.contract_ref)  # Already frozen before any model actions.
             if stage == Stage.ACCEPTANCE:
@@ -304,18 +374,22 @@ class ProjectRunner:
                     raise WorkflowError('acceptance requires fresh validation evidence')
                 passed = validation['correctness'] and validation['performance'] != 'shortfall'
             if stage == Stage.VALIDATION:
+                correctness = any(r['command'] == 'validation' and r['classification'] == 'passed'
+                                  for r in receipts)
+                performance = ('shortfall' if any(r['classification'] == 'performance_shortfall'
+                    for r in receipts) else ('met' if any(r['command'] == 'timing'
+                    and r['classification'] == 'passed' for r in receipts) else 'not_measured')
+                    if self.config.performance_seconds else 'not_requested')
+                passed = passed and correctness and performance in ('met', 'not_requested')
                 self.append(dict(type='validation-results', operation_id=operation,
-                    source_hash=self.backend.project_hash(), correctness=passed,
-                    performance='shortfall' if any(r['classification'] == 'performance_shortfall'
-                        for r in receipts) else ('met' if any(r['command'] == 'timing' and r['classification'] == 'passed'
-                        for r in receipts) else 'not_measured') if self.config.performance_seconds
-                        else 'not_requested'))
+                    source_hash=self.backend.project_hash(), correctness=correctness,
+                    performance=performance))
             if receipts:
                 self.append(dict(type='command-results', operation_id=operation, receipts=receipts))
             return self.result(operation, StageResult(passed=passed, artifact_refs=tuple(refs),
                 retrieval_refs=(selection['query_ref'],) if selection else (),
                 retrospective_ref=selection['retrospective_ref'] if selection else None,
-                new_source_hash=changed))
+                new_source_hash=changed, redesign=redesign))
 
     def context(self):
         last = self.latest('command-results')
@@ -326,9 +400,12 @@ class ProjectRunner:
                 stderr=self.store.read_bytes(row['stderr']).decode(errors='replace')))
         return dict(project=self.spec.to_dict(), contract=self.contract_ref,
             editable_files=list(self.config.editable_files), feedback=feedback,
+            iterations={k: self.workflow.state[k] for k in ('design', 'implementation')},
+            last_validation=self.latest('validation-results'),
             strategy_protocol='Read mapped skills; query_kdb and retrospect; select_strategy '
                 'with every result decision; perform matching proposal. Optimisation also '
-                'requires optimisation_decision. Use read_project_file to select editable source.')
+                'requires optimisation_decision. Use read_project_file to select editable source. '
+                'In debug/validation request_redesign(reason) revisits design with fresh evidence.')
 
     def reconcile(self):
         flow = self.workflow
