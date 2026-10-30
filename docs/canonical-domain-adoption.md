@@ -98,3 +98,41 @@ phase scopes. They pause only their own enclosing operation interval; another
 concurrent billable interval remains charged by the canonical union clock.
 Historical transport evidence and independent bounded transport wall guards are
 preserved. No remote-device validation is implied by these source adapters.
+
+## Observed native failure/export and rehydration
+
+Domain contract v2 persists its existing CAS location relative to the task.
+DomainActivity retains a scoped dispatch intent before host work and a typed
+result/accounting receipt only after its actual callback observation. A returned
+pending/running/unknown status is not completion: it suspends the same operation
+and retains timing uncertainty. Exceptions remain unobserved unless the host
+explicitly guarantees a synchronous local source-edit failure. No new store or
+actor loop is introduced.
+
+DomainRunner's host-neutral completed-effects adapter validates real native
+reservations/results, target/provider/KDB/skill/budget identity, retrieval
+completion and elapsed intervals. The existing parent terminal_failure_proof and
+trusted terminal observation APIs consume that adapter, preserving pending stage
+and source evidence. Unknown remote work and unresolved timing cannot gain a
+terminal failure proof or export admission.
+
+The shared evidence_io.export_task recognizes domain tasks and uses a read-only
+normalized input adapter. The same existing serializer and evidence/SFT schema
+retain raw CAS bytes and event order. The input view declares a domain contract,
+not fabricated Python commands or an invented verifier. Original immutable CAS
+objects are linked into temporary export staging (copied only across filesystems)
+and never modified. No second logical evidence database is created.
+
+Host snapshots retain typed, host-owned compilation/verification/final-run/profile
+outcomes, source bytes, cases and provenance. The codec supports registered native
+dataclasses/enums and validates derived fields on reconstruction; it never uses
+pickle, evaluates repr strings, or runs candidate source. Accepted checkpoints
+must remain current-source verified. Fresh wrappers restore those actual CAS
+outcomes and return retained public results without another provider/compiler/run
+or duplicate memory publication. Existing native journal records are checked
+before committing memory. Old checkpoints lacking reconstructible typed native
+outcomes require explicit migration; success is never inferred from text alone.
+
+Failed preflight and task construction are terminal rejections in the shared
+Workflow. They retain their failed-stage evidence and host admission failure;
+they do not fabricate an Acceptance stage or retry unbounded excluded setup.

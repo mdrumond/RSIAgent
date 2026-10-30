@@ -8,6 +8,20 @@ from rsi.contracts import Stage
 import rsi.domain_bindings as bindings
 
 
+@pytest.fixture(autouse=True)
+def declared_cpu_fixture_backend(monkeypatch):
+    # These unit models/hosts are scripted CPU fixtures, never production evidence.
+    from rsi.domain_execution import DomainRunner
+    original = DomainRunner.create.__func__
+    original_init = DomainRunner.__init__
+    def init(self, *args, **kwargs):
+        return original_init(self, *args, **dict(kwargs, test_backend=True))
+    monkeypatch.setattr(DomainRunner, '__init__', init)
+    def create(cls, *args, **kwargs):
+        return original(cls, *args, **dict(kwargs, test_backend=True))
+    monkeypatch.setattr(DomainRunner, 'create', classmethod(create))
+
+
 class CanonicalSession:
     def __init__(self, *, initial='bad', repaired='fixed source'):
         self.initial, self.repaired, self.contexts = initial, repaired, []
@@ -202,3 +216,110 @@ def test_default_a3_trial_preserves_typed_host_verification_and_memory(tmp_path,
     presented = [json.loads(context['task']['domain']['instruction']) for context in session.contexts]
     assert all(row['source_contract'] == CANDIDATE_SOURCE_CONTRACT.as_dict() for row in presented)
     assert {context['stage'] for context in session.contexts} == {s.value for s in Stage if s != Stage.PREFLIGHT}
+
+
+def test_native_checkpoint_codec_preserves_derived_graph_and_typed_compile_result(tmp_path):
+    from test_a5_phase1_adaptive_actor import SourceBackend, _request
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from rsi.domain_checkpoint import encode, decode
+    executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'host.jsonl'))
+    request=_request(tmp_path,executor)
+    compiled=executor.compile(request.spec,'fixed source')
+    restored=decode(encode(compiled))
+    assert type(restored) is type(compiled)
+    assert restored.prepared.spec.graph.output_shape == compiled.prepared.spec.graph.output_shape
+    assert restored == compiled
+
+
+def test_fresh_a3_trial_returns_retained_native_result_without_target_or_duplicate_memory(tmp_path,monkeypatch):
+    from benchmarks.a3kernels.trial import A3TrialLoop
+    result, session, original=canonical_a3_fixture(tmp_path,monkeypatch)
+    before=original.memory.read()
+    class ForbiddenCandidate:
+        def compile(self,*args,**kwargs):
+            pytest.fail('accepted native compilation reran')
+        def run(self,*args,**kwargs):
+            pytest.fail('accepted native verification reran')
+    class ForbiddenSession:
+        completion_tokens=0
+        def prepare(self,*args,**kwargs):
+            pytest.fail('accepted native provider setup reran')
+        def close(self):
+            pass
+    fresh=A3TrialLoop(cell=original.cell,proposal=original.proposal,profile=original.profile,
+        actor=SimpleNamespace(session=ForbiddenSession(),close=lambda:None),candidate=ForbiddenCandidate(),
+        knowledge=original.knowledge,profiler=original.profiler,evidence=original.evidence,
+        memory=original.memory,workdir=original.workdir)
+    resumed=fresh.run()
+    assert resumed == result and resumed.verified.passed
+    assert original.memory.read() == before
+
+
+def test_fresh_kernel_actions_restore_verified_native_cas_without_reexecution(tmp_path,monkeypatch):
+    from test_a5_phase1_adaptive_actor import SourceBackend, _request
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.phase1_adaptive_actor import _ProjectActions, AdaptiveActionResult
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.trial import parse_trial_action
+    backend=SourceBackend()
+    executor=ProjectExecutor(backend,EvidenceLedger(tmp_path/'host.jsonl'))
+    request=_request(tmp_path,executor)
+    store=ContentAddressedArtifacts(request.branch_root/'artifacts')
+    def knowledge(*_):
+        return AdaptiveActionResult(dict(available=True,results=[]))
+    def actions():
+        return _ProjectActions(executor,request,executor.prepare(request.spec),store,
+            max_actions=40,max_seconds=500,max_source_bytes=128000,query_knowledge=knowledge,
+            request_profile=lambda *_:None,request_timing=lambda *_:None)
+    monkeypatch.setattr(bindings,'PiSessionAdapter',lambda **_:CanonicalSession())
+    driver=DirectActorDriver(DirectCompletionProvider({'OPENAI_API_KEY':'TEST','DEEPSEEK_API_KEY':'TEST'}))
+    inputs=dict(profile=direct_profile(MODEL_IDENTITIES[0]),workspace=tmp_path/'actor',context=None,turn_parser=parse_trial_action)
+    first=driver('frozen native task',action_executor=actions(),**inputs)
+    assert first.status=='host-verified'
+    before=(len(backend.requests),len(backend.run_requests))
+    fresh_actions=actions()
+    assert fresh_actions.latest is None and fresh_actions.source is None
+    monkeypatch.setattr(bindings,'PiSessionAdapter',lambda **_:pytest.fail('accepted actor reran'))
+    second=driver('frozen native task',action_executor=fresh_actions,**inputs)
+    assert second.status=='host-verified' and fresh_actions.latest.evidence.verified
+    assert fresh_actions.source=='fixed source'
+    assert before==(len(backend.requests),len(backend.run_requests))
+
+
+def test_failed_native_kernel_exports_actual_domain_receipts_with_pending_stage_intact(tmp_path,monkeypatch):
+    from test_a5_phase1_adaptive_actor import SourceBackend, _request
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.phase1_adaptive_actor import _ProjectActions, AdaptiveActionResult
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.trial import parse_trial_action
+    from rsi.evidence_io import export_task
+    executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'host.jsonl'))
+    request=_request(tmp_path,executor)
+    actions=_ProjectActions(executor,request,executor.prepare(request.spec),
+        ContentAddressedArtifacts(request.branch_root/'artifacts'),max_actions=40,max_seconds=500,
+        max_source_bytes=128000,query_knowledge=lambda *_:AdaptiveActionResult(dict(available=True,results=[])),
+        request_profile=lambda *_:None,request_timing=lambda *_:None)
+    class FailedSession(CanonicalSession):
+        def next_action(self,context,allowed,**kwargs):
+            if context['stage']=='debug':
+                raise ValueError('CPU fixture terminal malformed repair proposal')
+            return super().next_action(context,allowed,**kwargs)
+    monkeypatch.setattr(bindings,'PiSessionAdapter',lambda **_:FailedSession())
+    driver=DirectActorDriver(DirectCompletionProvider({'OPENAI_API_KEY':'TEST','DEEPSEEK_API_KEY':'TEST'}))
+    failed=driver('frozen native negative task',profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=tmp_path/'actor',context=None,turn_parser=parse_trial_action,action_executor=actions)
+    runner=failed.continuation.runner
+    before=dict(runner.workflow.pending)
+    proof=runner.terminal_failure_proof()
+    assert proof['failed_stage']=='debug' and len(proof['command_receipts'])==2
+    assert proof['pending']==before and proof['correctness'] is None
+    export=export_task(runner.root,tmp_path/'native-dataset')
+    assert export['task_contract']==runner.contract_ref
+    assert runner.workflow.pending==before and actions.latest.evidence.verified is False

@@ -28,6 +28,20 @@ class Host:
         self.calls, self.verified = [], None
         self.manifest = {'original': 'preserved'}
 
+    def activity_observed_terminal(self, name, value):
+        return True  # This fixture performs synchronous local CPU work only.
+
+    def accepted_checkpoint_valid(self):
+        return self.verified is True
+
+    def checkpoint(self):
+        return dict(source=self.source, verified=self.verified, calls=self.calls)
+
+    def restore_checkpoint(self, snapshot, sources):
+        if self.source != snapshot['source'] and not getattr(self, 'allow_restore', False):
+            raise WorkflowError('CPU host source differs from observed checkpoint')
+        self.source, self.verified, self.calls = snapshot['source'], snapshot['verified'], snapshot['calls']
+
     def project_hash(self):
         return sha256(self.source.encode()).hexdigest()
 
@@ -245,3 +259,126 @@ def test_required_performance_cannot_be_accepted_without_measurement(tmp_path):
     assert result['status'] != 'accepted'
     assert not runner.workflow.outcome
     assert result['correctness'] is True and result['performance'] == 'not_measured'
+
+
+def test_failed_native_packet_and_shared_export_do_not_require_python_manifest(tmp_path):
+    from rsi.evidence_io import export_task
+    runner, host, session, _, _ = make(tmp_path)
+    original = session.next_action
+    def malformed(context, allowed, **options):
+        if context['stage'] == 'debug':
+            raise ValueError('CPU fixture observed ordinary invalid host proposal')
+        return original(context, allowed, **options)
+    session.next_action = malformed
+    result = runner.run()
+    assert result['status'] == 'suspended'
+    pending = dict(runner.workflow.pending)
+    proof = runner.terminal_failure_proof()
+    assert proof['failed_stage'] == 'debug'
+    assert proof['pending'] == pending and proof['replay_allowed'] is False
+    assert proof['command_receipts'] and proof['actor_seconds_total'] > 0
+    assert not (runner.root/'manifest.json').exists()
+    manifest = export_task(runner.root, tmp_path/'native-export')
+    assert manifest['task_contract'] == runner.contract_ref
+    assert runner.workflow.pending == pending
+    records = [__import__('json').loads(row) for row in (tmp_path/'native-export'/'evidence.jsonl').read_text().splitlines()]
+    assert any(row['kind']=='event' and row['data']['type']=='domain-result' for row in records)
+    assert any(row['kind']=='artifact' and row['id']==proof['accounting_snapshot'] for row in records)
+
+
+def test_fresh_native_wrapper_rehydrates_accepted_state_without_any_actor_or_host_call(tmp_path):
+    runner, host, _, _, injections = make(tmp_path)
+    assert runner.run()['status'] == 'accepted'
+    prior_seconds = runner.workflow.accounting.seconds()
+    prior_counts = runner.workflow.state['executions']
+    fresh = Host(tmp_path, host.clock)
+    fresh.allow_restore = True
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('accepted checkpoint reran actor/target work')
+    fresh.execute = forbidden
+    resumed = DomainRunner(runner.root, fresh, **dict(injections, session_factory=forbidden))
+    assert fresh.verified is True and fresh.source == 'stable'
+    assert resumed.run()['status'] == 'accepted'
+    assert resumed.workflow.state['executions'] == prior_counts
+    assert resumed.workflow.accounting.seconds() == prior_seconds
+
+
+def test_unobserved_native_activity_cannot_produce_failure_proof_or_export(tmp_path):
+    from rsi.evidence_io import export_task
+    runner, host, _, _, _ = make(tmp_path)
+    original = host.execute
+    def lost(stage, args, operation, activity):
+        if stage == Stage.TEST:
+            activity.run('unknown-host-job','execution',lambda _: {'status':'running','handle':'CPU-UNKNOWN'},execution=True)
+            raise ValueError('observation lost')
+        return original(stage,args,operation,activity)
+    host.execute = lost
+    assert runner.run()['status'] == 'suspended'
+    with pytest.raises(WorkflowError):
+        runner.terminal_failure_proof()
+    with pytest.raises(WorkflowError):
+        export_task(runner.root,tmp_path/'unsafe-export')
+    assert not (tmp_path/'unsafe-export').exists()
+
+
+def test_corrupt_native_receipt_or_identity_cannot_gain_terminal_authority(tmp_path):
+    runner, host, session, _, _ = make(tmp_path)
+    original = session.next_action
+    def fail(context, allowed, **kwargs):
+        if context['stage'] == 'debug':
+            raise ValueError('terminal local proposal error')
+        return original(context,allowed,**kwargs)
+    session.next_action = fail
+    runner.run()
+    assert runner.terminal_failure_proof()['outcome'] == 'failed'
+    host.identity = dict(host.identity, target='different CPU identity')
+    with pytest.raises(WorkflowError):
+        runner.terminal_failure_proof()
+
+
+@pytest.mark.parametrize('failed_stage', [Stage.PREFLIGHT, Stage.TASK_CONSTRUCTION])
+def test_failed_admission_is_terminal_even_with_zero_clock_and_all_caps_disabled(tmp_path, failed_stage):
+    clock = Clock()
+    host = Host(tmp_path, clock)
+    calls = []
+    def preflight(context):
+        calls.append(Stage.PREFLIGHT)
+        return failed_stage != Stage.PREFLIGHT
+    host.preflight = preflight
+    original = host.execute
+    def perform(stage,args,operation,activity):
+        calls.append(stage)
+        if stage == failed_stage:
+            return DomainObservation(False)
+        return original(stage,args,operation,activity)
+    host.execute = perform
+    class ZeroClockSession(Session):
+        def prepare(self, timeout, *, schemas):
+            self.schemas = schemas
+        def next_action(self,*args,**kwargs):
+            before = clock.value
+            result = super().next_action(*args,**kwargs)
+            clock.value = before
+            return result
+    session = ZeroClockSession(clock)
+    factories=[]
+    def factory():
+        factories.append(True)
+        return session
+    spec = ProjectSpec('admission','frozen admission',('CPU-host',),budgets=BudgetLimits(
+        design_iterations=None,implementation_iterations=None,execution_tries=None,actor_seconds=None,wall_seconds=None))
+    runner=DomainRunner.create(tmp_path/'task',spec,builtin_bundle(),host,
+        query=lambda _: pytest.fail('admission queried development knowledge'),backend_identity='TEST-admission',
+        session_factory=factory,test_backend=True,clock=clock)
+    result=runner.run()
+    assert result['status']=='rejected' and result['stage']==failed_stage.value
+    assert calls.count(failed_stage)==1 and runner.workflow.pending is None
+    assert runner.workflow.accounting.seconds()==0
+    assert not any(row['evidence']['stage']=='acceptance' for row in result['history'])
+    failure=runner.workflow.state['failure']
+    assert failure['stage']==failed_stage.value and failure['reason'] and failure['artifact_refs']
+    assert all(row['evidence']['skill_refs'] for row in result['history'])
+    if failed_stage==Stage.PREFLIGHT:
+        assert factories==[] and session.calls==0
+    else:
+        assert len(factories)==1 and session.calls==len(builtin_bundle().skills_for(failed_stage))+1

@@ -45,6 +45,37 @@ def unpack_query(raw, store, provenance, negatives):
 class SourceHost:
     editable_files = ('kernel',)
 
+    checkpoint_fields = ('source', 'feedback', 'observations')
+
+    def checkpoint(self):
+        return dict(adapter=type(self).__name__, fields={name:getattr(self,name,None) for name in self.checkpoint_fields})
+
+    def restore_checkpoint(self, snapshot, sources):
+        if snapshot is None or snapshot['adapter'] != type(self).__name__:
+            raise WorkflowError('native host checkpoint adapter differs')
+        expected = sources[self.editable_files[0]]
+        if snapshot['fields']['source'] != expected:
+            raise WorkflowError('native retained source bytes differ from typed checkpoint')
+        if self.source != expected and (not hasattr(self,'source_path') or self.source_path.exists()):
+            raise WorkflowError('native source changed outside retained checkpoint')
+        if hasattr(self,'source_path') and not self.source_path.exists():
+            self.source_path.parent.mkdir(parents=True,exist_ok=True)
+            self.source_path.write_text(expected)
+        if set(snapshot['fields']) != set(self.checkpoint_fields):
+            raise WorkflowError('native checkpoint field contract differs')
+        for name,value in snapshot['fields'].items():
+            setattr(self,name,value)
+
+    def activity_exception_terminal(self, name, error):
+        # Source edits are synchronous local writes, never compiler/job dispatch.
+        return name == 'edit' and isinstance(error, (ValueError, OSError))
+
+    def activity_observed_terminal(self, name, value):
+        # These adapters own synchronous observed-result host interfaces.
+        # Exceptions stay unresolved in DomainActivity; A3 overrides ambiguous
+        # FailedEvidence returns below. No model output establishes closure.
+        return True
+
     def project_hash(self):
         return sha256(self.source.encode()).hexdigest()
 
@@ -104,6 +135,47 @@ class KernelActionsHost(SourceHost):
             memory=sha256(memory).hexdigest(), verifier=fingerprint(str(
                 getattr(self.actions, 'prepared', inputs.get('context')))))
 
+    def checkpoint(self):
+        target = self.actions
+        while 'observe' in vars(target) and 'actions' in vars(target):
+            target = target.actions
+        names = ('source','source_sha256','latest','latest_source_sha256','admitted','citations',
+                 'host_facts','observed_failures','latest_run_at','last_compile_source_sha256','actions','metered_actions') if self.adaptive else (
+                 'latest_run','final_run','final_profile','total_actions','actions','compile_probes','admitted_artifacts')
+        return dict(adapter='kernel', adaptive=self.adaptive, source=self.source,
+            fields={name:getattr(target,name,None) for name in names},
+            feedback=self.feedback, observations=self.observations)
+
+    def restore_checkpoint(self, snapshot, sources):
+        if snapshot is None or snapshot['adapter'] != 'kernel' or snapshot['adaptive'] != self.adaptive:
+            raise WorkflowError('kernel checkpoint adapter differs')
+        expected = sources[self.editable_files[0]]
+        if snapshot['source'] != expected:
+            raise WorkflowError('kernel checkpoint source bytes differ')
+        target = self.actions
+        while 'observe' in vars(target) and 'actions' in vars(target):
+            target = target.actions
+        if self.source != expected:
+            if self.adaptive and target.source is not None:
+                raise WorkflowError('kernel source changed outside checkpoint')
+            if not self.adaptive:
+                from benchmarks.a5kernels.trial import _SOURCE_PATHS
+                path = target.workspace / _SOURCE_PATHS[target.language]
+                if path.exists():
+                    raise WorkflowError('kernel source changed outside checkpoint')
+                path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_text(expected)
+        latest = snapshot['fields'].get('latest')
+        if latest is not None:
+            from rsi.domain_checkpoint import encode
+            if encode(latest.prepared) != encode(target.prepared):
+                raise WorkflowError('kernel prepared oracle/cases changed on resume')
+        if set(snapshot['fields']) != set(self.checkpoint()['fields']):
+            raise WorkflowError('kernel checkpoint field contract differs')
+        for name,value in snapshot['fields'].items():
+            setattr(target,name,value)
+        self.feedback, self.observations = snapshot['feedback'], snapshot['observations']
+
     @property
     def source(self):
         if self.adaptive:
@@ -123,6 +195,12 @@ class KernelActionsHost(SourceHost):
         raw = json.loads(outcome.observation)
         self.observations.append(dict(action=name, observation=raw))
         return outcome, raw.get('host', raw)
+
+    def accepted_checkpoint_valid(self):
+        if not self.verified():
+            return False
+        return self.adaptive or bool(self.actions.final_run and self.actions.final_run.verified.passed
+            and self.actions.final_run.candidate_source_sha256 == sha256(self.source.encode()).hexdigest())
 
     def preflight(self, context):
         if self.adaptive:
@@ -299,6 +377,34 @@ class A3Host(SourceHost):
             memory=fingerprint(dict(cell=owner.memory.cell_id, lineage=owner.memory.lineage_id)),
             verifier=fingerprint(dict(proposal=asdict(owner.proposal), parameters=dict(owner.proposal.parameters))))
 
+    checkpoint_fields = SourceHost.checkpoint_fields + ('compilation','verified','profile','timing',
+        'queries','actions','failures','failure_classification','interpretation')
+
+    def checkpoint(self):
+        result = super().checkpoint()
+        callback = getattr(self.owner.candidate,'checkpoint_state',None)
+        result['candidate_state'] = callback() if callback else None
+        return result
+
+    def restore_checkpoint(self, snapshot, sources):
+        super().restore_checkpoint(snapshot,sources)
+        if snapshot.get('candidate_state') is not None:
+            callback = getattr(self.owner.candidate,'restore_checkpoint_state',None)
+            if callback is None:
+                raise WorkflowError('native candidate checkpoint adapter is unavailable')
+            callback(snapshot['candidate_state'])
+
+    def accepted_checkpoint_valid(self):
+        from benchmarks.a3kernels.phase1_protocol import VerifiedResult
+        return bool(isinstance(self.verified, VerifiedResult) and self.verified.passed and
+            self.owner._submit_gate(self.source,self.compilation,self.verified,self.profile) is None)
+
+    def activity_observed_terminal(self, name, value):
+        from benchmarks.a3kernels.phase1_protocol import FailedEvidence
+        from benchmarks.a3kernels.trial import infrastructure_unavailable
+        return not (isinstance(value, FailedEvidence) and (
+            infrastructure_unavailable(value) or self.owner._retryable_failure(name, value)))
+
     def write(self, text):
         if not text.strip():
             raise ValueError('candidate source must not be empty')
@@ -427,9 +533,12 @@ def a3_adoption():
             memory = ProjectMemory(owner.proposal, owner.proposal.project_id, owner.cell.cell_id,
                 owner.memory.lineage_id, host.verified.source_fingerprint, tuple(host.actions), tuple(facts),
                 (AgentInterpretation(host.interpretation, ()),))
-            entry_ref = owner.memory.append(memory)['entry_sha256']
-            owner.evidence.append(EvidenceKind.RESULT, owner._identity(dict(verified=host.verified,
-                                                                          memory_entry_sha256=entry_ref)))
+            existing = next((entry for entry in owner.memory.read() if entry['memory'] == memory.as_dict()), None)
+            entry_ref = (existing or owner.memory.append(memory))['entry_sha256']
+            if not any(e.kind == EvidenceKind.RESULT.value and e.payload.get('memory_entry_sha256') == entry_ref
+                       for e in owner.evidence.entries):
+                owner.evidence.append(EvidenceKind.RESULT, owner._identity(dict(verified=host.verified,
+                                                                              memory_entry_sha256=entry_ref)))
         from benchmarks.a3kernels.phase1_protocol import VerifiedResult
         return TrialResult('passed' if result['status'] == 'accepted' else
             host.failure_classification or result['status'], len(result['history']),
@@ -471,6 +580,13 @@ class OptimizerHost(SourceHost):
         self.identity = dict(target=fingerprint(getattr(owner.backend, 'identity', type(owner.backend).__qualname__)),
             provider=owner.agent.identity, kdb=fingerprint(dict(config=self.submission.get('config'),
                 available=owner.knowledge is not None)), memory=fingerprint(snapshot), verifier=fingerprint(owner._spec(self.submission)))
+
+    checkpoint_fields = SourceHost.checkpoint_fields + ('spec','baseline','evaluation','value')
+
+    def accepted_checkpoint_valid(self):
+        from optimizer.loop import score
+        actual = score(self.baseline, self.evaluation) if self.evaluation is not None else None
+        return actual is not None and actual == self.value
 
     def write(self, text):
         value = json.loads(text)

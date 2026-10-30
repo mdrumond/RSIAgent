@@ -168,6 +168,21 @@ class _RecordingCandidate:
         self.backend, self.store = backend, store
         self.verified: dict[str, VerifiedResult] = {}
 
+    def checkpoint_state(self):
+        callback = getattr(self.backend, 'checkpoint_state', None)
+        return dict(verified=dict(self.verified), backend=callback() if callback else None)
+
+    def restore_checkpoint_state(self, state):
+        if any(not isinstance(result, VerifiedResult) or not result.passed or key != result.execution_id
+               for key,result in state['verified'].items()):
+            raise ValueError('retained candidate verification cache differs')
+        if state['backend'] is not None:
+            callback = getattr(self.backend, 'restore_checkpoint_state', None)
+            if callback is None:
+                raise ValueError('candidate backend checkpoint adapter is unavailable')
+            callback(state['backend'])
+        self.verified = dict(state['verified'])
+
     def compile(self, source, workdir, **options):
         result = self.backend.compile(source, workdir, **options)
         if isinstance(result, CandidateCompilation):
@@ -219,6 +234,14 @@ class _RecoveryCandidate:
     def __init__(self, backend, policy: ProjectRuntimePolicy) -> None:
         self.backend, self.policy = backend, policy
         self.observed = False
+
+    def checkpoint_state(self):
+        return dict(policy=self.policy, observed=self.observed)
+
+    def restore_checkpoint_state(self, state):
+        if state['policy'] != self.policy or type(state['observed']) is not bool:
+            raise ValueError('retained recovery policy checkpoint differs')
+        self.observed = state['observed']
 
     def compile(self, source, workdir, **options):
         recovery = self.policy.recovery

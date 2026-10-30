@@ -7,9 +7,11 @@ No target commands, remote transports or KDB implementation are introduced.
 """
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 from threading import RLock
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Protocol
 
@@ -79,23 +81,51 @@ class DomainActivity:
             key = self.operation + ':' + name
             if not flow.reserve_execution(key):
                 raise WorkflowError('domain operation already reserved; observe before resuming')
+        activity = uuid.uuid4().hex
+        dispatch = dict(kind='rsi-domain-dispatch-v1', activity_id=activity,
+            operation_id=self.operation, stage=flow.stage.value, name=name, category=category,
+            execution=execution, reservation=self.operation+':'+name if execution else None,
+            contract_ref=self.runner.contract_ref, identity=self.runner.checked_identity(self.runner.backend),
+            backend_identity=self.runner.service.backend_identity, test_backend=self.runner.service.test_backend,
+            source_hash=self.runner.backend.project_hash(), remaining=flow.remaining())
+        dispatch_ref = self.runner.store.put_json(dispatch)
         self.runner.append(dict(type='domain-dispatch', operation_id=self.operation,
-            name=name, category=category, execution=execution))
+            activity_id=activity, reference=dispatch_ref))
         from rsi.domain_timing import CURRENT
         scope = dict(flow=flow, category=category, token=flow.accounting.start(category))
         context = CURRENT.set(scope)
+        from rsi.domain_checkpoint import encode, has_pending_result
+        def finish(value, status, terminal):
+            flow.accounting.end(scope['token'])
+            receipt = dict(kind='rsi-domain-result-v1', activity_id=activity, dispatch_ref=dispatch_ref,
+                operation_id=self.operation, stage=flow.stage.value, contract_ref=self.runner.contract_ref,
+                source_hash=self.runner.backend.project_hash(), observed_terminal=terminal, status=status,
+                result=encode(value), accounting_ref=self.runner.store.put_json(flow.state['intervals']))
+            self.runner.append(dict(type='domain-result', operation_id=self.operation,
+                activity_id=activity, reference=self.runner.store.put_json(receipt)))
+            self.runner.capture_checkpoint(self.operation, scope='activity')
         try:
             value = callback(seconds)
-        except BaseException:
-            flow.accounting.unresolved.add(scope['token'])
-            # An exception does not prove a remote operation stopped. Keep the
-            # interval unresolved until this host observes authoritative closure.
-            self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
-                name=name, interval=scope['token']))
+        except BaseException as error:
+            terminal = isinstance(error, Exception) and getattr(self.runner.backend,
+                'activity_exception_terminal', lambda *_: False)(name, error) is True
+            if terminal:
+                finish(dict(error_type=type(error).__name__, message=str(error)), 'failed', True)
+            else:
+                flow.accounting.unresolved.add(scope['token'])
+                self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
+                    name=name, activity_id=activity, interval=scope['token']))
             raise
         finally:
             CURRENT.reset(context)
-        flow.accounting.end(scope['token'])
+        terminal = not has_pending_result(value) and (not execution or getattr(self.runner.backend,
+            'activity_observed_terminal', lambda *_: False)(name, value) is True)
+        finish(value, 'complete' if terminal else 'unobserved', terminal)
+        if not terminal:
+            flow.state['timing_uncertainties'][activity] = dict(
+                reason='native activity has no authoritative terminal observation', dispatch_ref=dispatch_ref)
+            flow._save()
+            raise WorkflowError('native activity remains unobserved; observe original dispatch before recovery')
         if execution:
             self.executions.append(name)
         self.runner.actor._available()
@@ -126,11 +156,12 @@ class DomainRunner(ProjectRunner):
         if (root / 'domain.json').exists():
             raise FileExistsError('domain task already exists; reopen the same task')
         identity = cls.checked_identity(host)
-        frozen = dict(spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
+        frozen = dict(kind='rsi-domain-contract-v2', test_backend=injections.get('test_backend', False),
+            spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
             backend_identity=injections['backend_identity'], created=injections.get('clock', time.time)())
         reference = host.store.put_json(frozen)
         root.mkdir(parents=True, exist_ok=True)
-        atomic_json(root / 'domain.json', dict(contract=reference))
+        atomic_json(root / 'domain.json', dict(contract=reference, store_root=os.path.relpath(host.store.root.resolve(), root.resolve())))
         return cls(root, host, **injections)
 
     @staticmethod
@@ -161,8 +192,15 @@ class DomainRunner(ProjectRunner):
         self.event_lock, self.event_path = RLock(), self.root / 'events.json'
         self.event_refs = json.loads(self.event_path.read_text()) if self.event_path.exists() else []
         self.events = [self.store.read_json(ref) for ref in self.event_refs]
-        self.workflow = Workflow(self.root / 'workflow.json', self.resolve,
-            source_hash=host.project_hash(), limits=self.spec.budgets, clock=clock)
+        if frozen.get('kind') == 'rsi-domain-contract-v2' and frozen['test_backend'] != test_backend:
+            raise CanonicalConfigurationError('domain test/production backend changed on resume')
+        state_path = self.root / 'workflow.json'
+        persisted = json.loads(state_path.read_text()) if state_path.exists() else None
+        if persisted and persisted['limits'] != frozen['spec']['budgets']:
+            raise WorkflowError('native persisted budget differs from frozen allocation')
+        self.restore_checkpoint(host, persisted)
+        self.workflow = Workflow(state_path, self.resolve,
+            source_hash=persisted['source'] if persisted else host.project_hash(), limits=self.spec.budgets, clock=clock)
         self.workflow.state['created'] = frozen['created']
         self.workflow._save()
         self.service = StrategyEvidence(self.store, self.append, lambda: self.workflow.state,
@@ -181,6 +219,8 @@ class DomainRunner(ProjectRunner):
         host.workflow = self.workflow
         # Public result/reconciliation fields use the same frozen domain contract.
         self.backend = _HostView(host, self.contract_ref)
+        if not persisted:
+            self.capture_checkpoint(None, scope='initial')
 
     def actor_event(self, kind, data):
         super().actor_event(kind, data)
@@ -195,11 +235,37 @@ class DomainRunner(ProjectRunner):
             raise ValueError('domain evidence tool shadows canonical action')
         return dict(tools, **extra)
 
+    def tool(self, name, stage, args, operation):
+        if name != 'query_kdb':
+            return super().tool(name, stage, args, operation)
+        call = uuid.uuid4().hex
+        self.append(dict(type='query-dispatch', call_id=call, operation_id=operation,
+            request_ref=self.store.put_json(args)))
+        try:
+            result = super().tool(name, stage, args, operation)
+        except BaseException:
+            self.append(dict(type='query-finished', call_id=call, operation_id=operation, status='unavailable'))
+            raise
+        self.append(dict(type='query-finished', call_id=call, operation_id=operation,
+            status='complete', reference=result['reference']))
+        return result
+
     def preflight(self, operation, context):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline identity changed')
-        self.backend.preflight(context)
-        return self.result(operation, StageResult(artifact_refs=(self.contract_ref,)))
+        value = self.backend.preflight(context)
+        if isinstance(value, StageResult):
+            return self.result(operation, value)
+        if isinstance(value, DomainObservation):
+            return self.result(operation, StageResult(passed=value.passed,
+                artifact_refs=(*value.artifact_refs, self.contract_ref)))
+        if value is not None and type(value) is not bool:
+            raise TypeError('host preflight must return bool, None or trusted observation')
+        ref = self.store.put_json(dict(operation_id=operation, stage=Stage.PREFLIGHT.value,
+            contract_ref=self.contract_ref, passed=value is not False,
+            reason='host preflight returned False' if value is False else 'host preflight completed'))
+        return self.result(operation, StageResult(passed=value is not False,
+            artifact_refs=(self.contract_ref, ref)))
 
     def perform(self, stage, args, operation, seconds):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
@@ -267,11 +333,84 @@ class DomainRunner(ProjectRunner):
         passed = observation.passed and (stage != Stage.VALIDATION or
             observation.correctness is True and observation.performance != 'shortfall' and
             (self.spec.performance_goal is None or observation.performance == 'met'))
+        checkpoint = self.capture_checkpoint(operation, scope='stage')
         return self.result(operation, StageResult(passed=passed,
-            artifact_refs=(*observation.artifact_refs, *extra_refs, ref),
+            artifact_refs=(*observation.artifact_refs, *extra_refs, ref, checkpoint),
             retrieval_refs=(selection['query_ref'],) if selection else (),
             retrospective_ref=selection['retrospective_ref'] if selection else None,
             new_source_hash=actual if actual != old_hash else None, redesign=redesign))
+
+    def capture_checkpoint(self, operation, *, scope):
+        from rsi.domain_checkpoint import encode
+        host = getattr(self.backend, 'host', self.backend)
+        sources = {path:self.store.put_bytes(host.read(path)['content'].encode()) for path in self.config.editable_files}
+        snapshot = getattr(host, 'checkpoint', lambda: None)()
+        row = dict(kind='rsi-domain-checkpoint-v1', contract_ref=self.contract_ref,
+            identity=self.checked_identity(host), source_hash=host.project_hash(), sources=sources,
+            operation_id=operation, scope=scope, host_state=encode(snapshot))
+        ref = self.store.put_json(row)
+        self.append(dict(type='domain-checkpoint', operation_id=operation, reference=ref))
+        return ref
+
+    def restore_checkpoint(self, host, persisted):
+        if not persisted:
+            return
+        from rsi.domain_checkpoint import decode
+        admitted = {ref for row in persisted['history'] for ref in row.get('evidence', {}).get('artifact_refs', ())}
+        observed = set()
+        for event in self.events:
+            if event['type'] == 'domain-result':
+                receipt = self.store.read_json(event['reference'])
+                if receipt['observed_terminal'] is True:
+                    observed.add((receipt['operation_id'], receipt['source_hash']))
+            if event['type'] == 'domain-checkpoint':
+                row = self.store.read_json(event['reference'])
+                if row['scope'] == 'initial' or row['scope'] == 'activity' and (row['operation_id'],row['source_hash']) in observed:
+                    admitted.add(event['reference'])
+            if event['type'] == 'stage-result' and persisted.get('pending') and event['operation_id'] == persisted['pending']['id']:
+                admitted.update(event['evidence']['artifact_refs'])
+        event = next((e for e in reversed(self.events) if e['type'] == 'domain-checkpoint' and e['reference'] in admitted), None)
+        if event is None:
+            if persisted.get('outcome') == 'accepted':
+                raise WorkflowError('accepted native task lacks retained typed checkpoint; explicit migration required')
+            return
+        row = self.store.read_json(event['reference'])
+        if row['contract_ref'] != self.contract_ref or row['identity'] != self.checked_identity(host):
+            raise WorkflowError('native checkpoint contract/target identity differs')
+        snapshot = decode(row['host_state'])
+        restore = getattr(host, 'restore_checkpoint', None)
+        if restore is None:
+            if host.project_hash() != row['source_hash']:
+                raise WorkflowError('host cannot rehydrate its retained source checkpoint')
+        else:
+            sources = {path:self.store.read_bytes(ref).decode() for path,ref in row['sources'].items()}
+            restore(snapshot, sources)
+        if host.project_hash() != row['source_hash']:
+            raise WorkflowError('restored native source differs from retained checkpoint')
+        if persisted.get('outcome') == 'accepted':
+            last = persisted['history'][-1] if persisted['history'] else {}
+            if (persisted['pending'] is not None or last.get('evidence', {}).get('stage') != Stage.ACCEPTANCE.value
+                    or last.get('passed') is not True or row['source_hash'] != persisted['source'] or persisted['verified'] != persisted['source']
+                    or getattr(host, 'accepted_checkpoint_valid', lambda: False)() is not True):
+                raise WorkflowError('accepted native checkpoint lacks current verified outcome')
+
+    def _completed_effects(self, observed_queries=()):
+        from rsi.domain_evidence import completed_effects
+        self.workflow.accounting.seconds()
+        if self.workflow.limits.to_dict() != self.workflow.state['limits']:
+            raise WorkflowError('native budget changed without persistence')
+        try:
+            return completed_effects(self.root, self.store, self.contract_ref, self.workflow.state,
+                self.events, self.service.backend_identity, self.service.test_backend,
+                self.checked_identity(self.backend), self.backend.project_hash(),
+                actor_active=self.actor.session is not None)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise WorkflowError('native completed-effect evidence is unavailable or corrupt') from error
+
+    def export_task(self, destination):
+        self._completed_effects()
+        from rsi.domain_evidence import export_domain_task
+        return export_domain_task(self.root, destination)
 
     def reconcile(self):
         if not self.workflow.pending and self.backend.project_hash() != self.workflow.source_hash:
@@ -327,7 +466,19 @@ class CanonicalAdoption:
         if not isinstance(runner, DomainRunner):
             raise TypeError('canonical adoption factory must return DomainRunner')
         result = runner.run()
-        return self.finish(owner, runner, result, inputs)
+        from rsi.domain_checkpoint import encode, decode
+        event = runner.latest('domain-public-result')
+        if event and runner.workflow.outcome == 'accepted':
+            row = runner.store.read_json(event['reference'])
+            if row['contract_ref'] != runner.contract_ref or row['source_hash'] != runner.backend.project_hash():
+                raise WorkflowError('retained native public result scope differs')
+            return decode(row['value'])
+        value = self.finish(owner, runner, result, inputs)
+        if runner.workflow.outcome == 'accepted' and not getattr(value,'continuation',None):
+            ref = runner.store.put_json(dict(contract_ref=runner.contract_ref,
+                source_hash=runner.backend.project_hash(), value=encode(value)))
+            runner.append(dict(type='domain-public-result', reference=ref))
+        return value
 
 
 def require_adoption(value):
