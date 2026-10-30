@@ -167,7 +167,13 @@ class ControllerSession(PiCodingSession):
             except StopIteration as result:
                 completed.append(result.value)
                 return dict(observation=dict(host_completed=True, workflow_committed=False, result=asdict(result.value.result)), terminate=True, state={'allowed':[]})
-            return dict(observation=resource(current[0]['observation']), terminate=False, state=status())
+            response = dict(observation=resource(current[0]['observation']), terminate=False, state=status())
+            if (current[0]['observation'] or {}).get('event') == 'action-superseded':
+                # The initial prompt is sent once. Deliver changed host inputs
+                # through Pi's actual tool conversation before another decision.
+                response['task'] = resource(current[0]['task'])
+                response['terminate'] = True
+            return response
         def handle(name, args):
             if name == 'native_event':
                 record('pi-native-event', dict(event=args))
@@ -203,7 +209,10 @@ class ControllerSession(PiCodingSession):
             if batch['truncated'] or completed:
                 return dict(observation=dict(error='batch truncated or stage already completed', executed=False),
                             isError=True, terminate=True, state={'allowed':[]})
-            return execute(call['name'],call['arguments'])
+            response = execute(call['name'],call['arguments'])
+            if response.get('task') is not None:
+                batch['truncated'] = True  # Remaining calls used the superseded context.
+            return response
         def pump():
             try:
                 request, done, response = self.requests.get_nowait()
