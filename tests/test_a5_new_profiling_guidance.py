@@ -3,6 +3,9 @@ import json
 
 import pytest
 
+from canonical_kernel_fixtures import canonical_kernel
+from test_rsi_production_domain_bindings import CanonicalSession
+
 from benchmarks.a5kernels.phase1_experiments import (
     ProfilingGuidance, PendingTreatmentError, admit_runnable_cell, build_cells,
 )
@@ -44,10 +47,10 @@ def test_admission_hashes_all_references_and_preserves_legacy_cells(tmp_path):
             assert before.as_dict() == after.as_dict()
 
 
-def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path):
+def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path, canonical_kernel):
     identity, text = _guidance(tmp_path / "skill")
     cell = next(c for c in build_cells(_guide(), profiling_guide=identity)
-                if c.profiling is ProfilingGuidance.NEW and c.model.provider == "OpenAI"
+                if c.profiling is ProfilingGuidance.NEW and c.model.provider == "DeepSeek"
                 and c.knowledge.value == "without-kdb")
     calls = []
     now = [0.0]
@@ -72,31 +75,64 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path)
     spec = _project("context-copy", "gm-ub-movement")
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
     prepared = campaign.project_actor.executor.prepare(ProjectSpec.from_mapping(spec))
-    campaign.actor.max_seconds = 1
-    campaign.actor.clock = lambda: now[0]
+    from rsi.domain_bindings import kernel_adoption
+    from rsi.contracts import BudgetLimits
+    case = canonical_kernel
+    campaign.actor.canonical = kernel_adoption(baseline_query=case.baseline_query)
+    campaign.actor.canonical_budgets = BudgetLimits(actor_seconds=120, wall_seconds=120)
+    case.enable_native()
+    offsets, instruction_refs = [], []
+    def select(context, allowed):
+        instruction = context['task']['domain']['instruction']
+        ref = hashlib.sha256(instruction.encode()).hexdigest()
+        if not instruction_refs:
+            instruction_refs.append(ref)
+        offset = len(offsets) * 3072
+        if offset < len(instruction.encode()):
+            offsets.append(offset)
+            return 'read_context', dict(record=ref, offset=offset, limit=3072)
+        return CanonicalSession.next_action(case.session, context, allowed)
+    case.select = select
+    case.after_select = lambda context, selected: setattr(case, 'now', case.now + 121) if selected[0] == 'perform' else None
+    # Keep production composition and treatment binding; only model decisions
+    # are scripted through the actual canonical Pi SDK gateway.
     with pytest.raises(RuntimeError, match="without host-verified"):
         campaign.project_actor(AdaptiveProjectRequest(
             prepared.spec, 1, b"", tmp_path / "actor-proof", prepared.inputs, prepared.expected,
         ))
-    actor_request = calls[-1]
-    actor_context = json.loads(actor_request["messages"][1]["content"].split(
-        "Production context (immutable, identical for every project): ", 1,
-    )[1])
-    assert actor_context["profiling_guidance"] == text
-    retained = list((tmp_path / "actor-proof" / "artifacts" / "objects").rglob("*"))
-    assert any(path.is_file() and path.read_bytes() == production_request_bytes({"request": actor_request})
-               for path in retained)
+    pages = {}
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get('record') == instruction_refs[0] and 'text' in value:
+                pages[value['offset']] = value['text']
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except (ValueError, TypeError):
+                return
+            if not isinstance(decoded, str):
+                visit(decoded)
+    visit(case.wires)
+    delivered = ''.join(pages[offset] for offset in sorted(pages))
+    actor_context = json.loads(delivered.split(
+        "Production context (immutable, identical for every project): ", 1)[1])
+    assert actor_context['profiling_guidance'] == text
+    retained = [row['request'] for row in case.runner.events if row['type'] == 'pi-provider-request']
+    assert retained == case.wires and retained
+    dispatches = [case.runner.store.read_json(row['reference'])
+                  for row in case.runner.events if row['type'] == 'domain-dispatch']
+    assert not any(row['category'] in ('compilation', 'execution', 'profiling') for row in dispatches)
     with pytest.raises(ValueError, match="does not match"):
         build_adaptive_phase1(
             cell=cell, paths=_paths(tmp_path / "bad"), objective="Learn.",
             initial_memory=b"", guide_bytes=GUIDE_BYTES,
             profiling_guidance_text=text + " changed", command_executor=FakeCommandExecutor(),
         )
-
-
-def production_request_bytes(value):
-    from benchmarks.a5kernels.evidence import canonical_bytes
-    return canonical_bytes(value)
 
 
 def test_time_allocation_stops_before_next_selection_and_survives_resume(tmp_path):

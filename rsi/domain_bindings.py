@@ -432,62 +432,65 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
     runner = continuation.runner
     admitted = dict(outcome.admitted_artifacts)
     admitted.update(admitted_artifacts or {})
-    payloads, remaining_bytes = {}, 64000
-    for ref in admitted:
-        data = runner.store.read_bytes(ref)
-        if len(data) <= min(8192, remaining_bytes):
-            payloads[ref] = data.decode(errors='replace')
-            remaining_bytes -= len(data)
-    from benchmarks.ascend.agent_context import WorkingContext
-    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    # Authenticate every admitted object before optional summary preparation;
+    # missing/corrupt evidence is never downgraded to a provider failure.
+    payloads = {reference:runner.store.read_bytes(reference) for reference in admitted}
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder, _EmptyTextCompletion
+    from benchmarks.ascend.agent_context import ContextBudgetError
+    from rsi.domain_distillation import terminal_budget, bounded_driver, terminal_context, bounded_message
     recorder = _ProviderEvidenceRecorder(runner.backend.host.control_root)
     host = runner.backend.host
-    # Reuse the existing direct-provider context policy for this noncoding task.
-    # Full host material remains in CAS; summaries never acquire host authority.
-    working = WorkingContext([dict(role='system', content=owner.system_prompt),
-        dict(role='user', content=continuation.instruction)])
-    for row in runner.workflow.state['history']:
-        working.append(dict(role='user', content=json.dumps(dict(workflow_step=row))))
-    for summary in host_summaries:
-        working.append(dict(role='user', content=json.dumps(dict(host_summary=summary))))
-    working.pinned = [dict(role=row['role'], content=row['content']) for row in host.feedback]
-    terminal = dict(role='user', content=DISTILLATION_PROMPT + '\n' + json.dumps(dict(
-        admitted_artifacts=admitted, artifact_payloads=payloads,
-        workflow_history=runner.workflow.state['history'][-1:])))
-    working.append(terminal)
+    budget = terminal_budget(owner.provider, continuation.profile)
+    def failed(failure, tokens):
+        recorder.failure(failure, stage='distillation', turn=turn)
+        ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
+            exception_type=type(failure).__name__, source_hash=host.project_hash(),
+            contract_ref=runner.contract_ref, host_outcome=outcome.status))
+        runner.append(dict(type='domain-distillation-failure', reference=ref))
+        return replace(outcome, tokens=tokens, distillation_failure=ref,
+                       wall_time_s=runner.workflow.accounting.seconds())
+    turn = 0
+    try:
+        working = terminal_context(owner, runner, continuation.profile, continuation.instruction,
+            admitted, payloads, host_summaries, budget, DISTILLATION_PROMPT)
+    except ContextBudgetError as failure:
+        return failed(failure, 0)
     tokens, turn = 0, 0
     while True:
         seconds = runner.actor._available()
-        driver = owner.with_time_budget(seconds)
+        driver = bounded_driver(owner, seconds, continuation.profile, budget)
+        original_complete = driver._complete
+        def observed_complete(*args, **kwargs):
+            nonlocal tokens
+            try:
+                completion = original_complete(*args, **kwargs)
+            except _EmptyTextCompletion as empty:
+                tokens += empty.completion_tokens
+                raise
+            tokens += completion.completion_tokens
+            return completion
+        driver._complete = observed_complete
         token = runner.workflow.accounting.start('thinking')
         try:
             try:
-                messages, summary_tokens = driver._prepare_context(
+                messages, _ = driver._prepare_context(
                     working, continuation.profile, recorder, turn=turn)
-                tokens += summary_tokens
                 driver._request(recorder, continuation.profile, messages, stage='distillation', turn=turn)
                 completion = driver._complete(recorder, continuation.profile, messages,
                                                stage='distillation', turn=turn)
             except Exception as failure:
-                recorder.failure(failure, stage='distillation', turn=turn)
-                ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-                    exception_type=type(failure).__name__, source_hash=host.project_hash(),
-                    contract_ref=runner.contract_ref, host_outcome=outcome.status))
-                runner.append(dict(type='domain-distillation-failure', reference=ref))
-                # The already verified host outcome survives a separate summary
-                # failure. No candidate or execution is replayed.
-                return replace(outcome, tokens=tokens, distillation_failure=ref,
-                               wall_time_s=runner.workflow.accounting.seconds())
+                return failed(failure, tokens)
         finally:
             runner.workflow.accounting.end(token)
-        tokens += completion.completion_tokens
         recorder.response(completion.text, stage='distillation', turn=turn)
         owner._trace('message', dict(role='assistant', content=completion.text))
         try:
             distilled = parse_agent_distillation(completion.text, admitted)
         except ValueError as exc:
-            working.append(dict(role='assistant', content=completion.text))
-            working.append(dict(role='user', content='Correct terminal JSON: ' + str(exc)))
+            limit = max(256, budget.target // 4)
+            working.append(bounded_message(runner.store, dict(role='assistant', content=completion.text), limit))
+            working.append(bounded_message(runner.store,
+                dict(role='user', content='Correct terminal JSON: ' + str(exc)), limit))
             turn += 1
             continue
         return replace(outcome, tokens=tokens, terminal_response=completion.text,
@@ -502,7 +505,8 @@ class A3Host(SourceHost):
         from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
         self.owner, self.runtime = owner, owner.candidate
         self.control_root = owner.workdir
-        self.store = ContentAddressedArtifacts(owner.workdir / 'canonical-artifacts')
+        self.store = ContentAddressedArtifacts(getattr(owner, 'canonical_artifact_root', owner.workdir / 'canonical-artifacts'))
+        self.canonical_prior_root = getattr(owner, 'canonical_prior_root', None)
         self.source_path = owner.workdir / 'canonical-source'
         self.source = self.source_path.read_text() if self.source_path.exists() else ''
         self.compilation = self.verified = self.profile = self.timing = None
@@ -558,9 +562,22 @@ class A3Host(SourceHost):
         return bool(isinstance(self.verified, VerifiedResult) and self.verified.passed and
             self.owner._submit_gate(self.source,self.compilation,self.verified,self.profile) is None)
 
+    def call(self, activity, name, category, callback):
+        from benchmarks.a3kernels.project_execution import RecoveryStarterEvidenceUnavailable
+        def observed(seconds):
+            try:
+                return callback(seconds)
+            except RecoveryStarterEvidenceUnavailable as carrier:
+                return carrier.failure
+        return super().call(activity, name, category, observed)
+
     def activity_observed_terminal(self, name, value):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence
         from benchmarks.a3kernels.trial import infrastructure_unavailable
+        from rsi.a3_recovery import known_prelaunch_failure
+        if known_prelaunch_failure(value):
+            return True  # Typed pre-launch failure, not an unknown original job.
+
         unavailable = isinstance(value, FailedEvidence) and (
             infrastructure_unavailable(value) or self.owner._retryable_failure(name, value))
         if unavailable:
@@ -663,19 +680,21 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
-def a3_adoption(*, baseline_query=None):
+def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
         actor = getattr(owner.actor, 'canonical_actor', owner.actor)
         # Production A3Actor owns an existing registered Pi session. Preserve its
         # exact model/credential route instead of creating a new provider stack.
         session = getattr(actor, 'session', None)
-        if session is None:
+        if session_factory is None and session is None:
             raise CanonicalConfigurationError('A3 canonical binding needs the registered Pi actor session')
-        def session_factory():
+        def existing_session():
             return PiSessionAdapter.from_existing_session(session)
         root = owner.workdir / 'canonical'
-        injections = dict(query=host.query, backend_identity=fingerprint(host.identity), session_factory=session_factory)
+        injections = dict(query=host.query, backend_identity=fingerprint(host.identity),
+            session_factory=session_factory or existing_session, test_backend=test_backend,
+            **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             return DomainRunner(root, host, **injections)
         bundle, limits = baseline_contract(owner, owner.budgets.max_seconds)
@@ -724,8 +743,36 @@ class OptimizerHost(SourceHost):
     def boundary_reached(self, stage):
         return stage != Stage.TEST or self.value is None
 
+    def admit_tool(self, name, stage, args, operation):
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and name == 'optimisation_decision' and args['action'] == 'edit'):
+            raise StrategyRejected('This public attempt already evaluated its candidate. '
+                'Choose profile or noop for this source; a new candidate needs a new public attempt.')
+
+    def admit_proposal(self, stage, args, operation):
+        edit = args.get('edit')
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and edit is not None and edit['source'] != self.source):
+            raise StrategyRejected('The single-evaluation candidate is fixed after TEST. '
+                'Retain this source; use noop/profile, or start another public attempt for a new candidate.')
+
+    def activity_exception_terminal(self, name, error):
+        from optimizer.control import ObservedBudgetStop
+        if name == 'profile' and isinstance(error, ObservedBudgetStop):
+            error.validate(self.owner.directory)
+            return True
+        return super().activity_exception_terminal(name, error)
+
     def refresh_public_result(self, retained):
-        return self.owner.store.get(self.owner.key)
+        row = self.owner.store.get(self.owner.key)
+        # CanonicalAdoption invokes this only for an authenticated accepted
+        # checkpoint. A normal run settles the current job, whereas explicit
+        # single-evaluation calls leave it available for another public attempt.
+        if (row['status'] == 'running' and not row['stop_requested']
+                and not self.inputs.get('single_evaluation') and not self.inputs.get('prepare_only')):
+            self.owner.store.transition(self.owner.key, 'completed', stage=Stage.ACCEPTANCE.value)
+            row = self.owner.store.get(self.owner.key)
+        return row
 
     def on_actor_event(self, kind, data):
         observer = self.owner.memory_observer
@@ -846,8 +893,18 @@ class OptimizerHost(SourceHost):
                 raise CanonicalConfigurationError('configured optimizer backend has no compile diagnostics capability')
             candidate = dict(source=args['source'], block_count=args['block_count'])
             directory = self.owner.directory / 'compile' / fingerprint(candidate) / operation
-            report = self.call(DomainActivity(self.runner, operation), 'compile-diagnostic', 'compilation',
-                lambda remaining: callback(candidate['source'], directory, block_count=candidate['block_count']))
+            request = self.runner.latest('actor-request', operation)
+            if not request or not request.get('request_id'):
+                raise WorkflowError('compile diagnostic requires an actual current actor request')
+            import uuid
+            invocation = self.store.put_json(dict(kind='domain-tool-invocation-v1', call_id=uuid.uuid4().hex,
+                name='compile-diagnostic', operation_id=operation, request_id=request['request_id'],
+                contract_ref=self.runner.contract_ref, source_hash=self.project_hash(), arguments=args))
+            self.runner.append(dict(type='domain-tool-invocation', operation_id=operation,
+                                    reference=invocation))
+            report = DomainActivity(self.runner, operation).run('compile-diagnostic', 'compilation',
+                lambda remaining: callback(candidate['source'], directory, block_count=candidate['block_count']),
+                execution=True, invocation=invocation)
             ref = self.owner._artifact('compile', report)
             self.owner.state['history'].append(dict(tool=dict(action='compile', **args), result=ref, content=report))
             self.owner._save()
@@ -916,9 +973,45 @@ class OptimizerHost(SourceHost):
                 summaries = filter_presentation(self.submission['memory_snapshot'], summaries)
         self.presentable_memory = summaries['memory_summary']
         value.update(summaries)
+        value['workload'] = dict(single_evaluation=bool(self.inputs.get('single_evaluation')),
+            evaluated=self.evaluation is not None,
+            candidate_locked=bool(self.inputs.get('single_evaluation') and self.evaluation is not None))
         value.update(baseline=self.baseline, history=self.owner.state['history'],
                      best=self.owner.state.get('best'))
         return value
+
+    def retain_evaluation(self, evaluation, args, operation):
+        from optimizer.loop import score
+        owner = self.owner
+        self.evaluation, self.value = evaluation, score(self.baseline, evaluation)
+        existing = next((row for row in owner.state['history'] if row.get('domain_operation') == operation), None)
+        if existing is not None:
+            if self.owner._read(existing['result']) != evaluation:
+                raise WorkflowError('retained evaluation history differs from observed terminal result')
+            return existing
+        candidate = json.loads(self.source)
+        ref = owner._artifact('evaluation', evaluation)
+        row = dict(candidate_sha256=sha256(candidate['source'].encode()).hexdigest(),
+            configuration_sha256=fingerprint(candidate), block_count=candidate['block_count'],
+            result=ref, source=owner._artifact('candidate.cpp', candidate['source']),
+            content=evaluation, speedup=self.value, summary=args['proposal'], domain_operation=operation)
+        owner.state['seen'].append(row['configuration_sha256'])
+        owner.state['candidate'] = row['source']
+        owner.state['history'].append(row)
+        if self.value is not None and self.value > owner.state.get('best', {}).get('speedup', 0):
+            owner.state['best'] = dict(row, faster_than_torch=self.value > 1)
+        owner._save()
+        return row
+
+    def recover_terminal_boundary(self, stage, operation, args, receipts):
+        if stage != Stage.TEST or not self.inputs.get('single_evaluation'):
+            return None
+        if len(receipts) != 1 or receipts[0]['dispatch']['name'] != 'evaluate':
+            raise WorkflowError('single evaluation recovery requires exactly its original terminal evaluation')
+        self.retain_evaluation(receipts[0]['result'], args, operation)
+        reference = self.store.put_json(dict(stage=stage.value, passed=self.value is not None,
+            evaluation=self.evaluation, speedup=self.value, source=self.project_hash()))
+        return DomainObservation(self.value is not None, (reference,))
 
     def execute(self, stage, args, operation, activity):
         from optimizer.loop import score
@@ -934,6 +1027,8 @@ class OptimizerHost(SourceHost):
             owner._save()
         passed = True
         if stage == Stage.TEST:
+            if self.inputs.get('single_evaluation') and self.evaluation is not None:
+                raise WorkflowError('single-evaluation workload already consumed its candidate evaluation')
             candidate = json.loads(self.source)
             directory = owner.directory / fingerprint(candidate) / operation
             if stage == Stage.TEST:
@@ -943,26 +1038,24 @@ class OptimizerHost(SourceHost):
                 owner.backend.evaluate(candidate['source'], directory, block_count=candidate['block_count']))
             self.value = score(self.baseline, self.evaluation)
             passed = self.value is not None
-            ref = owner._artifact('evaluation', self.evaluation)
-            row = dict(candidate_sha256=sha256(candidate['source'].encode()).hexdigest(),
-                configuration_sha256=fingerprint(candidate), block_count=candidate['block_count'],
-                result=ref, source=owner._artifact('candidate.cpp', candidate['source']),
-                content=self.evaluation, speedup=self.value, summary=args['proposal'])
-            owner.state['seen'].append(row['configuration_sha256'])
-            owner.state['candidate'] = row['source']
-            owner.state['history'].append(row)
-            if passed and self.value > owner.state.get('best', {}).get('speedup', 0):
-                owner.state['best'] = dict(row, faster_than_torch=self.value > 1)
-            owner._save()
+            self.retain_evaluation(self.evaluation, args, operation)
         if stage == Stage.VALIDATION:
             self.value = activity.run('verify-evaluation', 'execution', lambda seconds:
                 score(self.baseline, self.evaluation) if self.evaluation is not None else None, execution=True)
             passed = self.value is not None
         if stage == Stage.OPTIMISATION and args['optimisation_decision']['action'] == 'profile':
             candidate = json.loads(self.source)
-            report = self.call(activity, 'profile', 'profiling', lambda seconds:
-                owner.backend.profile(candidate['source'], owner.directory / fingerprint(candidate) / 'profile',
-                                      block_count=candidate['block_count']))
+            from optimizer.control import ObservedBudgetStop
+            try:
+                report = self.call(activity, 'profile', 'profiling', lambda seconds:
+                    owner.backend.profile(candidate['source'], owner.directory / fingerprint(candidate) / 'profile',
+                                          block_count=candidate['block_count']))
+            except ObservedBudgetStop as error:
+                if owner.store.get(owner.key)['stop_requested'] or self.value is None:
+                    raise
+                proof = error.validate(owner.directory)
+                report = dict(status='unavailable', reason='observed elapsed stop', terminal_receipt=proof)
+                owner.store.add_event(owner.key, 'profiling-unavailable', report)
             owner.state['history'].append(dict(tool={'action': 'profile'}, content=report,
                                               result=owner._artifact('profiling', report)))
             owner._save()

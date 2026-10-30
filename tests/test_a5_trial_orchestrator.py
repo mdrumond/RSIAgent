@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from canonical_kernel_fixtures import canonical_kernel
+
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.fixtures import Language
@@ -366,85 +368,69 @@ def test_actions_before_write_return_recoverable_observations(tmp_path, action):
     assert result.verified.passed
 
 
-def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_path):
-    captured = {}
-
-    class Config:
-        primary_temperature = 1.0
-
-    class Result:
-        status = "done"
-        iters = 2
-        turns = 3
-        wall_secs = 3.5
-
-    def run_attempt(*args, **kwargs):
-        captured["cfg"] = args[2]
-        captured["kwargs"] = kwargs
-        return Result(), []
-
-    monkeypatch.setattr("core.loop.run_attempt", run_attempt)
-    driver = CoreAttemptDriver(object(), Config(), lambda path: path)
-    outcome = driver(
-        "instruction", profile=load_a5_model_profile(),
-        workspace=tmp_path, context=tmp_path,
-        turn_parser=parse_trial_action, action_executor=lambda _action: None,
-    )
-
-    assert captured["cfg"].primary_temperature == 0.0
-    assert captured["cfg"].retry_temperature == 0.0
-    assert captured["cfg"].temperature == 0.0
-    assert captured["cfg"].allow_truncation_retry is False
-    assert captured["kwargs"]["action_nudge"] == captured["kwargs"]["strict_action_nudge"]
-    for action in ("propose", "write", "compile", "run", "query-knowledge",
-                   "request-profile", "submit"):
-        assert action in captured["kwargs"]["action_nudge"]
-    assert outcome.wall_time_s == 3.5
-    assert outcome.tokens is None
-    assert outcome.iterations == 3
+def _legacy_loop_sentinel(monkeypatch, dispatch):
+    """Detect legacy dispatch without loading its optional provider dependencies."""
+    import sys
+    from types import ModuleType
+    import core
+    legacy = ModuleType('core.loop')
+    legacy.run_attempt = dispatch
+    monkeypatch.setitem(sys.modules, 'core.loop', legacy)
+    monkeypatch.setattr(core, 'loop', legacy, raising=False)
 
 
-@pytest.mark.parametrize("compile_probe", [False, True])
+def test_core_driver_freezes_generation_and_restricted_nudges(canonical_kernel, monkeypatch):
+    from rsi.domain_execution import CanonicalAdoption
+    case = canonical_kernel
+    cfg = SimpleNamespace(primary_temperature=1., retry_temperature=.8)
+    native = case.driver.canonical
+    adoption = CanonicalAdoption(
+        lambda owner, **inputs: native.build(case.driver, **inputs),
+        lambda owner, runner, result, inputs: native.finish(case.driver, runner, result, inputs))
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: pytest.fail('legacy loop ran'))
+    driver = CoreAttemptDriver(object(), cfg, lambda path: path, canonical=adoption)
+    result = case.run(driver)
+    assert result.status == 'host-verified'
+    assert case.actions.latest.evidence.verified
+    assert cfg.primary_temperature == 1. and cfg.retry_temperature == .8
+    # The canonical engine owns the staged action schemas, including required skill reads.
+    assert 'perform' in case.session.schemas and 'read_skill' in case.session.schemas
+    assert 'submit' not in case.session.schemas
+
+
+@pytest.mark.parametrize('compile_probe', [False, True])
 def test_core_driver_disables_inherited_compaction_without_mutating_config(
-    monkeypatch, tmp_path, compile_probe,
+    canonical_kernel, monkeypatch, compile_probe,
 ):
-    import core.loop as loop
+    from rsi.domain_execution import CanonicalAdoption
     from config.settings import load
-    from core.trace import ArtifactSink
-
+    case = canonical_kernel
     cfg = load(None)
     cfg.max_iters = 2 if compile_probe else 4
-    cfg.history_keep_pairs = 1
-    cfg.keep_chars = 0
-    cfg.fold_batch = 1
-    cfg.ctx_high_water = 0
-    requests = []
-    replies = iter([
-        '{"propose":{"text":"first"}}',
-        '{"compile":{}}' if compile_probe else '{"propose":{"text":"second"}}',
-        '{"submit":{}}',
-    ])
+    cfg.history_keep_pairs, cfg.keep_chars, cfg.fold_batch, cfg.ctx_high_water = 1, 0, 1, 0
+    baseline = dict(vars(cfg))
+    native = case.driver.canonical
+    adoption = CanonicalAdoption(
+        lambda owner, **inputs: native.build(case.driver, **inputs),
+        lambda owner, runner, result, inputs: native.finish(case.driver, runner, result, inputs))
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: pytest.fail('legacy context manager ran'))
+    result = case.run(CoreAttemptDriver(object(), cfg, lambda path: path, canonical=adoption))
+    assert result.status == 'host-verified'
+    assert dict(vars(cfg)) == baseline
+    assert len(case.contexts) > cfg.max_iters
+    assert case.calls.count('compile') >= 1 and case.actions.latest.evidence.verified
 
-    def chat(_model, system, _user, **kwargs):
-        assert system != loop.SUMMARIZER_SYSTEM
-        requests.append(kwargs)
-        return next(replies)
 
-    monkeypatch.setattr(loop, "chat", chat)
-    outcome = CoreAttemptDriver(object(), cfg, lambda path: ArtifactSink(str(path)))(
-        "task", profile=load_a5_model_profile(), workspace=tmp_path,
-        context=tmp_path / "context", turn_parser=parse_trial_action,
-        action_executor=lambda action: ActionOutcome(
-            "ok", action.kind == "submit", budget_exempt=action.kind == "compile",
-        ),
-    )
-
-    assert outcome.status == "done"
-    assert len(requests) == 3
-    assert outcome.iterations == 3
-    assert all(request["allow_truncation_retry"] is False for request in requests)
-    assert all(request["top_p"] == 1.0 for request in requests)
-    assert cfg.history_keep_pairs == 1
+def test_core_driver_requires_explicit_canonical_configuration_before_dispatch(tmp_path, monkeypatch):
+    from rsi.domain_execution import CanonicalConfigurationError
+    calls = []
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: calls.append('legacy'))
+    driver = CoreAttemptDriver(object(), object(), lambda path: calls.append('sink'))
+    with pytest.raises(CanonicalConfigurationError):
+        driver('task', profile=load_a5_model_profile(), workspace=tmp_path, context=tmp_path,
+               turn_parser=parse_trial_action, action_executor=lambda action: calls.append('host'))
+    assert calls == []
+    assert not (tmp_path / 'canonical').exists()
 
 
 def test_failed_candidate_can_omit_undiscovered_kernel_name(tmp_path):

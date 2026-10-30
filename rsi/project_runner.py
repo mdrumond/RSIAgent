@@ -23,6 +23,7 @@ from rsi.python_execution import PythonExecution, atomic_json, digest
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import SkillBundle
 from rsi.strategy import QueryUnavailable, StrategyEvidence
+from benchmarks.ascend.agent_context import ContextBudgetError
 
 
 @dataclass(frozen=True)
@@ -658,6 +659,7 @@ class ProjectRunner:
 
     def run(self):
         status, error, classification, closure_ref = None, None, None, None
+        typed_error = None
         entry_pending = self.workflow.pending
         try:
             self.reconcile()
@@ -674,6 +676,11 @@ class ProjectRunner:
                 error_type=type(exc).__name__, pending=self.workflow.pending))
         except QueryUnavailable as exc:
             status, error = 'suspended', str(exc)
+        except ContextBudgetError as exc:
+            typed_error = exc
+            status, error, classification = 'suspended', str(exc), 'context_budget_exhausted'
+            self.append(dict(type='project-failure', classification=classification,
+                error_type=type(exc).__name__, pending=self.workflow.pending))
         except (WorkflowError, ValueError, OSError) as exc:
             error = str(exc)
             status = 'budget_exhausted' if 'exhausted' in error else 'suspended'
@@ -709,4 +716,8 @@ class ProjectRunner:
             skill_bundle_hash=self.bundle.digest, actor_closure_ref=closure_ref)
         result['outcome_ref'] = self._outcome(result, closure_ref)
         result['events'] = tuple(self.event_refs)
+        if typed_error is not None:
+            # Preserve the original typed admission failure for domain callers'
+            # abort classification, after retaining outcome and actor closure.
+            raise typed_error
         return result

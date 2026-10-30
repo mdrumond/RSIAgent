@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from .jobs import atomic, canonical
-from .control import ObservationUnavailable, WorkerStopped
+from .control import ObservationUnavailable, WorkerStopped, ObservedBudgetStop
 from rsi.domain_timing import transfer_phase
 
 CLIENT_TIMEOUT = 120
@@ -217,13 +217,18 @@ class CheckedTransport:
                 # can become WorkerStopped (and release optional diagnostics).
                 if self.stopped() and state.get('native_handle'):
                     self.cancel_pending(directory)
+                    if time.monotonic() >= self.deadline:
+                        raise ObservedBudgetStop('elapsed allocation ended after observed cancellation', path)
                     raise WorkerStopped('stopped after cancelling retained operation')
                 raise ObservationUnavailable('local command client interrupted; observe retained handle or recover dispatch')
             if state.get('deadline_expired'):
+                if not state.get('native_handle'):
+                    raise ObservationUnavailable(
+                        'remote timeout lacks an observed native handle; retain legacy acknowledgement for observation')
                 state['state'] = 'cancelled'
                 state['reason'] = 'wall-time budget exhausted'
                 atomic(path, canonical(state))
-                raise WorkerStopped('remote wall-time budget exhausted')
+                raise ObservedBudgetStop('remote wall-time budget exhausted', path)
             if state['state'] == 'completed':
                 return
             if state['state'] == 'failed' and state.get('handle'):

@@ -70,21 +70,29 @@ class DomainActivity:
         self.runner, self.operation = runner, operation
         self.executions = []
 
-    def run(self, name, category, callback, *, execution=False):
+    def run(self, name, category, callback, *, execution=False, invocation=None):
         flow = self.runner.workflow
         if category not in flow.accounting.BILLABLE | flow.accounting.EXCLUDED:
             raise ValueError('unknown domain activity category')
         if category in ('compilation', 'execution', 'profiling') and not execution:
             raise ValueError('compilation/execution/profiling require an execution reservation')
         seconds = self.runner.actor._available()
+        key = self.operation + ':' + name
+        if invocation is not None:
+            intent = self.runner.store.read_json(invocation)
+            admitted = self.runner.latest('domain-tool-invocation', self.operation)
+            if (not admitted or admitted['reference'] != invocation or intent['operation_id'] != self.operation
+                    or intent['contract_ref'] != self.runner.contract_ref or intent['name'] != name
+                    or intent['source_hash'] != self.runner.backend.project_hash()):
+                raise WorkflowError('diagnostic invocation lacks current host admission')
+            key += ':' + invocation
         if execution:
-            key = self.operation + ':' + name
             if not flow.reserve_execution(key):
                 raise WorkflowError('domain operation already reserved; observe before resuming')
         activity = uuid.uuid4().hex
         dispatch = dict(kind='rsi-domain-dispatch-v1', activity_id=activity,
             operation_id=self.operation, stage=flow.stage.value, name=name, category=category,
-            execution=execution, reservation=self.operation+':'+name if execution else None,
+            execution=execution, reservation=key if execution else None, invocation_ref=invocation,
             contract_ref=self.runner.contract_ref, identity=self.runner.checked_identity(self.runner.backend),
             backend_identity=self.runner.service.backend_identity, test_backend=self.runner.service.test_backend,
             source_hash=self.runner.backend.project_hash(), remaining=flow.remaining())
@@ -112,7 +120,10 @@ class DomainActivity:
             terminal = isinstance(error, Exception) and getattr(self.runner.backend,
                 'activity_exception_terminal', lambda *_: False)(name, error) is True
             if terminal:
-                finish(dict(error_type=type(error).__name__, message=str(error)), 'failed', True)
+                failure = dict(error_type=type(error).__name__, message=str(error))
+                if getattr(error, 'terminal_receipt', None) is not None:
+                    failure['terminal_receipt'] = error.terminal_receipt
+                finish(failure, 'failed', True)
             else:
                 flow.accounting.unresolved.add(scope['token'])
                 self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
@@ -157,6 +168,10 @@ class DomainRunner(ProjectRunner):
         root = Path(root)
         if (root / 'domain.json').exists():
             raise FileExistsError('domain task already exists; reopen the same task')
+        prior = getattr(host, 'canonical_prior_root', None)
+        if prior is not None:
+            from rsi.a3_recovery import retry_spec
+            spec = retry_spec(host, spec, injections.get('clock', time.time))
         identity = cls.checked_identity(host)
         frozen = dict(kind='rsi-domain-contract-v2', test_backend=injections.get('test_backend', False),
             spec=spec.to_dict(), skills=bundle.to_dict(), identity=identity,
@@ -164,7 +179,11 @@ class DomainRunner(ProjectRunner):
         reference = host.store.put_json(frozen)
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(root / 'domain.json', dict(contract=reference, store_root=os.path.relpath(host.store.root.resolve(), root.resolve())))
-        return cls(root, host, **injections)
+        runner = cls(root, host, **injections)
+        if prior is not None:
+            from rsi.a3_recovery import carry_retry_elapsed
+            carry_retry_elapsed(runner, prior)
+        return runner
 
     @staticmethod
     def checked_identity(host):
@@ -261,6 +280,9 @@ class DomainRunner(ProjectRunner):
         return dict(tools, **extra)
 
     def tool(self, name, stage, args, operation):
+        admission = getattr(self.backend, 'admit_tool', None)
+        if admission is not None:
+            admission(name, stage, args, operation)
         if name != 'query_kdb':
             return super().tool(name, stage, args, operation)
         call = uuid.uuid4().hex
@@ -295,7 +317,15 @@ class DomainRunner(ProjectRunner):
     def perform(self, stage, args, operation, seconds):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline changed during workflow')
+        admission = getattr(self.backend, 'admit_proposal', None)
+        if admission is not None:
+            admission(stage, args, operation)  # Pure: before intent/edit/reservation/command effects.
         selection = self.selection(operation) if stage in (Stage.DESIGN, Stage.OPTIMISATION) else None
+        request = self.latest('actor-request', operation)
+        intent = self.store.put_json(dict(kind='domain-stage-intent-v1', operation_id=operation,
+            stage=stage.value, contract_ref=self.contract_ref, source_hash=self.backend.project_hash(),
+            request_id=request['request_id'] if request else None, arguments=args))
+        self.append(dict(type='domain-stage-intent', operation_id=operation, reference=intent))
         activity = DomainActivity(self, operation)
         if stage == Stage.OPTIMISATION:
             decision = self.store.read_json(next(e['reference'] for e in reversed(self.events)
@@ -445,6 +475,9 @@ class DomainRunner(ProjectRunner):
     def reconcile(self):
         if not self.workflow.pending and self.backend.project_hash() != self.workflow.source_hash:
             raise WorkflowError('domain source changed outside workflow; explicit reconciliation required')
+        if self.workflow.pending and not self.latest('stage-result', self.workflow.pending['id']):
+            from rsi.domain_recovery import recover_completed_boundary
+            recover_completed_boundary(self)
         return super().reconcile()
 
     def run(self):
