@@ -229,8 +229,41 @@ class ProjectRunner:
             ref = self.store.put_json(args)
         self.append(dict(type='project-tool', operation_id=operation, stage=stage.value,
                          name=name, reference=ref, status='error' if read_error else 'ok'))
-        return dict(reference=ref, evidence=self.store.read_json(ref),
+        evidence = self.store.read_json(ref)
+        return dict(reference=ref, evidence=evidence, summary=self.evidence_summary(name, ref, evidence),
                     status='error' if read_error else 'ok')
+
+    def evidence_summary(self, name, reference, record):
+        """Small actual inventory for the actor's always-visible receipt index.
+
+        Full CAS records stay in result.evidence for existing context paging;
+        these summaries never stand in for considering the retained row content.
+        """
+        pending, stage = self.workflow.pending, self.workflow.stage
+        summary = dict(tool=name, reference=reference, stage=stage.value,
+            operation_id=pending['id'] if pending else None,
+            host_perform_ready=bool(pending and self.perform_ready(stage, pending['id'])),
+            mapped_skill_reads_required=list(self.bundle.skills_for(stage)))
+        if name == 'query_kdb':
+            payload = record['payload']
+            response = payload['response']
+            groups = ('results', 'negative_records')
+            summary.update(query_ref=reference, query=payload['request']['query'],
+                counts={group: len(response[group]) for group in groups},
+                decision_indexes={group: list(range(len(response[group]))) for group in groups},
+                requirements='Select with query_ref, retrospective_ref, mapped skill_refs; '
+                    'every group/index needs used/rejected and reason; negative used needs redirection.')
+        elif name == 'retrospect':
+            payload = record['payload']
+            summary.update(retrospective_ref=reference, history_count=len(payload['history']),
+                failure_indexes=payload['failures'], redirection_indexes=payload['redirections'],
+                requirements='Use this operation-scoped retrospective_ref in select_strategy.')
+        elif name == 'select_strategy':
+            payload = record['payload']
+            summary.update(selection_ref=reference, query_ref=payload['query_ref'],
+                retrospective_ref=payload['retrospective_ref'], decision_count=len(payload['decisions']),
+                requirements='Selection recorded; optimisation also needs optimisation_decision before perform.')
+        return summary
 
     def latest(self, kind, operation=None):
         return next((e for e in reversed(self.events) if e['type'] == kind and

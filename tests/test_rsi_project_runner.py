@@ -504,3 +504,42 @@ def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
         assert runner.events == []
     finally:
         database.close()
+
+
+def test_evidence_inventory_is_compact_and_full_records_remain_available(tmp_path):
+    import json
+    runner, _, database = make(tmp_path)
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        operation = runner.workflow.begin()
+        callback = runner.service.query_backend
+        def with_large_manifest(payload):
+            response = callback(payload)  # Real configured KnowledgeDB query.
+            response['provenance']['test_large_manifest'] = 'x' * 10000
+            return response
+        runner.service.query_backend = with_large_manifest
+        retrieval = runner.tool('query_kdb', Stage.DESIGN, dict(query='stable sum'), operation)
+        summary = retrieval['summary']
+        full = runner.store.read_json(retrieval['reference'])
+        assert retrieval['evidence'] == full
+        assert summary['query_ref'] == retrieval['reference']
+        assert summary['operation_id'] == operation and summary['stage'] == Stage.DESIGN.value
+        assert summary['host_perform_ready'] is False
+        assert summary['mapped_skill_reads_required'] == list(runner.bundle.skills_for(Stage.DESIGN))
+        for group in ('results', 'negative_records'):
+            count = len(full['payload']['response'][group])
+            assert summary['counts'][group] == count
+            assert summary['decision_indexes'][group] == list(range(count))
+        assert len(json.dumps(summary)) < 2048
+        assert len(full['payload']['response']['provenance']['test_large_manifest']) == 10000
+        retro = runner.tool('retrospect', Stage.DESIGN, dict(supplement='Consider actual history'), operation)
+        payload = runner.store.read_json(retro['reference'])['payload']
+        assert retro['summary']['retrospective_ref'] == retro['reference']
+        assert retro['summary']['history_count'] == len(payload['history']) == 2
+        assert retro['summary']['failure_indexes'] == payload['failures']
+        assert retro['summary']['redirection_indexes'] == payload['redirections']
+        assert retro['evidence']['payload'] == payload
+    finally:
+        runner.actor.close()
+        database.close()
