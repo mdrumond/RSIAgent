@@ -132,16 +132,19 @@ def test_cumulative_optimizer_elapsed_is_idempotent_and_preserves_parent_allocat
 def test_existing_transfer_scope_excludes_actual_copy_without_remote_clock_math(tmp_path):
     from test_rsi_domain_execution import make
     from rsi.domain_execution import DomainActivity
-    from rsi.domain_timing import transfer_phase
+    from rsi.domain_timing import transfer_phase, canonical_allowance
     runner, host, _, _, _ = make(tmp_path)
     operation = runner.workflow.begin()
     runner.workflow.dispatched(operation, 'CPU-STUB')
     @transfer_phase
     def copy():
+        assert canonical_allowance() is None
         host.advance(30)
     def command(seconds):
+        before = canonical_allowance()
         host.advance(3)
         copy()
+        assert canonical_allowance() == before - 3
         host.advance(2)
     DomainActivity(runner, operation).run('compile', 'compilation', command, execution=True)
     assert runner.workflow.accounting.seconds() == 5
