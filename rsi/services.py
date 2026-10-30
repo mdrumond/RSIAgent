@@ -540,8 +540,9 @@ class BoundCycle(TuningBindings):
         packet = self.store.read_json(row['artifact_ref'])
         if packet['operation_id'] != operation or packet['original_id'] != row['original_id']:
             raise ValueError('project receipt scope differs')
-        if packet['result']['contract_ref'] != runner.contract_ref:
-            raise ValueError('project contract differs')
+        if (packet['result']['contract_ref'] != runner.contract_ref
+                or packet['result']['execution_contract_ref'] != runner.backend.manifest['contract']):
+            raise ValueError('project or execution contract differs')
         result = packet['result']
         validation = runner.latest('validation-results')
         host_outcome = packet.get('host_outcome', result['status'])

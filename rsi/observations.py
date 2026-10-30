@@ -5,6 +5,7 @@ Selected strategies remain model claims; host command outcomes establish only
 observations on the frozen verifier/input scope, never universal correctness.
 """
 import json
+import hashlib
 
 
 def capture(runner, artifacts, outcome):
@@ -60,7 +61,10 @@ def capture(runner, artifacts, outcome):
     validation = runner.latest('validation-results')
     if validation and validation['source_hash'] != actual:
         validation = None
-    verifier = preview(runner.backend.verifier.read_bytes(), 3000)
+    verifier_bytes = runner.backend.verifier.read_bytes()
+    if hashlib.sha256(verifier_bytes).hexdigest() != runner.backend.contract['verifier']:
+        raise ValueError('frozen verifier changed before observation capture')
+    verifier = preview(verifier_bytes, 3000)
     refs.update((runner.contract_ref, runner.backend.manifest['contract']))
     observation = dict(schema='rsi-project-observations-v1', authority='host-observed-project-facts',
         outcome=outcome, applicability=dict(project_id=spec.project_id, goal=spec.goal,
