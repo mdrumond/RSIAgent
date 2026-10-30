@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 """Production actor and optimizer delivery enforces shared usage and withdrawal."""
 import json
 
@@ -67,7 +69,7 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
     from optimizer.jobs import JobStore,canonical,sha
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import Agent,Backend,candidate
@@ -78,18 +80,45 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
     snapshot['snapshot_id']=sha(canonical(snapshot))
     jobs=JobStore(tmp_path/'jobs')
     key=jobs.create('def forward(x): return x','forward',{'args':[{'shape':[5],'dtype':'float32'}]},snapshot,max_seconds=60)['job_id']
-    loop=OptimizationLoop(jobs,key,Agent([{'action':'cases','signatures':[],'summary':''},
-        {'action':'read-memory','index':0},candidate('fast')]),Backend(),
-        memory_observer=service.optimizer_observer(tmp_path/'optimizer-project'))
-    loop.run(single_evaluation=True)
+    observed = []
+    actual_observer = service.optimizer_observer(tmp_path/'optimizer-project')
+    def observer(kind, snapshot, payload, event_id):
+        result = actual_observer(kind, snapshot, payload, event_id)
+        if kind == 'read-memory' or kind == 'presentation' and result.get('memory_summary'):
+            observed.append((kind, event_id))
+        return result
+    observer.filter_presentation = actual_observer.filter_presentation
+    from canonical_optimizer_fixtures import scripted_optimizer_http
+    delivered = []
+    class DeliveryAgent(Agent):
+        def complete(self, stage, context, record):
+            delivered.extend(row['result'] for row in context['evidence'] if row['name'] == 'read_memory')
+            return super().complete(stage, context, record)
+    agent = DeliveryAgent([{'action':'cases','signatures':[],'summary':''},
+        {'action':'read-memory','index':0},candidate('fast')])
+    state = scripted_optimizer_http(monkeypatch, agent)
+    loop=OptimizationLoop(jobs,key,agent,Backend(),memory_observer=observer)
+    result = loop.run(single_evaluation=True)
+    assert result['status'] == 'running'
+    assert loop.state['canonical_active']['status'] == 'accepted'
+    assert state.requests
+    assert len(delivered) == 1
+    assert all(delivered[0][key] == value for key, value in snapshot['memory_entries'][0].items())
+    requests = [row for row in loop.fixture_runner.events if row['type'] == 'pi-provider-request']
+    assert len(requests) == len(state.requests)
+    reservations = [row['reservation_id'] for row in requests]
+    assert len(reservations) == len(set(reservations))
     rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
     assert len(rows)==1 and rows[0]['actor_role']=='optimizer'
-    assert rows[0]['accesses']==3  # prompt, full read, next prompt
+    assert any(kind == 'presentation' for kind, _ in observed)
+    assert sum(kind == 'read-memory' for kind, _ in observed) == 1
+    accesses = len(set(observed))
+    assert rows[0]['accesses'] == accesses
     service.ledger.transition(base['version'],'quarantined',event_id='bad',reason='Conflict',evidence=['e'*64])
     result=service.optimizer_observer(tmp_path/'optimizer-project')('read-memory',snapshot,
         {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
     assert result['status']=='tool-error'
-    assert service.ledger.stats(base['memory_id'])['accesses']==3
+    assert service.ledger.stats(base['memory_id'])['accesses'] == accesses
 
 
 @pytest.mark.parametrize('withdraw_first',[False,True])

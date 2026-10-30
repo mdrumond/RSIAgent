@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 """Ordinary verified projects correct or retire accessed memories without trials."""
 from dataclasses import asdict
 from pathlib import Path
