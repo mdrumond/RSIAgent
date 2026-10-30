@@ -10,6 +10,9 @@ role_elapsed(operation_id) must read elapsed_seconds from the trusted host
 role_finished ledger for that operation; elapsed_seconds excludes role setup.
 Missing/malformed receipts suspend accounting and leave provider work pending.
 Only this adapter can admit evidence; model proposals cannot introduce facts.
+usage_complete=True is a host attestation that citation/application telemetry was
+fully observed. Without it, exposure cannot establish nonuse. Skill/content hashes
+identify the exact version; names alone never establish pruning eligibility.
 
 Callbacks match CycleScheduler. Validation receives immutable incumbent/candidate
 bundle refs and frozen case IDs plus a durable operation ID. It is a host callback,
@@ -17,6 +20,7 @@ never a role. Unknown provider/validation work requires explicit reconciliation.
 Raw instrumentation remains in CAS and its source logs for later SFT.
 """
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -169,15 +173,33 @@ class Learning:
         self._finish(identity, result)
         return SnapshotUpdate(**result)
 
-    def removal_eligible(self, skill, section, *, safety=False, counterevidence=False, reviewed=False):
+    def removal_eligible(self, skill, section, *, safety=False, counterevidence=False,
+                         reviewed=False, document=None):
+        # Absent explicit citation/application instrumentation is not proof of nonuse.
+        if document is None:
+            if self.active is None:
+                return False
+            document = self._bundle(self.active).document(skill)
         exposed, used = set(), set()
+        section_hash = sha256(document.read(section).encode()).hexdigest()
         for project, ref in self.state['projects'].items():
-            for event in self.store.read_json(ref)['usage']:
-                if event['skill'] == skill and event.get('section') in (None, section):
-                    if event['kind'] == 'exposed':
-                        exposed.add(project)
-                    if event['kind'] in ('cited', 'applied'):
-                        used.add(project)
+            packet = self.store.read_json(ref)
+            if packet.get('usage_complete') is not True:
+                continue
+            for event in packet['usage']:
+                if event['skill'] != skill or event.get('section') not in (None, section):
+                    continue
+                # Section receipts can survive unrelated document edits; whole-document
+                # receipts require that exact document hash, never the skill name alone.
+                matches = (event.get('content_hash') == section_hash if event.get('section') == section
+                           else event.get('skill_hash') == document.digest
+                           and event.get('content_hash') == document.digest)
+                if not matches:
+                    continue
+                if event['kind'] == 'exposed':
+                    exposed.add(project)
+                if event['kind'] in ('cited', 'applied'):
+                    used.add(project)
         return (len(exposed) >= self.window and not used
                 and (not safety or counterevidence or reviewed))
 
@@ -231,13 +253,12 @@ class Learning:
         packet_ref = self.store.put_json(packet)
         self.state['operations'][identity]['packet'] = packet_ref
         self._save()  # Freeze evidence and incumbent before invoking the provider.
-        evidence = [AdmittedEvidence(ref, dict(kind=info['kind'], summary=info['summary'][:1000]))
-                    for ref, info in packet['evidence'].items()]
         # Bounded context; never truncate identifiers, baseline or raw retained CAS.
         prompt = ('Prioritise error avoidance, detection and recovery before optimisation. '
             'Retrieval frequency is not usefulness. Negative results and rejected negative ideas '
             'can demonstrate valuable avoidance. Cite admitted outcome evidence. '
-            'replace sets only Learned guidance; remove deletes one exact learned fragment, '
+            'replace sets Learned guidance and must preserve existing guidance unless deletion is authorised. '
+            'Routine additions append. remove deletes one exact learned fragment. '
             'Add the section when absent. A complete YAML-frontmatter document replacement, '
             'or exact removal outside Learned guidance, requires cited host review/counterevidence. '
             'Never delete a mapped skill. Preserve safety/recovery unless '
@@ -251,6 +272,26 @@ class Learning:
         context['aggregate']['outcomes'] = context['aggregate']['outcomes'][:10]
         context['aggregate']['sections'] = {key: {kind: ids[-10:] for kind, ids in counts.items()}
                                             for key, counts in context['aggregate']['sections'].items()}
+        # Freeze precisely the historical evidence admitted to this invocation.
+        admitted = dict(packet['evidence'])
+        sources = {ref: [packet_ref] for ref in admitted}
+        selected = {item['reference'] for item in context['aggregate']['outcomes']}
+        selected.update(ref for query in context['aggregate']['queries'].values() for ref in query['evidence_ids'])
+        for project, ref in self.state['projects'].items():
+            historical = self.store.read_json(ref)
+            for evidence_id, info in historical['evidence'].items():
+                if evidence_id in selected:
+                    self.store.read_bytes(evidence_id)
+                    if evidence_id in admitted and admitted[evidence_id] != info:
+                        raise ValueError('conflicting admitted evidence metadata')
+                    admitted[evidence_id] = info
+                    sources.setdefault(evidence_id, []).append(ref)
+        operation = self.state['operations'][identity]
+        operation['admitted'] = self.store.put_json(admitted)
+        operation['admission_sources'] = self.store.put_json(sources)
+        self._save()
+        evidence = [AdmittedEvidence(ref, dict(kind=info['kind'], summary=info['summary'][:1000]))
+                    for ref, info in admitted.items()]
         encoded = json.dumps(context, sort_keys=True)
         if len(encoded) + len(prompt) + len(json.dumps([asdict(e) for e in evidence])) > self.context_chars:
             raise ValueError('learning context exceeds bound; host must summarise admitted inputs')
@@ -289,11 +330,12 @@ class Learning:
         incumbent = request['incumbent']
         bundle = self._bundle(incumbent)
         packet = self.store.read_json(operation['packet'])
-        proposal = _proposal('skillwriter', self.store.read_json(proposal_ref), set(packet['evidence']))
+        admitted = self.store.read_json(operation['admitted'])
+        proposal = _proposal('skillwriter', self.store.read_json(proposal_ref), set(admitted))
         if not proposal.evidence_ids:
             raise ValueError('proposal requires admitted outcome support')
         docs = {d.name: d for d in bundle.documents}
-        protected = any(packet['evidence'][ref]['kind'] in ('counterevidence', 'review')
+        protected = any(admitted[ref]['kind'] in ('counterevidence', 'review')
                         for ref in proposal.evidence_ids)
         for edit in proposal.edits:
             if edit.skill not in docs or not edit.content.strip():
@@ -315,14 +357,17 @@ class Learning:
                 docs[edit.skill] = SkillDocument(edit.skill, content)
                 continue
             if edit.operation == 'remove':
-                if not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
-                                             counterevidence=protected):
+                if not protected and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
+                                                               document=doc):
                     raise ValueError('removal lacks exposure window or safety review')
                 if section.count(edit.content) != 1:
                     raise ValueError('remove must identify one exact learned fragment')
                 replacement = section.replace(edit.content, '', 1)
             else:
                 replacement = edit.content + '\n'
+            if (section.strip() and section.strip() not in replacement and not protected
+                    and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True, document=doc)):
+                raise ValueError('replacement deletes guidance without removal authorisation')
             if re.search(r'^#{1,2} |^---$', replacement, re.MULTILINE):
                 raise ValueError('learned fragment cannot change document structure')
             marker = '## Learned guidance\n'
@@ -338,7 +383,7 @@ class Learning:
         reference = self.store.put_json(candidate.to_dict())
         self._bundle(reference)
         self.state['candidates'][reference] = dict(incumbent=incumbent, proposal=proposal_ref,
-            packet=self.store.put_json(packet), memory=request['memory'], quarantined=False)
+            packet=self.store.put_json(packet), admitted=operation['admitted'], admission_sources=operation['admission_sources'], memory=request['memory'], quarantined=False)
         return SnapshotUpdate(**self._finish(identity, dict(reference=reference, actor_seconds=actor_seconds)))
 
     def evaluate(self, candidate, cases, operation_id):
