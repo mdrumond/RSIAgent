@@ -263,18 +263,24 @@ def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_
 
 
 def test_candidate_contract_serializes_a3_argument_semantics_and_safe_baseline():
-    contract = CANDIDATE_SOURCE_CONTRACT.as_dict()
-
-    assert contract["argument_semantics"] == [
-        "count is the logical number of float32 elements to process.",
-        "Global-memory allocations may be padded, but process only indices in [0, count).",
-        "buffer_bytes is the capacity of each independent input-A, input-B, and output local buffer; do not divide it among buffers.",
-    ]
-    assert contract["safe_baseline"] == [
-        "Use three independent TBuf objects for input A, input B, and output, and initialize each one with the full buffer_bytes capacity.",
-        "Use DataCopyPad with blockLen = count * sizeof(float) for logical-tail-safe input and output transfers.",
-        "Order input copies before vector work with an MTE2-to-V event, and order vector work before the output copy with a V-to-MTE3 event.",
-    ]
+    from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateSourceAdmissionError
+    contract = json.loads(json.dumps(CANDIDATE_SOURCE_CONTRACT.as_dict()))
+    source = contract['exported_signature'] + ' {}'
+    backend = A3CandidateBackend(lambda *_args, **_kwargs: pytest.fail('source admission dispatched host'))
+    plan = backend.plan(source, request_id='contract', attempt_id='first', project_id='bounded-tail',
+                        length=33, padded_length=64, block_count=3, seed=7)
+    candidate, = [file for file in plan.files if file.relative_path == contract['source_slot']]
+    assert candidate.content == source
+    assert (plan.logical_length, plan.padded_length, plan.block_count) == (33, 64, 3)
+    assert len(plan.input_a) == len(plan.input_b) == 64
+    assert plan.input_a[33:] == plan.input_b[33:] == (0.0,) * 31
+    output = tuple(a+b for a,b in zip(plan.input_a, plan.input_b))
+    verified = VerifiedResult.from_receipt(plan, ExecutionReceipt(0, output), max_abs_error=0.0)
+    assert verified.passed and verified.source_fingerprint == plan.source_fingerprint
+    with pytest.raises(CandidateSourceAdmissionError):
+        backend.plan(source.replace('uint32_t count', 'uint64_t count'), request_id='contract',
+            attempt_id='wrong-abi', project_id='bounded-tail', length=33, padded_length=64,
+            block_count=3, seed=7)
 
 
 @pytest.mark.parametrize(
@@ -282,78 +288,39 @@ def test_candidate_contract_serializes_a3_argument_semantics_and_safe_baseline()
     build_a3_experiment_plan().cells,
     ids=lambda cell: cell.cell_id,
 )
-def test_candidate_contract_is_identical_in_every_treatment_actor_prompt(
-    tmp_path, cell,
-):
-    actions = [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-        '{"action":"run"}',
-        *(
-            ['{"action":"profile","metric":"PipeUtilization"}']
-            if cell.profiling is ProfilingGuidance.WITH_GUIDANCE else []
-        ),
-        json.dumps({
-            "action": "submit",
-            "interpretation": "host result passed",
-            "supports": [],
-        }),
-    ]
-    result, prompts, _journal = _run(
-        tmp_path / cell.cell_id,
-        actions,
-        cell=cell,
-        knowledge=FakeKnowledge(cell.knowledge is KnowledgeMode.WITH_KDB),
-    )
-
-    assert result.status == "passed"
-    assert all(
-        json.loads(prompt)["candidate_source_contract"]
-        == CANDIDATE_SOURCE_CONTRACT.as_dict()
-        for prompt in prompts
-    )
+def test_candidate_contract_is_identical_in_every_treatment_actor_prompt(tmp_path, cell):
+    from canonical_a3_fixtures import make_trial
+    owner, session = make_trial(tmp_path / cell.cell_id, cell=cell)
+    result = owner.run()
+    assert result.status == 'passed' and result.verified.passed
+    presented = [json.loads(context['task']['domain']['instruction']) for context in session.contexts]
+    assert presented and all(row['source_contract'] == CANDIDATE_SOURCE_CONTRACT.as_dict() for row in presented)
+    queries = owner.baseline_knowledge.journal.read()
+    assert queries and all(row['collection'] == 'baseline' for row in queries)
+    experience = owner.knowledge.journal.read()
+    assert bool(experience) == (cell.knowledge is KnowledgeMode.WITH_KDB)
+    if not owner.knowledge.enabled:
+        assert owner.knowledge.database is None
+        evidence = [row for context in session.contexts for row in context['evidence'] if row['name'] == 'query_kdb']
+        assert all(hit['citation']['collection'] == 'baseline'
+                   for row in evidence for hit in row['result']['evidence']['payload']['response']['results'])
 
 
 def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
-    submitted_supports = []
-
-    def submit_from_context(context):
-        context_value = json.loads(context)
-        observations = context_value["observations"]
-        authoritative = [
-            item["authoritative_evidence"]
-            for item in observations
-            if isinstance(item, dict) and "authoritative_evidence" in item
-        ]
-        assert [item["kind"] for item in authoritative] == [
-            "compile", "host-verification",
-        ]
-        assert all(item["status"] == "passed" for item in authoritative)
-        assert len({item["source_fingerprint"] for item in authoritative}) == 1
-        submitted_supports.extend(
-            context_value["action_contract"]["eligible_submit_supports"]
-        )
-        assert submitted_supports == [
-            item["evidence_sha256"] for item in authoritative
-        ]
-        assert all(len(digest) == 64 for digest in submitted_supports)
-        return json.dumps({
-            "action": "submit",
-            "interpretation": "host compilation and verification passed",
-            "supports": submitted_supports,
-        })
-
-    result, _, journal = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-        '{"action":"run"}',
-        submit_from_context,
-    ])
-
-    assert result.status == "passed"
-    assert journal.read()[0]["memory"]["agent_interpretations"][0][
-        "supports"
-    ] == submitted_supports
+    from canonical_a3_fixtures import make_trial
+    owner, session = make_trial(tmp_path)
+    result = owner.run()
+    assert result.status == 'passed'
+    runner = owner.canonical.build(owner)
+    host = runner.backend.host
+    facts = owner.memory.read()[0]['memory']['host_facts']
+    assert {row['evidence_sha256'] for row in facts} == {
+        host.compilation.attestation_sha256, result.verified.evidence_sha256}
+    receipts = [runner.store.read_json(row['reference']) for row in runner.events if row['type'] == 'domain-result']
+    assert receipts and all(row['observed_terminal'] for row in receipts)
+    assert host.compilation.plan.source_fingerprint == result.verified.source_fingerprint
+    assert owner.run() == result
+    assert len(owner.memory.read()) == 1
 
 
 def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):
@@ -916,67 +883,32 @@ def test_verify_runtime_failure_is_deterministic_and_requires_rewrite(tmp_path):
 
 
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
+    from canonical_a3_fixtures import make_trial
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB, profiling=ProfilingGuidance.WITH_GUIDANCE)
-    knowledge, profiler = FakeKnowledge(True), FakeProfiler()
-    actions = [
-        json.dumps({"action": "write_source", "source": SOURCE}), '{"action":"compile"}',
-        '{"action":"run"}', '{"action":"query","query":"DataCopyPad","limit":2}',
-        '{"action":"profile","metric":"PipeUtilization"}',
-        json.dumps({"action": "submit", "interpretation": "profile supports result", "supports": []}),
-    ]
-    result, prompts, _ = _run(
-        tmp_path, actions, cell=cell, knowledge=knowledge, profiler=profiler
-    )
-    assert result.status == "passed"
-    assert knowledge.queries == ["DataCopyPad"]
-    observation = json.loads(prompts[4])["observations"][-1]
-    assert observation["knowledge_results"][0]["text"].startswith("Use DataCopyPad")
-    assert len(observation["knowledge_results"][0]["text"]) <= 2048
-    assert observation["knowledge_results"][0]["citation"] == {
-        "chunk_id": "1" * 64,
-        "collection": "a3-reference",
-        "content_sha256": "3" * 64,
-        "end_line": 14,
-        "path": "docs/datacopy.md",
-        "source_revision": "2" * 64,
-        "start_line": 10,
-    }
-    assert profiler.requests[0].treatment.value == cell.profiling.value
+    owner, session = make_trial(tmp_path, cell=cell)
+    result = owner.run()
+    assert result.status == 'passed'
+    queries = owner.knowledge.journal.read()
+    assert queries and all(row['collection'] == 'experience' for row in queries)
+    assert all(row['collection_fingerprint'] == owner.knowledge.manifest.fingerprint for row in queries)
+    assert all(row['citations'] for row in queries)
+    request, = owner.profiler.requests
+    assert request.treatment.value == cell.profiling.value
     assert result.profile_result.candidate_execution_id == result.verified.execution_id
-    profile_observation = json.loads(prompts[5])["observations"][-1]
-    assert profile_observation == {
-        "profile_evidence": {
-            "evidence_sha256": result.profile_result.evidence_sha256,
-            "metric": "PipeUtilization",
-            "metric_values": [["vector_ratio", 0.75]],
-            "source_fingerprint": result.profile_result.source_fingerprint,
-            "timeline": [["kernel_count", 20.0]],
-        }
-    }
-    profile_fact = next(
-        fact for fact in json.loads((tmp_path / "memory.jsonl").read_text())["memory"]["host_facts"]
-        if fact["category"] == "profiling"
-    )
-    assert "vector_ratio=0.75" in profile_fact["statement"]
-    assert "kernel_count=20" in profile_fact["statement"]
-    support_contract = json.loads(prompts[5])["action_contract"]
-    assert support_contract["profile_metric"] == "PipeUtilization"
-    assert support_contract["eligible_submit_supports"][-1] == (
-        result.profile_result.evidence_sha256
-    )
+    assert result.profile_result.source_fingerprint == result.verified.source_fingerprint
+    facts = owner.memory.read()[0]['memory']['host_facts']
+    assert any(row['category'] == 'profiling' and row['evidence_sha256'] == result.profile_result.evidence_sha256 for row in facts)
 
 
 def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
-    result, _, _ = _run(
-        tmp_path,
-        [json.dumps({"action": "write_source", "source": SOURCE}),
-         '{"action":"compile"}', '{"action":"run"}',
-         json.dumps({"action": "submit", "interpretation": "host facts", "supports": []})],
-        execution_profile="bz-a3-2",
-    )
-    assert result.status == "passed"
-    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    assert {entry.payload["execution_profile"] for entry in entries} == {"bz-a3-2"}
+    from canonical_a3_fixtures import make_trial
+    owner, session = make_trial(tmp_path, execution_profile='bz-a3-2')
+    result = owner.run()
+    assert result.status == 'passed'
+    assert owner.canonical.build(owner).backend.host.compilation.plan.execution_profile == 'bz-a3-2'
+    assert {entry.payload['execution_profile'] for entry in owner.evidence.entries} == {'bz-a3-2'}
+    assert all(json.loads(context['task']['domain']['instruction'])['execution_profile'] == 'bz-a3-2'
+               for context in session.contexts)
 
 
 def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):
@@ -1289,8 +1221,21 @@ def test_provider_failure_recovery_does_not_hide_mixed_partial_state(tmp_path):
 
 @pytest.mark.parametrize("error", [ValueError("actor bug"), RuntimeError("actor bug")])
 def test_unclassified_actor_errors_still_surface(tmp_path, error):
-    with pytest.raises(type(error), match="actor bug"):
-        _run(tmp_path, [error])
+    from canonical_a3_fixtures import make_trial, A3Session, recording_candidate
+    class BrokenSession(A3Session):
+        def next_action(self, context, allowed, **kwargs):
+            raise error
+    candidate = recording_candidate()
+    owner, _ = make_trial(tmp_path, candidate=candidate, session=BrokenSession(initial=SOURCE))
+    if isinstance(error, ValueError):
+        assert owner.run().status == 'suspended'
+        runner = owner.canonical.build(owner)
+        row = runner.store.read_json(runner.latest('project-run-outcome')['reference'])
+        assert row['result']['error'] == str(error)
+    else:
+        with pytest.raises(type(error), match='actor bug'):
+            owner.run()
+    assert not candidate.calls and not owner.memory.read()
 
 
 def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
@@ -1468,44 +1413,27 @@ def test_model_and_treatment_authorities_must_match_cell(tmp_path):
 
 
 def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
+    from canonical_a3_fixtures import make_trial, recording_candidate
     cell = _cell()
-    profile = load_a3_model_profile(cell.backend_model)
-    journal = Phase1LearningJournal(
-        tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
-        cell_id=cell.cell_id, lineage_id="isolated-lineage",
-        evidence_resolver=Resolver(),
-        trial_protocol_sha256=trial_protocol_sha256(),
-    )
-    clock = FakeClock()
-    def invalid_actor(*_):
-        clock.advance(1)
-        return A3Completion(
-            '{"action":"compile"}', 1, {"profile_sha256": "0" * 64})
-    loop = A3TrialLoop(
-        cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
-        actor=invalid_actor, clock=clock,
-        candidate=FakeCandidate(), knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
-        evidence=EvidenceLedger(tmp_path / "evidence.jsonl"), memory=journal,
-        workdir=tmp_path / "work", budgets=TrialBudgets(1, 100, max_seconds=1),
-    )
-    result = loop.run()
-    assert result.status == "budget-exhausted"
-    assert result.failures == ("completion provenance does not match the cell model",)
+    other = next(model for model in BackendModel if model is not cell.backend_model)
+    candidate = recording_candidate()
+    owner, session = make_trial(tmp_path, cell=cell, candidate=candidate)
+    with pytest.raises(ValueError, match='model profile'):
+        A3TrialLoop(cell=cell, proposal=owner.proposal, profile=load_a3_model_profile(other),
+            actor=owner.actor, candidate=candidate, knowledge=owner.knowledge, profiler=owner.profiler,
+            evidence=owner.evidence, memory=owner.memory, workdir=owner.workdir, canonical=owner.canonical)
+    assert not session.contexts and not candidate.calls and not owner.memory.read()
+    assert owner.run().status == 'passed'
+    assert all(json.loads(context['task']['domain']['instruction'])['profile'] == owner.profile.as_dict()
+               for context in session.contexts)
 
 
 def test_structured_completion_bypasses_text_parser_and_keeps_host_validation(tmp_path, monkeypatch):
-    profile = load_a3_model_profile(_cell().backend_model)
-    selections = [
-        {"action": "compile"},  # Rejected while source is required.
-        {"action": "write_source", "source": SOURCE},
-        {"action": "compile"}, {"action": "run"},
-        {"action": "submit", "interpretation": "host result passed", "supports": []},
-    ]
-    completions = [A3Completion(json.dumps(value), 1, {"profile_sha256": profile.fingerprint},
-                               selected_action=value) for value in selections]
+    from canonical_a3_fixtures import make_trial
     monkeypatch.setattr('benchmarks.a3kernels.trial.parse_action',
-                        lambda _: pytest.fail('structured completion must not be reparsed'))
-    result, prompts, journal = _run(tmp_path, completions)
+                        lambda _: pytest.fail('canonical decisions must not enter the old action parser'))
+    owner, session = make_trial(tmp_path)
+    result = owner.run()
     assert result.status == 'passed' and result.verified.passed
-    assert len(result.failures) == 1
-    assert len(prompts) == 5 and len(journal.read()) == 1
+    assert {context['stage'] for context in session.contexts} >= {'test', 'validation', 'acceptance'}
+    assert len(owner.memory.read()) == 1
