@@ -373,3 +373,47 @@ def test_old_citation_does_not_protect_changed_guidance(env):
         learner.memory_update(baseline, [row], ctx)
     assert learner.removal_eligible('debug', 'learned-guidance', document=changed)
     assert not learner.removal_eligible('debug', 'learned-guidance', document=old)
+
+
+def test_duplicate_candidate_preserves_quarantine_and_validation_decisions(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project()
+    packets['p']['evidence'][row['artifact_ref']]['kind'] = 'counterevidence'
+    learner = make()
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    learner.evaluate(candidate, ('case',), 'v')
+    first_validation = dict(learner.state['candidates'][candidate]['validation'])
+    learner.quarantine(candidate, row['artifact_ref'])
+    again = learner.skill_update(bundle, baseline, row, dict(ctx, operation_id='again')).reference
+    assert again == candidate
+    record = learner.state['candidates'][candidate]
+    assert record['quarantined'] == row['artifact_ref']
+    assert record['validation'] == first_validation
+    assert len(record['proposals']) == 2
+    assert len(record['validations']) == 1
+    assert learner.evaluate(candidate, ('case',), 'v2') == bundle
+    assert len(record['validations']) == 2
+    with pytest.raises(ValueError, match='quarantined'):
+        learner.rollback(candidate)
+
+
+def test_later_regression_can_quarantine_and_survives_restart(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project('original')
+    learner = make()
+    candidate = learner.skill_update(bundle, baseline, row, ctx).reference
+    assert learner.evaluate(candidate, ('case',), 'v') == candidate
+    later, later_ctx = project('regression')
+    counter = later['artifact_ref']
+    packets['regression']['candidate_ref'] = candidate
+    with pytest.raises(ValueError, match='counterevidence'):
+        learner.quarantine(candidate, counter, evidence_row=later)
+    packets['regression']['evidence'][counter]['kind'] = 'counterevidence'
+    learner.quarantine(candidate, counter, evidence_row=later)
+    resumed = make()
+    assert resumed.active == bundle
+    assert resumed.state['candidates'][candidate]['quarantined'] == counter
+    admitted = resumed.state['candidates'][candidate]['quarantine_evidence'][-1]
+    assert store.read_json(admitted['packet'])['project_id'] == 'regression'
+    with pytest.raises(ValueError, match='quarantined'):
+        resumed.rollback(candidate)

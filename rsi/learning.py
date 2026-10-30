@@ -382,8 +382,11 @@ class Learning:
         candidate = SkillBundle(tuple(docs.values()), bundle.mapping)
         reference = self.store.put_json(candidate.to_dict())
         self._bundle(reference)
-        self.state['candidates'][reference] = dict(incumbent=incumbent, proposal=proposal_ref,
-            packet=self.store.put_json(packet), admitted=operation['admitted'], admission_sources=operation['admission_sources'], memory=request['memory'], quarantined=False)
+        origin = dict(incumbent=incumbent, proposal=proposal_ref,
+            packet=self.store.put_json(packet), admitted=operation['admitted'],
+            admission_sources=operation['admission_sources'], memory=request['memory'])
+        record = self.state['candidates'].setdefault(reference, dict(origin, quarantined=False))
+        record.setdefault('proposals', []).append(dict(origin, operation_id=identity))
         return SnapshotUpdate(**self._finish(identity, dict(reference=reference, actor_seconds=actor_seconds)))
 
     def evaluate(self, candidate, cases, operation_id):
@@ -408,6 +411,7 @@ class Learning:
         self.store.read_bytes(verdict.evidence_ref)
         record = self.state['candidates'][request['candidate']]
         record['validation'] = dict(asdict(verdict), cases=request['cases'])
+        record.setdefault('validations', []).append(dict(record['validation'], operation_id=operation_id))
         if (verdict.workflow is True and verdict.correctness is True and not record['quarantined']
                 and self.active == request['incumbent']):
             self.state['active'] = request['candidate']
@@ -416,19 +420,33 @@ class Learning:
         self._finish(operation_id, dict(active=self.active))
         return self.active
 
-    def quarantine(self, candidate, counterevidence_ref):
+    def quarantine(self, candidate, counterevidence_ref, *, evidence_row=None):
+        """Admit later regression evidence through the same trusted loader.
+
+        evidence_row is a host project-result row, never an actor packet or a
+        bare CAS object. The loader verifies scope/authority before admission and
+        returns candidate_ref identifying the affected immutable bundle.
+        """
         record = self.state['candidates'][candidate]
-        packet = self.store.read_json(record['packet'])
+        packet = (self._packet(evidence_row) if evidence_row is not None
+                  else self.store.read_json(record['packet']))
+        if evidence_row is not None and packet.get('candidate_ref') != candidate:
+            raise ValueError('later counterevidence must identify affected candidate')
         if packet['evidence'].get(counterevidence_ref, {}).get('kind') != 'counterevidence':
             raise ValueError('host-admitted counterevidence required')
         record['quarantined'] = counterevidence_ref
+        record.setdefault('quarantine_evidence', []).append(dict(
+            evidence=counterevidence_ref, packet=self.store.put_json(packet)))
         if self.active == candidate:
-            self.state['active'] = record['incumbent']
+            self.state['active'] = next((ref for ref in reversed(self.state['versions'])
+                if ref != candidate and not self.state['candidates'].get(ref, {}).get('quarantined')), None)
         self._save()
 
     def rollback(self, reference):
         if reference not in self.state['versions']:
             raise ValueError('rollback requires previously active immutable version')
+        if self.state['candidates'].get(reference, {}).get('quarantined'):
+            raise ValueError('rollback target is quarantined')
         self._bundle(reference)
         self.state['active'] = reference
         self._save()
