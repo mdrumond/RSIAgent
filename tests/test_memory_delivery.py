@@ -96,6 +96,7 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypa
             return super().complete(stage, context, record)
     agent = DeliveryAgent([{'action':'cases','signatures':[],'summary':''},
         {'action':'read-memory','index':0},candidate('fast')])
+    agent.canonical_fixture = True
     state = scripted_optimizer_http(monkeypatch, agent)
     loop=OptimizationLoop(jobs,key,agent,Backend(),memory_observer=observer)
     result = loop.run(single_evaluation=True)

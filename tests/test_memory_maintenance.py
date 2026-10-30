@@ -252,8 +252,10 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
     snapshot['snapshot_id']=sha(canonical(snapshot))
     jobs=JobStore(tmp_path/'jobs')
     key=jobs.create('def forward(x): return x','forward',{'args':[{'shape':[5],'dtype':'float32'}]},snapshot,max_seconds=60)['job_id']
-    loop=OptimizationLoop(jobs,key,Agent([{'action':'cases','signatures':[],'summary':''},
-        {'action':'read-memory','index':0},candidate('fast')]),Backend(),
+    agent = Agent([{'action':'cases','signatures':[],'summary':''},
+        {'action':'read-memory','index':0},candidate('fast')])
+    agent.canonical_fixture = True
+    loop=OptimizationLoop(jobs,key,agent,Backend(),
         memory_observer=service.optimizer_observer(tmp_path/'optimizer-project'))
     loop.run(single_evaluation=True)
     rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
