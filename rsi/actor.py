@@ -505,7 +505,7 @@ class WorkflowActor:
                     if name == 'select_strategy' and self.recover_invalid_actions:
                         required = {'query_ref': 'query_kdb', 'retrospective_ref': 'retrospect'}
                         invalid = {field: tool for field, tool in required.items()
-                            if args[field] not in {row['result'].get('reference')
+                            if field in args and args[field] not in {row['result'].get('reference')
                                 for row in evidence_material if row['name'] == tool}}
                         if invalid:
                             observation = dict(event='invalid-action', action=name,
