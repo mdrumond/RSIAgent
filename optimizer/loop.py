@@ -124,6 +124,13 @@ class OptimizationLoop:
         try:
             return require_adoption(self.canonical).run(self, prepare_only=prepare_only,
                 single_evaluation=single_evaluation, memory_snapshot=memory_snapshot, context=context)
+        except WorkerStopped:
+            # Classification does not settle an unknown native operation. Its
+            # pending dispatch and clock uncertainty remain available to observe.
+            row = self.store.get(self.key)
+            if row['status'] == 'running' and not row['stop_requested']:
+                self.store.transition(self.key, 'budget-exhausted')
+            raise
         finally:
             close = getattr(self.agent, 'close', None)
             if close is not None:
