@@ -6,6 +6,7 @@ Stopping is cooperative: the service must drain its canonical actor before exit.
 from __future__ import annotations
 
 import fcntl
+import ctypes
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ _TERMINAL = {'completed', 'failed', 'stopped', 'interrupted'}
 def _directory(instance):
     root, _ = _locations(instance)
     directory = root / 'runs' / 'jobs'
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     if directory.resolve() != directory:
         raise ValueError('job directory escapes instance')
     return root, directory
@@ -46,6 +47,22 @@ def _identity(pid):
     return {'pid': pid, 'start_ticks': fields[19],
             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
             'state': fields[0]}
+
+
+def _pidfd_open(pid):
+    if hasattr(os, 'pidfd_open'):
+        return os.pidfd_open(pid)
+    # Some supported Python builds omit the wrapper despite Linux libc support.
+    libc = ctypes.CDLL(None, use_errno=True)
+    operation = getattr(libc, 'pidfd_open', None)
+    if operation is None:
+        raise ValueError('safe process stopping requires Linux pidfd_open support')
+    operation.argtypes, operation.restype = (ctypes.c_int, ctypes.c_uint), ctypes.c_int
+    descriptor = operation(pid, 0)
+    if descriptor < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return descriptor
 
 
 def _alive(identity):
@@ -149,8 +166,10 @@ def stop(instance, job_id):
         # Durable flag covers the launch/identity publication race.
         _publish(directory / f'{job_id}.stop', b'{}\n')
         return record
+    if not _alive(identity):
+        return status(root, job_id)
     try:
-        descriptor = os.pidfd_open(identity['pid'])
+        descriptor = _pidfd_open(identity['pid'])
     except ProcessLookupError:
         return status(root, job_id)
     try:
