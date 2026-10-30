@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 
@@ -43,6 +45,8 @@ def test_independent_instances(tmp_path, inputs):
     for name in ('runs', 'artifacts', 'dashboard'):
         assert (first / name).is_dir()
     manifest = inspect_instance(first)
+    assert all(not Path(name).is_absolute() and '..' not in Path(name).parts
+               and '.git' not in Path(name).parts for name in manifest['files'])
     assert manifest['machinery']['revision']
     assert manifest['files']['machinery/rsi/cli.py']
     assert manifest['files']['machinery/rsi/instances.py']
@@ -153,3 +157,47 @@ def test_committed_release_only(tmp_path, monkeypatch):
     assert not (target / '.env').exists()
     assert not (target / 'untracked.txt').exists()
     assert (repo / 'rsi/instances.py').read_text() == 'uncommitted'
+
+
+def test_installed_wheel_bootstraps_outside_checkout(tmp_path, inputs):
+    root = Path(__file__).resolve().parents[1]
+    revision = git(root, 'rev-parse', 'HEAD')
+    source = tmp_path / 'release-source'
+    # Build input comes exclusively from pinned tracked Git blobs.
+    entries = subprocess.check_output(
+        ['git', '-C', str(root), 'ls-tree', '-rz', revision]).split(b'\0')
+    for entry in filter(None, entries):
+        info, name = entry.split(b'\t', 1)
+        mode, kind, oid = info.split()
+        if kind != b'blob' or mode == b'120000':
+            continue
+        target = source / os.fsdecode(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(
+            ['git', '-C', str(root), 'cat-file', 'blob', oid.decode()]))
+    subprocess.run(
+        [sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--no-build-isolation',
+         '--wheel-dir', str(tmp_path / 'wheels'), str(source)],
+        check=True, capture_output=True)
+    installed = tmp_path / 'installed'
+    subprocess.run(
+        [sys.executable, '-m', 'pip', 'install', '--no-deps', '--no-compile',
+         '--target', str(installed), str(next((tmp_path / 'wheels').glob('rsi-*.whl')))],
+        check=True, capture_output=True)
+    environment = {**os.environ, 'PYTHONPATH': str(installed)}
+    destination = tmp_path / 'instance'
+    arguments = [sys.executable, '-m', 'rsi', 'instance', 'create', str(destination)]
+    for key, value in inputs.items():
+        arguments.extend(['--' + key.replace('_', '-'), str(value)])
+    created = subprocess.run(arguments, cwd=tmp_path, env=environment,
+                             check=True, capture_output=True, text=True)
+    manifest = json.loads(created.stdout)
+    assert manifest['machinery']['kind'] == 'distribution'
+    assert 'machinery/rsi/instances.py' in manifest['files']
+    assert all(not Path(name).is_absolute() and '.git' not in Path(name).parts
+               for name in manifest['files'])
+    environment['PYTHONPATH'] = str(destination / 'machinery')
+    inspected = subprocess.run(
+        [sys.executable, '-m', 'rsi', 'instance', 'inspect', str(destination)],
+        cwd=tmp_path, env=environment, check=True, capture_output=True, text=True)
+    assert json.loads(inspected.stdout) == manifest
