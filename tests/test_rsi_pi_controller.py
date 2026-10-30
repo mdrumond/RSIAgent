@@ -74,7 +74,7 @@ def test_native_completed_tools_keep_conversation_and_main_thread(monkeypatch, t
     finally:actor.close()
     assert flow.stage==Stage.DESIGN and len(called)==1 and len(requests)==2
     assert len([row for kind,row in events if kind=='skill-delivered'])==2
-    assert any(kind=='pi-event' and row['type']=='agent_settled' for kind,row in events)
+    assert any(kind=='pi-event' and row['event']['type']=='agent_settled' for kind,row in events)
 
 
 def test_native_compaction_runs_through_same_gateway_without_context_rewrite(monkeypatch,tmp_path):
@@ -105,7 +105,7 @@ def test_native_compaction_runs_through_same_gateway_without_context_rewrite(mon
         actor.step({'goal':'force Pi native compaction'})
     finally:actor.close()
     assert summaries and len(recalls)==9 and flow.stage==Stage.DESIGN
-    assert any(kind=='pi-event' and row['type']=='compaction_end' and not row.get('aborted') for kind,row in events), [row for kind,row in events if kind=='pi-event' and 'compact' in row['type']]
+    assert any(kind=='pi-event' and row['event']['type']=='compaction_end' and not row['event'].get('aborted') for kind,row in events), [row['event'] for kind,row in events if kind=='pi-event' and 'compact' in row['event']['type']]
     assert len([row for kind,row in events if kind=='pi-provider-request'])==len(requests)
     assert any('retained evidence' in json.dumps(request) for request in summaries)
 
@@ -212,7 +212,7 @@ def test_successful_native_settlement_commits_stage_once(monkeypatch,tmp_path):
     try:
         actor.step({});actor.step({'goal':'commit once after settlement'})
     finally:actor.close()
-    settled=next(i for i,(kind,row) in enumerate(events) if kind=='pi-event' and row['type']=='agent_settled')
+    settled=next(i for i,(kind,row) in enumerate(events) if kind=='pi-event' and row['event']['type']=='agent_settled')
     commits=[i for i,(kind,row) in enumerate(events) if kind=='stage-result' and row['stage']==Stage.TASK_CONSTRUCTION.value]
     assert performed==[True] and len(commits)==1 and commits[0]>settled
     assert flow.stage==Stage.DESIGN and flow.pending is None and len(flow.state['history'])==2
@@ -516,3 +516,34 @@ def test_only_explicit_wall_deadline_bounds_adopted_route(monkeypatch):
     adapter=PiSessionAdapter.from_existing_session(raw,wall_deadline=wall)
     try:assert adapter.session.enclosing_deadline==wall
     finally:adapter.close()
+
+
+def test_real_project_runner_durably_records_native_pi_event_envelopes(monkeypatch,tmp_path):
+    from coding.pi.session import runtime_preflight,RuntimeUnavailable
+    from test_rsi_project_runner import make
+    try:runtime_preflight()
+    except RuntimeUnavailable:pytest.skip('cached pinned Pi/Node22 required')
+    calls=[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        calls.append(json.loads(kwargs['data']))
+        return response([('read_skill',{'name':name}) for name in names] if len(calls)==1 else
+                        [('perform',{'proposal':'freeze actual Python task contract'})],len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    runner,_,database=make(tmp_path,session_factory=lambda:PiSessionAdapter(
+        model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}))
+    try:
+        runner.actor.step(runner.context())
+        runner.actor.step(runner.context())
+        persisted=[runner.store.read_json(ref) for ref in json.loads(runner.event_path.read_text())]
+        pi_events=[row for row in persisted if row['type']=='pi-event']
+        assert pi_events and any(row['event']['type']=='agent_settled' for row in pi_events)
+        assert runner.workflow.stage==Stage.DESIGN and runner.workflow.pending is None
+        assert len(runner.workflow.state['history'])==2 and len(calls)==2
+        from core.artifacts import canonical_bytes
+        assert canonical_bytes(persisted)==canonical_bytes(runner.events)
+        operation=runner.workflow.state['history'][-1]['evidence']['operation_id']
+        assert all(row['operation_id']==operation for row in pi_events)
+    finally:
+        runner.actor.close()
+        database.close()

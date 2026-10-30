@@ -220,7 +220,7 @@ class ControllerSession(PiCodingSession):
         try:
             prompt = dict(task=resource(turn[0]['task']), **status())
             self.rpc.prompt(json.dumps(prompt), pump=pump, remaining_seconds=remaining,
-                on_event=lambda event:record('pi-event',event))
+                on_event=lambda event:record('pi-event',dict(event=event)))
             while not self.gateway.finished.is_set() or not self.requests.empty():
                 pump()
                 remaining()
