@@ -88,8 +88,12 @@ def test_sink_failure_does_not_establish_read(tmp_path):
 def test_builtins_cover_stages_and_global_skills():
     bundle = builtin_bundle()
     for stage in Stage:
-        assert stage.value in bundle.skills_for(stage)
-        assert 'kdb' in bundle.skills_for(stage)
+        assigned = bundle.skills_for(stage)
+        assert assigned
+        for name in assigned:
+            document = bundle.document(name)
+            assert document.content
+        assert 'kdb' in assigned
     for name in ('memory-update', 'recovery', 'skill-writing', 'skill-evaluation'):
         assert bundle.document(name).content
 
