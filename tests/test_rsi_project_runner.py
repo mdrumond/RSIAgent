@@ -125,6 +125,32 @@ def test_missing_query_refuses_strategy_before_host_execution(tmp_path):
         database.close()
 
 
+def test_noop_with_redundant_edit_receives_feedback_before_host_dispatch(tmp_path):
+    class RedundantEdit(Session):
+        attempted = False
+        def next_action(self, context, allowed, **kwargs):
+            name, args = super().next_action(context, allowed, **kwargs)
+            if name == 'perform' and context['stage'] == 'optimisation' and not self.attempted:
+                self.attempted = True
+                source = context['source']
+                args = dict(args, edit=dict(path=source['path'], sha256=source['sha256'],
+                                            source=source['text']))
+            return name, args
+    runner, _, database = make(tmp_path, RedundantEdit())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        invalid = [e for e in runner.events if e['type']=='actor-invalid-action']
+        assert len(invalid) == 1 and invalid[0]['accepted'] is False
+        operation = invalid[0]['operation_id']
+        assert len([e for e in runner.events if e['type']=='host-dispatch'
+                    and e['operation_id']==operation]) == 1
+        assert not any(e['type']=='source-edit' and e['operation_id']==operation for e in runner.events)
+        assert runner.workflow.accounting.seconds('thinking') > 0
+    finally:
+        database.close()
+
+
 def test_pending_resume_never_calls_provider_twice(tmp_path):
     session = Session(missing_query=True)
     runner, injections, database = make(tmp_path, session)
@@ -926,5 +952,80 @@ def test_unfinished_query_dispatch_vetoes_admission_record_and_old_rejection(tmp
         with pytest.raises(WorkflowError, match='untrusted'):
             reopened.workflow.reject_operation(operation, old_reference, source)
         assert reopened.workflow.pending['id'] == operation
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('correction', ['redirect', 'reject'])
+def test_strategy_rejection_reuses_real_receipts_and_original_budget(tmp_path, correction):
+    from copy import deepcopy
+    import time
+
+    class ModelClock:
+        value = 0.
+
+        def __call__(self):
+            return time.time() + self.value
+
+    clock = ModelClock()
+
+    class CorrectStrategy(Session):
+        invalid_args = None
+        corrected_args = None
+        feedback = None
+
+        def next_action(self, context, allowed, **kwargs):
+            clock.value += 2
+            if self.invalid_args is not None and self.corrected_args is None:
+                self.feedback = deepcopy(context)
+                assert not any(e['type'] == 'strategy-evidence' and e['kind'] == 'selection'
+                               for e in runner.events)
+                assert not any(row['name'] == 'select_strategy' for row in context['evidence'])
+                assert context['observation']['event'] == 'invalid-action'
+                assert context['observation']['action'] == 'select_strategy'
+                assert context['observation']['accepted'] is False
+                args = deepcopy(self.invalid_args)
+                for decision in args['decisions']:
+                    if decision['group'] == 'negative_records':
+                        if correction == 'redirect':
+                            decision['redirection'] = 'Replace naive accumulation with fsum'
+                        else:
+                            decision['action'] = 'rejected'
+                self.corrected_args = args
+                return 'select_strategy', args
+            name, args = super().next_action(context, allowed, **kwargs)
+            if name == 'select_strategy' and self.invalid_args is None:
+                for decision in args['decisions']:
+                    if decision['group'] == 'negative_records':
+                        decision['action'] = 'used'
+                        decision.pop('redirection', None)
+                self.invalid_args = deepcopy(args)
+            return name, args
+
+    session = CorrectStrategy()
+    runner, _, database = make(tmp_path, session, clock=clock,
+        source_text='from math import fsum\ndef solve(xs): return fsum(xs)\n')
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        feedback = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(feedback) == 1
+        failure = feedback[0]
+        operation = failure['operation_id']
+        tools = [e for e in runner.events if e['type'] == 'project-tool'
+                 and e['operation_id'] == operation]
+        assert [e['name'] for e in tools] == ['query_kdb', 'retrospect', 'select_strategy']
+        payload = runner.store.read_json(tools[-1]['reference'])['payload']
+        assert payload == session.corrected_args
+        for field in ('query_ref', 'retrospective_ref', 'skill_refs'):
+            assert payload[field] == session.invalid_args[field]
+        inventory = session.feedback['evidence_receipts']
+        assert {row['reference'] for row in inventory} == {e['reference'] for e in tools[:2]}
+        assert {row['receipt_id'] for row in session.feedback['skill_receipts']} == set(payload['skill_refs'])
+        completed = [row for row in result['history'] if row['evidence']['operation_id'] == operation]
+        assert len(completed) == 1 and completed[0]['passed']
+        stages = [row['evidence']['stage'] for row in result['history']]
+        assert sorted(stages) == sorted(stage.value for stage in Stage)
+        assert runner.workflow.accounting.seconds('thinking') >= session.calls * 2 + 2
     finally:
         database.close()
