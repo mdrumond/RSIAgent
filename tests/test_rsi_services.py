@@ -181,7 +181,7 @@ def test_baseline_corruption_and_backend_substitution_are_rejected(instance):
         InstanceServices(instance.root, environment={}).open_cycle('safe')
     with (instance.root / 'memory/knowledge.sqlite3').open('ab') as stream:
         stream.write(b'changed')
-    with pytest.raises(ValueError, match='checksum'):
+    with pytest.raises(ValueError, match='checksum|baseline'):
         instance.create_cycle('bad', 'phase1')
     assert not (instance.root / 'runs/bad').exists()
 
@@ -757,6 +757,20 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
         assert cycle.scheduler.state['spent'] == (original['actor_seconds'] + .25 + comparison['actor_seconds'])
     finally:
         cycle.close()
+    parent_files = {name: (cycle.root / name).read_bytes()
+                    for name in ('cycle.json', 'learning.json', 'memory/active.json')}
+    inherited = instance.create_cycle('published-inference', 'inference')
+    try:
+        assert inherited.binding['input_handoff']['parent_cycle'] == 'paired-failed'
+        assert inherited.scheduler.state['skills'] == pair.frozen['candidate']
+        assert inherited.scheduler.state['memory'] == cycle.scheduler.state['memory']
+        inherited.step()  # Existing inference fork creates its own mutable heads.
+        assert inherited.memory.root != cycle.memory.root
+        assert inherited.learning.path != cycle.learning.path
+        for name, data in parent_files.items():
+            assert (cycle.root / name).read_bytes() == data
+    finally:
+        inherited.close()
 
 
 def test_phase1_observed_code_and_measurements_reach_phase2_query(instance):
@@ -786,13 +800,10 @@ def test_phase1_observed_code_and_measurements_reach_phase2_query(instance):
         baseline = phase1.memory.snapshot()
     finally:
         phase1.close()
-    path = instance.root / 'phase1-memory.json'
-    path.write_bytes(baseline)
-    config = show_configuration(instance.root)['payload']
-    config.update(memory_snapshot=path.name, memory_sha256=hashlib.sha256(baseline).hexdigest())
-    set_configuration(instance.root, config)
     phase2 = instance.create_cycle('observation-phase2', 'phase2')
     try:
+        assert phase2.binding['input_handoff']['parent_cycle'] == 'observation-phase1'
+        assert phase2.spec.baseline_kdb == hashlib.sha256(baseline).hexdigest()
         response = phase2.query(phase2.spec.baseline_kdb)({'query': feature})
         facts = response['results'][0]['observations']
         assert facts['final_sources'][0]['text'] == source

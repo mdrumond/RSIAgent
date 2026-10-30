@@ -15,13 +15,12 @@ import json
 import os
 from pathlib import Path
 import re
-import sqlite3
 import time
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.subject_memory import SubjectMemory, digest as memory_digest
 from rsi.actor import PiSessionAdapter
-from rsi.configuration import show_configuration
+from rsi.configuration import _snapshot, show_configuration
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec, Stage
 from rsi.cycles import CycleScheduler, HostTaskResult
 from rsi.learning import Learning, Validation
@@ -38,6 +37,7 @@ from rsi.service_tuning import TuningBindings
 from rsi.instance_ingestion import load_ingestion_records
 from rsi.evidence_io import _references
 from rsi.observations import capture as capture_observations
+from rsi.handoffs import capture_parent
 from rsi.evaluation import SkillEvaluation, TuningController, case_identity
 
 
@@ -78,9 +78,11 @@ class InstanceServices:
             raise ValueError('configured executable does not exist')
         return path.absolute()
 
-    def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None):
+    def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None,
+                     from_cycle=None, inheritance='auto', input_overrides=()):
         created = time.time()
         mode = Mode(mode)
+        input_overrides = tuple(input_overrides)
         if recover is not None and type(recover) is not bool:
             raise ValueError('recovery override must be bool or null')
         root = self.root / 'runs' / _name(cycle_id)
@@ -94,41 +96,48 @@ class InstanceServices:
         # Validate every configured host command before publishing the cycle.
         for spec in projects:
             self.project_config(config, spec)
-        with self.setup.measure('baseline-skills-load', cycle_id):
-            mapping_path = self.path(config.get('skill_map_ref', config['skill_map']))
-            mapping = {Stage(k): tuple(v) for k, v in json.loads(mapping_path.read_text()).items()}
-            bundle = SkillBundle.capture(self.path(config.get('baseline_skills', config['skills'])), mapping)
-        skills = self.store.put_json(bundle.to_dict())
-        kdb = self.path(config.get('baseline_kdb', config['kdb']))
-        if kdb.is_dir():
-            kdb = kdb / config.get('kdb_filename', 'knowledge.sqlite3')
-        if not kdb.is_file():
-            raise ValueError('existing baseline knowledge.sqlite3 required')
-        # Bootstrap inventory authenticates the copied baseline before opening SQLite.
-        manifest = json.loads((self.root / 'instance.json').read_text())
-        relative = str(kdb.relative_to(self.root)) if kdb.is_relative_to(self.root) else None
-        expected = config.get('kdb_sha256') or manifest.get('files', {}).get(relative)
-        if not expected or hashlib.sha256(kdb.read_bytes()).hexdigest() != expected:
-            raise ValueError('verified baseline KDB checksum required')
-        initial = b''
-        if config.get('memory_snapshot'):
-            initial = self.path(config['memory_snapshot']).read_bytes()
-            if hashlib.sha256(initial).hexdigest() != config.get('memory_sha256'):
-                raise ValueError('verified baseline memory checksum required')
+        with self.setup.measure('accepted-input-capture', cycle_id):
+            parent = capture_parent(self.root, mode, from_cycle, inheritance=inheritance,
+                                    overrides=input_overrides, configuration=snapshot)
+        requested_config = self.store.put_json(snapshot)
+        # Explicit parent policy acknowledges inherited baseline settings. Keep new
+        # curriculum/prompts/provider, but bind inherited KDB provenance consistently.
+        if parent.parent_cycle is not None:
+            source = self.store.read_json(parent.source_config_ref)['payload']
+            keys = dict(memory=('memory_snapshot', 'memory_sha256'),
+                skills=('baseline_skills', 'skills', 'skill_map_ref', 'skill_map'),
+                kdb=('baseline_kdb', 'kdb', 'kdb_sha256', 'kdb_filename', 'kdb_collections', 'kdb_ingestion_refs'))
+            config = json.loads(json.dumps(config))
+            for component, names in keys.items():
+                if component not in input_overrides:
+                    for name in names:
+                        if name in source:
+                            config[name] = source[name]
+                        else:
+                            config.pop(name, None)
+            snapshot = _snapshot(config)
+        bundle = SkillBundle.from_dict(self.store.read_json(parent.skills_ref))
+        mapping = dict(bundle.mapping)
+        skills = parent.skills_ref
+        initial = self.store.read_bytes(parent.memory_ref)
         root.mkdir(parents=True)
         with self.setup.measure('baseline-kdb-copy', cycle_id):
-            with sqlite3.connect(kdb.as_uri() + '?mode=ro', uri=True) as source:
-                with sqlite3.connect(root / 'knowledge.sqlite3') as target:
-                    source.backup(target)
-        kdb_ref = self.store.put_bytes((root / 'knowledge.sqlite3').read_bytes())
+            with (root / 'knowledge.sqlite3').open('xb') as stream:
+                stream.write(self.store.read_bytes(parent.kdb_ref))
+                stream.flush()
+                os.fsync(stream.fileno())
         with self.setup.measure('accepted-memory-load', cycle_id):
             memory = self._memory(root / 'memory', initial)
         memory_ref = self.store.put_bytes(memory.snapshot())
+        if memory_ref != parent.memory_ref:
+            raise ValueError('copied accepted memory differs from captured parent')
         configuration_ref = self.store.put_json(snapshot)
         spec = CycleSpec(cycle_id, mode, projects, memory_ref, skills,
                          self.store.put_json({k.value: list(v) for k, v in mapping.items()}), configuration_ref)
         atomic_json(root / 'service.json', dict(spec=spec.to_dict(), config=snapshot,
-            kdb=kdb_ref, initial=initial.decode(), recover=recover, created=created,
+            kdb=parent.kdb_ref, initial=initial.decode(), recover=recover, created=created,
+            requested_configuration_ref=requested_config, input_handoff=asdict(parent),
+            input_policy=dict(inheritance=inheritance, overrides=list(input_overrides), from_cycle=from_cycle),
             test_identity=self.test.identity if self.test else None))
         return self.open_cycle(cycle_id)
 
@@ -139,15 +148,25 @@ class InstanceServices:
         if snapshot is not None and snapshot.get('schema') != 'subject-memory-snapshot-v1':
             raise ValueError('accepted SubjectMemory snapshot required')
         memory = SubjectMemory(root, (snapshot['initial_memory'].encode() if snapshot else b''))
-        if snapshot and not memory.records():
+        if snapshot:
+            empty = not memory.records()
             with memory.transaction() as state:
                 for record in snapshot['memories']:
                     version = memory_digest(record)
                     folder = memory.root / 'versions'
                     folder.mkdir(exist_ok=True)
-                    atomic_json(folder / (version + '.json'), record)
-                    state['active'][record['memory_id']] = version
-            if json.loads(memory.snapshot()) != snapshot:
+                    path = folder / (version + '.json')
+                    if path.exists() and json.loads(path.read_text()) != record:
+                        raise ValueError('inherited accepted memory version differs')
+                    if not path.exists():
+                        atomic_json(path, record)
+                    if empty:
+                        state['active'][record['memory_id']] = version
+                    # This is inheritance of an accepted snapshot, not a new task verdict.
+                    identity = 'inherited-snapshot:' + hashlib.sha256(baseline).hexdigest() + ':' + version
+                    state['admissions'].setdefault(identity,
+                        dict(memory_id=record['memory_id'], version=version))
+            if empty and json.loads(memory.snapshot()) != snapshot:
                 raise ValueError('accepted baseline memory differs')
         return memory
 
