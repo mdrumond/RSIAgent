@@ -172,7 +172,7 @@ class Gateway:
                         owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes, **getattr(error,"details",{})})
                         return self.error(413, "context_length_exceeded: request exceeds the context window byte budget", context_overflow=True)
                     return self.error(400, "invalid smoke request")
-                row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
+                row = {"reservation_id": rid, "dispatch_attempted": False, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
                 owner.records.append(row)
                 owner.finished.clear()
                 try:
@@ -181,6 +181,7 @@ class Gateway:
                     owner.on_record("pi-provider-request", {
                         "reservation_id": rid, "request_bytes": row["request_bytes"], "request": request})
                     url = "https://api.openai.com/v1/responses" if responses else owner.spec["url"]
+                    row["dispatch_attempted"] = True
                     with requests.post(url, data=json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode(), headers={
                         "Content-Type": "application/json",
                         "Authorization": "Bearer " + owner.api_key,
