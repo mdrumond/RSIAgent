@@ -329,3 +329,77 @@ def test_pi_dispatch_identity_is_durable_before_thinking(tmp_path):
     request = next(data for kind,data in events if kind == 'actor-request')
     provider = next(data for kind,data in events if kind == 'pi-provider-request')
     assert request['request_id'] == provider['request_id']
+
+
+@pytest.mark.parametrize('with_context_read', [False, True])
+def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_path, with_context_read):
+    from coding.pi.session import runtime_preflight, RuntimeUnavailable
+    from test_pi_runtime import stream
+    try: runtime_preflight()
+    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
+    bundle = builtin_bundle()
+    names = bundle.skills_for(Stage.TASK_CONSTRUCTION)
+    events, executed, requests = [], [], []
+    guide = 'Python project context. ' * 100
+
+    def actual_reads():
+        return [data['skill'] for kind,data in events if kind == 'skill-usage'
+                and data['kind'] == 'read' and data['stage'] == Stage.TASK_CONSTRUCTION.value]
+
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        index = len(requests)
+        if with_context_read and index == 1:
+            snapshot = json.loads(next(m['content'] for m in request['messages'] if m['role']=='user'))
+            reference = snapshot['context']['host']['task']['guide']['record']
+            actions = [('read_context', {'record':reference, 'limit':128})]
+        elif index == 1 + int(with_context_read):
+            actions = [('read_skill', {'name':name}) for name in names]
+            actions.append(('perform', {'proposal':'phantom execution'}))
+            if with_context_read:
+                pages = [json.loads(m['content']) for m in request['messages'] if m['role']=='tool']
+                assert pages[0]['text'] == guide[:128]
+        elif index == 2 + int(with_context_read):
+            assert actual_reads() == [names[0]] and not executed
+            actions = [('read_skill', {'name':names[1]})]
+        else:
+            assert index == 3 + int(with_context_read) and actual_reads() == list(names) and not executed
+            actions = [('perform', {'proposal':'verified host invocation'})]
+        response = stream(*actions[0], index)
+        original = response.iter_lines
+        def lines():
+            for line in original():
+                if line.startswith(b'data: {'):
+                    body = json.loads(line[6:])
+                    delta = body['choices'][0]['delta']
+                    if delta.get('tool_calls'):
+                        delta['tool_calls'] = [dict(index=i, id=f'batch_{index}_{i}', type='function',
+                            function=dict(name=name, arguments=json.dumps(args)))
+                            for i,(name,args) in enumerate(actions)]
+                        line = b'data: ' + json.dumps(body).encode()
+                yield line
+        response.iter_lines = lines
+        return response
+
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
+    actor = WorkflowActor(flow, bundle,
+        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
+        perform=lambda stage,args,*_:executed.append(args['proposal']) or StageResult(),
+        preflight=lambda *_:StageResult(), emit=lambda kind,data:events.append((kind,data)))
+    try:
+        actor.step({})
+        actor.step({'guide':guide})
+    finally:
+        actor.close()
+    assert flow.stage == Stage.DESIGN and len(requests) == 3 + int(with_context_read)
+    assert actual_reads() == list(names)
+    assert executed == ['verified host invocation']
+    actions = [data for kind,data in events if kind == 'pi-action']
+    assert [data['discarded_actions'] for data in actions] == [2, 0, 0]
+    context_reads = [data for kind,data in events if kind == 'pi-context-read']
+    assert len(context_reads) == int(with_context_read)
+    if with_context_read:
+        assert context_reads[0]['record'] == hashlib.sha256(guide.encode()).hexdigest()
+        assert context_reads[0]['bytes'] == 128
