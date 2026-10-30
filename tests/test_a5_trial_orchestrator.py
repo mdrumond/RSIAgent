@@ -368,6 +368,17 @@ def test_actions_before_write_return_recoverable_observations(tmp_path, action):
     assert result.verified.passed
 
 
+def _legacy_loop_sentinel(monkeypatch, dispatch):
+    """Detect legacy dispatch without loading its optional provider dependencies."""
+    import sys
+    from types import ModuleType
+    import core
+    legacy = ModuleType('core.loop')
+    legacy.run_attempt = dispatch
+    monkeypatch.setitem(sys.modules, 'core.loop', legacy)
+    monkeypatch.setattr(core, 'loop', legacy, raising=False)
+
+
 def test_core_driver_freezes_generation_and_restricted_nudges(canonical_kernel, monkeypatch):
     from rsi.domain_execution import CanonicalAdoption
     case = canonical_kernel
@@ -376,7 +387,7 @@ def test_core_driver_freezes_generation_and_restricted_nudges(canonical_kernel, 
     adoption = CanonicalAdoption(
         lambda owner, **inputs: native.build(case.driver, **inputs),
         lambda owner, runner, result, inputs: native.finish(case.driver, runner, result, inputs))
-    monkeypatch.setattr('core.loop.run_attempt', lambda *a, **kw: pytest.fail('legacy loop ran'))
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: pytest.fail('legacy loop ran'))
     driver = CoreAttemptDriver(object(), cfg, lambda path: path, canonical=adoption)
     result = case.run(driver)
     assert result.status == 'host-verified'
@@ -402,7 +413,7 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(
     adoption = CanonicalAdoption(
         lambda owner, **inputs: native.build(case.driver, **inputs),
         lambda owner, runner, result, inputs: native.finish(case.driver, runner, result, inputs))
-    monkeypatch.setattr('core.loop.run_attempt', lambda *a, **kw: pytest.fail('legacy context manager ran'))
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: pytest.fail('legacy context manager ran'))
     result = case.run(CoreAttemptDriver(object(), cfg, lambda path: path, canonical=adoption))
     assert result.status == 'host-verified'
     assert dict(vars(cfg)) == baseline
@@ -413,7 +424,7 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(
 def test_core_driver_requires_explicit_canonical_configuration_before_dispatch(tmp_path, monkeypatch):
     from rsi.domain_execution import CanonicalConfigurationError
     calls = []
-    monkeypatch.setattr('core.loop.run_attempt', lambda *a, **kw: calls.append('legacy'))
+    _legacy_loop_sentinel(monkeypatch, lambda *a, **kw: calls.append('legacy'))
     driver = CoreAttemptDriver(object(), object(), lambda path: calls.append('sink'))
     with pytest.raises(CanonicalConfigurationError):
         driver('task', profile=load_a5_model_profile(), workspace=tmp_path, context=tmp_path,

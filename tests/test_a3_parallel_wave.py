@@ -3,7 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import PurePosixPath
-from threading import Barrier, Lock, local
+from threading import Barrier, Lock
 import time
 
 import pytest
@@ -158,7 +158,9 @@ def test_semantic_project_failure_does_not_stop_the_pool():
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_path, capsys, interrupt):
+def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_path, capsys, interrupt, monkeypatch):
+    from canonical_a3_fixtures import install_native_kernel, native_knowledge_config, embedding_factory
+    sessions = install_native_kernel(monkeypatch, baseline_root=tmp_path)
     guide = tmp_path / "guide.md"
     guide.write_text("Native guide")
     initial = tmp_path / "initial.md"
@@ -168,11 +170,12 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         cpl_remote="/tools/cpl-remote", validation_wrapper="/checked/catlass-validation.sh",
         remote_workspace="/owned", physical_devices=[2, 5],
         environment_identity=dict(cann_version="cann", profiler_version="msprof"))
+    config.update(native_knowledge_config(tmp_path))
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     root = tmp_path / "campaign"
     barrier, lock = Barrier(2), Lock()
-    transports, measurements, openings = [], [], []
+    transports, measurements = [], []
     first_run = True
 
     class Transport:
@@ -217,11 +220,6 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         def capture(self, metric):
             return self.result("profile")
 
-    state = local()
-    source = 'extern "C" __global__ __aicore__ void project_kernel(GM_ADDR gm_input0, GM_ADDR gm_output) {}'
-    actions = [json.dumps({"write": {"slot": "kernel", "content": source}}),
-               '{"run":{}}', '{"request-timing":{}}', '{"request-profile":{}}', '{"submit":{}}']
-
     def provider(**kwargs):
         messages = kwargs["request"]["messages"]
         if "Curriculum Agent" in messages[0]["content"]:
@@ -240,19 +238,14 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         elif "Distill only" in messages[0]["content"] or "Distill only" in messages[-1]["content"]:
             text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
         else:
-            index = getattr(state, "index", 0)
-            if index == 0:
-                with lock:
-                    openings.append(messages[1]["content"])
-            text = actions[index]
-            state.index = index + 1
+            pytest.fail("kernel decisions escaped the canonical session factory")
         return DirectCompletion(text, 1)
 
     args = ["--target", "a3", "run", "--root", str(root), "--objective", "Learn native measurement",
         "--initial-memory", str(initial), "--config", str(path), "--model", "openai/gpt-5.6-sol",
         "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance",
         "--project-target", "2", "--max-projects", "2"]
-    deps = dict(transport_factory=Transport, provider_transport=provider, measurement_factory=Measurement,
+    deps = dict(embedding_factory=embedding_factory, transport_factory=Transport, provider_transport=provider, measurement_factory=Measurement,
         environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
     main(args, **deps)
     if interrupt:
@@ -265,10 +258,12 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
     assert {transport.device for transport in transports} == {2, 5}
     assert len({transport.state for transport in transports}) == 2
     assert all("native-workers" in str(transport.state) for transport in transports)
-    assert len(openings) == 2
-    # Both projects see exactly the same production context and pre-wave memory.
-    assert openings[0].split("\nPre-wave memory (immutable, readable index): ")[1] == openings[1].split(
-        "\nPre-wave memory (immutable, readable index): ")[1]
+    active_sessions = [session for session in sessions if session.contexts]
+    assert len(active_sessions) == 2
+    instructions = [session.contexts[0]['task']['domain']['instruction'] for session in active_sessions]
+    # Immutable pre-wave memory is identical while each branch has its own task.
+    memories = [text.split("Pre-wave memory (immutable, readable index): ")[-1] for text in instructions]
+    assert memories[0] == memories[1]
     for project in (("copy-0",) if interrupt else ("copy-0", "copy-1")):
         rows = [row for row in measurements if row[0] == project]
         assert {row[2] for row in rows} == {"timing", "profile"}
@@ -281,7 +276,7 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
     assert list(json.loads(publication.read_bytes())["commits"])[0]["project_id"] == "copy-0"
     main(["resume" if arg == "run" else arg for arg in args], **deps)
     assert before == {p: p.read_bytes() for p in before}
-    assert len(openings) == 2
+    assert len([session for session in sessions if session.contexts]) == 2
 
 
 def test_phase2_rejects_parallel_workers_before_opening_state(tmp_path):
