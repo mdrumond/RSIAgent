@@ -6,7 +6,7 @@ import pytest
 
 from core.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.subject_memory import SubjectMemory
-from rsi.configuration import _snapshot
+from rsi.configuration import _snapshot, checked_snapshot
 from rsi.contracts import CycleSpec, Mode, ProjectSpec
 from rsi.cycles import CycleScheduler, HostTaskResult, SnapshotUpdate
 from rsi.handoffs import capture_parent
@@ -170,3 +170,14 @@ def test_mismatched_configuration_refused(tmp_path):
     atomic_json(folder / 'service.json', binding)
     with pytest.raises(ValueError, match='configuration differs'):
         capture_parent(root, 'phase2', configuration=config)
+
+
+def test_checked_snapshot_detaches_and_rejects_changed_payload():
+    original = _snapshot({'prompts': {'actor': 'keep independent verification'}})
+    detached = checked_snapshot(original)
+    detached['payload']['prompts']['actor'] = 'changed'
+    assert original['payload']['prompts']['actor'] == 'keep independent verification'
+    with pytest.raises(ValueError, match='integrity'):
+        checked_snapshot(detached)
+    with pytest.raises(ValueError):
+        checked_snapshot(_snapshot({'budgets': {'actor_seconds': -1}}))
