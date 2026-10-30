@@ -5,7 +5,8 @@ import json
 import pytest
 
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
-from rsi.cycles import CycleScheduler, HostTaskResult, IsolationSnapshot, SimplificationResult, SnapshotUpdate
+from rsi.cycles import (CycleScheduler, HostTaskResult, IsolationSnapshot,
+                        RejectedSkillUpdate, SimplificationResult, SnapshotUpdate)
 from rsi.runtime import WorkflowError
 
 
@@ -79,6 +80,28 @@ def test_phase2_required_hook_and_coalesced_due_events(tmp_path):
     assert len([e for e in s.state['events'] if e['kind'] == 'paired_recovery_due']) == 5
     assert s.state['skills'] == 'skills0'
     s.close()
+
+
+def test_every_failed_original_is_simplified_after_prior_recovery_exhaustion(tmp_path):
+    calls = []
+    def run(project, memory, skills, ctx):
+        calls.append(('run', project.project_id))
+        return HostTaskResult('failed', 'observed-failure', 1)
+    def simplify(project, result, ctx):
+        calls.append(('simplify', project.project_id))
+        return SimplificationResult(replace(project, project_id=project.project_id+'-small'),
+                                    0, 'host-simplification-receipt')
+    scheduler = CycleScheduler(tmp_path/'state', spec(), run,
+        lambda *_: SnapshotUpdate('updated-memory'), simplify=simplify, recovery_limit=1)
+    try:
+        finish(scheduler)
+        assert calls == [('run', '0'), ('run', '1'), ('simplify', '0'),
+                         ('run', '0-small'), ('simplify', '1'), ('run', '1-small')]
+        assert [r['original_id'] for r in scheduler.state['recoveries']] == ['0', '1']
+        assert len([e for e in scheduler.state['events'] if e['kind']=='recovery_exhausted']) == 2
+        assert scheduler.state['spent'] == 4
+    finally:
+        scheduler.close()
 
 
 @pytest.mark.parametrize('kind', ['original', 'memory', 'skill'])
@@ -335,3 +358,76 @@ def test_bare_simplification_spec_is_not_silently_free(tmp_path):
     assert s.state['pending']['kind'] == 'simplify'
     assert s.state['phase'] == 'simplify' and not s.state['recoveries']
     s.close()
+
+
+def rejected_writer(tmp_path, *, wall_seconds=None, clock=None):
+    calls, contexts = [], []
+    def run(project, memory, skills, ctx):
+        calls.append(project.project_id)
+        return HostTaskResult('accepted', 'actual-task-receipt', 2)
+    def write(*args):
+        contexts.append(args[-1])
+        if len(contexts) == 1:
+            raise ValueError('observed fixture proposal rejected by host')
+        return SnapshotUpdate('new-candidate', .2)
+    scheduler = CycleScheduler(tmp_path/'state', spec(Mode.PHASE2, 1), run,
+        lambda *_: SnapshotUpdate('memory1'), skill_update=write,
+        actor_seconds=20, wall_seconds=wall_seconds, **({'clock':clock} if clock else {}))
+    scheduler.step()
+    scheduler.step()
+    with pytest.raises(ValueError):
+        scheduler.step()
+    result = RejectedSkillUpdate(scheduler.state['pending']['id'], scheduler.state['namespace'],
+        'skills0', 'memory1', 'actual-task-receipt', 'retained-proposal', 'host-rejection', .7)
+    return scheduler, result, calls, contexts
+
+
+def test_rejected_writer_is_charged_once_and_fresh_attempt_reuses_task(tmp_path):
+    scheduler, rejected, calls, contexts = rejected_writer(tmp_path)
+    try:
+        scheduler.reconcile_rejected_skill(rejected)
+        assert scheduler.state['spent'] == 2.7
+        assert scheduler.state['phase'] == 'skill' and scheduler.state['pending'] is None
+        assert not scheduler.state['candidates'] and not scheduler.extension_events()
+        scheduler.reconcile_rejected_skill(rejected)
+        assert scheduler.state['spent'] == 2.7
+        with pytest.raises(WorkflowError):
+            scheduler.reconcile_rejected_skill(replace(rejected, rejection_ref='different-rejection'))
+        scheduler.step()
+        assert calls == ['0']  # No programming task replay.
+        assert contexts[1]['operation_id'] != rejected.operation_id
+        assert contexts[1]['previous_skill_rejections'][0]['proposal_ref'] == rejected.proposal_ref
+        assert contexts[1]['remaining']['actor_seconds'] == 17.3
+        assert scheduler.state['skills'] == 'skills0'
+        assert scheduler.state['candidates'] == [dict(reference='new-candidate',
+            operation_id=contexts[1]['operation_id'])]
+        assert len([e for e in scheduler.extension_events() if e['kind']=='candidate_validation_due']) == 1
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize('field', ['operation_id', 'namespace', 'incumbent', 'memory_ref', 'project_ref'])
+def test_rejected_writer_scope_mismatch_preserves_pending_and_cost(tmp_path, field):
+    scheduler, rejected, _, _ = rejected_writer(tmp_path)
+    try:
+        before = json.dumps(scheduler.state, sort_keys=True)
+        with pytest.raises(WorkflowError):
+            scheduler.reconcile_rejected_skill(replace(rejected, **{field:'wrong-scope'}))
+        assert json.dumps(scheduler.state, sort_keys=True) == before
+    finally:
+        scheduler.close()
+
+
+def test_rejected_writer_reconciliation_does_not_reset_expired_wall(tmp_path):
+    now = [10.]
+    scheduler, rejected, calls, _ = rejected_writer(tmp_path, wall_seconds=1, clock=lambda:now[0])
+    try:
+        created = scheduler.state['created']
+        now[0] = 12.
+        scheduler.reconcile_rejected_skill(rejected)
+        assert scheduler.state['created'] == created and scheduler.remaining()['wall_seconds'] == 0
+        with pytest.raises(WorkflowError, match='elapsed allocation'):
+            scheduler.step()
+        assert calls == ['0'] and scheduler.state['spent'] == 2.7
+    finally:
+        scheduler.close()

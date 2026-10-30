@@ -45,8 +45,8 @@ def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, 
         memory_ref=store.put_bytes(b'memory'), kdb_ref=store.put_bytes(b'kdb'),
         model_config={'model': 'TEST', 'temperature': 0}, incumbent=incumbent, candidate=candidate,
         joint_limits=limits or BudgetLimits(design_iterations=6, implementation_iterations=4,
-                                            execution_tries=40, actor_seconds=60),
-        remaining_parent=remaining or {'actor_seconds': 40, 'recovery_seconds': 30}, runner_factory=factory)
+                                            execution_tries=40, actor_seconds=1200),
+        remaining_parent=remaining or {'actor_seconds': 1200, 'recovery_seconds': 1200}, runner_factory=factory)
     return pair, original, store, calls, database
 
 
@@ -63,7 +63,7 @@ def test_equal_frozen_inputs_new_allocation_and_source_isolation(tmp_path):
         spent = original.workflow.accounting.seconds()
         old, new = pair.request('incumbent'), pair.request('candidate')
         assert old.spec == new.spec
-        assert old.spec.budgets.actor_seconds == 15
+        assert old.spec.budgets.actor_seconds == 600
         assert old.spec.budgets.implementation_iterations == 2
         assert old.memory_ref == new.memory_ref and old.kdb_ref == new.kdb_ref
         assert old.backend_identity == new.backend_identity
@@ -454,5 +454,154 @@ def test_failed_command_changed_source_is_frozen_from_public_proof(tmp_path):
             assert (request.root.parent / 'inputs/new_input.json').read_bytes() == b'{}'
             assert request.spec.goal == original.spec.goal
         assert captured['state'] == (original.root / 'workflow.json').read_bytes()
+    finally:
+        db.close()
+
+
+def test_parent_deadline_persists_without_rewriting_runner_contract(tmp_path):
+    clock = Clock()
+    runner, injections, db = make(tmp_path, clock=clock)
+    try:
+        limits = runner.spec.budgets.to_dict()
+        created = runner.workflow.state['created']
+        runner.workflow.constrain_wall_deadline('parent-cycle', clock() + 100)
+        clock.value += 25
+        reopened = ProjectRunner(runner.root, **injections)
+        assert reopened.workflow.remaining()['wall_seconds'] == 75
+        reopened.workflow.constrain_wall_deadline('parent-cycle', clock() + 1000)
+        assert reopened.workflow.remaining()['wall_seconds'] == 75
+        assert reopened.workflow.state['created'] == created
+        assert reopened.workflow.limits.to_dict() == limits == reopened.spec.budgets.to_dict()
+        assert runner.store.read_json(runner.contract_ref)['spec']['budgets'] == limits
+    finally:
+        db.close()
+
+
+def test_first_arm_setup_wall_expiry_blocks_next_dispatch_and_resume(tmp_path):
+    clock = Clock()
+    prepared = []
+    class SlowSetup(Session):
+        def prepare(self, timeout, *, schemas):
+            prepared.append(timeout)
+            clock.value += 50
+            return super().prepare(timeout, schemas=schemas)
+    def trial(request, reopen, injections):
+        injections['session_factory'] = SlowSetup
+        return ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, _, store, calls, db = setup_pair(tmp_path, clock=clock, wrap=trial,
+        limits=BudgetLimits(actor_seconds=1200, wall_seconds=40),
+        remaining={'actor_seconds': 1200, 'wall_seconds': 40})
+    incumbent, candidate = pair.frozen['incumbent'], pair.frozen['candidate']
+    spec = CycleSpec('wall', Mode.PHASE2, (ProjectSpec('p', 'original goal', ('python',)),),
+                     pair.frozen['memory'], incumbent)
+    scheduler = CycleScheduler(tmp_path / 'wall-cycle', spec,
+        lambda *a: HostTaskResult('failed', 'r', 0), lambda *a: SnapshotUpdate(pair.frozen['memory']),
+        skill_update=lambda *a: SnapshotUpdate(candidate), wall_seconds=40, clock=clock)
+    learning = LearningStub(incumbent)
+    def open_pair(*args):
+        return PairedRecovery(pair.path, artifacts=store, runner_factory=pair.factory, clock=clock)
+    try:
+        for _ in range(3):
+            scheduler.step()
+        controller = CycleController(tmp_path / 'wall-controller', scheduler, learning,
+                                     artifacts=store, pair_factory=open_pair)
+        with pytest.raises(WorkflowError, match='parent wall'):
+            controller.step()
+        retained = open_pair()
+        first = store.read_json(retained.state['arms']['incumbent']['receipt'])
+        assert first['wall_limited'] and first['outcome'] == 'failed'
+        assert prepared == [20] and len(calls) == 1
+        assert retained.state['arms']['candidate']['status'] == 'ready'
+        frozen = retained.frozen
+        clock.value += 100
+        resumed = CycleController(controller.path, scheduler, learning, artifacts=store, pair_factory=open_pair)
+        with pytest.raises(WorkflowError, match='parent wall'):
+            resumed.reconcile(dispatch=True)
+        with pytest.raises(WorkflowError, match='observe/reconcile'):
+            resumed.reconcile()
+        assert open_pair().frozen == frozen and len(calls) == 1
+        assert not learning.calls
+    finally:
+        scheduler.close()
+        db.close()
+
+
+def test_current_arm_thinking_gets_remaining_wall_and_expiry_is_retained(tmp_path):
+    clock = Clock()
+    thinking_limits = []
+    class Bounded(Session):
+        def next_action(self, context, allowed, *, seconds, **kwargs):
+            thinking_limits.append(seconds)
+            clock.value += seconds + 1
+            return super().next_action(context, allowed, seconds=seconds, **kwargs)
+    def trial(request, reopen, injections):
+        injections['session_factory'] = Bounded
+        return ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, _, store, calls, db = setup_pair(tmp_path, clock=clock, wrap=trial,
+        limits=BudgetLimits(actor_seconds=1200, wall_seconds=40),
+        remaining={'actor_seconds': 1200, 'wall_seconds': 40})
+    try:
+        first = pair.step()
+        assert thinking_limits == [20] and first['wall_limited']
+        proof = store.read_json(first['terminal_failure_ref'])
+        state = store.read_json(proof['accounting_snapshot'])
+        assert state['pending'] and state['wall_deadlines']
+        assert proof['limits']['wall_seconds'] == 20
+        assert first['actor_seconds'] == 21
+        with pytest.raises(WorkflowError, match='parent wall'):
+            pair.step()
+        assert len(calls) == 1
+    finally:
+        db.close()
+
+
+def test_factory_copy_time_counts_against_persisted_arm_deadline(tmp_path):
+    clock = Clock()
+    sessions = []
+    def trial(request, reopen, injections):
+        clock.value += 50
+        injections['session_factory'] = lambda: sessions.append(Session()) or sessions[-1]
+        return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **injections)
+    pair, _, store, calls, db = setup_pair(tmp_path, clock=clock, wrap=trial,
+        limits=BudgetLimits(actor_seconds=1200, wall_seconds=40),
+        remaining={'actor_seconds': 1200, 'wall_seconds': 40})
+    try:
+        first = pair.step()
+        assert first['wall_limited'] and not sessions
+        state = store.read_json(first['workflow_receipt'])
+        assert state['history'] == [] and state['limits']['wall_seconds'] == 20
+        assert min(state['wall_deadlines'].values()) < state['created']
+        with pytest.raises(WorkflowError, match='parent wall'):
+            pair.step()
+        assert len(calls) == 1
+    finally:
+        db.close()
+
+
+def test_parent_remaining_wall_bounds_backend_command_timeout(tmp_path, monkeypatch):
+    import subprocess
+    import rsi.python_execution as execution
+    runner, _, db = make(tmp_path)
+    timeouts, killed = [], []
+    class Process:
+        pid, returncode = 123456, -9
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                timeouts.append(timeout)
+                raise subprocess.TimeoutExpired('frozen-compile', timeout)
+            return b'', b''
+    try:
+        runner.workflow.constrain_wall_deadline('parent-cycle', runner.workflow.clock() + 100)
+        remaining = runner.workflow.remaining()['wall_seconds']
+        runner.workflow.begin()
+        monkeypatch.setattr(execution.subprocess, 'Popen', lambda *a, **kw: Process())
+        monkeypatch.setattr(execution.os, 'killpg', lambda pid, sig: killed.append(pid))
+        receipt = runner.backend.run('bounded-compile', 'compile')
+        assert receipt['timed_out'] and receipt['classification'] == 'timeout'
+        assert len(timeouts) == 1 and 0 < timeouts[0] <= remaining
+        assert killed == [Process.pid]
+        assert runner.spec.budgets.wall_seconds is None
     finally:
         db.close()
