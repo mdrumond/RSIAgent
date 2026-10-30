@@ -244,49 +244,20 @@ def _run(
     return loop.run(), prompts, journal
 
 
-def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
-    actions = [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "submit", "interpretation": "host result passed", "supports": []}),
-    ]
-    result, prompts, journal = _run(tmp_path, actions)
-    assert result.status == "passed" and result.verified.passed
-    assert result.knowledge_queries == 0 and result.profile_result is None
-    assert len(journal.read()) == 1
-    assert all(_cell().cell_id in prompt and "isolated-lineage" in prompt for prompt in prompts)
-    memory = journal.read()[0]["memory"]
-    assert memory["agent_interpretations"][0]["supports"] == []
-    first, after_write = map(json.loads, prompts[:2])
-    assert first["proposal"] == DEFAULT_PROPOSALS[0].as_dict()
-    assert first["policy"] == {
-        "block_count": 1, "logical_length": 32, "padded_length": 64,
-        "profiling_treatment": "without-profiling-guidance",
-    }
-    assert first["action_contract"]["trial_state"] == "source-required"
-    assert first["action_contract"]["required_next_action"] is None
-    assert first["allowed_actions"] == {
-        "write_source": ["action", "source"],
-    }
-    assert after_write["action_contract"]["trial_state"] == "compile-required"
-    assert after_write["action_contract"]["required_next_action"] == "compile"
-    assert set(after_write["allowed_actions"]) == {"compile"}
-    assert first["action_contract"] == {
-        "profile_metric": "PipeUtilization",
-        "eligible_submit_supports": [],
-        "trial_state": "source-required",
-        "required_next_action": None,
-    }
-    assert first["current_candidate_source"] is None
-    assert after_write["current_candidate_source"] == SOURCE
-    contract = first["candidate_source_contract"]
-    assert contract == CANDIDATE_SOURCE_CONTRACT.as_dict()
-    assert contract["source_slot"] == first["source_slot"] == "candidate.cpp"
-    validate_candidate_source(contract["exported_signature"] + " {}")
-    assert all(
-        json.loads(prompt)["candidate_source_contract"] == contract
-        for prompt in prompts
-    )
+def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_path):
+    from rsi.domain_execution import CanonicalConfigurationError
+    class NoTargetDispatch(FakeCandidate):
+        def compile(self, *args, **kwargs):
+            pytest.fail('target compiler ran without mandatory canonical configuration')
+        def run(self, *args, **kwargs):
+            pytest.fail('target runner ran without mandatory canonical configuration')
+    with pytest.raises(CanonicalConfigurationError):
+        _run(tmp_path, [], candidate=NoTargetDispatch())
+    # The former KDB-disabled/unstructured actor success case is intentionally
+    # invalid under the new mandatory baseline/provider contract. The actual
+    # canonical default-path success/memory proof lives in production binding tests.
+    path = tmp_path / 'memory.jsonl'
+    assert not path.exists() or not path.read_bytes()
 
 
 def test_candidate_contract_serializes_a3_argument_semantics_and_safe_baseline():

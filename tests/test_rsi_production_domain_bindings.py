@@ -183,4 +183,7 @@ def test_default_a3_trial_preserves_typed_host_verification_and_memory(tmp_path,
     assert result.status == 'passed' and result.verified.passed
     assert result.memory_entry_sha256
     assert result.knowledge_queries == 2
+    from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
+    presented = [json.loads(context['task']['domain']['instruction']) for context in session.contexts]
+    assert all(row['source_contract'] == CANDIDATE_SOURCE_CONTRACT.as_dict() for row in presented)
     assert {context['stage'] for context in session.contexts} == {s.value for s in Stage if s != Stage.PREFLIGHT}
