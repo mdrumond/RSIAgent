@@ -7,21 +7,27 @@ CURRENT = ContextVar('canonical_domain_activity', default=None)
 
 
 @contextmanager
-def excluded_phase(category='transfer'):
+def activity_phase(category):
     scope = CURRENT.get()
-    if scope is None or scope['excluded']:
+    if scope is None or scope['category'] == category:
         yield
         return
-    flow = scope['flow']
+    flow, previous = scope['flow'], scope['category']
     flow.accounting.end(scope['token'])
     scope['token'] = flow.accounting.start(category)
-    scope['excluded'] = True
+    scope['category'] = category
     try:
         yield
     finally:
         flow.accounting.end(scope['token'])
-        scope['token'] = flow.accounting.start(scope['category'])
-        scope['excluded'] = False
+        scope['token'] = flow.accounting.start(previous)
+        scope['category'] = previous
+
+
+@contextmanager
+def excluded_phase(category='transfer'):
+    with activity_phase(category):
+        yield
 
 
 def transfer_phase(function):

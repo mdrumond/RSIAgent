@@ -486,7 +486,9 @@ class TrialActionExecutor:
                                      error=str(exc))
         self.final_run = candidate
         if self.final_run.verified.passed:
-            self.final_profile = self.profiling.final(self.final_run)
+            from rsi.domain_timing import activity_phase
+            with activity_phase('profiling'):
+                self.final_profile = self.profiling.final(self.final_run)
         else:
             self.final_profile = {
                 "available": False,
