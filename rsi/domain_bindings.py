@@ -571,6 +571,24 @@ class A3Host(SourceHost):
                 return carrier.failure
         return super().call(activity, name, category, observed)
 
+    def activity_exception_terminal(self, name, error):
+        from benchmarks.a3kernels.candidate import CandidateSourceAdmissionError
+        return (name in ('compile', 'run') and isinstance(error, CandidateSourceAdmissionError)
+                or super().activity_exception_terminal(name, error))
+
+    def _candidate_call(self, activity, name, category, callback):
+        from benchmarks.a3kernels.candidate import CandidateSourceAdmissionError
+        try:
+            return self.call(activity, name, category, callback)
+        except CandidateSourceAdmissionError as error:
+            # This existing type is a source admission failure before native
+            # staging/dispatch, not proof about an arbitrary callback exception.
+            self.owner._retain_loop_failure(len(self.actions), error, self.failures, [])
+            self.observations.append(dict(action=name, passed=False, source=self.project_hash(),
+                error_type=type(error).__name__, detail=str(error)))
+            self.compilation = self.verified = self.profile = self.timing = None
+            return None
+
     def activity_observed_terminal(self, name, value):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence
         from benchmarks.a3kernels.trial import infrastructure_unavailable
@@ -634,7 +652,7 @@ class A3Host(SourceHost):
         passed = True
         if stage == Stage.TEST:
             self.actions.append('compile')
-            self.compilation = self.call(activity, 'compile', 'compilation', lambda seconds:
+            self.compilation = self._candidate_call(activity, 'compile', 'compilation', lambda seconds:
                 owner.candidate.compile(self.source, owner.workdir, request_id=owner.cell.cell_id,
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
@@ -645,7 +663,7 @@ class A3Host(SourceHost):
             if self.compilation is None:
                 raise ValueError('A3 validation requires its actual retained compilation')
             self.actions.append('run')
-            self.verified = self.call(activity, 'run', 'execution', lambda seconds:
+            self.verified = self._candidate_call(activity, 'run', 'execution', lambda seconds:
                 owner.candidate.run(self.source, owner.workdir, request_id=owner.cell.cell_id,
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
@@ -1077,7 +1095,7 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
             owner._save()
         row = owner.store.get(owner.key)
         if row['status'] == 'queued':
-            owner.store.transition(owner.key, 'running')
+            row = owner.store.transition(owner.key, 'running')
         host = OptimizerHost(owner, inputs)
         agent = getattr(owner.agent, 'agent', owner.agent)
         if session_factory is None and not hasattr(agent, 'model'):
@@ -1095,7 +1113,14 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
                           test_backend=test_backend, **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             runner = DomainRunner(root, host, **injections)
-            if runner.workflow.state.pop('domain_boundary', None):
+            boundary = runner.workflow.state.pop('domain_boundary', None)
+            # JobStore.resume is the public control boundary. Preserve every
+            # pending operation/clock row: resume only removes the stop flag;
+            # normal canonical reconciliation still owns unresolved effects.
+            resumed = (runner.workflow.state['stopped'] and not row['stop_requested']
+                       and row['status'] == 'running' and any(event['kind'] == 'resumed'
+                           for event in owner.store.events(owner.key)))
+            if boundary or resumed:
                 runner.workflow.resume()
             return runner
         bundle, limits = baseline_contract(owner, max(0.001, row['max_seconds'] - row['elapsed_seconds']))

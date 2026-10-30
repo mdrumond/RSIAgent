@@ -76,3 +76,79 @@ def test_actual_trial_status_roundtrip_preserves_wire_and_telemetry(tmp_path,sta
         proposal=DEFAULT_PROPOSALS[0],execution_profile='gz-a3',ordinal=0,trial=trial)
     restored=LiveComposition._trial_from_outcome(evidence.entries[-1].payload['infrastructure_retry'])
     assert restored==trial
+
+
+@pytest.mark.parametrize('operation',['compile','run'])
+@pytest.mark.parametrize('typed',[True,False],ids=['actual-source-validator','arbitrary-value-error'])
+def test_source_admission_repairs_only_authentic_typed_validation(tmp_path,operation,typed):
+    from canonical_a3_fixtures import make_trial, A3Session
+    from test_a3_trial_loop import FakeCandidate, Resolver, SOURCE
+    from benchmarks.a3kernels.candidate import validate_candidate_source
+    malformed=SOURCE.replace('vector_add','wrong_signature')
+    calls=[]
+    class Candidate(FakeCandidate):
+        def invoke(self, name, source, workdir, **options):
+            calls.append((name,source))
+            if name==operation and source==malformed:
+                if typed:
+                    validate_candidate_source(source)  # Existing validator, not a fabricated typed exception.
+                raise ValueError('Callback failed without a no-effects admission contract')
+            return getattr(super(),name)(source,workdir,**options)
+        def compile(self,source,workdir,**options):
+            return self.invoke('compile',source,workdir,**options)
+        def run(self,source,workdir,**options):
+            return self.invoke('run',source,workdir,**options)
+    owner,session=make_trial(tmp_path, candidate=Candidate(Resolver()),
+        session=A3Session(initial=malformed,repaired=SOURCE))
+    owner.canonical=official(owner,session)
+    result=owner.run()
+    root=owner.workdir/'canonical'
+    state=json.loads((root/'workflow.json').read_text())
+    if typed:
+        assert result.status=='passed' and result.verified is not None and result.verified.passed
+        assert any(name==operation and source==malformed for name,source in calls)
+        assert any(name=='run' and source!=malformed for name,source in calls)
+        assert len(owner.memory.read())==1 and result.failures
+        runner=owner.canonical.build(owner)
+        failures=[runner.store.read_json(event['reference']) for event in runner.events
+            if event['type']=='domain-result' and runner.store.read_json(event['reference'])['status']=='failed']
+        assert len(failures)==1 and failures[0]['observed_terminal'] is True
+        from rsi.domain_checkpoint import decode
+        assert decode(failures[0]['result'])['error_type']=='CandidateSourceAdmissionError'
+        assert any(row['passed'] is False for row in state['history'])
+    else:
+        assert result.status=='suspended' and state['pending'] is not None and not owner.memory.read()
+        before=list(calls);raw=(root/'workflow.json').read_bytes()
+        assert owner.run().status=='suspended'
+        assert calls==before and (root/'workflow.json').read_bytes()==raw
+
+
+def test_observed_source_admission_failure_cannot_satisfy_passing_test(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from canonical_a3_fixtures import make_trial, A3Session
+    from test_a3_trial_loop import FakeCandidate, Resolver, SOURCE
+    from benchmarks.a3kernels.candidate import validate_candidate_source
+    from rsi.domain_bindings import A3Host
+    from rsi.contracts import Stage
+    calls=[]
+    class Candidate(FakeCandidate):
+        def compile(self,source,workdir,**options):
+            calls.append(source)
+            validate_candidate_source(source)
+            return super().compile(source,workdir,**options)
+    original=A3Host.execute
+    def wrong_passing_claim(self,stage,*args):
+        observation=original(self,stage,*args)
+        if stage==Stage.TEST and observation.passed is False:
+            return replace(observation,passed=True)
+        return observation
+    monkeypatch.setattr(A3Host,'execute',wrong_passing_claim)
+    malformed=SOURCE.replace('vector_add','wrong_signature')
+    owner,session=make_trial(tmp_path,candidate=Candidate(Resolver()),
+        session=A3Session(initial=malformed,repaired=SOURCE))
+    owner.canonical=official(owner,session)
+    result=owner.run()
+    state=json.loads((owner.workdir/'canonical/workflow.json').read_text())
+    assert result.status=='suspended' and state['pending']['stage']=='test'
+    assert calls==[malformed] and not owner.memory.read()
+    assert not any(row['evidence']['stage']=='test' for row in state['history'])
