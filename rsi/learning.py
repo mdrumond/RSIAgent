@@ -272,8 +272,11 @@ class Learning:
             'Retrieval frequency is not usefulness. Negative results and rejected negative ideas '
             'can demonstrate valuable avoidance. Cite admitted outcome evidence. '
             'replace sets Learned guidance and must preserve existing guidance unless deletion is authorised. '
-            'Routine additions append. remove deletes one exact learned fragment. '
-            'Add the section when absent. A complete YAML-frontmatter document replacement, '
+            'Routine replace content is the section body only, preserving existing body and appending additions. '
+            'Do not include a Learned guidance heading, any other heading, or YAML frontmatter in routine fragments. '
+            'The host creates the section heading when absent; never create it yourself. '
+            'Routine remove content identifies one exact body fragment. '
+            'Separately, a complete YAML-frontmatter document replacement, '
             'or exact removal outside Learned guidance, requires cited host review/counterevidence. '
             'Never delete a mapped skill. Preserve safety/recovery unless '
             'counterevidence or explicit review supports removal.\n')
