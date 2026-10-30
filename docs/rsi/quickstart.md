@@ -25,6 +25,14 @@ legacy/embedding packages and the NOOA role worker into separate owned Python
 environments; incompatible OpenAI SDK requirements do not share an environment.
 Setup time is recorded separately from actor time.
 
+Before starting jobs, set `kdb_collections` in the configuration payload to the
+existing collection names in that database. Configure `embeddings.cache_dir` to
+a prepared cache containing the pinned BGE model. Embedding setup installs Python
+packages; it does not download model weights. Retrieval loads cached weights
+only by default. To permit downloading the pinned weights, explicitly set
+`embeddings.local_files_only` to `false` in the payload. Repository ingestion can
+add a collection to the configured baseline after embeddings are available.
+
 For CPU-only offline setup, provide a complete compatible wheelhouse including a
 CPU PyTorch wheel and both separate role/legacy dependency sets, plus the pinned
 npm cache:
@@ -49,7 +57,9 @@ with optional `--expect-revision REV` for conflict detection. An execution entry
 in `project_configs` is keyed by curriculum `project_id` and supplies `source`,
 `verifier`, `editable_files`, and `commands` (`compile`, `test`, `validation`,
 optional `timing` and `profile`). Its test command must match the ProjectSpec
-command. Performance acceptance uses frozen host measurements and a declared
+command. Both `test` and `validation` command arrays must pass `{verifier}` as a
+standalone argument, for example `["python", "{verifier}"]`, so execution uses the
+frozen independent verifier. Performance acceptance uses frozen host measurements and a declared
 threshold, not model assertions.
 
 Every actor uses the same host-controlled stages. Design and optimisation require
