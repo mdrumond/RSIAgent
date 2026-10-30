@@ -150,3 +150,46 @@ def test_loopback_binds_port_zero_and_retains_actual_endpoint(tmp_path, monkeypa
     assert receipt['url'] == f'http://127.0.0.1:{receipt["port"]}'
     assert responses == [b'instance dashboard']
     assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_reconstructed_wheel_installs_and_imports_outside_checkout(tmp_path):
+    import subprocess
+    source = tmp_path / 'inventory'
+    metadata = source / 'rsi-0.1.0.dist-info'
+    metadata.mkdir(parents=True)
+    (metadata / 'METADATA').write_text('Metadata-Version: 2.1\nName: rsi\nVersion: 0.1.0\n')
+    (metadata / 'WHEEL').write_text('Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+    (metadata / 'RECORD').write_text('')
+    (source / 'rsi').mkdir()
+    (source / 'rsi/__init__.py').write_text('value = 42\n')
+    wheel = instance_setup._wheel(source, tmp_path)
+    environment = tmp_path / 'venv'
+    subprocess.run([sys.executable, '-I', '-m', 'venv', '--without-pip', str(environment)],
+                   check=True, timeout=60)
+    interpreter = environment / 'bin/python'
+    purelib = subprocess.check_output([str(interpreter), '-I', '-c',
+                                      'import sysconfig; print(sysconfig.get_path("purelib"))'],
+                                     text=True, timeout=10).strip()
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(('PIP_', 'PYTHON'))}
+    subprocess.run([sys.executable, '-I', '-m', 'pip', '--isolated', 'install',
+                    '--ignore-installed', '--no-index', '--no-deps', '--target', purelib,
+                    str(wheel)], check=True, env=env, cwd=tmp_path, timeout=60,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run([str(interpreter), '-I', '-c',
+                    'import rsi, sys; from pathlib import Path; assert rsi.value == 42; '
+                    'assert Path(rsi.__file__).resolve().is_relative_to(Path(sys.prefix))'],
+                   check=True, env=env, cwd=tmp_path, timeout=10)
+
+
+def test_stop_never_signals_reused_or_dead_process_identity(tmp_path, monkeypatch):
+    from rsi import jobs
+    root = instance(tmp_path)
+    (root / 'dashboard/process.json').write_text(json.dumps(
+        {'state': 'running', 'launch_id': 'old', 'process': {'pid': os.getpid(),
+                                                         'start_ticks': 'different'}}))
+    monkeypatch.setattr(jobs, '_alive', lambda _: False)
+    def forbidden(*_):
+        pytest.fail('must never open or signal a reused process identity')
+    monkeypatch.setattr(dashboard_runtime.os, 'pidfd_open', forbidden)
+    assert dashboard_runtime.stop(root)['state'] == 'interrupted'
