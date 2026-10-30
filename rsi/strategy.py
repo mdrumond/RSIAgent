@@ -35,6 +35,8 @@ class StrategyEvidence:
     of that same host log. CAS existence alone never grants receipt authority.
     A service belongs to one workflow identity, immutable bundle and configured
     backend. The caller owns backend construction, timeout and actor accounting.
+    Backend names carry no quality certification; test_backend records the trusted
+    composition's explicit declaration rather than guessing from an identifier.
     """
 
     def __init__(self, artifacts, emit, snapshot, bundle, query, *,
@@ -43,11 +45,12 @@ class StrategyEvidence:
             raise ValueError('workflow and configured backend identity required')
         if not callable(query):
             raise ValueError('configured KDB query callback required')
-        if 'TEST' in backend_identity.upper() and not test_backend:
-            raise ValueError('TEST backend requires explicit test_backend=True')
+        if type(test_backend) is not bool:
+            raise ValueError('test_backend must be an explicit boolean')
         self.artifacts, self.emit, self.snapshot = artifacts, emit, snapshot
         self.bundle, self.query_backend = bundle, query
         self.workflow_id, self.backend_identity = workflow_id, backend_identity
+        self.test_backend = test_backend
         self.receipts = {}
         for event in events:
             if event.get('type') == 'strategy-evidence' and event.get('workflow') == workflow_id:
@@ -138,7 +141,7 @@ class StrategyEvidence:
                           error_type=type(exc).__name__), context)
             raise QueryUnavailable('KDB unavailable; strategy suspended') from exc
         return self._persist('retrieval', dict(request=request, response=result,
-                             backend=self.backend_identity), context)
+                             backend=self.backend_identity, test_backend=self.test_backend), context)
 
     def retrospect(self, *, supplement=None):
         context = self._strategy_context()

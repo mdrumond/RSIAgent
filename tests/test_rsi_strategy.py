@@ -189,12 +189,16 @@ def test_failed_log_append_grants_no_authority(setup):
     assert not service.resolve('retrieval', query, Stage.DESIGN, 'op1')
 
 
-def test_test_backend_requires_explicit_opt_in(setup):
+@pytest.mark.parametrize('test_backend', [False, True])
+def test_backend_identity_not_interpreted_and_explicit_kind_retained(setup, test_backend):
     service, _, state, log, store, _, _ = setup
-    with pytest.raises(ValueError):
-        StrategyEvidence(store, log.append, lambda: state, service.bundle,
-                         service.query_backend, workflow_id='project1',
-                         backend_identity='TEST@1')
+    configured = StrategyEvidence(store, log.append, lambda: state, service.bundle,
+                                  service.query_backend, workflow_id='project1',
+                                  backend_identity='latest', test_backend=test_backend)
+    ref = configured.query({'query': 'stable sum'})
+    receipt = store.read_json(ref)['payload']
+    assert receipt['backend'] == 'latest'
+    assert receipt['test_backend'] is test_backend
 
 
 def test_kdb_alone_cannot_complete_or_select_and_restart_preserves_gate(setup):
