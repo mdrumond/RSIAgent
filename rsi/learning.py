@@ -34,7 +34,7 @@ from rsi.contracts import Mode
 from rsi.cycles import RejectedSkillUpdate, SnapshotUpdate
 from rsi.python_execution import atomic_json
 from rsi.roles import AdmittedEvidence, _proposal
-from rsi.skills import SkillBundle, SkillDocument, validate_metadata
+from rsi.skills import SkillBundle, SkillDocument
 
 
 class ProposalRejected(ValueError):

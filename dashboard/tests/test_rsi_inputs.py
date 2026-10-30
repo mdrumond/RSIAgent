@@ -214,3 +214,127 @@ function change(input,value) {input.value=value;input.dispatchEvent({type:'input
 '''
     subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/rsi_inputs.js')],
                    check=True, capture_output=True, text=True, timeout=20)
+
+
+
+def test_existing_project_omitted_budgets_keep_contract_defaults_after_prompt_edit():
+    from pathlib import Path
+    import shutil
+    import subprocess
+    from rsi.contracts import ProjectSpec
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is unavailable')
+    original = dict(project_id='existing-numeric', goal='Preserve existing limits',
+                    command=['python', 'verify.py'])
+    script = r"""
+const assert=require('node:assert/strict'),vm=require('node:vm');
+class Element {
+ constructor(tag){this.tagName=tag;this.children=[];this.listeners={};this.dataset={};this.value='';}
+ append(...items){this.children.push(...items);} replaceChildren(...items){this.children=items;}
+ setAttribute(k,v){this[k]=v;} setCustomValidity(v){this.invalid=v;}
+ addEventListener(k,f){this.listeners[k]=f;} dispatchEvent(e){this.listeners[e.type]?.(e);}
+ showModal(){} close(){}
+}
+const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);};
+get('rsi-inputs').dataset.enabled='true';get('rsi-inputs').querySelectorAll=()=>[];
+const original=JSON.parse(process.argv[2]);
+const baseline={prompts:{actor:'original guidance'},budgets:{design_iterations:99},
+ phase1_projects:[original],phase2_projects:[],project_configs:{'existing-numeric':{
+ source:'/old/source',verifier:'/old/verifier.py',editable_files:['solution.py'],commands:{
+ compile:['python','-m','py_compile','solution.py'],test:['python','verify.py'],validation:['python','verify.py']}}}};
+let posted;
+const context={document:{getElementById:get,createElement:tag=>new Element(tag),body:{dataset:{csrf:'token'}}},
+ Event:class{constructor(type){this.type=type;}},crypto:{randomUUID:()=> 'roundtrip'},
+ setTimeout:fn=>fn(),console,fetch:async(url,options)=>{
+ let value;
+ if(url==='/api/rsi/config'&&options){posted=JSON.parse(options.body);value={operation_id:'saved'};}
+ else if(url.startsWith('/api/operations/'))value={status:'succeeded',result:{revision:'new',payload:posted.payload}};
+ else value={revision:'old',payload:baseline};
+ return {ok:true,json:async()=>value};
+}};
+vm.runInNewContext(require('node:fs').readFileSync(process.argv[1],'utf8'),context);
+const flatten=n=>[n,...n.children.filter(c=>typeof c==='object').flatMap(flatten)];
+(async()=>{
+ await new Promise(resolve=>setImmediate(resolve));
+ const prompt=flatten(get('prompt-fields')).find(n=>n['aria-label']==='Actor instructions');
+ prompt.value='Changed only actor instructions';prompt.dispatchEvent({type:'input'});
+ await get('inputs-form').onsubmit({preventDefault(){}});
+ assert.ok(posted);assert.equal(posted.payload.budgets.design_iterations,99);
+ assert.equal(posted.payload.prompts.actor,'Changed only actor instructions');
+ process.stdout.write(JSON.stringify(posted.payload));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+    completed = subprocess.run([node, '-e', script,
+        str(Path(__file__).parents[1] / 'static/rsi_inputs.js'), json.dumps(original)],
+        check=True, capture_output=True, text=True, timeout=20)
+    saved = json.loads(completed.stdout)
+    assert ProjectSpec.from_dict(saved['phase1_projects'][0]).budgets == ProjectSpec.from_dict(original).budgets
+    assert saved['budgets']['design_iterations'] == 99
+
+
+def test_multievent_shared_project_rename_keeps_execution_edits_detached():
+    from pathlib import Path
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is unavailable')
+    script = r'''
+const assert=require('node:assert/strict'),vm=require('node:vm');
+class Element {
+ constructor(tag){this.tagName=tag;this.children=[];this.listeners={};this.dataset={};this.value='';}
+ append(...items){this.children.push(...items);} replaceChildren(...items){this.children=items;}
+ setAttribute(k,v){this[k]=v;} setCustomValidity(v){this.invalid=v;}
+ addEventListener(k,f){this.listeners[k]=f;} dispatchEvent(e){this.listeners[e.type]?.(e);}
+ showModal(){} close(){}
+}
+const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,new Element('div'));return nodes.get(id);};
+get('rsi-inputs').dataset.enabled='true';get('rsi-inputs').querySelectorAll=()=>[];
+const execution={source:'/shared',verifier:'/shared/verify.py',editable_files:['solution.py'],commands:{
+ compile:['python','-m','py_compile','solution.py'],test:['python','verify.py'],validation:['python','verify.py']}};
+const project=()=>({project_id:'shared',goal:'Independent phase work',command:['python','verify.py']});
+const baseline={phase1_projects:[project()],phase2_projects:[project()],project_configs:{shared:execution}};
+let model,posted;
+const wireJSON={parse:JSON.parse,stringify:(value,...rest)=>{
+ // Observe the actual model at the JSON serialization boundary used by the editor.
+ if(value&&value.phase1_projects&&value.project_configs)model=value;
+ return JSON.stringify(value,...rest);
+}};
+const context={JSON:wireJSON,document:{getElementById:get,createElement:tag=>new Element(tag),body:{dataset:{csrf:'token'}}},
+ Event:class{constructor(type){this.type=type;}},crypto:{randomUUID:()=> 'rename'},setTimeout:fn=>fn(),console,
+ fetch:async(url,options)=>{
+ let value;
+ if(url==='/api/rsi/config'&&options){posted=JSON.parse(options.body);value={operation_id:'saved'};}
+ else if(url.startsWith('/api/operations/'))value={status:'succeeded',result:{revision:'new',payload:posted.payload}};
+ else value={revision:'old',payload:baseline};
+ return {ok:true,json:async()=>value};
+}};
+vm.runInNewContext(require('node:fs').readFileSync(process.argv[1],'utf8'),context);
+const flatten=n=>[n,...n.children.filter(c=>typeof c==='object').flatMap(flatten)];
+const field=(section,title)=>flatten(get(section)).find(n=>n['aria-label']===title);
+function change(input,value){input.value=value;input.dispatchEvent({type:'input'});assert.ok(!input.invalid);}
+(async()=>{
+ await new Promise(resolve=>setImmediate(resolve));
+ const id=field('phase1-projects','Project ID');
+ change(id,'shared-a');change(id,'shared-ab');change(id,'shared-abc');
+ id.dispatchEvent({type:'change'});
+ assert.equal(model.phase2_projects[0].project_id,'shared');
+ assert.notEqual(model.project_configs['shared-abc'],model.project_configs.shared);
+ // The dependent execution editor binds these exact model objects after rerender.
+ const verifier=field('phase1-projects','Frozen verifier file path');
+ if(verifier)change(verifier,'/renamed/verify.py');
+ else model.project_configs['shared-abc'].verifier='/renamed/verify.py';
+ model.project_configs['shared-abc'].editable_files.push('extra.py');
+ assert.equal(model.project_configs.shared.verifier,'/shared/verify.py');
+ assert.deepEqual(Array.from(model.project_configs.shared.editable_files),['solution.py']);
+ await get('inputs-form').onsubmit({preventDefault(){}});
+ assert.ok(posted);
+ assert.equal(posted.payload.project_configs['shared-a'],undefined);
+ assert.equal(posted.payload.project_configs['shared-ab'],undefined);
+ assert.equal(posted.payload.project_configs['shared-abc'].verifier,'/renamed/verify.py');
+ assert.deepEqual(posted.payload.project_configs.shared,execution);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+    subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/rsi_inputs.js')],
+                   check=True, capture_output=True, text=True, timeout=20)
