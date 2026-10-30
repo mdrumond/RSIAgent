@@ -11,7 +11,7 @@ from rsi.domain_execution import (CanonicalAdoption, CanonicalConfigurationError
                                   DomainObservation, DomainRunner)
 from rsi.skills import builtin_bundle, SkillBundle
 from rsi.runtime import WorkflowError
-from rsi.strategy import QueryUnavailable
+from rsi.strategy import QueryUnavailable, StrategyRejected
 
 
 def fingerprint(value):
@@ -133,12 +133,17 @@ class KernelActionsHost(SourceHost):
     """A5 and shared A3 adaptive actions retain all their host gates/artifacts."""
     def __init__(self, owner, inputs):
         self.owner, self.inputs = owner, inputs
-        self.actions = inputs['action_executor']
+        self.actions = inputs.get('action_executor')
+        if not callable(self.actions):
+            raise CanonicalConfigurationError(
+                'kernel execution requires a metadata-backed callable host or explicit CanonicalAdoption')
         self.adaptive = hasattr(self.actions, 'prepared')
-        self.store = self.actions.artifacts
+        self.store = getattr(self.actions, 'artifacts', None)
         if self.store is None:
-            raise CanonicalConfigurationError('kernel binding requires its existing evidence store')
-        self.runtime = self.actions.executor if self.adaptive else self.actions.backend
+            raise CanonicalConfigurationError('kernel host requires its actual artifacts, frozen verifier, memory and KDB; use a configured host or explicit CanonicalAdoption')
+        self.runtime = getattr(self.actions, 'executor' if self.adaptive else 'backend', None)
+        if self.runtime is None:
+            raise CanonicalConfigurationError('kernel host requires its existing execution backend')
         self.instruction = inputs['instruction']
         self.control_root, self.feedback, self.observations = inputs['workspace'], [], []
         self.initial_source = self.source
@@ -668,7 +673,9 @@ class OptimizerHost(SourceHost):
             snapshot = self.submission['memory_snapshot']
             index = args['index']
             if type(index) is not int or not 0 <= index < len(snapshot['memory_entries']):
-                raise ValueError('memory index is outside the admitted snapshot')
+                raise StrategyRejected(
+                    f'memory index is outside admitted entries [0, {len(snapshot["memory_entries"])}); '
+                    'use read_memory with an admitted index or read_context for a paged tool result')
             row = snapshot['memory_entries'][index]
             if self.owner.memory_observer is not None:
                 row = self.owner.memory_observer('read-memory', snapshot, dict(result=row), operation)
@@ -677,25 +684,40 @@ class OptimizerHost(SourceHost):
             import base64
             reference, offset = args['sha256'], args.get('offset', 0)
             if offset < 0:
-                raise ValueError('artifact offset must be nonnegative')
-            try:
+                raise StrategyRejected('artifact offset must be nonnegative')
+            job, memory = self.artifact_scope()
+            if reference not in job and reference not in memory:
+                raise StrategyRejected(json.dumps(dict(
+                    reason='reference is outside admitted job and memory artifacts',
+                    guidance='Use read_context for paged query results or read_memory for snapshot entries. '
+                             'Query receipts are not artifacts; use exact admitted IDs from artifact_scope.',
+                    job_ids=sorted(job), memory_ids=sorted(memory))))
+            if reference in job:
                 data = self.owner.store.read_artifact(self.owner.key, reference)
-            except (ValueError, FileNotFoundError):
-                row = self.submission['memory_snapshot']['files'].get(reference)
-                if row is None:
-                    raise ValueError('artifact is absent from admitted job/memory')
-                data = base64.b64decode(row['base64'], validate=True)
+            else:
+                data = base64.b64decode(memory[reference]['base64'], validate=True)
+                if sha256(data).hexdigest() != reference:
+                    raise ValueError('admitted memory artifact digest mismatch')
             text = data.decode('utf-8')
             return dict(text=text[offset:offset+8192], next_offset=offset+8192 if len(text)>offset+8192 else None)
         return dict(propose_cases=EvidenceTool(OPTIMIZER_SCHEMAS['cases'], propose, (Stage.TASK_CONSTRUCTION,)),
                     read_memory=EvidenceTool(OPTIMIZER_SCHEMAS['read-memory'], read_memory),
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
 
+    def artifact_scope(self):
+        job = {row['sha256'] for row in self.owner.store.artifacts(self.owner.key)}
+        memory = {row['sha256']: row for row in self.submission['memory_snapshot']['files'].values()}
+        return job, memory
+
     def context(self):
         if self.owner.store.get(self.owner.key)['stop_requested']:
             self.workflow.stop()
             raise WorkflowError('workflow stopped by user')
         value = super().context()
+        job, memory = self.artifact_scope()
+        value['artifact_scope'] = dict(job_ids=sorted(job), memory_ids=sorted(memory),
+            memory_entries=len(self.submission['memory_snapshot']['memory_entries']),
+            query_results='Use returned content/read_context pages; query receipt IDs are not artifact IDs.')
         value.update(baseline=self.baseline, history=self.owner.state['history'],
                      best=self.owner.state.get('best'))
         return value
