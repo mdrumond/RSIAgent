@@ -96,6 +96,8 @@ class Workflow:
         self.path, self.resolver, self.clock = Path(path), resolver, clock
         if self.path.exists():
             self.state = json.loads(self.path.read_text())
+            if source_hash != self.source_hash:
+                raise WorkflowError("source differs from persisted checkpoint; reconcile source explicitly")
         else:
             self.state = dict(stage=Stage.PREFLIGHT.value, source=source_hash,
                               limits=(limits or BudgetLimits()).to_dict(), pending=None,
@@ -164,12 +166,16 @@ class Workflow:
             counts["executions"] = self.limits.execution_tries
         if any(cap is not None and self.state[key] >= cap for key, cap in counts.items()):
             raise WorkflowError("iteration or execution cap exhausted")
+        before = {key: self.state[key] for key in counts}
+        if self.stage == Stage.DESIGN:
+            before["implementation"] = self.state["implementation"]
         for key in counts:
             self.state[key] += 1
         if self.stage == Stage.DESIGN:
             self.state["implementation"] = 0
         operation = uuid.uuid4().hex
-        self.state["pending"] = dict(id=operation, stage=self.stage.value, handle=None)
+        self.state["pending"] = dict(id=operation, stage=self.stage.value, handle=None,
+                                      counts_before=before)
         self._save()
         return operation
 
@@ -205,6 +211,9 @@ class Workflow:
         if not_dispatched:
             if not self.pending or self.pending["id"] != operation or evidence is not None:
                 raise WorkflowError("invalid absent-operation receipt")
+            if "counts_before" not in self.pending:
+                raise WorkflowError("legacy reservation requires explicit counter reconciliation")
+            self.state.update(self.pending["counts_before"])
             self.state["history"].append(dict(operation=operation, not_dispatched=True))
             self.state["pending"] = None
             self._needs_reconciliation = False
@@ -244,9 +253,15 @@ class Workflow:
         if stage == Stage.TEST:
             self.state["tested"] = self.source_hash if passed else None
         elif stage == Stage.DEBUG:
+            if not passed:
+                self.state.update(tested=None, verified=None)
             next_stage = Stage.OPTIMISATION if self.state["tested"] == self.source_hash else Stage.IMPLEMENTATION
         elif stage == Stage.OPTIMISATION:
-            next_stage = Stage.TEST if changed else Stage.VALIDATION
+            if not passed:
+                self.state.update(tested=None, verified=None)
+                next_stage = Stage.DEBUG
+            else:
+                next_stage = Stage.TEST if changed else Stage.VALIDATION
         elif stage == Stage.VALIDATION:
             if passed and self.state["tested"] == self.source_hash:
                 self.state["verified"] = self.source_hash
