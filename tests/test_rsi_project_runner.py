@@ -288,7 +288,7 @@ def test_copy_consumes_wall_budget_but_not_actor_budget(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('error_type,classification', [
-    ('ActionError', 'malformed_action'), ('PiProviderError', 'provider_failure'),
+    ('PiProviderError', 'provider_failure'),
     ('PiDeadlineError', 'provider_timeout'), ('PiCancelled', 'actor_cancelled'),
     ('PiError', 'actor_failure')])
 def test_known_pi_failure_is_durable_charged_and_never_replayed(tmp_path, error_type, classification):
@@ -542,4 +542,65 @@ def test_evidence_inventory_is_compact_and_full_records_remain_available(tmp_pat
         assert retro['evidence']['payload'] == payload
     finally:
         runner.actor.close()
+        database.close()
+
+
+def test_repeated_malformed_actions_recover_until_original_actor_budget(tmp_path):
+    from coding.pi.session import ActionError
+    clock = Clock()
+    class Malformed(Session):
+        def next_action(self, *args, **kwargs):
+            self.calls += 1
+            clock.value += 2
+            raise ActionError('select_strategy missing required query_ref')
+    session = Malformed()
+    runner, injections, database = make(tmp_path, session, clock=clock,
+                                       budgets=BudgetLimits(actor_seconds=5))
+    try:
+        result = runner.run()
+        assert result['status'] == 'budget_exhausted', result
+        assert runner.workflow.accounting.seconds('thinking') == 6
+        assert session.calls == 3 and result['pending']
+        assert runner.workflow.outcome is None
+        feedback = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(feedback) == 2 and all(e['accepted'] is False for e in feedback)
+        assert not any(e['type'] == 'host-dispatch' for e in runner.events)
+        reopened = ProjectRunner(runner.root, **injections).run()
+        assert reopened['pending'] == result['pending'] and session.calls == 3
+    finally:
+        database.close()
+
+
+def test_malformed_model_arguments_and_missing_read_are_corrected_in_same_operation(tmp_path):
+    from coding.pi.session import ActionError
+    class CorrectArguments(Session):
+        rejected = False
+        observed_feedback = False
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                if not self.rejected:
+                    self.rejected = True
+                    raise ActionError('read_project_file requires path')
+                if not self.observed_feedback:
+                    assert context['observation']['event'] == 'invalid-action'
+                    assert context['observation']['accepted'] is False
+                    self.observed_feedback = True
+                    return 'read_project_file', dict(path='guidance.md')
+                reads = [r for r in context['evidence'] if r['name'] == 'read_project_file']
+                if len(reads) == 1:
+                    assert reads[0]['result']['status'] == 'error'
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    session = CorrectArguments()
+    runner, _, database = make(tmp_path, session)
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        assert session.observed_feedback
+        failures = [e for e in runner.events if e['type'] == 'actor-invalid-action']
+        assert len(failures) == 1
+        completed = [r for r in result['history'] if r.get('evidence', {}).get('operation_id')
+                     == failures[0]['operation_id']]
+        assert len(completed) == 1 and completed[0]['passed']
+    finally:
         database.close()

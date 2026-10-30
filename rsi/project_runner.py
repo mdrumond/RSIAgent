@@ -96,7 +96,7 @@ class ProjectRunner:
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
         # Always use the durable authority, including skill reads on the live path.
         self.workflow.resolver = self.resolve
 
