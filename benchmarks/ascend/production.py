@@ -6,6 +6,7 @@ from coding.pi.actor import PiActorDriver
 from coding.pi import ENGINE_IDENTITY
 
 import re
+import json
 from queue import Queue
 from threading import Lock, Condition
 
@@ -295,6 +296,14 @@ def build_native_adaptive_phase1(
                 return query_action(payload, replace(context, remaining_seconds=remaining))
             finally:
                 query_lock.release()
+        # Preserve the actual collection manifests through synchronization.
+        def canonical_identity():
+            with KnowledgeDB.open_read_only(config.kdb, embeddings) as database:
+                manifests = {item.collection: json.loads(item.to_json())
+                             for item in database.selected_manifests(config.collection)}
+            return dict(manifests=manifests,
+                        adaptive=adaptive.identity if adaptive is not None else None)
+        query.canonical_identity = getattr(query_action, 'canonical_identity', canonical_identity)
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
     curriculum_query = None

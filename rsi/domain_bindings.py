@@ -37,6 +37,35 @@ def knowledge_identity(knowledge):
                             getattr(knowledge, 'snapshots', {}).items()})
 
 
+def combine_queries(baseline, experience):
+    """Preserve both real retrieval namespaces; never synthesize availability."""
+    if any(not isinstance(row, dict) or not isinstance(row.get('results'), (list, tuple))
+           for row in (baseline, experience)):
+        raise QueryUnavailable('configured baseline/experience query omitted results')
+    return dict(results=[*baseline['results'], *experience['results']],
+        negative_records=[*baseline.get('negative_records', []), *experience.get('negative_records', [])],
+        provenance=dict(baseline=baseline.get('provenance'), experience=experience.get('provenance')))
+
+
+def frozen_context_bytes(path):
+    """Freeze all named context bytes, including a genuinely empty directory."""
+    path = Path(path)
+    if path.is_symlink():
+        raise CanonicalConfigurationError('baseline context must not be a symlink')
+    if path.is_file():
+        return path.read_bytes()
+    if not path.is_dir():
+        raise CanonicalConfigurationError('baseline context is absent')
+    rows = []
+    for child in sorted(path.rglob('*')):
+        if child.is_symlink():
+            raise CanonicalConfigurationError('baseline context contains a symlink')
+        if child.is_file():
+            rows.append(dict(path=child.relative_to(path).as_posix(),
+                             sha256=sha256(child.read_bytes()).hexdigest()))
+    return json.dumps(dict(kind='context-directory-v1', files=rows), sort_keys=True).encode()
+
+
 def baseline_contract(owner, parent_seconds):
     bundle = getattr(owner, 'canonical_skills', None) or builtin_bundle()
     if isinstance(bundle, dict):
@@ -114,8 +143,14 @@ class SourceHost:
     def context(self):
         from benchmarks.ascend.actor_control import ActorControl, ActorStopped
         feedback = self.feedback
+        control = ActorControl(self.control_root)
+        checkpoint = control.status().get('checkpoint') or {}
+        retained = checkpoint.get('feedback', [])
+        for row in retained:
+            if row not in feedback:
+                feedback.append(row)
         try:
-            ActorControl(self.control_root).boundary(dict(feedback=feedback), feedback)
+            control.boundary(dict(feedback=feedback), feedback)
         except ActorStopped:
             self.workflow.stop()
             raise WorkflowError('workflow stopped by user') from None
@@ -131,8 +166,9 @@ class SourceHost:
 
 class KernelActionsHost(SourceHost):
     """A5 and shared A3 adaptive actions retain all their host gates/artifacts."""
-    def __init__(self, owner, inputs):
+    def __init__(self, owner, inputs, *, baseline_query=None):
         self.owner, self.inputs = owner, inputs
+        self.baseline_query = baseline_query
         self.actions = inputs.get('action_executor')
         if not callable(self.actions):
             raise CanonicalConfigurationError(
@@ -150,11 +186,15 @@ class KernelActionsHost(SourceHost):
         request = getattr(self.actions, 'request', None)
         if request is None and inputs.get('context') is None:
             raise CanonicalConfigurationError('kernel canonical binding requires a retained baseline memory context')
-        memory = request.pre_wave_memory if request is not None else Path(inputs['context']).read_bytes()
+        memory = request.pre_wave_memory if request is not None else frozen_context_bytes(inputs['context'])
+        experience = self.actions.query_knowledge if self.adaptive else self.actions.knowledge
+        self.experience_enabled = getattr(experience, 'enabled', True)
         self.identity = dict(target=fingerprint(dict(runtime=getattr(self.runtime, 'runtime_identity',
             type(self.runtime).__qualname__), prepared=str(getattr(self.actions, 'prepared', '')))),
             provider=inputs['profile'].identity.as_dict(), kdb=fingerprint(knowledge_identity(
+                baseline_query if baseline_query is not None else
                 self.actions.query_knowledge if self.adaptive else self.actions.knowledge)),
+            experience=fingerprint(knowledge_identity(experience)),
             memory=sha256(memory).hexdigest(), verifier=fingerprint(str(
                 getattr(self.actions, 'prepared', inputs.get('context')))))
 
@@ -226,6 +266,9 @@ class KernelActionsHost(SourceHost):
             and self.actions.final_run.candidate_source_sha256 == sha256(self.source.encode()).hexdigest())
 
     def preflight(self, context):
+        if self.baseline_query is not None:
+            super().preflight(context)
+            return
         if self.adaptive:
             if getattr(self.actions.query_knowledge, '__name__', '') == 'disabled_knowledge_action':
                 raise CanonicalConfigurationError('canonical kernel workflow requires enabled baseline KDB')
@@ -251,13 +294,17 @@ class KernelActionsHost(SourceHost):
         return dict(read_artifact=EvidenceTool(obj(dict(sha256=STRING, offset=INTEGER), ['sha256']), read)) if self.adaptive else {}
 
     def query(self, payload):
+        baseline = self.baseline_query(payload) if self.baseline_query is not None else None
+        if baseline is not None and not self.experience_enabled:
+            return baseline
         _, raw = self.action('query-knowledge', payload)
         raw = raw.get('knowledge_query', raw)
         negatives = [row for row in self.observations if row['action'] in ('compile', 'run')
                      and ('fail' in json.dumps(row).lower() or 'host-mismatch' in json.dumps(row) or
                           row['observation'].get('host', {}).get('passed') is False)]
-        return unpack_query(raw, self.store, dict(binding=self.identity['kdb'],
+        experience = unpack_query(raw, self.store, dict(binding=self.identity['kdb'],
             host_query=self.store.put_json(raw)), negatives)
+        return combine_queries(baseline, experience) if baseline is not None else experience
 
     def verified(self):
         if self.adaptive:
@@ -307,9 +354,9 @@ class KernelContinuation:
     instruction: str
 
 
-def kernel_adoption():
+def kernel_adoption(*, baseline_query=None):
     def build(owner, **inputs):
-        host = KernelActionsHost(owner, inputs)
+        host = KernelActionsHost(owner, inputs, baseline_query=baseline_query)
         bundle, limits = baseline_contract(owner, owner.max_seconds)
         spec = ProjectSpec('kernel', inputs['instruction'], ('host-kernel-executor',), budgets=limits)
         root = Path(inputs['workspace']) / 'canonical'
@@ -317,7 +364,11 @@ def kernel_adoption():
             session_factory=lambda: PiSessionAdapter(model=inputs['profile'].identity.backend_model.value,
                                                      environ=owner.provider.coding_environment()))
         if (root / 'domain.json').exists():
-            return DomainRunner(root, host, **injections)
+            runner = DomainRunner(root, host, **injections)
+            from benchmarks.ascend.actor_control import ActorControl
+            if runner.workflow.state['stopped'] and not ActorControl(host.control_root).status()['stop_requested']:
+                runner.workflow.resume()  # Keep every pending dispatch and elapsed interval.
+            return runner
         return DomainRunner.create(root, spec, bundle, host, **injections)
 
     def finish(owner, runner, result, inputs):
@@ -349,32 +400,66 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
         if len(data) <= min(8192, remaining_bytes):
             payloads[ref] = data.decode(errors='replace')
             remaining_bytes -= len(data)
-    messages = [dict(role='user', content=continuation.instruction), dict(role='user', content=
-        DISTILLATION_PROMPT + '\n' + json.dumps(dict(admitted_artifacts=admitted,
-            artifact_payloads=payloads, host_summaries=list(host_summaries)[:16],
-            workflow_history=runner.workflow.state['history'][-20:])))]
-    tokens = 0
+    from benchmarks.ascend.agent_context import WorkingContext
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    recorder = _ProviderEvidenceRecorder(runner.backend.host.control_root)
+    host = runner.backend.host
+    # Reuse the existing direct-provider context policy for this noncoding task.
+    # Full host material remains in CAS; summaries never acquire host authority.
+    working = WorkingContext([dict(role='system', content=owner.system_prompt),
+        dict(role='user', content=continuation.instruction)])
+    for row in runner.workflow.state['history']:
+        working.append(dict(role='user', content=json.dumps(dict(workflow_step=row))))
+    for summary in host_summaries:
+        working.append(dict(role='user', content=json.dumps(dict(host_summary=summary))))
+    working.pinned = [dict(role=row['role'], content=row['content']) for row in host.feedback]
+    terminal = dict(role='user', content=DISTILLATION_PROMPT + '\n' + json.dumps(dict(
+        admitted_artifacts=admitted, artifact_payloads=payloads,
+        workflow_history=runner.workflow.state['history'][-1:])))
+    working.append(terminal)
+    tokens, turn = 0, 0
     while True:
         seconds = runner.actor._available()
+        driver = owner.with_time_budget(seconds)
         token = runner.workflow.accounting.start('thinking')
         try:
-            completion = owner.provider.complete(continuation.profile, messages, max_seconds=seconds)
+            try:
+                messages, summary_tokens = driver._prepare_context(
+                    working, continuation.profile, recorder, turn=turn)
+                tokens += summary_tokens
+                driver._request(recorder, continuation.profile, messages, stage='distillation', turn=turn)
+                completion = driver._complete(recorder, continuation.profile, messages,
+                                               stage='distillation', turn=turn)
+            except Exception as failure:
+                recorder.failure(failure, stage='distillation', turn=turn)
+                ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
+                    exception_type=type(failure).__name__, source_hash=host.project_hash(),
+                    contract_ref=runner.contract_ref, host_outcome=outcome.status))
+                runner.append(dict(type='domain-distillation-failure', reference=ref))
+                # The already verified host outcome survives a separate summary
+                # failure. No candidate or execution is replayed.
+                return replace(outcome, tokens=tokens, distillation_failure=ref,
+                               wall_time_s=runner.workflow.accounting.seconds())
         finally:
             runner.workflow.accounting.end(token)
         tokens += completion.completion_tokens
+        recorder.response(completion.text, stage='distillation', turn=turn)
         owner._trace('message', dict(role='assistant', content=completion.text))
         try:
             distilled = parse_agent_distillation(completion.text, admitted)
         except ValueError as exc:
-            messages.extend((dict(role='assistant', content=completion.text),
-                             dict(role='user', content='Correct terminal JSON: ' + str(exc))))
+            working.append(dict(role='assistant', content=completion.text))
+            working.append(dict(role='user', content='Correct terminal JSON: ' + str(exc)))
+            turn += 1
             continue
         return replace(outcome, tokens=tokens, terminal_response=completion.text,
+                       wall_time_s=runner.workflow.accounting.seconds(),
                        distillation=distilled, admitted_artifacts=admitted, continuation=None)
 
 
 class A3Host(SourceHost):
-    def __init__(self, owner):
+    def __init__(self, owner, *, baseline_query=None):
+        self.baseline_query = baseline_query
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
         self.owner, self.runtime = owner, owner.candidate
@@ -408,7 +493,8 @@ class A3Host(SourceHost):
             source_contract=CANDIDATE_SOURCE_CONTRACT.as_dict(),
             memory=json.loads(memory_context)), default=str)
         self.identity = dict(target=owner.execution_profile, provider=owner.profile.as_dict(),
-            kdb=fingerprint(knowledge_identity(owner.knowledge)),
+            kdb=fingerprint(knowledge_identity(baseline_query if baseline_query is not None else owner.knowledge)),
+            experience=fingerprint(knowledge_identity(owner.knowledge)),
             memory=sha256(memory_context.encode()).hexdigest(),
             verifier=fingerprint(dict(proposal=asdict(owner.proposal), parameters=dict(owner.proposal.parameters))))
 
@@ -457,13 +543,17 @@ class A3Host(SourceHost):
         self.actions.append('write_source')
 
     def query(self, payload):
+        baseline = self.baseline_query(payload) if self.baseline_query is not None else None
+        if baseline is not None and not self.owner.knowledge.enabled:
+            return baseline
         from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
         self.queries += 1
         rows = self.owner.knowledge.query(KnowledgeQuery(payload['query'], payload.get('limit', 5)))
         if not self.owner.knowledge.enabled:
             raise QueryUnavailable('A3 canonical workflow requires an enabled baseline Knowledge Agent')
-        return dict(results=[asdict(row) for row in rows], negative_records=[row for row in
+        experience = dict(results=[asdict(row) for row in rows], negative_records=[row for row in
             self.observations if row.get('passed') is False], provenance=dict(binding=self.identity['kdb']))
+        return combine_queries(baseline, experience) if baseline is not None else experience
 
     def retain_failure(self, operation, result):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
@@ -535,9 +625,9 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
-def a3_adoption():
+def a3_adoption(*, baseline_query=None):
     def build(owner, **inputs):
-        host = A3Host(owner)
+        host = A3Host(owner, baseline_query=baseline_query)
         actor = getattr(owner.actor, 'canonical_actor', owner.actor)
         # Production A3Actor owns an existing registered Pi session. Preserve its
         # exact model/credential route instead of creating a new provider stack.
@@ -593,11 +683,50 @@ def a3_adoption():
 class OptimizerHost(SourceHost):
     editable_files = ('candidate.json',)
 
+    def boundary_reached(self, stage):
+        return stage != Stage.TEST or self.value is None
+
+    def refresh_public_result(self, retained):
+        return self.owner.store.get(self.owner.key)
+
+    def on_actor_event(self, kind, data):
+        observer = self.owner.memory_observer
+        if kind != 'pi-provider-request' or observer is None:
+            return
+        # Only exact summary rows observed in the actual gateway request count;
+        # building/filtering a context or admitting a CAS reference is not exposure.
+        shown = []
+        def visit(value):
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except (ValueError, TypeError):
+                    return
+                if not isinstance(decoded, str):
+                    visit(decoded)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                for row in value.get('memory_summary', []):
+                    if row in self.presentable_memory and row not in shown:
+                        shown.append(row)
+                for item in value.values():
+                    visit(item)
+        visit(data['request'])
+        if shown:
+            delivered = observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown),
+                                 data['reservation_id'])
+            if delivered.get('memory_summary') != shown:
+                raise WorkflowError('memory availability changed before provider dispatch; refresh context')
+
+
     def __init__(self, owner, inputs):
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         from optimizer.memory import verify_snapshot
         self.owner, self.runtime, self.inputs = owner, owner.backend, inputs
-        self.boundary_stage = Stage.TASK_CONSTRUCTION if inputs.get('prepare_only') else None
+        self.boundary_stage = (Stage.TASK_CONSTRUCTION if inputs.get('prepare_only') else
+                               Stage.TEST if inputs.get('single_evaluation') else None)
         self.submission = owner.store.submission(owner.key)
         snapshot = inputs.get('memory_snapshot') or self.submission['memory_snapshot']
         verify_snapshot(snapshot)
@@ -614,7 +743,10 @@ class OptimizerHost(SourceHost):
             raise ValueError('supplied representatives exceed configured case budget')
         self.baseline = owner._read(owner.state['baseline']) if 'baseline' in owner.state else None
         self.evaluation, self.value = None, None
-        self.instruction = json.dumps(dict(submission=self.spec, memory=snapshot,
+        self.presentable_memory = []
+        self.instruction = json.dumps(dict(submission=self.spec,
+            memory=dict(snapshot_id=snapshot['snapshot_id'], entries=len(snapshot['memory_entries']),
+                        files={name:row['sha256'] for name,row in snapshot['files'].items()}),
             guide=getattr(getattr(owner.agent, 'agent', owner.agent), 'guide', ''),
             optimizer_context=owner.context, source_format='candidate.json requires source and block_count; '
             'use native optimizer_kernel ABI from the frozen baseline contracts'), default=str)
@@ -669,6 +801,19 @@ class OptimizerHost(SourceHost):
             self.owner.store.add_event(self.owner.key, 'case-proposals',
                 dict(accepted=accepted, rejected=rejected, summary=args['summary']))
             return dict(accepted=accepted, rejected=rejected)
+        def compile_candidate(stage, args, operation, seconds):
+            from rsi.domain_execution import DomainActivity
+            callback = getattr(self.owner.backend, 'compile', None)
+            if callback is None:
+                raise CanonicalConfigurationError('configured optimizer backend has no compile diagnostics capability')
+            candidate = dict(source=args['source'], block_count=args['block_count'])
+            directory = self.owner.directory / 'compile' / fingerprint(candidate) / operation
+            report = self.call(DomainActivity(self.runner, operation), 'compile-diagnostic', 'compilation',
+                lambda remaining: callback(candidate['source'], directory, block_count=candidate['block_count']))
+            ref = self.owner._artifact('compile', report)
+            self.owner.state['history'].append(dict(tool=dict(action='compile', **args), result=ref, content=report))
+            self.owner._save()
+            return report
         def read_memory(stage, args, operation, seconds):
             snapshot = self.submission['memory_snapshot']
             index = args['index']
@@ -678,7 +823,7 @@ class OptimizerHost(SourceHost):
                     'use read_memory with an admitted index or read_context for a paged tool result')
             row = snapshot['memory_entries'][index]
             if self.owner.memory_observer is not None:
-                row = self.owner.memory_observer('read-memory', snapshot, dict(result=row), operation)
+                row = self.owner.memory_observer('read-memory', snapshot, dict(action=dict(index=index), result=row), operation)
             return row
         def read_artifact(stage, args, operation, seconds):
             import base64
@@ -699,8 +844,14 @@ class OptimizerHost(SourceHost):
                 if sha256(data).hexdigest() != reference:
                     raise ValueError('admitted memory artifact digest mismatch')
             text = data.decode('utf-8')
-            return dict(text=text[offset:offset+8192], next_offset=offset+8192 if len(text)>offset+8192 else None)
-        return dict(propose_cases=EvidenceTool(OPTIMIZER_SCHEMAS['cases'], propose, (Stage.TASK_CONSTRUCTION,)),
+            result = dict(offset=offset, text=text[offset:offset+8192],
+                          next_offset=offset+8192 if len(text)>offset+8192 else None)
+            if reference not in job and reference in memory and self.owner.memory_observer is not None:
+                result = self.owner.memory_observer('read-artifact', self.submission['memory_snapshot'],
+                    dict(action=dict(sha256=reference, offset=offset), result=result), operation)
+            return result
+        return dict(compile=EvidenceTool(OPTIMIZER_SCHEMAS['compile'], compile_candidate),
+                    propose_cases=EvidenceTool(OPTIMIZER_SCHEMAS['cases'], propose, (Stage.TASK_CONSTRUCTION,)),
                     read_memory=EvidenceTool(OPTIMIZER_SCHEMAS['read-memory'], read_memory),
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
 
@@ -718,6 +869,15 @@ class OptimizerHost(SourceHost):
         value['artifact_scope'] = dict(job_ids=sorted(job), memory_ids=sorted(memory),
             memory_entries=len(self.submission['memory_snapshot']['memory_entries']),
             query_results='Use returned content/read_context pages; query receipt IDs are not artifact IDs.')
+        summaries = dict(memory_summary=[dict(index=index, summary=str(entry)[:1200])
+            for index,entry in enumerate(self.submission['memory_snapshot']['memory_entries'])])
+        observer = self.owner.memory_observer
+        if observer is not None:
+            filter_presentation = getattr(observer, 'filter_presentation', None)
+            if filter_presentation is not None:
+                summaries = filter_presentation(self.submission['memory_snapshot'], summaries)
+        self.presentable_memory = summaries['memory_summary']
+        value.update(summaries)
         value.update(baseline=self.baseline, history=self.owner.state['history'],
                      best=self.owner.state.get('best'))
         return value
@@ -774,7 +934,7 @@ class OptimizerHost(SourceHost):
                                  performance='not_requested')
 
 
-def optimizer_adoption():
+def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         if owner.state.get('pending') and not owner.state.get('canonical_active'):
             raise CanonicalConfigurationError('retained legacy native operation needs explicit canonical checkpoint migration; observe original handles first')
@@ -789,10 +949,10 @@ def optimizer_adoption():
             owner.store.transition(owner.key, 'running')
         host = OptimizerHost(owner, inputs)
         agent = getattr(owner.agent, 'agent', owner.agent)
-        if not hasattr(agent, 'model'):
+        if session_factory is None and not hasattr(agent, 'model'):
             raise CanonicalConfigurationError('optimizer canonical binding requires a registered Pi model or explicit CanonicalAdoption')
         active = owner.state.get('canonical_active')
-        if (active is None or (inputs.get('single_evaluation') and active.get('status') == 'accepted')
+        if (active is None or (inputs.get('single_evaluation') and active.get('status') in ('accepted', 'evaluated'))
                 or (not inputs.get('prepare_only') and active.get('status') == 'prepared')):
             active = dict(index=owner.state.get('canonical_count', 0) + 1, status='new')
             owner.state['canonical_count'] = active['index']
@@ -800,7 +960,8 @@ def optimizer_adoption():
             owner._save()
         root = owner.directory / ('canonical-' + str(active['index']))
         injections = dict(query=host.query, backend_identity=fingerprint(host.identity),
-                          session_factory=lambda: PiSessionAdapter(model=agent.model))
+                          session_factory=session_factory or (lambda: PiSessionAdapter(model=agent.model)),
+                          test_backend=test_backend, **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             runner = DomainRunner(root, host, **injections)
             if runner.workflow.state.pop('domain_boundary', None):
@@ -813,8 +974,9 @@ def optimizer_adoption():
     def finish(owner, runner, result, inputs):
         elapsed = runner.workflow.accounting.seconds()
         owner.store.account_canonical_elapsed(owner.key, runner.contract_ref, elapsed)
-        owner.state['canonical_active']['status'] = ('prepared' if runner.workflow.state.get('domain_boundary')
-                                                      else result['status'])
+        boundary = runner.workflow.state.get('domain_boundary')
+        owner.state['canonical_active']['status'] = ('prepared' if boundary == Stage.TASK_CONSTRUCTION.value else
+                                                      'evaluated' if boundary == Stage.TEST.value else result['status'])
         owner._save()
         row = owner.store.get(owner.key)
         if row['status'] == 'running' and not runner.workflow.state.get('domain_boundary') and not (

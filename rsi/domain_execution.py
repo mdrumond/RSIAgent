@@ -221,6 +221,7 @@ class DomainRunner(ProjectRunner):
             observed_close._rsi_original_close = original_close
             session.close = observed_close
             return session
+        host.runner = self
         self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
@@ -440,7 +441,8 @@ class DomainRunner(ProjectRunner):
             def step(self, context):
                 stage = runner.workflow.stage
                 result = actor.step(context)
-                if stage == boundary:
+                reached = getattr(runner.backend, 'boundary_reached', lambda stage: True)
+                if stage == boundary and reached(stage):
                     runner.workflow.state['domain_boundary'] = boundary.value
                     runner.workflow.stop()
                     raise WorkflowError('requested domain workload boundary reached')
@@ -483,7 +485,9 @@ class CanonicalAdoption:
             row = runner.store.read_json(event['reference'])
             if row['contract_ref'] != runner.contract_ref or row['source_hash'] != runner.backend.project_hash():
                 raise WorkflowError('retained native public result scope differs')
-            return decode(row['value'])
+            value = decode(row['value'])
+            refresh = getattr(runner.backend, 'refresh_public_result', None)
+            return refresh(value) if refresh is not None else value
         value = self.finish(owner, runner, result, inputs)
         if runner.workflow.outcome == 'accepted' and not getattr(value,'continuation',None):
             ref = runner.store.put_json(dict(contract_ref=runner.contract_ref,

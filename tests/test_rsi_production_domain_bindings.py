@@ -554,3 +554,60 @@ def test_optimizer_unknown_artifact_strict_mode_does_not_recover(tmp_path,monkey
     assert result['status']=='suspended' and runner.workflow.pending
     assert reads==[] and backend.prepares==0
     assert not any(e['type']=='actor-invalid-action' for e in runner.events)
+
+
+def test_single_evaluation_settles_failed_candidate_before_debug_and_reopens_with_current_memory(tmp_path):
+    from optimizer.jobs import canonical, sha
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture, Backend
+    store, key = fixture(tmp_path)
+    backend = Backend()
+    class NextAttempt(CanonicalSession):
+        def next_action(self, context, allowed, **kwargs):
+            if not context['unread_skills'] and context['stage'] == Stage.IMPLEMENTATION.value:
+                return 'perform', dict(proposal='Repair the prior failed candidate using current attempt memory',
+                    edit=dict(path=context['source']['path'], sha256=context['source']['sha256'], source=self.initial))
+            return super().next_action(context, allowed, **kwargs)
+    sessions = iter([CanonicalSession(initial=json.dumps(dict(source='bad', block_count=1)),
+                                      repaired=json.dumps(dict(source='fast', block_count=1))),
+                     NextAttempt(initial=json.dumps(dict(source='fast', block_count=1)),
+                                      repaired=json.dumps(dict(source='fast', block_count=1)))])
+    adoption = bindings.optimizer_adoption(session_factory=lambda: next(sessions), test_backend=True)
+    agent = SimpleNamespace(identity={'test_decisions':'canonical'})
+    first = OptimizationLoop(store, key, agent, backend, knowledge=lambda _: [], canonical=adoption)
+    first.run(single_evaluation=True)
+    assert backend.evaluations == ['bad']
+    assert first.state['history'][-1]['content']['status'] == 'incorrect'
+    assert first.state['canonical_active']['status'] == 'evaluated'
+    root = first.directory/'canonical-1'
+    failed = json.loads((root/'workflow.json').read_text())
+    assert failed['pending'] is None and failed['domain_boundary'] == 'test'
+    assert not any(row['evidence']['stage']=='debug' for row in failed['history'])
+    body = dict(files={}, memory_entries=[dict(note='new attempt feedback')])
+    current = dict(body, snapshot_id=sha(canonical(body)))
+    second = OptimizationLoop(store, key, agent, backend, knowledge=lambda _: [], canonical=adoption)
+    second.run(single_evaluation=True, memory_snapshot=current)
+    assert backend.prepares == 1 and backend.evaluations == ['bad','fast']
+    assert len([row for row in second.state['history'] if 'candidate_sha256' in row]) == 2
+    assert second.state['canonical_active']['index'] == 2
+    contract = json.loads((second.directory/'canonical-2'/'domain.json').read_text())['contract']
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    retained = ContentAddressedArtifacts(second.directory/'canonical-artifacts').read_json(contract)
+    assert retained['identity']['memory'] == bindings.fingerprint(current)
+    assert json.loads((root/'workflow.json').read_text()) == failed
+
+
+def test_frozen_context_directory_hashes_all_named_bytes_and_rejects_missing_context(tmp_path):
+    from rsi.domain_execution import CanonicalConfigurationError
+    context = tmp_path/'context'; context.mkdir()
+    empty = bindings.frozen_context_bytes(context)
+    (context/'memory.json').write_bytes(b'actual admitted memory')
+    first = bindings.frozen_context_bytes(context)
+    assert first != empty
+    (context/'guide.txt').write_bytes(b'actual admitted guide')
+    second = bindings.frozen_context_bytes(context)
+    assert first != second
+    (context/'memory.json').write_bytes(b'changed memory')
+    assert bindings.frozen_context_bytes(context) != second
+    with pytest.raises(CanonicalConfigurationError):
+        bindings.frozen_context_bytes(tmp_path/'missing')

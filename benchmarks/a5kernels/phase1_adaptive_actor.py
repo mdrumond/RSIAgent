@@ -160,6 +160,10 @@ def disabled_knowledge_action(
     })
 
 
+# Treatment identity is distinct from a configured canonical baseline KDB.
+disabled_knowledge_action.enabled = False
+
+
 def disabled_profile_action(
     _payload: Mapping[str, object], _context: AdaptiveActionContext,
 ) -> AdaptiveActionResult:
@@ -865,12 +869,17 @@ class AdaptiveActorProjectExecutor:
                 outcome, admitted_artifacts=actions.admitted,
                 host_summaries=tuple(asdict(fact) for fact in facts),
             )
-            if not isinstance(learned.distillation, AgentDistillation):
-                raise RuntimeError("terminal project omitted structured distillation")
-            if learned.terminal_response is None:
-                raise RuntimeError("terminal project omitted exact distillation response")
-            distillation = learned.distillation
-            artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
+            if learned.distillation_failure is not None:
+                # Host verification is complete; unavailable model summaries do
+                # not invalidate it or publish any agent-written lesson.
+                distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
+            else:
+                if not isinstance(learned.distillation, AgentDistillation):
+                    raise RuntimeError("terminal project omitted structured distillation")
+                if learned.terminal_response is None:
+                    raise RuntimeError("terminal project omitted exact distillation response")
+                distillation = learned.distillation
+                artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
         else:
             # Subject campaigns and usefulness arms delegate learning independently.
             # The factual result is still compatible with legacy wave readers.
