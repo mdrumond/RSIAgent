@@ -373,33 +373,50 @@ def test_local_native_source_rejection_has_observed_failure_receipt_and_export(t
     assert export_task(runner.root,tmp_path/'local-native-failure')['task_contract']==runner.contract_ref
 
 
-def test_existing_pi_session_adoption_preserves_route_and_delivers_reads(monkeypatch):
+def test_existing_pi_session_adoption_transfers_controller_route_and_cleanup(monkeypatch):
+    import time
     import coding.pi.session as native
-    from rsi.actor import PiSessionAdapter, WorkflowContextRecords, SCHEMAS
+    from coding.pi.controller import ControllerSession
+    from rsi.actor import PiSessionAdapter
     from pathlib import Path
     monkeypatch.setattr(native, 'runtime_preflight', lambda: Path('/unused-cpu-fixture'))
     session = native.PiCodingSession(model='deepseek-flash', schemas={},
-        environ={'DEEPSEEK_API_KEY': 'CPU-fixture-secret'})
-    profile, gateway = session.profile, session.gateway
+        environ={'DEEPSEEK_API_KEY': 'CPU-fixture-secret'}, own_process_group=False)
+    # A3's actor request deadline may expire during excluded setup/transfer. It
+    # must survive as provenance, not become an inferred enclosing wall limit.
+    session.deadline = session.gateway.deadline = time.monotonic() - 1
+    provenance = dict(session=session.deadline, gateway=session.gateway.deadline)
+    profile, gateway, original_stack = session.profile, session.gateway, session.stack
+    cleaned = []
+    original_stack.callback(lambda: cleaned.append('original transport cleanup'))
     adapter = PiSessionAdapter.from_existing_session(session)
-    assert adapter.session is session and session.profile is profile and session.gateway is gateway
-    assert session._provider_secret == 'CPU-fixture-secret'
-    assert session.context_factory is WorkflowContextRecords
-    delivered = []
-    def next_action(context, allowed, *, record, **kwargs):
-        record('pi-provider-request', dict(request=dict(messages=[dict(content='observed skill bytes')])))
-        return 'perform', dict(proposal='CPU fixture')
-    monkeypatch.setattr(session, 'next_action', next_action)
-    adapter.delivery.begin('operation')
-    adapter.expect_read('receipt', 'observed skill bytes')
-    action = adapter.next_action(dict(operation_id='operation', stage=Stage.TASK_CONSTRUCTION.value),
-        ['perform'], seconds=1, record=lambda kind, data: delivered.append((kind, data)), source=None)
-    assert action[0] == 'perform' and adapter.missing_reads(['receipt']) == []
-    assert any(kind == 'skill-delivered' for kind, _ in delivered)
-    request = dict(tools=[dict(function=dict(name='perform', parameters={}))])
-    assert gateway.request_projector(request)['tools'][0]['function']['parameters'] == session.schemas['perform']
-    assert session.schemas['read_skill'] == SCHEMAS['read_skill']
+    controller = adapter.session
+    try:
+        assert isinstance(controller, ControllerSession) and controller is not session
+        assert controller.model == session.model and controller.profile is profile
+        assert controller.gateway is gateway and controller.stack is original_stack
+        assert controller._provider_secret == 'CPU-fixture-secret'
+        assert controller.own_process_group is False and controller.rpc is None
+        assert controller.request_deadline_provenance == provenance
+        assert controller.enclosing_deadline is None
+        assert session.closed and not controller.closed
+        session.close()
+        assert not controller.closed and cleaned == []
+        delivered = []
+        adapter.delivery.begin('operation')
+        adapter.expect_read('receipt', 'observed skill bytes')
+        adapter.delivery.observe(dict(messages=[dict(content='observed skill bytes')]),
+            lambda kind, data: delivered.append((kind, data)))
+        assert adapter.missing_reads(['receipt']) == []
+        assert any(kind == 'skill-delivered' for kind, _ in delivered)
+        controller.schemas['perform'] = dict(type='object', properties=dict(proposal=dict(type='string')))
+        request = dict(tools=[dict(function=dict(name='perform', parameters={}))])
+        assert gateway.request_projector(request)['tools'][0]['function']['parameters'] == controller.schemas['perform']
+    finally:
+        adapter.close()
+    assert controller.closed and cleaned == ['original transport cleanup']
     adapter.close()
+    assert cleaned == ['original transport cleanup']
 
 
 @pytest.mark.parametrize('changed', ['memory', 'collection', 'negative_snapshot'])
