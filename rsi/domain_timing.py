@@ -22,8 +22,6 @@ def activity_phase(category):
         flow.accounting.end(scope['token'])
         scope['token'] = flow.accounting.start(previous)
         scope['category'] = previous
-        if category in flow.accounting.EXCLUDED and scope.get('budget_update') is not None:
-            scope['budget_update']()
 
 
 @contextmanager
@@ -38,3 +36,17 @@ def transfer_phase(function):
         with excluded_phase():
             return function(*args, **kwargs)
     return wrapped
+
+
+def canonical_allowance():
+    scope = CURRENT.get()
+    if scope is None or scope['category'] in scope['flow'].accounting.EXCLUDED:
+        return None
+    values = [value for value in scope['flow'].remaining().values() if value is not None]
+    return max(0., min(values)) if values else None
+
+
+def bounded_deadline(wall_deadline):
+    import time
+    remaining = canonical_allowance()
+    return wall_deadline if remaining is None else min(wall_deadline, time.monotonic() + remaining)

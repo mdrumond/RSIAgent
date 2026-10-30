@@ -83,6 +83,10 @@ class CplNativeCandidateBackend:
 
     def _allowance(self):
         remaining = self.timeout if self.remaining_seconds is None else min(self.timeout, self.remaining_seconds())
+        from rsi.domain_timing import canonical_allowance
+        canonical = canonical_allowance()
+        if canonical is not None:
+            remaining = min(remaining, canonical)
         if not math.isfinite(remaining) or remaining <= 0:
             raise self._pending('CPL native elapsed allocation exhausted', 'deadline-exhausted')
         return remaining

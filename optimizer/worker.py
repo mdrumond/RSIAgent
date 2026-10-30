@@ -41,6 +41,15 @@ def load_config(path, worker_config_path=None):
 
 
 class RemoteBackend:
+    @property
+    def deadline(self):
+        from rsi.domain_timing import bounded_deadline
+        return bounded_deadline(self._deadline)
+
+    @deadline.setter
+    def deadline(self, value):
+        self._deadline = value
+
     def __init__(self, store, job_id, config, *, transport=None, transport_factory=None):
         if transport is not None and transport_factory is not None:
             raise ValueError('supply transport or transport_factory, not both')
