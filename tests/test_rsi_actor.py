@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from rsi.actor import PiSessionAdapter, StageResult, WorkflowActor, SourceSnapshot
+# Snapshot transport compatibility; production native transport is tested separately.
+from rsi.actor import SnapshotPiSessionAdapter as PiSessionAdapter
+from rsi.actor import StageResult, WorkflowActor, SourceSnapshot
 from rsi.contracts import BudgetLimits, Stage
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import builtin_bundle

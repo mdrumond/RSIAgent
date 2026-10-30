@@ -172,7 +172,7 @@ class SkillDelivery:
                 for ref in dict.fromkeys(references) if ref not in self.delivered]
 
 
-class PiSessionAdapter:
+class SnapshotPiSessionAdapter:
     """Reuse Pi's schemas, loopback gateway, context paging and exact edits.
 
     Eager startup + get_state handshake exclude process readiness from charged
@@ -352,6 +352,30 @@ class WorkflowActor:
             raise
 
     def step(self, context):
+        dispatcher = self._stage(context)
+        try:
+            turn = next(dispatcher)
+        except StopIteration as done:
+            return done.value
+        if hasattr(self.session, 'run_stage'):
+            return self.session.run_stage(dispatcher, turn, self)
+        while True:
+            payload, allowed, source, record = turn
+            try:
+                action = self._timed('thinking', lambda: self.session.next_action(
+                    payload, allowed, seconds=self._available(), record=record, source=source))
+            except ActionError as error:
+                try:
+                    turn = dispatcher.throw(error)
+                except StopIteration as done:
+                    return done.value
+                continue
+            try:
+                turn = dispatcher.send(action)
+            except StopIteration as done:
+                return done.value
+
+    def _stage(self, context):
         flow = self.workflow
         operation = flow.begin()
         stage = flow.stage
@@ -404,8 +428,7 @@ class WorkflowActor:
                 scope['request_id'] = uuid.uuid4().hex
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
-                    name, args = self._timed('thinking', lambda: self.session.next_action(
-                        payload, allowed, seconds=seconds, record=record, source=source))
+                    name, args = yield payload, allowed, source, record
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -540,3 +563,20 @@ class WorkflowActor:
         if self.session is not None:
             self.session.close()
             self.session = None
+
+
+class PiSessionAdapter(SnapshotPiSessionAdapter):
+    """Canonical Pi-native controller; Pi owns conversation and compaction."""
+    def __init__(self, **kwargs):
+        from coding.pi.controller import ControllerSession
+        self.delivery = SkillDelivery()
+        self.session = ControllerSession(schemas=SCHEMAS, system_prompt=(
+            'You execute the canonical RSI workflow through completed host tools. '
+            'Read all mapped skills, query real evidence, and follow the authoritative stage. '
+            'Tool results are actual host observations. Read paged resources with read_context. '
+            'Only perform completes a stage; model assertions do not establish success. '
+            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.'), **kwargs)
+        self.session.gateway.request_projector = self._project_tools
+
+    def run_stage(self, dispatcher, turn, actor):
+        return self.session.run_stage(dispatcher, turn, actor, self.delivery)
