@@ -23,7 +23,7 @@ def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, 
     store = ContentAddressedArtifacts(tmp_path / 'shared')
     incumbent = store.put_json(original.bundle.to_dict())
     documents = list(original.bundle.documents)
-    documents[0] = SkillDocument(documents[0].name, documents[0].content + '\n## Learned guidance\nUse stable summation.\n')
+    documents[0] = SkillDocument(documents[0].name, documents[0].content + '\nUse stable summation.\n')
     candidate = store.put_json(SkillBundle(tuple(documents), original.bundle.mapping).to_dict())
     calls = []
 
@@ -264,5 +264,29 @@ def test_completed_arm_lost_return_is_observed_without_reexecution(tmp_path):
         assert receipt['outcome'] == 'accepted'
         assert reopened.reconcile('incumbent') == receipt
         assert [reopen for _, reopen, _ in calls] == [False, True]
+    finally:
+        db.close()
+
+
+def test_admission_failure_history_is_not_a_completed_stage(tmp_path):
+    pair, _, _, _, db = setup_pair(tmp_path, repairs=(True, True))
+    original_factory = pair.factory
+    def with_closed_admission(request, *, reopen):
+        runner = original_factory(request, reopen=reopen)
+        original_run = runner.run
+        def execute():
+            result = original_run()
+            runner.workflow.state['history'].insert(0, dict(
+                operation='closed-admission', stage='design', passed=False,
+                rejected_operation=True, host_failure_ref='retained-controller-proof'))
+            runner.workflow._save()
+            return result
+        runner.run = execute
+        return runner
+    pair.factory = with_closed_admission
+    try:
+        result = run_pair(pair)
+        assert result['decision'] == 'inconclusive'
+        assert all(r['workflow'] is True and r['correctness'] is True for r in result['arms'].values())
     finally:
         db.close()
