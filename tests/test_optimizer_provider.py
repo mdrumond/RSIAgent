@@ -36,7 +36,7 @@ def test_hanging_provider_is_terminated_on_stop_or_remaining_budget(stop):
     with pytest.raises(WorkerStopped):
         agent.complete('optimize', {'hang': True}, lambda *row: records.append(row))
     assert time.monotonic() - started < 2
-    assert set(multiprocessing.active_children()) == before
+    assert set(multiprocessing.active_children()) <= before
     assert records[0][0] == 'request'
 
 

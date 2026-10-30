@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import fcntl
 import json
 from pathlib import Path
@@ -149,8 +151,10 @@ def test_optimizer_restart_instruction_reaches_production_job_context(tmp_path):
     execution, agent, backend = executor(tmp_path, [candidate('good')])
     execution.prepare()
     execution.attempt('reviewed-restart')
-    assert all(context['user_feedback'][0]['content'] == 'Use the reviewed repair direction'
-               for _, context in agent.contexts)
+    assert agent.contexts
+    assert all(context['task']['domain']['feedback'] == [dict(role='user',
+        content='Use the reviewed repair direction', feedback_id=1)]
+        for _, context in agent.contexts)
     manifest = execution.job_directory/'manifest.json'
     assert manifest.exists()
     assert interaction._inbox(tmp_path/'task', {'plan': {'task': {'kind': 'optimizer'}}}).root == manifest.parent

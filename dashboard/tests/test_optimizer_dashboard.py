@@ -81,7 +81,7 @@ def test_disabled_and_action_validation(setup, tmp_path):
 
 def test_launch_failure_and_live_http(setup):
     from threading import Thread
-    from urllib.request import urlopen, Request
+    from urllib.request import build_opener, ProxyHandler, Request
     from werkzeug.serving import make_server
 
     app, _, _ = setup
@@ -92,6 +92,7 @@ def test_launch_failure_and_live_http(setup):
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f'http://127.0.0.1:{server.server_port}'
+    urlopen = build_opener(ProxyHandler({})).open
     try:
         token = json.load(urlopen(base + '/api/csrf'))['token']
         payload = {'source': 'def f(x): return x', 'entrypoint': 'f',

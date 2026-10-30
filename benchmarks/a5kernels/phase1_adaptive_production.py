@@ -8,6 +8,7 @@ from coding.pi.actor import PiActorDriver
 from coding.pi import ENGINE_IDENTITY
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -192,6 +193,11 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
             admitted_artifacts=admitted,
         )
 
+    def canonical_identity():
+        with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
+            return dict(manifests={item.collection: json.loads(item.to_json())
+                for item in database.selected_manifests(paths.collection)})
+    query.canonical_identity = canonical_identity
     return query
 
 

@@ -64,6 +64,13 @@ class CplNativeCandidateBackend:
         return error
 
     def _timed(self, stage, callback, *, key=None):
+        if stage in ('upload', 'compile', 'execute'):
+            from rsi.domain_timing import activity_phase
+            with activity_phase(dict(upload='transfer', compile='compilation', execute='execution')[stage]):
+                return self._timed_record(stage, callback, key=key)
+        return self._timed_record(stage, callback, key=key)
+
+    def _timed_record(self, stage, callback, *, key=None):
         started, epoch = self.clock(), self.wall_clock()
         try:
             return callback()
@@ -76,6 +83,10 @@ class CplNativeCandidateBackend:
 
     def _allowance(self):
         remaining = self.timeout if self.remaining_seconds is None else min(self.timeout, self.remaining_seconds())
+        from rsi.domain_timing import canonical_allowance
+        canonical = canonical_allowance()
+        if canonical is not None:
+            remaining = min(remaining, canonical)
         if not math.isfinite(remaining) or remaining <= 0:
             raise self._pending('CPL native elapsed allocation exhausted', 'deadline-exhausted')
         return remaining

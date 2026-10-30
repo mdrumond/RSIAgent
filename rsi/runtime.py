@@ -159,11 +159,36 @@ class Workflow:
         deadlines[scope] = min(deadlines.get(scope, deadline), deadline)
         self._save()
 
+    def grant_actor_seconds(self, key, seconds, receipt):
+        """Trusted controller allocation; never refunds closed or unknown work.
+
+        Frozen base limits stay immutable. Reusing the same authority key is
+        idempotent; changing its amount or receipt is a hard error.
+        """
+        if (not isinstance(key, str) or not key or not isinstance(receipt, str) or not receipt
+                or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0
+                or self.limits.actor_seconds is None):
+            raise ValueError('finite additional actor allocation and retained authority required')
+        grant = dict(seconds=seconds, receipt=receipt)
+        grants = self.state.setdefault('actor_grants', {})
+        if key in grants and grants[key] != grant:
+            raise WorkflowError('actor allocation authority was reused with different contents')
+        grants[key] = grant
+        self._save()
+
+    def actor_allocation(self):
+        base = self.limits.actor_seconds
+        grants = self.state.get('actor_grants', {})
+        if any(type(row['seconds']) not in (int, float) or not math.isfinite(row['seconds'])
+               or row['seconds'] <= 0 for row in grants.values()):
+            raise WorkflowError('invalid retained actor allocation')
+        return None if base is None else base + sum(row['seconds'] for row in grants.values())
+
     def remaining(self):
         now = self.accounting.now()
         if now < self.state["created"]:
             raise WorkflowError("clock precedes workflow creation")
-        actor = self.limits.actor_seconds
+        actor = self.actor_allocation()
         wall = self.limits.wall_seconds
         deadlines = list(self.state.get('wall_deadlines', {}).values())
         if wall is not None:
@@ -338,6 +363,10 @@ class Workflow:
             self.state["outcome"] = "accepted" if passed else "rejected"
         elif not passed:
             next_stage = stage
+            if stage in (Stage.PREFLIGHT, Stage.TASK_CONSTRUCTION):
+                self.state.update(outcome='rejected', failure=dict(stage=stage.value,
+                    operation_id=evidence.operation_id, reason='host-admission-failed',
+                    artifact_refs=list(evidence.artifact_refs)))
         if redesign:
             next_stage = Stage.DESIGN
             self.state.update(tested=None, verified=None)

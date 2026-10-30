@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 import json
 import pytest
 
@@ -16,6 +18,7 @@ def fixture(tmp_path, attempts=3, seconds=7200):
 
 
 class Agent:
+    canonical_fixture = True
     identity = {'model': 'fake-fixed'}
 
     def __init__(self, actions):
@@ -68,44 +71,55 @@ def test_bad_evidence_read_returns_feedback_before_candidate(tmp_path, action):
     backend = Backend()
 
     class RepairAgent(Agent):
+        feedback = []
         def complete(self, stage, context, record):
-            if context.get('history'):
-                assert json.loads(context['history'][-1]['content_preview'])['status'] == 'tool-error'
+            if context['observation'] and context['observation'].get('event') == 'invalid-action':
+                self.feedback.append(context['observation'])
+                assert context['observation']['accepted'] is False
+                assert backend.evaluations == []
             return super().complete(stage, context, record)
 
     agent = RepairAgent([{'action': 'cases', 'signatures': [], 'summary': ''},
                          action, candidate('fast')])
-    result = OptimizationLoop(store, key, agent, backend).run(single_evaluation=True)
+    loop = OptimizationLoop(store, key, agent, backend)
+    result = loop.run(single_evaluation=True)
     assert result['attempts'] == 1
     assert backend.evaluations == ['fast']
-    state = OptimizationLoop(store, key, Agent([]), backend).state
-    assert 'model_action' not in state
-    assert state['history'][0]['tool'] == action
+    assert len(agent.feedback) == 1
+    invalid = [event for event in loop.fixture_runner.events if event['type'] == 'actor-invalid-action']
+    assert len(invalid) == 1
+    assert loop.state['canonical_active']['status'] == 'accepted'
 
 
-def test_bad_read_replay_is_cleared_only_with_persisted_feedback(tmp_path, monkeypatch):
+def test_bad_read_feedback_survives_authenticated_stage_recovery(tmp_path, monkeypatch):
+    from rsi.domain_execution import DomainRunner
     store, key = fixture(tmp_path, attempts=1)
     backend = Backend()
     bad = {'action': 'read-artifact', 'sha256': 'abc123', 'offset': 0}
     loop = OptimizationLoop(store, key, Agent([
-        {'action': 'cases', 'signatures': [], 'summary': ''}, bad]), backend)
-    def interrupted(action, result):
-        # Simulate process death before the feedback checkpoint.
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(loop, '_tool_result', interrupted)
+        {'action': 'cases', 'signatures': [], 'summary': ''}, bad, candidate('fast')]), backend)
+    original = DomainRunner.append
+    def crash(runner, event):
+        original(runner, event)
+        if event['type'] == 'stage-result' and event['stage'] == 'implementation':
+            raise KeyboardInterrupt
+    monkeypatch.setattr(DomainRunner, 'append', crash)
     with pytest.raises(KeyboardInterrupt):
-        loop.run()
-    resumed = OptimizationLoop(store, key, Agent([candidate('fast')]), backend)
-    assert resumed._read(resumed.state['model_action']) == bad
+        loop.run(single_evaluation=True)
+    invalid = [row for row in loop.fixture_runner.events if row['type'] == 'actor-invalid-action']
+    assert len(invalid) == 1 and invalid[0]['accepted'] is False
+    assert backend.evaluations == []
+    replies = sum(event['kind'] == 'model-response' for event in store.events(key))
+    monkeypatch.setattr(DomainRunner, 'append', original)
+    resumed = OptimizationLoop(store, key, Agent([]), backend)
     resumed.run(single_evaluation=True)
-    state = OptimizationLoop(store, key, Agent([]), backend).state
-    assert state['history'][0]['content']['status'] == 'tool-error'
-    assert 'model_action' not in state
-    assert backend.evaluations == ['fast']
+    assert [row for row in resumed.fixture_runner.events if row['type'] == 'actor-invalid-action'] == invalid
+    assert sum(event['kind'] == 'model-response' for event in store.events(key)) == replies
+    assert backend.evaluations == ['fast'] and backend.prepares == 1
+    assert resumed.state['canonical_active']['status'] == 'accepted'
 
 
-def test_resume_pre_fix_failed_job_replays_bad_read_as_feedback(tmp_path):
+def test_resume_legacy_bad_read_uses_canonical_feedback_and_preserves_baseline(tmp_path):
     store, key = fixture(tmp_path, attempts=1)
     backend = Backend()
     loop = OptimizationLoop(store, key, Agent([
@@ -118,12 +132,15 @@ def test_resume_pre_fix_failed_job_replays_bad_read_as_feedback(tmp_path):
     loop._save()
     store.transition(key, 'failed')
     store.resume(key, additional_attempts=1, additional_seconds=1)
-    OptimizationLoop(store, key, Agent([candidate('fast')]), backend).run(single_evaluation=True)
-    state = OptimizationLoop(store, key, Agent([]), backend).state
-    assert state['history'][0]['tool'] == bad
-    assert state['history'][0]['content']['status'] == 'tool-error'
-    assert backend.prepares == 1
-    assert backend.evaluations == ['fast']
+    # Old model_action is inert history, not an executable canonical receipt.
+    # The resumed model makes an actual proposal and receives real feedback.
+    resumed = OptimizationLoop(store, key, Agent([bad, candidate('fast')]), backend)
+    resumed.run(single_evaluation=True)
+    invalid = [row for row in resumed.fixture_runner.events if row['type'] == 'actor-invalid-action']
+    assert len(invalid) == 1 and invalid[0]['accepted'] is False
+    assert resumed._read(retained) == bad
+    assert backend.prepares == 1 and backend.evaluations == ['fast']
+    assert resumed.state['canonical_active']['status'] == 'accepted'
 
 
 def test_corrupt_retained_artifact_is_not_model_feedback(tmp_path):
@@ -133,9 +150,14 @@ def test_corrupt_retained_artifact_is_not_model_feedback(tmp_path):
     loop = OptimizationLoop(store, key, Agent([
         {'action': 'cases', 'signatures': [], 'summary': ''},
         {'action': 'read-artifact', 'sha256': artifact['sha256'], 'offset': 0}]), Backend())
+    result = loop.run()
+    assert result['status'] == 'failed'
+    runner = loop.fixture_runner
+    assert runner.workflow.pending is not None
+    assert not any(event['type'] == 'actor-invalid-action' for event in runner.events)
+    assert loop.backend.evaluations == []
     with pytest.raises(ValueError, match='artifact digest mismatch'):
-        loop.run()
-    assert store.get(key)['status'] == 'failed'
+        store.read_artifact(key, artifact['sha256'])
 
 
 def test_missing_recorded_artifact_is_not_model_feedback(tmp_path):
@@ -145,9 +167,13 @@ def test_missing_recorded_artifact_is_not_model_feedback(tmp_path):
     loop = OptimizationLoop(store, key, Agent([
         {'action': 'cases', 'signatures': [], 'summary': ''},
         {'action': 'read-artifact', 'sha256': artifact['sha256'], 'offset': 0}]), Backend())
+    result = loop.run()
+    assert result['status'] == 'failed'
+    assert loop.fixture_runner.workflow.pending is not None
+    assert not any(event['type'] == 'actor-invalid-action' for event in loop.fixture_runner.events)
+    assert loop.backend.evaluations == []
     with pytest.raises(FileNotFoundError):
-        loop.run()
-    assert store.get(key)['status'] == 'failed'
+        store.read_artifact(key, artifact['sha256'])
 
 
 def test_failure_repair_slower_faster_and_time_budget(tmp_path):
@@ -167,20 +193,27 @@ def test_failure_repair_slower_faster_and_time_budget(tmp_path):
             clock.now += 1
             return super().profile(*args, **kwargs)
     class TimedAgent(Agent):
+        optimize = True
+        profile = True
         def complete(self, *args, **kwargs):
             clock.now += 1
             return super().complete(*args, **kwargs)
     backend = TimedBackend()
+    # Debug repairs the incorrect implementation, then the real optimisation
+    # stage selects the faster edit. Candidate counts remain telemetry.
     agent = TimedAgent([{'action': 'cases', 'signatures': [], 'summary': 'tails'},
-                   candidate('bad'), candidate('slow'), candidate('fast')])
-    result = OptimizationLoop(store, key, agent, backend, clock=clock).run()
+        candidate('bad'), candidate('slow'), candidate('fast'),
+        {'action': 'finish', 'summary': 'preserve the verified best'}])
+    loop = OptimizationLoop(store, key, agent, backend, clock=clock)
+    result = loop.run()
     assert result['status'] == 'budget-exhausted'
-    state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
-    assert state['best']['speedup'] == 2
-    assert state['best']['faster_than_torch'] is True
-    assert backend.profiles == ['slow', 'fast']  # reserved final attempt retains diagnostics
+    assert backend.evaluations == ['bad', 'slow', 'fast']
+    assert loop.state['best']['speedup'] == 2
+    assert loop.state['best']['faster_than_torch'] is True
     assert store.get(key)['attempts'] == 3
     assert backend.prepares == 1
+    assert backend.profiles == ['fast']
+    assert loop.fixture_runner.workflow.remaining()['actor_seconds'] == 0
     assert any(e['kind'] == 'model-response' for e in store.events(key))
 
 
@@ -202,9 +235,18 @@ def test_stop_resume_preserves_suite_and_candidates(tmp_path):
 def test_model_time_counts_before_prepare_and_stop_boundary(tmp_path):
     store, key = fixture(tmp_path, seconds=1)
     backend = Backend()
-    clock = iter([0, 2])
-    result = OptimizationLoop(store, key, Agent([{'action': 'cases', 'signatures': [], 'summary': ''}]),
-                              backend, clock=lambda: next(clock)).run()
+    class Clock:
+        now = 0
+        def __call__(self):
+            return self.now
+    clock = Clock()
+    class SlowDecision(Agent):
+        def complete(self, *args, **kwargs):
+            action = super().complete(*args, **kwargs)
+            clock.now += 2
+            return action
+    result = OptimizationLoop(store, key, SlowDecision([
+        {'action': 'cases', 'signatures': [], 'summary': ''}]), backend, clock=clock).run()
     assert result['status'] == 'budget-exhausted'
     assert backend.prepares == 0
     store, key = fixture(tmp_path / 'stop')
@@ -241,7 +283,7 @@ def test_whole_suite_score_and_missing_timing():
     assert score(base, result) is None
 
 
-def test_pending_candidate_recovery_reuses_directory_and_charge(tmp_path):
+def test_retained_legacy_candidate_requires_checkpoint_migration_without_replay(tmp_path):
     store, key = fixture(tmp_path)
     backend = Backend()
     loop = OptimizationLoop(store, key, Agent([]), backend)
@@ -254,28 +296,36 @@ def test_pending_candidate_recovery_reuses_directory_and_charge(tmp_path):
         pending={**source, 'sha256': digest, 'attempt': 1})
     loop._save()
     store.record_attempt(key, candidate_sha256=digest, result='evaluating')
-    result = OptimizationLoop(store, key, Agent([{'action': 'finish', 'summary': ''}]), backend).run()
-    assert result['status'] == 'completed'
-    assert result['attempts'] == 1
-    assert backend.evaluations == ['fast']
+    from rsi.domain_execution import CanonicalConfigurationError
+    before = dict(loop.state['pending'])
+    with pytest.raises(CanonicalConfigurationError, match='checkpoint migration'):
+        OptimizationLoop(store, key, Agent([]), backend).run()
+    resumed = OptimizationLoop(store, key, Agent([]), backend)
+    assert resumed.state['pending'] == before
+    assert store.get(key)['attempts'] == 1
+    assert backend.evaluations == []
 
 
 def test_rejected_cases_visible_and_profile_failure_preserves_best(tmp_path):
     store, key = fixture(tmp_path)
     backend = Backend()
-    def fail(*args, **kwargs):
-        raise RuntimeError('unsupported capture')
+    def fail(source, *args, **kwargs):
+        backend.profiles.append(source)
+        return dict(status='unavailable', reason='unsupported capture')
     backend.profile = fail
     actions = [{'action': 'cases', 'signatures': [{'args': [{'shape': [-1], 'dtype': 'float32'}]}],
-                'summary': 'negative rejected'}, candidate('slow'), {'action': 'finish', 'summary': ''}]
-    OptimizationLoop(store, key, Agent(actions), backend).run()
-    events = store.events(key)
-    proposals = next(e['payload'] for e in events if e['kind'] == 'case-proposals')
+                'summary': 'negative rejected'}, candidate('slow')]
+    agent = Agent(actions)
+    agent.profile = True
+    loop = OptimizationLoop(store, key, agent, backend)
+    assert loop.run()['status'] == 'completed'
+    proposals = next(e['payload'] for e in store.events(key) if e['kind'] == 'case-proposals')
     assert len(proposals['rejected']) == 1
-    state = [e['payload'] for e in events if e['kind'] == 'optimizer-state'][-1]
-    assert state['best']['speedup'] == .5
-    assert not state['best']['faster_than_torch']
-    assert any(e['kind'] == 'profiling-unavailable' for e in events)
+    assert loop.state['best']['speedup'] == .5
+    assert not loop.state['best']['faster_than_torch']
+    assert backend.profiles == ['slow']
+    diagnostics = [row for row in loop.state['history'] if row.get('tool', {}).get('action') == 'profile']
+    assert len(diagnostics) == 1 and diagnostics[0]['content']['status'] == 'unavailable'
 
 
 def test_pi_agent_retains_provider_usage_and_host_action():
@@ -307,9 +357,10 @@ def test_dashboard_signature_envelope_flows_through_job_store(tmp_path):
             assert spec['signatures'] == [signature]
             return super().prepare(spec, directory)
     result = OptimizationLoop(store, key, Agent([
-        {'action': 'cases', 'signatures': [], 'summary': 'preserve supplied representative'},
-        {'action': 'finish', 'summary': 'baseline only'}]), CheckingBackend()).run()
-    assert result['status'] == 'completed'
+        {'action': 'cases', 'signatures': [], 'summary': 'preserve supplied representative'}]),
+        CheckingBackend()).run(prepare_only=True)
+    assert result['status'] == 'running'
+    assert result['attempts'] == 0
 
 
 def test_launch_geometry_is_part_of_candidate_identity(tmp_path):
@@ -322,84 +373,109 @@ def test_launch_geometry_is_part_of_candidate_identity(tmp_path):
             self.paths.append((str(directory), block_count))
             return super().evaluate(source, directory, block_count=block_count)
     backend = GeometryBackend()
-    actions = [{'action': 'cases', 'signatures': [], 'summary': ''},
-               candidate('fast'), {**candidate('fast'), 'block_count': 2},
-               {**candidate('fast'), 'block_count': 2}, {'action': 'finish', 'summary': ''}]
-    result = OptimizationLoop(store, key, Agent(actions), backend).run()
+    first = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend)
+    first.run(single_evaluation=True)
+    second = OptimizationLoop(store, key, Agent([{**candidate('fast'), 'block_count': 2}]), backend)
+    result = second.run(single_evaluation=True)
     assert result['attempts'] == 2
+    # Reopening the accepted project must return its retained result, without
+    # selecting another action or evaluating the same launch configuration.
+    OptimizationLoop(store, key, Agent([]), backend).run()
+    assert backend.prepares == 1
     assert [count for _, count in backend.paths] == [1, 2]
     assert backend.paths[0][0] != backend.paths[1][0]
 
 
-def test_final_reserved_attempt_reconnects_without_added_budget(tmp_path):
-    import pytest
+def test_final_reserved_attempt_requires_observation_without_added_budget(tmp_path):
+    from canonical_optimizer_fixtures import retained_native, unresolved_authority
     from optimizer.control import ObservationUnavailable
+    from rsi.runtime import WorkflowError
     store, key = fixture(tmp_path, attempts=1)
     class LostBackend(Backend):
         def evaluate(self, *args, **kwargs):
-            if not self.evaluations:
-                self.evaluations.append('lost')
-                store.account_time(key, store.get(key)['max_seconds'])
-                raise ObservationUnavailable('same retained handle')
-            return super().evaluate(*args, **kwargs)
+            self.evaluations.append('lost')
+            raise ObservationUnavailable('same retained handle')
     backend = LostBackend()
-    with pytest.raises(ObservationUnavailable):
-        OptimizationLoop(store, key, Agent([{'action': 'cases', 'signatures': [], 'summary': ''},
-                                           candidate('fast')]), backend).run()
-    assert store.get(key)['status'] == 'budget-exhausted'
-    assert store.get(key)['stage'] == 'observation-unavailable'
-    OptimizationLoop(store, key, Agent([]), backend).run()
-    state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
-    assert state['best']['speedup'] == 2
-    assert store.get(key)['attempts'] == store.get(key)['max_attempts'] == 1
+    loop = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend)
+    with pytest.raises(ObservationUnavailable, match='same retained handle'):
+        loop.run()
+    before, budget = retained_native(loop), store.get(key)
+    assert before.workflow['pending'] is not None
+    assert budget['attempts'] == budget['max_attempts'] == 1
+    resumed = OptimizationLoop(store, key, Agent([]), backend)
+    with pytest.raises(WorkflowError, match='reconciliation'):
+        resumed.run()
+    assert unresolved_authority(retained_native(resumed)) == unresolved_authority(before)
+    assert backend.evaluations == ['lost'] and backend.prepares == 1
+    assert 'best' not in resumed.state
+    after = store.get(key)
+    assert all(after[field] == budget[field] for field in ('max_seconds', 'max_attempts', 'attempts'))
+    assert after['elapsed_seconds'] >= budget['elapsed_seconds']
 
 
-def test_replay_persisted_cases_and_candidate_actions_without_model_calls(tmp_path):
-    for stage in ('cases', 'optimize'):
+def test_replay_persisted_cases_and_candidate_actions_without_model_calls(tmp_path, monkeypatch):
+    from rsi.domain_execution import DomainRunner
+    original = DomainRunner.append
+    for stage in ('task_construction', 'implementation'):
         store, key = fixture(tmp_path / stage, attempts=1)
         backend = Backend()
-        loop = OptimizationLoop(store, key, Agent([]), backend)
-        store.transition(key, 'running', stage=stage)
-        action = {'action': 'cases', 'signatures': [], 'summary': ''} if stage == 'cases' else candidate('fast')
-        if stage == 'optimize':
-            loop.state['spec'] = loop._artifact('spec', loop._spec(store.submission(key)))
-            loop.state['baseline'] = loop._artifact('baseline', backend.prepare({}, tmp_path))
-        loop.state['action_result'] = loop._artifact(stage, action)
-        loop._save()  # crash after _action returned evidence, before caller checkpoint
-        actions = [candidate('fast')] if stage == 'cases' else []
-        OptimizationLoop(store, key, Agent(actions), backend).run(single_evaluation=True)
+        actions = [{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]
+        def crash(runner, event):
+            original(runner, event)
+            if event['type'] == 'stage-result' and event['stage'] == stage:
+                raise KeyboardInterrupt
+        monkeypatch.setattr(DomainRunner, 'append', crash)
+        with pytest.raises(KeyboardInterrupt):
+            OptimizationLoop(store, key, Agent(actions), backend).run(single_evaluation=True)
+        assert backend.prepares == 1 and backend.evaluations == []
+        replies = sum(event['kind'] == 'model-response' for event in store.events(key))
+        monkeypatch.setattr(DomainRunner, 'append', original)
+        remaining = [candidate('fast')] if stage == 'task_construction' else []
+        resumed = OptimizationLoop(store, key, Agent(remaining), backend)
+        resumed.run(single_evaluation=True)
         assert store.get(key)['attempts'] == 1
-        assert backend.evaluations == ['fast']
+        assert backend.evaluations == ['fast'] and backend.prepares == 1
+        assert sum(event['kind'] == 'model-response' for event in store.events(key)) == replies + len(remaining)
+        assert len([event for event in store.events(key) if event['kind'] == 'case-proposals']) == 1
 
 
-def test_final_reserved_profile_reconnect_does_not_repeat_evaluation(tmp_path):
-    import pytest
+def test_final_reserved_profile_requires_observation_without_repeat_evaluation(tmp_path):
+    from canonical_optimizer_fixtures import retained_native, unresolved_authority
     from optimizer.control import ObservationUnavailable
+    from rsi.runtime import WorkflowError
     store, key = fixture(tmp_path, attempts=1)
     class LostProfile(Backend):
         def profile(self, *args, **kwargs):
-            if not self.profiles:
-                self.profiles.append('lost')
-                store.account_time(key, store.get(key)['max_seconds'])
-                raise ObservationUnavailable('retained profile handle')
-            return {'status': 'available'}
+            self.profiles.append('lost')
+            raise ObservationUnavailable('retained profile handle')
     backend = LostProfile()
-    with pytest.raises(ObservationUnavailable):
-        OptimizationLoop(store, key, Agent([
-            {'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
-    OptimizationLoop(store, key, Agent([]), backend).run()
-    state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
-    assert len(state['history']) == len(backend.evaluations) == 1
-    assert state['best']['speedup'] == 2
-    assert 'profiling' not in state['best']
+    agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')])
+    agent.profile = True
+    loop = OptimizationLoop(store, key, agent, backend)
+    with pytest.raises(ObservationUnavailable, match='retained profile handle'):
+        loop.run()
+    before, budget = retained_native(loop), store.get(key)
+    resumed = OptimizationLoop(store, key, Agent([]), backend)
+    with pytest.raises(WorkflowError, match='reconciliation'):
+        resumed.run()
+    assert unresolved_authority(retained_native(resumed)) == unresolved_authority(before)
+    assert len(resumed.state['history']) == len(backend.evaluations) == 1
+    assert resumed.state['best']['speedup'] == 2 and 'profiling' not in resumed.state['best']
     assert backend.profiles == ['lost']
-    assert any(event['kind'] == 'profiling-unavailable' for event in store.events(key))
-    assert store.get(key)['attempts'] == store.get(key)['max_attempts'] == 1
+    after = store.get(key)
+    assert all(after[field] == budget[field] for field in ('max_seconds', 'max_attempts', 'attempts'))
+    assert after['elapsed_seconds'] >= budget['elapsed_seconds']
 
 
 def test_finish_respects_stop_or_time_boundary_after_model_returns(tmp_path):
     for boundary in ('stop', 'time'):
         store, key = fixture(tmp_path / boundary)
+        class Clock:
+            now = 0
+            def __call__(self): return self.now
+        clock = Clock()
         class BoundaryAgent(Agent):
             def complete(self, stage, context, record):
                 action = super().complete(stage, context, record)
@@ -407,35 +483,32 @@ def test_finish_respects_stop_or_time_boundary_after_model_returns(tmp_path):
                     if boundary == 'stop':
                         store.stop(key)
                     else:
-                        store.account_time(key, 7200)
+                        clock.now += 7200
                 return action
+        backend = Backend()
         result = OptimizationLoop(store, key, BoundaryAgent([
-            {'action': 'cases', 'signatures': [], 'summary': ''},
-            {'action': 'finish', 'summary': 'done'}]), Backend()).run()
+            {'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]),
+            backend, clock=clock).run()
         assert result['status'] == ('stopped' if boundary == 'stop' else 'budget-exhausted')
+        assert backend.prepares == 1 and backend.evaluations == []
+        assert store.get(key)['attempts'] == 0
 
 
 def test_configured_case_cap_is_shared_with_model_and_filters_excess(tmp_path):
     store, key = fixture(tmp_path, attempts=1)
     extra = [{'args': [{'shape': [size], 'dtype': 'float32'}]} for size in (7, 9, 11)]
-    class CappedAgent(Agent):
-        def complete(self, stage, context, record):
-            if stage == 'cases':
-                assert context['max_cases'] == 2
-                assert context['remaining_signatures'] == 1
-            return super().complete(stage, context, record)
     class CappedBackend(Backend):
         def prepare(self, spec, directory):
             assert len(spec['signatures']) == 2
             assert spec['signatures'][1] == extra[0]
             return super().prepare(spec, directory)
-    result = OptimizationLoop(store, key, CappedAgent([
-        {'action': 'cases', 'signatures': extra, 'summary': 'corners'},
-        {'action': 'finish', 'summary': ''}]), CappedBackend(), max_cases=2).run()
-    assert result['status'] == 'completed'
+    result = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': extra, 'summary': 'corners'}]),
+        CappedBackend(), max_cases=2).run(prepare_only=True)
+    assert result['status'] == 'running' and result['attempts'] == 0
     proposals = next(e['payload'] for e in store.events(key) if e['kind'] == 'case-proposals')
     assert len(proposals['accepted']) == 1 and len(proposals['rejected']) == 2
-    assert all('2-case budget' in row['error'] for row in proposals['rejected'])
+    assert [row['signature'] for row in proposals['rejected']] == extra[1:]
 
 
 def test_case_cap_validation_preserves_all_representatives(tmp_path):
@@ -455,9 +528,10 @@ def test_case_cap_validation_preserves_all_representatives(tmp_path):
 def test_model_actions_have_no_count_ceiling_and_receive_remaining_time(tmp_path):
     store, key = fixture(tmp_path, attempts=1)
     class TimeAwareAgent(Agent):
+        optimize = True
         identity = {'model': 'fake-fixed', 'coding_engine': 'pi'}
         def complete(self, stage, context, record):
-            assert 0 < context['remaining_seconds'] <= 7200
+            assert 0 < self.canonical_remaining_seconds <= 7200
             assert 'remaining_provider_requests' not in context
             return super().complete(stage, context, record)
     actions = [{'action': 'cases', 'signatures': [], 'summary': ''}] + [
@@ -473,7 +547,10 @@ def test_model_actions_have_no_count_ceiling_and_receive_remaining_time(tmp_path
     assert backend.evaluations == ['bad', 'slow', 'fast']
     state = next(event['payload'] for event in reversed(store.events(key))
                  if event['kind'] == 'optimizer-state')
-    assert state['turn'] > 200 and state['best']['speedup'] == 2
+    assert state['turn'] == 199 and state['best']['speedup'] == 2
+    invalid = [row for row in loop.fixture_runner.events if row['type'] == 'actor-invalid-action']
+    assert len(invalid) == 2
+    assert loop.fixture_runner.workflow.remaining()['actor_seconds'] > 0
 
 
 @pytest.mark.parametrize('wrapped', [False, True])
@@ -497,6 +574,9 @@ def test_knowledge_compacts_before_checkpoints_and_sources_are_readable_after_re
             checkpoint = loop._read(event['payload']['action_result'])
             assert len(canonical(checkpoint)) < 4096
     resumed = OptimizationLoop(store, key, Agent([]), Backend())
+    # This utility scenario deliberately disables retrieval after reconstruction.
+    # The canonical fixture otherwise installs the actual baseline SQLite KDB.
+    resumed.knowledge = None
     resumed._tool({'action': 'query-knowledge', 'query': 'unavailable'}, snapshot)
     assert resumed.state['history'][-1]['content'] == {'status': 'unavailable'}
     for entry, original in zip(index['results'], rows):

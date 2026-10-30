@@ -1,3 +1,5 @@
+from canonical_optimizer_fixtures import canonical_optimizer_backend
+
 """Ordinary verified projects correct or retire accessed memories without trials."""
 from dataclasses import asdict
 from pathlib import Path
@@ -239,29 +241,9 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
-    from optimizer.jobs import JobStore,canonical,sha
-    from optimizer.loop import OptimizationLoop
-    from test_optimizer_loop import Agent,Backend,candidate
-    from test_subject_knowledge import setup as knowledge_setup,proposal as knowledge_proposal
-    service,memory,store,_=knowledge_setup(tmp_path/'knowledge')
-    base=memory.accept('lesson',knowledge_proposal(store),{})
-    snapshot={'files':{},'memory_entries':memory.records()}
-    snapshot['snapshot_id']=sha(canonical(snapshot))
-    jobs=JobStore(tmp_path/'jobs')
-    key=jobs.create('def forward(x): return x','forward',{'args':[{'shape':[5],'dtype':'float32'}]},snapshot,max_seconds=60)['job_id']
-    loop=OptimizationLoop(jobs,key,Agent([{'action':'cases','signatures':[],'summary':''},
-        {'action':'read-memory','index':0},candidate('fast')]),Backend(),
-        memory_observer=service.optimizer_observer(tmp_path/'optimizer-project'))
-    loop.run(single_evaluation=True)
-    rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
-    assert len(rows)==1 and rows[0]['actor_role']=='optimizer'
-    assert rows[0]['accesses']==3  # prompt, full read, next prompt
-    service.ledger.transition(base['version'],'quarantined',event_id='bad',reason='Conflict',evidence=['e'*64])
-    result=service.optimizer_observer(tmp_path/'optimizer-project')('read-memory',snapshot,
-        {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
-    assert result['status']=='tool-error'
-    assert service.ledger.stats(base['memory_id'])['accesses']==3
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
+    from test_memory_delivery import exercise_optimizer_memory_delivery
+    exercise_optimizer_memory_delivery(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize('action',['restore','retire'])

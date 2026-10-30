@@ -123,13 +123,21 @@ def _references(value):
             yield from _references(item)
 
 
-def export_task(task, destination):
+def export_task(task, destination, *, adapter=None):
     """Export a quiescent canonical task. Missing/corrupt evidence fails closed.
 
     Retains event order, raw artifacts, failures and incomplete state. Does not
     invent completions, elapsed measurements or outcomes. No environment read.
     """
     task, destination = Path(task).resolve(strict=True), Path(destination).absolute()
+    if adapter is None and (task / 'domain.json').is_file():
+        from rsi.domain_evidence import DomainExportAdapter
+        adapter = DomainExportAdapter(task)
+    if adapter is not None:
+        if destination.is_relative_to(task):
+            raise ValueError('export destination must be outside the task')
+        with adapter.view() as view:
+            return export_task(view, destination)
     if destination.is_relative_to(task):
         raise ValueError('export destination must be outside the task')
     store = ContentAddressedArtifacts(task / 'artifacts')

@@ -215,42 +215,21 @@ def test_compiler_errors_are_visible_and_full_diagnostic_is_readable():
 
 
 def test_actor_provider_receives_layout_contract_without_context_reads(monkeypatch, tmp_path):
-    try: runtime_preflight()
-    except RuntimeError: pytest.skip('Pi runtime unavailable')
-    from types import SimpleNamespace
-    from coding.pi.actor import PiActorDriver
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    from benchmarks.a5kernels.phase1_project_executor import ProjectKernelABI
-    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
-    seen = []
-    def provider(*_, **kwargs):
-        request = json.loads(kwargs['data']); seen.append(request)
-        snapshot = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
-        contract = snapshot['context']['host']['task_contract']
-        assert contract['shape'] == [2, 23] and contract['dtype'] == 'float32'
-        assert contract['block_count'] == 1 and contract['padding_multiple'] == 32
-        assert contract['abi']['input_arguments'] == ['gm_input0']
-        assert contract['inputs'] == [{'argument': 'gm_input0', 'logical_shape': [2, 23], 'physical_shape': [2, 32]}]
-        assert contract['output']['logical_shape'] == [2, 23]
-        assert contract['output']['physical_shape'] == [2, 32]
-        return stream('write', {'slot': 'kernel', 'content': 'candidate'})
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    def execute(action):
-        assert action.kind == 'write'
-        return ActionOutcome('{}', terminal=True)
-    execute.prepared = SimpleNamespace(
-        spec=SimpleNamespace(shape=(2, 23), dtype=SimpleNamespace(value='float32'),
-            padding_multiple=32, block_count=1, graph=SimpleNamespace(as_dict=lambda: {'output': 'y'})),
-        abi=ProjectKernelABI('project_kernel', ('gm_input0',), 'gm_output'),
-        inputs=(SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), storage='private inputs'),),
-        expected=SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), dtype='float32', values='private oracle'))
-    model = next(item for item in MODEL_IDENTITIES if item.backend_model.value == 'deepseek-flash')
-    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake-provider-secret', 'OPENAI_API_KEY': 'fake-openai-secret'}), max_seconds=10)
-    driver('Implement the supplied layout.', profile=direct_profile(model), workspace=tmp_path,
-           context=None, turn_parser=parse_trial_action, action_executor=execute)
-    assert len(seen) == 1
-    assert 'private inputs' not in json.dumps(seen) and 'private oracle' not in json.dumps(seen)
+    state = _canonical_kernel_case(tmp_path, monkeypatch, real=True, shape=(2,23)).run()
+    assert state.outcome.status == 'host-verified'
+    first = next(value for role,value in _native_wire_objects(state.wires[:1])
+                 if role=='user' and 'task' in value)
+    contract = first['task']['domain']['kernel_contract']
+    assert contract['shape']==[2,23] and contract['dtype']=='float32'
+    assert contract['block_count']==1 and contract['padding_multiple']==32
+    assert contract['abi']['input_arguments']==['gm_input0']
+    assert contract['inputs']==[dict(argument='gm_input0',logical_shape=[2,23],physical_shape=[2,32])]
+    assert contract['output']['logical_shape']==[2,23]
+    assert contract['output']['physical_shape']==[2,32]
+    assert 'storage' not in contract['inputs'][0] and 'values' not in contract['output']
+    assert not any(e['type']=='pi-context-read' for e in state.runner.events
+                   if e.get('stage')=='task_construction')
+
 
 
 
@@ -500,180 +479,66 @@ def test_missing_runtime_fails_before_credentials_or_provider(monkeypatch):
 
 
 def test_actor_compile_and_host_turns_are_bounded_by_time_only(monkeypatch, tmp_path):
-    import coding.pi.actor as actor_module
-    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
-    actions = iter([('compile', {}), ('compile', {}), ('submit', {})])
-    class FakeSession:
-        completion_tokens = 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def next_action(self, *args, **kwargs): return next(actions)
-    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
-    driver = actor_module.PiActorDriver(DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_turns=1, max_seconds=10)
-    seen = []
-    def execute(action):
-        seen.append(action.kind)
-        return ActionOutcome('{}', action.kind == 'submit', 'passed', budget_exempt=action.kind == 'compile')
-    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))), workspace=tmp_path,
-                     context=None, turn_parser=parse_trial_action, action_executor=execute)
-    assert outcome.status == 'passed' and seen == ['compile', 'compile', 'submit']
-    assert outcome.continuation.deadline > time.monotonic()
+    state = _canonical_kernel_case(tmp_path, monkeypatch).run()
+    assert state.outcome.status=='host-verified'
+    assert state.calls.count('compile')>1 and state.calls.count('run')>1
+    assert len(state.contexts)>1  # max_turns=1 is retired telemetry, not an elapsed limit.
+    assert state.runner.workflow.accounting.seconds()>0
+    assert state.runner.workflow.remaining()['actor_seconds']>0
+
 
 
 def test_actor_expires_without_executing_another_action(monkeypatch, tmp_path):
-    import coding.pi.actor as actor_module
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
-    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
-    class FakeSession:
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def next_action(self, *args, **kwargs): pytest.fail('deadline expired')
-    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
-    times = iter([0, 2])
-    driver = actor_module.PiActorDriver(DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}),
-                                        max_seconds=1, clock=lambda: next(times))
-    outcome = driver('task', profile=None, workspace=tmp_path, context=None,
-                     turn_parser=None, action_executor=None)
-    assert outcome.status == 'time-budget-exhausted' and outcome.iterations == 0
+    state = _canonical_kernel_case(tmp_path, monkeypatch, expire=True).run()
+    assert state.outcome.status=='budget_exhausted' and state.calls==[]
+    assert state.runner.workflow.pending['stage']=='task_construction'
+    assert state.runner.workflow.accounting.seconds()>=1
+    assert not any(e['type']=='host-dispatch' for e in state.runner.events)
+
 
 
 def test_actor_inherits_executor_deadline_and_preserves_clock_on_clone(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-    import coding.pi.actor as actor_module
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
-    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
-    clock = lambda: 10
-    session = SimpleNamespace(deadline=4000, gateway=SimpleNamespace(deadline=4000))
-    class Session:
-        completion_tokens = 0
-        deadline = 4000
-        gateway = session.gateway
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def next_action(self, *args, **kwargs): pytest.fail('enclosing attempt expired')
-    active = Session()
-    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: active)
-    driver = actor_module.PiActorDriver(DirectCompletionProvider(
-        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=3600, clock=clock)
-    cloned = driver.with_trace(lambda *args: None)
-    assert cloned.clock is clock
-    outcome = cloned('task', profile=None, workspace=tmp_path, context=None,
-        turn_parser=None, action_executor=SimpleNamespace(deadline=9))
-    assert outcome.status == 'time-budget-exhausted'
-    assert active.deadline == active.gateway.deadline == 9
+    # Explicit canonical parent wall allocation, not an old raw actor deadline.
+    state = _canonical_kernel_case(tmp_path, monkeypatch, parent_expired=True)
+    cloned = state.driver.with_trace(lambda *_:None)
+    assert cloned.clock is state.driver.clock
+    assert cloned.canonical_budgets == state.driver.canonical_budgets
+    state.run(cloned)
+    assert state.outcome.status=='budget_exhausted' and state.calls==[]
+    assert state.contexts==[] and state.runner.workflow.accounting.seconds()==0
+
 
 
 def test_actor_reports_rejected_action_for_next_turn_recovery(monkeypatch, tmp_path):
-    import coding.pi.actor as actor_module
-    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
-    observations = []
-    class RecoveringSession:
-        completion_tokens = 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def next_action(self, context, *args, **kwargs):
-            observations.append(context['latest_host_observation'])
-            if len(observations) == 1:
-                raise actor_module.ActionError('Pi returned no accepted host action')
-            host = context['latest_host_observation']['host']
-            assert host['event'] == 'invalid-action'
-            assert host['error'] == 'Pi returned no accepted host action'
-            return 'submit', {}
-    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: RecoveringSession())
-    driver = actor_module.PiActorDriver(DirectCompletionProvider({
-        'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
-    executed = []
-    def execute(action):
-        executed.append(action.kind)
-        return ActionOutcome('{}', True, 'host-verified')
-    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
-                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
-                     action_executor=execute)
-    assert outcome.status == 'host-verified'
-    assert executed == ['submit']
-    assert len(observations) == 2
+    state = _canonical_kernel_case(tmp_path, monkeypatch, reject=True).run()
+    assert state.outcome.status=='host-verified'
+    rejected=[c for c in state.contexts if c.get('observation',{} ) and c['observation'].get('event')=='invalid-action']
+    assert rejected and rejected[0]['observation']['accepted'] is False
+    assert any(e['type']=='actor-invalid-action' for e in state.runner.events)
+
 
 
 def test_real_pi_actor_waits_for_submit_acceptance(monkeypatch, tmp_path):
-    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import A5BackendModel, MODEL_IDENTITIES
-    from coding.pi.actor import PiActorDriver
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('npm ci --prefix integrations/pi required')
-    actions = [('run', {}), ('submit', {}), ('request-timing', {}), ('submit', {})]
-    calls = []
-    def provider(*args, **kwargs):
-        calls.append(json.loads(kwargs['data']))
-        name, payload = actions[len(calls)-1]
-        return stream(name, payload, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    seen = []
-    verified, timed = False, False
-    def execute(action):
-        nonlocal verified, timed
-        seen.append(action.kind)
-        if action.kind == 'run':
-            verified = True
-            host = {'classification': 'host-verified'}
-        elif action.kind == 'request-timing':
-            assert verified
-            timed = True
-            host = {'event': 'performance-study', 'passed': True}
-        else:
-            assert action.kind == 'submit'
-            if verified and timed:
-                return ActionOutcome('{}', True, 'host-verified')
-            host = {'error': 'submit requires retained project evidence', 'missing': ['performance-study']}
-        return ActionOutcome(json.dumps({'host': host}), False, 'continue')
-    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake'},
-        models=(A5BackendModel.DEEPSEEK_FLASH,)), max_seconds=30)
-    profile = direct_profile(next(i for i in MODEL_IDENTITIES if i.backend_model is A5BackendModel.DEEPSEEK_FLASH))
-    outcome = driver('Synthetic task requires verified correctness and timing.', profile=profile,
-                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
-                     action_executor=execute)
-    assert outcome.status == 'host-verified'
-    assert seen == ['run', 'submit', 'request-timing', 'submit']
-    assert len(calls) == 4
+    state = _canonical_kernel_case(tmp_path, monkeypatch, real=True, reject=True).run()
+    assert state.outcome.status=='host-verified'
+    history=state.runner.workflow.state['history']
+    assert history[-1]['evidence']['stage']=='acceptance' and history[-1]['passed']
+    assert any(h['evidence']['stage']=='validation' and h['passed'] for h in history)
+    assert state.runner.backend.host.actions.actions.count('submit')==1
+    responses=[value for role,value in _native_wire_objects(state.wires) if role=='tool']
+    assert any(r.get('isError') and r.get('observation',{}).get('executed') is False for r in responses)
+
 
 
 def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_path):
-    import coding.pi.actor as actor_module
-    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
-    requests = []
-    class FakeSession:
-        completion_tokens = 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def next_action(self, payload, allowed, **kwargs):
-            requests.append((payload, set(allowed)))
-            return ('not-an-action', {}) if len(requests) == 1 else ('submit', {})
-    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
-    driver = actor_module.PiActorDriver(DirectCompletionProvider(
-        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
-    executed = []
-    def execute(action):
-        executed.append(action.kind)
-        return ActionOutcome('{}', True, 'passed')
-    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
-                     workspace=tmp_path, context=None,
-                     turn_parser=parse_trial_action, action_executor=execute)
-    assert outcome.status == 'passed' and executed == ['submit']
-    feedback = requests[1][0]['latest_host_observation']['host']
-    assert feedback['event'] == 'invalid-action'
-    assert feedback['allowed_actions'] == sorted(requests[1][1])
-    assert 'submit' in feedback['allowed_actions']
+    state = _canonical_kernel_case(tmp_path, monkeypatch, real=True, reject=True).run()
+    assert state.outcome.status=='host-verified'
+    denied=[value for role,value in _native_wire_objects(state.wires) if role=='tool']
+    denied=[r for r in denied if r.get('isError') and r.get('observation',{}).get('executed') is False]
+    assert denied and 'perform' not in denied[0]['state']['allowed']
+    assert 'read_skill' in denied[0]['state']['allowed']
+    assert any(e['type']=='skill-delivered' for e in state.runner.events)
+
 
 
 def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
@@ -734,3 +599,158 @@ def test_real_pi_openai_large_snapshot_retains_multiple_pages_within_configured_
                          environ={'OPENAI_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30) as pi:
         assert pi.next_action(context, ['write']) == ('write', {'source': 'selected with both pages'})
     assert len(requests) == 3
+
+
+def _native_wire_objects(wires):
+    for wire in wires:
+        for message in wire['messages']:
+            content=message.get('content') or []
+            texts=[content] if isinstance(content,str) else [part.get('text','') for part in content]
+            for text in texts:
+                if text.startswith('{'):
+                    yield message['role'],json.loads(text)
+
+
+def _canonical_kernel_case(tmp_path, monkeypatch, *, real=False, shape=None,
+                           reject=False, expire=False, parent_expired=False):
+    """Real canonical host/SQL evidence; scripted CPU decisions, never a device."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from hashlib import sha256
+    from rsi.contracts import Stage, BudgetLimits
+    from rsi.domain_execution import DomainRunner
+    from rsi.actor import PiSessionAdapter
+    from coding.pi.session import ActionError
+    import rsi.domain_bindings as binding
+    from rsi.strategy import knowledge_db_query
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from benchmarks.a5kernels.evidence import EvidenceLedger, canonical_digest
+    from benchmarks.a5kernels.phase1_project import ProjectGraph
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor, CompileObservation, RuntimeObservation
+    from benchmarks.a5kernels.phase1_adaptive_actor import _ProjectActions, AdaptiveActionResult
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.trial import parse_trial_action
+    from coding.pi.actor import PiActorDriver
+    from test_a5_phase1_adaptive_actor import _spec, _request
+    from test_rsi_evidence_io import FixtureEmbeddings
+    from test_rsi_production_domain_bindings import CanonicalSession
+    from test_rsi_pi_controller import response
+    clock = SimpleNamespace(value=time.time())
+    clock.now = lambda: clock.value
+    state = SimpleNamespace(calls=[], contexts=[], wires=[], runner=None)
+    class Backend:
+        def compile(self, request):
+            state.calls.append('compile'); clock.value += .05
+            compile(request.candidate_source, 'cpu-candidate.py', 'exec')
+            return CompileObservation(True, canonical_digest({'source':request.candidate_source}), 'CPU Python compiled', 'CPU')
+        def run(self, request, compilation):
+            state.calls.append('run'); clock.value += .05
+            namespace = {}
+            exec(compile(request.candidate_source, 'cpu-candidate.py', 'exec'), namespace)
+            observed = tuple(namespace['solve'](list(request.inputs[0].storage)))
+            return RuntimeObservation(True, canonical_digest({'observed':observed}), 'CPU numeric result', observed)
+    executor = ProjectExecutor(Backend(), EvidenceLedger(tmp_path/'host.jsonl'))
+    spec = _spec()
+    if shape is not None:
+        graph = ProjectGraph.from_mapping(dict(inputs=[dict(name='x',shape=list(shape))],
+            nodes=[dict(name='out',op='relu',operands=['x'],axis=None)],output='out'))
+        spec = ProjectSpec.from_mapping(dict(spec.as_dict(), shape=list(shape), graph=graph.as_dict(), padding_multiple=32))
+    request = _request(tmp_path, executor, spec)
+    artifacts = ContentAddressedArtifacts(request.branch_root/'artifacts')
+    seed = tmp_path/'seed.py'; seed.write_text('def stable_relu(x): return max(0, x)\n')
+    database = KnowledgeDB(tmp_path/'knowledge.sqlite3', FixtureEmbeddings())
+    manifest = database.index(tmp_path,[seed],collection='cpu-baseline',language='python')
+    query = knowledge_db_query(database, ('cpu-baseline',), negative_query=lambda _: [
+        row for row in state.runner.workflow.state['history'] if row.get('passed') is False])
+    def knowledge(payload, context):
+        return AdaptiveActionResult(query(payload))
+    knowledge.canonical_identity = dict(manifest=json.loads(manifest.to_json()))
+    actions = _ProjectActions(executor,request,executor.prepare(request.spec),artifacts,
+        max_actions=1,max_seconds=120,max_source_bytes=128000,query_knowledge=knowledge,
+        request_profile=lambda *_:None,request_timing=lambda *_:None)
+    original = DomainRunner.create.__func__
+    def create(cls,*args,**kwargs):
+        runner = original(cls,*args,**dict(kwargs,test_backend=True,clock=clock.now))
+        state.runner = runner
+        if parent_expired: clock.value += 2
+        return runner
+    monkeypatch.setattr(DomainRunner,'create',classmethod(create))
+    width = request.inputs[0].physical_shape[-1]; logical = request.inputs[0].shape[-1]
+    good = f'def solve(xs):\n    return [max(0,x) if i % {width} < {logical} else 0 for i,x in enumerate(xs)]\n'
+    class Model(CanonicalSession):
+        rejected = False
+        def next_action(self, context, allowed, **kwargs):
+            state.contexts.append(context); clock.value += .01
+            if reject and not self.rejected:
+                self.rejected = True
+                raise ActionError('CPU fixture rejected malformed model action')
+            action = super().next_action(context,allowed,**kwargs)
+            if expire and action[0]=='perform': clock.value += 2
+            return action
+    model = Model(initial='def solve(xs):\n    return list(xs)\n', repaired=good)
+    # Explicit factory boundary substitutes decisions only; all stages/authority
+    # and numeric verification remain the real default native production binding.
+    if real:
+        def payload():
+            runner=state.runner; stage=runner.workflow.stage; op=runner.workflow.pending['id']
+            reads=[e for e in runner.events if e['type']=='skill-usage' and e.get('kind')=='read' and e['operation_id']==op]
+            names=runner.bundle.skills_for(stage); read_names={e['skill'] for e in reads}
+            source=runner.snapshot()
+            evidence=[dict(name=e['name'],result=dict(reference=e['reference'],evidence=runner.store.read_json(e['reference'])))
+                for e in runner.events if e['type']=='project-tool' and e['operation_id']==op]
+            return dict(stage=stage.value,unread_skills=[n for n in names if n not in read_names],evidence=evidence,
+                read_skills=[dict(receipt_id=runner.service.read_receipt(e['receipt_id'])) for e in reads],
+                source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
+        def provider(*_,**kwargs):
+            wire=json.loads(kwargs['data']); state.wires.append(wire)
+            if not wire.get('tools'):
+                return response([],len(state.wires))
+            # One genuine SDK-level rejection before reads. No host completion.
+            if reject and len(state.wires)==1:
+                model.rejected=True
+                return response([('read_context',{'record':'0'*64})],len(state.wires))
+            name,args=model.next_action(payload(),[],seconds=60,record=lambda *_:None,source=None)
+            return response([(name,args)],len(state.wires))
+        monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    else:
+        monkeypatch.setattr(binding,'PiSessionAdapter',lambda **_:model)
+        monkeypatch.setattr('coding.pi.actor.runtime_preflight',lambda:None)
+    profile = direct_profile(next(m for m in MODEL_IDENTITIES if m.backend_model.value=='deepseek-flash'))
+    limits=BudgetLimits(actor_seconds=1 if expire else 120,wall_seconds=1 if parent_expired else None)
+    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY':'fake-provider-secret','OPENAI_API_KEY':'fake-openai-secret'}),
+        max_turns=1,max_seconds=120,clock=clock.now,canonical_budgets=limits,system_prompt='Use the frozen CPU host contract.')
+    def run(active=None):
+        try:
+            state.outcome=(active or driver)('CPU ReLU with zero padded tail',profile=profile,workspace=tmp_path/'actor',
+                context=None,turn_parser=parse_trial_action,action_executor=actions)
+            return state
+        finally:
+            database.close()
+    state.run,state.driver,state.clock = run,driver,clock
+    return state
+
+
+@pytest.mark.parametrize('kind',['callback','missing','deadline','layout-only'])
+def test_incomplete_callback_requires_explicit_canonical_authority(monkeypatch,tmp_path,kind):
+    from types import SimpleNamespace
+    import coding.pi.actor as module
+    import rsi.domain_bindings as binding
+    from rsi.domain_execution import CanonicalConfigurationError
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
+    monkeypatch.setattr(module,'runtime_preflight',lambda:None)
+    calls=[]
+    def callback(action):
+        calls.append(action)
+        pytest.fail('inadmissible callback executed')
+    if kind=='layout-only':callback.prepared=SimpleNamespace()
+    executor={'callback':callback,'missing':None,'deadline':SimpleNamespace(deadline=9),'layout-only':callback}[kind]
+    monkeypatch.setattr(binding,'PiSessionAdapter',lambda **_:pytest.fail('stage session created before admission'))
+    provider=DirectCompletionProvider({'DEEPSEEK_API_KEY':'fake','OPENAI_API_KEY':'fake-openai'})
+    monkeypatch.setattr(provider,'complete',lambda *a,**kw:pytest.fail('provider invoked before admission'))
+    driver=module.PiActorDriver(provider)
+    with pytest.raises(CanonicalConfigurationError):
+        driver('task',profile=None,workspace=tmp_path,context=None,turn_parser=None,action_executor=executor)
+    assert calls==[] and not (tmp_path/'canonical/domain.json').exists()

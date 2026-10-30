@@ -168,6 +168,21 @@ class _RecordingCandidate:
         self.backend, self.store = backend, store
         self.verified: dict[str, VerifiedResult] = {}
 
+    def checkpoint_state(self):
+        callback = getattr(self.backend, 'checkpoint_state', None)
+        return dict(verified=dict(self.verified), backend=callback() if callback else None)
+
+    def restore_checkpoint_state(self, state):
+        if any(not isinstance(result, VerifiedResult) or not result.passed or key != result.execution_id
+               for key,result in state['verified'].items()):
+            raise ValueError('retained candidate verification cache differs')
+        if state['backend'] is not None:
+            callback = getattr(self.backend, 'restore_checkpoint_state', None)
+            if callback is None:
+                raise ValueError('candidate backend checkpoint adapter is unavailable')
+            callback(state['backend'])
+        self.verified = dict(state['verified'])
+
     def compile(self, source, workdir, **options):
         result = self.backend.compile(source, workdir, **options)
         if isinstance(result, CandidateCompilation):
@@ -219,6 +234,14 @@ class _RecoveryCandidate:
     def __init__(self, backend, policy: ProjectRuntimePolicy) -> None:
         self.backend, self.policy = backend, policy
         self.observed = False
+
+    def checkpoint_state(self):
+        return dict(policy=self.policy, observed=self.observed)
+
+    def restore_checkpoint_state(self, state):
+        if state['policy'] != self.policy or type(state['observed']) is not bool:
+            raise ValueError('retained recovery policy checkpoint differs')
+        self.observed = state['observed']
 
     def compile(self, source, workdir, **options):
         recovery = self.policy.recovery
@@ -289,6 +312,8 @@ def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
             1,
             {"profile_sha256": profile.fingerprint},
         )
+    wrapped.canonical_actor = actor
+    wrapped.canonical_recovery_source = recovery.source
     return wrapped
 
 
@@ -386,8 +411,8 @@ class LiveComposition:
             or value.get("schema") != _RETRY_SCHEMA
             or value.get("event") != "outcome"
             or status not in {
-                "passed", "budget-exhausted", "attempt-rewrite-required",
-                "infrastructure-unverified",
+                "passed", "budget-exhausted", "budget_exhausted", "attempt-rewrite-required",
+                "infrastructure-unverified", "suspended", "rejected",
             }
             or any(
                 type(value.get(key)) is not int or value[key] < 0
@@ -412,9 +437,18 @@ class LiveComposition:
             memory_entry, value["completion_turns"],
         )
 
+    @staticmethod
+    def _attempt_workdir(paths, proposal, ordinal):
+        root = paths.workspace / proposal.project_id
+        return root if ordinal == 0 else root / ('infrastructure-' + str(ordinal))
+
+    def _fresh_retry_safe(self, paths, proposal, ordinal):
+        from rsi.a3_recovery import observed_prelaunch_root
+        return observed_prelaunch_root(self._attempt_workdir(paths, proposal, ordinal) / 'canonical')
+
     def _resume_retry_ordinal(
         self, evidence: EvidenceLedger, cell: A3ExperimentCell,
-        proposal: CurriculumProposal,
+        proposal: CurriculumProposal, paths: CellPaths,
     ) -> tuple[int, bool, TrialResult | None]:
         """Return next ordinal, wait state, and any retained terminal trial."""
         relevant = self._project_retry_entries(evidence, cell, proposal)
@@ -422,10 +456,15 @@ class LiveComposition:
             return 0, True, None
         last = relevant[-1].payload["infrastructure_retry"]
         event, ordinal = last.get("event"), last.get("attempt_ordinal")
-        if event == "wait-completed":
-            return ordinal + 1, True, None
-        if event == "scheduled":
-            return ordinal + 1, False, None
+        if event in {"wait-completed", "scheduled"}:
+            if not self._fresh_retry_safe(paths, proposal, ordinal):
+                outcome = next((entry.payload['infrastructure_retry'] for entry in reversed(relevant)
+                    if entry.payload['infrastructure_retry'].get('event') == 'outcome'
+                    and entry.payload['infrastructure_retry']['attempt_ordinal'] == ordinal), None)
+                if outcome is None:
+                    raise ValueError('scheduled retry lacks an authenticated prior outcome')
+                return ordinal, True, self._trial_from_outcome(outcome)
+            return ordinal + 1, event == "wait-completed", None
         if event == "started":
             # The retained handle may still be active. Fail closed without changing
             # identity or consuming a retry; only an authenticated outcome may retry.
@@ -443,7 +482,7 @@ class LiveComposition:
             trial = self._trial_from_outcome(last)
             if trial.status != "infrastructure-unverified":
                 return ordinal, True, trial
-            if ordinal >= _MAX_INFRASTRUCTURE_RETRIES:
+            if ordinal >= _MAX_INFRASTRUCTURE_RETRIES or not self._fresh_retry_safe(paths, proposal, ordinal):
                 return ordinal, True, trial
             failed_digest = canonical_digest(last)
             self._append_retry_event(
@@ -531,7 +570,7 @@ class LiveComposition:
         for proposal in self.proposals[start:]:
             policy = ProjectRuntimePolicy.from_proposal(proposal)
             ordinal, wait_complete, trial = self._resume_retry_ordinal(
-                evidence, cell, proposal
+                evidence, cell, proposal, paths
             )
             if not wait_complete:
                 self._wait_for_retry(evidence, cell, proposal, ordinal)
@@ -554,21 +593,25 @@ class LiveComposition:
                     ),
                     store, proposal.project_id,
                 )
-                trial = A3TrialLoop(
+                loop = A3TrialLoop(
                     cell=cell, proposal=proposal, profile=profile,
                     actor=_policy_actor(
                         self.dependencies.actor_factory(cell, proposal), profile, policy
                     ),
                     candidate=candidate, knowledge=knowledge, profiler=profiler,
                     evidence=evidence, memory=memory,
-                    workdir=paths.workspace / proposal.project_id,
+                    workdir=self._attempt_workdir(paths, proposal, ordinal),
                     timing_dimensions=(
                         policy.study_dimensions
                         if policy.performance_preset is PerformancePreset.TIMING else None
                     ),
                     execution_profile=self.dependencies.execution_profile,
                     infrastructure_attempt_ordinal=ordinal,
-                ).run()
+                )
+                loop.canonical_artifact_root = paths.workspace / proposal.project_id / 'canonical-artifacts'
+                if ordinal:
+                    loop.canonical_prior_root = self._attempt_workdir(paths, proposal, ordinal-1) / 'canonical'
+                trial = loop.run()
                 self._append_attempt_outcome(
                     evidence, cell=cell, proposal=proposal,
                     execution_profile=self.dependencies.execution_profile,
@@ -577,6 +620,7 @@ class LiveComposition:
                 if (
                     trial.status != "infrastructure-unverified"
                     or ordinal >= _MAX_INFRASTRUCTURE_RETRIES
+                    or not self._fresh_retry_safe(paths, proposal, ordinal)
                 ):
                     break
                 failed_digest = canonical_digest(
@@ -614,7 +658,8 @@ class LiveComposition:
                             else (
                                 "token-budget-exhausted"
                                 if "token budget exhausted" in trial.failures
-                                else "time-budget-exhausted"
+                                else "time-budget-exhausted" if trial.status in {"budget-exhausted", "budget_exhausted"}
+                                else trial.status
                             )
                         )
                     ),

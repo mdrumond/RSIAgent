@@ -29,7 +29,7 @@ class QueryUnavailable(WorkflowError):
 
 
 class StrategyRejected(WorkflowError):
-    """A model selection was rejected before any selection receipt was written."""
+    """A pure model evidence argument was rejected before host reads or receipt admission."""
 
 
 class StrategyEvidence:

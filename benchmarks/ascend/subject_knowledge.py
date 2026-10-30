@@ -294,7 +294,7 @@ class SubjectKnowledge:
         def observe(kind, snapshot, payload, event_id):
             records = {i:entry for i,entry in enumerate(snapshot['memory_entries'])
                        if isinstance(entry, dict) and {'memory_id','proposal','provenance'} <= entry.keys()}
-            if kind == 'presentation':
+            if kind in ('presentation', 'presentation-filter'):
                 rows = payload.get('memory_summary', [])
                 chosen = [row['index'] for row in rows if row['index'] in records]
             elif kind == 'read-memory':
@@ -308,17 +308,19 @@ class SubjectKnowledge:
                 chosen = [i for i,record in records.items()
                           if sha in {memory_digest(record), *memory_artifacts(record)}]
             unavailable = {i for i in chosen if not self.ledger.available(memory_digest(records[i]))}
-            if kind == 'presentation':
+            if kind in ('presentation', 'presentation-filter'):
                 payload = dict(payload, memory_summary=[row for row in payload.get('memory_summary', [])
                                                        if row['index'] not in unavailable])
             elif unavailable:
                 return dict(status='tool-error', error='Memory version withdrawn pending evidence-backed resolution')
             if kind == 'read-artifact' and not payload['result'].get('text'):
                 return payload['result']
-            for index in set(chosen) - unavailable:
+            for index in (set(chosen) - unavailable if kind != 'presentation-filter' else set()):
                 record = records[index]
                 self.ledger.access(kind + ':' + actor_id + ':' + event_id + ':' + memory_digest(record),
                     memory_id=record['memory_id'], version=memory_digest(record), campaign_id=str(self.root.resolve()),
                     project_id=Path(directory).name, actor_id=actor_id, actor_role='optimizer')
-            return payload if kind == 'presentation' else payload['result']
+            return payload if kind in ('presentation', 'presentation-filter') else payload['result']
+        observe.filter_presentation = lambda snapshot, payload: observe(
+            'presentation-filter', snapshot, payload, '')
         return observe
