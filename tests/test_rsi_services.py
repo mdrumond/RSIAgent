@@ -757,3 +757,69 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
         assert cycle.scheduler.state['spent'] == (original['actor_seconds'] + .25 + comparison['actor_seconds'])
     finally:
         cycle.close()
+
+
+def test_phase1_observed_code_and_measurements_reach_phase2_query(instance):
+    from uuid import uuid4
+    feature = uuid4().hex  # This fact is absent from the original empty baseline KDB.
+    source = 'FEATURE_FACT = ' + repr(feature) + '\nanswer = 42\n'
+    (instance.root / 'source/solution.py').write_text(source)
+    (instance.root / 'verify.py').write_text(
+        "import json, runpy\nvalues = runpy.run_path('solution.py')\n"
+        "assert values['answer'] == 42\n"
+        "print(json.dumps({'feature_fact': values['FEATURE_FACT'], 'cases_checked': 1}))\n")
+    phase1 = instance.create_cycle('observation-phase1', 'phase1')
+    try:
+        assert phase1.step().outcome == 'accepted'
+        row = phase1.scheduler.state['originals'][0]
+        packet = phase1.load_project(row)
+        observed = packet['observations']
+        assert observed['final_sources'][0]['text'] == source
+        assert observed['applicability']['final_source_hash'] == phase1.open_project(row['operation_id']).backend.project_hash()
+        assert all(r['authority'] == 'model-claim' for r in observed['strategies']['items'])
+        numeric = [r for r in observed['commands']['items'] if r['command'] == 'validation'][0]
+        assert json.loads(numeric['stdout']['text']) == dict(feature_fact=feature, cases_checked=1)
+        assert numeric['numeric'] and numeric['classification'] == 'passed' and numeric['elapsed_seconds'] >= 0
+        assert not observed['final_sources'][0]['truncated']
+        assert phase1.store.read_json(packet['observations_ref']) == observed
+        phase1.step()  # Existing Learning admits project facts to SubjectMemory.
+        baseline = phase1.memory.snapshot()
+    finally:
+        phase1.close()
+    path = instance.root / 'phase1-memory.json'
+    path.write_bytes(baseline)
+    config = show_configuration(instance.root)['payload']
+    config.update(memory_snapshot=path.name, memory_sha256=hashlib.sha256(baseline).hexdigest())
+    set_configuration(instance.root, config)
+    phase2 = instance.create_cycle('observation-phase2', 'phase2')
+    try:
+        response = phase2.query(phase2.spec.baseline_kdb)({'query': feature})
+        facts = response['results'][0]['observations']
+        assert facts['final_sources'][0]['text'] == source
+        assert any(json.loads(r['stdout']['text'])['feature_fact'] == feature
+                   for r in facts['commands']['items'] if r['command'] == 'validation')
+        assert phase2.step().outcome == 'accepted'
+        second = phase2.open_project(phase2.scheduler.state['originals'][0]['operation_id'])
+        queries = [second.store.read_json(e['reference'])['payload']['response']
+                   for e in second.events if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert queries and all(q['results'][0]['observations']['final_sources'][0]['text'] == source for q in queries)
+        # Full raw code/verifier/measurement artifacts accompany bounded model-visible facts.
+        for reference in facts['artifact_refs']:
+            assert second.store.read_bytes(reference) == phase2.store.read_bytes(reference)
+    finally:
+        phase2.close()
+
+
+def test_observed_source_truncation_keeps_complete_artifact_and_negative_fact_scope(instance):
+    source = 'answer = 42\n' + '# deliberately long observed source\n' * 500
+    (instance.root / 'source/solution.py').write_text(source)
+    cycle = instance.create_cycle('bounded-observations', 'phase1')
+    try:
+        assert cycle.step().outcome == 'accepted'
+        packet = cycle.load_project(cycle.scheduler.state['originals'][0])
+        row = packet['observations']['final_sources'][0]
+        assert row['truncated'] and row['text_chars'] == len(source)
+        assert len(row['text']) < len(source)
+        assert cycle.store.read_bytes(row['reference']).decode() == source
+    finally:
+        cycle.close()

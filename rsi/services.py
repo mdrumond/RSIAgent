@@ -36,6 +36,8 @@ from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.service_tuning import TuningBindings
 from rsi.instance_ingestion import load_ingestion_records
+from rsi.evidence_io import _references
+from rsi.observations import capture as capture_observations
 from rsi.evaluation import SkillEvaluation, TuningController, case_identity
 
 
@@ -360,14 +362,26 @@ class BoundCycle(TuningBindings):
             raise ValueError('accepted memory snapshot required')
         ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
         records = snapshot['memories']
-        negatives = []
+        positives, negatives = [], []
         for record in records:
-            if record['proposal']['kind'] != 'correctness':
-                negative = dict(record)
-                reference = record.get('provenance', {}).get('packet')
-                if reference:
-                    negative['observed_evidence'] = self.store.read_json(reference)['evidence']
-                negatives.append(negative)
+            reference = record.get('provenance', {}).get('packet')
+            packet = self.store.read_json(reference) if reference else {}
+            observations = record['proposal'].get('observations', packet.get('observations'))
+            observation_ref = record['proposal'].get('observations_ref', packet.get('observations_ref'))
+            if observation_ref and self.store.read_json(observation_ref) != observations:
+                raise ValueError('accepted memory observation reference differs from retained facts')
+            if observations is not None and packet.get('observations') not in (None, observations):
+                raise ValueError('accepted observations differ from admitted host packet')
+            metadata = dict(record, proposal={k: v for k, v in record['proposal'].items()
+                if k not in ('observations', 'observations_ref')})
+            if record['proposal']['kind'] == 'correctness':
+                positives.append(dict(memory=metadata, observations=observations,
+                    provenance=dict(snapshot=memory_ref, packet=reference, observations=observation_ref)))
+            else:
+                row = dict(metadata, observations=observations, observations_ref=observation_ref)
+                if packet:
+                    row['observed_evidence'] = packet['evidence']
+                negatives.append(row)
         if self.services.test:
             adapter = self.services.test.query
         else:
@@ -390,8 +404,7 @@ class BoundCycle(TuningBindings):
         def query(payload):
             result = json.loads(json.dumps(adapter(payload), allow_nan=False))
             result['negative_records'].extend([*negatives, *ingestion['negative_records']])
-            result['results'].extend(dict(memory=r, provenance={'snapshot': memory_ref})
-                for r in records if r['proposal']['kind'] == 'correctness')
+            result['results'].extend(positives)
             result['provenance'].update(memory_snapshot=memory_ref,
                                         ingestions=ingestion['provenance'])
             return result
@@ -433,9 +446,30 @@ class BoundCycle(TuningBindings):
         with self.services.setup.measure('project-open' if reopen else 'project-snapshot-copy-and-bind', str(root)):
             runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
                 root, spec, bundle, config, **injections)
-            # Query provenance must remain exportable from the owning task CAS.
-            for reference in (*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref):
-                runner.store.put_bytes(self.store.read_bytes(reference))
+            # Reuse export's reference contract to retain the query's artifact closure.
+            pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref]
+            for record in self.store.read_json(memory_ref)['memories']:
+                if record['proposal'].get('observations_ref'):
+                    pending.append(record['proposal']['observations_ref'])
+                packet_ref = record.get('provenance', {}).get('packet')
+                if packet_ref:
+                    packet = self.store.read_json(packet_ref)
+                    pending.extend(packet.get('observations', {}).get('artifact_refs', []))
+                    if packet.get('observations_ref'):
+                        pending.append(packet['observations_ref'])
+            copied = set()
+            while pending:
+                reference = pending.pop()
+                if reference in copied:
+                    continue
+                data = self.store.read_bytes(reference)
+                runner.store.put_bytes(data)
+                copied.add(reference)
+                try:
+                    value = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                pending.extend(_references(value))
         context = runner.context
         runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
                                       configuration_ref=configuration_ref)
@@ -533,14 +567,17 @@ class BoundCycle(TuningBindings):
             if event['type'] == 'skill-usage':
                 usage.append({k: v for k, v in event.items() if k != 'type'})
         kind = 'correctness' if result['status'] == 'accepted' and result['correctness'] is True else 'failure'
-        summary = (str(proof['classification']) + ': ' + str(proof['error'])
-                   if proof else host_outcome)
+        observations, summary = capture_observations(runner, self.store, host_outcome)
+        observations_ref = self.store.put_json(observations)
+        if proof:
+            summary = str(proof['classification']) + ': ' + str(proof['error']) + '; ' + summary
         raw = list(result['events'])
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
         return dict(project_id=row['original_id'], outcome=host_outcome,
             evidence={row['artifact_ref']: dict(kind=kind, summary=summary)},
-            queries=queries, usage=usage, raw_refs=raw)
+            queries=queries, usage=usage, raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
+            observations=observations, observations_ref=observations_ref)
 
     def isolate(self, memory, skills, context):
         receipt = fork_inference(self.root / 'inference', self.memory, self.learning.path,
