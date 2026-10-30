@@ -13,6 +13,7 @@ def register(commands):
         actions = command.add_subparsers(dest='action', required=True)
         start = actions.add_parser('start')
         start.add_argument('--cycle', default=None)
+        _inheritance_flags(start)
         if mode == 'inference':
             start.add_argument('--project', type=Path, required=True)
             start.add_argument('--no-recovery', action='store_true')
@@ -21,12 +22,33 @@ def register(commands):
             entry.add_argument('--job', required=True)
             if action == 'revisit':
                 entry.add_argument('--cycle', required=True)
+                _inheritance_flags(entry)
     command = commands.add_parser('job', help='inspect retained job state and evidence')
     actions = command.add_subparsers(dest='action', required=True)
     actions.add_parser('list')
     for action in ('status', 'evidence'):
         entry = actions.add_parser(action)
         entry.add_argument('job_id')
+
+
+def _inheritance_flags(parser):
+    parser.add_argument('--from-cycle')
+    parser.add_argument('--inheritance', choices=('auto', 'parent', 'baseline'), default='auto')
+    parser.add_argument('--input-override', dest='input_overrides', action='append',
+                        choices=('memory', 'skills', 'kdb'), default=[])
+
+
+def _inheritance_request(args):
+    if args.command == 'phase1':
+        if args.from_cycle is not None or args.inheritance == 'parent':
+            raise ValueError('phase1 always uses baseline inputs and cannot select a parent')
+        policy = 'baseline'
+    else:
+        policy = args.inheritance
+    if args.from_cycle is not None and policy == 'baseline':
+        raise ValueError('baseline inheritance cannot select a parent cycle')
+    return dict(from_cycle=args.from_cycle, inheritance=policy,
+                input_overrides=list(dict.fromkeys(args.input_overrides)))
 
 
 def execute(args):
@@ -55,4 +77,6 @@ def execute(args):
                 raise ValueError('revisit requires a new cycle identity')
             request['previous_cycle'] = request['cycle_id']
             request['cycle_id'] = args.cycle
+    if args.action in ('start', 'revisit'):
+        request.update(_inheritance_request(args))
     return jobs.start(args.instance, request)
