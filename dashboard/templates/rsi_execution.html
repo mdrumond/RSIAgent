@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}RSI execution{% endblock %}
+{% block body %}
+<link rel="stylesheet" href="{{ url_for('static', filename='rsi_inputs.css') }}">
+<section id="rsi-execution" data-enabled="{{ 'true' if enabled else 'false' }}">
+<h1>RSI execution</h1><p><a href="{{ url_for('rsi_inputs_page') }}">Edit curriculum, prompts, baselines, skill mappings and project settings</a></p>
+<p>Start and revisit use current saved inputs. Resume observes the same retained cycle and preserves its budgets. A revisit needs a new cycle identity and inherits its previous cycle’s accepted state by default. Adopt applies current saved inputs to upcoming work at a safe boundary; resume retains frozen inputs.</p>
+{% if not enabled %}<p>Read-only view. Execution controls are disabled.</p>{% endif %}
+<p id="execution-status" role="status" aria-live="polite"></p>
+<form id="phase-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}>
+<legend>Phase or inference project</legend>
+<label>Mode<select name="mode"><option>phase1</option><option>phase2</option><option>inference</option></select></label>
+<label>Operation<select name="operation"><option>start</option><option>stop</option><option>resume</option><option>revisit</option><option>adopt</option></select></label>
+<label>Retained job<select name="job_id" id="retained-job"><option value="">Select a job for stop, resume or revisit</option></select></label>
+<label>Cycle identity (optional for start; new identity required for revisit)<input name="cycle_id"></label>
+<fieldset id="inheritance-fields"><legend>Starting inputs (start and revisit only)</legend>
+<label>Parent cycle, optional<input name="from_cycle"></label>
+<label>Inheritance policy<select name="inheritance"><option value="">CLI default (revisit preserves accepted parent)</option><option value="auto">Automatic accepted parent selection</option><option value="parent">Require accepted parent</option><option value="baseline">Use configured baselines</option></select></label>
+<p>Phase 1 starts from baseline by default. Later modes use CLI automatic selection. Choose a parent explicitly to inherit its published accepted memory, skills and KDB. Candidates are never treated as accepted.</p>
+<p>Override selected parent inputs with current configured baselines:</p>
+{% for name in ['memory','skills','kdb'] %}<label><input type="checkbox" name="input_override" value="{{ name }}">{{ name }}</label>{% endfor %}
+</fieldset>
+<label>Inference ProjectSpec JSON<textarea name="project" rows="6" spellcheck="false">{}</textarea></label>
+<label><input name="recover" type="checkbox" checked>Enable inference recovery</label>
+<button>Submit phase command</button></fieldset></form>
+<section class="control-panel"><h2>Retained jobs and evidence</h2><button type="button" id="refresh-jobs">Refresh jobs</button><div id="jobs-list"></div>
+<h3>Time and skill inspection</h3><p>Charged categories: thinking, retrieval, implementation, debug, compilation, execution and profiling. Setup and transfer are excluded. Category durations can overlap; the actor total must be the host’s interval union. Unknown timing is never shown as zero. Wall remaining includes all elapsed time.</p><div id="time-ledger"></div><details><summary>Retained inspection details</summary><pre id="job-inspection">Select a retained job to inspect.</pre></details></section>
+<section class="control-panel"><h2>Accepted skill output</h2><p>Inspect a cycle’s published validated skill bundle, including an inference cycle. This is separate from editing baseline inputs.</p>
+<form id="published-skills-form"><label>Cycle identity<input name="cycle_id" required></label><button>Read accepted skills</button></form><pre id="published-skills">No cycle selected.</pre>
+<form id="skill-export-form"><fieldset {% if not enabled %}disabled{% endif %}><legend>Export reusable skill folders</legend>
+<label>Source<select name="selection"><option value="cycle">Published accepted cycle</option><option value="builtin">Builtin templates</option></select></label>
+<label>Cycle identity (for accepted output)<input name="cycle_id"></label>
+<label>New destination folder (must not exist)<input name="destination" id="skill-export-destination" required></label><button type="button" id="browse-skill-parent">Choose destination parent</button>
+<p>Writes SKILL.md folders, map.json, bundle.json and an export manifest with exact hashes. Existing folders are never overwritten.</p><button>Export reusable skills</button></fieldset></form></section>
+<dialog id="skill-destination-browser"><h2>Choose destination parent</h2><p id="skill-folder-status" role="status"></p><div id="skill-folder-list"></div><button type="button" id="use-skill-parent">Use this parent</button><button type="button" id="close-skill-parent">Cancel</button></dialog>
+<form id="repo-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Add repository to this instance’s KDB</legend>
+<p>Indexes committed source into a new immutable baseline copy. Previously admitted cycles keep their baseline. Configured embeddings and this instance’s evidence store are used automatically. Indexed material is not automatically a known-good idea. Select folders in the input editor and paste their node paths here.</p>
+{% for name,label in [('source','Local repository folder'),('collection','New collection name'),('repository','Credential-free repository identity')] %}<label>{{ label }}<input name="{{ name }}" required></label>{% endfor %}
+<label>Additional negative-outcome JSON snapshot, optional<input name="negative_records"></label>
+<p>Existing negative evidence is retained. Supply an actual JSON snapshot to append new negative results; leaving this blank does not discard prior evidence.</p><button>Add repository to new baseline copy</button></fieldset></form>
+<form id="export-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}><legend>Export retained task evidence for SFT</legend>
+<p>The task must be quiescent. The CLI verifies artifacts and writes a deterministic manifest; no training labels or missing transcripts are invented.</p>
+<label>Canonical task folder<input name="task" required></label><label>New export destination<input name="destination" required></label><button>Export evidence</button></fieldset></form>
+<form id="tune-form" class="control-panel"><h2>Manual skill fine tuning</h2>
+<p id="tuning-capability">Checking the pinned CLI for canonical evaluator support…</p>
+<fieldset id="tuning-fields" disabled><legend>Freeze tuning inputs</legend>
+<label>Project evidence identity<input name="project_id" required></label>
+<label>User guidance<textarea name="guidance" rows="6" required></textarea></label>
+<p>Runs the existing evaluator with retained project evidence. Candidate creation does not imply promotion.</p>
+<button>Request skill fine tuning</button></fieldset></form>
+<section class="control-panel"><h2>Baseline skill content and workflow map</h2>
+<p>Save captures a new immutable baseline for future cycles. Running projects and accepted learned bundles retain their revisions. Save a skill or save the complete step map separately; each operation captures its own immutable revision.</p>
+<p id="skills-capability">Checking immutable revision support…</p>
+<button type="button" id="reload-skills" disabled>Reload baseline revision</button>
+<form id="skills-form"><fieldset id="skills-fields" disabled><legend>Baseline revision</legend>
+<p id="skills-revision"></p><label>Skill<select id="skill-selector"></select></label>
+<label>Full SKILL.md content<textarea id="skill-content" rows="16" spellcheck="false"></textarea></label>
+<label>New skill ID<input id="new-skill-id"></label><button type="button" id="add-skill">Add skill</button>
+<label>Workflow step → skill IDs (JSON)<textarea id="skill-map" rows="10" spellcheck="false"></textarea></label>
+<p>Map values are arrays of skill IDs. Every referenced skill must exist; the CLI validates the canonical workflow and skill metadata.</p>
+<button type="button" id="save-skill">Save selected skill revision</button><button>Save workflow map revision</button></fieldset></form></section>
+</section><script src="{{ url_for('static', filename='rsi_execution.js') }}" defer></script>
+{% endblock %}

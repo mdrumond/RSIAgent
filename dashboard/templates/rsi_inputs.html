@@ -4,6 +4,7 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='rsi_inputs.css') }}">
 <section id="rsi-inputs" data-enabled="{{ 'true' if enabled else 'false' }}">
 <h1>RSI inputs</h1>
+<p><a href="{{ url_for('rsi_execution_page') }}">Run phases, inference and inspect retained jobs</a></p>
 <p>Edit the inputs for future projects. Running projects keep their existing settings.</p>
 {% if not enabled %}<p>Read-only view. Editing is disabled.</p>{% endif %}
 <p id="input-status" role="status" aria-live="polite">Loading settings…</p>
@@ -15,6 +16,7 @@
 <section class="control-panel"><h2>Project budgets</h2><p>Actor time includes thinking, compilation, execution and profiling. Setup and remote copying are excluded. Wall time includes all elapsed time.</p><div id="budget-fields"></div></section>
 <section class="control-panel"><h2>Phase 1 projects</h2><p>Small experiments, demonstrations and microbenchmarks.</p><div id="phase1-projects"></div><button type="button" data-add="phase1_projects">Add project</button></section>
 <section class="control-panel"><h2>Phase 2 projects</h2><p>End-to-end projects with performance goals.</p><div id="phase2-projects"></div><button type="button" data-add="phase2_projects">Add project</button></section>
+<section class="control-panel"><h2>Independent held-out evaluation projects</h2><p>Configure actual independent cases, not training projects. Five cases × two runs per arm is the default. Each case has its own project and execution contract. Counts alone do not create held-outs; the host also rejects overlapping frozen case identities.</p><div id="heldout-projects"></div><button type="button" data-add="heldout_cases">Add held-out case</button></section>
 <section class="control-panel"><h2>Recovery and skill evaluation</h2><div id="policy-fields"></div></section>
 <details class="control-panel"><summary>Advanced settings</summary><p>Additional settings, skill overrides and mappings are preserved. Use references rather than credentials.</p><label>Complete configuration JSON<textarea id="advanced-settings" rows="18" spellcheck="false"></textarea></label><button type="button" id="apply-advanced">Apply JSON to form</button></details>
 <button type="submit">Save settings</button>

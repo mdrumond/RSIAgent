@@ -25,15 +25,19 @@ def register_rsi_inputs(app, config_path, csrf_token, runner=None):
     runner = runner or subprocess.run
     app.config['RSI_INPUTS_ENABLED'] = True
 
-    def cli(*arguments):
+    def cli(*arguments, timeout=30):
         result = runner([sys.executable, '-m', 'rsi', '--instance', str(instance), *arguments],
-                        capture_output=True, text=True, check=False, shell=False, timeout=30)
+                        capture_output=True, text=True, check=False, shell=False, timeout=timeout)
         if result.returncode:
             # Only known validation messages are public; never reflect provider/env content.
             if 'configuration revision conflict' in result.stderr:
                 raise ControlError('configuration revision conflict; reload before saving')
             raise ControlError('Settings or folder could not be read. Check the references and values.')
         return json.loads(result.stdout)
+
+    app.extensions['rsi_cli'] = cli
+    from .rsi_execution import register_rsi_execution
+    register_rsi_execution(app, controls, csrf_token, cli)
 
     def local_request():
         try:
