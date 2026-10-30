@@ -36,22 +36,41 @@ def restore_grants(runner):
         runner.workflow.grant_actor_seconds(key, row['seconds'], row['receipt'])
 
 
+def optimizer_allocation_anchor(owner):
+    """Snapshot the parent budget actually used to freeze the new contract."""
+    events = owner.store.events(owner.key)
+    parent = next((event['payload']['manifest'] for event in reversed(events)
+                   if 'manifest' in event['payload']), None)
+    if parent is None:
+        raise WorkflowError('optimizer contract has no retained parent budget admission')
+    return parent, dict(job_id=owner.key, sequence=events[-1]['sequence'],
+                        event_sha256=events[-1]['sha256'], max_seconds=parent['max_seconds'])
+
+
 def optimizer_resume_grants(owner, runner):
-    """Import only explicit, chained JobStore budget increases after admission."""
+    """Import only increases after the immutable contract's budget boundary."""
     events = owner.store.events(owner.key)  # JobStore verifies the full hash chain.
-    index = owner.state['canonical_active']['index']
-    previous, admitted = None, False
-    for event in events:
-        payload = event['payload']
-        manifest = payload.get('manifest')
-        if (event['kind'] == 'optimizer-state'
-                and payload.get('canonical_active', {}).get('index') == index):
-            admitted = True
+    anchor = runner.store.read_json(runner.contract_ref).get('actor_allocation_anchor')
+    if anchor is None:
+        if any(event['kind'] in ('resumed', 'manual-continuation') for event in events):
+            raise WorkflowError('optimizer contract needs an explicit allocation-anchor migration')
+        return
+    sequence = anchor['sequence']
+    if (anchor['job_id'] != owner.key or type(sequence) is not int or not 0 <= sequence < len(events)
+            or events[sequence]['sha256'] != anchor['event_sha256']):
+        raise WorkflowError('optimizer contract parent budget boundary differs')
+    parent = next(event['payload']['manifest'] for event in reversed(events[:sequence+1])
+                  if 'manifest' in event['payload'])
+    if parent['max_seconds'] != anchor['max_seconds']:
+        raise WorkflowError('optimizer contract admitted parent budget differs')
+    previous = anchor['max_seconds']
+    for event in events[sequence+1:]:
+        manifest = event['payload'].get('manifest')
         if manifest is None:
             continue
         current = manifest['max_seconds']
-        if admitted and event['kind'] in ('resumed', 'manual-continuation'):
-            if previous is None or current < previous:
+        if event['kind'] in ('resumed', 'manual-continuation'):
+            if current < previous:
                 raise WorkflowError('optimizer resume allocation lacks its admitted parent budget')
             if current > previous:
                 runner.grant_actor_seconds(event['sha256'], current-previous,
