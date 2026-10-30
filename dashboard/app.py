@@ -19,7 +19,7 @@ from .control import ControlError, ControlManager
 
 def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None,
                optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None,
-               curriculum_status=None, actor_launcher=None):
+               curriculum_status=None, actor_launcher=None, rsi_runner=None):
     app = Flask(__name__)
     @app.url_value_preprocessor
     def supported_phase(_endpoint, values):
@@ -46,6 +46,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
                                  binder=curriculum_binder, restart=curriculum_restart, status=curriculum_status)
     from .knowledge import register_knowledge
     register_knowledge(app, config_path, csrf_token)
+    from .rsi_inputs import register_rsi_inputs
+    register_rsi_inputs(app, config_path, csrf_token, rsi_runner)
     last = [0.0]
 
     def view():

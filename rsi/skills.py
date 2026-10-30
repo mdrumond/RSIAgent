@@ -128,6 +128,25 @@ class SkillBundle:
         return _hash(json.dumps(self.to_dict(), sort_keys=True, separators=(',', ':')))
 
 
+def validate_metadata(bundle: SkillBundle) -> None:
+    """Apply the same metadata contract to edited baselines and learned skills."""
+    try:
+        import yaml  # Existing legacy dependency; ordinary reads remain dependency-free.
+    except ImportError as exc:
+        raise ValueError("Skill editing requires PyYAML from the existing rsi[legacy] environment") from exc
+    for document in bundle.documents:
+        header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)',
+                          document.content, re.DOTALL)
+        try:
+            metadata = yaml.safe_load(header[1]) if header else None
+        except yaml.YAMLError as exc:
+            raise ValueError('invalid skill metadata') from exc
+        if (not isinstance(metadata, dict) or metadata.get('name') != document.name
+                or not isinstance(metadata.get('description'), str)
+                or not metadata['description'].strip()):
+            raise ValueError('invalid skill metadata')
+
+
 def builtin_bundle() -> SkillBundle:
     """Load packaged templates; callers persist the resulting baseline snapshot."""
     root = files('rsi').joinpath('templates')

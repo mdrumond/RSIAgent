@@ -74,18 +74,23 @@ class PairedRecovery:
     terminal_failure_ref may name an exact public terminal_failure_proof packet
     retained in artifacts. It admits a known-closed failed checkpoint without
     clearing pending or claiming stage completion. Unknown work remains blocked.
+    defer_wall_start freezes inputs now but starts the relative pair window at
+    its first dispatch; an absolute parent bound still applies during staging.
     One writer owns path, as for the canonical runner and Learning.
     """
     @classmethod
     def create(cls, path, checkpoint, *, artifacts, memory_ref, kdb_ref,
                model_config, incumbent, candidate, joint_limits,
-               remaining_parent, runner_factory, terminal_failure_ref=None, clock=None):
+               remaining_parent, runner_factory, terminal_failure_ref=None, clock=None, defer_wall_start=False):
         if not isinstance(checkpoint, ProjectRunner):
             raise ValueError('canonical checkpoint required')
+        if type(defer_wall_start) is not bool:
+            raise ValueError('defer_wall_start must be boolean')
         clock = clock or checkpoint.workflow.clock
         created = clock()
         walls = [v for v in (joint_limits.wall_seconds, remaining_parent.get('wall_seconds')) if v is not None]
-        deadline = created + min(walls) if walls else None
+        window = min(walls) if walls else None
+        deadline = created + window if window is not None and not defer_wall_start else None
         path = Path(path)
         if path.exists():
             raise ValueError('pair already exists; reopen it')
@@ -125,7 +130,9 @@ class PairedRecovery:
             original_workflow_ref=artifacts.put_json(checkpoint.workflow.state))
         frozen_ref = artifacts.put_json(frozen)
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json(path, dict(frozen=frozen_ref, created=created, wall_deadline=deadline, last_clock=created, arms={name: dict(
+        atomic_json(path, dict(frozen=frozen_ref, created=created, wall_deadline=deadline,
+            wall_window_seconds=window if defer_wall_start else None,
+            wall_started=None if defer_wall_start else created, last_clock=created, arms={name: dict(
             operation_id=uuid.uuid4().hex, status='ready') for name in ('incumbent', 'candidate')}))
         return cls(path, artifacts=artifacts, runner_factory=runner_factory, clock=clock)
 
@@ -151,12 +158,19 @@ class PairedRecovery:
         if not math.isfinite(now) or now < self.state.get('last_clock', now):
             raise WorkflowError('pair clock moved backwards')
         deadline = self.state.get('wall_deadline')
+        window = self.state.get('wall_window_seconds')
+        start_window = window is not None and self.state.get('wall_started') is None
+        if start_window:
+            deadline = min(deadline, now + window) if deadline is not None else now + window
         allowance = self.frozen['allocation']['wall_seconds']
         if allowance is not None and 'wall_deadline' not in self.state:
             raise WorkflowError('legacy pair requires authoritative parent wall deadline')
         if deadline is not None and (deadline <= now or allowance is not None and deadline - now < allowance):
             raise WorkflowError('insufficient parent wall allocation for frozen arm')
+        if start_window:
+            self.state.update(wall_started=now, wall_deadline=deadline)
         self.state['last_clock'] = now
+        self._save()  # Persist the first dispatch origin before staging/factory.
         return now
 
     def request(self, arm):
