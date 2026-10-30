@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from enum import Enum
 import fcntl
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from core.artifacts import canonical_bytes, _normalize
 
 
 GENESIS_HASH = "0" * 64
@@ -23,41 +24,8 @@ class EvidenceKind(str, Enum):
     RESULT = "result"
 
 
-def canonical_bytes(value: Any) -> bytes:
-    """Serialize JSON data identically or reject ambiguous/non-portable data."""
-
-    normalized = _normalize(value)
-    return json.dumps(
-        normalized,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
 def canonical_digest(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
-
-
-def _normalize(value: Any) -> Any:
-    if is_dataclass(value) and not isinstance(value, type):
-        return _normalize(asdict(value))
-    if isinstance(value, Enum):
-        return _normalize(value.value)
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("canonical evidence cannot contain non-finite numbers")
-        return value
-    if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
-            raise TypeError("canonical evidence mappings require string keys")
-        return {key: _normalize(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize(item) for item in value]
-    raise TypeError(f"unsupported canonical evidence type: {type(value).__name__}")
 
 
 @dataclass(frozen=True)
