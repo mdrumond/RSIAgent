@@ -310,7 +310,15 @@ class ClosedBudget(Session):
 
 
 def test_closed_budget_checkpoint_pending_preserved_and_new_arms_scope(tmp_path):
-    clock = Clock()
+    import time
+    class ElapsedClock(Clock):
+        def __init__(self):
+            self.started = time.monotonic()
+
+        def __call__(self):
+            return self.value + time.monotonic() - self.started
+
+    clock = ElapsedClock()
     captured = {}
     def freeze_failure(original, injections, store):
         result = original.run()
