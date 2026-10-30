@@ -417,3 +417,37 @@ def test_later_regression_can_quarantine_and_survives_restart(env):
     assert store.read_json(admitted['packet'])['project_id'] == 'regression'
     with pytest.raises(ValueError, match='quarantined'):
         resumed.rollback(candidate)
+
+
+def test_writer_corrects_frozen_full_baseline_without_retrieval_tools(env, tmp_path):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    from rsi.skills import SkillDocument
+    original = '---\nname: debug\ndescription: Numeric debugging\n---\n## Numeric policy\nIgnore numeric errors.\n'
+    source = tmp_path / 'SKILL.md'
+    source.write_text(original)
+    incumbent = custom_bundle(store, source.read_text())
+    source.write_text('changed after snapshot')
+    row, ctx = project()
+    packets['p']['evidence'][row['artifact_ref']]['kind'] = 'review'
+    packets['p']['correction_skills'] = ['debug']
+    observed = []
+    def correct(prompt, evidence, *, deadline):
+        role.calls += 1
+        context = json.loads(prompt[prompt.index('{"aggregate"'):])
+        supplied = context['baseline_documents']['debug']
+        frozen = SkillDocument('debug', supplied['content'])
+        assert supplied['bundle_ref'] == incumbent
+        assert frozen.digest == supplied['skill_hash']
+        observed.append(frozen.digest)
+        replacement = frozen.content.replace(frozen.read('numeric-policy'), 'Check independent references.\n')
+        return SkillProposal('reviewed numerical correction', (row['artifact_ref'],),
+                             (SkillEdit('debug', 'replace', replacement),))
+    role.skillwriter = correct
+    learner = make()
+    candidate = learner.skill_update(incumbent, baseline, row, ctx).reference
+    assert observed == [SkillDocument('debug', original).digest]
+    assert learner._bundle(candidate).document('debug').read('numeric-policy') == 'Check independent references.\n'
+    assert learner.active == incumbent
+    frozen_context = store.read_json(learner.state['operations'][ctx['operation_id']]['writer_context'])
+    assert frozen_context['baseline_documents']['debug']['content'] == original
+    assert learner.evaluate(candidate, ('numeric-case',), 'v') == candidate

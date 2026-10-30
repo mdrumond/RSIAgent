@@ -49,7 +49,7 @@ class Validation:
 
 class Learning:
     def __init__(self, path, artifacts, memory, roles, *, load_project, validate,
-                 mode='phase2', unused_window=10, context_chars=24000, clock=time.monotonic,
+                 mode='phase2', unused_window=10, context_chars=48000, clock=time.monotonic,
                  role_elapsed=None, request_seconds=600):
         if not callable(validate) or not callable(load_project):
             raise ValueError('host loader and validator required')
@@ -289,6 +289,14 @@ class Learning:
         operation = self.state['operations'][identity]
         operation['admitted'] = self.store.put_json(admitted)
         operation['admission_sources'] = self.store.put_json(sources)
+        self._save()
+        if any(info['kind'] in ('review', 'counterevidence') for info in admitted.values()):
+            targets = packet.get('correction_skills', [d.name for d in bundle.documents])
+            if not isinstance(targets, list) or not targets:
+                raise ValueError('correction_skills must select known frozen skills')
+            context['baseline_documents'] = {name: dict(content=bundle.document(name).content,
+                skill_hash=bundle.document(name).digest, bundle_ref=incumbent) for name in targets}
+        operation['writer_context'] = self.store.put_json(context)
         self._save()
         evidence = [AdmittedEvidence(ref, dict(kind=info['kind'], summary=info['summary'][:1000]))
                     for ref, info in admitted.items()]
