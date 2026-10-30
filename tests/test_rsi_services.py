@@ -42,7 +42,11 @@ class Decisions:
                 return 'select_strategy', dict(proposal='Preserve verified result',
                     query_ref=evidence['query_kdb']['reference'],
                     retrospective_ref=evidence['retrospect']['reference'],
-                    skill_refs=[r['receipt_id'] for r in context['read_skills']], decisions=[])
+                    skill_refs=[r['receipt_id'] for r in context['read_skills']],
+                    decisions=[dict(group=group, index=i, action='used' if group == 'results' else 'rejected',
+                        reason='Use observed guidance' if group == 'results' else 'Avoid retained failed approach')
+                        for group in ('results', 'negative_records') for i in range(len(
+                            evidence['query_kdb']['evidence']['payload']['response'][group]))])
             if context['stage'] == 'optimisation' and 'optimisation_decision' not in evidence:
                 return 'optimisation_decision', dict(action='noop', reason='Correctness before speed')
         return 'perform', {'proposal': 'Preserve verified result'}
@@ -177,7 +181,7 @@ def test_baseline_corruption_and_backend_substitution_are_rejected(instance):
         InstanceServices(instance.root, environment={}).open_cycle('safe')
     with (instance.root / 'memory/knowledge.sqlite3').open('ab') as stream:
         stream.write(b'changed')
-    with pytest.raises(ValueError, match='checksum'):
+    with pytest.raises(ValueError, match='checksum|baseline'):
         instance.create_cycle('bad', 'phase1')
     assert not (instance.root / 'runs/bad').exists()
 
@@ -501,3 +505,408 @@ def test_setup_telemetry_is_retained_without_charging_actor_setup(instance):
             assert cycle.store.read_json(row['reference'])['elapsed_seconds'] == row['elapsed_seconds']
     finally:
         cycle.close()
+
+
+def test_explicit_project_continue_resumes_only_after_authoritative_pending_reconciliation(instance, monkeypatch):
+    from rsi.project_runner import ProjectRunner
+    from rsi.runtime import WorkflowError
+    cycle = instance.create_cycle('continue', 'phase1')
+    def stop_before_dispatch(runner):
+        try:
+            runner.actor.step(runner.context())  # Real host preflight.
+            runner.actor.step(runner.context())  # Real skill-read/model task construction.
+            runner.workflow.begin()  # Design reservation; NO provider or host dispatch.
+            runner.workflow.stop()
+            raise KeyboardInterrupt('stopped at known undispatched boundary')
+        finally:
+            runner.actor.close()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ProjectRunner, 'run', stop_before_dispatch)
+            with pytest.raises(KeyboardInterrupt):
+                cycle.step()
+        operation = cycle.scheduler.state['pending']['id']
+        runner = cycle.open_project(operation)
+        pending = runner.workflow.pending['id']
+        assert runner.workflow.pending['handle'] is None and runner.workflow.state['stopped']
+        created = runner.workflow.state['created']
+        elapsed = runner.workflow.accounting.seconds()
+        allocation = runner.workflow.limits.to_dict()
+        calls = Decisions.calls
+        with pytest.raises(WorkflowError, match='no stage receipt'):
+            cycle.run_project(operation)
+        assert Decisions.calls == calls
+        assert cycle.open_project(operation).workflow.state['stopped']
+        # Trusted host knows this exact reservation was never dispatched above.
+        runner.workflow.reconcile(pending, not_dispatched=True)
+        assert runner.workflow.state['stopped'] and not runner.workflow.pending
+        result = cycle.run_project(operation)
+        assert result.outcome == 'accepted'
+        resumed = cycle.open_project(operation)
+        assert resumed.workflow.state['created'] == created
+        assert resumed.workflow.limits.to_dict() == allocation
+        assert resumed.workflow.accounting.seconds() >= elapsed
+        assert not resumed.workflow.state['stopped']
+        assert any(h.get('not_dispatched') for h in resumed.workflow.state['history'])
+        cycle.scheduler.reconcile(operation, result)
+        assert cycle.scheduler.state['originals'][0]['outcome'] == 'accepted'
+    finally:
+        cycle.close()
+
+
+def test_ingested_and_accepted_memory_negatives_reach_real_actor_queries(instance, tmp_path):
+    import subprocess
+    from benchmarks.ascend.subject_memory import SubjectMemory
+    from rsi.instance_ingestion import ingest_instance
+    from test_rsi_instance_ingestion import source_repo
+    observed = subprocess.run([sys.executable, '-c', 'assert 1 == 0, "observed prior failure"'],
+                              capture_output=True, text=True)
+    assert observed.returncode != 0
+    failure = instance.store.put_json(dict(returncode=observed.returncode, stderr=observed.stderr))
+    memory = SubjectMemory(instance.root / 'baseline-memory')
+    memory.accept('observed-failure', dict(base_versions=[], kind='failure', project_id='earlier',
+        summary='independently observed assertion failure', evidence=[failure]), {'observed': failure})
+    baseline = memory.snapshot()
+    (instance.root / 'memory-snapshot.json').write_bytes(baseline)
+    config = show_configuration(instance.root)['payload']
+    config.update(memory_snapshot='memory-snapshot.json', memory_sha256=hashlib.sha256(baseline).hexdigest())
+    set_configuration(instance.root, config)
+    source, revision = source_repo(tmp_path)
+    negative = dict(id='ingested-negative', outcome='failed', source_revision=revision)
+    ingestion = ingest_instance(instance.root, source, collection='negative-baseline',
+        repository='fixture/negative', negative_records=[negative], test_embeddings=Embedding())
+    cycle = instance.create_cycle('negative-actor', 'phase1')
+    try:
+        result = cycle.step()
+        assert result.outcome == 'accepted'
+        runner = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+        refs = [e['reference'] for e in runner.events
+                if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert len(refs) >= 2  # Actual design and optimisation retrieval, no synthesized success.
+        for ref in refs:
+            response = runner.store.read_json(ref)['payload']['response']
+            assert negative in response['negative_records']
+            assert any(r.get('proposal', {}).get('kind') == 'failure' for r in response['negative_records'])
+            assert response['provenance']['ingestions'][0]['reference'] == ingestion['reference']
+        selections = [runner.store.read_json(e['reference'])['payload'] for e in runner.events
+                      if e['type'] == 'project-tool' and e['name'] == 'select_strategy']
+        assert all(sum(d['group'] == 'negative_records' for d in row['decisions']) == 2 for row in selections)
+    finally:
+        cycle.close()
+
+
+def test_ingestion_missing_or_wrong_baseline_receipt_cannot_be_empty_query_success(instance, tmp_path):
+    from rsi.instance_ingestion import ingest_instance
+    from test_rsi_instance_ingestion import source_repo
+    source, _ = source_repo(tmp_path)
+    result = ingest_instance(instance.root, source, collection='verified-index',
+        repository='fixture/index', negative_records=[{'id': 'failure'}], test_embeddings=Embedding())
+    original = show_configuration(instance.root)['payload']
+    altered = json.loads(json.dumps(original))
+    altered['kdb_ingestion_refs'] = ['f' * 64]
+    set_configuration(instance.root, altered)
+    missing = instance.create_cycle('missing-ingestion', 'phase1')
+    try:
+        with pytest.raises(FileNotFoundError):
+            missing.query(missing.spec.baseline_kdb)
+    finally:
+        missing.close()
+    receipt = instance.store.read_json(result['reference'])
+    receipt['kdb_sha256'] = '0' * 64
+    altered['kdb_ingestion_refs'] = [instance.store.put_json(receipt)]
+    set_configuration(instance.root, altered)
+    foreign = instance.create_cycle('foreign-ingestion', 'phase1')
+    try:
+        with pytest.raises(ValueError, match='baseline checksum'):
+            foreign.query(foreign.spec.baseline_kdb)
+    finally:
+        foreign.close()
+
+
+class ClosedFailureAfterQuery(Decisions):
+    def next_action(self, context, allowed, **kwargs):
+        from coding.pi.rpc import PiDeadlineError
+        if context['stage'] == 'design' and any(r['name'] == 'query_kdb' for r in context['evidence']):
+            raise PiDeadlineError('observed test provider deadline after completed query')
+        return super().next_action(context, allowed, **kwargs)
+
+
+class ClosedBudgetAfterQuery(Decisions):
+    def next_action(self, context, allowed, **kwargs):
+        if context['stage'] == 'design' and any(r['name'] == 'query_kdb' for r in context['evidence']):
+            # Consume real actor thinking allocation; no fabricated exhaustion error.
+            time.sleep(kwargs['seconds'] + .02)
+        return super().next_action(context, allowed, **kwargs)
+
+
+def test_closed_failed_actor_enters_phase1_memory_and_fresh_recovery_without_clearing_pending(instance):
+    sessions = iter([ClosedFailureAfterQuery(), Decisions()])
+    instance.test = Bindings(instance.test.query, lambda: next(sessions), Roles, instance.test.identity)
+    config = show_configuration(instance.root)['payload']
+    config['recovery']['enabled'] = True
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('failed-and-recovered', 'phase1')
+    try:
+        first = cycle.step()
+        assert first.outcome == 'failed' and first.actor_seconds > 0
+        row = cycle.scheduler.state['originals'][0]
+        failed = cycle.open_project(row['operation_id'])
+        original_state = json.loads(json.dumps(failed.workflow.state))
+        assert failed.workflow.pending and failed.workflow.stage == Stage.DESIGN
+        packet = cycle.store.read_json(first.artifact_ref)
+        proof = cycle.store.read_json(packet['failure_proof_ref'])
+        assert proof['retrieval_receipts'] and proof['stage_completion_claim'] is False
+        assert proof['actor_seconds_total'] == first.actor_seconds
+        assert packet['workflow_valid'] is False
+        with pytest.raises(ValueError, match='unfinished scheduler admission'):
+            cycle.run_project(row['operation_id'])
+        cycle.step()  # Actual failed project packet -> accepted negative memory.
+        assert cycle.memory.records()[0]['proposal']['kind'] == 'failure'
+        recovered = cycle.step()  # New independent canonical task, same fixed skills.
+        assert recovered.outcome == 'accepted'
+        assert cycle.scheduler.state['spent'] == first.actor_seconds + recovered.actor_seconds
+        assert len(cycle.scheduler.state['originals']) == 1 and len(cycle.scheduler.state['recoveries']) == 1
+        assert cycle.open_project(row['operation_id']).workflow.state == original_state
+        assert cycle.scheduler.state['recoveries'][0]['operation_id'] != row['operation_id']
+    finally:
+        cycle.close()
+
+
+def test_known_failed_result_loss_reconciles_once_and_unknown_query_remains_blocked(instance):
+    from rsi.strategy import QueryUnavailable
+    instance.test = Bindings(instance.test.query, ClosedFailureAfterQuery, Roles, instance.test.identity)
+    cycle = instance.create_cycle('lost-failed-result', 'phase1')
+    try:
+        real = cycle.scheduler.runner
+        def lost(*args):
+            real(*args)
+            raise RuntimeError('host return lost after durable failed admission')
+        cycle.scheduler.runner = lost
+        with pytest.raises(RuntimeError):
+            cycle.step()
+        assert not cycle.scheduler.state['originals']
+        cycle.reconcile()
+        row = cycle.scheduler.state['originals'][0]
+        spent = cycle.scheduler.state['spent']
+        assert row['outcome'] == 'failed' and spent == row['actor_seconds']
+        with pytest.raises(ValueError, match='explicit learning'):
+            cycle.reconcile()
+        assert cycle.scheduler.state['spent'] == spent
+    finally:
+        cycle.close()
+    def unavailable(_):
+        raise QueryUnavailable('actual backend unavailable')
+    instance.test = Bindings(unavailable, Decisions, Roles, instance.test.identity)
+    unknown = instance.create_cycle('unknown-query', 'phase1')
+    try:
+        with pytest.raises(RuntimeError, match='suspended'):
+            unknown.step()
+        assert unknown.scheduler.state['pending'] and not unknown.scheduler.state['originals']
+        assert unknown.scheduler.state['spent'] == 0
+    finally:
+        unknown.close()
+
+
+def test_generated_paths_flow_through_service_and_preserve_actual_verification(instance):
+    config = show_configuration(instance.root)['payload']
+    config['project_configs']['answer']['generated_paths'] = ['results.json']
+    set_configuration(instance.root, config)
+    (instance.root / 'source/solution.py').write_text(
+        "from pathlib import Path\nPath('results.json').write_text('generated output')\nanswer = 42\n")
+    cycle = instance.create_cycle('generated', 'phase1')
+    try:
+        assert cycle.step().outcome == 'accepted'
+        runner = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+        assert (runner.backend.project / 'results.json').is_file()
+        assert runner.workflow.verified_source == runner.backend.project_hash()
+    finally:
+        cycle.close()
+
+
+def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trace(instance):
+    from rsi.roles import SkillEdit
+    class Writer(Roles):
+        def skillwriter(self, prompt, evidence, *, deadline):
+            self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
+            return SkillProposal('Use observed failure context before selecting strategy',
+                (evidence[0].evidence_id,), (SkillEdit('design', 'replace',
+                    builtin_bundle().document('design').read('learned-guidance') +
+                    '\nReview retained evidence promptly and preserve time for execution/verification.'),))
+    sessions = iter([ClosedBudgetAfterQuery(), ClosedBudgetAfterQuery(), Decisions()])
+    instance.test = Bindings(instance.test.query, lambda: next(sessions), Writer, instance.test.identity)
+    config = show_configuration(instance.root)['payload']
+    config['recovery']['enabled'] = True
+    config['phase2_projects'][0]['budgets']['actor_seconds'] = 1.0
+    config['recovery']['budgets'] = BudgetLimits(design_iterations=6, implementation_iterations=6,
+        execution_tries=20, actor_seconds=6).to_dict()
+    config['tuning'].update(every_projects=None, at_wave_end=False)
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('paired-failed', 'phase2')
+    try:
+        assert cycle.step().outcome == 'failed'
+        original = cycle.scheduler.state['originals'][0]
+        failed = cycle.open_project(original['operation_id'])
+        frozen_failed = json.loads(json.dumps(failed.workflow.state))
+        cycle.step()  # Memory accepts actual observed failure.
+        cycle.step()  # Real writer proposes different immutable design guidance.
+        assert cycle.learning.active == cycle.scheduler.state['skills']
+        cycle.step()  # Existing CycleController drains old/new canonical pair and validation.
+        assert cycle.open_project(original['operation_id']).workflow.state == frozen_failed
+        assert frozen_failed['pending']
+        pair_path = next((cycle.root / 'pairs').glob('*.json'))
+        from rsi.recovery import PairedRecovery
+        pair = PairedRecovery(pair_path, artifacts=cycle.store, runner_factory=cycle.trial)
+        comparison = pair.result()
+        assert comparison['arms']['incumbent']['outcome'] == 'failed'
+        assert comparison['arms']['incumbent']['workflow'] is False
+        assert comparison['arms']['candidate']['outcome'] == 'accepted'
+        assert pair.frozen['terminal_failure_ref']
+        assert cycle.store.read_json(pair.frozen['original_workflow_ref']) == frozen_failed
+        assert cycle.learning.active == cycle.scheduler.state['skills'] == pair.frozen['candidate']
+        assert pair.frozen['incumbent'] != pair.frozen['candidate']
+        assert cycle.scheduler.state['spent'] == (original['actor_seconds'] + .25 + comparison['actor_seconds'])
+    finally:
+        cycle.close()
+    parent_files = {name: (cycle.root / name).read_bytes()
+                    for name in ('cycle.json', 'learning.json', 'memory/active.json')}
+    inherited = instance.create_cycle('published-inference', 'inference')
+    try:
+        assert inherited.binding['input_handoff']['parent_cycle'] == 'paired-failed'
+        assert inherited.scheduler.state['skills'] == pair.frozen['candidate']
+        assert inherited.scheduler.state['memory'] == cycle.scheduler.state['memory']
+        inherited.step()  # Existing inference fork creates its own mutable heads.
+        assert inherited.memory.root != cycle.memory.root
+        assert inherited.learning.path != cycle.learning.path
+        for name, data in parent_files.items():
+            assert (cycle.root / name).read_bytes() == data
+    finally:
+        inherited.close()
+
+
+def test_phase1_observed_code_and_measurements_reach_phase2_query(instance):
+    from uuid import uuid4
+    feature = uuid4().hex  # This fact is absent from the original empty baseline KDB.
+    source = 'FEATURE_FACT = ' + repr(feature) + '\nanswer = 42\n'
+    (instance.root / 'source/solution.py').write_text(source)
+    (instance.root / 'verify.py').write_text(
+        "import json, runpy\nvalues = runpy.run_path('solution.py')\n"
+        "assert values['answer'] == 42\n"
+        "print(json.dumps({'feature_fact': values['FEATURE_FACT'], 'cases_checked': 1}))\n")
+    phase1 = instance.create_cycle('observation-phase1', 'phase1')
+    try:
+        assert phase1.step().outcome == 'accepted'
+        row = phase1.scheduler.state['originals'][0]
+        packet = phase1.load_project(row)
+        observed = packet['observations']
+        assert observed['final_sources'][0]['text'] == source
+        assert observed['applicability']['final_source_hash'] == phase1.open_project(row['operation_id']).backend.project_hash()
+        assert all(r['authority'] == 'model-claim' for r in observed['strategies']['items'])
+        numeric = [r for r in observed['commands']['items'] if r['command'] == 'validation'][0]
+        assert json.loads(numeric['stdout']['text']) == dict(feature_fact=feature, cases_checked=1)
+        assert numeric['numeric'] and numeric['classification'] == 'passed' and numeric['elapsed_seconds'] >= 0
+        assert not observed['final_sources'][0]['truncated']
+        assert phase1.store.read_json(packet['observations_ref']) == observed
+        phase1.step()  # Existing Learning admits project facts to SubjectMemory.
+        baseline = phase1.memory.snapshot()
+    finally:
+        phase1.close()
+    phase2 = instance.create_cycle('observation-phase2', 'phase2')
+    try:
+        assert phase2.binding['input_handoff']['parent_cycle'] == 'observation-phase1'
+        assert phase2.spec.baseline_kdb == hashlib.sha256(baseline).hexdigest()
+        response = phase2.query(phase2.spec.baseline_kdb)({'query': feature})
+        facts = response['results'][0]['observations']
+        assert facts['final_sources'][0]['text'] == source
+        assert any(json.loads(r['stdout']['text'])['feature_fact'] == feature
+                   for r in facts['commands']['items'] if r['command'] == 'validation')
+        assert phase2.step().outcome == 'accepted'
+        second = phase2.open_project(phase2.scheduler.state['originals'][0]['operation_id'])
+        queries = [second.store.read_json(e['reference'])['payload']['response']
+                   for e in second.events if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert queries and all(q['results'][0]['observations']['final_sources'][0]['text'] == source for q in queries)
+        # Full raw code/verifier/measurement artifacts accompany bounded model-visible facts.
+        for reference in facts['artifact_refs']:
+            assert second.store.read_bytes(reference) == phase2.store.read_bytes(reference)
+    finally:
+        phase2.close()
+
+
+def test_observed_source_truncation_keeps_complete_artifact_and_negative_fact_scope(instance):
+    source = 'answer = 42\n' + '# deliberately long observed source\n' * 500
+    (instance.root / 'source/solution.py').write_text(source)
+    cycle = instance.create_cycle('bounded-observations', 'phase1')
+    try:
+        assert cycle.step().outcome == 'accepted'
+        packet = cycle.load_project(cycle.scheduler.state['originals'][0])
+        row = packet['observations']['final_sources'][0]
+        assert row['truncated'] and row['text_chars'] == len(source)
+        assert len(row['text']) < len(source)
+        assert cycle.store.read_bytes(row['reference']).decode() == source
+    finally:
+        cycle.close()
+
+
+def test_repository_ingestion_freezes_old_cycle_and_new_cycle_retrieves_actual_index(instance, tmp_path):
+    from rsi.instance_ingestion import ingest_instance
+    from rsi.strategy import knowledge_db_query
+    from test_rsi_instance_ingestion import source_repo
+    baseline = instance.root / 'memory/knowledge.sqlite3'
+    original = baseline.read_bytes()
+    inventory = (instance.root / 'instance.json').read_bytes()
+    before = instance.create_cycle('before-real-ingest', 'phase1')
+    old_db = (before.root / 'knowledge.sqlite3').read_bytes()
+    old_binding = (before.root / 'service.json').read_bytes()
+    before.close()
+    source, revision = source_repo(tmp_path)
+    ingested = ingest_instance(instance.root, source, collection='new-repository',
+        repository='fixture/new-repository', negative_records=[dict(id='retained-negative', source_revision=revision)],
+        test_embeddings=Embedding())
+    assert baseline.read_bytes() == original
+    assert (instance.root / 'instance.json').read_bytes() == inventory
+    assert (before.root / 'knowledge.sqlite3').read_bytes() == old_db
+    assert (before.root / 'service.json').read_bytes() == old_binding
+    after = instance.create_cycle('after-real-ingest', 'phase1')
+    database = KnowledgeDB.open_read_only(after.root / 'knowledge.sqlite3', Embedding())
+    after.database = database
+    instance.test = Bindings(knowledge_db_query(database, ('new-repository',), negative_query=lambda _: []),
+                             Decisions, Roles, instance.test.identity)
+    try:
+        assert after.config['baseline_kdb'] == ingested['baseline_kdb']
+        assert after.config['kdb_ingestion_refs'] == [ingested['reference']]
+        assert after.step().outcome == 'accepted'
+        runner = after.open_project(after.scheduler.state['originals'][0]['operation_id'])
+        rows = [runner.store.read_json(e['reference'])['payload']['response']
+                for e in runner.events if e['type'] == 'project-tool' and e['name'] == 'query_kdb']
+        assert rows and all(any(hit['collection'] == 'new-repository' and hit['text'].strip() == 'answer = 42'
+                               for hit in row['results']) for row in rows)
+        assert all(row['provenance']['ingestions'][0]['reference'] == ingested['reference'] for row in rows)
+        with KnowledgeDB.open_read_only(before.root / 'knowledge.sqlite3', Embedding()) as old:
+            with pytest.raises(KeyError):
+                old.manifest('new-repository')
+    finally:
+        after.close()
+
+
+def test_phase1_explicit_revisit_inherits_accepted_head_and_never_writes_skills(instance):
+    parent = instance.create_cycle('revisit-parent', 'phase1')
+    try:
+        assert parent.step().outcome == 'accepted'
+        parent.step()  # Publish actual accepted memory boundary.
+        memory, skills = parent.scheduler.state['memory'], parent.scheduler.state['skills']
+        parent_bytes = {name: (parent.root / name).read_bytes()
+                        for name in ('cycle.json', 'learning.json', 'memory/active.json')}
+    finally:
+        parent.close()
+    revisited = instance.create_cycle('revisited-phase1', 'phase1', from_cycle='revisit-parent', inheritance='parent')
+    try:
+        assert revisited.scheduler.state['memory'] == memory
+        assert revisited.scheduler.state['skills'] == skills
+        assert revisited.binding['input_handoff']['parent_cycle'] == 'revisit-parent'
+        assert revisited.step().outcome == 'accepted'
+        revisited.step()
+        assert revisited.scheduler.state['skills'] == skills
+        assert not revisited.scheduler.state['candidates'] and not Roles.prompts
+        for name, data in parent_bytes.items():
+            assert (parent.root / name).read_bytes() == data
+    finally:
+        revisited.close()
