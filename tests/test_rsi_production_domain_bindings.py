@@ -1111,3 +1111,63 @@ def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_can
     operation=requested[0]['operation_id']
     assert not any(row['type']=='domain-dispatch' and row['operation_id']==operation
         and runner.store.read_json(row['reference'])['name']=='edit' for row in runner.events)
+
+
+def test_explicit_same_job_resume_reopens_stopped_canonical_work_without_elapsed_refund(tmp_path):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture, Backend
+    store,key=fixture(tmp_path);backend=Backend();agent=SimpleNamespace(identity={'model':'CPU decisions'})
+    model=CanonicalSession(initial=json.dumps(dict(source='bad',block_count=1)),
+                           repaired=json.dumps(dict(source='fast',block_count=1)))
+    adoption=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True)
+    def owner():
+        return OptimizationLoop(store,key,agent,backend,knowledge=lambda _:[],canonical=adoption)
+    first=owner();first.run(single_evaluation=True)
+    store.stop(key)
+    assert owner().run()['status']=='stopped'
+    checkpoint=first.directory/'canonical-1/workflow.json'
+    stopped=json.loads(checkpoint.read_text());elapsed=store.get(key)['elapsed_seconds']
+    assert stopped['stopped'] is True and stopped['pending'] is None
+    store.resume(key,additional_seconds=10)
+    assert owner().run()['status']=='completed'
+    resumed=json.loads(checkpoint.read_text())
+    assert all(resumed['intervals'][key]==value for key,value in stopped['intervals'].items())
+    assert resumed['limits']==stopped['limits'] and store.get(key)['elapsed_seconds']>=elapsed
+    assert backend.prepares==1 and backend.evaluations==['bad','fast']
+    assert store.get(key)['attempts']==2
+
+
+@pytest.mark.parametrize('failure',['retained-history-crash','unobserved-profile'])
+def test_public_attempt_settles_only_authenticated_pending_evaluation_before_publication(tmp_path,monkeypatch,failure):
+    from optimizer.control import WorkerStopped, ObservationUnavailable
+    from optimizer.loop import OptimizationLoop
+    def profile(*args,**kwargs):
+        if failure=='unobserved-profile':raise WorkerStopped('Original profiling operation has no terminal observer')
+        return dict(status='unavailable')
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,profile)
+    original=OptimizationLoop._save;crashed=[]
+    def crash_after_history(owner):
+        original(owner)
+        if failure=='retained-history-crash' and not crashed and any(
+                row.get('domain_operation') and row.get('result') for row in owner.state['history']):
+            crashed.append(True)
+            raise RuntimeError('Actual evaluation history persisted before stage settlement')
+    monkeypatch.setattr(OptimizationLoop,'_save',crash_after_history)
+    try:
+        with pytest.raises(RuntimeError if failure=='retained-history-crash' else WorkerStopped):
+            task.attempt('same-attempt')
+        checkpoint=task.job_directory/'execution/canonical-1/workflow.json'
+        raw=checkpoint.read_bytes();pending=json.loads(raw)['pending']
+        assert pending['stage']==('test' if failure=='retained-history-crash' else 'optimisation')
+        before=(backend.prepares,list(backend.evaluations),len(model.contexts),task.store.get(task.job_id)['attempts'])
+        assert task._event('task-attempt-result') is None
+        if failure=='retained-history-crash':
+            assert task.attempt('same-attempt')['verified'] is True
+            settled=json.loads(checkpoint.read_text())
+            assert settled['pending'] is None and settled['domain_boundary']=='test'
+            assert settled['history'][-1]['evidence']['operation_id']==pending['id']
+        else:
+            with pytest.raises(ObservationUnavailable):task.attempt('same-attempt')
+            assert checkpoint.read_bytes()==raw and task._event('task-attempt-result') is None
+        assert (backend.prepares,backend.evaluations,len(model.contexts),task.store.get(task.job_id)['attempts'])==before
+    finally:db.close()

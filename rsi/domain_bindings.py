@@ -1095,7 +1095,7 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
             owner._save()
         row = owner.store.get(owner.key)
         if row['status'] == 'queued':
-            owner.store.transition(owner.key, 'running')
+            row = owner.store.transition(owner.key, 'running')
         host = OptimizerHost(owner, inputs)
         agent = getattr(owner.agent, 'agent', owner.agent)
         if session_factory is None and not hasattr(agent, 'model'):
@@ -1113,7 +1113,14 @@ def optimizer_adoption(*, session_factory=None, test_backend=False, clock=None):
                           test_backend=test_backend, **(dict(clock=clock) if clock is not None else {}))
         if (root / 'domain.json').exists():
             runner = DomainRunner(root, host, **injections)
-            if runner.workflow.state.pop('domain_boundary', None):
+            boundary = runner.workflow.state.pop('domain_boundary', None)
+            # JobStore.resume is the public control boundary. Preserve every
+            # pending operation/clock row: resume only removes the stop flag;
+            # normal canonical reconciliation still owns unresolved effects.
+            resumed = (runner.workflow.state['stopped'] and not row['stop_requested']
+                       and row['status'] == 'running' and any(event['kind'] == 'resumed'
+                           for event in owner.store.events(owner.key)))
+            if boundary or resumed:
                 runner.workflow.resume()
             return runner
         bundle, limits = baseline_contract(owner, max(0.001, row['max_seconds'] - row['elapsed_seconds']))
