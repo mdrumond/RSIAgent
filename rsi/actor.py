@@ -519,6 +519,17 @@ class WorkflowActor:
                         observation = dict(event='invalid-action', error=error, accepted=False, allowed=list(allowed))
                         record('actor-invalid-action', observation)
                         continue
+                if stage == Stage.OPTIMISATION:
+                    decisions = [row['result'].get('evidence', {}) for row in evidence_material
+                                 if row['name'] == 'optimisation_decision']
+                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args):
+                        error = 'optimisation decision does not match edit; noop/profile must omit edit'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', error=error, accepted=False,
+                                           optimisation_decision=decisions[-1])
+                        record('actor-invalid-action', observation)
+                        continue
                 seconds = self._available()
                 if stage in (Stage.TEST, Stage.VALIDATION):
                     if self.managed_executions:
