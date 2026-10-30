@@ -114,6 +114,9 @@ def start(instance, request):
                 if request.get('action') not in ('resume', 'revisit') or request.get('previous_job') != previous['job_id']:
                     raise ValueError('interrupted job requires explicit resume/revisit with its retained ID')
         job_id = str(uuid.uuid4())
+        request = dict(request)
+        if request.get('action') != 'resume':
+            request['request_id'] = job_id
         path = _path(directory, job_id)
         record = {'job_id': job_id, 'state': 'launching', 'request': request,
                   'configuration': snapshot, 'process': None}
@@ -171,5 +174,6 @@ def evidence(instance, job_id):
     record = status(root, job_id)
     path = directory / f'{job_id}.events.jsonl'
     lines = path.read_bytes().splitlines(keepends=True) if path.exists() else []
-    return {'job': record, 'events': [json.loads(line) for line in lines if line.endswith(b'\n')],
+    from .job_inspection import inspect_cycle
+    return {'job': record, 'inspection': inspect_cycle(root, record['request']), 'events': [json.loads(line) for line in lines if line.endswith(b'\n')],
             'log': str(directory / f'{job_id}.log')}

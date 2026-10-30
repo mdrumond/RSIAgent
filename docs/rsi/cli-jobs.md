@@ -44,3 +44,28 @@ and `evidence-export`; their help lists explicit database, embedding, outcome an
 artifact inputs. Fine tuning is reported as awaiting its service rather than
 claiming an unevaluated candidate was promoted. Dashboard serving and dependency
 environment setup are separate commands supplied by their integration streams.
+
+## Baseline skills and timing evidence
+
+- skills get [NAME] [--builtin]
+- skills set NAME --file SKILL.md [--expect-bundle REF]
+- skills map inspect
+- skills map set --file mapping.json [--expect-bundle REF]
+- skills tune --project CYCLE/OPERATION --guidance TEXT
+
+Content and mapping edits validate the complete bundle and YAML metadata, publish
+an immutable baseline copy, and revise configuration pointers with a conflict
+check. Existing admitted bundles remain unchanged. A cycle baseline cannot be
+switched by steering; start a new cycle to use an edited baseline.
+
+Tuning resolves a retained phase2/inference host project receipt, also accepted as
+its CAS reference, then starts an owned service job with structured user guidance.
+The service performs the configured independent A/B evaluation; it retains the
+incumbent on ties, regressions or incomplete evidence. Tuning is not a direct skill
+promotion or a second programming workflow.
+
+Job evidence includes an inspection section with task intervals, per-category
+charged/excluded durations, the canonical actor union, remaining allocations and
+skill references. Category durations can overlap: use actor_union_seconds for the
+charged total. Active or uncertain actor totals remain null; bounded remaining
+values that cannot be established are omitted. Disabled caps are explicitly null.

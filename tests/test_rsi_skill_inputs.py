@@ -1,0 +1,114 @@
+"""Immutable baseline edits and actual request propagation; no provider calls."""
+import json
+from pathlib import Path
+
+import pytest
+
+from rsi.cli import main
+from rsi.configuration import set_configuration, show_configuration
+from rsi.skill_inputs import inspect_skills, update_skills
+from rsi.skills import SkillBundle, builtin_bundle
+from core.artifacts import ContentAddressedArtifacts
+
+
+@pytest.fixture
+def baseline(tmp_path):
+    root = tmp_path / 'instance'
+    (root / 'config').mkdir(parents=True)
+    bundle = builtin_bundle()
+    for doc in bundle.documents:
+        path = root / 'skills' / doc.name / 'SKILL.md'
+        path.parent.mkdir(parents=True)
+        path.write_text(doc.content)
+    (root / 'config/map.json').write_text(json.dumps(bundle.to_dict()['mapping']))
+    (root / 'config/instance.json').write_text(json.dumps(dict(
+        machinery='machinery', kdb='memory/kdb.sqlite', skills='skills', skill_map='config/map.json')))
+    (root / 'instance.json').write_text('{}')
+    return root, bundle
+
+
+def test_edit_publishes_new_baseline_and_preserves_prior_capture(baseline):
+    root, original = baseline
+    before = inspect_skills(root)
+    content = original.document('debug').content + '\n## Numeric checks\nCheck error against Decimal.\n'
+    result = update_skills(root, name='debug', content=content, expect_bundle=before['bundle_ref'])
+    assert result['bundle_ref'] != before['bundle_ref']
+    assert original.document('debug').content != content
+    assert (root / 'skills/debug/SKILL.md').read_text() == original.document('debug').content
+    assert inspect_skills(root, 'debug')['documents'][0]['content'] == content
+    frozen = SkillBundle.from_dict(ContentAddressedArtifacts(root / 'artifacts').read_json(result['bundle_ref']))
+    assert frozen.document('debug').content == content
+    payload = show_configuration(root)['payload']
+    assert str(Path(payload['baseline_skills']).parent).endswith('skill-bundles')
+
+
+def test_invalid_content_and_mapping_never_change_configuration(baseline):
+    root, original = baseline
+    before = show_configuration(root)
+    with pytest.raises(ValueError, match='metadata'):
+        update_skills(root, name='debug', content='## Contract\nNo metadata\n')
+    mapping = original.to_dict()['mapping']
+    mapping['design'] = ['missing-skill']
+    with pytest.raises(ValueError):
+        update_skills(root, mapping=mapping)
+    assert show_configuration(root) == before
+    with pytest.raises(ValueError, match='conflict'):
+        update_skills(root, name='debug', content=original.document('debug').content, expect_bundle='stale')
+
+
+def test_map_edit_validates_whole_bundle_and_captures_new_snapshot(baseline):
+    root, original = baseline
+    mapping = original.to_dict()['mapping']
+    mapping['design'] = ['design', 'debug', 'kdb']
+    result = update_skills(root, mapping=mapping)
+    after = inspect_skills(root)
+    assert after['mapping']['design'] == ['design', 'debug', 'kdb']
+    assert after['bundle_ref'] == result['bundle_ref']
+    assert original.skills_for('design') == ('design', 'kdb')
+
+
+def test_revision_race_preserves_concurrent_editor_without_partial_pointer(baseline, monkeypatch):
+    root, original = baseline
+    import rsi.skill_inputs as module
+    setter = module.set_configuration
+    def race(instance, payload, *, expect_revision):
+        current = show_configuration(instance)['payload']
+        current['prompts']['actor'] = 'concurrent steering'
+        setter(instance, current)
+        return setter(instance, payload, expect_revision=expect_revision)
+    monkeypatch.setattr(module, 'set_configuration', race)
+    with pytest.raises(ValueError, match='revision conflict'):
+        update_skills(root, name='debug', content=original.document('debug').content + '\nReviewed.\n')
+    after = show_configuration(root)['payload']
+    assert after['prompts']['actor'] == 'concurrent steering'
+    assert 'baseline_skills' not in after
+
+
+def test_cli_get_map_and_builtin_are_real_bundle_data(baseline, capsys):
+    root, original = baseline
+    assert main(['--instance', str(root), 'skills', 'get', 'design']) == 0
+    assert json.loads(capsys.readouterr().out)['documents'][0]['content'] == original.document('design').content
+    assert main(['--instance', str(root), 'skills', 'map', 'inspect']) == 0
+    assert json.loads(capsys.readouterr().out)['mapping'] == original.to_dict()['mapping']
+
+
+def test_manual_tune_resolves_retained_host_project_and_guidance(baseline, monkeypatch):
+    root, _ = baseline
+    from rsi import jobs
+    store = ContentAddressedArtifacts(root / 'artifacts')
+    task = root / 'runs/application/projects/op1'
+    task.mkdir(parents=True)
+    reference = store.put_json(dict(root=str(task), operation_id='op1'))
+    (task / 'service-result.json').write_text(json.dumps({'reference': reference}))
+    (root / 'runs/application/service.json').write_text(json.dumps({'spec': {'mode': 'phase2'}}))
+    captured = []
+    monkeypatch.setattr(jobs, 'start', lambda instance, request: captured.append(request) or {})
+    for value in ('application/op1', reference):
+        assert main(['--instance', str(root), 'skills', 'tune', '--project', value,
+                     '--guidance', 'Avoid previous numeric cancellation']) == 0
+    assert captured == [dict(action='tune', mode='phase2', cycle_id='application',
+        project_ref=reference, user_guidance='Avoid previous numeric cancellation')] * 2
+    wrong = store.put_json(dict(root=str(task), operation_id='some-other-operation'))
+    assert main(['--instance', str(root), 'skills', 'tune', '--project', wrong,
+                 '--guidance', 'no invented receipts']) == 2
+    assert len(captured) == 2
