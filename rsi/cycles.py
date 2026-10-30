@@ -12,7 +12,7 @@ step dispatches at most one durable operation. An exception, stop or restart
 with pending work requires reconcile(operation_id, authoritative_result), or
 confirmed not_dispatched=True. No hook/runner is automatically replayed.
 """
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import copy
 import fcntl
 import json
@@ -93,6 +93,25 @@ class SnapshotUpdate:
     def __post_init__(self):
         if not self.reference:
             raise ValueError('retained snapshot reference required')
+        _seconds(self.actor_seconds)
+
+
+@dataclass(frozen=True)
+class RejectedSkillUpdate:
+    """Host-proven semantic rejection of a finished, retained writer proposal."""
+    operation_id: str
+    namespace: str
+    incumbent: str
+    memory_ref: str
+    project_ref: str
+    proposal_ref: str
+    rejection_ref: str
+    actor_seconds: float
+
+    def __post_init__(self):
+        for key, value in asdict(self).items():
+            if key != 'actor_seconds' and (not isinstance(value, str) or not value.strip()):
+                raise ValueError('scoped retained rejection references required')
         _seconds(self.actor_seconds)
 
 
@@ -202,9 +221,44 @@ class CycleScheduler:
                                     ('wall_seconds', elapsed)]}
 
     def _context(self, operation):
-        return dict(operation_id=operation['id'], namespace=self.state['namespace'],
+        context = dict(operation_id=operation['id'], namespace=self.state['namespace'],
                     wave=self.state['wave'], original_project_id=operation.get('original_id'),
                     recovery=operation.get('recovery', False), remaining=self.remaining())
+        if operation['kind'] == 'skill' and self.state['originals']:
+            context['previous_skill_rejections'] = [copy.deepcopy(row) for row in
+                self.state.get('rejected_skill_updates', {}).values()
+                if row['project_ref'] == self.state['originals'][-1]['artifact_ref']]
+        return context
+
+    def reconcile_rejected_skill(self, result):
+        """Charge observed rejection once, retaining the task and pending history.
+
+        A subsequent normal step may create a fresh writer operation only if
+        existing elapsed allocations permit it. This never creates a candidate.
+        """
+        if not isinstance(result, RejectedSkillUpdate):
+            raise TypeError('host-proven rejected skill update required')
+        row, state = asdict(result), self.state
+        previous = state.get('rejected_skill_updates', {}).get(result.operation_id)
+        if previous is not None:
+            if previous != row:
+                raise WorkflowError('rejected operation replay differs')
+            return copy.deepcopy(previous)
+        pending = state['pending']
+        if (not pending or pending['kind'] != 'skill' or pending['id'] != result.operation_id
+                or state['phase'] != 'skill' or state['namespace'] != result.namespace
+                or state['skills'] != result.incumbent or state['memory'] != result.memory_ref
+                or not state['originals'] or state['originals'][-1]['artifact_ref'] != result.project_ref
+                or result.operation_id in state['completed_operations']):
+            raise WorkflowError('rejected proposal scope differs from pending skill operation')
+        state.setdefault('rejected_skill_updates', {})[result.operation_id] = row
+        state['spent'] += result.actor_seconds
+        state['completed_operations'][result.operation_id] = 'skill_rejected'
+        state['events'].append(dict(kind='skill_proposal_rejected', **row))
+        state['pending'] = None
+        self.needs_reconciliation = False
+        self._save()
+        return copy.deepcopy(row)
 
     def _due(self, reason):
         if self.spec.mode == Mode.PHASE1:
@@ -269,7 +323,7 @@ class CycleScheduler:
                     or remaining['recovery_seconds'] is not None and remaining['recovery_seconds'] <= 0):
                 s['events'].append(dict(kind='recovery_exhausted', original_id=item['original_id']))
                 s['recovery_queue'].pop(0)
-                s['phase'] = 'recovery'
+                s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
                 self._save()
                 return None
             operation.update(spec=item['spec'], original_id=item['original_id'])

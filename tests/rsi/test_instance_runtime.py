@@ -129,16 +129,29 @@ def test_loopback_binds_port_zero_and_retains_actual_endpoint(tmp_path, monkeypa
     app.add_url_rule('/', view_func=lambda: 'instance dashboard')
     monkeypatch.setattr(dashboard.app, 'create_app', lambda *_: app)
     make_server = werkzeug.serving.make_server
-    responses = []
+    responses, errors = [], []
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    monkeypatch.setenv('HTTP_PROXY', 'http://127.0.0.1:9')
     def server(host, port, application, **kwargs):
         real = make_server(host, port, application, **kwargs)
+        # handle_request otherwise waits forever when the client fails first.
+        real.timeout = 3
         def once(**_):
             import threading
-            reader = threading.Thread(target=lambda: responses.append(
-                urllib.request.urlopen(f'http://127.0.0.1:{real.server_port}', timeout=3).read()))
+            def request():
+                try:
+                    with opener.open(f'http://127.0.0.1:{real.server_port}', timeout=3) as response:
+                        responses.append(response.read())
+                except Exception as exc:
+                    errors.append(exc)
+            reader = threading.Thread(target=request, daemon=True)
             reader.start()
-            real.handle_request()
-            reader.join(timeout=3)
+            try:
+                real.handle_request()
+            finally:
+                reader.join(timeout=4)
+            assert not reader.is_alive(), 'loopback HTTP reader exceeded its timeout'
+            assert not errors, f'loopback HTTP request failed: {errors!r}'
         real.serve_forever = once
         return real
     monkeypatch.setattr(werkzeug.serving, 'make_server', server)
@@ -232,12 +245,14 @@ def test_owned_dashboard_processes_get_distinct_ports_and_stop(tmp_path):
     second = tmp_path / 'second'
     shutil.copytree(first, second)
     records = []
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         for root in (first, second):
             receipt = dashboard_runtime.start(root)
             records.append(receipt)
             assert receipt['state'] == 'running', receipt
-            assert urllib.request.urlopen(receipt['url'], timeout=5).status == 200
+            with opener.open(receipt['url'], timeout=5) as response:
+                assert response.status == 200
         assert records[0]['port'] != records[1]['port']
         for root in (first, second):
             dashboard_runtime.stop(root)
