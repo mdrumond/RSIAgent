@@ -209,9 +209,18 @@ class DomainRunner(ProjectRunner):
             self.bundle, query, workflow_id=self.contract_ref, backend_identity=backend_identity,
             events=self.events, test_backend=test_backend)
         self._factory_attempted = False
+        self._session_closure_ref = None
         def tracked_factory():
             self._factory_attempted = True
-            return session_factory()
+            self._session_closure_ref = None
+            session = session_factory()
+            original_close = getattr(session.close, '_rsi_original_close', session.close)
+            def observed_close():
+                original_close()
+                self._session_closure_ref = self._observe_session_close(session)
+            observed_close._rsi_original_close = original_close
+            session.close = observed_close
+            return session
         self.actor = WorkflowActor(self.workflow, self.bundle, tracked_factory,
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,

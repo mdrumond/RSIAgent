@@ -402,8 +402,15 @@ class A3Host(SourceHost):
     def activity_observed_terminal(self, name, value):
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence
         from benchmarks.a3kernels.trial import infrastructure_unavailable
-        return not (isinstance(value, FailedEvidence) and (
-            infrastructure_unavailable(value) or self.owner._retryable_failure(name, value)))
+        unavailable = isinstance(value, FailedEvidence) and (
+            infrastructure_unavailable(value) or self.owner._retryable_failure(name, value))
+        if unavailable:
+            # DomainActivity must suspend before returning an unobserved value;
+            # retain the native classification/diagnostic at that boundary.
+            self.failure_classification = 'infrastructure-unverified'
+            self.owner._retain_candidate_failure(len(self.actions), name, value,
+                self.failures, self.observations, next_action='terminate-project')
+        return not unavailable
 
     def write(self, text):
         if not text.strip():
