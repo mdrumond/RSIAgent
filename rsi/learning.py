@@ -31,10 +31,89 @@ import re
 import time
 
 from rsi.contracts import Mode
-from rsi.cycles import SnapshotUpdate
+from rsi.cycles import RejectedSkillUpdate, SnapshotUpdate
 from rsi.python_execution import atomic_json
 from rsi.roles import AdmittedEvidence, _proposal
 from rsi.skills import SkillBundle, SkillDocument
+
+
+class ProposalRejected(ValueError):
+    """Proven semantic invalidity, never a storage/provider/timing failure."""
+
+
+def _skill_metadata(bundle):
+    for doc in bundle.documents:
+        import yaml  # Existing legacy dependency; no new parser or YAML subset.
+        header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)', doc.content, re.DOTALL)
+        try:
+            metadata = yaml.safe_load(header[1]) if header else None
+        except yaml.YAMLError as exc:
+            raise ValueError('invalid skill metadata') from exc
+        if (not isinstance(metadata, dict) or metadata.get('name') != doc.name
+                or not isinstance(metadata.get('description'), str)
+                or not metadata['description'].strip()):
+            raise ValueError('invalid skill metadata')
+    return bundle
+
+
+def validate_skill_proposal(bundle, wire, admitted, removable):
+    """Pure semantic check/application; no CAS, model, logs or publication."""
+    try:
+        proposal = _proposal('skillwriter', wire, set(admitted))
+        if not proposal.evidence_ids:
+            raise ValueError('proposal requires admitted outcome support')
+        docs = {d.name: d for d in bundle.documents}
+        protected = any(admitted[ref]['kind'] in ('counterevidence', 'review')
+                        for ref in proposal.evidence_ids)
+        for edit in proposal.edits:
+            if edit.skill not in docs or not edit.content.strip():
+                raise ValueError('known skill and nonempty learned fragment required')
+            doc = docs[edit.skill]
+            learned = 'learned-guidance' in doc.sections
+            section = doc.read('learned-guidance') if learned else ''
+            full_document = edit.operation == 'replace' and edit.content.startswith('---')
+            outside = edit.operation == 'remove' and edit.content not in section
+            if full_document or outside:
+                if not protected:
+                    raise ValueError('baseline correction requires host review/counterevidence')
+                if full_document:
+                    content = edit.content
+                else:
+                    if doc.content.count(edit.content) != 1:
+                        raise ValueError('remove must identify one exact baseline fragment')
+                    content = doc.content.replace(edit.content, '', 1)
+                docs[edit.skill] = SkillDocument(edit.skill, content)
+                continue
+            if edit.operation == 'remove':
+                if not protected and not removable.get(edit.skill, False):
+                    raise ValueError('removal lacks exposure window or safety review')
+                if section.count(edit.content) != 1:
+                    raise ValueError('remove must identify one exact learned fragment')
+                replacement = section.replace(edit.content, '', 1)
+            elif edit.operation == 'append':
+                replacement = section + ('' if not section or section.endswith('\n') else '\n') + edit.content + '\n'
+            else:
+                replacement = edit.content + '\n'
+            if (section.strip() and section.strip() not in replacement and not protected
+                    and not removable.get(edit.skill, False)):
+                raise ValueError('replacement deletes guidance without removal authorisation')
+            fragment = edit.content if edit.operation == 'append' else replacement
+            pattern = r'^#{1,6}(?:[ \t]|$)|^---[ \t]*$' if edit.operation == 'append' else r'^#{1,2} |^---$'
+            if re.search(pattern, fragment, re.MULTILINE):
+                raise ValueError('learned fragment cannot change document structure')
+            marker = '## Learned guidance\n'
+            if learned:
+                # Resolve by parsed section content, independent of heading spelling.
+                heading = next(m for m in re.finditer(r'^## ([^\n]+)\n', doc.content, re.MULTILINE)
+                    if re.sub(r'[^a-z0-9]+', '-', m[1].lower()).strip('-') == 'learned-guidance')
+                content = doc.content[:heading.end()] + replacement + doc.content[heading.end() + len(section):]
+            else:
+                content = doc.content + ('' if doc.content.endswith('\n') else '\n') + marker + replacement
+            docs[edit.skill] = SkillDocument(edit.skill, content)
+        candidate = SkillBundle(tuple(docs.values()), bundle.mapping)
+        return _skill_metadata(candidate)
+    except ValueError as exc:
+        raise ProposalRejected(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -94,6 +173,8 @@ class Learning:
         if existing:
             if existing['request'] != request:
                 raise ValueError('operation identity reused with different inputs')
+            if 'rejection' in existing:
+                raise RuntimeError('rejected operation requires a fresh writer identity')
             if 'result' not in existing:
                 raise RuntimeError('unknown work: reconcile before retry')
             return existing['result']
@@ -122,18 +203,7 @@ class Learning:
 
     def _bundle(self, ref):
         bundle = SkillBundle.from_dict(self.store.read_json(ref))
-        for doc in bundle.documents:
-            import yaml  # Existing legacy dependency; no new parser or YAML subset.
-            header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)', doc.content, re.DOTALL)
-            try:
-                metadata = yaml.safe_load(header[1]) if header else None
-            except yaml.YAMLError as exc:
-                raise ValueError('invalid skill metadata') from exc
-            if (not isinstance(metadata, dict) or metadata.get('name') != doc.name
-                    or not isinstance(metadata.get('description'), str)
-                    or not metadata['description'].strip()):
-                raise ValueError('invalid skill metadata')
-        return bundle
+        return _skill_metadata(bundle)
 
     def _packet(self, row):
         packet = self.load_project(row)
@@ -266,6 +336,7 @@ class Learning:
         packet = self._packet(row)
         packet_ref = self.store.put_json(packet)
         self.state['operations'][identity]['packet'] = packet_ref
+        self.state['operations'][identity]['namespace'] = ctx.get('namespace')
         self._save()  # Freeze evidence and incumbent before invoking the provider.
         # Bounded context; never truncate identifiers, baseline or raw retained CAS.
         prompt = ('Prioritise error avoidance, detection and recovery before optimisation. '
@@ -283,6 +354,7 @@ class Learning:
             'Never delete a mapped skill. Preserve safety/recovery unless '
             'counterevidence or explicit review supports removal.\n')
         context = dict(bundle=incumbent, memory=memory_ref, packet=packet_ref,
+                       previous_skill_rejections=ctx.get('previous_skill_rejections', []),
                        skills={d.name: d.read('learned-guidance') if 'learned-guidance' in d.sections else ''
                                for d in bundle.documents}, aggregate=self.aggregate(packet))
         # Retain full aggregates in CAS; bound only model context to recent projects.
@@ -374,71 +446,83 @@ class Learning:
         self._save()
         return elapsed
 
+    def _checked_candidate(self, operation, proposal_ref):
+        # Load/verify everything before entering the pure semantic boundary.
+        bundle = self._bundle(operation['request']['incumbent'])
+        admitted = self.store.read_json(operation['admitted'])
+        wire = self.store.read_json(proposal_ref)
+        removable = {doc.name: self.removal_eligible(doc.name, 'learned-guidance', safety=True, document=doc)
+                     for doc in bundle.documents if 'learned-guidance' in doc.sections}
+        return validate_skill_proposal(bundle, wire, admitted, removable)
+
+    def reject_observed_proposal(self, operation_id, proposal_ref, *, namespace=None):
+        """Close only an observed, semantically invalid writer output.
+
+        namespace= is a trusted host binding for pre-upgrade operations that
+        lack saved namespace metadata; Cycle independently verifies that scope.
+        No candidate publication, no correctness/validation claim, no replay of
+        provider work. Cycle consumes the typed receipt once and schedules a new
+        writer operation against the SAME original task/memory/incumbent.
+        """
+        operation = self.state['operations'][operation_id]
+        if namespace is not None and operation.get('namespace') not in (None, namespace):
+            raise ValueError('rejection namespace differs from frozen operation')
+        namespace = operation.get('namespace') or namespace
+        if operation.get('proposal') != proposal_ref:
+            raise ValueError('rejection must identify exact retained proposal')
+        if 'rejection' in operation:
+            if namespace is not None and namespace != operation['rejection']['namespace']:
+                raise ValueError('rejection replay namespace mismatch')
+            return RejectedSkillUpdate(**operation['rejection'])
+        if ('result' in operation or operation['request']['kind'] != 'skill'
+                or operation.get('failure') or not isinstance(namespace, str) or not namespace
+                or operation.get('accounting_incomplete') or 'role_finished' not in operation):
+            raise RuntimeError('unsettled or completed work cannot be semantically rejected')
+        request = operation['request']
+        observed_project = self._packet(request['row'])
+        frozen_project = self.store.read_json(operation['packet'])
+        if observed_project['project_id'] != frozen_project['project_id']:
+            raise ValueError('host project identity differs from frozen writer input')
+        elapsed = operation['role_finished']['elapsed_seconds']
+        SnapshotUpdate(proposal_ref, elapsed)
+        try:
+            self._checked_candidate(operation, proposal_ref)
+        except ProposalRejected as exc:
+            reason = str(exc)
+        else:
+            raise ValueError('valid proposal cannot be rejected')
+        request = operation['request']
+        provenance = dict(operation_id=operation_id, namespace=namespace,
+            incumbent=request['incumbent'], memory_ref=request['memory'],
+            project_ref=request['row']['artifact_ref'], proposal_ref=proposal_ref,
+            actor_seconds=elapsed, packet_ref=operation['packet'],
+            observed_project=observed_project,
+            admitted_ref=operation['admitted'], role_finished=operation['role_finished'],
+            status='rejected', reason=reason)
+        rejection_ref = self.store.put_json(provenance)
+        result = RejectedSkillUpdate(operation_id=operation_id, namespace=namespace,
+            incumbent=request['incumbent'], memory_ref=request['memory'],
+            project_ref=request['row']['artifact_ref'], proposal_ref=proposal_ref,
+            rejection_ref=rejection_ref, actor_seconds=elapsed)
+        operation['namespace'] = namespace
+        operation['rejection'] = asdict(result)
+        operation['status'] = 'rejected'
+        self._save()
+        return result
+
     def reconcile_proposal(self, identity, proposal_ref, actor_seconds):
         SnapshotUpdate(proposal_ref, actor_seconds)  # validates elapsed accounting
         operation = self.state['operations'][identity]
         if 'result' in operation:
             return SnapshotUpdate(**operation['result'])
+        if 'rejection' in operation:
+            raise RuntimeError('rejected operation requires a fresh writer identity')
         request = operation['request']
         if request['kind'] != 'skill':
             raise ValueError('not a writer operation')
         incumbent = request['incumbent']
-        bundle = self._bundle(incumbent)
         packet = self.store.read_json(operation['packet'])
-        admitted = self.store.read_json(operation['admitted'])
-        proposal = _proposal('skillwriter', self.store.read_json(proposal_ref), set(admitted))
-        if not proposal.evidence_ids:
-            raise ValueError('proposal requires admitted outcome support')
-        docs = {d.name: d for d in bundle.documents}
-        protected = any(admitted[ref]['kind'] in ('counterevidence', 'review')
-                        for ref in proposal.evidence_ids)
-        for edit in proposal.edits:
-            if edit.skill not in docs or not edit.content.strip():
-                raise ValueError('known skill and nonempty learned fragment required')
-            doc = docs[edit.skill]
-            learned = 'learned-guidance' in doc.sections
-            section = doc.read('learned-guidance') if learned else ''
-            full_document = edit.operation == 'replace' and edit.content.startswith('---')
-            outside = edit.operation == 'remove' and edit.content not in section
-            if full_document or outside:
-                if not protected:
-                    raise ValueError('baseline correction requires host review/counterevidence')
-                if full_document:
-                    content = edit.content
-                else:
-                    if doc.content.count(edit.content) != 1:
-                        raise ValueError('remove must identify one exact baseline fragment')
-                    content = doc.content.replace(edit.content, '', 1)
-                docs[edit.skill] = SkillDocument(edit.skill, content)
-                continue
-            if edit.operation == 'remove':
-                if not protected and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
-                                                               document=doc):
-                    raise ValueError('removal lacks exposure window or safety review')
-                if section.count(edit.content) != 1:
-                    raise ValueError('remove must identify one exact learned fragment')
-                replacement = section.replace(edit.content, '', 1)
-            elif edit.operation == 'append':
-                replacement = section + ('' if not section or section.endswith('\n') else '\n') + edit.content + '\n'
-            else:
-                replacement = edit.content + '\n'
-            if (section.strip() and section.strip() not in replacement and not protected
-                    and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True, document=doc)):
-                raise ValueError('replacement deletes guidance without removal authorisation')
-            fragment = edit.content if edit.operation == 'append' else replacement
-            pattern = r'^#{1,6}(?:[ \t]|$)|^---[ \t]*$' if edit.operation == 'append' else r'^#{1,2} |^---$'
-            if re.search(pattern, fragment, re.MULTILINE):
-                raise ValueError('learned fragment cannot change document structure')
-            marker = '## Learned guidance\n'
-            if learned:
-                # Resolve by parsed section content, independent of heading spelling.
-                heading = next(m for m in re.finditer(r'^## ([^\n]+)\n', doc.content, re.MULTILINE)
-                    if re.sub(r'[^a-z0-9]+', '-', m[1].lower()).strip('-') == 'learned-guidance')
-                content = doc.content[:heading.end()] + replacement + doc.content[heading.end() + len(section):]
-            else:
-                content = doc.content + ('' if doc.content.endswith('\n') else '\n') + marker + replacement
-            docs[edit.skill] = SkillDocument(edit.skill, content)
-        candidate = SkillBundle(tuple(docs.values()), bundle.mapping)
+        candidate = self._checked_candidate(operation, proposal_ref)
         reference = self.store.put_json(candidate.to_dict())
         self._bundle(reference)
         origin = dict(incumbent=incumbent, proposal=proposal_ref,
