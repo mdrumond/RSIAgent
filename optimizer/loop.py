@@ -43,13 +43,18 @@ def score(baseline, result):
 
 class OptimizationLoop:
     def __init__(self, store, job_id, agent, backend, *, knowledge=None, clock=time.time,
-                 max_cases=24, memory_observer=None):
+                 max_cases=24, memory_observer=None, canonical=None, canonical_skills=None, canonical_budgets=None):
         if type(max_cases) is not int or not 1 <= max_cases <= 24:
             raise ValueError('max_cases must be between one and 24')
         self.max_cases = max_cases
         self.store, self.key, self.agent, self.backend = store, job_id, agent, backend
         self.knowledge, self.clock = knowledge, clock
         self.memory_observer = memory_observer
+        if canonical is None:
+            from rsi.domain_bindings import optimizer_adoption
+            canonical = optimizer_adoption()
+        self.canonical = canonical
+        self.canonical_skills, self.canonical_budgets = canonical_skills, canonical_budgets
         self.directory = store.root / job_id / 'execution'
         self.directory.mkdir(exist_ok=True)
         self.state = next((copy.deepcopy(e['payload']) for e in reversed(store.events(job_id))
@@ -101,13 +106,14 @@ class OptimizationLoop:
         return normalize_job_submission(submission)
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
+        from rsi.domain_execution import require_adoption
+        # Preparation and single-evaluation are explicit workload boundaries,
+        # not permission to dispatch the previous independent search loop.
         try:
-            from benchmarks.ascend.actor_control import ActorControl
-            with ActorControl(self.directory.parent).lease():
-                return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
-                                 memory_snapshot=memory_snapshot, context=context)
+            return require_adoption(self.canonical).run(self, prepare_only=prepare_only,
+                single_evaluation=single_evaluation, memory_snapshot=memory_snapshot, context=context)
         finally:
-            close = getattr(self.agent, "close", None)
+            close = getattr(self.agent, 'close', None)
             if close is not None:
                 close()
 

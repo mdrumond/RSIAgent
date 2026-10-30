@@ -12,6 +12,7 @@ import time
 
 from .jobs import atomic, canonical
 from .control import ObservationUnavailable, WorkerStopped
+from rsi.domain_timing import transfer_phase
 
 CLIENT_TIMEOUT = 120
 CANCEL_TIMEOUT = 30
@@ -36,6 +37,15 @@ def exclusive(path, *, wait=False, stopped=lambda: False):
 
 
 class CheckedTransport:
+    @property
+    def deadline(self):
+        from rsi.domain_timing import bounded_deadline
+        return bounded_deadline(self._deadline)
+
+    @deadline.setter
+    def deadline(self, value):
+        self._deadline = value
+
     def __init__(self, config, *, run=None, retain=lambda handle: None,
                  stopped=lambda: False, deadline=float('inf')):
         self.config, self.run, self.retain, self.stopped = config, run, retain, stopped
@@ -101,6 +111,7 @@ class CheckedTransport:
         state['state'] = 'cancelled'
         atomic(path, canonical(state))
 
+    @transfer_phase
     def transfer(self, action, source, destination):
         # Transfer sentinels also prevent duplicate uncertain submission.
         local = Path(source if action == 'upload' else destination)

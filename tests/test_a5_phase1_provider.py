@@ -59,18 +59,19 @@ def test_invalid_prompt_retries_identical_request_without_replaying_actions(tmp_
             raise PromptRejected("openai-secret")
         return DirectCompletion('{"submit":{}}', 2)
     provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append)
-    driver = DirectActorDriver(provider)
-    def execute(action):
-        actions.append(action.kind)
-        from benchmarks.a5kernels.trial import ActionOutcome
-        return ActionOutcome('{"host":{"event":"done"}}', True, "host-verified")
-    from benchmarks.a5kernels.trial import parse_trial_action
-    outcome = driver("write an ordinary kernel", profile=direct_profile(MODEL_IDENTITIES[0]),
-                     workspace=tmp_path / "actor", context=None,
-                     turn_parser=parse_trial_action, action_executor=execute)
+    # Provider retry/receipt semantics remain a provider contract; programming
+    # stage control is covered by canonical domain tests, not the retired loop.
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    recorder = _ProviderEvidenceRecorder(tmp_path / 'actor')
+    completion = provider.complete(direct_profile(MODEL_IDENTITIES[0]),
+        [{'role': 'user', 'content': 'write an ordinary kernel'}],
+        attempt_observer=lambda kind, payload: recorder.attempt(kind, payload, stage='action', turn=1))
+    recorder.response(completion.text, stage='action', turn=1)
+    action = parse_trial_action(completion.text)
+    actions.append(action.kind)
     assert calls[0] == calls[1]
     assert delays == [120]
-    assert actions == ["submit"] and outcome.iterations == 1 and outcome.tokens == 2
+    assert actions == ["submit"] and completion.completion_tokens == 2
     rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
     requests = [row for row in rows if row["role"] == "provider-request"]
     assert len(requests) == 2 and requests[0]["sha256"] == requests[1]["sha256"]

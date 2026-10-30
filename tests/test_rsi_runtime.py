@@ -319,3 +319,20 @@ def test_absent_redesign_restores_previous_implementation_count(tmp_path):
     assert restored.state["design"] == 1
     assert restored.state["executions"] == 0
     assert restored.begin(execution=True)
+
+
+@pytest.mark.parametrize('stage', [Stage.PREFLIGHT, Stage.TASK_CONSTRUCTION])
+def test_failed_admission_is_rejected_without_time_or_iteration_progress(tmp_path, stage):
+    flow = make(tmp_path, clock=Clock(), limits=BudgetLimits(None,None,None,None,None))
+    if stage == Stage.TASK_CONSTRUCTION:
+        finish(flow)
+    before = len(flow.state['history'])
+    finish(flow, passed=False)
+    assert flow.outcome == 'rejected' and flow.stage == stage and flow.pending is None
+    assert len(flow.state['history']) == before+1
+    assert flow.state['history'][-1]['passed'] is False
+    assert flow.state['history'][-1]['evidence']['stage'] == stage.value
+    assert flow.state['failure']['stage'] == stage.value and flow.state['failure']['reason']
+    assert flow.accounting.seconds() == 0
+    with pytest.raises(WorkflowError):
+        flow.begin()

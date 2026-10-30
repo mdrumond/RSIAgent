@@ -138,7 +138,9 @@ class Resolver:
 
 
 class FakeKnowledge:
-    def __init__(self, enabled): self.enabled, self.queries = enabled, []
+    def __init__(self, enabled):
+        self.enabled, self.queries = enabled, []
+        self.canonical_identity = dict(enabled=enabled, test_collection='CPU', manifest='a3-fixture-v1')
     def query(self, query):
         assert isinstance(query, KnowledgeQuery)
         self.queries.append(query.query)
@@ -244,49 +246,20 @@ def _run(
     return loop.run(), prompts, journal
 
 
-def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
-    actions = [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "submit", "interpretation": "host result passed", "supports": []}),
-    ]
-    result, prompts, journal = _run(tmp_path, actions)
-    assert result.status == "passed" and result.verified.passed
-    assert result.knowledge_queries == 0 and result.profile_result is None
-    assert len(journal.read()) == 1
-    assert all(_cell().cell_id in prompt and "isolated-lineage" in prompt for prompt in prompts)
-    memory = journal.read()[0]["memory"]
-    assert memory["agent_interpretations"][0]["supports"] == []
-    first, after_write = map(json.loads, prompts[:2])
-    assert first["proposal"] == DEFAULT_PROPOSALS[0].as_dict()
-    assert first["policy"] == {
-        "block_count": 1, "logical_length": 32, "padded_length": 64,
-        "profiling_treatment": "without-profiling-guidance",
-    }
-    assert first["action_contract"]["trial_state"] == "source-required"
-    assert first["action_contract"]["required_next_action"] is None
-    assert first["allowed_actions"] == {
-        "write_source": ["action", "source"],
-    }
-    assert after_write["action_contract"]["trial_state"] == "compile-required"
-    assert after_write["action_contract"]["required_next_action"] == "compile"
-    assert set(after_write["allowed_actions"]) == {"compile"}
-    assert first["action_contract"] == {
-        "profile_metric": "PipeUtilization",
-        "eligible_submit_supports": [],
-        "trial_state": "source-required",
-        "required_next_action": None,
-    }
-    assert first["current_candidate_source"] is None
-    assert after_write["current_candidate_source"] == SOURCE
-    contract = first["candidate_source_contract"]
-    assert contract == CANDIDATE_SOURCE_CONTRACT.as_dict()
-    assert contract["source_slot"] == first["source_slot"] == "candidate.cpp"
-    validate_candidate_source(contract["exported_signature"] + " {}")
-    assert all(
-        json.loads(prompt)["candidate_source_contract"] == contract
-        for prompt in prompts
-    )
+def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_path):
+    from rsi.domain_execution import CanonicalConfigurationError
+    class NoTargetDispatch(FakeCandidate):
+        def compile(self, *args, **kwargs):
+            pytest.fail('target compiler ran without mandatory canonical configuration')
+        def run(self, *args, **kwargs):
+            pytest.fail('target runner ran without mandatory canonical configuration')
+    with pytest.raises(CanonicalConfigurationError):
+        _run(tmp_path, [], candidate=NoTargetDispatch())
+    # The former KDB-disabled/unstructured actor success case is intentionally
+    # invalid under the new mandatory baseline/provider contract. The actual
+    # canonical default-path success/memory proof lives in production binding tests.
+    path = tmp_path / 'memory.jsonl'
+    assert not path.exists() or not path.read_bytes()
 
 
 def test_candidate_contract_serializes_a3_argument_semantics_and_safe_baseline():
@@ -850,33 +823,17 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
         assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
 
 
-def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path):
-    class PrepareFailure(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_calls = 0
-
-        def compile(self, source, workdir, **kw):
-            self.compile_calls += 1
-            plan = self._plan(
-                source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"),
-                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-            )
-            return FailedEvidence.create(
-                plan, stage="prepare", error_type="RuntimeError",
-                detail="VPN route unavailable",
-            )
-
-    candidate = PrepareFailure()
-    result, prompts, _ = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}',
-    ], candidate=candidate)
-
-    assert result.status == "infrastructure-unverified"
-    assert candidate.compile_calls == 1
-    assert len(prompts) == 2
+def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path, monkeypatch):
+    from test_rsi_production_domain_bindings import canonical_a3_fixture
+    result, session, trial = canonical_a3_fixture(tmp_path, monkeypatch, prepare_failure=True)
+    assert result.status == 'infrastructure-unverified'
+    assert trial.candidate.compile_calls == 1
+    assert result.verified is None and result.memory_entry_sha256 is None
+    assert not trial.memory.read()
+    assert session.contexts[-1]['stage'] == 'test'
+    assert not any(context['stage'] == 'debug' for context in session.contexts)
+    state = json.loads((trial.workdir / 'canonical' / 'workflow.json').read_text())
+    assert state['pending'] and state['executions'] == 1
 
 
 def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
@@ -1023,19 +980,19 @@ def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
 
 
 def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):
-    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
-    early_submit = json.dumps({
-        "action": "submit", "interpretation": "too early", "supports": [],
-    })
-    result, _, journal = _run(tmp_path, [
-        json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}',
-        early_submit, early_submit, early_submit, early_submit, early_submit,
-    ], cell=cell, budgets=TrialBudgets(max_seconds=8))
-    assert result.status == "budget-exhausted"
-    assert result.completion_turns == 0
-    assert "profile" in result.failures[-1]
-    assert journal.read() == ()
+    # Test the retained host gate directly. Canonical programming control has a
+    # separate real default-binding proof; no unstructured actor loop is needed.
+    owner = object.__new__(A3TrialLoop)
+    owner.cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+    candidate = FakeCandidate()
+    options = dict(request_id=owner.cell.cell_id, attempt_id='gate', length=32, project_id=DEFAULT_PROPOSALS[0].project_id)
+    compilation = candidate.compile(SOURCE, tmp_path, **options)
+    verified = candidate.run(SOURCE, tmp_path, **options)
+    assert owner._submit_gate(None, None, None, None)
+    assert owner._submit_gate(SOURCE, compilation, verified, None)
+    assert owner._submit_gate(SOURCE, compilation, verified, object()) is None
+    other = candidate.compile(SOURCE + '\n// different revision', tmp_path, **options)
+    assert owner._submit_gate(SOURCE, other, verified, object())
 
 
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):

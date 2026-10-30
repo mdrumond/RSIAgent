@@ -201,6 +201,21 @@ class JobStore:
                 self._exhaust(row)
         return self._update(job_id, 'elapsed', change)
 
+    def account_canonical_elapsed(self, job_id, project, total):
+        """Idempotent cumulative controller receipt, including failed work."""
+        if not isinstance(total, (int, float)) or not 0 <= total < float('inf'):
+            raise ValueError('canonical elapsed time must be finite and nonnegative')
+        def change(row):
+            receipts = row.setdefault('canonical_elapsed', {})
+            previous = receipts.get(project, 0)
+            if total < previous:
+                raise ValueError('canonical elapsed receipt moved backwards')
+            row['elapsed_seconds'] += total - previous
+            receipts[project] = total
+            if row['status'] == 'running':
+                self._exhaust(row)
+        return self._update(job_id, 'canonical-elapsed', change)
+
     def stop(self, job_id):
         def change(row):
             row['stop_requested'] = True

@@ -323,6 +323,10 @@ class Workflow:
             self.state["outcome"] = "accepted" if passed else "rejected"
         elif not passed:
             next_stage = stage
+            if stage in (Stage.PREFLIGHT, Stage.TASK_CONSTRUCTION):
+                self.state.update(outcome='rejected', failure=dict(stage=stage.value,
+                    operation_id=evidence.operation_id, reason='host-admission-failed',
+                    artifact_refs=list(evidence.artifact_refs)))
         if redesign:
             next_stage = Stage.DESIGN
             self.state.update(tested=None, verified=None)

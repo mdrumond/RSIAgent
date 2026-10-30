@@ -277,6 +277,12 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if hasattr(campaign, 'budget'):
                 allowance = min(allowance, campaign._remaining())
             return knowledge.actor_query(payload, context, remaining_seconds=allowance)
+        def canonical_identity():
+            # The selected reference DB includes immutable memory documents and
+            # negative records; the request separately freezes actor memory bytes.
+            from hashlib import sha256
+            return dict(database_sha256=sha256(Path(knowledge.database_path).read_bytes()).hexdigest())
+        actor_knowledge.canonical_identity = canonical_identity
         actor.query_knowledge = actor_knowledge
     actor.observe_knowledge_read = knowledge.actor_read
     actor.prepare_memory = knowledge.actor_snapshot
