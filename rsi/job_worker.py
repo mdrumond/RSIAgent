@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import signal
 import threading
+import sys
+
+from .job_service import JobStop
 
 from .configuration import _bytes, _publish
 from .jobs import _identity, _path
@@ -19,7 +22,13 @@ def run_owned(instance, job_id, lock, run_service):
     record = json.loads(path.read_text())
     stopped = threading.Event()
     stop_file = directory / f'{job_id}.stop'
-    previous_handler = signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    active = False
+    def request_stop(*_):
+        first = not stopped.is_set()
+        stopped.set()
+        if active and first:
+            raise JobStop()
+    previous_handler = signal.signal(signal.SIGTERM, request_stop)
     events_lock = threading.Lock()
 
     def should_stop():
@@ -35,16 +44,31 @@ def run_owned(instance, job_id, lock, run_service):
     try:
         record.update(state='running', process=_identity(os.getpid()))
         _publish(path, _bytes(record))
+        active = True
         result = run_service(root, record['request'], record['configuration'],
                              should_stop=should_stop, emit=emit)
         record.update(state='stopped' if should_stop() else 'completed', result=result)
+    except JobStop:
+        record.update(state='stopped')
     except BaseException as exc:
         # Service owns cleanup of canonical actor and children before raising.
         record.update(state='failed', error=f'{type(exc).__name__}: {exc}')
         raise
     finally:
+        active = False
         try:
             _publish(path, _bytes(record))
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
             os.close(lock)
+
+
+def main():
+    from .job_service import run_job
+    if len(sys.argv) != 4:
+        raise ValueError('owned worker requires instance, job ID and inherited lock')
+    run_owned(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), run_job)
+
+
+if __name__ == '__main__':
+    main()

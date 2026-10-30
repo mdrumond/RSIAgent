@@ -48,5 +48,8 @@ def execute(args):
             return jobs.stop(args.instance, args.job)
         request = dict(previous['request'], action=args.action, previous_job=args.job)
         if args.action == 'revisit':
+            if args.cycle == request['cycle_id']:
+                raise ValueError('revisit requires a new cycle identity')
+            request['previous_cycle'] = request['cycle_id']
             request['cycle_id'] = args.cycle
     return jobs.start(args.instance, request)

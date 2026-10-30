@@ -27,4 +27,4 @@ def dispatch(instance, argv):
     bootstrap = ('import sys; sys.path.insert(0, sys.argv.pop(1)); '
                  'from rsi.cli import main; raise SystemExit(main())')
     return subprocess.run([sys.executable, '-I', '-c', bootstrap,
-                           str(machinery), *argv], cwd=machinery).returncode
+                           str(machinery), *argv], cwd=Path.cwd()).returncode

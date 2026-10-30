@@ -163,7 +163,7 @@ def test_instance_cli_uses_pinned_copy_outside_global_checkout(instance, monkeyp
     argv, options = called[0]
     assert argv[:3] == [sys.executable, '-I', '-c']
     assert str(instance / 'machinery') in argv
-    assert options['cwd'] == instance / 'machinery'
+    assert options['cwd'] == Path.cwd()
     source.write_text('def main(): return 0\n')
     with pytest.raises(ValueError, match='integrity'):
         dispatch(instance, ['job', 'list'])
@@ -175,3 +175,119 @@ def test_partial_event_write_is_not_presented_as_complete_evidence(instance):
     (instance / f'runs/jobs/{job_id}.events.jsonl').write_bytes(
         b'{"operation":"complete"}\n{"operation":"partial')
     assert jobs.evidence(instance, job_id)['events'] == [{'operation': 'complete'}]
+
+
+@pytest.fixture
+def service_surface(monkeypatch):
+    """Exercise CLI adaptation decisions without launching a second agent loop."""
+    from types import SimpleNamespace
+    from rsi import services
+    calls = []
+    scheduler = SimpleNamespace(state={'phase': 'original', 'stopped': False, 'pending': None})
+    scheduler.extension_events = lambda: []
+    scheduler.resume = lambda: calls.append('resume')
+    cycle = SimpleNamespace(scheduler=scheduler,
+        controller=SimpleNamespace(state={'pending': None}),
+        spec=SimpleNamespace(mode=SimpleNamespace(value='inference'), configuration_ref='frozen-ref'))
+    cycle.close = lambda: calls.append('close')
+    def stop():
+        calls.append('canonical-stop')
+        scheduler.state['stopped'] = True
+    cycle.request_stop = stop
+    cycle.reconcile = lambda: calls.append('observe-only')
+    def step():
+        calls.append('step')
+        scheduler.state['phase'] = 'complete'
+        return {'outcome': 'accepted'}
+    cycle.step = step
+    class Services:
+        def __init__(self, root):
+            calls.append(('instance', root))
+        def create_cycle(self, identity, mode, **kwargs):
+            calls.append(('create', identity, mode, kwargs))
+            return cycle
+        def open_cycle(self, identity):
+            calls.append(('open', identity))
+            return cycle
+        def status(self, identity):
+            return json.loads(json.dumps({'cycle.json': scheduler.state}))
+    monkeypatch.setattr(services, 'InstanceServices', Services)
+    return calls, cycle
+
+
+def test_job_binding_admits_exact_frozen_inputs_and_real_recovery_override(instance, service_surface):
+    from rsi.job_service import run_job
+    calls, cycle = service_surface
+    snapshot = {'revision': 'original', 'payload': {'prompts': {'actor': 'frozen'}}}
+    request = {'action': 'revisit', 'mode': 'inference', 'cycle_id': 'new',
+               'previous_cycle': 'old', 'recover': False, 'projects': [{'project_id': 'a'}]}
+    events = []
+    result = run_job(instance, request, snapshot, should_stop=lambda: False, emit=events.append)
+    assert result['state'] == 'complete'
+    assert calls[1] == ('create', 'new', 'inference', {
+        'projects': request['projects'], 'configuration': snapshot,
+        'recover': False, 'lineage': 'old'})
+    assert calls.count('step') == 1 and calls[-1] == 'close'
+    assert events[0]['configuration_ref'] == 'frozen-ref'
+
+
+def test_resume_unknown_pending_observes_without_dispatch(instance, service_surface):
+    from rsi.job_service import run_job
+    from rsi.runtime import WorkflowError
+    calls, cycle = service_surface
+    cycle.scheduler.state['pending'] = {'id': 'retained'}
+    def observe():
+        calls.append('observe-only')
+        raise WorkflowError('existing operation still unknown')
+    cycle.reconcile = observe
+    result = run_job(instance, {'action': 'resume', 'mode': 'inference', 'cycle_id': 'same'},
+        {}, should_stop=lambda: False, emit=lambda _: None)
+    assert result['state'] == 'suspended'
+    assert 'step' not in calls and 'resume' not in calls
+    assert calls[-2:] == ['observe-only', 'close']
+
+
+def test_stop_unwinds_active_service_before_persisting_canonical_stop(instance, service_surface):
+    from rsi.job_service import run_job
+    calls, cycle = service_surface
+    def interrupted_step():
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        finally:
+            calls.append('child-cleanup-and-elapsed-charge')
+    cycle.step = interrupted_step
+    job_id, _ = record(instance)
+    path = jobs._path(instance / 'runs/jobs', job_id)
+    value = json.loads(path.read_text())
+    value['request'] = {'action': 'start', 'mode': 'inference', 'cycle_id': 'same'}
+    _publish(path, _bytes(value))
+    lock = os.open(instance / 'runs/jobs', os.O_RDONLY | os.O_DIRECTORY)
+    run_owned(instance, job_id, lock, run_job)
+    result = jobs.status(instance, job_id)
+    assert result['state'] == 'stopped'
+    assert calls[-3:] == ['child-cleanup-and-elapsed-charge', 'canonical-stop', 'close']
+    assert result['result']['evidence']['cycle.json']['stopped'] is True
+
+
+def test_blocked_controller_returns_without_busy_loop(instance, service_surface):
+    from rsi.job_service import run_job
+    calls, cycle = service_surface
+    cycle.step = lambda: calls.append('step')
+    result = run_job(instance, {'action': 'start', 'mode': 'inference', 'cycle_id': 'same'},
+        {}, should_stop=lambda: False, emit=lambda _: None)
+    assert result['state'] == 'blocked'
+    assert calls.count('step') == 1
+
+
+def test_competing_dispatch_is_refused_by_instance_lock(instance, monkeypatch):
+    import fcntl
+    _, directory = jobs._directory(instance)
+    lock = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(jobs, '_machinery', lambda root: root / 'machinery')
+    try:
+        with pytest.raises(ValueError, match='already has an owned running job'):
+            jobs.start(instance, {'action': 'start', 'mode': 'phase1', 'cycle_id': 'a'})
+        assert list(directory.glob('*.json')) == []
+    finally:
+        os.close(lock)
