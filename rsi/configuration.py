@@ -32,6 +32,16 @@ def _snapshot(payload):
             'payload': json.loads(data)}
 
 
+
+def checked_snapshot(snapshot):
+    """Authenticate a revision/payload pair and return detached validated data."""
+    validate_configuration(snapshot['payload'])
+    if _snapshot(snapshot['payload']) != snapshot:
+        raise ValueError('configuration revision integrity failure')
+    # Reuse the canonical snapshot serializer for a detached JSON payload.
+    return _snapshot(snapshot['payload'])
+
+
 def _object(value, name):
     if not isinstance(value, dict):
         raise ValueError(f'{name} must be an object')

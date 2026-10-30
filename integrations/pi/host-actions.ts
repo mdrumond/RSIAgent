@@ -23,6 +23,7 @@ export default function (pi: ExtensionAPI) {
       name, label: name,
       ...(ordered ? { executionMode: "sequential" as const } : {}),
       description: name === "read_context" ? "Page an admitted host context record using its digest and next_offset."
+        : ordered && name === "read_skill" ? "Select a skill read; its completed text and receipt appear in the next host snapshot. Use current_skill_content for already-read text or read_context for paged text, instead of repeating completed reads."
         : name === "edit_source" ? "Queue an exact, unambiguous source edit against the current SHA256."
         : `Queue the host action ${name}. This receipt does not execute or validate anything.`,
       parameters: parameters as any,

@@ -40,6 +40,7 @@ class SkillEvaluation:
     def create(cls, path, *, checkpoints, training, artifacts, memory_ref, kdb_ref,
                model_config, incumbent, candidate, joint_limits, remaining_parent,
                runner_factory, case_count=5, repetitions=2, steering=None, clock=time.time):
+        created = clock()  # Include input verification and all pair staging in wall time.
         checkpoints, training = tuple(checkpoints), tuple(training)
         if any(type(n) is not int or n <= 0 for n in (case_count, repetitions)):
             raise ValueError('positive case count and repetitions required')
@@ -74,7 +75,7 @@ class SkillEvaluation:
         BudgetLimits.from_dict(limits.to_dict())
         plan = dict(incumbent=incumbent, candidate=candidate, training=list(training), cases=identities,
             case_count=case_count, repetitions=repetitions, steering=steering,
-            parent=copy.deepcopy(remaining_parent), created=clock(), pairs=[])
+            parent=copy.deepcopy(remaining_parent), created=created, pairs=[])
         # Persist all frozen paired inputs BEFORE the first actor dispatch.
         for i, checkpoint in enumerate(checkpoints):
             for repetition in range(repetitions):
@@ -83,7 +84,7 @@ class SkillEvaluation:
                     memory_ref=memory_ref, kdb_ref=kdb_ref, model_config=model_config,
                     incumbent=incumbent, candidate=candidate, joint_limits=limits,
                     remaining_parent={k: remaining_parent.get(k) for k in ('actor_seconds', 'wall_seconds')},
-                    runner_factory=runner_factory)
+                    runner_factory=runner_factory, clock=clock)
                 plan['pairs'].append(dict(path=str(pair_path.resolve()), frozen=pair.state['frozen'],
                                           case=i, repetition=repetition))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,21 +98,16 @@ class SkillEvaluation:
 
     def pair(self, index):
         row = self.plan['pairs'][index]
-        def factory(request, *, reopen):
-            def check_wall():
-                wall = self.plan['parent'].get('wall_seconds')
-                if not reopen and wall is not None:
-                    elapsed = self.clock() - self.plan['created']
-                    reserve = request.spec.budgets.wall_seconds
-                    if elapsed < 0 or not math.isfinite(elapsed) or elapsed + reserve > wall:
-                        raise WorkflowError('insufficient parent wall allocation for frozen arm')
-            check_wall()
-            runner = self.factory(request, reopen=reopen)
-            check_wall()  # Includes factory/setup, before PairedRecovery calls run().
-            return runner
-        pair = PairedRecovery(row['path'], artifacts=self.store, runner_factory=factory)
+        pair = PairedRecovery(row['path'], artifacts=self.store,
+                              runner_factory=self.factory, clock=self.clock)
         if pair.state['frozen'] != row['frozen']:
             raise WorkflowError('retained paired inputs changed')
+        wall = self.plan['parent'].get('wall_seconds')
+        if wall is not None:
+            # The same original absolute bound reaches the current arm's setup,
+            # provider and commands. Pair owns persistence and only tightens;
+            # resume/observation never grants a fresh relative allowance.
+            pair.bind_parent_wall_deadline(self.plan['created'] + wall)
         return pair
 
     def step(self):
@@ -160,8 +156,19 @@ class SkillEvaluation:
                                recovered, row['performance'] == 'met')
                 if arm == 'candidate':
                     eligible &= accepted and all(scores[arm][:3]) and row['performance'] not in ('not_measured', 'shortfall')
-            comparisons.append((scores['candidate'] > scores['incumbent']) -
-                               (scores['candidate'] < scores['incumbent']))
+            comparison = ((scores['candidate'] > scores['incumbent']) -
+                          (scores['candidate'] < scores['incumbent']))
+            if pair['decision'] == 'inconclusive':
+                # A closed provider/setup failure is not evidence against skills.
+                # A genuine both-pass tie may coexist with another beneficial
+                # case, but an unobserved comparator must block round promotion.
+                comparison = 0
+                eligible &= all(row['outcome'] == 'accepted' and all(scores[arm][:3])
+                    and row['performance'] not in ('not_measured', 'shortfall')
+                    for arm, row in pair['arms'].items())
+            elif pair['decision'] == 'regression':
+                comparison = -1
+            comparisons.append(comparison)
         decision = ('regression' if any(c < 0 for c in comparisons) else
                     'benefit' if eligible and any(c > 0 for c in comparisons) else 'inconclusive')
         evidence = dict(plan=self.state['plan'], pairs=[p['evidence_ref'] for p in pairs],
