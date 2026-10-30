@@ -27,9 +27,8 @@ class ControllerSession(PiCodingSession):
 
     def _configure_controller(self):
         self.extension_file = ROOT / 'integrations/pi/rsi-controller.ts'
-        self.settings_override = {'compaction': dict(enabled=True, reserveTokens=4096, keepRecentTokens=1024)}
-        self.context_window = 8192
-        self.gateway.spec['max_tokens'] = min(self.gateway.spec['max_tokens'],2048)
+        self.settings_override = {'compaction': dict(enabled=True, reserveTokens=8192, keepRecentTokens=1024)}
+        self.context_window = 16384
         self.requests = queue.Queue()
         self.thinking = None
         self.control = {}
