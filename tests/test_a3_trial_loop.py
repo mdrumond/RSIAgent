@@ -183,67 +183,28 @@ class FakeClock:
     def advance(self, seconds): self.now += seconds
 
 
-def _run(
-    tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
-    candidate=None, budgets=None, completion_tokens=1,
-    execution_profile="gz-a3", evidence=None, model_default_budgets=False,
-    clock=None, actor_seconds=1, backend_seconds=.25,
-):
-    clock = clock or FakeClock()
+def _run(tmp_path, *, cell=None, knowledge=None, candidate=None):
+    """Exercise admission rejection without a provider or baseline configuration."""
     selected = cell or _cell()
-    profile = load_a3_model_profile(selected.backend_model)
-    resolver = Resolver()
-    queue = list(actions)
-    prompts = []
-    def actor(actual_profile, context):
-        assert actual_profile == profile
-        prompts.append(context)
-        clock.advance(actor_seconds)
-        action = queue.pop(0)
-        if isinstance(action, BaseException):
-            raise action
-        if callable(action):
-            action = action(context)
-        if isinstance(action, A3Completion):
-            return action
-        return A3Completion(
-            action, completion_tokens,
-            {"profile_sha256": profile.fingerprint},
-        )
+
+    def actor(*_args, **_kwargs):
+        pytest.fail("admission rejection must precede provider dispatch")
+
     journal = Phase1LearningJournal(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
-        evidence_resolver=resolver,
+        evidence_resolver=Resolver(),
         trial_protocol_sha256=trial_protocol_sha256(),
     )
-    selected_candidate = candidate or FakeCandidate(resolver)
-    selected_profiler = profiler or FakeProfiler(resolver)
-    if hasattr(selected_candidate, "resolver"):
-        selected_candidate.resolver = resolver
-    if hasattr(selected_profiler, "resolver"):
-        selected_profiler.resolver = resolver
-    def timed(operation):
-        def invoke(*args, **kwargs):
-            clock.advance(backend_seconds)
-            return operation(*args, **kwargs)
-        return invoke
-    for name in ('compile', 'run'):
-        setattr(selected_candidate, name, timed(getattr(selected_candidate, name)))
-    selected_profiler.profile = timed(selected_profiler.profile)
-    budget_options = (
-        {} if model_default_budgets
-        else {"budgets": budgets or TrialBudgets(10, 2000)}
-    )
     loop = A3TrialLoop(
-        cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
-        candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
-        profiler=selected_profiler,
-        evidence=evidence or EvidenceLedger(tmp_path / "evidence.jsonl"),
+        cell=selected, proposal=DEFAULT_PROPOSALS[0],
+        profile=load_a3_model_profile(selected.backend_model), actor=actor,
+        candidate=candidate or FakeCandidate(),
+        knowledge=knowledge or FakeKnowledge(False), profiler=FakeProfiler(),
+        evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work",
-        execution_profile=execution_profile, clock=clock,
-        **budget_options,
     )
-    return loop.run(), prompts, journal
+    return loop.run()
 
 
 def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_path):
@@ -254,7 +215,7 @@ def test_missing_canonical_provider_or_baseline_rejected_before_target_work(tmp_
         def run(self, *args, **kwargs):
             pytest.fail('target runner ran without mandatory canonical configuration')
     with pytest.raises(CanonicalConfigurationError):
-        _run(tmp_path, [], candidate=NoTargetDispatch())
+        _run(tmp_path, candidate=NoTargetDispatch())
     # The former KDB-disabled/unstructured actor success case is intentionally
     # invalid under the new mandatory baseline/provider contract. The actual
     # canonical default-path success/memory proof lives in production binding tests.
@@ -1188,7 +1149,7 @@ def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_p
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
     with pytest.raises(ValueError, match="Knowledge Agent"):
-        _run(tmp_path, [], cell=cell, knowledge=FakeKnowledge(False))
+        _run(tmp_path, cell=cell, knowledge=FakeKnowledge(False))
 
 
 def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
