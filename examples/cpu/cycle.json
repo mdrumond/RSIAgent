@@ -1,0 +1,13 @@
+{
+  "cycle_id": "cpu-numeric-smoke",
+  "mode": "phase1",
+  "baseline_kdb": "baseline:empty",
+  "baseline_skills": "baseline:templates",
+  "projects": [{
+    "project_id": "stable-sum",
+    "goal": "Sum floating-point inputs accurately despite cancellation",
+    "starting_folder": "examples/cpu",
+    "command": ["python", "verify.py"],
+    "correctness_ref": "examples/cpu/verify.py"
+  }]
+}
