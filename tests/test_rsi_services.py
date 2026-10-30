@@ -501,3 +501,50 @@ def test_setup_telemetry_is_retained_without_charging_actor_setup(instance):
             assert cycle.store.read_json(row['reference'])['elapsed_seconds'] == row['elapsed_seconds']
     finally:
         cycle.close()
+
+
+def test_explicit_project_continue_resumes_only_after_authoritative_pending_reconciliation(instance, monkeypatch):
+    from rsi.project_runner import ProjectRunner
+    from rsi.runtime import WorkflowError
+    cycle = instance.create_cycle('continue', 'phase1')
+    def stop_before_dispatch(runner):
+        try:
+            runner.actor.step(runner.context())  # Real host preflight.
+            runner.actor.step(runner.context())  # Real skill-read/model task construction.
+            runner.workflow.begin()  # Design reservation; NO provider or host dispatch.
+            runner.workflow.stop()
+            raise KeyboardInterrupt('stopped at known undispatched boundary')
+        finally:
+            runner.actor.close()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ProjectRunner, 'run', stop_before_dispatch)
+            with pytest.raises(KeyboardInterrupt):
+                cycle.step()
+        operation = cycle.scheduler.state['pending']['id']
+        runner = cycle.open_project(operation)
+        pending = runner.workflow.pending['id']
+        assert runner.workflow.pending['handle'] is None and runner.workflow.state['stopped']
+        created = runner.workflow.state['created']
+        elapsed = runner.workflow.accounting.seconds()
+        allocation = runner.workflow.limits.to_dict()
+        calls = Decisions.calls
+        with pytest.raises(WorkflowError, match='no stage receipt'):
+            cycle.run_project(operation)
+        assert Decisions.calls == calls
+        assert cycle.open_project(operation).workflow.state['stopped']
+        # Trusted host knows this exact reservation was never dispatched above.
+        runner.workflow.reconcile(pending, not_dispatched=True)
+        assert runner.workflow.state['stopped'] and not runner.workflow.pending
+        result = cycle.run_project(operation)
+        assert result.outcome == 'accepted'
+        resumed = cycle.open_project(operation)
+        assert resumed.workflow.state['created'] == created
+        assert resumed.workflow.limits.to_dict() == allocation
+        assert resumed.workflow.accounting.seconds() >= elapsed
+        assert not resumed.workflow.state['stopped']
+        assert any(h.get('not_dispatched') for h in resumed.workflow.state['history'])
+        cycle.scheduler.reconcile(operation, result)
+        assert cycle.scheduler.state['originals'][0]['outcome'] == 'accepted'
+    finally:
+        cycle.close()
