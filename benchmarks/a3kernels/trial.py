@@ -261,7 +261,12 @@ class A3TrialLoop:
 
     def run(self) -> TrialResult:
         from rsi.domain_execution import require_adoption
-        return require_adoption(self.canonical).run(self)
+        try:
+            return require_adoption(self.canonical).run(self)
+        finally:
+            close = getattr(getattr(self, 'actor', None), 'close', None)
+            if close is not None:
+                close()
 
     def _run(self) -> TrialResult:
         source = None

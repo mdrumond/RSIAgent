@@ -72,6 +72,7 @@ class DomainActivity:
         try:
             value = callback(seconds)
         except BaseException:
+            flow.accounting.unresolved.add(token)
             # An exception does not prove a remote operation stopped. Keep the
             # interval unresolved until this host observes authoritative closure.
             self.runner.append(dict(type='domain-interrupted', operation_id=self.operation,
