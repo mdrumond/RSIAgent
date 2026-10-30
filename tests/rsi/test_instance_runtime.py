@@ -208,13 +208,20 @@ def test_owned_dashboard_processes_get_distinct_ports_and_stop(tmp_path):
     mapping.write_text('{}')
     first = tmp_path / 'first'
     create_instance(first, baseline_kdb=kdb, baseline_skills=skills, skill_map=mapping)
-    # Use this test's existing Python dependencies, without installing or networking.
-    # The owned executable is explicit test support, not a successful setup claim.
-    interpreter = first / 'runtime/python/bin/python'
-    interpreter.parent.mkdir(parents=True)
-    import shlex
-    interpreter.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
-    interpreter.chmod(0o755)
+    # Explicit test-only dependency reuse; installation isolation has its own test.
+    # A real owned venv keeps -I startup semantics, with preexisting test packages
+    # made available through its own .pth file (no package mutation or network).
+    import subprocess
+    environment = first / 'runtime/python'
+    subprocess.run([sys.executable, '-I', '-m', 'venv', '--without-pip', str(environment)],
+                   check=True, timeout=60)
+    interpreter = environment / 'bin/python'
+    purelib = Path(subprocess.check_output(
+        [str(interpreter), '-I', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+        text=True, timeout=10).strip())
+    purelib.mkdir(parents=True, exist_ok=True)
+    paths = [p for p in sys.path if p.endswith(('site-packages', 'dist-packages'))]
+    (purelib / 'test-dependencies.pth').write_text('\n'.join(paths) + '\n')
     _, _, digest = instance_setup.machinery(first)
     (first / 'runtime/setup.json').write_text(json.dumps(
         {'state': 'ready', 'machinery_hash': digest, 'node': shutil.which('node') or '/usr/bin/node'}))
@@ -240,5 +247,5 @@ def test_owned_dashboard_processes_get_distinct_ports_and_stop(tmp_path):
         for record in records:
             try:
                 os.waitpid(record['process']['pid'], 0)
-            except (ChildProcessError, KeyError):
+            except (ChildProcessError, KeyError, TypeError):
                 pass

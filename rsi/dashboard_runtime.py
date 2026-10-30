@@ -128,8 +128,6 @@ def stop(instance):
 def serve(instance, launch_id, lock_descriptor):
     """Owned child entrypoint. Bind once; publish the actual kernel-selected port."""
     from .jobs import _identity
-    from dashboard.app import create_app
-    from werkzeug.serving import make_server
     root, _, _, directory = _paths(instance)
     path = directory / 'process.json'
     record = json.loads(path.read_text())
@@ -143,6 +141,8 @@ def serve(instance, launch_id, lock_descriptor):
 
     previous_handler = signal.signal(signal.SIGTERM, interrupted)
     try:
+        from dashboard.app import create_app
+        from werkzeug.serving import make_server
         config = directory / 'config.json'
         _publish(config, _bytes({'campaigns': [], 'rsi_instance': str(root),
                                  'controls': {'enabled': True}}))
