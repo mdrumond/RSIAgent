@@ -28,6 +28,10 @@ class QueryUnavailable(WorkflowError):
     """Suspend strategy work; unavailability is not a retrieval miss."""
 
 
+class StrategyRejected(WorkflowError):
+    """A model selection was rejected before any selection receipt was written."""
+
+
 class StrategyEvidence:
     """Single-writer evidence service; ``snapshot`` returns Workflow.state.
 
@@ -167,8 +171,8 @@ class StrategyEvidence:
         query = self._load('retrieval', query_ref, context)
         self._load('retrospective', retrospective_ref, context)
         if not isinstance(proposal, str) or not proposal.strip() or not skill_refs:
-            raise WorkflowError('proposal and skill reads required')
-        self._require_skill_coverage(skill_refs, context)
+            raise StrategyRejected('proposal and skill reads required')
+        self._require_skill_coverage(skill_refs, context, rejection=StrategyRejected)
         rows = query['response']
         expected = {(group, i) for group in ('results', 'negative_records')
                     for i in range(len(rows[group]))}
@@ -177,14 +181,14 @@ class StrategyEvidence:
             key = (decision['group'], decision['index'])
             if (key not in expected or key in seen or decision['action'] not in ('used', 'rejected')
                     or not isinstance(decision['reason'], str) or not decision['reason'].strip()):
-                raise WorkflowError('each retrieved record needs a unique reasoned decision')
+                raise StrategyRejected('each retrieved record needs a unique reasoned decision')
             if (key[0] == 'negative_records' and decision['action'] == 'used'
                     and (not isinstance(decision.get('redirection'), str)
                          or not decision['redirection'].strip())):
-                raise WorkflowError('negative reuse requires changed applicability/redirection')
+                raise StrategyRejected('negative reuse requires changed applicability/redirection')
             seen.add(key)
         if seen != expected:
-            raise WorkflowError('retrieved positive and negative records must be considered')
+            raise StrategyRejected('retrieved positive and negative records must be considered')
         return self._persist('selection', dict(proposal=proposal, query_ref=query_ref,
                              retrospective_ref=retrospective_ref, skill_refs=list(skill_refs),
                              decisions=decisions), context)
@@ -195,10 +199,10 @@ class StrategyEvidence:
             raise WorkflowError('exposure or citation is not a skill read')
         return event
 
-    def _require_skill_coverage(self, references, context):
+    def _require_skill_coverage(self, references, context, *, rejection=WorkflowError):
         reads = {self._skill(ref, context)['skill'] for ref in references}
         if not set(self.bundle.skills_for(Stage(context['stage']))) <= reads:
-            raise WorkflowError('all mapped stage skills must be read')
+            raise rejection('all mapped stage skills must be read')
 
     def _current_reads(self, context):
         return [ref for ref, kind in self.receipts.items()

@@ -21,6 +21,7 @@ from coding.pi.session import ActionError, PiCodingSession
 from rsi.contracts import Stage, StepEvidence
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillUsage
+from rsi.strategy import StrategyRejected
 
 
 SCHEMAS = {
@@ -511,8 +512,18 @@ class WorkflowActor:
                         record('actor-invalid-action', observation)
                         continue
                     seconds = self._available()
-                    observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
-                        stage, args, operation, seconds))
+                    try:
+                        observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
+                            stage, args, operation, seconds))
+                    except StrategyRejected as error:
+                        if not self.recover_invalid_actions:
+                            raise
+                        self._available()
+                        observation = dict(event='invalid-action', action=name,
+                            error=str(error)[:500], accepted=False, executed=False,
+                            **inventory)
+                        record('actor-invalid-action', observation)
+                        continue
                     observation = (dict(observation, action=name, executed=True) if isinstance(observation, dict)
                                    else dict(result=observation, action=name, executed=True))
                     material = {'name': name, 'result': observation}

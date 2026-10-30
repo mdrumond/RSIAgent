@@ -110,6 +110,7 @@ class ControllerSession(PiCodingSession):
             # State, not history: results stay in Pi's native tool conversation.
             return dict(done=False, allowed=sorted(self.allowed), stage=payload['stage'],
                 operation_id=payload['operation_id'], skill_receipts=payload['skill_receipts'],
+                evidence_receipts=payload['evidence_receipts'],
                 unread_skills=payload['unread_skills'], read_skill_names=payload['read_skill_names'],
                 source=resource(payload['source']), remaining_seconds=remaining())
         def resource(value):
