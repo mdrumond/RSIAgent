@@ -14,6 +14,8 @@ from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillBundle, SkillDocument
 from test_rsi_project_runner import Session, make
+from test_rsi_learning import env
+from rsi.learning import Validation
 
 
 def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, wrap=None):
@@ -190,15 +192,18 @@ class LearningStub:
 
 
 @pytest.mark.parametrize('decision', ['benefit', 'regression', 'inconclusive'])
-def test_controller_drains_before_next_original_and_only_promotes_validated(tmp_path, decision):
+def test_controller_drains_before_next_original_and_only_promotes_validated(tmp_path, decision, env):
+    store, _, incumbent, _, baseline, _, make_learning, project = env
+    learner = make_learning(validate=lambda *a: Validation(True, True, a[2][0]))
+    row, context = project()
+    candidate = learner.skill_update(incumbent, baseline, row, context).reference
     calls = []
     spec = CycleSpec('phase2', Mode.PHASE2, tuple(ProjectSpec(str(i), 'same goal', ('python',))
-                     for i in range(2)), 'memory', 'incumbent')
+                     for i in range(2)), baseline, incumbent)
     scheduler = CycleScheduler(tmp_path / 'cycle', spec,
         lambda project, memory, skills, ctx: (calls.append((project.goal, skills)) or HostTaskResult('failed', 'r', 1)),
-        lambda *a: SnapshotUpdate('memory+'), skill_update=lambda *a: SnapshotUpdate('candidate'))
-    learning = LearningStub('incumbent')
-    store = ContentAddressedArtifacts(tmp_path / 'cas')
+        lambda *a: SnapshotUpdate('memory+'), skill_update=lambda *a: SnapshotUpdate(candidate))
+    learning = learner
     class Pair:
         def result(self):
             return dict(decision=decision, actor_seconds=2., evidence_ref=store.put_json({'raw': 'metrics'}))
@@ -207,12 +212,13 @@ def test_controller_drains_before_next_original_and_only_promotes_validated(tmp_
     try:
         for _ in range(3):
             controller.step()
-        assert calls == [('same goal', 'incumbent')]
+        assert calls == [('same goal', incumbent)]
         controller.step()  # Must drain pair before original #2.
-        assert calls == [('same goal', 'incumbent')]
+        assert calls == [('same goal', incumbent)]
         controller.step()
-        assert calls[-1][1] == ('candidate' if decision == 'benefit' else 'incumbent')
-        assert len(learning.calls) == (1 if decision == 'benefit' else 0)
+        assert calls[-1][1] == (candidate if decision == 'benefit' else incumbent)
+        validations = [op for op in learner.state['operations'].values() if op['request']['kind'] == 'validation']
+        assert len(validations) == (1 if decision == 'benefit' else 0)
         assert scheduler.state['spent'] == 4.
         assert len(scheduler.state['extension_receipts']) == 1
     finally:
@@ -236,3 +242,27 @@ def test_disabled_recovery_leaves_candidate_pending_without_pair(tmp_path):
         assert scheduler.state['candidates'][0]['reference'] == 'candidate'
     finally:
         scheduler.close()
+
+
+def test_completed_arm_lost_return_is_observed_without_reexecution(tmp_path):
+    def disconnected(request, reopen, kwargs):
+        if reopen:
+            return ProjectRunner(request.root, **kwargs)
+        runner = ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
+        execute = runner.run
+        def lost_return():
+            execute()
+            raise ConnectionError('lost completed return')
+        runner.run = lost_return
+        return runner
+    pair, _, store, calls, db = setup_pair(tmp_path, repairs=(True, True), wrap=disconnected)
+    try:
+        with pytest.raises(ConnectionError):
+            pair.step()
+        reopened = PairedRecovery(pair.path, artifacts=store, runner_factory=pair.factory)
+        receipt = reopened.reconcile('incumbent')
+        assert receipt['outcome'] == 'accepted'
+        assert reopened.reconcile('incumbent') == receipt
+        assert [reopen for _, reopen, _ in calls] == [False, True]
+    finally:
+        db.close()
