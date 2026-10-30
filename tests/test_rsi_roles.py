@@ -205,6 +205,9 @@ def test_isolated_validates_real_process_receipts_and_controls_environment(monke
     assert result.findings == ()
     env = captured[0][1]
     assert env['DEEPSEEK_API_KEY'] == 'test-only-secret'
+    assert env['PYTHONNOUSERSITE'] == '1'
+    from pathlib import Path
+    assert not Path(env['PYTHONPATH']).exists()
     assert 'OPENAI_API_KEY' not in env
     assert captured[0][0][-2:] == ['-m', 'rsi.roles']
     assert [p['elapsed_seconds'] for e, p in events if e == 'role_finished'] == [0.02]
@@ -232,6 +235,8 @@ def test_isolated_enforces_timeout_without_retry_and_marks_missing_accounting(mo
         adapter.review('review', [], deadline=time.monotonic() + 5)
     assert len(captured) == 1
     assert events[-1][0] == 'accounting_incomplete'
+    from pathlib import Path
+    assert not Path(captured[0][1]['PYTHONPATH']).exists()
 
 
 def test_isolated_never_publishes_secret_output(monkeypatch):
@@ -241,3 +246,61 @@ def test_isolated_never_publishes_secret_output(monkeypatch):
     with pytest.raises(ValueError):
         adapter.review('review', [], deadline=time.monotonic() + 5)
     assert 'test-only-secret' not in json.dumps(events)
+
+
+def test_isolated_installed_wheel_excludes_host_dependencies(tmp_path):
+    """Install a real wheel outside checkout; child keeps its own OpenAI SDK."""
+    import os
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[1]
+    wheels, host = tmp_path / 'wheels', tmp_path / 'host-site'
+    wheels.mkdir()
+    subprocess.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps',
+                    '--no-build-isolation', '--wheel-dir', str(wheels), str(source)],
+                   check=True, capture_output=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps',
+                    '--target', str(host), str(next(wheels.glob('rsi-*.whl')))],
+                   check=True, capture_output=True)
+    sentinel = host / 'openai'
+    sentinel.mkdir()
+    (sentinel / '__init__.py').write_text("raise RuntimeError('host SDK leaked into worker')\n")
+    probe = '''
+import hashlib, json, pathlib, sys, time
+import openai, rsi.roles
+req = json.loads(sys.stdin.readline())
+assert pathlib.Path.cwd() != pathlib.Path(HOST)
+assert pathlib.Path(rsi.roles.__file__).read_bytes() == pathlib.Path(ORIGINAL).read_bytes()
+assert openai.__version__.startswith('2.')
+def emit(event, payload):
+    print(json.dumps(dict(event=event, payload=payload)), flush=True)
+emit('role_started', {'role': 'review', 'provider_identity': IDENTITY})
+emit('role_finished', {'role': 'review', 'success': True, 'elapsed_seconds': 0.0})
+emit('result', {'rationale': openai.__version__, 'evidence_ids': [], 'findings': []})
+'''
+    parent = '''
+import json, os, pathlib, subprocess, sys, time
+import rsi.roles as module
+from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+from benchmarks.a5kernels.phase1_provider import direct_profile
+identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == 'deepseek-flash')
+original = subprocess.Popen
+projection = []
+probe = %r
+probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict()))
+def launch(command, **kwargs):
+    projection.append(pathlib.Path(kwargs['cwd']))
+    assert kwargs['env']['PYTHONNOUSERSITE'] == '1'
+    assert kwargs['env']['PYTHONPATH'] != %r
+    return original([sys.executable, '-c', probe], **kwargs)
+module.subprocess.Popen = launch
+adapter = module.IsolatedRoles(sys.executable, direct_profile(identity), observer=lambda *args: None,
+                               environment={'DEEPSEEK_API_KEY': 'test-only-secret'})
+result = adapter.review('review', [], deadline=time.monotonic() + 10)
+assert result.rationale.startswith('2.')
+assert not projection[0].exists()
+print(json.dumps({'worker_openai': result.rationale, 'projection_removed': True}))
+''' % (probe, str(host), str(host))
+    completed = subprocess.run([sys.executable, '-c', parent], cwd=tmp_path,
+                               env={**os.environ, 'PYTHONPATH': str(host), 'PYTHONNOUSERSITE': '1'},
+                               check=True, capture_output=True, text=True)
+    assert json.loads(completed.stdout)['projection_removed'] is True

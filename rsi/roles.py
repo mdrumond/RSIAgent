@@ -9,6 +9,7 @@ No tools, execution, memory storage, or proposal application is delegated here.
 """
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from functools import lru_cache
 import json
@@ -16,6 +17,8 @@ import math
 import os
 from pathlib import Path
 import selectors
+import shutil
+import tempfile
 import subprocess
 import sys
 import time
@@ -274,10 +277,52 @@ def _proposal(role, data, admitted):
     return outer(data['rationale'], tuple(ids), tuple(entries))
 
 
+_MACHINERY_PACKAGES = ('rsi', 'core', 'coding', 'config', 'env', 'llm', 'optimizer',
+                       'explore', 'benchmarks', 'dashboard', 'integrations', 'tools')
+
+
+@contextmanager
+def _machinery_projection():
+    """Copy only this revision's owned machinery, never host site-packages.
+
+    A wheel's distribution inventory is authoritative. Source and copied-instance
+    layouts use their explicit package directories, with dependency/cache trees
+    excluded. Cleanup follows worker reaping, including failures during spawn.
+    """
+    from importlib.metadata import distribution, PackageNotFoundError
+    machinery = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory(prefix='rsi-roles-') as temporary:
+        root = Path(temporary)
+        if (machinery / 'pyproject.toml').is_file():
+            for name in _MACHINERY_PACKAGES:
+                source = machinery / name
+                if source.is_dir():
+                    shutil.copytree(source, root / name, ignore=shutil.ignore_patterns(
+                        '__pycache__', '*.pyc', '.git', 'node_modules', '.venv', 'build', 'dist'))
+        else:
+            try:
+                installed = distribution('rsi')
+            except PackageNotFoundError as exc:
+                raise RuntimeError('cannot identify installed RSI machinery') from exc
+            if Path(installed.locate_file('rsi/roles.py')).resolve() != Path(__file__).resolve():
+                raise RuntimeError('RSI distribution does not match controller machinery')
+            for entry in installed.files or ():
+                if entry.parts[0] not in _MACHINERY_PACKAGES or '..' in entry.parts:
+                    continue
+                source = Path(installed.locate_file(entry))
+                if source.is_file() and source.suffix != '.pyc':
+                    target = root.joinpath(*entry.parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+        if not (root / 'rsi' / 'roles.py').is_file():
+            raise RuntimeError('RSI machinery inventory lacks roles worker')
+        yield root
+
+
 class IsolatedRoles:
     """Explicit roles Python executable; host SDK/environment stays untouched.
 
-    The child runs this same installed/source machinery via PYTHONPATH, using
+    The child runs an owned-package projection of this exact machinery via PYTHONPATH, using
     its own NOOA dependencies. Only the selected registered credential crosses
     in the controlled environment. JSON contains evidence and receipts, not keys.
     Observer role_finished receipts are authoritative actor elapsed time; worker
@@ -300,8 +345,7 @@ class IsolatedRoles:
             raise ValueError('missing selected provider credential')
         self.environment = {k: environment[k] for k in ('PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SYSTEMROOT')
                             if k in environment}
-        self.environment.update({key: secret, 'PYTHONPATH': str(Path(__file__).resolve().parent.parent),
-                                 'PYTHONUNBUFFERED': '1'})
+        self.environment.update({key: secret, 'PYTHONNOUSERSITE': '1', 'PYTHONUNBUFFERED': '1'})
         self.roles_python, self.profile = str(executable), profile
         self.observer, self.setup_seconds, self.clock = observer, setup_seconds, clock
 
@@ -332,11 +376,15 @@ class IsolatedRoles:
         secret = self.environment[self.profile.identity.credential_env]
         if secret in wire:
             raise ValueError('credential cannot appear in role JSON')
+        with _machinery_projection() as root:
+            return self._dispatch(role, wire, allowance, evidence, secret, root)
+
+    def _dispatch(self, role, wire, allowance, evidence, secret, root):
         started = self.clock()
         cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
         process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   env=self.environment, cwd=Path(__file__).resolve().parent.parent)
+                                   env={**self.environment, 'PYTHONPATH': str(root)}, cwd=root)
         try:
             outgoing = wire.encode() + b'\n'
             os.set_blocking(process.stdin.fileno(), False)
