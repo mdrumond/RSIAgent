@@ -6,6 +6,7 @@ conversation, tool exchanges, and automatic compaction.
 """
 from dataclasses import asdict
 import json
+import hashlib
 import queue
 import threading
 import time
@@ -64,11 +65,15 @@ class ControllerSession(PiCodingSession):
             mutable = payload['stage'] in ('implementation', 'debug', 'optimisation')
             self.schemas['perform'] = actor.schemas['perform'] if mutable else obj({'proposal': STRING})
             self.allowed = set(allowed) | {'read_context'}
+            if mutable and source is not None and 'perform' in self.allowed:
+                self.allowed.add('edit_source')
+            if completed:
+                return dict(done=True, allowed=[], operation_id=payload['operation_id'])
             # State, not history: results stay in Pi's native tool conversation.
-            return dict(allowed=sorted(self.allowed), stage=payload['stage'],
+            return dict(done=False, allowed=sorted(self.allowed), stage=payload['stage'],
                 operation_id=payload['operation_id'], skill_receipts=payload['skill_receipts'],
                 unread_skills=payload['unread_skills'], read_skill_names=payload['read_skill_names'],
-                source=payload['source'], remaining_seconds=remaining())
+                source=resource(payload['source']), remaining_seconds=remaining())
         def resource(value):
             compact = self.context.compact(value, threshold=3072)
             if len(encoded(compact)) <= 6144:
@@ -76,7 +81,13 @@ class ControllerSession(PiCodingSession):
             # Page large raw results, retaining authoritative IDs/summaries.
             result = {'full_observation': self.context.admit(value)}
             if isinstance(value, dict):
-                result.update({key:value[key] for key in ('reference', 'receipt_id', 'action', 'executed', 'status', 'summary') if key in value})
+                for key in ('reference', 'receipt_id', 'action', 'executed', 'status',
+                            'path', 'sha256', 'project_hash', 'project_id', 'goal', 'contract'):
+                    if key in value:
+                        result[key] = value[key] if len(encoded(value[key])) <= 512 else self.context.admit(value[key])
+                if 'summary' in value:
+                    summary = value['summary']
+                    result['summary'] = summary if len(encoded(summary)) <= 2048 else self.context.admit(summary)
             return result
         def execute(name, args):
             nonlocal current
@@ -97,11 +108,20 @@ class ControllerSession(PiCodingSession):
                 record('pi-action-rejected', dict(error=str(error), name=name))
                 return dict(observation=dict(error=str(error), executed=False), isError=True, state=status())
             record('pi-action', dict(name=name, arguments=args, executed=False))
+            if name == 'edit_source':
+                source = current[2]
+                if source is None or args['sha256'] != source.sha256 or not args['old_text'] or source.text.count(args['old_text']) != 1:
+                    return dict(observation=dict(error='source edit is stale or ambiguous', executed=False),isError=True,state=status())
+                candidate = source.text.replace(args['old_text'],args['new_text'],1)
+                record('pi-edit-mapped', dict(source_sha256=source.sha256,
+                    candidate_sha256=hashlib.sha256(candidate.encode()).hexdigest()))
+                name,args = 'perform', dict(proposal='Apply exact source edit',
+                    edit=dict(path=source.path,sha256=source.sha256,source=candidate))
             try:
                 current = dispatcher.send((name,args))
             except StopIteration as result:
                 completed.append(result.value)
-                return dict(observation=dict(completed=True, result=asdict(result.value)), terminate=True, state={'allowed':[]})
+                return dict(observation=dict(host_completed=True, workflow_committed=False, result=asdict(result.value.result)), terminate=True, state={'allowed':[]})
             return dict(observation=resource(current[0]['observation']), terminate=False, state=status())
         def handle(name, args):
             if name == 'snapshot':
@@ -151,8 +171,7 @@ class ControllerSession(PiCodingSession):
                 else:
                     pause()
                     response['value'] = handle(name,data)
-                    if not completed:
-                        resume()
+                    resume()
             except BaseException as error:
                 response['error'] = str(error)
                 raise
@@ -161,7 +180,7 @@ class ControllerSession(PiCodingSession):
         self.rpc.timeout = threading.TIMEOUT_MAX
         resume()
         try:
-            prompt = dict(task=turn[0]['task'], **status())
+            prompt = dict(task=resource(turn[0]['task']), **status())
             self.rpc.prompt(json.dumps(prompt), pump=pump, remaining_seconds=remaining,
                 on_event=lambda event:record('pi-event',event))
             while not self.requests.empty():

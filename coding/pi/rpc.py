@@ -104,6 +104,8 @@ class PiRPC:
                     failure = PiCancelled if msg.get("stopReason") == "aborted" else PiProviderError
             if event.get("type") == "agent_settled":
                 settled = True
+                if event.get("aborted"):
+                    failure = PiCancelled
         if failure:
             raise failure("Pi provider request failed or was aborted")
         return self.events

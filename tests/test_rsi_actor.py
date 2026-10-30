@@ -366,7 +366,7 @@ def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
     actor.perform = late
     with pytest.raises(WorkflowError, match='budget'): actor.step({})
     assert flow.stage == Stage.TASK_CONSTRUCTION and flow.pending
-    results = [data for kind, data in events if kind == 'stage-result']
+    results = [data for kind, data in events if kind == 'stage-result-proposed']
     assert results[0]['result']['artifact_refs'] == ('host-artifact',)
     assert results[0]['operation_id'] == flow.pending['id']
 

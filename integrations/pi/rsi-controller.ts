@@ -15,7 +15,6 @@ export default function (pi: ExtensionAPI) {
   let batch = 0;
   const schemas = JSON.parse(readFileSync(process.env.RSI_PI_SCHEMAS!, "utf8"));
   for (const [name, parameters] of Object.entries(schemas)) {
-    if (name === "edit_source") continue;
     pi.registerTool(defineTool({
       name, label: name, parameters: parameters as any, executionMode: "sequential",
       description: name === "read_context" ? "Read an admitted resource page." : `Execute ${name}; receive the completed host result.`,
@@ -23,7 +22,7 @@ export default function (pi: ExtensionAPI) {
         const result = await host("execute_call", { batch, id });
         if (result.state) pi.setActiveTools(result.state.allowed);
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }],
-          details: undefined, isError: result.isError, terminate: result.terminate };
+          details: undefined, isError: result.isError, terminate: true };
       },
     }));
   }
@@ -40,6 +39,12 @@ export default function (pi: ExtensionAPI) {
     batch += 1;
     await host("propose_batch", { batch, truncated: event.message.stopReason === "length",
       calls: event.message.content.filter(c => c.type === "toolCall") });
+  });
+  pi.on("agent_before_settle", async event => {
+    if (event.outcome !== "completed") return;
+    const state = await host("snapshot", {});
+    pi.setActiveTools(state.allowed);
+    if (!state.done) return { continue: true };
   });
   // No context hook: native tool exchanges, recovery and compaction remain Pi's.
 }

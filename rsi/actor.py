@@ -66,6 +66,12 @@ class StageResult:
 
 
 @dataclass(frozen=True)
+class _StageProposal:
+    result: StageResult
+    evidence: StepEvidence
+
+
+@dataclass(frozen=True)
 class EvidenceTool:
     """Host-owned PR6 tool; invoke(stage, args, operation, seconds) returns data."""
     schema: dict
@@ -356,9 +362,9 @@ class WorkflowActor:
         try:
             turn = next(dispatcher)
         except StopIteration as done:
-            return done.value
+            return self._commit(done.value)
         if hasattr(self.session, 'run_stage'):
-            return self.session.run_stage(dispatcher, turn, self)
+            return self._commit(self.session.run_stage(dispatcher, turn, self))
         while True:
             payload, allowed, source, record = turn
             try:
@@ -368,12 +374,22 @@ class WorkflowActor:
                 try:
                     turn = dispatcher.throw(error)
                 except StopIteration as done:
-                    return done.value
+                    return self._commit(done.value)
                 continue
             try:
                 turn = dispatcher.send(action)
             except StopIteration as done:
-                return done.value
+                return self._commit(done.value)
+
+    def _commit(self, proposal):
+        self._available()
+        result, evidence = proposal.result, proposal.evidence
+        self.emit('stage-result', dict(result=asdict(result), evidence=evidence.to_dict(),
+            stage=evidence.stage.value, operation_id=evidence.operation_id,
+            settlement='host' if evidence.stage == Stage.PREFLIGHT else 'transport'))
+        self.workflow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
+                               redesign=result.redesign)
+        return result
 
     def _stage(self, context):
         flow = self.workflow
@@ -553,11 +569,9 @@ class WorkflowActor:
         evidence = StepEvidence(stage=stage, operation_id=operation, source_hash=flow.source_hash,
             skill_refs=tuple(refs), artifact_refs=result.artifact_refs,
             retrieval_refs=result.retrieval_refs, retrospective_ref=result.retrospective_ref)
-        record('stage-result', dict(result=asdict(result), evidence=evidence.to_dict()))
+        record('stage-result-proposed', dict(result=asdict(result), evidence=evidence.to_dict()))
         self._available()
-        flow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
-                      redesign=result.redesign)
-        return result
+        return _StageProposal(result, evidence)
 
     def close(self):
         if self.session is not None:
