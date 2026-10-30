@@ -52,7 +52,7 @@ class ProjectIdea:
 @dataclass(frozen=True)
 class SkillEdit:
     skill: str
-    operation: Literal['replace', 'remove']
+    operation: Literal['replace', 'remove', 'append']
     content: str
 
 
@@ -111,7 +111,7 @@ def _framework():
     class Edit(BaseModel):
         model_config = ConfigDict(extra='forbid', strict=True)
         skill: str = Field(min_length=1)
-        operation: Literal['replace', 'remove']
+        operation: Literal['replace', 'remove', 'append']
         content: str
 
     class Finding(BaseModel):
@@ -282,7 +282,7 @@ def _proposal(role, data, admitted):
             raise ValueError('invalid proposal entry fields')
         if any(type(v) is not str or (not v.strip() and k != 'content') for k, v in row.items()):
             raise ValueError('invalid proposal entry value')
-        if role == 'skillwriter' and row['operation'] not in ('replace', 'remove'):
+        if role == 'skillwriter' and row['operation'] not in ('replace', 'remove', 'append'):
             raise ValueError('invalid skill operation')
         if role == 'review' and row['severity'] not in ('P0', 'P1', 'P2', 'P3'):
             raise ValueError('invalid finding severity')
