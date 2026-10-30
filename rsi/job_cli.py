@@ -16,7 +16,7 @@ def register(commands):
         if mode == 'inference':
             start.add_argument('--project', type=Path, required=True)
             start.add_argument('--no-recovery', action='store_true')
-        for action in ('stop', 'resume', 'revisit'):
+        for action in ('stop', 'resume', 'revisit', 'adopt'):
             entry = actions.add_parser(action)
             entry.add_argument('--job', required=True)
             if action == 'revisit':

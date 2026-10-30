@@ -71,7 +71,7 @@ def _machinery(root):
         source = root / relative
         if source.is_symlink() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
             raise ValueError(f'pinned machinery integrity failure: {relative}')
-    for relative in ('rsi/jobs.py', 'rsi/job_worker.py', 'rsi/services.py', 'rsi/job_service.py'):
+    for relative in ('rsi/jobs.py', 'rsi/job_worker.py', 'rsi/services.py', 'rsi/service.py'):
         if f'machinery/{relative}' not in manifest['files']:
             raise ValueError('instance release lacks CLI job support; bootstrap an updated instance')
     return machinery
