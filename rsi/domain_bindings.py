@@ -1,5 +1,6 @@
 """Production bindings to existing kernel host actions, not legacy actor loops."""
 from dataclasses import asdict, dataclass, replace
+from copy import deepcopy
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -154,8 +155,17 @@ class SourceHost:
         except ActorStopped:
             self.workflow.stop()
             raise WorkflowError('workflow stopped by user') from None
-        return dict(instruction=self.instruction, feedback=feedback, observations=self.observations,
-                    source_contract=self.identity)
+        return deepcopy(dict(instruction=self.instruction, feedback=feedback, observations=self.observations,
+                             source_contract=self.identity))
+
+    def context_refresh(self, delivered):
+        # Consume real inbox receipts only at the shared actor action boundary.
+        # The delivered context is an immutable snapshot, never an alias of the
+        # host's evolving feedback list.
+        before = [row['feedback_id'] for row in delivered.get('feedback', [])]
+        fresh = self.context()
+        after = [row['feedback_id'] for row in fresh['feedback']]
+        return fresh if before != after else None
 
     def preflight(self, context):
         self.read(self.editable_files[0])

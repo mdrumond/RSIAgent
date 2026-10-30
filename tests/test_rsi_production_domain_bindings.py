@@ -611,3 +611,43 @@ def test_frozen_context_directory_hashes_all_named_bytes_and_rejects_missing_con
     assert bindings.frozen_context_bytes(context) != second
     with pytest.raises(CanonicalConfigurationError):
         bindings.frozen_context_bytes(tmp_path/'missing')
+
+
+def test_source_context_refresh_consumes_new_receipt_without_mutating_delivered_snapshot(tmp_path):
+    from benchmarks.ascend.actor_control import ActorControl
+    from rsi.domain_bindings import SourceHost
+    host = SourceHost()
+    host.control_root, host.feedback, host.observations = tmp_path, [], []
+    host.instruction, host.identity = 'actual host task', {'baseline':'frozen'}
+    host.workflow = SimpleNamespace(stop=lambda: pytest.fail('unexpected stop'))
+    delivered = host.context()
+    assert host.context_refresh(delivered) is None
+    control = ActorControl(tmp_path)
+    receipt = control.send('steer-1', 'review numeric evidence before running')
+    fresh = host.context_refresh(delivered)
+    assert delivered['feedback'] == []
+    assert fresh['feedback'][0]['feedback_id'] == receipt['id']
+    assert fresh['feedback'][0]['content'] == 'review numeric evidence before running'
+    assert control.status()['messages'][0]['consumed'] is not None
+    assert host.context_refresh(fresh) is None
+    fresh['observations'].append({'untrusted':'caller mutation'})
+    assert host.observations == []
+
+
+def test_source_context_refresh_stop_preserves_unconsumed_feedback_and_stops_same_workflow(tmp_path):
+    from benchmarks.ascend.actor_control import ActorControl
+    from rsi.domain_bindings import SourceHost
+    from rsi.runtime import WorkflowError
+    stopped = []
+    host = SourceHost()
+    host.control_root, host.feedback, host.observations = tmp_path, [], []
+    host.instruction, host.identity = 'actual host task', {'baseline':'frozen'}
+    host.workflow = SimpleNamespace(stop=lambda: stopped.append(True))
+    delivered = host.context()
+    control = ActorControl(tmp_path)
+    control.send('steer-1', 'retain this feedback across stop')
+    control.stop()
+    with pytest.raises(WorkflowError):
+        host.context_refresh(delivered)
+    assert stopped == [True] and delivered['feedback'] == []
+    assert control.status()['messages'][0]['consumed'] is None

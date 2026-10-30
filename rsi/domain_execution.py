@@ -226,13 +226,26 @@ class DomainRunner(ProjectRunner):
             perform=self.perform, preflight=self.preflight, emit=self.actor_event,
             source_snapshot=self.snapshot, host_category=None,
             evidence_tools=self.tools(), skill_reference=self.service.read_receipt,
-            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True)
+            managed_executions=True, perform_ready=self.perform_ready, recover_invalid_actions=True,
+            context_refresh=self.context_refresh)
         self.workflow.resolver = self.resolve
         host.workflow = self.workflow
         # Public result/reconciliation fields use the same frozen domain contract.
         self.backend = _HostView(host, self.contract_ref)
         if not persisted:
             self.capture_checkpoint(None, scope='initial')
+
+    def context_refresh(self, delivered):
+        callback = getattr(self.backend, 'context_refresh', None)
+        if callback is None:
+            return None
+        domain = callback(delivered.get('domain', {}))
+        if domain is None:
+            return None
+        # Rebuild the complete authoritative envelope and validate its baseline,
+        # rather than returning just feedback or patching the delivered request.
+        fresh = self.context()
+        return fresh
 
     def actor_event(self, kind, data):
         super().actor_event(kind, data)
