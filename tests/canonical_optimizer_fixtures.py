@@ -155,7 +155,7 @@ def retained_native(execution):
         events=[store.read_json(reference) for reference in json.loads((root / 'events.json').read_bytes())])
 
 
-def scripted_optimizer_http(monkeypatch, agent):
+def scripted_optimizer_http(monkeypatch, agent, *, compile_if_offered=False):
     """Run the real Pi controller; script only provider HTTP tool decisions."""
     from types import SimpleNamespace
     from rsi.actor import PiSessionAdapter
@@ -176,6 +176,9 @@ def scripted_optimizer_http(monkeypatch, agent):
         state.requests.append(wire)
         if not wire.get('tools'):
             return response([], len(state.requests))
+        if compile_if_offered and any(tool["function"]["name"] == "compile" for tool in wire["tools"]):
+            return response([("compile", dict(source="pass", block_count=1,
+                                             summary="Probe advertised compiler"))], len(state.requests))
         session = state.session
         runner = session.owner.fixture_runner
         operation = runner.workflow.pending['id']
