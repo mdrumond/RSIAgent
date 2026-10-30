@@ -10,6 +10,12 @@ role_elapsed(operation_id) must read elapsed_seconds from the trusted host
 role_finished ledger for that operation; elapsed_seconds excludes role setup.
 Missing/malformed receipts suspend accounting and leave provider work pending.
 Only this adapter can admit evidence; model proposals cannot introduce facts.
+Optional observations are host-scoped goals/source/diagnostics/performance and
+strategies labelled as model claims. Preserve their labels, not success-derived
+validity. They flow into accepted SubjectMemory records and writer context.
+usage_complete=True is a host attestation that citation/application telemetry was
+fully observed. Without it, exposure cannot establish nonuse. Skill/content hashes
+identify the exact version; names alone never establish pruning eligibility.
 
 Callbacks match CycleScheduler. Validation receives immutable incumbent/candidate
 bundle refs and frozen case IDs plus a durable operation ID. It is a host callback,
@@ -17,6 +23,7 @@ never a role. Unknown provider/validation work requires explicit reconciliation.
 Raw instrumentation remains in CAS and its source logs for later SFT.
 """
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -45,7 +52,7 @@ class Validation:
 
 class Learning:
     def __init__(self, path, artifacts, memory, roles, *, load_project, validate,
-                 mode='phase2', unused_window=10, context_chars=24000, clock=time.monotonic,
+                 mode='phase2', unused_window=10, context_chars=48000, clock=time.monotonic,
                  role_elapsed=None, request_seconds=600):
         if not callable(validate) or not callable(load_project):
             raise ValueError('host loader and validator required')
@@ -159,6 +166,8 @@ class Learning:
             kind = 'correctness' if packet['outcome'] == 'accepted' and 'correctness' in kinds else 'failure'
             proposal = dict(base_versions=[], kind=kind, project_id=project,
                             summary=packet['outcome'], evidence=list(packet['evidence']))
+            if 'observations' in packet:
+                proposal['observations'] = packet['observations']
             self.memory.accept(identity + ':' + project, proposal,
                 dict(packet=packet_ref, baseline=baseline, queries=packet['queries'], raw_refs=packet['raw_refs']))
             if not ctx.get('recovery'):
@@ -169,15 +178,33 @@ class Learning:
         self._finish(identity, result)
         return SnapshotUpdate(**result)
 
-    def removal_eligible(self, skill, section, *, safety=False, counterevidence=False, reviewed=False):
+    def removal_eligible(self, skill, section, *, safety=False, counterevidence=False,
+                         reviewed=False, document=None):
+        # Absent explicit citation/application instrumentation is not proof of nonuse.
+        if document is None:
+            if self.active is None:
+                return False
+            document = self._bundle(self.active).document(skill)
         exposed, used = set(), set()
+        section_hash = sha256(document.read(section).encode()).hexdigest()
         for project, ref in self.state['projects'].items():
-            for event in self.store.read_json(ref)['usage']:
-                if event['skill'] == skill and event.get('section') in (None, section):
-                    if event['kind'] == 'exposed':
-                        exposed.add(project)
-                    if event['kind'] in ('cited', 'applied'):
-                        used.add(project)
+            packet = self.store.read_json(ref)
+            if packet.get('usage_complete') is not True:
+                continue
+            for event in packet['usage']:
+                if event['skill'] != skill or event.get('section') not in (None, section):
+                    continue
+                # Section receipts can survive unrelated document edits; whole-document
+                # receipts require that exact document hash, never the skill name alone.
+                matches = (event.get('content_hash') == section_hash if event.get('section') == section
+                           else event.get('skill_hash') == document.digest
+                           and event.get('content_hash') == document.digest)
+                if not matches:
+                    continue
+                if event['kind'] == 'exposed':
+                    exposed.add(project)
+                if event['kind'] in ('cited', 'applied'):
+                    used.add(project)
         return (len(exposed) >= self.window and not used
                 and (not safety or counterevidence or reviewed))
 
@@ -191,10 +218,13 @@ class Learning:
         packets = {key: self.store.read_json(ref) for key, ref in self.state['projects'].items()}
         if current is not None:
             packets[current['project_id']] = current
-        queries, sections, outcomes = {}, {}, []
+        queries, sections, outcomes, observations = {}, {}, [], []
         priority = {'counterevidence': 0, 'failure': 1, 'avoidance': 1, 'recovery': 2,
                     'correctness': 3, 'review': 3, 'performance': 4}
         for project, packet in packets.items():
+            if 'observations' in packet:
+                observations.append(dict(project=project, packet_ref=self.store.put_json(packet),
+                    evidence_ids=list(packet['evidence']), observations=packet['observations']))
             for ref, info in packet['evidence'].items():
                 outcomes.append(dict(project=project, reference=ref, kind=info['kind'],
                                      summary=info['summary'][:500]))
@@ -210,7 +240,7 @@ class Learning:
                 counts = sections.setdefault(key, {})
                 counts.setdefault(event['kind'], set()).add(project)
         return dict(outcomes=sorted(outcomes, key=lambda x: priority[x['kind']]),
-                    queries=queries, sections={key: {kind: sorted(ids) for kind, ids in counts.items()}
+                    observations=observations, queries=queries, sections={key: {kind: sorted(ids) for kind, ids in counts.items()}
                                               for key, counts in sections.items()})
 
     def skill_update(self, incumbent, memory_ref, row, ctx):
@@ -231,13 +261,12 @@ class Learning:
         packet_ref = self.store.put_json(packet)
         self.state['operations'][identity]['packet'] = packet_ref
         self._save()  # Freeze evidence and incumbent before invoking the provider.
-        evidence = [AdmittedEvidence(ref, dict(kind=info['kind'], summary=info['summary'][:1000]))
-                    for ref, info in packet['evidence'].items()]
         # Bounded context; never truncate identifiers, baseline or raw retained CAS.
         prompt = ('Prioritise error avoidance, detection and recovery before optimisation. '
             'Retrieval frequency is not usefulness. Negative results and rejected negative ideas '
             'can demonstrate valuable avoidance. Cite admitted outcome evidence. '
-            'replace sets only Learned guidance; remove deletes one exact learned fragment, '
+            'replace sets Learned guidance and must preserve existing guidance unless deletion is authorised. '
+            'Routine additions append. remove deletes one exact learned fragment. '
             'Add the section when absent. A complete YAML-frontmatter document replacement, '
             'or exact removal outside Learned guidance, requires cited host review/counterevidence. '
             'Never delete a mapped skill. Preserve safety/recovery unless '
@@ -249,8 +278,38 @@ class Learning:
         context['aggregate_ref'] = self.store.put_json(context['aggregate'])
         context['aggregate']['queries'] = dict(list(context['aggregate']['queries'].items())[-10:])
         context['aggregate']['outcomes'] = context['aggregate']['outcomes'][:10]
+        context['aggregate']['observations'] = context['aggregate']['observations'][-10:]
         context['aggregate']['sections'] = {key: {kind: ids[-10:] for kind, ids in counts.items()}
                                             for key, counts in context['aggregate']['sections'].items()}
+        # Freeze precisely the historical evidence admitted to this invocation.
+        admitted = dict(packet['evidence'])
+        sources = {ref: [packet_ref] for ref in admitted}
+        selected = {item['reference'] for item in context['aggregate']['outcomes']}
+        selected.update(ref for query in context['aggregate']['queries'].values() for ref in query['evidence_ids'])
+        selected.update(ref for item in context['aggregate']['observations'] for ref in item['evidence_ids'])
+        for project, ref in self.state['projects'].items():
+            historical = self.store.read_json(ref)
+            for evidence_id, info in historical['evidence'].items():
+                if evidence_id in selected:
+                    self.store.read_bytes(evidence_id)
+                    if evidence_id in admitted and admitted[evidence_id] != info:
+                        raise ValueError('conflicting admitted evidence metadata')
+                    admitted[evidence_id] = info
+                    sources.setdefault(evidence_id, []).append(ref)
+        operation = self.state['operations'][identity]
+        operation['admitted'] = self.store.put_json(admitted)
+        operation['admission_sources'] = self.store.put_json(sources)
+        self._save()
+        if any(info['kind'] in ('review', 'counterevidence') for info in admitted.values()):
+            targets = packet.get('correction_skills', [d.name for d in bundle.documents])
+            if not isinstance(targets, list) or not targets:
+                raise ValueError('correction_skills must select known frozen skills')
+            context['baseline_documents'] = {name: dict(content=bundle.document(name).content,
+                skill_hash=bundle.document(name).digest, bundle_ref=incumbent) for name in targets}
+        operation['writer_context'] = self.store.put_json(context)
+        self._save()
+        evidence = [AdmittedEvidence(ref, dict(kind=info['kind'], summary=info['summary'][:1000]))
+                    for ref, info in admitted.items()]
         encoded = json.dumps(context, sort_keys=True)
         if len(encoded) + len(prompt) + len(json.dumps([asdict(e) for e in evidence])) > self.context_chars:
             raise ValueError('learning context exceeds bound; host must summarise admitted inputs')
@@ -289,11 +348,12 @@ class Learning:
         incumbent = request['incumbent']
         bundle = self._bundle(incumbent)
         packet = self.store.read_json(operation['packet'])
-        proposal = _proposal('skillwriter', self.store.read_json(proposal_ref), set(packet['evidence']))
+        admitted = self.store.read_json(operation['admitted'])
+        proposal = _proposal('skillwriter', self.store.read_json(proposal_ref), set(admitted))
         if not proposal.evidence_ids:
             raise ValueError('proposal requires admitted outcome support')
         docs = {d.name: d for d in bundle.documents}
-        protected = any(packet['evidence'][ref]['kind'] in ('counterevidence', 'review')
+        protected = any(admitted[ref]['kind'] in ('counterevidence', 'review')
                         for ref in proposal.evidence_ids)
         for edit in proposal.edits:
             if edit.skill not in docs or not edit.content.strip():
@@ -315,14 +375,17 @@ class Learning:
                 docs[edit.skill] = SkillDocument(edit.skill, content)
                 continue
             if edit.operation == 'remove':
-                if not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
-                                             counterevidence=protected):
+                if not protected and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True,
+                                                               document=doc):
                     raise ValueError('removal lacks exposure window or safety review')
                 if section.count(edit.content) != 1:
                     raise ValueError('remove must identify one exact learned fragment')
                 replacement = section.replace(edit.content, '', 1)
             else:
                 replacement = edit.content + '\n'
+            if (section.strip() and section.strip() not in replacement and not protected
+                    and not self.removal_eligible(edit.skill, 'learned-guidance', safety=True, document=doc)):
+                raise ValueError('replacement deletes guidance without removal authorisation')
             if re.search(r'^#{1,2} |^---$', replacement, re.MULTILINE):
                 raise ValueError('learned fragment cannot change document structure')
             marker = '## Learned guidance\n'
@@ -337,8 +400,11 @@ class Learning:
         candidate = SkillBundle(tuple(docs.values()), bundle.mapping)
         reference = self.store.put_json(candidate.to_dict())
         self._bundle(reference)
-        self.state['candidates'][reference] = dict(incumbent=incumbent, proposal=proposal_ref,
-            packet=self.store.put_json(packet), memory=request['memory'], quarantined=False)
+        origin = dict(incumbent=incumbent, proposal=proposal_ref,
+            packet=self.store.put_json(packet), admitted=operation['admitted'],
+            admission_sources=operation['admission_sources'], memory=request['memory'])
+        record = self.state['candidates'].setdefault(reference, dict(origin, quarantined=False))
+        record.setdefault('proposals', []).append(dict(origin, operation_id=identity))
         return SnapshotUpdate(**self._finish(identity, dict(reference=reference, actor_seconds=actor_seconds)))
 
     def evaluate(self, candidate, cases, operation_id):
@@ -363,6 +429,7 @@ class Learning:
         self.store.read_bytes(verdict.evidence_ref)
         record = self.state['candidates'][request['candidate']]
         record['validation'] = dict(asdict(verdict), cases=request['cases'])
+        record.setdefault('validations', []).append(dict(record['validation'], operation_id=operation_id))
         if (verdict.workflow is True and verdict.correctness is True and not record['quarantined']
                 and self.active == request['incumbent']):
             self.state['active'] = request['candidate']
@@ -371,19 +438,33 @@ class Learning:
         self._finish(operation_id, dict(active=self.active))
         return self.active
 
-    def quarantine(self, candidate, counterevidence_ref):
+    def quarantine(self, candidate, counterevidence_ref, *, evidence_row=None):
+        """Admit later regression evidence through the same trusted loader.
+
+        evidence_row is a host project-result row, never an actor packet or a
+        bare CAS object. The loader verifies scope/authority before admission and
+        returns candidate_ref identifying the affected immutable bundle.
+        """
         record = self.state['candidates'][candidate]
-        packet = self.store.read_json(record['packet'])
+        packet = (self._packet(evidence_row) if evidence_row is not None
+                  else self.store.read_json(record['packet']))
+        if evidence_row is not None and packet.get('candidate_ref') != candidate:
+            raise ValueError('later counterevidence must identify affected candidate')
         if packet['evidence'].get(counterevidence_ref, {}).get('kind') != 'counterevidence':
             raise ValueError('host-admitted counterevidence required')
         record['quarantined'] = counterevidence_ref
+        record.setdefault('quarantine_evidence', []).append(dict(
+            evidence=counterevidence_ref, packet=self.store.put_json(packet)))
         if self.active == candidate:
-            self.state['active'] = record['incumbent']
+            self.state['active'] = next((ref for ref in reversed(self.state['versions'])
+                if ref != candidate and not self.state['candidates'].get(ref, {}).get('quarantined')), None)
         self._save()
 
     def rollback(self, reference):
         if reference not in self.state['versions']:
             raise ValueError('rollback requires previously active immutable version')
+        if self.state['candidates'].get(reference, {}).get('quarantined'):
+            raise ValueError('rollback target is quarantined')
         self._bundle(reference)
         self.state['active'] = reference
         self._save()

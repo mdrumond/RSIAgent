@@ -39,6 +39,28 @@ class HostTaskResult:
 
 
 @dataclass(frozen=True)
+class SimplificationResult:
+    """Trusted host result with retained timing evidence, never model estimates.
+
+    The hook retains its receipt under context.operation_id before returning;
+    receipt_ref identifies that host record for reconciliation after a lost return.
+    actor_seconds is measured billable elapsed time, including model thinking and
+    failed attempts, excluding setup/transfers. A host-only rewrite supplies zero
+    explicitly. No implicit free-work default is permitted.
+    """
+    spec: ProjectSpec
+    actor_seconds: float
+    receipt_ref: str
+
+    def __post_init__(self):
+        if not isinstance(self.spec, ProjectSpec):
+            raise TypeError('revised ProjectSpec required')
+        if not isinstance(self.receipt_ref, str) or not self.receipt_ref.strip():
+            raise ValueError('retained host timing receipt required')
+        _seconds(self.actor_seconds)
+
+
+@dataclass(frozen=True)
 class IsolationSnapshot:
     """Host receipt for separate mutable heads, even when CAS content is equal."""
     namespace: str
@@ -56,7 +78,10 @@ class IsolationSnapshot:
                 or proof['namespace'] != self.namespace
                 or proof['memory'] != self.memory or proof['skills'] != self.skills
                 or not (root / 'memory/active.json').is_file()
-                or not (root / 'learning.json').is_file()):
+                or not (root / 'learning.json').is_file()
+                or (root / 'memory').resolve() == Path(proof['parent']).resolve()
+                or not (root / 'memory/active.json').resolve().is_relative_to(root)
+                or not (root / 'learning.json').resolve().is_relative_to(root)):
             raise ValueError('invalid mutable-branch isolation proof')
 
 
@@ -82,9 +107,10 @@ class CycleScheduler:
     wave_limit and recovery_limit are explicit hard caps (None disables each).
     Actor time is supplied by host timing receipts, excluding setup/transfers.
     Wall time includes all elapsed time, including controller downtime.
-    Inference requires isolate(memory, skills, context) -> (memory_ref, skill_ref)
+    Inference requires isolate(memory, skills, context) -> IsolationSnapshot
     before any project runs. This hook must publish truly isolated store branches.
-    simplify(spec, result, context) -> ProjectSpec is optional and Phase1-only.
+    simplify(spec, result, context) -> SimplificationResult is Phase1-only.
+    Its spec and context receive remaining parent/recovery elapsed limits.
     Phase2/inference recovery is emitted as deferred work for paired evaluation.
     """
 
@@ -250,13 +276,14 @@ class CycleScheduler:
         s['pending'] = operation
         self._save()  # Identity is durable before any external action, including hooks.
         ctx = self._context(operation)
-        if phase in ('original', 'recovery'):
+        if phase in ('original', 'recovery', 'simplify'):
             spec = ProjectSpec.from_dict(operation['spec'])
             caps = [v for v in (spec.budgets.actor_seconds, remaining['actor_seconds'],
                                 remaining['recovery_seconds'] if operation['recovery'] else None) if v is not None]
             wall = [v for v in (spec.budgets.wall_seconds, remaining['wall_seconds']) if v is not None]
             spec = replace(spec, budgets=replace(spec.budgets, actor_seconds=min(caps) if caps else None,
                                                 wall_seconds=min(wall) if wall else None))
+        if phase in ('original', 'recovery'):
             result = self.runner(spec, s['memory'], s['skills'], ctx)
         elif phase == 'memory':
             rows = s['wave_results'] if self.spec.mode == Mode.PHASE1 else [s['originals'][-1]]
@@ -265,7 +292,7 @@ class CycleScheduler:
             result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(s['originals'][-1]), ctx)
         elif phase == 'simplify':
             item = s['recovery_queue'][0]
-            result = self.simplify(ProjectSpec.from_dict(item['spec']), copy.deepcopy(item['result']), ctx)
+            result = self.simplify(spec, copy.deepcopy(item['result']), ctx)
         elif phase == 'isolate':
             result = self.isolate(s['memory'], s['skills'], ctx)
         else:
@@ -338,26 +365,29 @@ class CycleScheduler:
                     s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
         elif kind == 'simplify':
             original = ProjectSpec.from_dict(op['spec'])
-            if not isinstance(result, ProjectSpec) or result.project_id == original.project_id:
+            if not isinstance(result, SimplificationResult):
+                raise TypeError('host simplification result with elapsed receipt required')
+            revised = result.spec
+            if revised.project_id == original.project_id:
                 raise ValueError('simplification requires a new linked project identity')
-            if result.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
+            if revised.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
                 raise ValueError('revised project identity already used')
             s['events'].append(dict(kind='project_revised', original_id=op['original_id'],
-                                    parent_id=original.project_id, revised=result.to_dict()))
-            s['recovery_queue'][0]['spec'] = result.to_dict()
+                                    parent_id=original.project_id, revised=revised.to_dict(),
+                                    operation_id=operation_id, receipt_ref=result.receipt_ref,
+                                    actor_seconds=result.actor_seconds))
+            s['spent'] += result.actor_seconds
+            s['recovery_spent'] += result.actor_seconds
+            s['recovery_queue'][0]['spec'] = revised.to_dict()
             s['phase'] = 'recovery'
         elif kind == 'isolate':
-            if isinstance(result, IsolationSnapshot):
-                result.verify()
-                if result.namespace != s['namespace']:
-                    raise ValueError('isolation namespace differs')
-                s['isolation'] = dict(branch_root=result.branch_root, receipt_ref=result.receipt_ref)
-                result = (result.memory, result.skills)
-            elif (not isinstance(result, tuple) or len(result) != 2 or
-                    any(not isinstance(ref, str) or not ref for ref in result) or
-                    result[0] == s['memory'] or result[1] == s['skills']):
-                raise ValueError('isolation must return independent memory and skill references')
-            s['memory'], s['skills'] = result
+            if not isinstance(result, IsolationSnapshot):
+                raise ValueError('host mutable-branch isolation receipt required')
+            result.verify()
+            if result.namespace != s['namespace']:
+                raise ValueError('isolation namespace differs')
+            s['isolation'] = dict(branch_root=result.branch_root, receipt_ref=result.receipt_ref)
+            s['memory'], s['skills'] = result.memory, result.skills
             s['phase'] = 'original'
         s['completed_operations'][operation_id] = kind
         s['pending'] = None
@@ -368,6 +398,25 @@ class CycleScheduler:
         """Unacknowledged host extensions; tuning remains owned by PR11."""
         return copy.deepcopy([e for e in self.state['events']
             if e.get('id') and e['id'] not in self.state.get('extension_receipts', {})])
+
+    def enqueue_tuning(self, event_id, steering):
+        """Idempotent host/manual request, sharing scheduled extension accounting."""
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise ValueError('nonblank tuning request identity required')
+        steering = copy.deepcopy(steering)
+        if (not isinstance(steering, dict) or set(steering) - {'user_guidance', 'project_ref'}
+                or any(not isinstance(v, str) for v in steering.values())):
+            raise ValueError('structured tuning steering required')
+        if self.spec.mode == Mode.PHASE1:
+            raise WorkflowError('Phase1 cannot tune skills')
+        event = dict(kind='manual_tuning', id=event_id, steering=steering)
+        existing = next((e for e in self.state['events'] if e.get('id') == event_id), None)
+        if existing is not None and existing != event:
+            raise ValueError('tuning request identity reused')
+        if existing is None:
+            self.state['events'].append(event)
+            self._save()
+        return event_id
 
     def complete_extension(self, event_id, receipt_ref, *, actor_seconds=0.0, recovery=False):
         _seconds(actor_seconds)
