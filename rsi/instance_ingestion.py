@@ -56,7 +56,7 @@ def ingest_instance(instance, source, *, collection, repository, negative_record
     def path(value):
         selected = Path(value).expanduser()
         return (selected if selected.is_absolute() else root / selected).resolve(strict=True)
-    baseline = path(config.get('baseline_kdb', config['kdb']))
+    baseline = path(config['baseline_kdb'] if 'baseline_kdb' in config else config['kdb'])
     if baseline.is_dir():
         baseline = baseline / config.get('kdb_filename', 'knowledge.sqlite3')
     inventory = json.loads((root / 'instance.json').read_text())
