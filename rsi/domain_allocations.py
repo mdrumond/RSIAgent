@@ -52,9 +52,20 @@ def optimizer_resume_grants(owner, runner):
     events = owner.store.events(owner.key)  # JobStore verifies the full hash chain.
     anchor = runner.store.read_json(runner.contract_ref).get('actor_allocation_anchor')
     if anchor is None:
-        if any(event['kind'] in ('resumed', 'manual-continuation') for event in events):
+        # Old contracts can spend their existing allocation. A resume label is
+        # not evidence of extra time, and cannot establish a new grant boundary.
+        previous, increased = None, False
+        for event in events:
+            manifest = event['payload'].get('manifest')
+            if manifest is None:
+                continue
+            current = manifest['max_seconds']
+            if event['kind'] in ('resumed', 'manual-continuation'):
+                increased |= previous is None or current > previous
+            previous = current
+        if increased:
             raise WorkflowError('optimizer contract needs an explicit allocation-anchor migration')
-        return
+        return  # Never import unassigned extra time into a legacy contract.
     sequence = anchor['sequence']
     if (anchor['job_id'] != owner.key or type(sequence) is not int or not 0 <= sequence < len(events)
             or events[sequence]['sha256'] != anchor['event_sha256']):

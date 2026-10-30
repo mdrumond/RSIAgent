@@ -267,3 +267,47 @@ def test_resume_before_first_contract_creation_is_already_in_frozen_base_budget(
     reopened=resumed.canonical.build(resumed)
     assert reopened.workflow.actor_allocation()==13 and not reopened.workflow.state.get('actor_grants')
     assert (backend.prepares,backend.evaluations,len(model.contexts))==calls
+
+
+@pytest.mark.parametrize('additional_seconds',[0,10],ids=['zero-increase-resume','positive-needs-anchor'])
+def test_legacy_unanchored_contract_resume_uses_only_unambiguous_frozen_time(tmp_path,monkeypatch,additional_seconds):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture,Backend
+    from test_rsi_domain_execution import Clock
+    from rsi.domain_execution import DomainRunner
+    from rsi.runtime import WorkflowError
+    store,key=fixture(tmp_path,seconds=13);backend=Backend();clock=Clock()
+    model=CanonicalSession(initial=json.dumps(dict(source='bad',block_count=1)),
+                           repaired=json.dumps(dict(source='fast',block_count=1)))
+    create=DomainRunner.create.__func__
+    def legacy_create(cls,root,spec,bundle,host,**kwargs):
+        del host.allocation_anchor  # Actual frozen historical shape, before contract creation.
+        return create(cls,root,spec,bundle,host,**kwargs)
+    monkeypatch.setattr(DomainRunner,'create',classmethod(legacy_create))
+    adoption=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True,clock=clock)
+    def owner():
+        return OptimizationLoop(store,key,SimpleNamespace(identity={'model':'CPU decisions'}),backend,
+            knowledge=lambda _:[],canonical=adoption)
+    first=owner();first.run(single_evaluation=True)
+    store.stop(key);assert owner().run()['status']=='stopped'
+    path=first.directory/'canonical-1/workflow.json';before=path.read_bytes()
+    calls=(backend.prepares,list(backend.evaluations),len(model.contexts))
+    if additional_seconds:
+        store.resume(key,additional_seconds=additional_seconds)
+    else:
+        # Exercise the retained zero-increase control-event schema through the
+        # actual JobStore hash-chain commit, not an invented allocation receipt.
+        store._update(key,'resumed',lambda row:row.update(stop_requested=False,status='queued',stage='queued'))
+    current=owner()
+    if additional_seconds:
+        with pytest.raises(WorkflowError):current.run()
+        assert path.read_bytes()==before
+        assert (backend.prepares,backend.evaluations,len(model.contexts))==calls
+        assert not json.loads(path.read_text()).get('actor_grants')
+    else:
+        assert current.run()['status']=='completed'
+        runner=current.canonical.build(current)
+        assert 'actor_allocation_anchor' not in runner.store.read_json(runner.contract_ref)
+        assert runner.workflow.actor_allocation()==13 and not runner.workflow.state.get('actor_grants')
+        assert store.get(key)['max_seconds']==13 and backend.evaluations==['bad','fast']
+        assert all(runner.workflow.state['intervals'][key]==value for key,value in json.loads(before)['intervals'].items())
