@@ -251,7 +251,16 @@ def test_isolated_never_publishes_secret_output(monkeypatch):
 def test_isolated_installed_wheel_excludes_host_dependencies(tmp_path):
     """Install a real wheel outside checkout; child keeps its own OpenAI SDK."""
     import os
+    import venv
     from pathlib import Path
+    worker_version = '2.0.0-worker-fixture'
+    worker = tmp_path / 'worker'
+    venv.EnvBuilder(with_pip=False).create(worker)
+    worker_python = worker / 'bin' / 'python'
+    site = Path(subprocess.check_output([str(worker_python), '-c',
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])'], text=True).strip())
+    (site / 'openai').mkdir()
+    (site / 'openai' / '__init__.py').write_text('__version__ = ' + repr(worker_version) + '\n')
     source = Path(__file__).resolve().parents[1]
     wheels, host = tmp_path / 'wheels', tmp_path / 'host-site'
     wheels.mkdir()
@@ -270,7 +279,7 @@ import openai, rsi.roles
 req = json.loads(sys.stdin.readline())
 assert pathlib.Path.cwd() != pathlib.Path(HOST)
 assert pathlib.Path(rsi.roles.__file__).read_bytes() == pathlib.Path(ORIGINAL).read_bytes()
-assert openai.__version__.startswith('2.')
+assert openai.__version__ == EXPECTED_VERSION
 def emit(event, payload):
     print(json.dumps(dict(event=event, payload=payload)), flush=True)
 emit('role_started', {'role': 'review', 'provider_identity': IDENTITY})
@@ -286,20 +295,20 @@ identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == 'deepsee
 original = subprocess.Popen
 projection = []
 probe = %r
-probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict()))
+probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict())).replace('EXPECTED_VERSION', repr(%r))
 def launch(command, **kwargs):
     projection.append(pathlib.Path(kwargs['cwd']))
     assert kwargs['env']['PYTHONNOUSERSITE'] == '1'
     assert kwargs['env']['PYTHONPATH'] != %r
-    return original([sys.executable, '-c', probe], **kwargs)
+    return original([%r, '-c', probe], **kwargs)
 module.subprocess.Popen = launch
 adapter = module.IsolatedRoles(sys.executable, direct_profile(identity), observer=lambda *args: None,
                                environment={'DEEPSEEK_API_KEY': 'test-only-secret'})
 result = adapter.review('review', [], deadline=time.monotonic() + 10)
-assert result.rationale.startswith('2.')
+assert result.rationale == %r
 assert not projection[0].exists()
 print(json.dumps({'worker_openai': result.rationale, 'projection_removed': True}))
-''' % (probe, str(host), str(host))
+''' % (probe, str(host), worker_version, str(host), str(worker_python), worker_version)
     completed = subprocess.run([sys.executable, '-c', parent], cwd=tmp_path,
                                env={**os.environ, 'PYTHONPATH': str(host), 'PYTHONNOUSERSITE': '1'},
                                check=True, capture_output=True, text=True)
