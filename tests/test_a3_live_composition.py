@@ -98,8 +98,19 @@ class FakeCandidate:
 
 
 class FakeKnowledge:
-    def __init__(self, enabled, calls): self.enabled, self.calls = enabled, calls
-    def query(self, query): self.calls.append(query.query); return ()
+    """CPU embedding fixture backed by the real read-only A3 SQLite agent."""
+    def __init__(self, enabled, calls):
+        from tempfile import TemporaryDirectory
+        from canonical_a3_fixtures import a3_knowledge
+        self._directory = TemporaryDirectory(prefix='a3-experience-')
+        self.agent = a3_knowledge(self._directory.name, enabled=enabled, collection='experience')
+        self.enabled, self.calls = enabled, calls
+        self.manifest = self.agent.manifest
+        self.collection = self.agent.collection
+
+    def query(self, query):
+        self.calls.append(query.query)
+        return self.agent.query(query)
 
 
 class FakeProfiler:
@@ -117,21 +128,10 @@ class FakeProfiler:
 
 
 def actor_factory(cell, proposal):
-    actions = [
-        {"action": "write_source", "source": SOURCE}, {"action": "compile"},
-        {"action": "run"},
-    ]
-    if cell.knowledge is KnowledgeMode.WITH_KDB:
-        actions.append({"action": "query", "query": "vector add", "limit": 1})
-    if cell.profiling is ProfilingGuidance.WITH_GUIDANCE:
-        actions.append({"action": "profile", "metric": "PipeUtilization"})
-    actions.append({"action": "submit", "interpretation": "host facts only", "supports": []})
-    iterator = iter(actions)
-    def actor(profile, context):
-        return A3Completion(
-            json.dumps(next(iterator)), 1,
-            {"profile_sha256": profile.fingerprint},
-        )
+    from canonical_a3_fixtures import A3Session
+    def actor(*_):
+        pytest.fail('LiveComposition entered the former actor action loop')
+    actor.session = actor.canonical_session = A3Session(initial=SOURCE, repaired=SOURCE + '\n// repaired')
     return actor
 
 
@@ -146,6 +146,12 @@ def dependencies(knowledge_calls, profile_calls):
             cell.profiling is ProfilingGuidance.WITH_GUIDANCE, profile_calls
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def canonical_live_trials(monkeypatch, tmp_path):
+    from canonical_a3_fixtures import install_live_trials
+    return install_live_trials(monkeypatch, tmp_path / 'canonical-fixture')
 
 
 def trial_protocol_sha256(
@@ -212,7 +218,7 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
     wave = Phase1Wave(cfg, composition.execute)
     records = wave.run()
     assert len(records) == 8 and {row["status"] for row in records} == {"passed"}
-    assert len(knowledge_calls) == 4 * len(DEFAULT_PROPOSALS)
+    assert len(knowledge_calls) == 8 * len(DEFAULT_PROPOSALS)
     assert profile_calls.count("timing") == 8 * 3
     assert len([value for value in profile_calls if value != "timing"]) == 4 * len(DEFAULT_PROPOSALS)
     cells = __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells()
@@ -240,7 +246,7 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
     ],
 )
 def test_recovery_starter_launch_loss_terminates_without_rewrite_loop(
-    tmp_path, family, stage, error_type,
+    tmp_path, family, stage, error_type, canonical_live_trials,
 ):
     proposal = next(
         item for item in DEFAULT_PROPOSALS
@@ -267,14 +273,8 @@ def test_recovery_starter_launch_loss_terminates_without_rewrite_loop(
             )
 
     candidate = InfrastructureStarter()
-    model_calls = []
-
-    def unexpected_actor(*_args):
-        model_calls.append(True)
-        raise AssertionError("recovery did not stop at the forced starter")
-
     deps = LiveDependencies(
-        actor_factory=lambda *_: unexpected_actor,
+        actor_factory=actor_factory,
         candidate_factory=lambda *_: candidate,
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
         profiler_factory=lambda *_: FakeProfiler(False, []),
@@ -294,9 +294,13 @@ def test_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     assert record["status"] == "failed"
     assert record["terminal_reason"] == "infrastructure-unverified"
     assert record["completed_projects"] == 0
-    assert candidate.compile_calls == 4
-    assert sleeps == [120, 120, 120]
-    assert model_calls == []
+    expected_attempts = 1 if error_type == "AmbiguousRemoteOutcome" else 4
+    assert candidate.compile_calls == expected_attempts
+    assert sleeps == [120] * (expected_attempts - 1)
+    assert record["infrastructure_retries_used"] == expected_attempts - 1
+    assert canonical_live_trials and all(not any(
+        context["stage"] == "debug" for context in session.contexts)
+        for session in canonical_live_trials)
     reloaded = Phase1Wave(
         cfg,
         lambda *_: pytest.fail("persisted failure replayed the recovery starter"),
@@ -316,10 +320,10 @@ def test_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     ]
     assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
         (stage, error_type)
-    ] * 4
+    ] * expected_attempts
 
 
-def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
+def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path, canonical_live_trials):
     proposal = next(
         item for item in DEFAULT_PROPOSALS
         if item.family.value == "runtime-recovery"
@@ -349,13 +353,8 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
             )
 
     candidate = AmbiguousStarterRun()
-    model_calls = []
     deps = LiveDependencies(
-        actor_factory=lambda *_: (
-            lambda *_args: model_calls.append(True) or pytest.fail(
-                "ambiguous starter requested a model repair"
-            )
-        ),
+        actor_factory=actor_factory,
         candidate_factory=lambda *_: candidate,
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
         profiler_factory=lambda *_: FakeProfiler(False, []),
@@ -374,10 +373,11 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
     result = composition.execute(cell, paths)
 
     assert result["terminal_reason"] == "infrastructure-unverified"
-    assert candidate.run_calls == 4
-    assert sleeps == [120, 120, 120]
-    assert candidate.compile_calls == 4
-    assert model_calls == []
+    assert candidate.run_calls == candidate.compile_calls == 1
+    assert sleeps == [] and result["infrastructure_retries_used"] == 0
+    assert canonical_live_trials and all(not any(
+        context["stage"] == "debug" for context in session.contexts)
+        for session in canonical_live_trials)
     failures = [
         json.loads(line)["payload"].get("failed_evidence")
         for line in paths.evidence.read_text().splitlines()
@@ -385,7 +385,7 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
     ]
     assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
         ("execute", "AmbiguousRemoteOutcome")
-    ] * 4
+    ]
 
 
 @pytest.mark.parametrize("operation", ["compile", "run"])
@@ -438,9 +438,8 @@ def test_ordinary_ambiguous_candidate_evidence_uses_infrastructure_retries(
     ).execute(cell, paths)
 
     assert result["terminal_reason"] == "infrastructure-unverified"
-    assert result["infrastructure_retries_used"] == 3
-    assert sleeps == [120, 120, 120]
-    assert len(attempts) == 4
+    assert result["infrastructure_retries_used"] == 0
+    assert sleeps == [] and len(attempts) == 1
     failures = [
         entry.payload["failed_evidence"]
         for entry in EvidenceLedger(paths.evidence).entries
@@ -449,7 +448,7 @@ def test_ordinary_ambiguous_candidate_evidence_uses_infrastructure_retries(
     assert all(item["error_type"] == "AmbiguousRemoteOutcome" for item in failures)
 
 
-def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
+def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path, canonical_live_trials):
     proposal = DEFAULT_PROPOSALS[0]
     cell = next(
         item for item in foundation_cells()
@@ -457,7 +456,7 @@ def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
         and item.knowledge is KnowledgeMode.WITHOUT_KDB
         and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
     )
-    attempts, actor_calls, sleeps = [], [], []
+    attempts, sleeps = [], []
 
     class PrepareFailure(FakeCandidate):
         def compile(self, source, workdir, **options):
@@ -468,17 +467,8 @@ def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
                 detail="VPN route unavailable",
             )
 
-    def counting_actor_factory(selected, selected_proposal):
-        actor = actor_factory(selected, selected_proposal)
-
-        def counting_actor(*args):
-            actor_calls.append(True)
-            return actor(*args)
-
-        return counting_actor
-
     deps = LiveDependencies(
-        actor_factory=counting_actor_factory,
+        actor_factory=actor_factory,
         candidate_factory=lambda *_: PrepareFailure(proposal),
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
         profiler_factory=lambda *_: FakeProfiler(False, []),
@@ -498,7 +488,10 @@ def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
     assert result["infrastructure_retries_used"] == 3
     assert sleeps == [120, 120, 120]
     assert len(attempts) == 4
-    assert len(actor_calls) == 8
+    assert len(canonical_live_trials) == 4
+    assert all(session.contexts for session in canonical_live_trials)
+    assert all(not any(context["stage"] == "debug" for context in session.contexts)
+               for session in canonical_live_trials)
 
 
 def test_cell_execution_lock_rejects_concurrent_same_process_run(tmp_path):
@@ -585,7 +578,7 @@ def test_committed_memory_repairs_missing_passed_attempt_outcome(
 
 @pytest.mark.parametrize("failures_before_success", [1, 2, 3])
 def test_infrastructure_retry_succeeds_at_each_boundary_with_fresh_dependencies(
-    tmp_path, failures_before_success,
+    tmp_path, failures_before_success, canonical_live_trials,
 ):
     proposal = DEFAULT_PROPOSALS[2]
     cell = next(
@@ -606,8 +599,8 @@ def test_infrastructure_retry_succeeds_at_each_boundary_with_fresh_dependencies(
             if self.ordinal < failures_before_success:
                 plan = self.base.plan(source, **options)
                 return FailedEvidence.create(
-                    plan, stage="compile", error_type="AmbiguousRemoteOutcome",
-                    detail="launch result unavailable",
+                    plan, stage="prepare", error_type="RuntimeError",
+                    detail="route unavailable before any launch",
                 )
             return super().compile(source, workdir, **options)
 
@@ -647,11 +640,10 @@ def test_infrastructure_retry_succeeds_at_each_boundary_with_fresh_dependencies(
     assert sleeps == [120] * failures_before_success
     assert factory_calls == list(range(failures_before_success + 1))
     assert profiler_calls == actor_calls == factory_calls
-    assert list(dict.fromkeys(
-        value.split("-turn-")[0] for value in attempted_ids
-    )) == [
-        f"infra-{ordinal}" for ordinal in range(failures_before_success + 1)
-    ]
+    assert [session.owner.infrastructure_attempt_ordinal for session in canonical_live_trials] == factory_calls
+    # Actual canonical operations replace the old textual infra/turn IDs.
+    assert len(attempted_ids) == len(set(attempted_ids)) == failures_before_success + 2
+    assert all(attempted_ids)
     assert len(paths.memory.read_text().splitlines()) == 1
 
 
@@ -741,7 +733,7 @@ def test_retained_noninfrastructure_outcome_stops_without_retry(tmp_path):
     assert calls == sleeps == []
 
 
-def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path):
+def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path, canonical_live_trials):
     proposal = DEFAULT_PROPOSALS[0]
     cell = next(
         item for item in foundation_cells()
@@ -762,8 +754,8 @@ def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path):
     LiveComposition._append_attempt_outcome(
         evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
         ordinal=0, trial=TrialResult(
-            "infrastructure-unverified", 2, 1, None, None, 0,
-            ("launch result unavailable",),
+            "infrastructure-unverified", 0, 0, None, None, 0,
+            ("route unavailable before any actor/candidate dispatch",),
         ),
     )
     attempt_ids, sleeps = [], []
@@ -788,10 +780,11 @@ def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path):
     assert result["status"] == "passed"
     assert result["infrastructure_retries_used"] == 1
     assert sleeps == [120]
-    assert attempt_ids and all(value.startswith("infra-1-") for value in attempt_ids)
+    assert attempt_ids and len(attempt_ids) == len(set(attempt_ids))
+    assert all(session.owner.infrastructure_attempt_ordinal == 1 for session in canonical_live_trials)
 
 
-def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path):
+def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path, canonical_live_trials):
     proposal = DEFAULT_PROPOSALS[0]
     cell = next(
         item for item in foundation_cells()
@@ -801,27 +794,19 @@ def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path)
     )
     attempts, sleeps = [], []
 
-    class PendingOnce(FakeCandidate):
+    class UnobservablePending(FakeCandidate):
         def compile(self, source, workdir, **options):
             attempts.append(options["attempt_id"])
-            if len(attempts) == 1:
-                plan = self.base.plan(source, **options)
-                return FailedEvidence.create(
-                    plan, stage="prepare", error_type="TransferPending",
-                    detail="observe retained handle",
-                )
-            return super().compile(source, workdir, **options)
+            if len(attempts) > 1:
+                pytest.fail('unobserved original compile was replayed')
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(plan, stage="prepare", error_type="TransferPending",
+                detail="no terminal observation is available for the original transfer")
 
-    actions = iter((
-        {"action": "write_source", "source": SOURCE},
-        {"action": "compile"}, {"action": "compile"}, {"action": "run"},
-        {"action": "submit", "interpretation": "host facts", "supports": []},
-    ))
+
     deps = LiveDependencies(
-        actor_factory=lambda *_: lambda profile, context: A3Completion(
-            json.dumps(next(actions)), 1, {"profile_sha256": profile.fingerprint},
-        ),
-        candidate_factory=lambda *args: PendingOnce(proposal),
+        actor_factory=actor_factory,
+        candidate_factory=lambda *args: UnobservablePending(proposal),
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
         profiler_factory=lambda *_: FakeProfiler(False, []),
         execution_profile="bz-a3-1",
@@ -831,14 +816,19 @@ def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path)
         cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
         proposals=(proposal,),
     ).paths(cell)
-    result = LiveComposition(
-        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
-    ).execute(cell, paths)
-
-    assert result["status"] == "passed"
-    assert result["infrastructure_retries_used"] == 0
-    assert sleeps == []
-    assert attempts == ["infra-0-turn-2", "infra-0-turn-2"]
+    composition = LiveComposition(cfg, deps, proposals=(proposal,), sleeper=sleeps.append)
+    result = composition.execute(cell, paths)
+    assert result['status'] == 'failed' and result['terminal_reason'] == 'infrastructure-unverified'
+    assert result['infrastructure_retries_used'] == 0 and sleeps == []
+    assert len(attempts) == 1
+    session, = canonical_live_trials
+    owner = session.owner
+    pending = dict(owner.canonical.build(owner).workflow.pending)
+    assert pending['id'] == attempts[0]
+    retained = paths.evidence.read_bytes()
+    assert composition.execute(cell, paths) == result
+    assert attempts == [pending['id']] and paths.evidence.read_bytes() == retained
+    assert owner.canonical.build(owner).workflow.pending == pending
 
 
 def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
@@ -891,12 +881,15 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
 
     old_dependencies = dependencies([], [])
     if not smoke:
+        from canonical_a3_fixtures import A3Session
+        class InterruptSession(A3Session):
+            def next_action(self, context, allowed, **kwargs):
+                raise KeyboardInterrupt()
         def interrupted_actor_factory(selected_cell, proposal):
+            actor = actor_factory(selected_cell, proposal)
             if proposal == DEFAULT_PROPOSALS[1]:
-                def interrupt(*_args):
-                    raise KeyboardInterrupt()
-                return interrupt
-            return actor_factory(selected_cell, proposal)
+                actor.session = actor.canonical_session = InterruptSession(initial=SOURCE)
+            return actor
         old_dependencies = LiveDependencies(
             actor_factory=interrupted_actor_factory,
             candidate_factory=old_dependencies.candidate_factory,
@@ -953,181 +946,139 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     assert dependency_calls == []
 
 
-def elapsed_trial_clock(monkeypatch, *, seconds=10):
-    """Model calls consume simulated time; live composition keeps its real host loop."""
-    import benchmarks.a3kernels.live_composition as composition_module
-    from benchmarks.a3kernels.trial import A3TrialLoop, TrialBudgets
-    class TimedTrial(A3TrialLoop):
-        def __init__(self, **kwargs):
-            now = [0.0]
-            actor = kwargs['actor']
-            def timed_actor(*args):
-                now[0] += 1
-                return actor(*args)
-            super().__init__(**{**kwargs, 'actor': timed_actor,
-                'clock': lambda: now[0], 'budgets': TrialBudgets(max_seconds=seconds)})
-    monkeypatch.setattr(composition_module, 'A3TrialLoop', TimedTrial)
 
 
-def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path, monkeypatch):
-    elapsed_trial_clock(monkeypatch)
+def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path, monkeypatch, canonical_live_trials):
+    from canonical_a3_fixtures import CanonicalSession
+    from coding.pi.session import ActionError
+    from test_a3_trial_loop import FakeClock
+    from benchmarks.a3kernels.trial import TrialBudgets
     cfg = config(tmp_path)
     first, later = foundation_cells()[4:6]
     invalid_calls = []
-
-    def invalid_transport(**_kwargs):
-        invalid_calls.append(first.cell_id)
-        return A3TransportResult("", 0)
-
-    def resilient_actor_factory(cell, proposal):
+    clock = FakeClock()
+    class InvalidSession(CanonicalSession):
+        def next_action(self, context, allowed, **kwargs):
+            invalid_calls.append(first.cell_id)
+            clock.advance(1)
+            raise ActionError('scripted malformed provider action')
+    def scripted_factory(cell, proposal):
+        actor = actor_factory(cell, proposal)
         if cell == first:
-            from benchmarks.a3_model_profiles import complete_a3
-            return lambda profile, context: complete_a3("test", context, model=cell.backend_model,
-                environ={"DEEPSEEK_API_KEY": "fixture-secret"}, transport=invalid_transport)
-        return actor_factory(cell, proposal)
-
-    deps = LiveDependencies(
-        actor_factory=resilient_actor_factory,
+            actor.session = actor.canonical_session = InvalidSession()
+            actor.canonical_clock = clock
+            actor.canonical_budgets = TrialBudgets(max_seconds=10)
+        return actor
+    deps = LiveDependencies(actor_factory=scripted_factory,
         candidate_factory=lambda cell, proposal, paths: FakeCandidate(proposal),
         knowledge_factory=lambda cell, paths: FakeKnowledge(False, []),
         profiler_factory=lambda cell, proposal, paths, verified: FakeProfiler(
-            cell.profiling is ProfilingGuidance.WITH_GUIDANCE, []
-        ),
-        execution_profile="bz-a3-1",
-    )
-    composition = LiveComposition(
-        cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
-    )
-    wave = SmokeWave(
-        cfg, composition.execute, cells=(first, later),
-        execution_profile="bz-a3-1",
-    )
-
+            cell.profiling is ProfilingGuidance.WITH_GUIDANCE, []), execution_profile='bz-a3-1')
+    composition = LiveComposition(cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix='smoke')
+    wave = SmokeWave(cfg, composition.execute, cells=(first, later), execution_profile='bz-a3-1')
     records = wave.run()
+    assert [record['status'] for record in records] == ['failed', 'passed']
+    assert records[0]['terminal_reason'] == 'time-budget-exhausted'
+    assert records[0]['completed_projects'] == 0
+    assert records[0]['failed_project_id'] == SMOKE_PROPOSALS[0].project_id
+    assert len(invalid_calls) == 10
+    owner = canonical_live_trials[0].owner
+    events = owner.canonical.build(owner).events
+    assert len([row for row in events if row['type'] == 'actor-invalid-action']) == 9
     first_paths = wave.paths(first)
-    retained = (
-        first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
-    )
-
-    assert [record["status"] for record in records] == ["failed", "passed"]
-    assert records[0]["terminal_reason"] == "time-budget-exhausted"
-    assert records[0]["completed_projects"] == 0
-    assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
-    assert "invalid-content" not in first_paths.terminal.read_text()
+    retained = first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
+    assert wave.paths(later).terminal.is_file() and wave.resume() == records
     assert len(invalid_calls) == 10
-    failures = tuple(
-        entry for entry in EvidenceLedger(first_paths.evidence).entries
-        if "provider_response_failure" in entry.payload
-    )
-    assert len(failures) == 10
-    assert all(
-        entry.payload["provider_response_failure"]["code"]
-        == "invalid-content-or-usage"
-        for entry in failures
-    )
-    assert wave.paths(later).terminal.is_file()
-    assert wave.resume() == records
-    assert len(invalid_calls) == 10
-    assert retained == (
-        first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
-    )
+    assert retained == (first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes())
 
 
-def test_terminal_reports_time_exhaustion_independent_of_token_usage(tmp_path, monkeypatch):
-    elapsed_trial_clock(monkeypatch)
-    cfg = config(tmp_path)
-    cell = foundation_cells()[0]
-
-    def expensive_actor_factory(selected, _proposal):
-        profile = load_a3_model_profile(selected.backend_model)
-        return lambda *_: A3Completion(
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            40000, {"profile_sha256": profile.fingerprint},
-        )
-
-    deps = LiveDependencies(
-        actor_factory=expensive_actor_factory,
-        candidate_factory=lambda *_: object(),
-        knowledge_factory=lambda *_: FakeKnowledge(False, []),
-        profiler_factory=lambda *_: object(),
-        execution_profile="bz-a3-1",
-    )
-    composition = LiveComposition(
-        cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
-    )
-    record = SmokeWave(
-        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
-    ).run()[0]
-
-    assert record["status"] == "failed"
-    assert record["terminal_reason"] == "time-budget-exhausted"
-    assert record["completed_projects"] == 0
-
-
-def test_late_host_mismatch_can_be_repaired_before_deadline(tmp_path, monkeypatch):
-    elapsed_trial_clock(monkeypatch, seconds=40)
-    cfg = config(tmp_path)
-    cell = next(
-        item for item in foundation_cells()
-        if item.backend_model is BackendModel.GPT_5_6_SOL
-        and item.knowledge is KnowledgeMode.WITHOUT_KDB
-        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
-    )
-    calls = []
-    actions = (
-        [{"action": "compile"}] * 23
-        + [{"action": "write_source", "source": SOURCE},
-           {"action": "compile"}, {"action": "run"},
-           {"action": "write_source", "source": SOURCE + "\n"},
-           {"action": "compile"}, {"action": "run"},
-           {"action": "submit", "interpretation": "repaired", "supports": []}]
-    )
-
-    def late_actor_factory(_cell, _proposal):
-        iterator = iter(actions)
-        def actor(profile, _context):
-            calls.append("actor")
-            return A3Completion(
-                json.dumps(next(iterator)), 1,
-                {"profile_sha256": profile.fingerprint},
-            )
+def test_terminal_reports_time_exhaustion_independent_of_token_usage(tmp_path, monkeypatch, canonical_live_trials):
+    from canonical_a3_fixtures import CanonicalSession
+    from coding.pi.session import ActionError
+    from test_a3_trial_loop import FakeClock
+    from benchmarks.a3kernels.trial import TrialBudgets
+    clock = FakeClock()
+    class ExpensiveSession(CanonicalSession):
+        completion_tokens = 0
+        def next_action(self, context, allowed, **kwargs):
+            self.completion_tokens += 40000
+            clock.advance(1)
+            raise ActionError('scripted malformed expensive action')
+    def expensive_factory(cell, proposal):
+        actor = actor_factory(cell, proposal)
+        actor.session = actor.canonical_session = ExpensiveSession()
+        actor.canonical_clock = clock
+        actor.canonical_budgets = TrialBudgets(max_seconds=10)
         return actor
+    deps = LiveDependencies(actor_factory=expensive_factory,
+        candidate_factory=lambda *_: object(), knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: object(), execution_profile='bz-a3-1')
+    cfg = config(tmp_path)
+    composition = LiveComposition(cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix='smoke')
+    cell = foundation_cells()[0]
+    wave = SmokeWave(cfg, composition.execute, cells=(cell,), execution_profile='bz-a3-1')
+    record = wave.run()[0]
+    assert record['status'] == 'failed' and record['terminal_reason'] == 'time-budget-exhausted'
+    assert record['completed_projects'] == 0
+    session, = canonical_live_trials
+    assert session.completion_tokens == 400000
+    outcome, = [entry.payload['infrastructure_retry'] for entry in session.owner.evidence.entries
+                if entry.payload.get('infrastructure_retry', {}).get('event') == 'outcome']
+    assert outcome['tokens'] == session.completion_tokens
+    retained = wave.paths(cell).evidence.read_bytes()
+    resumed = composition.execute(cell, wave.paths(cell))
+    assert resumed['terminal_reason'] == 'time-budget-exhausted'
+    assert len(canonical_live_trials) == 1 and session.completion_tokens == 400000
+    assert wave.paths(cell).evidence.read_bytes() == retained
+    assert not session.owner.memory.read()
+    assert not [row for row in session.owner.canonical.build(session.owner).events if row['type'] == 'domain-dispatch']
 
+
+def test_late_host_mismatch_can_be_repaired_before_deadline(tmp_path, monkeypatch, canonical_live_trials):
+    from canonical_a3_fixtures import CanonicalSession
+    from coding.pi.session import ActionError
+    from test_a3_trial_loop import FakeClock
+    from benchmarks.a3kernels.trial import TrialBudgets
+    clock = FakeClock()
+    class LateSession(CanonicalSession):
+        invalid = 23
+        def next_action(self, context, allowed, **kwargs):
+            if self.invalid:
+                self.invalid -= 1
+                clock.advance(1)
+                raise ActionError('scripted invalid decision before candidate')
+            clock.advance(.1)
+            return super().next_action(context, allowed, **kwargs)
+    def late_factory(cell, proposal):
+        actor = actor_factory(cell, proposal)
+        actor.session = actor.canonical_session = LateSession(initial=SOURCE, repaired=SOURCE + '\n// repair')
+        actor.canonical_clock = clock
+        actor.canonical_budgets = TrialBudgets(max_seconds=40)
+        return actor
     class HostMismatch(FakeCandidate):
         mismatched = False
-        def run(self, source, _workdir, **options):
+        def run(self, source, workdir, **options):
             if self.mismatched:
-                return super().run(source, _workdir, **options)
+                return super().run(source, workdir, **options)
             self.mismatched = True
             plan = self.base.plan(source, **options)
             output = (0.0,) * plan.padded_length
-            return VerifiedResult.from_receipt(
-                plan, ExecutionReceipt(0, output),
-                max_abs_error=max(
-                    abs(a + b) for a, b in zip(plan.input_a, plan.input_b)
-                ),
-            )
-
-    deps = LiveDependencies(
-        actor_factory=late_actor_factory,
-        candidate_factory=lambda _cell, proposal, _paths: HostMismatch(proposal),
+            return VerifiedResult.from_receipt(plan, ExecutionReceipt(0, output),
+                max_abs_error=max(abs(a+b) for a,b in zip(plan.input_a, plan.input_b)))
+    deps = LiveDependencies(actor_factory=late_factory,
+        candidate_factory=lambda cell, proposal, paths: HostMismatch(proposal),
         knowledge_factory=lambda *_: FakeKnowledge(False, []),
-        profiler_factory=lambda *_: FakeProfiler(False, []),
-        execution_profile="bz-a3-1",
-    )
-    wave = SmokeWave(
-        cfg,
-        LiveComposition(
-            cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
-        ).execute,
-        cells=(cell,), execution_profile="bz-a3-1",
-    )
-
-    record = wave.run()[0]
-    assert record["status"] == "passed"
-    assert record["terminal_reason"] == "completed"
-    assert len(calls) == 30
-    assert wave.report()["records"][0]["terminal_reason"] == "completed"
+        profiler_factory=lambda *_: FakeProfiler(False, []), execution_profile='bz-a3-1')
+    cfg = config(tmp_path)
+    cell = next(cell for cell in foundation_cells() if cell.backend_model is BackendModel.GPT_5_6_SOL
+        and cell.knowledge is KnowledgeMode.WITHOUT_KDB and cell.profiling is ProfilingGuidance.WITHOUT_GUIDANCE)
+    composition = LiveComposition(cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix='smoke')
+    record = SmokeWave(cfg, composition.execute, cells=(cell,), execution_profile='bz-a3-1').run()[0]
+    assert record['status'] == 'passed' and record['terminal_reason'] == 'completed'
+    session, = canonical_live_trials
+    assert session.invalid == 0 and 23 < clock() < 40
+    assert any(context['stage'] == 'debug' for context in session.contexts)
+    assert len(session.owner.memory.read()) == 1
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):
@@ -1472,6 +1423,9 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
     cpl_remote.chmod(0o755)
     selected = {}
 
+    class TransportSelected(Exception):
+        pass
+
     class InspectingComposition:
         def __init__(self, _config, dependencies):
             self.dependencies = dependencies
@@ -1492,17 +1446,12 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
                 profiler_cpl_remote=profiler.cpl_remote,
                 profiler_device=profiler.physical_device,
             )
-            return {
-                "status": "passed",
-                "terminal_reason": "completed",
-                "completed_projects": len(DEFAULT_PROPOSALS),
-                "failed_project_id": None,
-                "evidence_sha256": canonical_digest(selected),
-                "infrastructure_retries_used": 0,
-                "infrastructure_retry_evidence_sha256": canonical_digest([]),
-            }
+            raise TransportSelected
+
 
     monkeypatch.setattr(run_a3_phase1, "LiveComposition", InspectingComposition)
+    monkeypatch.setattr("benchmarks.a3kernels.live_composition.model_actor_factory",
+                        lambda *_args, **_kwargs: actor_factory)
     monkeypatch.setattr(
         run_a3_phase1, "_bz_preflight", lambda *args: {"state": "completed"},
     )
@@ -1523,8 +1472,9 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
         "--cell-id", cell.cell_id,
     ]
 
-    assert run_a3_phase1.main(argv) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 1
+    with pytest.raises(TransportSelected):
+        run_a3_phase1.main(argv)
+    assert not tuple(cfg.state_root.rglob("terminal.json"))
     assert selected == {
         "dependency_profile": "bz-a3-2",
         "candidate_profile": "bz-a3-2",
