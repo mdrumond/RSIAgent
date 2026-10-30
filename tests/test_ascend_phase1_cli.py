@@ -17,7 +17,8 @@ def test_a5_selection_delegates_exact_legacy_arguments():
 
 
 @pytest.mark.parametrize("sync_performance", [False, True])
-def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys, sync_performance):
+@pytest.mark.parametrize("model", [None, "openai/gpt-5.6-sol"])
+def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys, sync_performance, model):
     guide = tmp_path / "guide.md"
     guide.write_text("Native guide; do not use Catlass DSL.")
     memory = tmp_path / "initial.md"
@@ -67,6 +68,8 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
                     '{"run":{}}', '{"request-profile":{}}']
     actions = iter([*actions, '{"submit":{}}'])
     def provider(**kwargs):
+        assert kwargs["request"]["model"] == ("gpt-5.6-sol" if model else "deepseek-flash")
+        assert kwargs["base_url"] == ("https://api.openai.com/v1" if model else "https://api.deepseek.com")
         messages = kwargs["request"]["messages"]
         if "Curriculum Agent" in messages[0]["content"]:
             context = json.loads(messages[-1]["content"].rsplit("\n", 1)[-1])
@@ -86,7 +89,8 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         return DirectCompletion(text, 1)
 
     main(["--target", "a3", "run", "--root", str(root), "--objective", "Learn native copy profiling",
-          "--initial-memory", str(memory), "--config", str(config_path), "--model", "openai/gpt-5.6-sol",
+          "--initial-memory", str(memory), "--config", str(config_path),
+          *(["--model", model] if model else []),
           "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance",
           "--project-target", "1", "--max-seconds", "300"],
          transport_factory=Transport, provider_transport=provider, measurement_factory=Measurements,
@@ -105,6 +109,7 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
             row.get("candidate_sha256") for row in payloads}
     identity = json.loads((root / "campaign-identity.json").read_text())
     assert identity["language"] == "ascend-c"
+    assert identity["model"]["backend_model"] == (model or "deepseek-flash")
     assert identity["runtime_budget"] == {"policy": "elapsed-time-v1", "max_seconds": 300}
     assert "discovered-a3" in (root / "campaign-identity.json").read_text()
     assert "CATLASS" not in capsys.readouterr().out

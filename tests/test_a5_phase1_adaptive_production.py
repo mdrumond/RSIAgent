@@ -552,8 +552,9 @@ def test_resume_and_report_delegate_to_same_retained_coordinator(tmp_path, monke
 
 
 @pytest.mark.parametrize("action", ["run", "resume"])
+@pytest.mark.parametrize("model", [None, "openai/gpt-5.6-sol"])
 def test_cli_wires_each_action_to_the_production_factory(
-    tmp_path, capsys, action,
+    tmp_path, capsys, action, model,
 ):
     guide_path = tmp_path / "guide.md"
     guide_path.write_bytes(GUIDE_BYTES)
@@ -580,7 +581,7 @@ def test_cli_wires_each_action_to_the_production_factory(
         "--tla-root", str(tmp_path),
         "--catlass-source", "/opt/catlass",
         "--catlass-revision", "9a6ac627b5f4078060287844189730cf0d184800",
-        "--model", "openai/gpt-5.6-sol",
+        *(["--model", model] if model else []),
         "--knowledge", "without-kdb",
         "--profiling", "with-profiling-guidance",
         "--device", "3",
@@ -594,6 +595,10 @@ def test_cli_wires_each_action_to_the_production_factory(
     assert captured["guide_bytes"] == GUIDE_BYTES
     assert captured["initial_memory"] == b'{"prior":1}'
     assert captured["environment"] == {"loaded": "env"}
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    profile = direct_profile(captured["cell"].model)
+    assert profile.request([{"role": "user", "content": "test"}])["model"] == ("gpt-5.6-sol" if model else "deepseek-flash")
+    assert profile.base_url == ("https://api.openai.com/v1" if model else "https://api.deepseek.com")
     assert captured["cell"].profiling is ProfilingGuidance.WITH_GUIDANCE
     assert captured["paths"].device == 3
     assert captured["max_parallel"] == 2

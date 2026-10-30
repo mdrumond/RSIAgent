@@ -168,7 +168,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     parser.add_argument("--config", type=Path)
     parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--model", choices=[i.backend_model.value for i in MODEL_IDENTITIES])
+    parser.add_argument("--model", choices=[i.backend_model.value for i in MODEL_IDENTITIES],
+                        default="deepseek-flash")
     parser.add_argument("--knowledge", choices=("with-kdb", "without-kdb"))
     parser.add_argument("--profiling", choices=("new", "without-profiling-guidance"))
     parser.add_argument("--project-target", type=int)
@@ -182,8 +183,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             raise ValueError("--target a3 requires native A3 retained campaign identity")
         result = AdaptivePhase1Coordinator.read_retained_report(args.root, args.objective, memory)
     else:
-        if any(v is None for v in (args.config, args.model, args.knowledge, args.profiling)):
-            parser.error("live native actions require --config, --model, --knowledge, --profiling")
+        if any(v is None for v in (args.config, args.knowledge, args.profiling)):
+            parser.error("live native actions require --config, --knowledge, --profiling")
         config = load_native_config(args.config, args.worker_config)
         guide = Path(config["guide"]).read_bytes()
         profile = direct_profile(next(i for i in MODEL_IDENTITIES if i.backend_model.value == args.model))

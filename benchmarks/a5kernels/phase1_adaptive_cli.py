@@ -41,7 +41,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--catlass-source")
     parser.add_argument("--catlass-revision")
-    parser.add_argument("--model", choices=[item.value for item in A5BackendModel])
+    parser.add_argument("--model", choices=[item.value for item in A5BackendModel],
+                        default=A5BackendModel.DEEPSEEK_FLASH.value)
     parser.add_argument("--knowledge", choices=[item.value for item in KnowledgeMode])
     parser.add_argument("--profiling", choices=[item.value for item in ProfilingGuidance])
     parser.add_argument("--device", type=int, default=0)
@@ -82,7 +83,6 @@ def main(
         "--tla-root": args.tla_root,
         "--catlass-source": args.catlass_source,
         "--catlass-revision": args.catlass_revision,
-        "--model": args.model,
         "--knowledge": args.knowledge,
         "--profiling": args.profiling,
     }
