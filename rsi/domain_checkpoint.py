@@ -69,14 +69,26 @@ def decode(value):
 
 
 def has_pending_result(value):
-    """A callback returning is insufficient when it reports ongoing host work."""
+    """Inspect current response envelopes, not historical diagnostic status rows."""
     if is_dataclass(value) and not isinstance(value, type):
-        return any(has_pending_result(getattr(value, field.name)) for field in fields(value))
+        current = {field.name:getattr(value,field.name) for field in fields(value)
+                   if field.name in ('state','status','observation')}
+        return has_pending_result(current)
     if isinstance(value, Mapping):
         if any(value.get(key) in ('pending','queued','running','unknown','unresolved','dispatching','ambiguous')
                for key in ('state','status') if isinstance(value.get(key), str)):
             return True
-        return any(has_pending_result(v) for v in value.values())
+        for key in ('host','result','observation'):
+            child = value.get(key)
+            if key == 'observation' and isinstance(child,str):
+                import json
+                try:
+                    child = json.loads(child)
+                except ValueError:
+                    continue
+            if has_pending_result(child):
+                return True
+        return False
     if isinstance(value, (tuple,list)):
         return any(has_pending_result(v) for v in value)
     return False

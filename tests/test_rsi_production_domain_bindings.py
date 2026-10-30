@@ -323,3 +323,10 @@ def test_failed_native_kernel_exports_actual_domain_receipts_with_pending_stage_
     export=export_task(runner.root,tmp_path/'native-dataset')
     assert export['task_contract']==runner.contract_ref
     assert runner.workflow.pending==before and actions.latest.evidence.verified is False
+
+
+def test_native_terminal_status_inspection_does_not_reclassify_diagnostic_history():
+    from rsi.domain_checkpoint import has_pending_result
+    assert has_pending_result({'result':{'status':'running','handle':'native-owned'}})
+    assert not has_pending_result({'status':'verified','history':[{'status':'running'}],
+                                  'diagnostics':{'status':'queued'}})
