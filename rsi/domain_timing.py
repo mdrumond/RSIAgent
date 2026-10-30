@@ -22,6 +22,8 @@ def activity_phase(category):
         flow.accounting.end(scope['token'])
         scope['token'] = flow.accounting.start(previous)
         scope['category'] = previous
+        if category in flow.accounting.EXCLUDED and scope.get('budget_update') is not None:
+            scope['budget_update']()
 
 
 @contextmanager

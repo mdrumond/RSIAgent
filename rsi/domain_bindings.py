@@ -75,12 +75,55 @@ class SourceHost:
         self.read(self.editable_files[0])
 
     def call(self, activity, name, category, callback):
-        # Existing runtimes may expose phase-aware execution; never invent remote
-        # timestamps or subtract an estimated transfer cost from wall duration.
-        phased = getattr(self.runtime, 'canonical_activity', None)
-        if phased is not None:
-            return phased(name, callback, activity)
-        return activity.run(name, category, lambda seconds: callback(seconds), execution=True)
+        def invoke(seconds):
+            from rsi.domain_timing import CURRENT
+            flow = activity.runner.workflow
+            remaining = activity.runner.actor._available
+            restored, deadlines, seen, pending = [], [], set(), [self.runtime]
+            while pending:
+                target = pending.pop()
+                if id(target) in seen or not hasattr(target, '__dict__'):
+                    continue
+                seen.add(id(target))
+                attributes = vars(target)
+                for key in ('backend', 'transport', 'candidate', 'executor'):
+                    if key in attributes:
+                        pending.append(attributes[key])
+                original = attributes.get('remaining_seconds')
+                if callable(original):
+                    def bounded(original=original):
+                        values = [v for v in (original(), remaining()) if v is not None]
+                        return min(values) if values else float('inf')
+                    if hasattr(original, 'stop_requested'):
+                        bounded.stop_requested = original.stop_requested
+                    restored.append((target, 'remaining_seconds', original))
+                    target.remaining_seconds = bounded
+                # Optimizer deadlines are explicitly monotonic in both classes.
+                deadline = attributes.get('deadline')
+                if type(target).__module__ in ('optimizer.worker', 'optimizer.transport') and isinstance(deadline, (int,float)):
+                    restored.append((target, 'deadline', deadline))
+                    deadlines.append((target, deadline))
+            def refresh():
+                allowance = remaining()
+                if allowance is not None:
+                    for target, wall_deadline in deadlines:
+                        target.deadline = min(wall_deadline, time.monotonic() + allowance)
+            scope = CURRENT.get()
+            previous = scope.get('budget_update') if scope else None
+            if scope is not None:
+                scope['budget_update'] = refresh
+            try:
+                refresh()
+                return callback(remaining())
+            finally:
+                if scope is not None:
+                    if previous is None:
+                        scope.pop('budget_update', None)
+                    else:
+                        scope['budget_update'] = previous
+                for target, key, original in reversed(restored):
+                    setattr(target, key, original)
+        return activity.run(name, category, invoke, execution=True)
 
 
 class KernelActionsHost(SourceHost):
