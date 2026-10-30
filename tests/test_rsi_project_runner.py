@@ -66,10 +66,10 @@ class Session:
         pass
 
 
-def make(tmp_path, session=None, *, config_overrides=None, budgets=None, **overrides):
+def make(tmp_path, session=None, *, config_overrides=None, budgets=None, source_text=None, **overrides):
     source = tmp_path / 'input'
     source.mkdir()
-    (source / 'solution.py').write_text('def solve(xs):\n    total = 0.0\n    for x in xs: total += x\n    return total\n')
+    (source / 'solution.py').write_text(source_text or 'def solve(xs):\n    total = 0.0\n    for x in xs: total += x\n    return total\n')
     (source / 'helper.py').write_text('value = 1\n')
     verifier = tmp_path / 'verify.py'
     verifier.write_text("import runpy\nsolve = runpy.run_path('solution.py')['solve']\n"
@@ -212,7 +212,10 @@ def test_budget_exhaustion_keeps_partial_history_without_acceptance(tmp_path):
 
 
 def test_correctness_and_performance_shortfall_are_separate(tmp_path):
-    runner, _, database = make(tmp_path, config_overrides=dict(
+    runner, _, database = make(tmp_path,
+        source_text='from math import fsum\ndef solve(xs): return fsum(xs)\n',
+        budgets=BudgetLimits(design_iterations=2, implementation_iterations=1, execution_tries=40),
+        config_overrides=dict(
         performance_seconds=1e-9,
         commands={
             'compile': [sys.executable, '-m', 'py_compile', 'solution.py'],
@@ -221,12 +224,24 @@ def test_correctness_and_performance_shortfall_are_separate(tmp_path):
             'timing': [sys.executable, 'solution.py']}))
     try:
         result = runner.run()
-        assert result['status'] == 'rejected', result
+        assert result['status'] == 'budget_exhausted', result
         assert result['correctness'] is True
         assert result['performance'] == 'shortfall'
+        assert runner.workflow.outcome is None
+        validations = [r for r in result['history'] if r.get('evidence', {}).get('stage') == 'validation']
+        assert len(validations) == 2 and all(not r['passed'] for r in validations)
+        assert all(e['correctness'] is True for e in runner.events if e['type'] == 'validation-results')
+        designs = [r for r in result['history'] if r.get('evidence', {}).get('stage') == 'design']
+        assert len(designs) == 2
+        first, second = [r['evidence'] for r in designs]
+        assert first['retrieval_refs'] != second['retrieval_refs']
+        assert first['retrospective_ref'] != second['retrospective_ref']
+        retrospective = runner.store.read_json(second['retrospective_ref'])['payload']
+        assert any(r.get('evidence', {}).get('stage') == 'validation' and not r['passed']
+                   for r in retrospective['history'])
         (runner.backend.project / 'solution.py').write_text('invalid source!')
         reopened = runner.run()
-        assert reopened['status'] == 'suspended'
+        assert reopened['status'] == 'budget_exhausted'
         assert reopened['correctness'] is None
     finally:
         database.close()
@@ -330,6 +345,7 @@ def test_global_task_construction_queries_and_advertised_scopes(tmp_path):
             stage = Stage(context['stage'])
             assert ('select_strategy' in allowed) == (stage in (Stage.DESIGN, Stage.OPTIMISATION))
             assert ('optimisation_decision' in allowed) == (stage == Stage.OPTIMISATION)
+            assert ('request_redesign' in allowed) == (stage in (Stage.DEBUG, Stage.VALIDATION))
             if 'perform' in allowed:
                 assert set(context['skills']) <= {r['skill'] for r in context['read_skills']}
                 if stage in (Stage.DESIGN, Stage.OPTIMISATION):
@@ -408,5 +424,83 @@ def test_source_change_or_host_effects_veto_closure_proof(tmp_path):
         with pytest.raises(WorkflowError, match='untrusted'):
             flow.reject_operation(operation, reference, flow.source_hash)
         assert flow.pending['id'] == operation
+    finally:
+        database.close()
+
+
+def test_explicit_redesign_has_scoped_cas_reason_and_new_design_evidence(tmp_path):
+    class Redesign(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if (context['stage'] == Stage.DEBUG.value and context['task']['iterations']['design'] == 1
+                    and not any(r['name'] == 'request_redesign' for r in context['evidence'])):
+                return 'request_redesign', dict(reason='Replace unstable algorithm after numeric evidence')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, Redesign())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        requests = [e for e in runner.events if e['type'] == 'project-tool' and e['name'] == 'request_redesign']
+        assert len(requests) == 1
+        request = requests[0]
+        proof = runner.store.read_json(request['reference'])
+        assert proof['stage'] == Stage.DEBUG.value
+        assert proof['contract_ref'] == runner.contract_ref
+        step = next(r for r in result['history'] if r.get('evidence', {}).get('operation_id') == proof['operation_id'])
+        assert step['redesign'] is True
+        assert request['reference'] in step['evidence']['artifact_refs']
+        assert runner.workflow.state['design'] == 2
+        from rsi.runtime import WorkflowError
+        with pytest.raises(WorkflowError, match='redesign requires'):
+            runner.tool('request_redesign', Stage.ACCEPTANCE, {'reason': 'skip stage'}, 'unknown')
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize('requested_path', ['guidance.md', '../guidance.md'])
+def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path):
+    class CorrectPath(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                rows = context['evidence']
+                if not any(r['name'] == 'query_kdb' for r in rows):
+                    return 'query_kdb', dict(query='stable sum')
+                reads = [r['result'] for r in rows if r['name'] == 'read_project_file']
+                if not reads:
+                    return 'read_project_file', dict(path=requested_path)
+                assert reads[0]['status'] == 'error'
+                assert reads[0]['evidence']['path'] == requested_path
+                assert 'content' not in reads[0]['evidence']
+                if len(reads) == 1:
+                    assert context['source']['path'] == 'solution.py'
+                    return 'read_project_file', dict(path='helper.py')
+                assert reads[1]['status'] == 'ok'
+                assert reads[1]['evidence']['content'] == 'value = 1\n'
+                # Select solution again before numeric debug needs to edit it.
+                if len(reads) == 2:
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, CorrectPath())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        errors = [e for e in runner.events if e['type'] == 'project-tool' and e['status'] == 'error']
+        assert len(errors) == 1
+        payload = runner.store.read_json(errors[0]['reference'])
+        assert payload['error_type'] in ('ValueError', 'FileNotFoundError')
+        assert payload['editable_files'] == ['solution.py', 'helper.py']
+        assert result['pending'] is None
+    finally:
+        database.close()
+
+
+def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
+    runner, _, database = make(tmp_path)
+    try:
+        def denied(_):
+            raise PermissionError('unreadable protected input')
+        monkeypatch.setattr(runner.backend, 'read', denied)
+        with pytest.raises(PermissionError):
+            runner.tool('read_project_file', Stage.PREFLIGHT, dict(path='solution.py'), 'unused')
+        assert runner.events == []
     finally:
         database.close()
