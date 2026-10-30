@@ -144,8 +144,21 @@ def serve(instance, launch_id, lock_descriptor):
         from dashboard.app import create_app
         from werkzeug.serving import make_server
         config = directory / 'config.json'
-        _publish(config, _bytes({'campaigns': [], 'rsi_instance': str(root),
-                                 'controls': {'enabled': True}}))
+        if config.exists():
+            settings = json.loads(config.read_bytes())
+            if not isinstance(settings, dict):
+                raise ValueError('dashboard configuration must be an object')
+            binding = settings.get('rsi_instance')
+            if binding is not None:
+                selected = Path(binding).expanduser()
+                selected = selected if selected.is_absolute() else directory / selected
+                if selected.resolve() != root:
+                    raise ValueError('dashboard configuration belongs to another instance')
+            else:
+                _publish(config, _bytes(dict(settings, rsi_instance=str(root))))
+        else:
+            _publish(config, _bytes({'campaigns': [], 'rsi_instance': str(root),
+                                     'controls': {'enabled': True}}))
         app = create_app(config, directory / 'cache.sqlite')
         server = make_server('127.0.0.1', record['requested_port'], app, threaded=True)
         record.update(state='running', port=server.server_port,

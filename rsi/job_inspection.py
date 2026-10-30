@@ -23,14 +23,19 @@ def inspect_task(path, *, clock=time.time):
         union = accounting.seconds()
     except WorkflowError:
         condition = 'uncertain' if not accounting.unresolved else condition
-    for kind in ('actor_seconds', 'wall_seconds'):
-        cap = state['limits'][kind]
-        if cap is None:
-            remaining[kind] = None  # Only disabled caps are explicitly unlimited.
-        elif kind == 'actor_seconds' and union is not None:
-            remaining[kind] = max(0, cap - union)
-        elif kind == 'wall_seconds' and now >= state['created']:
-            remaining[kind] = max(0, cap - (now - state['created']))
+    cap = state['limits']['actor_seconds']
+    if cap is None:
+        remaining['actor_seconds'] = None
+    elif union is not None:
+        remaining['actor_seconds'] = max(0, cap - union)
+    deadlines = list(state.get('wall_deadlines', {}).values())
+    wall = state['limits']['wall_seconds']
+    if wall is not None:
+        deadlines.append(state['created'] + wall)
+    if not deadlines:
+        remaining['wall_seconds'] = None
+    elif now >= state['created']:
+        remaining['wall_seconds'] = max(0, min(deadlines) - now)
     def category(kind):
         if accounting.uncertainties and kind in ActorClock.BILLABLE:
             return None
@@ -71,13 +76,19 @@ def inspect_cycle(instance, request):
         task['task_id'] = str(Path(folder).relative_to(cycle))
         tasks.append(task)
     result = {'tasks': tasks}
+    learning_path = cycle / 'learning.json'
     for name in ('cycle.json', 'learning.json'):
-        path = cycle / name
+        path = cycle / name if name == 'cycle.json' else learning_path
         if path.exists():
             state = json.loads(path.read_text())
             if name == 'cycle.json':
                 result['skills_ref'] = state.get('skills')
                 result['candidate_refs'] = [row['reference'] for row in state.get('candidates', [])]
+                if state.get('isolation'):
+                    branch = Path(state['isolation']['branch_root']).resolve()
+                    if not branch.is_relative_to(cycle) or branch == cycle:
+                        raise ValueError('isolated learning branch escapes cycle')
+                    learning_path = branch / 'learning.json'
             else:
                 result['active_skills_ref'] = state.get('active')
     for task in tasks:

@@ -34,7 +34,7 @@ from rsi.contracts import Mode
 from rsi.cycles import RejectedSkillUpdate, SnapshotUpdate
 from rsi.python_execution import atomic_json
 from rsi.roles import AdmittedEvidence, _proposal
-from rsi.skills import SkillBundle, SkillDocument
+from rsi.skills import SkillBundle, SkillDocument, validate_metadata
 
 
 class ProposalRejected(ValueError):
@@ -49,17 +49,8 @@ class RejectedOperation(RuntimeError):
 
 
 def _skill_metadata(bundle):
-    for doc in bundle.documents:
-        import yaml  # Existing legacy dependency; no new parser or YAML subset.
-        header = re.match(r'\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)', doc.content, re.DOTALL)
-        try:
-            metadata = yaml.safe_load(header[1]) if header else None
-        except yaml.YAMLError as exc:
-            raise ValueError('invalid skill metadata') from exc
-        if (not isinstance(metadata, dict) or metadata.get('name') != doc.name
-                or not isinstance(metadata.get('description'), str)
-                or not metadata['description'].strip()):
-            raise ValueError('invalid skill metadata')
+    import yaml  # Missing host dependency is not a semantic rejection.
+    validate_metadata(bundle)
     return bundle
 
 
