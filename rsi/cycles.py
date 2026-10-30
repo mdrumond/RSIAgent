@@ -369,6 +369,23 @@ class CycleScheduler:
         return copy.deepcopy([e for e in self.state['events']
             if e.get('id') and e['id'] not in self.state.get('extension_receipts', {})])
 
+    def enqueue_tuning(self, event_id, steering):
+        """Idempotent host/manual request, sharing scheduled extension accounting."""
+        steering = copy.deepcopy(steering)
+        if (not isinstance(steering, dict) or set(steering) - {'user_guidance', 'project_ref'}
+                or any(not isinstance(v, str) for v in steering.values())):
+            raise ValueError('structured tuning steering required')
+        if self.spec.mode == Mode.PHASE1:
+            raise WorkflowError('Phase1 cannot tune skills')
+        event = dict(kind='manual_tuning', id=event_id, steering=steering)
+        existing = next((e for e in self.state['events'] if e.get('id') == event_id), None)
+        if existing is not None and existing != event:
+            raise ValueError('tuning request identity reused')
+        if existing is None:
+            self.state['events'].append(event)
+            self._save()
+        return event_id
+
     def complete_extension(self, event_id, receipt_ref, *, actor_seconds=0.0, recovery=False):
         _seconds(actor_seconds)
         receipts = self.state.setdefault('extension_receipts', {})

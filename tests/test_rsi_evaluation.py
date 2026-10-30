@@ -1,0 +1,236 @@
+"""Trusted comparisons execute canonical runners, never fabricate arm receipts."""
+from dataclasses import asdict, replace
+
+import pytest
+
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from rsi.contracts import BudgetLimits
+from rsi.evaluation import SkillEvaluation, TuningController, case_identity
+from rsi.project_runner import ProjectRunner
+from rsi.runtime import WorkflowError
+from test_rsi_project_runner import Session, make
+from test_rsi_learning import env
+
+
+def checkpoint(path, name, marker):
+    path.mkdir()
+    template, injected, database = make(path)
+    source = template.config.source
+    from pathlib import Path
+    solution = Path(source) / 'solution.py'
+    solution.write_text(solution.read_text() + '\n# ' + marker + '\n')
+    runner = ProjectRunner.create(path / 'checkpoint',
+        replace(template.spec, project_id=name), template.bundle, asdict(template.config), **injected)
+    return runner, injected, database
+
+
+@pytest.fixture
+def comparison(tmp_path, env):
+    store, _, incumbent, _, memory, _, make_learning, project = env
+    learner = make_learning()
+    row, ctx = project()
+    candidate = learner.skill_update(incumbent, memory, row, ctx).reference
+    training, _, training_db = checkpoint(tmp_path / 'training', 'training', 'training')
+    heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout')
+    calls = []
+    def factory(request, *, reopen):
+        calls.append((request.arm, reopen))
+        kwargs = dict(injected, backend_identity=request.backend_identity,
+                      session_factory=lambda: Session(repair=request.arm == 'candidate'))
+        if reopen:
+            return ProjectRunner(request.root, **kwargs)
+        return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
+    def create(**kwargs):
+        remaining = kwargs.pop('remaining_parent', {'actor_seconds': 30})
+        return SkillEvaluation.create(tmp_path / 'evaluation.json', checkpoints=[heldout],
+            training=[case_identity(training)], artifacts=store, memory_ref=memory,
+            kdb_ref=store.put_bytes(b'baseline knowledge'), model_config={'model': 'TEST'},
+            incumbent=incumbent, candidate=candidate, runner_factory=factory,
+            joint_limits=BudgetLimits(6, 4, 40, 30), remaining_parent=remaining,
+            case_count=1, repetitions=1, **kwargs)
+    yield create, learner, calls, store, heldout, training, factory
+    heldout_db.close()
+    training_db.close()
+
+
+def finish(evaluation):
+    while evaluation.result() is None:
+        evaluation.step()
+    return evaluation.result()
+
+
+def test_real_pairs_promote_only_after_entire_frozen_suite(comparison):
+    create, learner, calls, store, _, _, _ = comparison
+    evaluation = create(steering={'user_guidance': 'Prioritise numeric recovery', 'project_ref': 'p'})
+    learner.validate = evaluation.validation
+    assert learner.active == evaluation.plan['incumbent']
+    evaluation.step()
+    assert learner.active == evaluation.plan['incumbent']
+    assert evaluation.result() is None
+    result = finish(evaluation)
+    assert result['decision'] == 'benefit'
+    assert result['actor_seconds'] > 0
+    assert calls == [('incumbent', False), ('candidate', False)]
+    assert evaluation.promote(learner) == evaluation.plan['candidate']
+    assert learner.active == evaluation.plan['candidate']
+    assert store.read_json(result['evidence_ref'])['steering']['user_guidance'] == 'Prioritise numeric recovery'
+    assert evaluation.promote(learner) == learner.active
+
+
+def test_renamed_training_copy_is_rejected_before_any_dispatch(comparison):
+    create, _, calls, _, heldout, _, _ = comparison
+    with pytest.raises(ValueError, match='training'):
+        SkillEvaluation.create('unused', checkpoints=[heldout], training=[dict(case_identity(heldout), project_id='renamed')],
+            artifacts=None, memory_ref='m', kdb_ref='k', model_config={}, incumbent='old', candidate='new',
+            runner_factory=None, joint_limits=BudgetLimits(), remaining_parent={}, case_count=1, repetitions=1)
+    assert not calls
+
+
+def test_unknown_arm_requires_explicit_observation_after_reopen(comparison):
+    create, _, calls, store, _, _, factory = comparison
+    evaluation = create()
+    original_factory = evaluation.factory
+    def interrupted(request, *, reopen):
+        if not reopen:
+            raise ConnectionError('dispatch uncertain')
+        return original_factory(request, reopen=reopen)
+    evaluation.factory = interrupted
+    with pytest.raises(ConnectionError):
+        evaluation.step()
+    reopened = SkillEvaluation(evaluation.path, artifacts=store, runner_factory=factory)
+    with pytest.raises(WorkflowError):
+        reopened.step()
+    assert calls == []
+    # Explicit absence after observing no retained run is safe, not an automatic retry.
+    reopened.reconcile(not_dispatched=True)
+    finish(reopened)
+    assert len(calls) == 2
+
+
+def test_validation_cannot_admit_unfinished_or_other_candidate(comparison):
+    create, _, _, _, _, _, _ = comparison
+    evaluation = create()
+    with pytest.raises(WorkflowError):
+        evaluation.validation('old', 'new', [], 'validation')
+    finish(evaluation)
+    with pytest.raises(ValueError):
+        evaluation.validation(evaluation.plan['incumbent'], 'other', [evaluation.result()['evidence_ref']], 'v')
+
+
+def test_parent_budget_is_split_and_pending_cannot_be_replaced(comparison):
+    create, _, _, store, _, _, _ = comparison
+    evaluation = create()
+    pair = evaluation.pair(0)
+    assert pair.request('candidate').spec.budgets.actor_seconds == 15
+    assert pair.request('incumbent').spec.budgets == pair.request('candidate').spec.budgets
+    with pytest.raises(ValueError):
+        create()
+    finish(evaluation)
+    spent = evaluation.result()['actor_seconds']
+    assert spent <= 30
+    assert store.read_json(evaluation.result()['evidence_ref'])['pairs']
+
+
+@pytest.mark.parametrize('mode,decision', [('tie', 'inconclusive'), ('regression', 'regression')])
+def test_ties_and_regressions_do_not_call_learning(comparison, mode, decision):
+    create, learner, _, _, _, _, factory = comparison
+    evaluation = create()
+    def both_repair(request, *, reopen):
+        runner = factory(request, reopen=reopen)
+        runner.actor.session_factory = lambda: Session(repair=mode == 'tie' or request.arm == 'incumbent')
+        return runner
+    # Change the scripted provider, not trusted comparison receipts.
+    # Factory remains a real canonical runner; its fixed model identity is unchanged.
+    evaluation.factory = both_repair
+    result = finish(evaluation)
+    assert result['decision'] == decision
+    before = dict(learner.state['operations'])
+    assert evaluation.promote(learner) == evaluation.plan['incumbent']
+    assert learner.state['operations'] == before
+
+
+def test_default_five_cases_twice_are_frozen_before_dispatch(tmp_path, comparison):
+    _, _, calls, store, original, training, factory = comparison
+    cases, databases = [], []
+    try:
+        for index in range(5):
+            runner, _, database = checkpoint(tmp_path / f'case-{index}', f'case-{index}', f'case {index}')
+            cases.append(runner)
+            databases.append(database)
+        evaluation = SkillEvaluation.create(tmp_path / 'default.json', checkpoints=cases,
+            training=[case_identity(training)], artifacts=store,
+            memory_ref=store.put_bytes(b'memory'), kdb_ref=store.put_bytes(b'knowledge'),
+            model_config={'model': 'TEST'}, incumbent=store.put_json(original.bundle.to_dict()),
+            candidate=store.put_json(original.bundle.to_dict()), runner_factory=factory,
+            joint_limits=BudgetLimits(6, 4, 40, 30), remaining_parent={'actor_seconds': 100})
+        assert len(evaluation.plan['pairs']) == 10
+        assert not calls
+        allocations = []
+        for index in range(10):
+            pair = evaluation.pair(index)
+            allocations.extend(pair.request(arm).spec.budgets.actor_seconds for arm in ('incumbent', 'candidate'))
+            assert pair.state['arms']['candidate']['status'] == 'ready'
+        assert sum(allocations) == 100
+    finally:
+        for database in databases:
+            database.close()
+
+
+def test_elapsed_wall_limit_blocks_new_arms_without_replay(comparison):
+    create, _, calls, _, _, _, _ = comparison
+    evaluation = create(clock=lambda: 10., remaining_parent={'actor_seconds': 30, 'wall_seconds': 2.})
+    evaluation.clock = lambda: 12.
+    with pytest.raises(WorkflowError, match='wall allocation'):
+        evaluation.step()
+    assert not calls
+
+
+def test_periodic_and_manual_requests_use_one_scheduler_ledger(tmp_path, comparison):
+    from rsi.contracts import CycleSpec, Mode, ProjectSpec
+    from rsi.cycles import CycleScheduler, HostTaskResult, SnapshotUpdate
+    from rsi.recovery import CycleController
+    create, learner, _, store, _, _, _ = comparison
+    evaluation = create(steering={'project_ref': 'original', 'user_guidance': 'Numeric recovery first'})
+    learner.validate = evaluation.validation
+    originals = []
+    scheduler = CycleScheduler(tmp_path / 'cycle', CycleSpec('cycle', Mode.PHASE2,
+        (ProjectSpec('original', 'goal', ('python',)),), 'memory', learner.active),
+        lambda *a: originals.append(a) or HostTaskResult('accepted', 'receipt', 0),
+        lambda *a: SnapshotUpdate('memory'), skill_update=lambda *a: SnapshotUpdate(learner.active))
+    controller = CycleController(tmp_path / 'extensions', scheduler, learner, artifacts=store, pair_factory=None)
+    tuning = TuningController(tmp_path / 'tuning', controller,
+        evaluation_factory=lambda event, operation, remaining: evaluation)
+    try:
+        event_id = tuning.request({'project_ref': 'original', 'user_guidance': 'Numeric recovery first'})
+        assert scheduler.extension_events()[0]['steering']['project_ref'] == 'original'
+        assert tuning.step() is None
+        assert not originals
+        result = tuning.step()
+        assert result['decision'] == 'benefit'
+        spent = scheduler.state['spent']
+        assert spent == result['actor_seconds']
+        assert scheduler.state['skills'] == evaluation.plan['candidate']
+        assert scheduler.state['extension_receipts'][event_id]['actor_seconds'] == spent
+        # Receipt acknowledgement is idempotent after a disconnect.
+        scheduler.complete_extension(event_id, result['evidence_ref'], actor_seconds=spent)
+        assert scheduler.state['spent'] == spent
+    finally:
+        scheduler.close()
+
+
+def test_wave_end_coalesces_with_every_five_originals(tmp_path):
+    from rsi.contracts import CycleSpec, Mode, ProjectSpec
+    from rsi.cycles import CycleScheduler, HostTaskResult, SnapshotUpdate
+    scheduler = CycleScheduler(tmp_path / 'cycle', CycleSpec('five', Mode.PHASE2,
+        tuple(ProjectSpec(str(i), 'goal', ('python',)) for i in range(5)), 'memory', 'skills'),
+        lambda *a: HostTaskResult('accepted', 'receipt', 0), lambda *a: SnapshotUpdate('memory'),
+        skill_update=lambda *a: SnapshotUpdate('skills'))
+    try:
+        for _ in range(15):
+            scheduler.step()
+        events = [e for e in scheduler.extension_events() if e['kind'] == 'tuning_due']
+        assert len(events) == 1
+        assert events[0]['original_count'] == 5
+        assert set(events[0]['reasons']) == {'cadence', 'wave_end'}
+    finally:
+        scheduler.close()
