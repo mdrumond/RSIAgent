@@ -199,7 +199,9 @@ class PairedRecovery:
         validation = runner.latest('validation-results')
         if validation and validation['source_hash'] != flow.source_hash:
             validation = None
-        stages = {h['evidence']['stage'] for h in flow.state['history']}
+        # Admission-closure entries retain failed setup/thinking consumption,
+        # but do not establish completed stages or substitute for skill reads.
+        stages = {h['evidence']['stage'] for h in flow.state['history'] if 'evidence' in h}
         complete = {s.value for s in Stage} <= stages
         correctness = validation['correctness'] if validation else None
         workflow = complete and flow.verified_source == flow.source_hash if flow.outcome == 'accepted' else bool(stages)

@@ -197,6 +197,7 @@ class ProjectRunner:
             for name, schema in definitions.items()}
 
     def tool(self, name, stage, args, operation):
+        read_error = False
         if name == 'query_kdb':
             ref = self.service.query(args)
         elif name == 'retrospect':
@@ -211,16 +212,25 @@ class ProjectRunner:
             ref = self.store.put_json(dict(reason=args['reason'], operation_id=operation,
                 stage=stage.value, source_hash=self.workflow.source_hash, contract_ref=self.contract_ref))
         elif name == 'read_project_file':
-            row = self.backend.read(args['path'])
-            self.selected_file = args['path']
-            ref = self.store.put_json(dict(path=self.selected_file, **row))
+            try:
+                row = self.backend.read(args['path'])
+            except (FileNotFoundError, ValueError) as exc:
+                read_error = True
+                ref = self.store.put_json(dict(status='error', path=args['path'],
+                    error_type=type(exc).__name__, message=str(exc),
+                    editable_files=list(self.config.editable_files),
+                    hint='Choose a project path; KDB citation paths are not project files.'))
+            else:
+                self.selected_file = args['path']
+                ref = self.store.put_json(dict(path=self.selected_file, **row))
         else:
             if stage != Stage.OPTIMISATION or not args['reason'].strip():
                 raise WorkflowError('reasoned optimisation decision requires optimisation stage')
             ref = self.store.put_json(args)
         self.append(dict(type='project-tool', operation_id=operation, stage=stage.value,
-                         name=name, reference=ref))
-        return dict(reference=ref, evidence=self.store.read_json(ref))
+                         name=name, reference=ref, status='error' if read_error else 'ok'))
+        return dict(reference=ref, evidence=self.store.read_json(ref),
+                    status='error' if read_error else 'ok')
 
     def latest(self, kind, operation=None):
         return next((e for e in reversed(self.events) if e['type'] == kind and

@@ -31,6 +31,7 @@ from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
 from rsi.skills import SkillBundle
 from rsi.strategy import knowledge_db_query
+from rsi import revisions
 
 
 def _name(value):
@@ -61,23 +62,16 @@ class InstanceServices:
         path = Path(value).expanduser()
         return (path if path.is_absolute() else self.root / path).resolve(strict=True)
 
-    def create_cycle(self, cycle_id, mode, *, projects=None):
+    def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None):
         mode = Mode(mode)
+        if recover is not None and type(recover) is not bool:
+            raise ValueError('recovery override must be bool or null')
         root = self.root / 'runs' / _name(cycle_id)
         if root.exists():
             raise FileExistsError(root)
-        snapshot = show_configuration(self.root)
+        snapshot = revisions.checked(configuration) if configuration is not None else show_configuration(self.root)
         config = snapshot['payload']
-        rows = projects if projects is not None else config[
-            'phase1_projects' if mode == Mode.PHASE1 else 'phase2_projects']
-        projects = tuple(p if isinstance(p, ProjectSpec) else ProjectSpec.from_dict(p) for p in rows)
-        global_limits = BudgetLimits.from_dict(config['budgets']).to_dict()
-        def limits(project):
-            values = {key: min(v for v in (value, global_limits[key]) if v is not None)
-                      if value is not None or global_limits[key] is not None else None
-                      for key, value in project.budgets.to_dict().items()}
-            return replace(project, budgets=BudgetLimits.from_dict(values))
-        projects = tuple(limits(project) for project in projects)
+        projects = revisions.projects(config, mode, projects)
         if not projects:
             raise ValueError('cycle requires explicit curriculum projects')
         # Validate every configured host command before publishing the cycle.
@@ -114,7 +108,8 @@ class InstanceServices:
         spec = CycleSpec(cycle_id, mode, projects, memory_ref, skills,
                          self.store.put_json({k.value: list(v) for k, v in mapping.items()}), configuration_ref)
         atomic_json(root / 'service.json', dict(spec=spec.to_dict(), config=snapshot,
-            kdb=kdb_ref, initial=initial.decode(), test_identity=self.test.identity if self.test else None))
+            kdb=kdb_ref, initial=initial.decode(), recover=recover,
+            test_identity=self.test.identity if self.test else None))
         return self.open_cycle(cycle_id)
 
     @staticmethod
@@ -165,6 +160,7 @@ class InstanceServices:
 class BoundCycle:
     def __init__(self, services, root):
         self.services, self.root, self.store = services, root, services.store
+        revisions.recover(root, self.store)
         self.binding = json.loads((root / 'service.json').read_text())
         if self.binding['test_identity'] != (services.test.identity if services.test else None):
             raise ValueError('production/test backend binding differs')
@@ -176,6 +172,7 @@ class BoundCycle:
         self.roles_log = root / 'roles.json'
         self.role_events = json.loads(self.roles_log.read_text()) if self.roles_log.exists() else []
         self.database = None
+        self.active_runner = None
         self._roles = None
         memory_root, learning_path = root / 'memory', root / 'learning.json'
         state_path = root / 'cycle.json'
@@ -187,7 +184,8 @@ class BoundCycle:
         self.scheduler = CycleScheduler(state_path, self.spec, self.run,
             lambda *args: self.learning.memory_update(*args),
             skill_update=self.write_skills, isolate=self.isolate,
-            recover=self.config.get('recovery', {}).get('enabled', True),
+            recover=self.binding.get('recover') if self.binding.get('recover') is not None else
+                self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), **policy)
         try:
             self.memory = services._memory(memory_root, self.binding['initial'].encode())
@@ -247,7 +245,7 @@ class BoundCycle:
         receipts = self.scheduler.state.get('extension_receipts', {})
         if operation in receipts:
             record = self.store.read_json(receipts[operation]['reference'])
-            return _proposal('curriculum', record['proposal'], {self.spec.configuration_ref})
+            return _proposal('curriculum', record['proposal'], {record['configuration']})
         if any(e.get('id') == operation for e in self.scheduler.state['events']):
             raise ValueError('curriculum work pending; observe retained role receipts, never replay')
         if self.scheduler.state['pending'] or self.controller.state['pending']:
@@ -268,7 +266,8 @@ class BoundCycle:
             prompt = json.dumps({key: self.config.get('prompts', {}).get(key, '')
                                  for key in ('curriculum', 'waves')})
             proposal = self.roles().curriculum(prompt, evidence, deadline=deadline)
-            reference = self.store.put_json(dict(proposal=asdict(proposal), operation_id=operation))
+            reference = self.store.put_json(dict(proposal=asdict(proposal), operation_id=operation,
+                                                configuration=self.spec.configuration_ref))
             self.scheduler.complete_extension(operation, reference,
                 actor_seconds=self.role_elapsed(operation))
             return proposal
@@ -312,9 +311,11 @@ class BoundCycle:
         return query
 
     def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
-               backend_identity, reopen=False):
+               backend_identity, reopen=False, configuration_ref=None):
         admitted_at = time.time()
-        provider = self.config['provider']
+        configuration_ref = configuration_ref or self.spec.configuration_ref
+        frozen_config = self.store.read_json(configuration_ref)['payload']
+        provider = frozen_config['provider']
         if not self.services.test:
             from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
             from benchmarks.a5kernels.phase1_provider import direct_profile
@@ -337,8 +338,8 @@ class BoundCycle:
         runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
             root, spec, bundle, config, **injections)
         context = runner.context
-        runner.context = lambda: dict(context(), user_guidance=self.config.get('prompts', {}),
-                                      configuration_ref=self.spec.configuration_ref)
+        runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
+                                      configuration_ref=configuration_ref)
         return runner
 
     def run(self, spec, memory_ref, skills_ref, context):
@@ -353,7 +354,7 @@ class BoundCycle:
         runner = self.runner(root, spec=spec, bundle=SkillBundle.from_dict(self.store.read_json(skills_ref)),
             config=self.services.project_config(self.config, spec), memory_ref=memory_ref, backend_identity=backend)
         atomic_json(root / 'service-binding.json', binding)
-        result = runner.run()
+        result = self.execute(runner)
         return self.finish_project(runner, operation, result, context['original_project_id'])
 
     def finish_project(self, runner, operation, result, original_id=None):
@@ -374,7 +375,8 @@ class BoundCycle:
         root = self.root / 'projects' / _name(operation)
         binding = json.loads((root / 'service-binding.json').read_text())
         return self.runner(root, memory_ref=binding['memory'],
-                           backend_identity=self.store.put_json(binding), reopen=True)
+                           backend_identity=self.store.put_json(binding), reopen=True,
+                           configuration_ref=binding['configuration'])
 
     def retain(self, runner):
         for path in runner.store.objects.glob('*/*'):
@@ -423,6 +425,19 @@ class BoundCycle:
     def trial(self, request, *, reopen):
         runner = self.runner(request.root, spec=request.spec, bundle=request.bundle, config=request.config,
             memory_ref=request.memory_ref, backend_identity=request.backend_identity, reopen=reopen)
+        canonical_run = runner.run
+        def run_trial():
+            self.active_runner = runner
+            try:
+                return canonical_run()
+            except KeyboardInterrupt:
+                runner.workflow.stop()
+                self.scheduler.stop()
+                self.retain(runner)
+                raise
+            finally:
+                self.active_runner = None
+        runner.run = run_trial
         return runner
 
     def pair(self, event, operation, remaining):
@@ -474,13 +489,29 @@ class BoundCycle:
         self.scheduler.reconcile(pending['id'], HostTaskResult(packet['result']['status'], ref,
             runner.workflow.accounting.seconds()))
 
+    def adopt_revision(self, configuration=None):
+        return revisions.adopt(self, configuration or show_configuration(self.services.root))
+
+    def execute(self, runner):
+        self.active_runner = runner
+        try:
+            return runner.run()
+        except KeyboardInterrupt:
+            # Runner/backend finally blocks have already reaped their owned children.
+            runner.workflow.stop()
+            self.scheduler.stop()
+            self.retain(runner)
+            raise
+        finally:
+            self.active_runner = None
+
     def step(self):
         """Delegate one dispatch to the shared controller; no service driver loop."""
         return self.controller.step()
 
     def run_project(self, operation_id):
         runner = self.open_project(operation_id)
-        return self.finish_project(runner, operation_id, runner.run())
+        return self.finish_project(runner, operation_id, self.execute(runner))
 
     def close(self):
         self.scheduler.close()

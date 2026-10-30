@@ -454,3 +454,53 @@ def test_explicit_redesign_has_scoped_cas_reason_and_new_design_evidence(tmp_pat
             runner.tool('request_redesign', Stage.ACCEPTANCE, {'reason': 'skip stage'}, 'unknown')
     finally:
         database.close()
+
+
+@pytest.mark.parametrize('requested_path', ['guidance.md', '../guidance.md'])
+def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path):
+    class CorrectPath(Session):
+        def next_action(self, context, allowed, **kwargs):
+            if context['stage'] == Stage.TASK_CONSTRUCTION.value:
+                rows = context['evidence']
+                if not any(r['name'] == 'query_kdb' for r in rows):
+                    return 'query_kdb', dict(query='stable sum')
+                reads = [r['result'] for r in rows if r['name'] == 'read_project_file']
+                if not reads:
+                    return 'read_project_file', dict(path=requested_path)
+                assert reads[0]['status'] == 'error'
+                assert reads[0]['evidence']['path'] == requested_path
+                assert 'content' not in reads[0]['evidence']
+                if len(reads) == 1:
+                    assert context['source']['path'] == 'solution.py'
+                    return 'read_project_file', dict(path='helper.py')
+                assert reads[1]['status'] == 'ok'
+                assert reads[1]['evidence']['content'] == 'value = 1\n'
+                # Select solution again before numeric debug needs to edit it.
+                if len(reads) == 2:
+                    return 'read_project_file', dict(path='solution.py')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, CorrectPath())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        errors = [e for e in runner.events if e['type'] == 'project-tool' and e['status'] == 'error']
+        assert len(errors) == 1
+        payload = runner.store.read_json(errors[0]['reference'])
+        assert payload['error_type'] in ('ValueError', 'FileNotFoundError')
+        assert payload['editable_files'] == ['solution.py', 'helper.py']
+        assert result['pending'] is None
+    finally:
+        database.close()
+
+
+def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
+    runner, _, database = make(tmp_path)
+    try:
+        def denied(_):
+            raise PermissionError('unreadable protected input')
+        monkeypatch.setattr(runner.backend, 'read', denied)
+        with pytest.raises(PermissionError):
+            runner.tool('read_project_file', Stage.PREFLIGHT, dict(path='solution.py'), 'unused')
+        assert runner.events == []
+    finally:
+        database.close()
