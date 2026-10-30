@@ -66,6 +66,11 @@ class EvidenceTool:
     """Host-owned PR6 tool; invoke(stage, args, operation, seconds) returns data."""
     schema: dict
     invoke: object
+    stages: tuple[Stage, ...] | None = None
+
+    def __post_init__(self):
+        if self.stages is not None:
+            object.__setattr__(self, 'stages', tuple(Stage(stage) for stage in self.stages))
 
 
 class PiSessionAdapter:
@@ -109,7 +114,8 @@ class PiSessionAdapter:
         session.deadline = time.monotonic() + (threading.TIMEOUT_MAX if seconds is None else seconds)
         session.gateway.deadline = session.deadline
         write = None
-        if source is not None and Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION):
+        if ('perform' in allowed and source is not None
+                and Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)):
             write = lambda text: ('perform', {'proposal': 'Apply exact source edit',
                 'edit': {'path': source.path, 'sha256': source.sha256, 'source': text}})
         return session.next_action(context, allowed, record=record,
@@ -127,17 +133,23 @@ class WorkflowActor:
     the controller checks consumption again before releasing the result. Its
     default interval covers host work; an executor owning transfer/compile/run
     intervals must set host_category=None and instrument every interval itself.
+    TEST/VALIDATION callbacks reserve one execution by default. Multi-command
+    callbacks reserve additional command IDs with Workflow.reserve_execution.
+    managed_executions=True delegates all command reservations to the callback;
+    production bindings must use the guarded backend for every actual command.
     emit must durably retain events. Exceptions preserve pending operations for
     explicit host reconciliation; no receipt is reconstructed or invented.
     """
     def __init__(self, workflow, bundle, session_factory, *, perform, preflight,
                  emit, source_snapshot=None, host_category='implementation', setup_timeout=60,
-                 evidence_tools=None, skill_reference=None):
+                 evidence_tools=None, skill_reference=None, managed_executions=False, perform_ready=None):
         self.workflow, self.bundle = workflow, bundle
         self.session_factory, self.session = session_factory, None
         self.perform, self.preflight, self.emit = perform, preflight, emit
         self.source_snapshot, self.host_category = source_snapshot, host_category
         self.setup_timeout = setup_timeout
+        self.managed_executions = managed_executions
+        self.perform_ready = perform_ready or (lambda stage, operation: True)
         self.skill_reference = skill_reference or (lambda reference: reference)
         self.evidence_tools = dict(evidence_tools or {})
         if self.evidence_tools.keys() & (SCHEMAS.keys() | {'read_context', 'edit_source', 'snapshot'}):
@@ -246,18 +258,28 @@ class WorkflowActor:
                 seconds = self._available()
                 if source and source.project_hash != flow.source_hash:
                     raise WorkflowError('source changed outside current operation')
+                allowed = ['read_skill'] + [name for name, tool in self.evidence_tools.items()
+                    if tool.stages is None or stage in tool.stages]
+                if read_names == set(names) and self._timed('retrieval',
+                        lambda: self.perform_ready(stage, operation)):
+                    allowed.append('perform')
+                seconds = self._available()
                 payload = dict(task=context, stage=stage.value, operation_id=operation,
-                    skills=list(names), read_skills=list(read_material), evidence=list(evidence_material),
+                    skills=list(names), read_skill_names=[name for name in names if name in read_names],
+                    unread_skills=[name for name in names if name not in read_names],
+                    read_skills=list(read_material), evidence=list(evidence_material),
                     observation=observation,
                     source={'path': source.path, 'text': source.text, 'sha256': source.sha256,
                             'project_hash': source.project_hash} if source else None)
                 scope['request_id'] = uuid.uuid4().hex
                 record('actor-request', {'timestamp': flow.clock()})
                 name, args = self._timed('thinking', lambda: self.session.next_action(
-                    payload, list(self.schemas), seconds=seconds, record=record, source=source))
+                    payload, allowed, seconds=seconds, record=record, source=source))
                 self._available()
-                if name not in self.schemas:
-                    raise WorkflowError('unknown actor action')
+                if name == 'perform' and read_names != set(names):
+                    raise WorkflowError('read every mapped skill before performing stage')
+                if name not in allowed:
+                    raise WorkflowError('actor action unavailable in this stage or readiness state')
                 validate(args, self.schemas[name])
                 if name == 'read_skill':
                     text = self._timed('retrieval', lambda: usage.read(args['name'], args.get('section')))
@@ -280,8 +302,6 @@ class WorkflowActor:
                     evidence_material.append(material)
                     record('evidence-tool-result', material)
                     continue
-                if read_names != set(names):
-                    raise WorkflowError('read every mapped skill before performing stage')
                 if 'edit' in args:
                     edit = args['edit']
                     if (stage not in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)
@@ -289,6 +309,13 @@ class WorkflowActor:
                             or edit['sha256'] != source.sha256):
                         raise WorkflowError('source edit is unavailable or stale')
                 seconds = self._available()
+                if stage in (Stage.TEST, Stage.VALIDATION):
+                    if self.managed_executions:
+                        cap = flow.limits.execution_tries
+                        if cap is not None and flow.state['executions'] >= cap:
+                            raise WorkflowError('execution cap exhausted')
+                    elif not flow.reserve_execution(operation):
+                        raise WorkflowError('stage execution already reserved; reconcile before dispatch')
                 record('host-dispatch', {'timestamp': flow.clock()})
                 result = self._timed(self.host_category,
                     lambda: self.perform(stage, args, operation, seconds))

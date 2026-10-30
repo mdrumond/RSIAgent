@@ -65,7 +65,8 @@ class StrategyEvidence:
             raise WorkflowError('no matching active workflow operation')
         return dict(workflow=self.workflow_id, operation=pending['id'],
                     stage=state['stage'], bundle=self.bundle.digest,
-                    source=state['source'], history=_digest(state['history']))
+                    source=state['source'], history=_digest(state['history']),
+                    backend=self.backend_identity, test_backend=self.test_backend)
 
     def _persist(self, kind, payload, context=None):
         record = dict(kind=kind, context=context or self._context(), payload=payload,
@@ -81,7 +82,7 @@ class StrategyEvidence:
             raise WorkflowError('unknown host receipt')
         record = self.artifacts.read_json(reference)
         if record['kind'] != kind or record['context'] != context:
-            raise WorkflowError('receipt operation/stage/bundle/history/source mismatch')
+            raise WorkflowError('receipt operation/stage/bundle/history/source/backend mismatch')
         return record['payload']
 
     def record_skill_event(self, event):
@@ -120,7 +121,7 @@ class StrategyEvidence:
         return context
 
     def query(self, payload):
-        context = self._strategy_context()
+        context = self._context()
         # Freeze arguments before invoking a callback that may mutate its input.
         request = json.loads(_bytes(payload))
         if not isinstance(request.get('query'), str) or not request['query'].strip():
@@ -144,7 +145,7 @@ class StrategyEvidence:
                              backend=self.backend_identity, test_backend=self.test_backend), context)
 
     def retrospect(self, *, supplement=None):
-        context = self._strategy_context()
+        context = self._context()
         history = json.loads(_bytes(self.snapshot()['history']))
         if _digest(history) != context['history']:
             raise WorkflowError('history changed during retrospective')
@@ -178,7 +179,8 @@ class StrategyEvidence:
                     or not isinstance(decision['reason'], str) or not decision['reason'].strip()):
                 raise WorkflowError('each retrieved record needs a unique reasoned decision')
             if (key[0] == 'negative_records' and decision['action'] == 'used'
-                    and not str(decision.get('redirection', '')).strip()):
+                    and (not isinstance(decision.get('redirection'), str)
+                         or not decision['redirection'].strip())):
                 raise WorkflowError('negative reuse requires changed applicability/redirection')
             seen.add(key)
         if seen != expected:
@@ -205,7 +207,7 @@ class StrategyEvidence:
                 and record['payload']['kind'] == 'read']
 
     def resolve(self, kind, reference, stage, operation_id):
-        """Workflow.resolver-compatible; strategy completion requires selection."""
+        """All stages may retrieve; design/optimisation require selection."""
         try:
             context = self._context(stage, operation_id)
             if kind == 'skill':
@@ -215,6 +217,8 @@ class StrategyEvidence:
             if kind not in ('retrieval', 'retrospective'):
                 return False
             self._load(kind, reference, context)
+            if Stage(context['stage']) not in (Stage.DESIGN, Stage.OPTIMISATION):
+                return True
             field = 'query_ref' if kind == 'retrieval' else 'retrospective_ref'
             for ref, receipt_kind in self.receipts.items():
                 if receipt_kind == 'selection':
