@@ -245,3 +245,71 @@ def test_worker_finishing_during_stop_is_reported_not_raised(instance, monkeypat
     monkeypatch.setattr(signal, 'pidfd_send_signal', finished)
     assert jobs.stop(instance, job_id)['job_id'] == job_id
     assert (instance / f'runs/jobs/{job_id}.stop').exists()
+
+
+@pytest.fixture
+def held_startup(instance):
+    """A real child retains the launcher's inherited flock before PID publication."""
+    import fcntl
+    import select
+    identity, original = record(instance, state='launching')
+    directory = instance / 'runs/jobs'
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        child = subprocess.Popen([sys.executable, '-c',
+            "import os, sys; os.write(1, b'ready\\n'); sys.stdin.buffer.read(1)"],
+            pass_fds=(descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    finally:
+        os.close(descriptor)
+    def release():
+        if child.poll() is None:
+            child.stdin.write(b'x')
+            child.stdin.flush()
+        child.wait(timeout=5)
+    try:
+        assert select.select([child.stdout], [], [], 5)[0]
+        assert child.stdout.readline() == b'ready\n'
+        yield identity, original, release
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=5)
+        child.stdin.close()
+        child.stdout.close()
+
+
+def test_owned_startup_is_launching_without_fabricated_pid_and_stop_is_retained(instance, held_startup):
+    identity, original, _ = held_startup
+    assert jobs.status(instance, identity)['state'] == 'launching'
+    assert jobs.status(instance, identity)['process'] is None
+    assert jobs.list_jobs(instance)[0]['state'] == 'launching'
+    jobs.stop(instance, identity)
+    assert (instance / f'runs/jobs/{identity}.stop').exists()
+    assert jobs.status(instance, identity)['state'] == 'launching'
+    assert json.loads(jobs._path(instance / 'runs/jobs', identity).read_text()) == original
+
+
+def test_abandoned_startup_is_interrupted_without_mutating_or_replaying(instance, held_startup):
+    identity, original, release = held_startup
+    release()
+    assert jobs.status(instance, identity)['state'] == 'interrupted'
+    assert jobs.list_jobs(instance)[0]['state'] == 'interrupted'
+    assert json.loads(jobs._path(instance / 'runs/jobs', identity).read_text()) == original
+
+
+def test_new_dispatch_lock_cannot_hide_an_abandoned_launch(instance, monkeypatch):
+    from types import SimpleNamespace
+    identity, _ = record(instance, state='launching')
+    machinery = instance / 'machinery'
+    machinery.mkdir()
+    monkeypatch.setattr(jobs, '_machinery', lambda root: machinery)
+    # Support the later runtime-dispatch seam without preparing or launching a model.
+    monkeypatch.setitem(sys.modules, 'rsi.instance_dispatch', SimpleNamespace(
+        launch_context=lambda root, **kwargs: (root, machinery, sys.executable, dict(os.environ))))
+    spawned = []
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: spawned.append(args))
+    with pytest.raises(ValueError, match='explicit resume/revisit'):
+        jobs.start(instance, dict(action='start', mode='phase1', cycle_id='new'))
+    assert spawned == []
+    assert jobs.status(instance, identity)['state'] == 'interrupted'
