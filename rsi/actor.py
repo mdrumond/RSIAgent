@@ -462,6 +462,15 @@ class WorkflowActor:
                         receipt_id=reference, raw_receipt_id=receipt['receipt_id'])
                     continue
                 if name in self.evidence_tools:
+                    if ('skill_refs' in args and
+                            any(ref not in self._reads for ref in args['skill_refs'])):
+                        error = 'skill_refs must contain current host read receipt IDs, not skill names'
+                        if not self.recover_invalid_actions:
+                            raise WorkflowError(error)
+                        observation = dict(event='invalid-action', action=name, error=error,
+                                           accepted=False, skill_receipts=inventory['skill_receipts'])
+                        record('actor-invalid-action', observation)
+                        continue
                     seconds = self._available()
                     observation = self._timed('retrieval', lambda: self.evidence_tools[name].invoke(
                         stage, args, operation, seconds))
