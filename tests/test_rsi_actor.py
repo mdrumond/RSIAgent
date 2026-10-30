@@ -250,3 +250,17 @@ def test_adapter_deadline_is_assigned_after_setup_and_gateway_matches(monkeypatc
     adapter.next_action({'stage':Stage.DESIGN.value}, ['perform'],
         seconds=5, record=lambda *_:None, source=source)
     assert captured[-1]['write_action'] is None
+
+
+def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
+    actor, flow, _, _, clock, events = harness(tmp_path, reads(Stage.TASK_CONSTRUCTION)+[
+        ('perform', {'proposal':'construct'})])
+    def late(*args):
+        clock.value += 30
+        return StageResult(artifact_refs=('host-artifact',))
+    actor.perform = late
+    with pytest.raises(WorkflowError, match='budget'): actor.step({})
+    assert flow.stage == Stage.TASK_CONSTRUCTION and flow.pending
+    results = [data for kind, data in events if kind == 'stage-result']
+    assert results[0]['result']['artifact_refs'] == ('host-artifact',)
+    assert results[0]['operation_id'] == flow.pending['id']

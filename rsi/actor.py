@@ -7,7 +7,7 @@ be reconciled by its owner, never redispatched by constructing another actor.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import queue
@@ -267,12 +267,13 @@ class WorkflowActor:
                 result = self._timed(self.host_category,
                     lambda: self.perform(stage, args, operation, seconds))
                 break
-        self._available()
         if not isinstance(result, StageResult):
             raise TypeError('host must return StageResult')
         evidence = StepEvidence(stage=stage, operation_id=operation, source_hash=flow.source_hash,
             skill_refs=tuple(refs), artifact_refs=result.artifact_refs,
             retrieval_refs=result.retrieval_refs, retrospective_ref=result.retrospective_ref)
+        record('stage-result', dict(result=asdict(result), evidence=evidence.to_dict()))
+        self._available()
         flow.complete(evidence, passed=result.passed, new_source_hash=result.new_source_hash,
                       redesign=result.redesign)
         return result
