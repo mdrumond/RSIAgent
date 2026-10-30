@@ -58,6 +58,12 @@ before selecting a strategy. Mapped skills require real delivered reads. Missing
 or ambiguous execution evidence cannot complete a stage. Failed targets remain
 honest failures with retained source, receipts and elapsed costs.
 
+The programming controller runs through a Pi extension. Pi retains the tool
+conversation and manages automatic compaction; RSI executes host tools and checks
+their completed results before advancing the workflow. Large source and evidence
+records remain available through paged reads. Compaction work counts toward the
+actor budget, and the original observations remain in the evidence log for SFT.
+
 Phase1 keeps skills fixed and may simplify bounded recovery projects. Phase2
 writes candidates after tasks and validates them through paired recovery and
 independent A/B cases. Default tuning cadence is every five originals and wave
