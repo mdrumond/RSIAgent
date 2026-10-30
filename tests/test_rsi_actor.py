@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from rsi.actor import PiSessionAdapter, StageResult, WorkflowActor, SourceSnapshot
+# Snapshot transport compatibility; production native transport is tested separately.
+from rsi.actor import SnapshotPiSessionAdapter as PiSessionAdapter
+from rsi.actor import StageResult, WorkflowActor, SourceSnapshot
 from rsi.contracts import BudgetLimits, Stage
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import builtin_bundle
@@ -364,7 +366,7 @@ def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
     actor.perform = late
     with pytest.raises(WorkflowError, match='budget'): actor.step({})
     assert flow.stage == Stage.TASK_CONSTRUCTION and flow.pending
-    results = [data for kind, data in events if kind == 'stage-result']
+    results = [data for kind, data in events if kind == 'stage-result-proposed']
     assert results[0]['result']['artifact_refs'] == ('host-artifact',)
     assert results[0]['operation_id'] == flow.pending['id']
 
