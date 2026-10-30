@@ -13,7 +13,7 @@ from rsi.python_execution import PythonExecution, ingest_elapsed
 def backend(tmp_path, *, seconds=10):
     source = tmp_path / 'input'
     source.mkdir()
-    (source / 'solution.py').write_text('def stable_sum(xs):\n    return sum(xs)\n')
+    (source / 'solution.py').write_text('def stable_sum(xs):\n    total = 0.0\n    for x in xs:\n        total += x\n    return total\n')
     (source / 'helper.py').write_text('value = 1\n')
     verifier = Path(__file__).resolve().parents[1] / 'examples/cpu/verify.py'
     runner = PythonExecution.snapshot(tmp_path / 'task', source, verifier,

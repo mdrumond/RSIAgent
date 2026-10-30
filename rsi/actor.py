@@ -76,7 +76,8 @@ class PiSessionAdapter:
     only afterward from the remaining charged allocation.
     """
     def __init__(self, **kwargs):
-        self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM, **kwargs)
+        self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
+                                       first_action_only=True, **kwargs)
 
     def prepare(self, timeout, *, schemas):
         session = self.session
