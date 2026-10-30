@@ -907,7 +907,7 @@ class OptimizerHost(SourceHost):
         def compile_candidate(stage, args, operation, seconds):
             from rsi.domain_execution import DomainActivity
             callback = getattr(self.owner.backend, 'compile', None)
-            if callback is None:
+            if not callable(callback):
                 raise CanonicalConfigurationError('configured optimizer backend has no compile diagnostics capability')
             candidate = dict(source=args['source'], block_count=args['block_count'])
             directory = self.owner.directory / 'compile' / fingerprint(candidate) / operation
@@ -963,10 +963,13 @@ class OptimizerHost(SourceHost):
                 result = self.owner.memory_observer('read-artifact', self.submission['memory_snapshot'],
                     dict(action=dict(sha256=reference, offset=offset), result=result), operation)
             return result
-        return dict(compile=EvidenceTool(OPTIMIZER_SCHEMAS['compile'], compile_candidate),
-                    propose_cases=EvidenceTool(OPTIMIZER_SCHEMAS['cases'], propose, (Stage.TASK_CONSTRUCTION,)),
+        tools = {}
+        if callable(getattr(self.owner.backend, 'compile', None)):
+            tools['compile'] = EvidenceTool(OPTIMIZER_SCHEMAS['compile'], compile_candidate)
+        tools.update(propose_cases=EvidenceTool(OPTIMIZER_SCHEMAS['cases'], propose, (Stage.TASK_CONSTRUCTION,)),
                     read_memory=EvidenceTool(OPTIMIZER_SCHEMAS['read-memory'], read_memory),
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
+        return tools
 
     def artifact_scope(self):
         job = {row['sha256'] for row in self.owner.store.artifacts(self.owner.key)}
