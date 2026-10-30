@@ -23,7 +23,7 @@ def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, 
     store = ContentAddressedArtifacts(tmp_path / 'shared')
     incumbent = store.put_json(original.bundle.to_dict())
     documents = list(original.bundle.documents)
-    documents[0] = SkillDocument(documents[0].name, documents[0].content + '\n## Learned guidance\nUse stable summation.\n')
+    documents[0] = SkillDocument(documents[0].name, documents[0].content + '\nUse stable summation.\n')
     candidate = store.put_json(SkillBundle(tuple(documents), original.bundle.mapping).to_dict())
     calls = []
 

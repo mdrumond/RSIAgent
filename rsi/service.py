@@ -15,7 +15,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     if threading.current_thread() is not threading.main_thread():
         raise ValueError('owned job service must run on the worker main thread')
     action = request['action']
-    if action not in ('start', 'resume', 'revisit', 'adopt'):
+    if action not in ('start', 'resume', 'revisit', 'adopt', 'tune'):
         raise ValueError('unknown job action')
     snapshot = configuration if configuration is not None else request.get('configuration')
     services = InstanceServices(instance)
@@ -34,6 +34,11 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     previous = None
     dispatching = False
     try:
+        if request.get('mode') not in (None, cycle.spec.mode.value):
+            raise ValueError('request mode differs from retained cycle')
+        if action == 'tune':
+            event_id = cycle.request_tuning(request.get('steering', {}))
+            emit(dict(event='tuning_requested', cycle_id=cycle_id, event_id=event_id))
         if action == 'adopt':
             if snapshot is None:
                 raise ValueError('explicit frozen adoption revision required')
@@ -42,7 +47,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             return dict(status='adopted', cycle_id=cycle_id, **result)
         if action == 'resume':
             # Retained work is observed first. No pending provider/host work is replayed.
-            if cycle.scheduler.state['pending'] or cycle.controller.state['pending']:
+            if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
                 try:
                     cycle.reconcile()
                 except (ValueError, RuntimeError) as exc:
@@ -55,7 +60,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         previous = signal.signal(signal.SIGINT, interrupt)
         def watch():
             while not done.wait(.05):
-                if should_stop():
+                wall = cycle.scheduler.remaining()['wall_seconds']
+                if should_stop() or wall is not None and wall <= 0:
                     # Signal only this owned worker; canonical finally blocks own children.
                     os.kill(os.getpid(), signal.SIGINT)
                     return
@@ -75,7 +81,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             if state['phase'] in ('complete', 'wave_limit'):
                 extensions = cycle.scheduler.extension_events()
                 actionable = [e for e in extensions if e['kind'] in (
-                    'paired_recovery_due', 'candidate_validation_due')]
+                    'paired_recovery_due', 'candidate_validation_due', 'tuning_due', 'manual_tuning')]
                 if actionable:
                     continue
                 return dict(status='awaiting_tuning' if any(e['kind'] == 'tuning_due'
@@ -84,7 +90,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         cycle.scheduler.stop()
         return dict(status='stopped', cycle_id=cycle_id, pending=cycle.scheduler.state['pending'])
     except (ValueError, RuntimeError) as exc:
-        if cycle.scheduler.state['pending'] or cycle.controller.state['pending']:
+        if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
             emit(dict(event='cycle_suspended', cycle_id=cycle_id, error=str(exc)))
             return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
                         pending=cycle.scheduler.state['pending'],

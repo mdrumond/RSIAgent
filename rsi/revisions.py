@@ -9,7 +9,7 @@ from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
 from rsi.python_execution import atomic_json
 
 
-EDITABLE = {'prompts', 'phase1_projects', 'phase2_projects', 'project_configs', 'budgets'}
+EDITABLE = {'prompts', 'phase1_projects', 'phase2_projects', 'project_configs', 'budgets', 'tuning'}
 
 
 def checked(snapshot):
@@ -76,7 +76,7 @@ def recover(root, store, *, locked=False):
 def adopt(cycle, snapshot):
     snapshot = checked(snapshot)
     scheduler, state = cycle.scheduler, cycle.scheduler.state
-    if state['pending'] or cycle.controller.state['pending'] or state['phase'] not in ('original', 'complete'):
+    if state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending'] or state['phase'] not in ('original', 'complete'):
         raise ValueError('configuration adoption requires an idle task/wave boundary')
     if any('result' not in op for op in cycle.learning.state['operations'].values()):
         raise ValueError('reconcile learning before configuration adoption')
@@ -108,6 +108,10 @@ def adopt(cycle, snapshot):
     binding = dict(cycle.binding, spec=spec.to_dict(), config=snapshot)
     revised = copy.deepcopy(state)
     revised['config']['spec'] = spec.to_dict()
+    cadence = new.get('tuning', {}).get('every_projects', 5)
+    if cadence is not None and (type(cadence) is not int or cadence <= 0):
+        raise ValueError('positive tuning cadence or null required')
+    revised['config']['tuning_every'] = cadence
     revised['events'].append(dict(kind='configuration_adopted',
         previous=cycle.spec.configuration_ref, configuration=config_ref, cursor=cursor))
     if state['phase'] == 'complete' and len(incoming) > cursor:

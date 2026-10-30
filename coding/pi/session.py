@@ -133,9 +133,49 @@ class PiCodingSession:
         self.gateway.on_record = lambda kind, payload: self.record(kind, payload)
         self.closed = False
         self.context_reads = {}
+        self.ordered_batch = None
+        self.batch_error = None
+        self.discarded_actions = 0
 
     def _operation(self, name, args):
         with self.lock:
+            if self.first_action_only and name == "propose_batch":
+                self.ordered_batch = None
+                try:
+                    calls = args["calls"]
+                    if args.get("truncated") or not isinstance(calls, list):
+                        raise ValueError("truncated or invalid Pi batch")
+                    saved, selected = {}, None
+                    for call in calls:
+                        if not isinstance(call.get("id"), str) or call["id"] in saved:
+                            raise ValueError("invalid or duplicate tool call identity")
+                        if call["name"] not in self.allowed:
+                            raise ValueError("tool is not allowed in the current host state")
+                        validate(call["arguments"], self.schemas[call["name"]])
+                        saved[call["id"]] = json.loads(json.dumps(call))
+                        if selected is None and call["name"] != "read_context":
+                            selected = call["id"]
+                    self.ordered_batch = dict(batch=args["batch"], calls=saved, selected=selected, used=set())
+                    self.discarded_actions += max(0, sum(c["name"] != "read_context" for c in calls) - 1)
+                    self.record("pi-batch", dict(batch=args["batch"], calls=calls, selected_call_id=selected))
+                    return {"accepted": True}
+                except (ValueError, KeyError, TypeError) as error:
+                    self.batch_error = str(error)
+                    self.record("pi-batch-rejected", dict(error=self.batch_error))
+                    return {"accepted": False, "error": self.batch_error}
+            if self.first_action_only and name == "execute_call":
+                batch = self.ordered_batch
+                if not batch or args.get("batch") != batch["batch"]:
+                    raise ValueError("unknown ordered tool batch")
+                call = batch["calls"][args["id"]]
+                if call["id"] in batch["used"]:
+                    raise ValueError("tool call already handled")
+                batch["used"].add(call["id"])
+                if call["name"] != "read_context" and call["id"] != batch["selected"]:
+                    raise ValueError("only the first model-ordered host action is selected; extra call was not executed")
+                name, args = call["name"], call["arguments"]
+            elif self.first_action_only and name != "snapshot":
+                raise ValueError("ordered tool call identity required")
             if name == "snapshot":
                 return {"context": self.snapshot, "allowed": sorted(self.allowed)}
             if name not in self.allowed:
@@ -229,6 +269,7 @@ class PiCodingSession:
                "RSI_PI_GATEWAY_TOKEN": self.gateway.token, "RSI_PI_TOOL_TOKEN": self.token,
                "RSI_PI_TOOL_URL": f"http://127.0.0.1:{server.server_port}",
                "RSI_PI_SCHEMAS": str(directory / "schemas.json"),
+               "RSI_PI_FIRST_ACTION_ONLY": "1" if self.first_action_only else "0",
                "RSI_PI_REQUEST_BYTES": str(self.gateway.hard_bytes)}
         argv = [str(self.executable), "--mode", "rpc", "--no-session",
                 "--provider", "rsi-host", "--model", spec["model"],
@@ -256,6 +297,7 @@ class PiCodingSession:
         if source is not None and write_action is not None:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
+        self.ordered_batch, self.batch_error, self.discarded_actions = None, None, 0
         self.context = self.context_factory()
         self.context_reads = {}
         self.snapshot = self.context.snapshot({
@@ -278,6 +320,8 @@ class PiCodingSession:
             if not self.gateway.finished.wait(timeout=min(5, max(.1, self.deadline-time.monotonic()))):
                 raise PiError("provider accounting did not settle")
             events = self.rpc.events[start:]
+            if self.batch_error:
+                raise ActionError(self.batch_error)
             if any(e.get("message", {}).get("stopReason") == "length" for e in events):
                 raise ActionError("truncated Pi tool call; no action accepted")
             # Pi's argument validator can coerce scalars. Validate the original
@@ -307,7 +351,7 @@ class PiCodingSession:
             name, args = self.pending
             # Persist intent before returning it to the host that owns side effects.
             self.record("pi-action", {"id": uuid.uuid4().hex, "name": name, "arguments": args,
-                                      "discarded_actions": self.mutations - 1, **ENGINE_IDENTITY})
+                                      "discarded_actions": self.discarded_actions if self.first_action_only else self.mutations - 1, **ENGINE_IDENTITY})
             return name, args
         finally:
             # Stream records through the host callback, including on failed or

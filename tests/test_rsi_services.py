@@ -409,3 +409,95 @@ output.write_text(json.dumps(dict(result=result, child=child,
     assert receipt['child'] and not receipt['child_alive']
     assert receipt['workflow']['stopped'] and receipt['workflow']['pending']
     assert all(row[2] is not None for row in receipt['workflow']['intervals'].values())
+
+
+def configure_heldout(instance):
+    source = instance.root / 'heldout'
+    source.mkdir()
+    (source / 'solution.py').write_text('answer = sum([1, 2, 3])\n')
+    (instance.root / 'heldout-verify.py').write_text(
+        "import runpy\nassert runpy.run_path('solution.py')['answer'] == 6\n")
+    config = show_configuration(instance.root)['payload']
+    project = dict(config['phase2_projects'][0], project_id='independent-sum', goal='Sum integers correctly')
+    execution = json.loads(json.dumps(config['project_configs']['answer']))
+    execution.update(source='heldout', verifier='heldout-verify.py')
+    config['tuning'].update(heldout_projects=1, runs_per_arm=1, every_projects=1,
+                           heldout_cases=[dict(project=project, execution=execution)])
+    set_configuration(instance.root, config)
+
+
+def test_configured_heldout_tuning_uses_real_pairs_and_exact_validation_scope(instance):
+    configure_heldout(instance)
+    cycle = instance.create_cycle('tuned', 'phase2')
+    try:
+        incumbent = cycle.scheduler.state['skills']
+        for _ in range(4):
+            cycle.step()  # Original, memory, writer, successful-original validation.
+        assert len([e for e in cycle.scheduler.extension_events() if e['kind'] == 'tuning_due']) == 1
+        cycle.step()  # First real arm.
+        assert cycle.tuning.state['pending']
+        cycle.step()  # Second real arm and conservative tie decision.
+        assert not cycle.tuning.state['pending']
+        path = next((cycle.root / 'evaluations').glob('*/evaluation.json'))
+        from rsi.evaluation import SkillEvaluation
+        evaluation = SkillEvaluation(path, artifacts=cycle.store, runner_factory=cycle.trial)
+        result = evaluation.result()
+        assert evaluation.plan['case_count'] == 1 and evaluation.plan['repetitions'] == 1
+        assert result['decision'] != 'benefit'
+        assert cycle.learning.active == incumbent
+        verdict = cycle.validate(incumbent, evaluation.plan['candidate'], [result['evidence_ref']], 'exact')
+        assert verdict.workflow is False and verdict.correctness is False
+        with pytest.raises(ValueError, match='scope'):
+            cycle.validate('different-incumbent', evaluation.plan['candidate'], [result['evidence_ref']], 'foreign')
+        assert result['actor_seconds'] > 0
+    finally:
+        cycle.close()
+
+
+def test_manual_tuning_guidance_reaches_real_writer_and_frozen_suite(instance):
+    configure_heldout(instance)
+    config = show_configuration(instance.root)['payload']
+    config['tuning'].update(every_projects=None, at_wave_end=False)
+    set_configuration(instance.root, config)
+    cycle = instance.create_cycle('manual', 'phase2')
+    try:
+        for _ in range(5):
+            cycle.step()  # Includes explicit wave-end-disabled receipt.
+        steering = dict(project_ref='answer', user_guidance='Detect numerical mistakes before tuning speed')
+        cycle.request_tuning(steering)
+        cycle.step()
+        cycle.step()
+        assert any(steering['user_guidance'] in prompt for prompt in Roles.prompts)
+        path = next((cycle.root / 'evaluations').glob('*/evaluation.json'))
+        from rsi.evaluation import SkillEvaluation
+        suite = SkillEvaluation(path, artifacts=cycle.store, runner_factory=cycle.trial)
+        assert suite.plan['steering'] == steering
+        assert not cycle.tuning.state['pending']
+    finally:
+        cycle.close()
+
+
+def test_setup_telemetry_is_retained_without_charging_actor_setup(instance):
+    class SlowReady(Decisions):
+        def prepare(self, timeout, *, schemas):
+            time.sleep(.05)
+    instance.test = Bindings(instance.test.query, SlowReady, Roles, instance.test.identity)
+    before = time.time()
+    cycle = instance.create_cycle('telemetry', 'phase1')
+    try:
+        assert cycle.scheduler.state['created'] >= before
+        assert cycle.scheduler.state['created'] == cycle.binding['created']
+        cycle.step()
+        runner = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+        rows = [json.loads(line) for line in (instance.root / 'artifacts/setup.jsonl').read_text().splitlines()]
+        readiness = [r for r in rows if r['category'] == 'actor-process-readiness']
+        assert readiness and readiness[-1]['elapsed_seconds'] >= .05
+        assert runner.workflow.accounting.seconds('setup') >= .05
+        assert all(r['actor_billable'] is False for r in rows)
+        assert any(r['category'] == 'baseline-kdb-copy' for r in rows)
+        assert any(r['category'] == 'project-snapshot-copy-and-bind' for r in rows)
+        for row in rows:
+            assert row['elapsed_seconds'] >= 0 and row['reference']
+            assert cycle.store.read_json(row['reference'])['elapsed_seconds'] == row['elapsed_seconds']
+    finally:
+        cycle.close()

@@ -14,18 +14,23 @@ async function host(name: string, args: unknown, signal?: AbortSignal) {
 }
 
 export default function (pi: ExtensionAPI) {
+  const ordered = process.env.RSI_PI_FIRST_ACTION_ONLY === "1";
+  let batch = 0;
   const schemas = JSON.parse(readFileSync(process.env.RSI_PI_SCHEMAS!, "utf8"));
   const requestBytes = Number(process.env.RSI_PI_REQUEST_BYTES ?? 49152);
   for (const [name, parameters] of Object.entries(schemas)) {
     pi.registerTool(defineTool({
       name, label: name,
+      ...(ordered ? { executionMode: "sequential" as const } : {}),
       description: name === "read_context" ? "Page an admitted host context record using its digest and next_offset."
         : name === "edit_source" ? "Queue an exact, unambiguous source edit against the current SHA256."
         : `Queue the host action ${name}. This receipt does not execute or validate anything.`,
       parameters: parameters as any,
-      async execute(_id, args, signal) {
+      async execute(id, args, signal) {
         try {
-          const result = await host(name, args, signal);
+          const result = ordered
+            ? await host("execute_call", { batch, id }, signal)
+            : await host(name, args, signal);
           return { content: [{ type: "text" as const, text: JSON.stringify(result) }],
             details: undefined, terminate: name !== "read_context" };
         } catch (error) {
@@ -38,6 +43,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => {
     const snapshot = await host("snapshot", {}, ctx.signal);
     pi.setActiveTools(snapshot.allowed);
+  });
+  pi.on("message_end", async (event, ctx) => {
+    if (!ordered || event.message.role !== "assistant") return;
+    batch += 1;
+    // Pinned Pi emits this before argument coercion/tool execution. Python
+    // selects by original model order, independent of HTTP scheduling.
+    await host("propose_batch", { batch, truncated: event.message.stopReason === "length",
+      calls: event.message.content.filter(c => c.type === "toolCall") }, ctx.signal);
   });
   pi.on("turn_end", (event, ctx) => {
     if (event.message.role === "assistant" && event.message.stopReason === "length") ctx.abort();
