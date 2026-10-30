@@ -35,10 +35,10 @@ def comparison(tmp_path, env, request):
     heldout, injected, heldout_db = checkpoint(tmp_path / 'heldout', 'heldout', 'independent heldout',
         **getattr(request, 'param', {}))
     calls = []
-    def factory(request, *, reopen):
+    def factory(request, *, reopen, session_factory=None):
         calls.append((request.arm, reopen))
         kwargs = dict(injected, backend_identity=request.backend_identity,
-                      session_factory=lambda: Session(repair=request.arm == 'candidate'))
+                      session_factory=session_factory or (lambda: Session(repair=request.arm == 'candidate')))
         if reopen:
             return ProjectRunner(request.root, **kwargs)
         return ProjectRunner.create(request.root, request.spec, request.bundle, asdict(request.config), **kwargs)
@@ -145,9 +145,8 @@ def test_ties_and_regressions_do_not_call_learning(comparison, mode, decision):
     create, learner, _, _, _, _, factory = comparison
     evaluation = create()
     def both_repair(request, *, reopen):
-        runner = factory(request, reopen=reopen)
-        runner.actor.session_factory = lambda: Session(repair=mode == 'tie' or request.arm == 'incumbent')
-        return runner
+        return factory(request, reopen=reopen,
+                       session_factory=lambda: Session(repair=mode == 'tie' or request.arm == 'incumbent'))
     # Change the scripted provider, not trusted comparison receipts.
     # Factory remains a real canonical runner; its fixed model identity is unchanged.
     evaluation.factory = both_repair
@@ -320,11 +319,10 @@ def test_provider_only_variance_cannot_promote_even_alongside_task_benefit(compa
             return super().next_action(context, allowed, **kwargs)
     def trial(request, *, reopen):
         nonlocal failed_once
-        runner = factory(request, reopen=reopen)
         if not reopen and request.arm == 'incumbent' and not failed_once:
             failed_once = True
-            runner.actor.session_factory = lambda: ClosedProvider()
-        return runner
+            return factory(request, reopen=reopen, session_factory=lambda: ClosedProvider())
+        return factory(request, reopen=reopen)
     evaluation.factory = trial
     result = finish(evaluation)
     raw = [store.read_json(ref) for ref in result['pairs']]
