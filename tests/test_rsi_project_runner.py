@@ -302,3 +302,111 @@ def test_known_pi_failure_is_durable_charged_and_never_replayed(tmp_path, error_
         assert session.calls == 1
     finally:
         database.close()
+
+
+def test_concurrent_event_append_preserves_every_cas_record(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    import json
+    runner, _, database = make(tmp_path)
+    barrier = Barrier(8)
+    def append(index):
+        barrier.wait(timeout=5)
+        runner.append(dict(type='provider-record', index=index))
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(append, range(8)))
+        refs = json.loads(runner.event_path.read_text())
+        assert refs == runner.event_refs
+        assert [runner.store.read_json(ref) for ref in refs] == runner.events
+        assert {e['index'] for e in runner.events} == set(range(8))
+    finally:
+        database.close()
+
+
+def test_global_task_construction_queries_and_advertised_scopes(tmp_path):
+    class GlobalReader(Session):
+        def next_action(self, context, allowed, **kwargs):
+            stage = Stage(context['stage'])
+            assert ('select_strategy' in allowed) == (stage in (Stage.DESIGN, Stage.OPTIMISATION))
+            assert ('optimisation_decision' in allowed) == (stage == Stage.OPTIMISATION)
+            if 'perform' in allowed:
+                assert set(context['skills']) <= {r['skill'] for r in context['read_skills']}
+                if stage in (Stage.DESIGN, Stage.OPTIMISATION):
+                    assert any(r['name'] == 'select_strategy' for r in context['evidence'])
+                if stage == Stage.OPTIMISATION:
+                    assert any(r['name'] == 'optimisation_decision' for r in context['evidence'])
+            if stage == Stage.TASK_CONSTRUCTION:
+                evidence = {r['name'] for r in context['evidence']}
+                if 'query_kdb' not in evidence:
+                    return 'query_kdb', dict(query='stable sum')
+                if 'retrospect' not in evidence:
+                    return 'retrospect', dict(supplement='Inspect starting task context')
+            return super().next_action(context, allowed, **kwargs)
+    runner, _, database = make(tmp_path, GlobalReader())
+    try:
+        result = runner.run()
+        assert result['status'] == 'accepted', result
+        rows = [runner.store.read_json(e['reference']) for e in runner.events
+                if e['type'] == 'strategy-evidence' and e['kind'] == 'retrieval']
+        assert any(r['context']['stage'] == Stage.TASK_CONSTRUCTION.value for r in rows)
+    finally:
+        database.close()
+
+
+def test_proven_admission_rejection_preserves_counts_time_and_source(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, injections, database = make(tmp_path)
+    try:
+        flow = runner.workflow
+        flow.state['stage'] = Stage.DESIGN.value
+        operation = flow.begin()
+        flow.dispatched(operation, 'pi:closed-admission')
+        token = flow.accounting.start('thinking')
+        flow.accounting.end(token)
+        counts, charged, source = (flow.state['design'], flow.state['executions']), flow.accounting.seconds(), flow.source_hash
+        with pytest.raises(WorkflowError, match='untrusted'):
+            flow.reject_operation(operation, 'unknown-proof', source)
+        proof = dict(handle=flow.pending['handle'], actor_closed=True, no_host_effects=True,
+                     observation='Host observed Pi session closed after rejected tool admission')
+        reference = runner.record_admission_failure(operation, controller_proof=proof, observed_source_hash=source)
+        with pytest.raises(WorkflowError, match='source mismatch'):
+            flow.reject_operation(operation, reference, 'changed-source')
+        reopened = ProjectRunner(runner.root, **injections)
+        reopened.workflow.reject_operation(operation, reference, source)
+        assert reopened.workflow.pending is None
+        assert (reopened.workflow.state['design'], reopened.workflow.state['executions']) == counts
+        assert reopened.workflow.accounting.seconds() == charged
+        assert reopened.workflow.source_hash == source
+        assert reopened.workflow.state['history'][-1]['host_failure_ref'] == reference
+        assert reopened.workflow.begin() != operation
+    finally:
+        database.close()
+
+
+def test_source_change_or_host_effects_veto_closure_proof(tmp_path):
+    from rsi.runtime import WorkflowError
+    runner, _, database = make(tmp_path)
+    try:
+        flow = runner.workflow
+        operation = flow.begin()
+        flow.dispatched(operation, 'pi:unknown')
+        proof = dict(handle='pi:unknown', actor_closed=True, no_host_effects=True,
+                     observation='Controller closure observation')
+        reference = runner.record_admission_failure(operation, controller_proof=proof,
+                                                     observed_source_hash=flow.source_hash)
+        path = runner.backend.project / 'solution.py'
+        original = path.read_text()
+        path.write_text(original + '\n# external change\n')
+        with pytest.raises(WorkflowError, match='untrusted'):
+            flow.reject_operation(operation, reference, flow.source_hash)
+        path.write_text(original)
+        runner.append(dict(type='host-dispatch', operation_id=operation))
+        with pytest.raises(WorkflowError, match='no host effects'):
+            runner.record_admission_failure(operation, controller_proof=proof,
+                                             observed_source_hash=flow.source_hash)
+        with pytest.raises(WorkflowError, match='untrusted'):
+            flow.reject_operation(operation, reference, flow.source_hash)
+        assert flow.pending['id'] == operation
+    finally:
+        database.close()
