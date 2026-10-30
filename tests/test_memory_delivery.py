@@ -69,7 +69,7 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
+def exercise_optimizer_memory_delivery(tmp_path, monkeypatch):
     from optimizer.jobs import JobStore,canonical,sha
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import Agent,Backend,candidate
@@ -120,6 +120,10 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypa
         {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
     assert result['status']=='tool-error'
     assert service.ledger.stats(base['memory_id'])['accesses'] == accesses
+
+
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
+    exercise_optimizer_memory_delivery(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize('withdraw_first',[False,True])
