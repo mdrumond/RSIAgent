@@ -287,6 +287,7 @@ class A3Host(SourceHost):
             self.source_path.write_text(recovery)
             self.source = recovery
         self.feedback, self.observations, self.queries, self.actions = [], [], 0, []
+        self.failures, self.failure_classification = [], None
         self.instruction = json.dumps(dict(proposal=asdict(owner.proposal),
             profile=owner.profile.as_dict(), execution_profile=owner.execution_profile,
             source_contract=CANDIDATE_SOURCE_CONTRACT.as_dict(),
@@ -315,6 +316,20 @@ class A3Host(SourceHost):
         return dict(results=[asdict(row) for row in rows], negative_records=[row for row in
             self.observations if row.get('passed') is False], provenance=dict(binding=self.identity['kdb']))
 
+    def retain_failure(self, operation, result):
+        from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
+        from benchmarks.a3kernels.trial import infrastructure_unavailable
+        turn = len(self.actions)
+        if isinstance(result, FailedEvidence):
+            unavailable = infrastructure_unavailable(result) or self.owner._retryable_failure(operation, result)
+            self.owner._retain_candidate_failure(turn, operation, result, self.failures,
+                self.observations, next_action='terminate-project' if unavailable else 'write_source')
+            if unavailable:
+                self.failure_classification = 'infrastructure-unverified'
+                raise WorkflowError('A3 retained host operation requires infrastructure observation/recovery')
+        elif isinstance(result, VerifiedResult) and not result.passed:
+            self.owner._retain_verification_failure(turn, result, self.failures, self.observations)
+
     def execute(self, stage, args, operation, activity):
         from benchmarks.a3kernels.candidate import CandidateCompilation
         from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
@@ -330,6 +345,7 @@ class A3Host(SourceHost):
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
                     execution_profile=owner.execution_profile))
+            self.retain_failure('compile', self.compilation)
             passed = isinstance(self.compilation, CandidateCompilation)
         if stage in (Stage.TEST, Stage.VALIDATION) and passed:
             if self.compilation is None:
@@ -340,6 +356,7 @@ class A3Host(SourceHost):
                     attempt_id=operation, project_id=owner.proposal.project_id, length=owner._length(),
                     padded_length=owner._padded_length(), block_count=owner._block_count(), seed=0,
                     execution_profile=owner.execution_profile))
+            self.retain_failure('run', self.verified)
             passed = isinstance(self.verified, VerifiedResult) and self.verified.passed
             if passed and self.verified.source_fingerprint != self.compilation.plan.source_fingerprint:
                 raise ValueError('A3 compiler/verification source identity differs')
@@ -412,9 +429,12 @@ def a3_adoption():
             entry_ref = owner.memory.append(memory)['entry_sha256']
             owner.evidence.append(EvidenceKind.RESULT, owner._identity(dict(verified=host.verified,
                                                                           memory_entry_sha256=entry_ref)))
-        return TrialResult('passed' if result['status'] == 'accepted' else result['status'],
-            len(result['history']), sum(e.get('completion_tokens', 0) for e in runner.events), host.verified, host.profile, host.queries,
-            tuple(str(row) for row in host.observations if row.get('passed') is False), entry_ref)
+        from benchmarks.a3kernels.phase1_protocol import VerifiedResult
+        return TrialResult('passed' if result['status'] == 'accepted' else
+            host.failure_classification or result['status'], len(result['history']),
+            sum(e.get('completion_tokens', 0) for e in runner.events),
+            host.verified if isinstance(host.verified, VerifiedResult) else None,
+            host.profile, host.queries, tuple(host.failures), entry_ref)
     return CanonicalAdoption(build, finish)
 
 
