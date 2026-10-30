@@ -133,7 +133,7 @@ def builtin_bundle() -> SkillBundle:
     root = files('rsi').joinpath('templates')
     docs = tuple(SkillDocument(folder.name, folder.joinpath('SKILL.md').read_text(encoding='utf-8'))
                  for folder in root.iterdir() if folder.is_dir())
-    return SkillBundle(docs, tuple((stage, (stage.value, 'kdb')) for stage in Stage))
+    return SkillBundle(docs, tuple((stage, (stage.value.replace('_', '-'), 'kdb')) for stage in Stage))
 
 
 class SkillUsage:
@@ -220,6 +220,7 @@ class SkillUsage:
             record = json.loads(self._receipts[receipt_id])
         except KeyError as exc:
             raise ValueError('unknown host receipt') from exc
+        self.bundle.document(skill).read(section)
         if (record['kind'] != 'read' or record['stage'] != Stage(stage).value
                 or record['skill'] != skill or skill not in self._exposed
                 or record['section'] not in (None, section)):

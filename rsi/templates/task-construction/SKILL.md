@@ -1,5 +1,5 @@
 ---
-name: task_construction
+name: task-construction
 description: RSI output template for freeze the task.
 ---
 # Freeze the task
