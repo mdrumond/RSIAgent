@@ -402,3 +402,46 @@ def test_original_parent_deadline_bounds_current_setup_and_resumed_evaluation(co
     assert store.read_json(old['workflow_receipt'])['created'] == created
     assert len(calls) == 1 and not [op for op in learner.state['operations'].values()
                                    if op['request']['kind'] == 'validation']
+
+
+def test_later_pair_starts_relative_window_at_dispatch_without_resetting_round(comparison):
+    create, learner, calls, store, _, _, factory = comparison
+    class HostClock:
+        offset = 0.
+        def __call__(self):
+            return time.time() + self.offset
+    clock = HostClock()
+    def trial(request, *, reopen):
+        return factory(request, reopen=reopen, session_factory=lambda: Session(repair=True), clock=clock)
+    evaluation = create(repetitions=2, clock=clock,
+        joint_limits=BudgetLimits(6, 4, 40, 120, 1000),
+        remaining_parent={'actor_seconds': 240, 'wall_seconds': 2000})
+    evaluation.factory = trial
+    learner.validate = evaluation.validation
+    frozen = [evaluation.pair(i).frozen for i in range(2)]
+    round_deadline = evaluation.plan['created'] + 2000
+    assert all(evaluation.pair(i).state['wall_started'] is None for i in range(2))
+    evaluation.step()
+    clock.offset += 300  # Scheduling downtime counts toward wall, never actor time.
+    evaluation.step()
+    assert evaluation.pair(0).result()['decision'] == 'inconclusive'  # Real both-pass tie.
+    clock.offset += 300
+    evaluation.step()  # Previously rejected: staged deadline had <500s remaining.
+    second = evaluation.pair(1)
+    started = second.state['wall_started']
+    assert started - evaluation.plan['created'] >= 600
+    assert second.state['wall_deadline'] > evaluation.plan['created'] + 1000
+    assert second.state['wall_deadline'] <= round_deadline
+    old = store.read_json(second.state['arms']['incumbent']['receipt'])
+    assert old['outcome'] == 'accepted' and old['correctness'] is True
+    assert len(calls) == 3 and second.state['arms']['candidate']['status'] == 'ready'
+    resumed = SkillEvaluation(evaluation.path, artifacts=store, runner_factory=trial, clock=clock)
+    assert resumed.pair(1).state['wall_started'] == started
+    clock.offset += 2000  # The original round deadline includes resumed downtime.
+    with pytest.raises(WorkflowError, match='wall allocation'):
+        resumed.step()
+    assert resumed.pair(1).state['wall_started'] == started
+    assert [resumed.pair(i).frozen for i in range(2)] == frozen
+    assert resumed.pair(1).state['wall_deadline'] <= round_deadline
+    assert store.read_json(resumed.pair(1).state['arms']['incumbent']['receipt']) == old
+    assert len(calls) == 3 and learner.active == evaluation.plan['incumbent']

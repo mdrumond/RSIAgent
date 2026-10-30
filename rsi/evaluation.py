@@ -84,7 +84,7 @@ class SkillEvaluation:
                     memory_ref=memory_ref, kdb_ref=kdb_ref, model_config=model_config,
                     incumbent=incumbent, candidate=candidate, joint_limits=limits,
                     remaining_parent={k: remaining_parent.get(k) for k in ('actor_seconds', 'wall_seconds')},
-                    runner_factory=runner_factory, clock=clock)
+                    runner_factory=runner_factory, clock=clock, defer_wall_start=True)
                 plan['pairs'].append(dict(path=str(pair_path.resolve()), frozen=pair.state['frozen'],
                                           case=i, repetition=repetition))
         path.parent.mkdir(parents=True, exist_ok=True)
