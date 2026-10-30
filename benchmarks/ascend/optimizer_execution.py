@@ -177,7 +177,8 @@ class OptimizerTaskExecutor:
                         break
                 require_settled_candidate(self.job_directory / 'execution', prior,
                     historical=prior.get('canonical_active', {}).get('index') !=
-                               self._state().get('canonical_active', {}).get('index'))
+                               self._state().get('canonical_active', {}).get('index'),
+                    stop_requested=self.store.get(self.job_id)['stop_requested'])
                 return completed
             active = self._event('task-attempt-request')
             if active is not None and active['attempt_id'] not in {row['attempt_id'] for row in results}:
@@ -213,7 +214,8 @@ class OptimizerTaskExecutor:
             if candidate is None and self.store.get(self.job_id)['status'] in {'stopped', 'budget-exhausted', 'failed'}:
                 raise WorkerStopped('attempt stopped without a candidate result')
             from rsi.optimizer_settlement import require_settled_candidate
-            require_settled_candidate(loop.directory, state)
+            require_settled_candidate(loop.directory, state,
+                stop_requested=self.store.get(self.job_id)['stop_requested'])
             evidence = candidate.get('content') if candidate else None
             baseline = self._read(state['baseline'])
             verified = bool(evidence and evidence.get('status') == 'verified'

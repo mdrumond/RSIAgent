@@ -968,3 +968,88 @@ def test_cached_public_task_result_rechecks_real_terminal_receipt_integrity(tmp_
         with pytest.raises(FileNotFoundError):task.attempt('same-attempt')
         assert (backend.prepares,backend.evaluations,len(model.contexts))==before
     finally:db.close()
+
+
+def test_explicit_stop_blocks_task_cache_even_with_known_profile_cancellation(tmp_path,monkeypatch):
+    from optimizer.control import ObservedBudgetStop, WorkerStopped
+    holder={}
+    def profile(source,directory,**kwargs):
+        holder['task'].store.stop(holder['task'].job_id)
+        directory.mkdir(parents=True,exist_ok=True)
+        receipt=directory/'transport.json'
+        receipt.write_text(json.dumps(dict(state='cancelled',native_handle='remote:cpu-fixture:job:known-stopped')))
+        raise ObservedBudgetStop('Observed cancellation at explicit user stop',receipt)
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,profile)
+    holder['task']=task
+    try:
+        with pytest.raises(WorkerStopped):task.attempt('same-attempt')
+        before=(backend.prepares,list(backend.evaluations),len(model.contexts))
+        with pytest.raises(WorkerStopped):task.attempt('same-attempt')
+        assert task._event('task-attempt-result') is None
+        assert (backend.prepares,backend.evaluations,len(model.contexts))==before
+    finally:db.close()
+
+
+@pytest.mark.parametrize('recover',[True,False])
+def test_single_debug_edit_pure_denial_preserves_source_receipts_and_optional_profile(tmp_path,recover):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture, Backend
+    from copy import deepcopy
+    class Propose(CanonicalSession):
+        denied=False
+        after=None
+        before=None
+        def next_action(self,context,allowed,**kwargs):
+            if context['stage']=='debug' and not context['unread_skills']:
+                if not self.denied:
+                    self.denied=True;self.before=deepcopy(context)
+                    return 'perform',dict(proposal='Try another candidate after success',edit=dict(
+                        path=context['source']['path'],sha256=context['source']['sha256'],
+                        source=json.dumps(dict(source='another',block_count=1))))
+                self.after=deepcopy(context)
+                return 'perform',dict(proposal='Keep the observed single candidate')
+            names={row['name'] for row in context['evidence']}
+            if (context['stage']=='optimisation' and not context['unread_skills']
+                    and 'select_strategy' in names and 'optimisation_decision' not in names):
+                return 'optimisation_decision',dict(action='profile',reason='Optional same-source diagnostics')
+            return super().next_action(context,allowed,**kwargs)
+    store,key=fixture(tmp_path);backend=Backend()
+    model=Propose(initial=json.dumps(dict(source='fast',block_count=1)),repaired=json.dumps(dict(source='fast',block_count=1)))
+    owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'CPU decisions'}),backend,
+        knowledge=lambda _:[],canonical=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True))
+    runner=owner.canonical.build(owner,prepare_only=False,single_evaluation=True,memory_snapshot=None,context=None)
+    runner.actor.recover_invalid_actions=recover
+    result=runner.run()
+    assert backend.evaluations==['fast'] and store.get(key)['attempts']==1
+    if recover:
+        assert result['status']=='accepted' and backend.profiles==['fast']
+        assert model.after['observation']['executed'] is False
+        assert model.after['operation_id']==model.before['operation_id']
+        assert model.after['read_skills']==model.before['read_skills']
+        assert model.after['source']==model.before['source']
+    else:
+        assert result['status']=='suspended' and runner.workflow.pending['stage']=='debug'
+        assert model.after is None and backend.profiles==[]
+        assert not any(event['type']=='actor-invalid-action' for event in runner.events)
+    operation=model.before['operation_id']
+    assert not any(event['type']=='domain-dispatch' and event['operation_id']==operation
+        and runner.store.read_json(event['reference'])['name']=='edit' for event in runner.events)
+
+
+def test_legacy_remote_timeout_without_native_handle_remains_observation_required(tmp_path):
+    from optimizer.transport import CheckedTransport
+    from optimizer.control import ObservationUnavailable
+    calls=[]
+    def run(argv,**kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=124,interrupted=False,stderr='',stdout=(
+            'CATLASS_VALIDATION_HANDLE=cpu-fixture:legacy-ack\n'
+            'BZ_A3_JOB_STATE=failed exit=124\n'))
+    transport=CheckedTransport(dict(validation_wrapper='/fixture/validate',profile='cpu-fixture',
+        runtime='cpu-fixture',physical_device=0,cpl_remote='/fixture/cpl-remote'),run=run)
+    with pytest.raises(ObservationUnavailable):transport.execute(tmp_path/'operation',['true'])
+    retained=json.loads((tmp_path/'operation/transport.json').read_text())
+    assert retained['deadline_expired'] is True
+    assert retained['handle']=='cpu-fixture:legacy-ack' and 'native_handle' not in retained
+    assert retained['state']!='cancelled'
+    assert len(calls)==1 and 'cancel' not in calls[0] and 'download' not in calls[0]

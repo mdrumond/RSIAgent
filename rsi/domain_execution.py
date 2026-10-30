@@ -309,6 +309,9 @@ class DomainRunner(ProjectRunner):
     def perform(self, stage, args, operation, seconds):
         if self.checked_identity(self.backend) != self.store.read_json(self.contract_ref)['identity']:
             raise CanonicalConfigurationError('domain baseline changed during workflow')
+        admission = getattr(self.backend, 'admit_proposal', None)
+        if admission is not None:
+            admission(stage, args, operation)  # Pure: before intent/edit/reservation/command effects.
         selection = self.selection(operation) if stage in (Stage.DESIGN, Stage.OPTIMISATION) else None
         request = self.latest('actor-request', operation)
         intent = self.store.put_json(dict(kind='domain-stage-intent-v1', operation_id=operation,

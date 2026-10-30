@@ -599,8 +599,21 @@ class WorkflowActor:
                     elif not flow.reserve_execution(operation):
                         raise WorkflowError('stage execution already reserved; reconcile before dispatch')
                 record('host-dispatch', {'timestamp': flow.clock()})
-                result = self._timed(self.host_category,
-                    lambda: self.perform(stage, args, operation, seconds))
+                try:
+                    result = self._timed(self.host_category,
+                        lambda: self.perform(stage, args, operation, seconds))
+                except StrategyRejected as error:
+                    # This type is a pure admission denial, never a failure of
+                    # dispatched host work. Unmanaged TEST/VALIDATION already
+                    # reserved execution and therefore cannot soft-retry here.
+                    if (not self.recover_invalid_actions or not self.managed_executions
+                            and stage in (Stage.TEST, Stage.VALIDATION)):
+                        raise
+                    self._available()
+                    observation = dict(event='invalid-action', action=name, error=str(error)[:500],
+                                       accepted=False, executed=False, **inventory)
+                    record('actor-invalid-action', observation)
+                    continue
                 break
         if not isinstance(result, StageResult):
             raise TypeError('host must return StageResult')

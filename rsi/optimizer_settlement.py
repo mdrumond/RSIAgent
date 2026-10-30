@@ -4,14 +4,16 @@ import json
 from pathlib import Path
 
 from core.artifacts import ContentAddressedArtifacts
-from optimizer.control import ObservationUnavailable, ObservedBudgetStop
+from optimizer.control import ObservationUnavailable, ObservedBudgetStop, WorkerStopped
 from rsi.domain_checkpoint import decode
 from rsi.domain_evidence import completed_effects
 from rsi.runtime import WorkflowError
 
 
-def require_settled_candidate(execution, state, *, historical=False):
+def require_settled_candidate(execution, state, *, stop_requested, historical=False):
     """Candidate history alone never closes a provider or a native operation."""
+    if stop_requested:
+        raise WorkerStopped('explicit stop prevents cached candidate publication')
     active = state.get('canonical_active')
     if not active:
         raise ObservationUnavailable('task result lacks canonical settlement authority')

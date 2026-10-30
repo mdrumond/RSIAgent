@@ -730,10 +730,12 @@ class OptimizerHost(SourceHost):
             raise StrategyRejected('This public attempt already evaluated its candidate. '
                 'Choose profile or noop for this source; a new candidate needs a new public attempt.')
 
-    def before_edit(self, stage, edit, operation, activity):
+    def admit_proposal(self, stage, args, operation):
+        edit = args.get('edit')
         if (self.inputs.get('single_evaluation') and self.evaluation is not None
-                and edit['source'] != self.source):
-            raise WorkflowError('single-evaluation workload forbids another candidate after its observed TEST')
+                and edit is not None and edit['source'] != self.source):
+            raise StrategyRejected('The single-evaluation candidate is fixed after TEST. '
+                'Retain this source; use noop/profile, or start another public attempt for a new candidate.')
 
     def activity_exception_terminal(self, name, error):
         from optimizer.control import ObservedBudgetStop

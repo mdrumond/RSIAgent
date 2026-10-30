@@ -222,6 +222,9 @@ class CheckedTransport:
                     raise WorkerStopped('stopped after cancelling retained operation')
                 raise ObservationUnavailable('local command client interrupted; observe retained handle or recover dispatch')
             if state.get('deadline_expired'):
+                if not state.get('native_handle'):
+                    raise ObservationUnavailable(
+                        'remote timeout lacks an observed native handle; retain legacy acknowledgement for observation')
                 state['state'] = 'cancelled'
                 state['reason'] = 'wall-time budget exhausted'
                 atomic(path, canonical(state))
