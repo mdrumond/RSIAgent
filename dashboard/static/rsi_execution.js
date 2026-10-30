@@ -135,7 +135,7 @@
     $('retained-job').replaceChildren(new Option('Select retained job', ''));
     $('jobs-list').replaceChildren();
     for (const job of value.jobs) {
-      const label = `${job.mode} / ${job.cycle_id} / ${job.state} / ${job.job_id}`;
+      const label = `${job.mode} / ${job.cycle_id} / worker: ${job.state} / service: ${job.service_status || job.result_state || 'not supplied'} / ${job.job_id}`;
       $('retained-job').append(new Option(label, job.job_id));
       const button = document.createElement('button'); button.type = 'button';
       button.textContent = label; button.addEventListener('click', () => inspect(job.job_id));

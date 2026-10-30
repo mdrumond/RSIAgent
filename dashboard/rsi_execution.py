@@ -33,11 +33,18 @@ def _text(payload, key, required=True):
 def _public_job(row):
     """Do not reflect provider config, prompts, exception strings or worker logs."""
     request_data = row.get('request', {})
+    result = row.get('result')
+    result = result if isinstance(result, dict) else {}
+    service_status = result.get('status', result.get('state'))
+    if not isinstance(service_status, str) or service_status not in {'complete', 'completed', 'wave_limit', 'suspended', 'stopped',
+                              'tuned', 'adopted', 'awaiting_tuning', 'blocked', 'budget_exhausted',
+                              'failed', 'running', 'launching'}:
+        service_status = None
     return {**{key: row.get(key) for key in ('job_id', 'state')},
             'mode': request_data.get('mode'), 'cycle_id': request_data.get('cycle_id'),
             'action': request_data.get('action'),
             'configuration_revision': row.get('configuration', {}).get('revision'),
-            'result_state': (row.get('result') or {}).get('state')}
+            'service_status': service_status, 'result_state': service_status}
 
 
 def register_rsi_execution(app, controls, csrf_token, cli):
