@@ -10,7 +10,7 @@ import pytest
 from benchmarks.a5kernels.knowledge import KnowledgeDB
 from rsi.configuration import set_configuration, show_configuration
 from rsi.contracts import BudgetLimits, ProjectSpec, Stage
-from rsi.roles import CurriculumProposal, SkillProposal
+from rsi.roles import CurriculumProposal, ProjectIdea, SkillProposal
 from rsi.services import InstanceServices, TestBindings as Bindings
 from rsi.skills import builtin_bundle
 
@@ -61,7 +61,8 @@ class Roles:
     def curriculum(self, prompt, evidence, *, deadline):
         type(self).prompts.append(prompt)
         self.observer('role_finished', dict(role='curriculum', success=True, elapsed_seconds=0.125))
-        return CurriculumProposal('Retain configured host cases', (evidence[0].evidence_id,), ())
+        return CurriculumProposal('Retain configured host cases', (evidence[0].evidence_id,),
+                                  (ProjectIdea('answer', 'Compute answer', 'Independent verifier passes'),))
 
 
 @pytest.fixture
@@ -211,6 +212,9 @@ def test_role_curriculum_receives_frozen_guidance_and_no_setup_wallcharge(instan
             'curriculum': cycle.config['prompts']['curriculum'],
             'waves': cycle.config['prompts']['waves']}
         assert cycle.role_elapsed('ideas-op') == .125
+        assert cycle.scheduler.state['spent'] == .125
+        assert cycle.propose_curriculum(operation_id='ideas-op', deadline=time.monotonic() + 10) == proposal
+        assert cycle.scheduler.state['spent'] == .125
         with pytest.raises(ValueError, match='finished'):
             cycle.role_elapsed('missing')
     finally:

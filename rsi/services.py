@@ -9,7 +9,7 @@ explicit new cycle (or a linked continuation at a task boundary).
 Credentials are supplied by environment, never saved in contracts. Production
 requires an existing pinned KnowledgeDB; tests must opt into TestBindings.
 """
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -28,7 +28,7 @@ from rsi.learning import Learning, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
-from rsi.roles import AdmittedEvidence, IsolatedRoles
+from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
 from rsi.skills import SkillBundle
 from rsi.strategy import knowledge_db_query
 
@@ -242,15 +242,36 @@ class BoundCycle:
                                         evidence, deadline=deadline)
 
     def propose_curriculum(self, *, operation_id, deadline):
-        '''Typed suggestions only: executable commands still require host configuration.'''
-        self.role_operation = _name(operation_id)
+        """Typed, budgeted suggestions; commands still require host configuration."""
+        operation = _name(operation_id)
+        receipts = self.scheduler.state.get('extension_receipts', {})
+        if operation in receipts:
+            record = self.store.read_json(receipts[operation]['reference'])
+            return _proposal('curriculum', record['proposal'], {self.spec.configuration_ref})
+        if any(e.get('id') == operation for e in self.scheduler.state['events']):
+            raise ValueError('curriculum work pending; observe retained role receipts, never replay')
+        if self.scheduler.state['pending'] or self.controller.state['pending']:
+            raise ValueError('curriculum steering requires a task boundary')
+        remaining = self.scheduler.remaining()
+        for key in ('actor_seconds', 'wall_seconds'):
+            if remaining[key] is not None:
+                deadline = min(deadline, time.monotonic() + remaining[key])
+        if deadline <= time.monotonic():
+            raise TimeoutError('curriculum allocation exhausted')
+        self.scheduler.state['events'].append(dict(kind='curriculum_requested', id=operation))
+        self.scheduler._save()  # Durable before any role/provider setup or dispatch.
+        self.role_operation = operation
         try:
             evidence = [AdmittedEvidence(self.spec.configuration_ref,
                 dict(projects=[p.to_dict() for p in self.spec.projects],
                      memory=self.scheduler.state['memory']))]
             prompt = json.dumps({key: self.config.get('prompts', {}).get(key, '')
                                  for key in ('curriculum', 'waves')})
-            return self.roles().curriculum(prompt, evidence, deadline=deadline)
+            proposal = self.roles().curriculum(prompt, evidence, deadline=deadline)
+            reference = self.store.put_json(dict(proposal=asdict(proposal), operation_id=operation))
+            self.scheduler.complete_extension(operation, reference,
+                actor_seconds=self.role_elapsed(operation))
+            return proposal
         finally:
             self.role_operation = None
 
@@ -369,6 +390,14 @@ class BoundCycle:
         if packet['result']['contract_ref'] != runner.contract_ref:
             raise ValueError('project contract differs')
         result = packet['result']
+        validation = runner.latest('validation-results')
+        if (packet['workflow'] != runner.workflow.state or row['outcome'] != result['status']
+                or runner.backend.project_hash() != result['source_hash']
+                or (result['status'] == 'accepted' and (runner.workflow.outcome != 'accepted'
+                    or runner.workflow.verified_source != result['source_hash']
+                    or not validation or validation['source_hash'] != result['source_hash']
+                    or validation['correctness'] is not True))):
+            raise ValueError('project result differs from authoritative workflow/validation')
         queries, usage = [], []
         for event in runner.events:
             if event['type'] == 'project-tool' and event['name'] == 'query_kdb':
