@@ -39,6 +39,28 @@ class HostTaskResult:
 
 
 @dataclass(frozen=True)
+class IsolationSnapshot:
+    """Host receipt for separate mutable heads, even when CAS content is equal."""
+    namespace: str
+    memory: str
+    skills: str
+    branch_root: str
+    receipt_ref: str
+
+    def verify(self):
+        import hashlib
+        root = Path(self.branch_root).resolve()
+        data = (root / 'isolation.json').read_bytes()
+        proof = json.loads(data)
+        if (hashlib.sha256(data).hexdigest() != self.receipt_ref
+                or proof['namespace'] != self.namespace
+                or proof['memory'] != self.memory or proof['skills'] != self.skills
+                or not (root / 'memory/active.json').is_file()
+                or not (root / 'learning.json').is_file()):
+            raise ValueError('invalid mutable-branch isolation proof')
+
+
+@dataclass(frozen=True)
 class SnapshotUpdate:
     reference: str
     actor_seconds: float = 0.0
@@ -300,6 +322,10 @@ class CycleScheduler:
                     s['events'].append(dict(kind='paired_recovery_due', id=uuid.uuid4().hex,
                                             original=copy.deepcopy(last), memory=s['memory'],
                                             incumbent=s['skills'], candidate=result.reference))
+                elif last['outcome'] == 'accepted':
+                    s['events'].append(dict(kind='candidate_validation_due', id=uuid.uuid4().hex,
+                                            original=copy.deepcopy(last), memory=s['memory'],
+                                            incumbent=s['skills'], candidate=result.reference))
                 self._after_original()
             else:
                 s['memory'] = result.reference
@@ -321,7 +347,13 @@ class CycleScheduler:
             s['recovery_queue'][0]['spec'] = result.to_dict()
             s['phase'] = 'recovery'
         elif kind == 'isolate':
-            if (not isinstance(result, tuple) or len(result) != 2 or
+            if isinstance(result, IsolationSnapshot):
+                result.verify()
+                if result.namespace != s['namespace']:
+                    raise ValueError('isolation namespace differs')
+                s['isolation'] = dict(branch_root=result.branch_root, receipt_ref=result.receipt_ref)
+                result = (result.memory, result.skills)
+            elif (not isinstance(result, tuple) or len(result) != 2 or
                     any(not isinstance(ref, str) or not ref for ref in result) or
                     result[0] == s['memory'] or result[1] == s['skills']):
                 raise ValueError('isolation must return independent memory and skill references')
@@ -330,4 +362,36 @@ class CycleScheduler:
         s['completed_operations'][operation_id] = kind
         s['pending'] = None
         self.needs_reconciliation = False
+        self._save()
+
+    def extension_events(self):
+        """Unacknowledged host extensions; tuning remains owned by PR11."""
+        return copy.deepcopy([e for e in self.state['events']
+            if e.get('id') and e['id'] not in self.state.get('extension_receipts', {})])
+
+    def complete_extension(self, event_id, receipt_ref, *, actor_seconds=0.0, recovery=False):
+        _seconds(actor_seconds)
+        receipts = self.state.setdefault('extension_receipts', {})
+        receipt = dict(reference=receipt_ref, actor_seconds=actor_seconds, recovery=recovery)
+        if event_id in receipts:
+            if receipts[event_id] != receipt:
+                raise ValueError('extension receipt differs')
+            return
+        if not receipt_ref or not any(e.get('id') == event_id for e in self.state['events']):
+            raise ValueError('retained receipt and known event required')
+        receipts[event_id] = receipt
+        self.state['spent'] += actor_seconds
+        if recovery:
+            self.state['recovery_spent'] += actor_seconds
+        self._save()
+
+    def publish_validated_skills(self, expected, reference):
+        """Host coordinator calls only with Learning.active; no candidate activation."""
+        if self.spec.mode == Mode.PHASE1:
+            raise WorkflowError('Phase1 cannot promote skills')
+        if self.state['pending'] or self.state['skills'] not in (expected, reference):
+            raise WorkflowError('skill pointer changed or task running')
+        if not reference:
+            raise ValueError('active bundle reference required')
+        self.state['skills'] = reference
         self._save()
