@@ -190,7 +190,7 @@ def test_actor_still_rejects_multiple_queued_actions(monkeypatch):
         assert session.pending is None
 
 
-def test_real_pi_rejects_prose_evidence_then_corrects_without_context_growth(monkeypatch):
+def test_real_pi_rejects_prose_evidence_then_corrects_with_native_history(monkeypatch):
     try:
         runtime_preflight()
     except RuntimeError:
@@ -204,7 +204,7 @@ def test_real_pi_rejects_prose_evidence_then_corrects_without_context_growth(mon
         action = next(actions)
         name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
         calls.append(json.loads(options['data']))
-        assert len(options['data']) < 20000
+        assert len(options['data']) <= 196608
         return stream(name, args, len(calls))
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,

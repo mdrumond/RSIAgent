@@ -66,6 +66,7 @@ class PiRPC:
         deadline = time.monotonic() + self.timeout
         accepted = settled = False
         failure = None
+        failure_message = ""
         while not (accepted and settled):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -93,10 +94,16 @@ class PiRPC:
                 msg = event.get("message", {})
                 if msg.get("role") == "assistant" and msg.get("stopReason") in ("error", "aborted"):
                     failure = PiCancelled if msg.get("stopReason") == "aborted" else PiProviderError
+                    failure_message = str(msg.get("errorMessage") or msg.get("stopReason"))[:1000]
+                elif msg.get("role") == "assistant":
+                    # Pi can compact and retry before agent_settled. A recovered
+                    # response supersedes the failed low-level request.
+                    failure = None
+                    failure_message = ""
             if event.get("type") == "agent_settled":
                 settled = True
         if failure:
-            raise failure("Pi provider request failed or was aborted")
+            raise failure("Pi provider request failed: " + failure_message)
         return self.events
 
     def _kill(self, sig):

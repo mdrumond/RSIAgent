@@ -53,12 +53,11 @@ def safe_provider_error(error, api_key, token):
 
 
 class Gateway:
-    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None, request_projector=None):
+    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None):
         self.provider, self.spec = provider, dict(PROVIDERS[provider])
         if max_output_tokens is not None:
             self.spec["max_tokens"] = max_output_tokens
         self.records_path = records_path
-        self.request_projector = request_projector
         self.hard_bytes = hard_bytes
         self.on_record = on_record or (lambda *_: None)
         self.finished = threading.Event()
@@ -95,8 +94,6 @@ class Gateway:
         if request.get("stream") and not responses:
             request["stream_options"] = {"include_usage": True}
         request["parallel_tool_calls"] = False
-        if self.request_projector is not None:
-            request = self.request_projector(request, responses=responses, hard_bytes=self.hard_bytes)
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > self.hard_bytes:
             raise ValueError("provider request exceeds context hard byte budget")
@@ -122,7 +119,7 @@ class Gateway:
                 started_epoch = time.time()
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= (8388608 if owner.request_projector is not None else 524288):
+                    if not 0 < size <= max(524288, owner.hard_bytes * 2):
                         return self.error(413, "smoke request size limit")
                     payload = json.loads(self.rfile.read(size))
                     responses = self.path == "/v1/responses"
@@ -134,6 +131,8 @@ class Gateway:
                         rid = owner.budget.reserve(request, output_tokens=owner.spec["max_tokens"],
                                                    rates=owner.spec["rates"], label=owner.label)
                         owner.calls += 1
+                        if owner.stop_reason == "context-limit":
+                            owner.stop_reason = None  # Pi successfully rebuilt a request after overflow.
                 except TimeoutError as exc:
                     owner.stop_reason = owner.stop_reason or "deadline"
                     return self.error(408, str(exc))
@@ -141,7 +140,7 @@ class Gateway:
                     if isinstance(error, ContextLimitError) or "hard byte" in str(error):
                         owner.stop_reason = "context-limit"
                         owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes})
-                        return self.error(413, "request context exceeds the configured byte limit")
+                        return self.error(413, "request_too_large: request context exceeds the configured byte limit")
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
                 owner.records.append(row)
@@ -166,7 +165,8 @@ class Gateway:
                                 row["provider_error"] = safe_provider_error(error, owner.api_key, owner.token)
                             except (ValueError, AttributeError, TypeError):
                                 pass
-                            return self.error(502, f"provider HTTP {response.status_code}")
+                            return self.error(502, f"provider HTTP {response.status_code}: " +
+                                str(row.get("provider_error", {}).get("message", "request failed")))
                         if request.get("stream"):
                             self.send_response(200)
                             self.send_header("Content-Type", "text/event-stream")

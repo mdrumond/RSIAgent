@@ -157,7 +157,7 @@ def test_real_pi_reads_admitted_large_guide_with_complete_exchange(monkeypatch):
         call_ids = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
         results = {m['tool_call_id'] for m in request['messages'] if m['role']=='tool'}
         assert call_ids == results == {'call_0'}
-        assert len(kwargs['data']) <= 49152
+        assert len(kwargs['data']) <= 196608
         return stream('write', {'source':'kernel using the admitted guide'}, 1)
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with session(max_calls=2) as pi:
@@ -188,7 +188,7 @@ def test_real_pi_accumulates_three_pages_then_refreshes_host_turn(monkeypatch):
             return stream('write', {'source': ''.join(page['text'][0] for page in pages)}, index)
         assert index == 4  # A queued host action must not trigger another provider request.
         assert snapshot['context']['host'] == {'task': 'NEW', 'feedback': 'current'}
-        assert not pages and not any(m.get('tool_calls') for m in messages)
+        assert len(pages) == 4  # Pi retains history; only the injected snapshot changes.
         return stream('write', {'source': 'new'}, index)
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with session() as pi:
@@ -196,6 +196,7 @@ def test_real_pi_accumulates_three_pages_then_refreshes_host_turn(monkeypatch):
                               record=lambda *args: records.append(args)) == ('write', {'source': 'abc'})
         assert len(calls) == 4
         assert pi.next_action({'task': 'NEW', 'feedback': 'current'}, ['write']) == ('write', {'source': 'new'})
+        assert pi.context.read(reference, 0, 2048)['text'] == guide[:2048]
         assert len(calls) == 5
     reads = [payload for kind, payload in records if kind == 'pi-context-read']
     assert [row['offset'] for row in reads] == [0, 2048, 4096]
@@ -302,7 +303,7 @@ def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monke
         request = json.loads(kwargs['data'])
         index = len(requests)
         requests.append(request)
-        assert len(kwargs['data']) <= 49152
+        assert len(kwargs['data']) <= 196608
         if index == 0:
             packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
             refs.update({key: packet['context']['host'][key]['record'] for key in ['instruction', 'source']})
@@ -312,9 +313,9 @@ def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monke
             return stream('read_context', dict(record=record, offset=offset, limit=8192), index)
         if index in (3, 4):
             retained = pages(request)
-            assert len(retained) == 3
+            assert len(retained) == (3 if index == 3 else 4)
             assert {(row['record'], row['offset']) for row in retained} == set(reads)
-            assert ''.join(row['text'] for row in sorted(retained, key=lambda row: row['offset'])
+            assert ''.join(row['text'] for row in sorted(retained[:3], key=lambda row: row['offset'])
                            if row['record'] == refs['instruction']) == instruction
             assert next(row['text'] for row in retained if row['record'] == refs['source']) == source
             calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
@@ -322,7 +323,7 @@ def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monke
             if index == 3:
                 return stream('read_context', dict(limit=8192, offset=0, record=refs['instruction']), index)
         if index == 5:
-            assert not pages(request)
+            assert len(pages(request)) == 5
         return stream('write', {'source': 'kernel'}, index)
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with session() as pi:
@@ -338,7 +339,7 @@ def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete
         request = json.loads(kwargs['data'])
         index = len(requests)
         requests.append(request)
-        assert len(kwargs['data']) <= 49152
+        assert len(kwargs['data']) <= 196608
         packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
         calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
         results = [m for m in request['messages'] if m['role'] == 'tool']
@@ -346,7 +347,7 @@ def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete
         if index:
             assert any(json.loads(m['content'])['offset'] == (index-1)*4096 for m in results)
         if index == 10:
-            assert 1 < len(results) < 10
+            assert len(results) == 10
             return stream('write', {'source': 'bounded kernel'}, index)
         return stream('read_context', {'record': packet['context']['host']['guide']['record'],
                                       'offset': index*4096, 'limit': 4096}, index)
@@ -676,14 +677,14 @@ def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_pat
     assert 'submit' in feedback['allowed_actions']
 
 
-def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
+def test_real_pi_escaped_snapshot_preserves_complete_pages_under_gateway_request_cap(monkeypatch):
     requests = []
     context = {'guide': 'Page contents. ' * 2000,
                'quoted': {f'field-{index}': '\\"' * 240 for index in range(16)}}
     def provider(*_, **kwargs):
         request = json.loads(kwargs['data'])
         requests.append(request)
-        assert len(kwargs['data']) <= 49152
+        assert len(kwargs['data']) <= 196608
         snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role'] == 'user'))
         assert snapshot['context']['host']['quoted'] == context['quoted']
         index = len(requests) - 1
@@ -691,7 +692,7 @@ def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(mo
         if index:
             assert any(row['offset'] == (index - 1) * 7400 for row in retained)
         if index == 2:
-            assert [row['offset'] for row in retained] == [7400]
+            assert [row['offset'] for row in retained] == [0, 7400]
             calls = {call['id'] for row in request['messages'] for call in row.get('tool_calls', [])}
             assert calls == {row['tool_call_id'] for row in request['messages'] if row['role'] == 'tool'}
             return stream('write', {'source': 'selected after bounded paging'}, index)

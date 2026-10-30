@@ -42,6 +42,15 @@ export default function (pi: ExtensionAPI) {
     await host("propose_batch", { batch, truncated: event.message.stopReason === "length",
       calls: event.message.content.filter(c => c.type === "toolCall") });
   });
-  // No context replacement: Pi retains real tool exchanges across the review.
-  // Python's gateway projects the entire serialized request before forwarding.
+  pi.on("context", async (event, ctx) => {
+    const snapshot = await host("snapshot", {}, ctx.signal);
+    return { messages: [{ role: "user" as const, content: JSON.stringify(snapshot),
+      timestamp: Date.now() }, ...event.messages] };
+  });
+  pi.on("session_compact_failed", async (event) => {
+    await host("compaction", { error: event.errorMessage, aborted: event.aborted });
+  });
+  pi.on("session_compact", async (event) => {
+    await host("compaction", { fromExtension: event.fromExtension });
+  });
 }

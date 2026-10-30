@@ -33,15 +33,17 @@ The host supplies a task snapshot and a set of allowed typed tools. Pi can page 
 
 Each logical attempt owns its Pi process. The optimizer uses a persistent supervised child across host actions; Stop, deadlines, worker disappearance, and normal loop exit terminate its process group. Project sessions remain separate under parallel campaign execution.
 
-The extension disables built-in filesystem/shell tools, automatic retries, automatic paid compaction, cache warming, external context discovery, skills, and MCP discovery. Pi receives an isolated home directory and temporary loopback credentials, while model credentials remain in the Python gateway. This is a restricted tool interface, not a general operating-system sandbox.
+The extension disables built-in filesystem/shell tools, automatic network retries, cache warming, external context discovery, skills, and MCP discovery. Pi receives an isolated home directory and temporary loopback credentials, while model credentials remain in the Python gateway. This is a restricted tool interface, not a general operating-system sandbox.
 
 The host validates both the executed arguments and the original assistant arguments because Pi can coerce scalar types. Wrong-stage tools, ambiguous/stale edits, truncated output, and multiple mutations do not release a queued host action. Existing parsers and execution gates remain the final authority.
 
 ## Context and accounting
 
-Large guides, source, memory, and observations become hash-addressed admitted records with previews. `read_context` returns at most 8 KiB with an explicit continuation offset. The latest complete tool exchange is retained within a host turn; superseded turns are replaced by the authoritative host snapshot. This avoids replaying entire source revisions and diagnostics.
+Large guides, source, memory, and observations remain hash-addressed admitted records with bounded previews and paged `read_context` access. Pi owns conversation history and automatically summarizes older exchanges. RSI no longer drops Actor history or rewrites verifier provider requests. A fresh host snapshot is injected on each normal request: current source hashes, allowed actions, verification results and memory obligations remain authoritative outside summaries. A summary cannot admit a tool or establish host verification.
 
-DeepSeek snapshots target 16 KiB, leaving space inside the existing 24 KiB target / 32 KiB high / 48 KiB hard production context envelope for the system prompt, tool schemas, framing, and one page exchange. The gateway measures the complete serialized outgoing request and refuses anything above 48 KiB before upstream HTTP, independently of Pi's context hooks. OpenAI retains the larger registered hard envelope. Mandatory snapshots that do not fit fail locally; no model call is used to summarize them.
+Pi uses conservative effective context windows of 24,576 tokens for DeepSeek and 65,536 for OpenAI, reserving 8,192 and 32,768 for response and framing respectively and retaining one eighth as recent history. These are integration budgets, not provider model-capacity claims. The complete serialized gateway guards are 192 KiB and 768 KiB respectively, leaving space for JSON escaping, tools, host snapshots and native compaction requests. Token estimates cannot exactly predict serialized bytes; the gateway still rejects oversize packets before provider dispatch with an overflow error Pi recognizes. Mandatory snapshots that cannot fit remain local failures.
+
+Pi's own summarization requests use the same credential-isolated gateway, usage accounting, deadline and cancellation as ordinary requests. Pi can compact and retry an overflow once; RSI waits for final settlement and preserves the underlying diagnostic if recovery fails. Transient-network retries remain disabled. Summaries and model history do not replace retained host evidence.
 
 Runtime budgets use elapsed seconds. Compile probes, host actions, context pages, provider requests, evaluated candidates, cumulative tokens, and estimated spend are telemetry and do not stop execution. Pi and the optimizer supervisor enforce the enclosing deadline and cancellation. Per-request context and output-size limits still apply. Legacy count and dollar arguments remain accepted for configuration compatibility but do not enforce caps. Resume preserves elapsed allocations; incompatible engine or budget identities require a fresh attempt.
 
@@ -69,7 +71,7 @@ The full Pi matmul-add generation smoke was **not run**. A3 access is no longer 
 
 ## Review and validation
 
-Runtime code lives in `coding/pi/`; the sole extension is `integrations/pi/host-actions.ts`. Production adapters never import runtime code from the microbenchmark package. The prototype's remote adapter and connection example were removed from the introduced branch history. Existing main-branch execution adapters remain in use.
+Runtime code lives in `coding/pi/`; typed extensions are `integrations/pi/host-actions.ts` and `integrations/pi/verifier-tools.ts`. Production adapters never import runtime code from the microbenchmark package. The prototype's remote adapter and connection example were removed from the introduced branch history. Existing main-branch execution adapters remain in use.
 
 Suggested review order:
 

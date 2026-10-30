@@ -6,7 +6,6 @@ from coding.pi.context import encoded
 from coding.pi.schema import obj, STRING, INTEGER, validate
 from coding.pi.session import PiCodingSession, ROOT
 from .review_context import ReviewContextRecords
-from .review_projection import ReviewRequestProjector
 
 
 def original_arguments(value, schema):
@@ -69,9 +68,14 @@ class PiReviewSession(PiCodingSession):
             'limit': {'type': 'integer', 'minimum': 1, 'maximum': 2048}}, ['record'])
 
     def _operation(self, name, args):
+        if name == 'compaction':
+            result = super()._operation(name, args)
+            self.failure = self.compaction_failure
+            return result
         with self.lock:
             if name == 'snapshot':
-                return dict(allowed=self.state.allowed() + ['read_context'])
+                return dict(allowed=self.state.allowed() + ['read_context'],
+                    review_context=self.context.snapshot(self.view(), target=12000))
             if name == 'transcript':
                 message = args['message']
                 self.record('pi-transcript', dict(batch=args['batch'], message=message))
@@ -160,7 +164,6 @@ class PiReviewSession(PiCodingSession):
     def review(self, state):
         self.state, state.native = state, True
         self.record = state.agent._record
-        self.gateway.request_projector = ReviewRequestProjector(self.context, self.view, self.record)
         self._start()
         while state.decision is None:
             self.rpc.timeout = state.remaining()

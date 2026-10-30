@@ -25,7 +25,7 @@ def native(h, monkeypatch, batches):
     def http(*_, **options):
         payload = json.loads(options['data'])
         calls.append(payload)
-        assert len(options['data']) <= 49152
+        assert len(options['data']) <= 196608
         batch = next(batches)
         return batch(payload) if callable(batch) else stream_many(batch)
     monkeypatch.setattr('coding.pi.gateway.requests.post', http)
@@ -143,27 +143,41 @@ def test_model_end_without_verdict_continues_same_review_without_auto_accept(mon
     assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
 
 
-def test_native_long_conversation_projects_whole_packets_without_dropping_tool_pairs(monkeypatch):
-    from benchmarks.ascend.review_projection import exchanges
-    import hashlib
+def test_native_compaction_preserves_host_gate_and_does_not_replay_tools(monkeypatch):
+    from benchmarks.ascend.native_review import PiReviewSession
+    from benchmarks.ascend.pi_project_verifier import SCHEMAS, SYSTEM
+    from test_pi_native_compaction import text_response, with_usage
     h = Harness([], knowledge={'memories': [], 'citations': [], 'hits': [
         {'citation': {'collection': 'baseline', 'path': f'kernel{i}.cpp'}, 'text': 'α'*500}
         for i in range(5)]})
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('Node22 and pinned Pi required')
+    normal, summaries = [], []
     query = {'knowledge_query': {'query': 'increment examples'}}
-    calls = native(h, monkeypatch, [[query]] * 70 + [prerequisites(), [decision(memory())]])
-    assert h.agent.review(request(), max_seconds=40) == decision(memory())
-    projections = [e['payload'] for e in h.agent.last_trace if e['kind'] == 'pi-request-projection']
-    assert any(p['raw_bytes'] > 49152 for p in projections)
-    assert all(p['forwarded_bytes'] <= 49152 for p in projections)
-    final = calls[-1]
+    actions = iter([[query]] * 120 + [[decision()], prerequisites(), [decision(memory())]])
+    def http(*_, **options):
+        payload = json.loads(options['data'])
+        assert len(options['data']) <= 196608
+        if not payload.get('tools'):
+            summaries.append(payload)
+            return text_response('Reviewed examples; authoritative host review state determines readiness.')
+        normal.append(payload)
+        return with_usage(stream_many(next(actions)), len(options['data']) // 4)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', http)
+    h.agent.session_factory = lambda **options: PiReviewSession(model='deepseek-flash', schemas=SCHEMAS,
+        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
+        deadline=time.monotonic()+options['max_seconds'])
+    assert h.agent.review(request(), max_seconds=60) == decision(memory())
+    assert summaries
+    assert any(e['kind'] == 'pi-compaction' for e in h.agent.last_trace)
+    assert any(e['kind'] == 'feedback' for e in h.agent.last_trace)  # Summary cannot admit an early verdict.
+    assert len(h.queries) == 121  # 120 requested queries plus prerequisites, never replayed by compaction.
+    assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
+    assert len(normal) == 123
+    final = normal[-1]
     metadata = json.loads(next(m['content'] for m in final['messages'] if m['role'] == 'user'))
-    reference = metadata['older_exchanges']
-    stored = next(e['payload'] for e in h.agent.last_trace if e['kind'] == 'pi-context-record'
-                  and e['payload']['record'] == reference['record'])
-    assert hashlib.sha256(stored['text'].encode()).hexdigest() == reference['record']
-    archived = json.loads(stored['text'])
-    assert any(batch for _, batch in exchanges(archived))
-    assert any(batch for _, batch in exchanges(final['messages']))
     assert metadata['review_context']['host']['review_state']['ready_for_decision'] is True
 
 

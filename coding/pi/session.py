@@ -15,12 +15,12 @@ import uuid
 
 from .context import ContextRecords, encoded
 from .gateway import Gateway, PROVIDERS
-from .rpc import PiError, PiRPC, PiDeadlineError
+from .rpc import PiError, PiRPC, PiDeadlineError, PiCancelled
 from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 4, "context_policy": "bounded-host-turn-history-v3",
+                   "adapter_version": 5, "context_policy": "pi-native-compaction-v1",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
@@ -110,7 +110,7 @@ class PiCodingSession:
         self.gateway = Gateway(provider, key, RequestAccounting(), "production-pi",
                                max_calls=max_calls, deadline=self.deadline,
                                max_output_tokens=8192 if provider == "deepseek" else 32768,
-                               hard_bytes=49152 if provider == "deepseek" else 196608)
+                               hard_bytes=196608 if provider == "deepseek" else 786432)
         self.schemas = dict(schemas)
         self.schemas["read_context"] = obj({"record": STRING, "offset": INTEGER,
                                            "limit": {"type": "integer", "minimum": 1, "maximum": 8192}},
@@ -133,9 +133,16 @@ class PiCodingSession:
         self.gateway.on_record = lambda kind, payload: self.record(kind, payload)
         self.closed = False
         self.context_reads = {}
+        self.compaction_failure = None
 
     def _operation(self, name, args):
         with self.lock:
+            if name == "compaction":
+                self.record("pi-compaction", args)
+                if args.get("error"):
+                    failure = PiCancelled if args.get("aborted") else PiError
+                    self.compaction_failure = failure("Pi compaction failed: " + str(args["error"])[:1000])
+                return {}
             if name == "snapshot":
                 return {"context": self.snapshot, "allowed": sorted(self.allowed)}
             if name not in self.allowed:
@@ -174,8 +181,13 @@ class PiCodingSession:
         directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="rsi-pi-")))
         directory.chmod(0o700)
         (directory / "schemas.json").write_bytes(encoded(self.schemas))
+        # The effective context window is deliberately conservative: Pi owns
+        # history and summaries; the larger byte guard includes JSON escaping,
+        # tool schemas, fresh host snapshots, and compaction request envelopes.
         (directory / "settings.json").write_bytes(encoded({
-            "retry": {"enabled": False}, "compaction": {"enabled": False},
+            "retry": {"enabled": False}, "compaction": {"enabled": True,
+                "reserveTokens": self.gateway.spec["max_tokens"],
+                "keepRecentTokens": 3072 if self.gateway.provider == "deepseek" else 8192},
             "cacheWarming": "off", "quietStartup": True}))
         spec = self.gateway.spec
         (directory / "models.json").write_bytes(encoded({"providers": {"rsi-host": {
@@ -184,7 +196,7 @@ class PiCodingSession:
             "apiKey": "${RSI_PI_GATEWAY_TOKEN}",
             "models": [{"id": spec["model"], "name": spec["model"],
                         "reasoning": self.gateway.provider == "openai", "input": ["text"],
-                        "contextWindow": 65536, "maxTokens": spec["max_tokens"],
+                        "contextWindow": 24576 if self.gateway.provider == "deepseek" else 65536, "maxTokens": spec["max_tokens"],
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}],
         }}}))
         owner = self
@@ -256,7 +268,8 @@ class PiCodingSession:
         if source is not None and write_action is not None:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
-        self.context = self.context_factory()
+        # Pi summaries may still cite an older admitted digest. Keep immutable
+        # pages for this session; only the fresh snapshot is current authority.
         self.context_reads = {}
         self.snapshot = self.context.snapshot({
             "host": context,
@@ -277,6 +290,9 @@ class PiCodingSession:
                 if any(e.get("message", {}).get("stopReason") == "length" for e in self.rpc.events[start:]):
                     raise ActionError("truncated Pi tool call; no action accepted") from None
                 raise
+            if self.compaction_failure is not None:
+                self.pending = None
+                raise self.compaction_failure
             if not self.gateway.finished.wait(timeout=min(5, max(.1, self.deadline-time.monotonic()))):
                 raise PiError("provider accounting did not settle")
             events = self.rpc.events[start:]
