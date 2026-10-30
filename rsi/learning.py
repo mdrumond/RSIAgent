@@ -10,6 +10,9 @@ role_elapsed(operation_id) must read elapsed_seconds from the trusted host
 role_finished ledger for that operation; elapsed_seconds excludes role setup.
 Missing/malformed receipts suspend accounting and leave provider work pending.
 Only this adapter can admit evidence; model proposals cannot introduce facts.
+Optional observations are host-scoped goals/source/diagnostics/performance and
+strategies labelled as model claims. Preserve their labels, not success-derived
+validity. They flow into accepted SubjectMemory records and writer context.
 usage_complete=True is a host attestation that citation/application telemetry was
 fully observed. Without it, exposure cannot establish nonuse. Skill/content hashes
 identify the exact version; names alone never establish pruning eligibility.
@@ -163,6 +166,8 @@ class Learning:
             kind = 'correctness' if packet['outcome'] == 'accepted' and 'correctness' in kinds else 'failure'
             proposal = dict(base_versions=[], kind=kind, project_id=project,
                             summary=packet['outcome'], evidence=list(packet['evidence']))
+            if 'observations' in packet:
+                proposal['observations'] = packet['observations']
             self.memory.accept(identity + ':' + project, proposal,
                 dict(packet=packet_ref, baseline=baseline, queries=packet['queries'], raw_refs=packet['raw_refs']))
             if not ctx.get('recovery'):
@@ -213,10 +218,13 @@ class Learning:
         packets = {key: self.store.read_json(ref) for key, ref in self.state['projects'].items()}
         if current is not None:
             packets[current['project_id']] = current
-        queries, sections, outcomes = {}, {}, []
+        queries, sections, outcomes, observations = {}, {}, [], []
         priority = {'counterevidence': 0, 'failure': 1, 'avoidance': 1, 'recovery': 2,
                     'correctness': 3, 'review': 3, 'performance': 4}
         for project, packet in packets.items():
+            if 'observations' in packet:
+                observations.append(dict(project=project, packet_ref=self.store.put_json(packet),
+                    evidence_ids=list(packet['evidence']), observations=packet['observations']))
             for ref, info in packet['evidence'].items():
                 outcomes.append(dict(project=project, reference=ref, kind=info['kind'],
                                      summary=info['summary'][:500]))
@@ -232,7 +240,7 @@ class Learning:
                 counts = sections.setdefault(key, {})
                 counts.setdefault(event['kind'], set()).add(project)
         return dict(outcomes=sorted(outcomes, key=lambda x: priority[x['kind']]),
-                    queries=queries, sections={key: {kind: sorted(ids) for kind, ids in counts.items()}
+                    observations=observations, queries=queries, sections={key: {kind: sorted(ids) for kind, ids in counts.items()}
                                               for key, counts in sections.items()})
 
     def skill_update(self, incumbent, memory_ref, row, ctx):
@@ -270,6 +278,7 @@ class Learning:
         context['aggregate_ref'] = self.store.put_json(context['aggregate'])
         context['aggregate']['queries'] = dict(list(context['aggregate']['queries'].items())[-10:])
         context['aggregate']['outcomes'] = context['aggregate']['outcomes'][:10]
+        context['aggregate']['observations'] = context['aggregate']['observations'][-10:]
         context['aggregate']['sections'] = {key: {kind: ids[-10:] for kind, ids in counts.items()}
                                             for key, counts in context['aggregate']['sections'].items()}
         # Freeze precisely the historical evidence admitted to this invocation.
@@ -277,6 +286,7 @@ class Learning:
         sources = {ref: [packet_ref] for ref in admitted}
         selected = {item['reference'] for item in context['aggregate']['outcomes']}
         selected.update(ref for query in context['aggregate']['queries'].values() for ref in query['evidence_ids'])
+        selected.update(ref for item in context['aggregate']['observations'] for ref in item['evidence_ids'])
         for project, ref in self.state['projects'].items():
             historical = self.store.read_json(ref)
             for evidence_id, info in historical['evidence'].items():

@@ -451,3 +451,38 @@ def test_writer_corrects_frozen_full_baseline_without_retrieval_tools(env, tmp_p
     frozen_context = store.read_json(learner.state['operations'][ctx['operation_id']]['writer_context'])
     assert frozen_context['baseline_documents']['debug']['content'] == original
     assert learner.evaluate(candidate, ('numeric-case',), 'v') == candidate
+
+
+def test_observations_reach_subject_memory_search_and_writer_as_labelled_evidence(env):
+    store, role, bundle, memory, baseline, packets, make, project = env
+    row, ctx = project('numeric')
+    observations = dict(goal='accurate compensated summation', final_source='frozen-source-hash',
+        diagnostics=[dict(command_ref=row['artifact_ref'], result='cancellation reproduced')],
+        strategies=[dict(status='model_claim', strategy='compensated summation may recover accuracy')])
+    packets['numeric']['observations'] = observations
+    learner = make('phase1')
+    learner.memory_update(baseline, [row], ctx)
+    hits = memory.search('compensated')
+    assert len(hits) == 1
+    assert hits[0]['proposal']['observations'] == observations
+    assert hits[0]['proposal']['kind'] == 'failure'
+    aggregate = learner.aggregate()
+    observed = aggregate['observations'][0]
+    assert observed['observations']['strategies'][0]['status'] == 'model_claim'
+    assert store.read_json(observed['packet_ref'])['observations'] == observations
+    assert observed['evidence_ids'] == [row['artifact_ref']]
+    # A fresh Phase2 controller consumes the same trusted observations in role context.
+    phase2_path = learner.path.with_name('phase2.json')
+    from rsi.learning import Learning
+    seen = []
+    original_writer = role.skillwriter
+    def inspect_context(prompt, evidence, *, deadline):
+        context = json.loads(prompt[prompt.index('{"aggregate"'):])
+        seen.append(context['aggregate']['observations'][0]['observations'])
+        return original_writer(prompt, evidence, deadline=deadline)
+    role.skillwriter = inspect_context
+    phase2 = Learning(phase2_path, store, memory, role, load_project=lambda r: packets[r['original_id']],
+        validate=lambda *args: Validation(None, None, row['artifact_ref']), role_elapsed=lambda op: 2)
+    phase2.skill_update(bundle, baseline, row, dict(ctx, operation_id='skills'))
+    assert seen == [observations]
+    assert phase2.active == bundle
