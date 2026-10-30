@@ -30,8 +30,13 @@ class TuningBindings:
             raise ValueError('no evidence-supported candidate for active skill bundle')
         return candidates[-1]
 
-    def request_tuning(self, steering):
+    def request_tuning(self, steering, *, request_id=None):
         self.tuning_settings()  # Fail before enqueueing work when curriculum is absent.
+        self.tuning_project({'steering': steering})
+        if request_id is not None:
+            if not isinstance(request_id, str) or not request_id.strip():
+                raise ValueError('tuning request identity required')
+            return self.scheduler.enqueue_tuning(request_id, steering)
         return self.tuning.request(steering)
 
     def tuning_project(self, event):

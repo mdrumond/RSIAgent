@@ -43,6 +43,7 @@ def inspect_task(path, *, clock=time.time):
         excluded_seconds={k: category(k) for k in sorted(ActorClock.EXCLUDED)},
         actor_union_seconds=union, remaining=remaining, accounting_state=condition,
         intervals=intervals, clock_domain='controller', timing_uncertainties=state.get('timing_uncertainties', {}),
+        timing_receipts=state.get('timing_receipts', {}),
         source_hash=state['source'], stage=state['stage'])
     manifest = path / 'runner.json'
     if manifest.exists():
