@@ -581,16 +581,30 @@ class WorkflowActor:
 
 class PiSessionAdapter(SnapshotPiSessionAdapter):
     """Canonical Pi-native controller; Pi owns conversation and compaction."""
-    def __init__(self, **kwargs):
-        from coding.pi.controller import ControllerSession
-        self.delivery = SkillDelivery()
-        self.session = ControllerSession(schemas=SCHEMAS, system_prompt=(
+    system_prompt = (
             'You execute the canonical RSI workflow through completed host tools. '
             'Read all mapped skills, query real evidence, and follow the authoritative stage. '
             'Tool results are actual host observations. Read paged resources with read_context. '
             'Only perform completes a stage; model assertions do not establish success. '
-            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.'), **kwargs)
+            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.')
+
+    def __init__(self, **kwargs):
+        from coding.pi.controller import ControllerSession
+        self.delivery = SkillDelivery()
+        self.session = ControllerSession(schemas=SCHEMAS,system_prompt=self.system_prompt,**kwargs)
         self.session.gateway.request_projector = self._project_tools
+
+    @classmethod
+    def from_existing_session(cls, session):
+        from coding.pi.controller import ControllerSession
+        controller = ControllerSession.from_existing_session(session)
+        adapter = cls.__new__(cls)
+        adapter.delivery = SkillDelivery()
+        adapter.session = controller
+        controller.schemas.update(SCHEMAS)
+        controller.system_prompt = cls.system_prompt
+        controller.gateway.request_projector = adapter._project_tools
+        return adapter
 
     def run_stage(self, dispatcher, turn, actor):
         return self.session.run_stage(dispatcher, turn, actor, self.delivery)

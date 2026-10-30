@@ -35,11 +35,12 @@ def response(actions, index, tokens=100):
     return result
 
 
-def native_actor(tmp_path, events, perform, tools=None):
+def native_actor(tmp_path, events, perform, tools=None, *, clock=None, limits=None):
     from coding.pi.session import runtime_preflight, RuntimeUnavailable
     try: runtime_preflight()
     except RuntimeUnavailable: pytest.skip('cached pinned Pi/Node22 required')
-    workflow = Workflow(tmp_path/'workflow.json', lambda *_:False, source_hash='project-v1')
+    workflow = Workflow(tmp_path/'workflow.json', lambda *_:False, source_hash='project-v1',
+                        limits=limits, **({'clock':clock} if clock is not None else {}))
     actor = WorkflowActor(workflow, builtin_bundle(),
         lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
         perform=perform,preflight=lambda *_:StageResult(),evidence_tools=tools,
@@ -367,3 +368,137 @@ def test_aborted_settlement_never_commits_completed_host_result(monkeypatch,tmp_
     finally:actor.close()
     assert performed==[True] and flow.pending and flow.stage==Stage.TASK_CONSTRUCTION
     assert len(flow.state['history'])==1
+
+
+@pytest.mark.parametrize('last,aborted,error', [('toolUse',False,None),('error',False,'provider'),('toolUse',True,'cancelled')])
+def test_rpc_settlement_uses_recovered_final_assistant_outcome(last,aborted,error):
+    import queue
+    from coding.pi.rpc import PiRPC,PiProviderError,PiCancelled
+    rpc=object.__new__(PiRPC)
+    rpc.timeout=1;rpc.events=[];rpc.records=queue.Queue()
+    def send(command):
+        events=[dict(type='response',id=command['id'],success=True),
+                dict(type='message_end',message=dict(role='assistant',stopReason='error')),
+                dict(type='compaction_start'),dict(type='compaction_end'),
+                dict(type='message_end',message=dict(role='assistant',stopReason=last)),
+                dict(type='agent_settled',aborted=aborted)]
+        for event in events:rpc.records.put(('stdout',json.dumps(event).encode()+b'\n'))
+    rpc.send=send
+    if error:
+        with pytest.raises(PiProviderError if error=='provider' else PiCancelled):rpc.prompt('recover')
+    else:
+        rpc.prompt('recover')
+        assert rpc.events[-1]['type']=='agent_settled'
+
+
+@pytest.mark.parametrize('settles',[True,False])
+def test_native_waits_for_late_provider_ledger_before_commit(monkeypatch,tmp_path,settles):
+    from coding.pi.rpc import PiRPC
+    from rsi.contracts import BudgetLimits
+    class Clock:
+        value=1000.0
+        def __call__(self):return self.value
+    clock=Clock()
+    events,calls,workers=[],[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        calls.append(json.loads(kwargs['data']));clock.value+=1
+        return response([('read_skill',{'name':name}) for name in names] if len(calls)==1 else
+                        [('perform',{'proposal':'wait for final ledger'})],len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    actor,flow=native_actor(tmp_path,events,lambda *_:StageResult(),clock=clock,
+        limits=BudgetLimits(actor_seconds=20 if settles else 3))
+    original=PiRPC.prompt
+    def late_ledger(rpc,message,**kwargs):
+        result=original(rpc,message,**kwargs)
+        session=actor.session.session
+        while not session.gateway.finished.is_set() or not session.requests.empty():
+            kwargs['pump']()
+            session.gateway.finished.wait(.01)
+        finished=threading.Event()
+        class FinalLedger:
+            started=False
+            def is_set(self):
+                if not self.started and settles:
+                    self.started=True
+                    def publish():
+                        session.record('pi-provider',dict(reservation_id='late-ledger',status='completed',usage={'completion_tokens':7}))
+                        finished.set()
+                    worker=threading.Thread(target=publish);workers.append(worker);worker.start()
+                return finished.is_set()
+            def wait(self,timeout):
+                if not settles:clock.value+=2
+                return finished.wait(timeout)
+        session.gateway.finished=FinalLedger()
+        return result
+    monkeypatch.setattr(PiRPC,'prompt',late_ledger)
+    try:
+        actor.step({})
+        if settles:actor.step({'goal':'late usage settlement'})
+        else:
+            with pytest.raises(WorkflowError,match='time budget'):actor.step({'goal':'late usage settlement'})
+    finally:
+        actor.close()
+        for worker in workers:worker.join(timeout=2)
+    if not settles:
+        assert flow.pending and flow.stage==Stage.TASK_CONSTRUCTION and len(flow.state['history'])==1
+        assert flow.accounting.seconds('thinking')==4
+        return
+    ledger=next(i for i,(kind,row) in enumerate(events) if kind=='pi-provider' and row.get('reservation_id')=='late-ledger')
+    commit=next(i for i,(kind,row) in enumerate(events) if kind=='stage-result' and row['stage']==Stage.TASK_CONSTRUCTION.value)
+    assert ledger<commit and flow.stage==Stage.DESIGN and not any(worker.is_alive() for worker in workers)
+
+
+def test_existing_registered_route_transfers_to_real_native_controller(monkeypatch):
+    import time
+    import coding.pi.session as module
+    from coding.pi.controller import ControllerSession
+    monkeypatch.setattr(module,'runtime_preflight',lambda:None)
+    raw=module.PiCodingSession(model='deepseek-flash',schemas={},environ={'DEEPSEEK_API_KEY':'fake-provider-secret'},
+                               deadline=time.monotonic()+30,own_process_group=False)
+    gateway,profile,deadline=raw.gateway,raw.profile,raw.deadline
+    adapter=PiSessionAdapter.from_existing_session(raw)
+    try:
+        assert isinstance(adapter.session,ControllerSession)
+        assert raw.closed and not adapter.session.closed and adapter.session.rpc is None
+        assert adapter.session.gateway is gateway and adapter.session.profile is profile
+        assert adapter.session.deadline==deadline==adapter.session.enclosing_deadline
+        assert adapter.session.own_process_group is False
+        raw.close()
+        assert not adapter.session.closed
+    finally:adapter.close()
+    assert adapter.session.closed
+
+
+@pytest.mark.parametrize('state',['closed','started'])
+def test_existing_closed_or_started_route_is_not_reopened(monkeypatch,state):
+    import coding.pi.session as module
+    monkeypatch.setattr(module,'runtime_preflight',lambda:None)
+    raw=module.PiCodingSession(model='deepseek-flash',schemas={},environ={'DEEPSEEK_API_KEY':'fake-provider-secret'})
+    if state=='closed':raw.close()
+    else:raw.rpc=object()
+    with pytest.raises(ValueError,match='unstarted'):PiSessionAdapter.from_existing_session(raw)
+    raw.rpc=None;raw.close()
+
+
+def test_adopted_registered_route_runs_native_tools_without_new_provider_client(monkeypatch,tmp_path):
+    from coding.pi.session import PiCodingSession, runtime_preflight, RuntimeUnavailable
+    try:runtime_preflight()
+    except RuntimeUnavailable:pytest.skip('cached pinned Pi/Node22 required')
+    events,calls=[],[]
+    names=builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
+    def provider(*_,**kwargs):
+        calls.append(json.loads(kwargs['data']))
+        return response([('read_skill',{'name':name}) for name in names] if len(calls)==1 else
+                        [('perform',{'proposal':'use original route'})],len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+    raw=PiCodingSession(model='deepseek-flash',schemas={},environ={'DEEPSEEK_API_KEY':'fake-provider-secret'})
+    gateway=raw.gateway
+    flow=Workflow(tmp_path/'state.json',lambda *_:False,source_hash='v1')
+    actor=WorkflowActor(flow,builtin_bundle(),lambda:PiSessionAdapter.from_existing_session(raw),
+        perform=lambda *_:StageResult(),preflight=lambda *_:StageResult(),emit=lambda kind,data:events.append((kind,data)))
+    try:
+        actor.step({});actor.step({'goal':'adopted registered native route'})
+        assert actor.session.session.gateway is gateway
+    finally:actor.close()
+    assert raw.closed and flow.stage==Stage.DESIGN and len(calls)==2

@@ -100,8 +100,9 @@ class PiRPC:
                     settled = True
             if event.get("type") == "message_end":
                 msg = event.get("message", {})
-                if msg.get("role") == "assistant" and msg.get("stopReason") in ("error", "aborted"):
-                    failure = PiCancelled if msg.get("stopReason") == "aborted" else PiProviderError
+                if msg.get("role") == "assistant":
+                    stop = msg.get("stopReason")
+                    failure = (PiCancelled if stop == "aborted" else PiProviderError) if stop in ("error", "aborted") else None
             if event.get("type") == "agent_settled":
                 settled = True
                 if event.get("aborted"):

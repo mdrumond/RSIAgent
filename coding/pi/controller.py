@@ -4,6 +4,7 @@ HTTP handlers only queue requests. The RPC pump owns host callbacks, original
 argument validation, timing transitions, and durable records. Pi alone owns its
 conversation, tool exchanges, and automatic compaction.
 """
+from contextlib import ExitStack
 from dataclasses import asdict
 import json
 import hashlib
@@ -12,7 +13,7 @@ import threading
 import time
 
 from .context import encoded
-from .rpc import PiError
+from .rpc import PiError, PiDeadlineError
 from .schema import obj, STRING, validate
 from .session import ActionError, PiCodingSession, ROOT
 
@@ -20,15 +21,43 @@ from .session import ActionError, PiCodingSession, ROOT
 class ControllerSession(PiCodingSession):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.enclosing_deadline = kwargs.get('deadline')
+        self._configure_controller()
+
+    def _configure_controller(self):
         self.extension_file = ROOT / 'integrations/pi/rsi-controller.ts'
         self.settings_override = {'compaction': dict(enabled=True, reserveTokens=4096, keepRecentTokens=1024)}
         self.context_window = 8192
-        self.gateway.spec['max_tokens'] = 2048
+        self.gateway.spec['max_tokens'] = min(self.gateway.spec['max_tokens'],2048)
         self.requests = queue.Queue()
         self.thinking = None
         self.control = {}
         self.batches = {}
         self.record = lambda kind, data: self._enqueue(('record', kind, data))
+        self.gateway.on_record = lambda kind,data:self.record(kind,data)
+
+    @classmethod
+    def from_existing_session(cls, session):
+        """Transfer one unstarted registered route; never reopen a live session.
+
+        No provider client is constructed and no process starts here. Closing the
+        old raw owner becomes a no-op; this controller exclusively owns cleanup.
+        """
+        if not isinstance(session, PiCodingSession):
+            raise TypeError('expected a registered PiCodingSession')
+        if session.closed or session.rpc is not None or hasattr(session.gateway,'server'):
+            raise ValueError('only unstarted open Pi sessions can be adopted')
+        controller = cls.__new__(cls)
+        controller.__dict__ = session.__dict__.copy()
+        controller.schemas = dict(session.schemas)
+        # This inherited absolute limit belongs to the external parent wall.
+        # Native charged deadlines are recomputed from actor.remaining after
+        # every host callback, so excluded transfers never freeze actor time.
+        controller.enclosing_deadline = min(session.deadline,session.gateway.deadline)
+        controller._configure_controller()
+        session.closed = True
+        session.stack = ExitStack()
+        return controller
 
     def _enqueue(self, request):
         done, response = threading.Event(), {}
@@ -48,7 +77,13 @@ class ControllerSession(PiCodingSession):
         delivery.begin(turn[0]['operation_id'])
         record = turn[3]
         def remaining():
-            return actor._available()
+            seconds = actor._available()
+            if self.enclosing_deadline is not None:
+                inherited = self.enclosing_deadline-time.monotonic()
+                if inherited <= 0:
+                    raise PiDeadlineError('enclosing Pi deadline exhausted')
+                seconds = inherited if seconds is None else min(seconds,inherited)
+            return seconds
         def deadlines():
             seconds = remaining()
             self.deadline = time.monotonic() + (threading.TIMEOUT_MAX if seconds is None else seconds)
@@ -183,8 +218,10 @@ class ControllerSession(PiCodingSession):
             prompt = dict(task=resource(turn[0]['task']), **status())
             self.rpc.prompt(json.dumps(prompt), pump=pump, remaining_seconds=remaining,
                 on_event=lambda event:record('pi-event',event))
-            while not self.requests.empty():
+            while not self.gateway.finished.is_set() or not self.requests.empty():
                 pump()
+                remaining()
+                self.gateway.finished.wait(timeout=.01)
             if not completed:
                 raise ActionError('Pi settled without completing the host stage; pending operation retained')
             return completed[0]
