@@ -161,20 +161,23 @@ def test_committed_release_only(tmp_path, monkeypatch):
 
 def test_installed_wheel_bootstraps_outside_checkout(tmp_path, inputs):
     root = Path(__file__).resolve().parents[1]
-    revision = git(root, 'rev-parse', 'HEAD')
-    source = tmp_path / 'release-source'
-    # Build input comes exclusively from pinned tracked Git blobs.
-    entries = subprocess.check_output(
-        ['git', '-C', str(root), 'ls-tree', '-rz', revision]).split(b'\0')
-    for entry in filter(None, entries):
-        info, name = entry.split(b'\t', 1)
-        mode, kind, oid = info.split()
-        if kind != b'blob' or mode == b'120000':
-            continue
-        target = source / os.fsdecode(name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(subprocess.check_output(
-            ['git', '-C', str(root), 'cat-file', 'blob', oid.decode()]))
+    source = root
+    if (root / '.git').exists():
+        revision = git(root, 'rev-parse', 'HEAD')
+        source = tmp_path / 'release-source'
+        # Checkout builds use pinned blobs, excluding mutable/untracked files.
+        entries = subprocess.check_output(
+            ['git', '-C', str(root), 'ls-tree', '-rz', revision]).split(b'\0')
+        for entry in filter(None, entries):
+            info, name = entry.split(b'\t', 1)
+            mode, kind, oid = info.split()
+            if kind != b'blob' or mode == b'120000':
+                continue
+            target = source / os.fsdecode(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(subprocess.check_output(
+                ['git', '-C', str(root), 'cat-file', 'blob', oid.decode()]))
+    # Without Git metadata, build the supplied authenticated source export directly.
     subprocess.run(
         [sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--no-build-isolation',
          '--wheel-dir', str(tmp_path / 'wheels'), str(source)],
