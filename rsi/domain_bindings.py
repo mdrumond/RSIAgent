@@ -724,6 +724,17 @@ class OptimizerHost(SourceHost):
     def boundary_reached(self, stage):
         return stage != Stage.TEST or self.value is None
 
+    def admit_tool(self, name, stage, args, operation):
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and name == 'optimisation_decision' and args['action'] == 'edit'):
+            raise StrategyRejected('This public attempt already evaluated its candidate. '
+                'Choose profile or noop for this source; a new candidate needs a new public attempt.')
+
+    def before_edit(self, stage, edit, operation, activity):
+        if (self.inputs.get('single_evaluation') and self.evaluation is not None
+                and edit['source'] != self.source):
+            raise WorkflowError('single-evaluation workload forbids another candidate after its observed TEST')
+
     def activity_exception_terminal(self, name, error):
         from optimizer.control import ObservedBudgetStop
         if name == 'profile' and isinstance(error, ObservedBudgetStop):
@@ -941,6 +952,9 @@ class OptimizerHost(SourceHost):
                 summaries = filter_presentation(self.submission['memory_snapshot'], summaries)
         self.presentable_memory = summaries['memory_summary']
         value.update(summaries)
+        value['workload'] = dict(single_evaluation=bool(self.inputs.get('single_evaluation')),
+            evaluated=self.evaluation is not None,
+            candidate_locked=bool(self.inputs.get('single_evaluation') and self.evaluation is not None))
         value.update(baseline=self.baseline, history=self.owner.state['history'],
                      best=self.owner.state.get('best'))
         return value
@@ -992,6 +1006,8 @@ class OptimizerHost(SourceHost):
             owner._save()
         passed = True
         if stage == Stage.TEST:
+            if self.inputs.get('single_evaluation') and self.evaluation is not None:
+                raise WorkflowError('single-evaluation workload already consumed its candidate evaluation')
             candidate = json.loads(self.source)
             directory = owner.directory / fingerprint(candidate) / operation
             if stage == Stage.TEST:

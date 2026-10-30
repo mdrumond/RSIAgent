@@ -821,3 +821,150 @@ def test_optimizer_prepare_classifies_budget_stop_without_settling_unknown_nativ
     assert workflow['pending']['stage']=='task_construction'
     assert backend.prepares==1 and backend.evaluations==[]
     assert owner.state['history']==[] and store.get(key)['attempts']==0
+
+
+def test_positive_single_evaluation_rejects_requested_optimisation_edit_but_profiles_current_candidate(tmp_path):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import fixture, Backend
+    class EditThenProfile(CanonicalSession):
+        requested=False
+        rejection=None
+        def next_action(self,context,allowed,**kwargs):
+            names={row['name'] for row in context['evidence']}
+            if (context['stage']=='optimisation' and not context['unread_skills']
+                    and 'select_strategy' in names and 'optimisation_decision' not in names):
+                if not self.requested:
+                    self.requested=True
+                    return 'optimisation_decision',dict(action='edit',reason='Try a second candidate')
+                self.rejection=context['observation']
+                return 'optimisation_decision',dict(action='profile',reason='Profile only the observed candidate')
+            return super().next_action(context,allowed,**kwargs)
+    store,key=fixture(tmp_path);backend=Backend()
+    model=EditThenProfile(initial=json.dumps(dict(source='fast',block_count=1)),repaired=json.dumps(dict(source='fast',block_count=1)))
+    owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'CPU decisions'}),backend,
+        knowledge=lambda _:[],canonical=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True))
+    owner.run(single_evaluation=True)
+    assert model.requested and model.rejection['executed'] is False
+    assert backend.evaluations==['fast'] and backend.profiles==['fast']
+    assert store.get(key)['attempts']==1 and owner.state['canonical_active']['status']=='accepted'
+    assert len([row for row in owner.state['history'] if 'candidate_sha256' in row])==1
+
+
+def _public_optimizer_task(tmp_path,monkeypatch,profile):
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
+    from optimizer.jobs import canonical, sha
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from rsi.strategy import knowledge_db_query
+    from test_rsi_evidence_io import FixtureEmbeddings
+    from test_optimizer_task_execution import Backend
+    task=dict(task_id='cpu-task',submission=dict(source='def forward(x): return x',entrypoint='forward',
+        signatures=[dict(args=[dict(shape=[5],dtype='float32')])]))
+    body=dict(files={},memory_entries=[]);snapshot=dict(body,snapshot_id=sha(canonical(body)))
+    backend=Backend();backend.profile=profile
+    model=CanonicalSession(initial=json.dumps(dict(source='good',block_count=1)),repaired=json.dumps(dict(source='good',block_count=1)))
+    original=model.next_action
+    def decide(context,allowed,**kwargs):
+        names={row['name'] for row in context['evidence']}
+        if (context['stage']=='optimisation' and not context['unread_skills']
+                and 'select_strategy' in names and 'optimisation_decision' not in names):
+            return 'optimisation_decision',dict(action='profile',reason='Observe optional diagnostics')
+        return original(context,allowed,**kwargs)
+    model.next_action=decide
+    seed=tmp_path/'reference.py';seed.write_text(task['submission']['source'])
+    db=KnowledgeDB(tmp_path/'baseline.sqlite',FixtureEmbeddings());db.index(tmp_path,[seed],collection='baseline',language='python')
+    execution=OptimizerTaskExecutor(tmp_path/'task',task,snapshot,
+        dict(target='cpu-fixture',physical_device=0,validation_wrapper=str(tmp_path/'unused-wrapper')),
+        agent=SimpleNamespace(identity={'model':'CPU decisions'}),backend=backend)
+    original_loop=execution._loop
+    def loop():
+        owner=original_loop()
+        baseline=knowledge_db_query(db,('baseline',),negative_query=lambda _:[])
+        owner.knowledge=lambda query:baseline(dict(query=query))
+        owner.canonical=bindings.optimizer_adoption(session_factory=lambda:model,test_backend=True)
+        return owner
+    monkeypatch.setattr(execution,'_loop',loop)
+    return execution,backend,model,db
+
+
+def test_public_task_retry_does_not_publish_cached_candidate_with_plain_profile_stop(tmp_path,monkeypatch):
+    from optimizer.control import WorkerStopped, ObservationUnavailable
+    def profile(*args,**kwargs):raise WorkerStopped('No authoritative terminal observation')
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,profile)
+    try:
+        with pytest.raises(WorkerStopped):task.attempt('same-attempt')
+        before=(backend.prepares,list(backend.evaluations),len(model.contexts),task.store.get(task.job_id)['attempts'])
+        checkpoint=task.job_directory/'execution/canonical-1/workflow.json'
+        original_checkpoint=checkpoint.read_bytes()
+        with pytest.raises(ObservationUnavailable):task.attempt('same-attempt')
+        assert checkpoint.read_bytes()==original_checkpoint
+        assert (backend.prepares,backend.evaluations,len(model.contexts),task.store.get(task.job_id)['attempts'])==before
+        assert task._event('task-attempt-result') is None
+        state=json.loads((task.job_directory/'execution/canonical-1/workflow.json').read_text())
+        assert state['pending']['stage']=='optimisation'
+    finally:db.close()
+
+
+def test_public_task_publishes_only_known_observed_profile_budget_stop(tmp_path,monkeypatch):
+    from optimizer.control import ObservedBudgetStop
+    def profile(source,directory,**kwargs):
+        directory.mkdir(parents=True,exist_ok=True)
+        receipt=directory/'transport.json'
+        receipt.write_text(json.dumps(dict(state='cancelled',native_handle='remote:cpu-fixture:job:observed-profile')))
+        raise ObservedBudgetStop('CPU host observed original cancellation',receipt)
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,profile)
+    try:
+        result=task.attempt('same-attempt')
+        assert result['verified'] is True
+        before=(backend.prepares,list(backend.evaluations),len(model.contexts))
+        assert task.attempt('same-attempt')==result
+        assert (backend.prepares,backend.evaluations,len(model.contexts))==before
+        assert task.store.get(task.job_id)['attempts']==1
+    finally:db.close()
+
+
+def test_full_optimizer_run_still_allows_later_optimisation_candidate(tmp_path,monkeypatch):
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,lambda *a,**kw:dict(status='unavailable'))
+    original=model.next_action
+    edited=[]
+    def decisions(context,allowed,**kwargs):
+        evidence={row['name']:row['result'] for row in context['evidence']}
+        if not context['unread_skills']:
+            if context['stage']=='debug':return 'perform',dict(proposal='Retain observed correct candidate')
+            if context['stage']=='optimisation' and 'select_strategy' in evidence:
+                if 'optimisation_decision' not in evidence:
+                    return 'optimisation_decision',dict(action='noop' if edited else 'edit',reason='Full-project workload')
+                if evidence['optimisation_decision']['evidence']['action']=='edit':
+                    edited.append(True)
+                    return 'perform',dict(proposal='Evaluate the next full-project revision',edit=dict(
+                        path=context['source']['path'],sha256=context['source']['sha256'],
+                        source=json.dumps(dict(source='better',block_count=1))))
+        return original(context,allowed,**kwargs)
+    model.next_action=decisions
+    try:
+        owner=task._loop()
+        assert owner.run()['status']=='completed'
+        assert [source for source,_ in backend.evaluations]==['good','better']
+        assert task.store.get(task.job_id)['attempts']==2
+    finally:db.close()
+
+
+def test_cached_public_task_result_rechecks_real_terminal_receipt_integrity(tmp_path,monkeypatch):
+    from optimizer.control import ObservedBudgetStop
+    from core.artifacts import ContentAddressedArtifacts
+    def profile(source,directory,**kwargs):
+        directory.mkdir(parents=True,exist_ok=True)
+        receipt=directory/'transport.json'
+        receipt.write_text(json.dumps(dict(state='cancelled',native_handle='remote:cpu-fixture:job:known')))
+        raise ObservedBudgetStop('Observed original cancellation',receipt)
+    task,backend,model,db=_public_optimizer_task(tmp_path,monkeypatch,profile)
+    try:
+        assert task.attempt('same-attempt')['verified']
+        execution=task.job_directory/'execution'
+        cas=ContentAddressedArtifacts(execution/'canonical-artifacts')
+        events=[cas.read_json(ref) for ref in json.loads((execution/'canonical-1/events.json').read_text())]
+        terminal=next(row['reference'] for row in events if row['type']=='domain-result')
+        (cas.objects/terminal[:2]/terminal[2:]).unlink()
+        before=(backend.prepares,list(backend.evaluations),len(model.contexts))
+        with pytest.raises(FileNotFoundError):task.attempt('same-attempt')
+        assert (backend.prepares,backend.evaluations,len(model.contexts))==before
+    finally:db.close()

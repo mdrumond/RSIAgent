@@ -272,6 +272,9 @@ class DomainRunner(ProjectRunner):
         return dict(tools, **extra)
 
     def tool(self, name, stage, args, operation):
+        admission = getattr(self.backend, 'admit_tool', None)
+        if admission is not None:
+            admission(name, stage, args, operation)
         if name != 'query_kdb':
             return super().tool(name, stage, args, operation)
         call = uuid.uuid4().hex

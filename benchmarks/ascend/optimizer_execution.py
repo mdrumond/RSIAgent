@@ -146,6 +146,10 @@ class OptimizerTaskExecutor:
         Retry an interrupted call with the SAME attempt_id. Only start a new id
         after committing its result in the subject scheduler. Compile actions
         do not reserve evaluated revisions; infrastructure exceptions propagate.
+        After TEST observes a candidate, this partial call freezes its source:
+        optional profiling/noop may continue, but another candidate requires a new
+        public attempt. Unknown native/provider/timing state blocks publication
+        even when a verified evaluation is already present in history.
         """
         if not isinstance(attempt_id, str) or not attempt_id:
             raise ValueError('attempt_id must be a nonempty string')
@@ -164,6 +168,16 @@ class OptimizerTaskExecutor:
                 raise ValueError('resume the pending attempt with its original memory and feedback')
             completed = next((row for row in results if row['attempt_id'] == attempt_id), None)
             if completed is not None:
+                from rsi.optimizer_settlement import require_settled_candidate
+                prior = {}
+                for event in events:
+                    if event['kind'] == 'optimizer-state':
+                        prior = event['payload']
+                    if event['kind'] == 'task-attempt-result' and event['payload']['attempt_id'] == attempt_id:
+                        break
+                require_settled_candidate(self.job_directory / 'execution', prior,
+                    historical=prior.get('canonical_active', {}).get('index') !=
+                               self._state().get('canonical_active', {}).get('index'))
                 return completed
             active = self._event('task-attempt-request')
             if active is not None and active['attempt_id'] not in {row['attempt_id'] for row in results}:
@@ -198,6 +212,8 @@ class OptimizerTaskExecutor:
             candidate = evaluated[-1] if len(evaluated) > evaluations_completed else None
             if candidate is None and self.store.get(self.job_id)['status'] in {'stopped', 'budget-exhausted', 'failed'}:
                 raise WorkerStopped('attempt stopped without a candidate result')
+            from rsi.optimizer_settlement import require_settled_candidate
+            require_settled_candidate(loop.directory, state)
             evidence = candidate.get('content') if candidate else None
             baseline = self._read(state['baseline'])
             verified = bool(evidence and evidence.get('status') == 'verified'
