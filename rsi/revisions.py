@@ -4,20 +4,15 @@ import fcntl
 import json
 import os
 
-from rsi.configuration import _snapshot, validate_configuration
+from rsi.configuration import checked_snapshot
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
 from rsi.python_execution import atomic_json
 
 
-EDITABLE = {'prompts', 'phase1_projects', 'phase2_projects', 'project_configs', 'budgets'}
+EDITABLE = {'prompts', 'phase1_projects', 'phase2_projects', 'project_configs', 'budgets', 'tuning'}
 
 
-def checked(snapshot):
-    validate_configuration(snapshot['payload'])
-    if _snapshot(snapshot['payload']) != snapshot:
-        raise ValueError('configuration revision integrity failure')
-    return copy.deepcopy(snapshot)
-
+checked = checked_snapshot
 
 def projects(config, mode, rows=None):
     rows = config['phase1_projects' if mode == Mode.PHASE1 else 'phase2_projects'] if rows is None else rows
@@ -63,11 +58,12 @@ def recover(root, store, *, locked=False):
         history = root / 'revisions'
         history.mkdir(exist_ok=True)
         os.replace(journal, history / (transaction['reference'] + '.json'))
-        descriptor_sync = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor_sync)
-        finally:
-            os.close(descriptor_sync)
+        for directory in (root, history):
+            descriptor_sync = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor_sync)
+            finally:
+                os.close(descriptor_sync)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -76,7 +72,7 @@ def recover(root, store, *, locked=False):
 def adopt(cycle, snapshot):
     snapshot = checked(snapshot)
     scheduler, state = cycle.scheduler, cycle.scheduler.state
-    if state['pending'] or cycle.controller.state['pending'] or state['phase'] not in ('original', 'complete'):
+    if state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending'] or state['phase'] not in ('original', 'complete'):
         raise ValueError('configuration adoption requires an idle task/wave boundary')
     if any('result' not in op for op in cycle.learning.state['operations'].values()):
         raise ValueError('reconcile learning before configuration adoption')
@@ -108,6 +104,10 @@ def adopt(cycle, snapshot):
     binding = dict(cycle.binding, spec=spec.to_dict(), config=snapshot)
     revised = copy.deepcopy(state)
     revised['config']['spec'] = spec.to_dict()
+    cadence = new.get('tuning', {}).get('every_projects', 5)
+    if cadence is not None and (type(cadence) is not int or cadence <= 0):
+        raise ValueError('positive tuning cadence or null required')
+    revised['config']['tuning_every'] = cadence
     revised['events'].append(dict(kind='configuration_adopted',
         previous=cycle.spec.configuration_ref, configuration=config_ref, cursor=cursor))
     if state['phase'] == 'complete' and len(incoming) > cursor:

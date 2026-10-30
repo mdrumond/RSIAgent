@@ -60,19 +60,26 @@ class PiRPC:
         except (BrokenPipeError, OSError, ValueError):
             raise PiError("Pi RPC input closed") from None
 
-    def prompt(self, message):
+    def prompt(self, message, *, pump=None, remaining_seconds=None, on_event=None):
         rid = uuid.uuid4().hex
         self.send({"id": rid, "type": "prompt", "message": message})
         deadline = time.monotonic() + self.timeout
         accepted = settled = False
         failure = None
         while not (accepted and settled):
+            if pump is not None:
+                pump()
             remaining = deadline - time.monotonic()
+            if remaining_seconds is not None:
+                dynamic = remaining_seconds()
+                remaining = dynamic if dynamic is not None else self.timeout
             if remaining <= 0:
                 raise PiDeadlineError("Pi attempt deadline exceeded")
             try:
-                kind, line = self.records.get(timeout=remaining)
+                kind, line = self.records.get(timeout=min(remaining, .02) if pump is not None else remaining)
             except queue.Empty:
+                if pump is not None:
+                    continue
                 raise PiDeadlineError("Pi attempt deadline exceeded") from None
             if kind == "eof":
                 raise PiError("Pi exited before completing the RPC request")
@@ -83,6 +90,8 @@ class PiRPC:
             except (ValueError, UnicodeError):
                 raise PiError("invalid Pi JSONL record") from None
             self.events.append(event)
+            if on_event is not None:
+                on_event(event)
             if event.get("type") == "response" and event.get("id") == rid:
                 if not event.get("success"):
                     raise PiError("Pi rejected the prompt")
@@ -91,10 +100,13 @@ class PiRPC:
                     settled = True
             if event.get("type") == "message_end":
                 msg = event.get("message", {})
-                if msg.get("role") == "assistant" and msg.get("stopReason") in ("error", "aborted"):
-                    failure = PiCancelled if msg.get("stopReason") == "aborted" else PiProviderError
+                if msg.get("role") == "assistant":
+                    stop = msg.get("stopReason")
+                    failure = (PiCancelled if stop == "aborted" else PiProviderError) if stop in ("error", "aborted") else None
             if event.get("type") == "agent_settled":
                 settled = True
+                if event.get("aborted"):
+                    failure = PiCancelled
         if failure:
             raise failure("Pi provider request failed or was aborted")
         return self.events

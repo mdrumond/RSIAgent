@@ -147,14 +147,29 @@ class Workflow:
     def pending(self):
         return dict(self.state["pending"]) if self.state["pending"] else None
 
+    def constrain_wall_deadline(self, scope, deadline):
+        """Persist a host parent deadline without changing frozen task limits.
+
+        Constraints only tighten, survive reopen and flow through remaining()
+        to provider setup/thinking and backend execution timeouts.
+        """
+        if not scope or type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError('named finite parent wall deadline required')
+        deadlines = self.state.setdefault('wall_deadlines', {})
+        deadlines[scope] = min(deadlines.get(scope, deadline), deadline)
+        self._save()
+
     def remaining(self):
         now = self.accounting.now()
         if now < self.state["created"]:
             raise WorkflowError("clock precedes workflow creation")
         actor = self.limits.actor_seconds
         wall = self.limits.wall_seconds
+        deadlines = list(self.state.get('wall_deadlines', {}).values())
+        if wall is not None:
+            deadlines.append(self.state['created'] + wall)
         return {"actor_seconds": None if actor is None else max(0, actor - self.accounting.seconds()),
-                "wall_seconds": None if wall is None else max(0, wall - (now - self.state["created"]))}
+                "wall_seconds": max(0, min(deadlines) - now) if deadlines else None}
 
     def begin(self, *, execution=False):
         if self.state["stopped"] or self.outcome or self.pending:

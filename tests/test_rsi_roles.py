@@ -11,6 +11,7 @@ from rsi.roles import AdmittedEvidence, NoncodingRoles
 @pytest.fixture(autouse=True)
 def optional_framework(request):
     if (not request.node.name.startswith('test_isolated')
+            and not request.node.name.startswith('test_wall')
             and request.node.name != 'test_core_module_import_does_not_load_optional_framework'
             and importlib.util.find_spec('nooa') is None):
         pytest.skip('install rsi[roles] on Python 3.12/3.13')
@@ -251,7 +252,16 @@ def test_isolated_never_publishes_secret_output(monkeypatch):
 def test_isolated_installed_wheel_excludes_host_dependencies(tmp_path):
     """Install a real wheel outside checkout; child keeps its own OpenAI SDK."""
     import os
+    import venv
     from pathlib import Path
+    worker_version = '2.0.0-worker-fixture'
+    worker = tmp_path / 'worker'
+    venv.EnvBuilder(with_pip=False).create(worker)
+    worker_python = worker / 'bin' / 'python'
+    site = Path(subprocess.check_output([str(worker_python), '-c',
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])'], text=True).strip())
+    (site / 'openai').mkdir()
+    (site / 'openai' / '__init__.py').write_text('__version__ = ' + repr(worker_version) + '\n')
     source = Path(__file__).resolve().parents[1]
     wheels, host = tmp_path / 'wheels', tmp_path / 'host-site'
     wheels.mkdir()
@@ -270,7 +280,7 @@ import openai, rsi.roles
 req = json.loads(sys.stdin.readline())
 assert pathlib.Path.cwd() != pathlib.Path(HOST)
 assert pathlib.Path(rsi.roles.__file__).read_bytes() == pathlib.Path(ORIGINAL).read_bytes()
-assert openai.__version__.startswith('2.')
+assert openai.__version__ == EXPECTED_VERSION
 def emit(event, payload):
     print(json.dumps(dict(event=event, payload=payload)), flush=True)
 emit('role_started', {'role': 'review', 'provider_identity': IDENTITY})
@@ -286,21 +296,125 @@ identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == 'deepsee
 original = subprocess.Popen
 projection = []
 probe = %r
-probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict()))
+probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict())).replace('EXPECTED_VERSION', repr(%r))
 def launch(command, **kwargs):
     projection.append(pathlib.Path(kwargs['cwd']))
     assert kwargs['env']['PYTHONNOUSERSITE'] == '1'
     assert kwargs['env']['PYTHONPATH'] != %r
-    return original([sys.executable, '-c', probe], **kwargs)
+    return original([%r, '-c', probe], **kwargs)
 module.subprocess.Popen = launch
 adapter = module.IsolatedRoles(sys.executable, direct_profile(identity), observer=lambda *args: None,
                                environment={'DEEPSEEK_API_KEY': 'test-only-secret'})
 result = adapter.review('review', [], deadline=time.monotonic() + 10)
-assert result.rationale.startswith('2.')
+assert result.rationale == %r
 assert not projection[0].exists()
 print(json.dumps({'worker_openai': result.rationale, 'projection_removed': True}))
-''' % (probe, str(host), str(host))
+''' % (probe, str(host), worker_version, str(host), str(worker_python), worker_version)
     completed = subprocess.run([sys.executable, '-c', parent], cwd=tmp_path,
                                env={**os.environ, 'PYTHONPATH': str(host), 'PYTHONNOUSERSITE': '1'},
                                check=True, capture_output=True, text=True)
     assert json.loads(completed.stdout)['projection_removed'] is True
+
+
+def test_wall_framework_setup_exhaustion_never_starts_provider(monkeypatch):
+    import rsi.roles as module
+    roles, calls, events, clock = make_roles([])
+    class Client:
+        def __init__(self, owner, deadline):
+            self.deadline = deadline
+    class Agent:
+        def __init__(self, llm):
+            pass
+    def framework():
+        clock.now += 100
+        return Agent, Client
+    monkeypatch.setattr(module, '_framework', framework)
+    with pytest.raises(TimeoutError, match='wall'):
+        roles.skillwriter('write', [], deadline=110, wall_deadline=105)
+    assert calls == []
+    assert not events  # No fabricated role_finished for setup-only work.
+
+
+def test_wall_remaining_after_setup_bounds_provider_and_actor_receipt(monkeypatch):
+    from types import SimpleNamespace
+    import rsi.roles as module
+    roles, calls, events, clock = make_roles([])
+    observed = []
+    class Client:
+        def __init__(self, owner, deadline):
+            self.owner, self.deadline = owner, deadline
+    class Agent:
+        def __init__(self, llm):
+            self.llm = llm
+        async def skillwriter(self, **kwargs):
+            observed.append(self.llm.owner._remaining(self.llm.deadline))
+            clock.now += 2
+            return SimpleNamespace(model_dump=lambda **kwargs: dict(
+                rationale='no changes', evidence_ids=[], edits=[]))
+    def framework():
+        clock.now += 3
+        return Agent, Client
+    monkeypatch.setattr(module, '_framework', framework)
+    with pytest.raises(TimeoutError):
+        roles.skillwriter('write', [], deadline=110, wall_deadline=105)
+    assert observed == [2]
+    receipts = [payload for event, payload in events if event == 'role_finished']
+    assert len(receipts) == 1
+    assert receipts[0]['elapsed_seconds'] == 2
+    assert receipts[0]['success'] is False
+
+
+@pytest.mark.parametrize('finished_before_timeout', [False, True])
+def test_isolated_wall_kills_slow_worker_without_fabricated_finished(monkeypatch, tmp_path, finished_before_timeout):
+    from contextlib import contextmanager
+    import time
+    import rsi.roles as module
+    @contextmanager
+    def projection(check=lambda: None):
+        check()
+        yield tmp_path
+        check()
+    monkeypatch.setattr(module, '_machinery_projection', projection)
+    script = worker_script().split("time.sleep(0.02)")[0]
+    if finished_before_timeout:
+        script += "emit('role_finished', {'role': 'review', 'success': True, 'elapsed_seconds': 0.0})\n"
+    script += 'time.sleep(5)\n'
+    adapter, events, captured = isolated(monkeypatch, script)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        adapter.review('review', [], deadline=started + 10, wall_deadline=started + 0.3)
+    assert time.monotonic() - started < 2
+    assert len(captured) == 1
+    receipts = [payload for event, payload in events if event == 'role_finished']
+    assert len(receipts) == int(finished_before_timeout)
+    assert any(event == 'accounting_incomplete' for event, _ in events) is not finished_before_timeout
+
+
+def test_isolated_wall_projection_exhaustion_never_spawns(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+    import rsi.roles as module
+    now = [100.0]
+    @contextmanager
+    def projection(check=lambda: None):
+        now[0] += 6
+        check()
+        yield tmp_path
+    monkeypatch.setattr(module, '_machinery_projection', projection)
+    adapter, events, captured = isolated(monkeypatch, 'raise AssertionError("must not run")')
+    adapter.clock = lambda: now[0]
+    with pytest.raises(TimeoutError, match='wall'):
+        adapter.review('review', [], deadline=110, wall_deadline=105)
+    assert captured == []
+    assert events == []
+
+
+def test_skillwriter_real_predict_accepts_typed_append_without_normalisation():
+    roles, calls, events, _ = make_roles([{
+        'rationale': 'prevent recurrence', 'evidence_ids': ['numeric-failure'],
+        'edits': [{'skill': 'debug', 'operation': 'append', 'content': 'Retest cancellation.'}]}])
+    proposal = roles.skillwriter('Improve detection', [AdmittedEvidence('numeric-failure', {})], deadline=110)
+    assert proposal.edits[0].operation == 'append'
+    assert proposal.edits[0].content == 'Retest cancellation.'
+    assert len(calls) == 1
+    emitted = [payload for event, payload in events if event == 'role_proposal']
+    assert emitted[0]['proposal']['edits'] == [dict(skill='debug', operation='append', content='Retest cancellation.')]
