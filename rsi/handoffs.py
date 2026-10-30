@@ -20,9 +20,8 @@ from pathlib import Path
 import re
 
 from core.artifacts import ContentAddressedArtifacts
-from rsi.configuration import show_configuration
+from rsi.configuration import checked_snapshot, show_configuration
 from rsi.contracts import CycleSpec, Mode, Stage
-from rsi.revisions import checked
 from rsi.skills import SkillBundle
 
 
@@ -73,7 +72,7 @@ def _parent(root, store, expected):
         spec = CycleSpec.from_dict(binding['spec'])
         if spec.mode != expected or spec.cycle_id != root.name:
             raise ValueError('parent cycle identity/mode differs')
-        configuration = checked(binding['config'])
+        configuration = checked_snapshot(binding['config'])
         if (store.read_json(spec.configuration_ref) != configuration
                 or state['config']['spec'] != spec.to_dict()):
             raise ValueError('parent configuration differs from admitted state')
@@ -175,7 +174,7 @@ def capture_parent(instance, mode, from_cycle=None, *, inheritance='auto',
         raise ValueError('simple parent cycle identity required')
     if from_cycle and (inheritance == 'baseline' or mode == Mode.PHASE1):
         raise ValueError('baseline/Phase1 cannot select a parent')
-    current = checked(configuration if configuration is not None else show_configuration(root))
+    current = checked_snapshot(configuration if configuration is not None else show_configuration(root))
     store = ContentAddressedArtifacts(root / 'artifacts')
     selected = None
     expected = Mode.PHASE1 if mode == Mode.PHASE2 else Mode.PHASE2
