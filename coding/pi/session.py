@@ -66,6 +66,16 @@ class ActionError(PiError):
     pass
 
 
+def _truncated(events):
+    messages = [event.get("message", {}) for event in events if event.get("type") == "message_end"
+                and event.get("message", {}).get("role") == "assistant"]
+    # An earlier no-tool length may have recovered inside Pi. Tool arguments
+    # marked incomplete remain invalid even if they happen to parse as JSON.
+    return any(message.get("stopReason") == "length" and any(
+        part.get("type") == "toolCall" for part in message.get("content", [])) for message in messages
+    ) or bool(messages and messages[-1].get("stopReason") == "length")
+
+
 def runtime_preflight():
     executable = ROOT / "integrations/pi/node_modules/.bin/pi"
     manifest = ROOT / "integrations/pi/node_modules/@earendil-works/pi-coding-agent/package.json"
@@ -285,9 +295,12 @@ class PiCodingSession:
             try:
                 self.rpc.prompt("Select the next allowed action using the authoritative host snapshot.")
             except PiError:
+                if self.compaction_failure is not None:
+                    self.pending = None
+                    raise self.compaction_failure
                 if self.gateway.stop_reason == "context-limit":
                     raise PiError("Pi request context exceeds the configured byte limit; no action accepted") from None
-                if any(e.get("message", {}).get("stopReason") == "length" for e in self.rpc.events[start:]):
+                if _truncated(self.rpc.events[start:]):
                     raise ActionError("truncated Pi tool call; no action accepted") from None
                 raise
             if self.compaction_failure is not None:
@@ -296,7 +309,7 @@ class PiCodingSession:
             if not self.gateway.finished.wait(timeout=min(5, max(.1, self.deadline-time.monotonic()))):
                 raise PiError("provider accounting did not settle")
             events = self.rpc.events[start:]
-            if any(e.get("message", {}).get("stopReason") == "length" for e in events):
+            if _truncated(events):
                 raise ActionError("truncated Pi tool call; no action accepted")
             # Pi's argument validator can coerce scalars. Validate the original
             # assistant arguments as well before releasing any queued host effect.

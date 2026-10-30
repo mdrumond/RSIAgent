@@ -70,7 +70,8 @@ class PiReviewSession(PiCodingSession):
     def _operation(self, name, args):
         if name == 'compaction':
             result = super()._operation(name, args)
-            self.failure = self.compaction_failure
+            if self.compaction_failure is not None:
+                self.failure = self.compaction_failure
             return result
         with self.lock:
             if name == 'snapshot':

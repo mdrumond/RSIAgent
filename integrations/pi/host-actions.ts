@@ -39,7 +39,10 @@ export default function (pi: ExtensionAPI) {
     pi.setActiveTools(snapshot.allowed);
   });
   pi.on("turn_end", (event, ctx) => {
-    if (event.message.role === "assistant" && event.message.stopReason === "length") ctx.abort();
+    // Incomplete tool arguments cannot queue effects. A no-tool early length
+    // response is handled by Pi's native compact-and-retry before settlement.
+    if (event.message.role === "assistant" && event.message.stopReason === "length"
+      && event.message.content.some(part => part.type === "toolCall")) ctx.abort();
   });
   pi.on("context", async (event, ctx) => {
     const snapshot = await host("snapshot", {}, ctx.signal);
