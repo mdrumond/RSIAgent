@@ -40,10 +40,12 @@ to admitted history, pending work, baselines and other frozen cycle policy. Exis
 projects retain their source, skill, memory, verifier, budget and prompt contracts.
 
 Repository ingestion and retained task export are also available as `kdb-add-repo`
-and `evidence-export`; their help lists explicit database, embedding, outcome and
-artifact inputs. Fine tuning is reported as awaiting its service rather than
-claiming an unevaluated candidate was promoted. Dashboard serving and dependency
-environment setup are separate commands supplied by their integration streams.
+and `evidence-export`. Instance ingestion publishes a new baseline database and
+configuration revision while preserving already admitted cycles. Standalone
+ingestion accepts explicit database and embedding inputs. Fine tuning runs the
+same canonical runner on independently configured heldouts and retains the
+incumbent until complete validation supports promotion. See
+[quickstart.md](quickstart.md) for owned dependency setup and dashboard lifecycle.
 
 ## Baseline skills and timing evidence
 
