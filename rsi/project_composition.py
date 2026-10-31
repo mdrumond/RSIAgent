@@ -171,7 +171,7 @@ class ProjectComposition:
                 if reference in copied:
                     continue
                 data = self.store.read_bytes(reference)
-                runner.store.put_bytes(data)
+                runner.store.retain_from(self.store, reference)
                 copied.add(reference)
                 try:
                     value = json.loads(data)
