@@ -29,6 +29,14 @@ class WorkerArtifacts(ContentAddressedArtifacts):
         return self.parent.read_bytes(reference)
 
 
+def admission_intervals(branch):
+    """Original attempts and bounded observations, each retained under its identity."""
+    records = [json.loads(path.read_text()) for path in branch.glob('worker-admission-*.json')]
+    for path in branch.glob('admission-observations-*.json'):
+        records.extend(json.loads(path.read_text()))
+    return records
+
+
 @dataclass(frozen=True)
 class ProjectWorkerFactory:
     instance: str
@@ -64,7 +72,7 @@ class ProjectWorkerFactory:
         os.environ.clear()
         os.environ.update(environment)
         source_elapsed = (admitted['operations'][request.project_id].get('source_interval', {}).get('elapsed', 0.)
-                          if not request.reopen else 0.)
+                          if not request.reopen and request.actor_elapsed == 0 else 0.)
         deadline = time.monotonic() + max(0., request.actor_seconds - request.actor_elapsed - source_elapsed)
         def remaining():
             limits = [max(0., deadline - time.monotonic())]
@@ -128,7 +136,8 @@ class ProjectWorkerFactory:
             started, monotonic_start = time.time(), time.monotonic()
             admission_path = request.root.parent / 'worker-admission.json'
             admission_elapsed = json.loads(admission_path.read_text())['elapsed'] if admission_path.exists() else 0.
-            source_elapsed = operation.get('source_interval', {}).get('elapsed', 0.)
+            source_elapsed = (operation.get('source_interval', {}).get('elapsed', 0.)
+                              if request.actor_elapsed == 0 else 0.)
             deadline = monotonic_start + max(0., request.actor_seconds - request.actor_elapsed - admission_elapsed - source_elapsed)
             def remaining():
                 limits = [max(0., deadline - time.monotonic())]
@@ -188,12 +197,13 @@ class ProjectWorkerFactory:
             atomic_json(request.root / 'training-identity.json', case_identity(runner))
         admission_path = request.root.parent / 'worker-admission.json'
         admission = json.loads(admission_path.read_text()) if admission_path.exists() else None
-        if admission:
-            ingest_elapsed(runner.workflow.accounting, 'worker-admission:' + request.dispatch_id,
-                {'elapsed': admission['elapsed']}, category='execution',
-                observed_start=admission['started'], observed_end=admission['ended'],
-                observed_execution_start=admission['started'],
-                observed_execution_end=admission['started'] + admission['elapsed'])
+        for interval in admission_intervals(request.root.parent):
+            ingest_elapsed(runner.workflow.accounting, interval.get('interval_id',
+                'worker-admission:' + interval['dispatch_id']),
+                {'elapsed': interval['elapsed']}, category='execution',
+                observed_start=interval['started'], observed_end=interval['ended'],
+                observed_execution_start=interval['started'],
+                observed_execution_end=interval['started'] + interval['elapsed'])
         if binding_interval:
             ingest_elapsed(runner.workflow.accounting, 'lease-binding:' + request.dispatch_id,
                 {'elapsed': binding_interval['elapsed']}, category='execution',
@@ -334,7 +344,7 @@ class WaveBindings:
                 self.cycle.scheduler.state['active_wave'].setdefault('admission_receipts', {})[operation] = reference
                 self.cycle.scheduler._save()
         if not (pool._branch(operation) / 'runner' / 'service-binding.json').exists():
-            return False  # No canonical actor admission; retain the actual negative gate.
+            return self._observe_admission(pool, operation, row)
         runner = self._runner(operation)
         try:
             proof = runner.terminal_failure_proof()
@@ -362,6 +372,59 @@ class WaveBindings:
                 pool.settle_exhausted(operation, runner)
             else:
                 pool.settle_failure(operation, runner)
+        return True
+
+    def _observe_admission(self, pool, operation, row):
+        branch = pool._branch(operation)
+        path = branch / 'worker-admission.json'
+        if not path.exists():
+            return False
+        record = json.loads(path.read_text())
+        if record['dispatch_id'] != row['dispatch_id'] or record['receipt'].get('admitted') is True:
+            return False  # Binder/create failure is not proof of admission-only work.
+        wave = self.cycle.scheduler.state['active_wave']
+        admitted = self.cycle.store.read_json(wave['admission_ref'])
+        request = pool._request(operation, row)
+        receipt = record['receipt']
+        unknown = ('probe_pending', 'probe_unknown', 'submission_unknown')
+        def consumed():
+            return (sum(r['elapsed'] for r in admission_intervals(branch))
+                    + admitted['operations'][operation].get('source_interval', {}).get('elapsed', 0.))
+        if receipt.get('failure', {}).get('type') in unknown:
+            # Same dispatch/probe identity observes the retained handle; never
+            # substitute a fresh dispatch while a health command may still run.
+            started, monotonic_start = time.time(), time.monotonic()
+            remaining = max(0., row['allowance'] - consumed())
+            if admitted['wall_deadline'] is not None:
+                remaining = min(remaining, max(0., admitted['wall_deadline'] - time.time()))
+            if remaining <= 0:
+                return False
+            deadline = monotonic_start + min(45., remaining)
+            try:
+                receipt = self._factory(wave).executor_factory.guard(record['profile'], request,
+                    phase='admission', remaining=lambda: max(0., deadline - time.monotonic()))
+            except Exception as exc:
+                receipt = getattr(exc, 'admission_receipt', dict(admitted=False,
+                    failure=dict(type='probe_unknown'), error_type=type(exc).__name__))
+            elapsed = time.monotonic() - monotonic_start
+            observations = branch / ('admission-observations-' + row['dispatch_id'] + '.json')
+            history = json.loads(observations.read_text()) if observations.exists() else []
+            history.append(dict(interval_id='admission-observation:' + row['dispatch_id'] + ':' + str(len(history)),
+                dispatch_id=row['dispatch_id'], receipt=receipt, started=started,
+                elapsed=elapsed, ended=max(time.time(), started + elapsed)))
+            atomic_json(observations, history)
+        reference = self.cycle.store.put_json(dict(original=record, observed=receipt,
+            intervals=admission_intervals(branch)))
+        wave.setdefault('admission_receipts', {})[operation] = reference
+        self.cycle.scheduler._save()
+        elapsed = max(consumed(), row['actor_seconds'])
+        pool.retain_admission_elapsed(operation, row['dispatch_id'], elapsed, reference)
+        if receipt.get('failure', {}).get('type') in unknown:
+            return False
+        pool.reconcile(operation, lambda request, retained: dict(closed=True,
+            observation='original pre-runner admission probe settled; no actor or target project command admitted',
+            actor_seconds=max(elapsed, row['actor_seconds']), resume_ready=True, runner_exists=False,
+            admission_ref=reference))
         return True
 
     def observe(self):
@@ -479,6 +542,10 @@ class WaveBindings:
         if (worker['dispatch_id'] != row['dispatch_id'] or not worker.get('process')
                 or _alive(worker['process'])):
             raise ValueError('original controller must be observed closed first')
+        if not (pool._branch(operation) / 'runner' / 'service-binding.json').exists():
+            if not self._observe_admission(pool, operation, row):
+                raise ValueError('original pre-runner admission remains unresolved; retain probe identity and lease')
+            return None
         runner = self._runner(operation)
         for token, ended_at in observation.get('closed_actor_intervals', {}).items():
             if observation['controller_proof'].get('actor_closed') is not True:

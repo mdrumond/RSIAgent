@@ -118,7 +118,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             while not done.wait(.05):
                 wall = cycle.scheduler.remaining()['wall_seconds']
                 if should_stop() or wall is not None and wall <= 0:
-                    if cycle.waves:
+                    if cycle.waves and cycle.waves.active_pool is not None:
                         cycle.waves.stop()
                         return
                     # Signal only this owned worker; canonical finally blocks own children.
