@@ -184,3 +184,30 @@ def test_actual_pinned_cli_can_enter_setup_repair_with_failed_receipt(ready):
     assert pinned_cli.dispatch(root, ['--instance', str(root), 'instance', 'setup']) == 0
     row = json.loads((root / 'cli-observation.json').read_text())
     assert row == {'repair': True, 'prefix': sys.prefix}
+
+
+def test_env_python_helpers_use_owned_dependencies_with_user_site_disabled(ready, tmp_path, monkeypatch):
+    root, receipt = ready
+    caller = tmp_path / 'caller-bin'
+    caller.mkdir()
+    for name in ('python', 'python3', 'node'):
+        executable = caller / name
+        executable.write_text('#!/bin/sh\nexit 97\n')
+        executable.chmod(0o700)
+    monkeypatch.setenv('PATH', str(caller))
+    monkeypatch.setenv('PYTHONPATH', str(tmp_path / 'foreign-packages'))
+    monkeypatch.setenv('PYTHONHOME', str(tmp_path / 'foreign-home'))
+    _, _, _, env = launch_context(root, required=True)
+    helper = tmp_path / 'env-python-helper'
+    helper.write_text('#!/usr/bin/env python3\n'
+        'import json, site, sys, _rsi_dispatch_only\n'
+        'print(json.dumps(dict(prefix=sys.prefix, dependency=_rsi_dispatch_only.value, '
+        'user_site=site.ENABLE_USER_SITE)))\n')
+    helper.chmod(0o700)
+    row = json.loads(subprocess.check_output([str(helper)], env=env, text=True, timeout=10))
+    assert row == dict(prefix=str(root / 'runtime/python'), dependency=42, user_site=False)
+    assert subprocess.check_output(['node', '--version'], env=env, text=True,
+                                   timeout=10).strip() == receipt['node_version']
+    # Re-entering the launch context keeps owned executable precedence stable.
+    monkeypatch.setenv('PATH', env['PATH'])
+    assert launch_context(root, required=True)[3]['PATH'] == env['PATH']

@@ -32,7 +32,7 @@ def transient_guard(request, *, phase, metadata, configuration, remaining):
     return dict(admitted=True, physical_device=metadata['physical_device'], observation='CPU admitted')
 
 
-@pytest.mark.parametrize('failure', ['busy', 'probe_pending'])
+@pytest.mark.parametrize('failure', ['busy', 'probe_pending', 'submission_unknown', 'probe_unknown'])
 def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instance, tmp_path, failure):
     path = tmp_path / 'profiles.json'
     resolver = profiles(path)
@@ -55,9 +55,19 @@ def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instanc
         before = pool.status()['projects']
         original_dispatches = {r['dispatch_id'] for r in before.values()}
         assert not any((pool._branch(op) / 'runner').exists() for op in before)
-        if failure == 'probe_pending':
+        if failure != 'busy':
             assert {r['status'] for r in before.values()} == {'pending'}
             assert all(r['device'] is not None for r in before.values())
+            for op in before:
+                with pytest.raises(ValueError, match='admission remains unresolved'):
+                    cycle.waves.apply_observation(op, {})
+            quarantined = pool.status()['projects']
+            assert {r['status'] for r in quarantined.values()} == {'pending'}
+            assert {r['dispatch_id'] for r in quarantined.values()} == original_dispatches
+            assert all(r['device'] == before[op]['device'] and
+                       r['actor_seconds'] >= before[op]['actor_seconds']
+                       for op, r in quarantined.items())
+            assert not any((pool._branch(op) / 'runner').exists() for op in before)
         (coordination / 'release').touch()
         for op, row in before.items():
             if row['status'] == 'pending':

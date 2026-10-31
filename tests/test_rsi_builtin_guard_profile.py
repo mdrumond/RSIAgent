@@ -67,3 +67,42 @@ def test_cpl_profile_constructs_without_importing_or_forwarding_lease_binder_set
     assert resolver.metadata('frozen')['physical_device'] == 2
     assert resolver('frozen').metadata['runtime'] == 'test-runtime'
     assert len(resolver.binding_contract('frozen')) == 64
+
+
+@pytest.mark.parametrize('receipt_written', [False, True])
+def test_post_intent_cli_failure_is_guard_pending_and_never_resubmits(
+        setup, tmp_path, monkeypatch, receipt_written):
+    from rsi.python_execution import atomic_json
+    from rsi.runtime import WorkflowError
+    _, configuration, metadata, state = setup
+    path = tmp_path / 'unknown-profiles.json'
+    path.write_text(json.dumps({'profiles': {'frozen': dict(metadata=metadata,
+        guard='rsi.device_admission:guard', guard_configuration={'product': 'a3', 'chip': 0})}}))
+    resolver = ExecutorProfiles(str(path))
+    executor = configuration['executor']
+    monkeypatch.setattr(ExecutorProfiles, '_executor', lambda *args: executor)
+    calls = []
+    def failed_cli(args, remaining, *, result_path):
+        calls.append(args)
+        if args[0] == 'run' and receipt_written:
+            atomic_json(args[args.index('--receipt-file') + 1], dict(
+                target='test-target', handle='remote:test-target:job:original',
+                runtime='test-runtime', npu=dict(devices=[2])))
+        raise WorkflowError('retained CLI ambiguity')
+    monkeypatch.setattr(executor, '_cli', failed_cli)
+    request = SimpleNamespace(project=tmp_path / 'worker/runner/project',
+                              operation_id='original-command', category='execution', profile_path=None)
+    receipts = []
+    for _ in range(2):
+        with pytest.raises(GuardPending) as pending:
+            resolver.guard('frozen', request, phase='command', remaining=lambda: 60)
+        receipts.append(pending.value.admission_receipt)
+    expected = 'probe_unknown' if receipt_written else 'submission_unknown'
+    assert all(r['failure']['type'] == expected and not r['admitted'] for r in receipts)
+    assert sum(args[0] == 'run' for args in calls) == 1
+    assert [args[0] for args in calls] == (['run', 'observe'] if receipt_written else ['run'])
+    assert all(r['elapsed_seconds'] >= 0 for r in receipts)
+    assert receipts[0]['failure']['detail'] == 'retained CLI ambiguity'
+    if receipt_written:
+        assert all(r['raw_measurements']['submission']['handle'] ==
+                   'remote:test-target:job:original' for r in receipts)

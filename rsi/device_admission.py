@@ -223,7 +223,14 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
         if isinstance(exc, subprocess.TimeoutExpired):
             raw['timeout'] = dict(stdout=(exc.stdout or b'').decode(errors='replace'),
                                   stderr=(exc.stderr or b'').decode(errors='replace'))
-        result.update(failure=dict(type='admission_unavailable', detail=str(exc)),
+        failure = 'admission_unavailable'
+        if directory is not None and (directory / 'intent.json').exists():
+            # Dispatch intent is durable before invoking the CLI. A client error
+            # cannot prove that transport did not submit, or that a retained job
+            # has settled. Keep the original identity quarantined for observation.
+            failure = ('probe_unknown' if (directory / 'submission.json').exists()
+                       else 'submission_unknown')
+        result.update(failure=dict(type=failure, detail=str(exc)),
                       observation='Device admission unavailable: ' + str(exc))
     result['elapsed_seconds'] = time.monotonic() - started
     if directory is not None:
