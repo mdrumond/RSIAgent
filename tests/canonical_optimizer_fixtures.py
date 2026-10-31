@@ -167,7 +167,8 @@ def scripted_optimizer_http(monkeypatch, agent, *, compile_if_offered=False):
 
     class Session(PiSessionAdapter):
         def __init__(self, owner):
-            super().__init__(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'})
+            super().__init__(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'},
+                             context_window=16384, request_bytes=49152)
             self.owner, self.decisions = owner, OptimizerSession(owner)
             state.session = self
         def run_stage(self, dispatcher, turn, actor):

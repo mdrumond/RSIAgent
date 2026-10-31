@@ -78,7 +78,8 @@ def test_actual_project_runner_multistage_concise_summaries(monkeypatch,tmp_path
         return response([action],len(requests),tokens=len(kwargs['data'])//4)
     monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
     runner,_,database=make(tmp_path,session_factory=lambda:PiSessionAdapter(
-        model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}))
+        model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'},
+        context_window=16384,request_bytes=49152))
     try:
         result=runner.run()
         assert result['status']=='accepted',result
