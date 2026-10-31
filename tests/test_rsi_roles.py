@@ -503,4 +503,51 @@ def test_actual_typed_validation_emits_specific_finished_failure_detail():
     assert finished[0]['success'] is False and finished[0]['elapsed_seconds'] == 2
     assert finished[0]['error']['type'] == type(error.value).__name__
     assert finished[0]['error']['message'] == str(error.value)
-    assert 'negative_decisions[0].redirection' in str(error.value)
+    assert not any(event == 'role_proposal' for event, _ in events)
+
+
+@pytest.mark.parametrize('action, fields', [('used', {'redirection': 'Isolate the documented case'}),
+    ('rejected', {}), ('rejected', {'redirection': None}), ('rejected', {'redirection': ''})])
+def test_diagnostic_provider_schema_and_typed_result_preserve_conditional_contract(action, fields):
+    import re
+    decision = dict(query_ref='query', index=0, action=action, reason='Observed applicability')
+    decision.update(fields)
+    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
+        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
+        negative_decisions=[decision])
+    roles, calls, events, _ = make_roles([payload])
+    result = roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
+    assert result.negative_decisions[0].action == action
+    assert result.negative_decisions[0].redirection == fields.get('redirection')
+    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
+    items = schema['properties']['negative_decisions']['items']
+    branches = {key: schema['$defs'][ref.rsplit('/', 1)[1]]
+                for key, ref in items['discriminator']['mapping'].items()}
+    used, rejected = branches['used'], branches['rejected']
+    assert 'redirection' in used['required']
+    field = used['properties']['redirection']
+    assert field['type'] == 'string' and field['minLength'] >= 1
+    assert re.search(field['pattern'], 'Use an isolated case')
+    assert re.search(field['pattern'], ' \t\n') is None
+    assert 'redirection' not in rejected['required']
+    assert {row.get('type') for row in rejected['properties']['redirection']['anyOf']} == {'string', 'null'}
+    assert len(calls) == 1
+    assert [p['success'] for e, p in events if e == 'role_finished'] == [True]
+
+
+@pytest.mark.parametrize('fields', [{}, {'redirection': None}, {'redirection': ''},
+                                    {'redirection': ' \t\n'}, {'redirection': 7}])
+def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
+    decision = dict(query_ref='query', index=0, action='used', reason='Observed applicability')
+    decision.update(fields)
+    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
+        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
+        negative_decisions=[decision])
+    roles, calls, events, _ = make_roles([payload])
+    with pytest.raises(ValueError):
+        roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
+    assert len(calls) == 1
+    assert not any(event == 'role_proposal' for event, _ in events)
+    finished = [p for e, p in events if e == 'role_finished']
+    assert len(finished) == 1 and finished[0]['success'] is False
+    assert finished[0]['elapsed_seconds'] == 2 and finished[0]['error']

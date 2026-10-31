@@ -22,7 +22,7 @@ import tempfile
 import subprocess
 import sys
 import time
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 
 def _wall_remaining(clock, deadline):
@@ -141,13 +141,20 @@ def _framework():
         model_config = ConfigDict(extra='forbid', strict=True)
         query_ref: str
         index: int
-        action: Literal['used', 'rejected']
         reason: str = Field(min_length=1)
+
+    class UsedNegativeDecisionModel(NegativeDecisionModel):
+        action: Literal['used']
+        redirection: str = Field(min_length=1, pattern=r'\S')
+
+    class RejectedNegativeDecisionModel(NegativeDecisionModel):
+        action: Literal['rejected']
         redirection: str | None = None
 
     class Diagnostic(Proposal):
         proposal: DiagnosticProject
-        negative_decisions: list[NegativeDecisionModel]
+        negative_decisions: list[Annotated[
+            UsedNegativeDecisionModel | RejectedNegativeDecisionModel, Field(discriminator='action')]]
 
     class Edit(BaseModel):
         model_config = ConfigDict(extra='forbid', strict=True)
