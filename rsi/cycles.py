@@ -542,9 +542,15 @@ class CycleScheduler:
                 elif self.spec.mode != Mode.PHASE1:
                     s['phase'] = 'skill'
                 else:
+                    parents = {row['project']['project_id']: row for row in s.get('historical_failed_parents', [])}
+                    parents.update({row['project']['project_id']: row for row in s['wave_results']})
                     s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
                                                 result=r, attempts=0) for r in s['wave_results']
                                            if self.config['recover'] and r['outcome'] != 'accepted']
+                    if self.config.get('recovery_feedback'):
+                        s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
+                            result=r, attempts=0) for r in parents.values()
+                            if self.config['recover'] and r['outcome'] != 'accepted']
                     s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
         elif kind == 'simplify':
             original = ProjectSpec.from_dict(op['spec'])
@@ -578,7 +584,8 @@ class CycleScheduler:
                     raise ValueError('child allocation exceeds the measured remaining semantic pool')
             if revised.project_id == original.project_id:
                 raise ValueError('simplification requires a new linked project identity')
-            catalog = s.get('failed_parent_admission', {}).get('rows', [])
+            catalog = (s.get('failed_parent_admission', {}).get('rows', [])
+                       + s.get('historical_failed_parents', []))
             if revised.project_id in {r['project']['project_id']
                                       for r in s['originals'] + s['recoveries'] + catalog}:
                 raise ValueError('revised project identity already used')
