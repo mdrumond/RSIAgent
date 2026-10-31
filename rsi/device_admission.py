@@ -9,7 +9,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 import subprocess
 import sys
@@ -20,112 +19,18 @@ from rsi.python_execution import atomic_json, digest
 from rsi.runtime import WorkflowError
 
 
-# One query implementation for a controller here and a controller on the target.
-# Each timeout consumes the actual remaining elapsed allocation, not a count.
-_PROBE = r'''
-import json, subprocess, sys, time
+# Export precisely the same stdlib-only query engine/parser used by verifiers.
+from rsi.device_health_probe import AdmissionFailure, _require, _limit, assess, standalone_source, standalone_hash
+
+_PROBE = standalone_source() + r"""
+import sys
 spec = json.loads(sys.argv[1])
-started = time.monotonic()
-queries = {}
-for query in spec['queries']:
-    argv = ['npu-smi', 'info', '-t', query, '-i', str(spec['device'])]
-    if spec['chip'] is not None:
-        argv += ['-c', str(spec['chip'])]
-    allowance = min(spec['query_timeout'], spec['remaining']-(time.monotonic()-started))
-    if allowance <= 0:
-        queries[query] = dict(argv=argv, failure='budget_exhausted')
-        break
-    try:
-        p = subprocess.run(argv, capture_output=True, timeout=allowance)
-        queries[query] = dict(argv=argv, exit=p.returncode,
-            stdout=p.stdout.decode(errors='replace'), stderr=p.stderr.decode(errors='replace'))
-    except subprocess.TimeoutExpired as exc:
-        queries[query] = dict(argv=argv, failure='query_timeout',
-            stdout=(exc.stdout or b'').decode(errors='replace'),
-            stderr=(exc.stderr or b'').decode(errors='replace'))
-        break
-    except OSError as exc:
-        queries[query] = dict(argv=argv, failure='query_unavailable', error=str(exc))
-        break
-print(json.dumps(dict(physical_device=spec['device'], queries=queries)), flush=True)
-'''
-
-
-class AdmissionFailure(Exception):
-    def __init__(self, kind, detail):
-        self.kind = kind
-        super().__init__(detail)
-
-
-def _require(condition, kind, detail):
-    if not condition:
-        raise AdmissionFailure(kind, detail)
-
-
-def _limit(remaining, ceiling=60):
-    value = remaining()
-    _require(value is None or (type(value) in (int, float) and
-             math.isfinite(value) and value > 0), 'budget_exhausted',
-             'Device admission elapsed allocation exhausted')
-    return ceiling if value is None else min(value, ceiling)
-
-
-def _fields(text):
-    return {key.strip().lower(): value.strip() for key, value in
-            (line.split(':', 1) for line in text.splitlines() if ':' in line)}
-
-
-def _number(fields, name):
-    value = fields.get(name.lower(), '')
-    _require(bool(re.fullmatch(r'\d+(?:\.\d+)?', value)), 'metric_unavailable',
-             'Missing or unsupported metric: ' + name)
-    return float(value)
-
-
-def _measure(raw, product, device):
-    _require(raw.get('physical_device') == device, 'identity_mismatch', 'Probe device changed')
-    queries = raw.get('queries', {})
-    names = ['board', 'health', 'usages', 'proc-mem']
-    if product == 'a5':
-        names.append('current-fault-event')
-    for name in names:
-        item = queries.get(name, {})
-        _require(item.get('exit') == 0 and isinstance(item.get('stdout'), str),
-                 item.get('failure', 'metric_unavailable'), 'Unavailable query: ' + name)
-    board = _fields(queries['board']['stdout'])
-    _require(_number(board, 'NPU ID') == device, 'identity_mismatch', 'Board device ID changed')
-    _require(('950' if product == 'a5' else '910') in board.get('chip name', ''),
-             'identity_mismatch', 'Measured chip family differs from profile product')
-    health = _fields(queries['health']['stdout'])
-    status = health.get('health status', health.get('hw health status'))
-    _require(status is not None, 'metric_unavailable', 'Health status unavailable')
-    _require(status.upper() == 'OK', 'unhealthy', 'Device health: ' + status)
-    # A3 exposes hardware errors in health, rather than current-fault-event.
-    error = health.get('error code', health.get('hw error code', health.get('hw health code')))
-    _require(error is not None, 'metric_unavailable', 'Hardware error code unavailable')
-    _require(error.upper() in ('NA', '0', '0X0', 'NONE'), 'unhealthy',
-             'Device hardware error: ' + error)
-    if product == 'a5':
-        faults = _number(_fields(queries['current-fault-event']['stdout']), 'fault event count')
-        _require(faults == 0, 'unhealthy', 'Current fault events present')
-    usages = _fields(queries['usages']['stdout'])
-    capacity = _number(usages, 'HBM Capacity(MB)')
-    memory = _number(usages, 'HBM Usage Rate(%)')
-    core = _number(usages, 'Aicore Usage Rate(%)')
-    vector = _number(usages, 'Aivector Usage Rate(%)')
-    utilization = max(core, vector)
-    if product == 'a5':
-        utilization = max(utilization, _number(usages, 'NPU Utilization(%)'),
-                          _number(usages, 'Aicube Usage Rate(%)'))
-    _require(capacity > 0 and all(0 <= n <= 100 for n in (memory, utilization)),
-             'metric_unavailable', 'Invalid memory/utilization measurement')
-    processes = queries['proc-mem']['stdout']
-    pids = re.findall(r'Process id\s*:\s*(\d+)', processes, flags=re.I)
-    _require(bool(pids) or 'No process in device.' in processes,
-             'metric_unavailable', 'Process occupancy unavailable')
-    return dict(health=status, memory_percent=memory, memory_capacity_mb=capacity,
-                utilization_percent=utilization, process_ids=[int(pid) for pid in pids],
-                idle=not pids and utilization == 0)
+deadline = time.monotonic() + spec['remaining']
+result = local_probe(physical_device=spec['device'], configuration=dict(
+    product=spec.get('product', 'a3' if spec['chip'] == 0 else 'a5'), chip=spec['chip'],
+    query_timeout_seconds=spec['query_timeout']), remaining=lambda: max(0., deadline-time.monotonic()))
+print(json.dumps(result['raw_measurements']), flush=True)
+"""
 
 
 def _outer(metadata, configuration):
@@ -212,7 +117,8 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
     started = time.monotonic()
     raw = {}
     result = dict(admitted=False, observation='Device admission unavailable',
-                  physical_device=metadata.get('physical_device'), raw_measurements=raw)
+                  physical_device=metadata.get('physical_device'), raw_measurements=raw,
+                  probe_source_sha256=standalone_hash())
     directory = None
     try:
         _require(phase in ('admission', 'command'), 'configuration_invalid', 'Invalid guard phase')
@@ -244,7 +150,7 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
         queries = ['board', 'health', 'usages', 'proc-mem']
         if product == 'a5':
             queries.append('current-fault-event')
-        spec = dict(device=device, chip=chip, queries=queries, query_timeout=timeout,
+        spec = dict(device=device, product=product, chip=chip, queries=queries, query_timeout=timeout,
                     remaining=_limit(remaining, timeout * len(queries)))
         placement = metadata.get('controller_placement', 'remote')
         if placement in ('here', 'remote'):
@@ -271,15 +177,15 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
             raise AdmissionFailure('configuration_invalid', 'Controller placement must be here or on')
         atomic_json(directory / 'measurements.json', raw)
         _limit(remaining)
-        measurements = _measure(raw['probe'], product, device)
-        result['measurements'] = measurements
         category = getattr(request, 'category', '')
-        timing = category in ('profile', 'profiling', 'timing', 'benchmark') or bool(
-            getattr(request, 'profile_path', None)) or configuration.get('require_idle', False)
-        _require(measurements['idle'] or (not timing and configuration.get('allow_busy') is True
-                 and measurements['memory_percent'] < 50), 'device_busy',
-                 'Healthy idle device required; configured ordinary sharing requires memory below 50%')
-        result.update(admitted=True, observation='Fresh bounded device measurements admitted')
+        policy = dict(configuration)
+        policy['require_idle'] = (configuration.get('require_idle', False) or
+            category in ('profile', 'profiling', 'timing', 'benchmark') or
+            bool(getattr(request, 'profile_path', None)))
+        result['measurements'] = assess(raw['probe'], physical_device=device, configuration=policy)
+        result.update(admitted=True, degraded=result['measurements']['degraded'],
+            observation=('Explicitly authorized Alarm device admitted for ordinary work (degraded)'
+                         if result['measurements']['degraded'] else 'Fresh bounded device measurements admitted'))
     except AdmissionFailure as exc:
         result.update(failure=dict(type=exc.kind, detail=str(exc)), observation=str(exc))
     except (KeyError, TypeError, ValueError, OSError, WorkflowError, subprocess.SubprocessError) as exc:

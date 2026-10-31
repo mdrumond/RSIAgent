@@ -203,9 +203,65 @@ def test_query_engine_executes_selected_device_syntax(tmp_path, monkeypatch, chi
     executable.chmod(0o700)
     monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
     spec = dict(device=7, chip=chip, queries=['health'], query_timeout=1, remaining=2)
-    output = subprocess.run([sys.executable, '-c', _PROBE, json.dumps(spec)],
+    output = subprocess.run([sys.executable, '-I', '-c', _PROBE, json.dumps(spec)],
                             capture_output=True, timeout=3, check=True)
     measured = json.loads(output.stdout)['queries']['health']
     expected = ['npu-smi', 'info', '-t', 'health', '-i', '7']
     assert measured['argv'] == expected + (['-c', '0'] if chip == 0 else [])
     assert measured['exit'] == 0 and measured['stdout'] == 'measured\n'
+
+
+def test_frozen_stdlib_export_queries_once_and_counts_existing_processes(monkeypatch):
+    import hashlib
+    from rsi.device_health_probe import standalone_hash, standalone_source
+    source = standalone_source()
+    assert standalone_hash() == hashlib.sha256(source.encode('utf-8')).hexdigest()
+    namespace = {}
+    exec(compile(source, '<frozen-device-health>', 'exec'), namespace)
+    calls = []
+    measured = probe('a5', busy=True)
+    def query(argv, **kwargs):
+        calls.append((argv, kwargs['timeout']))
+        name = argv[argv.index('-t') + 1]
+        return SimpleNamespace(returncode=0, stdout=measured['queries'][name]['stdout'].encode(), stderr=b'')
+    monkeypatch.setattr(namespace['subprocess'], 'run', query)
+    result = namespace['local_probe'](physical_device=2,
+        configuration=dict(product='a5', chip=None, require_idle=True, allow_busy=True),
+        remaining=lambda: 4)
+    assert not result['admitted'] and result['failure']['type'] == 'device_busy'
+    assert len(calls) == 5 and all(timeout <= 4 for _, timeout in calls)
+    assert result['raw_measurements']['queries']['proc-mem']['stdout'] == measured['queries']['proc-mem']['stdout']
+
+
+def test_standalone_probe_preserves_unavailable_output(monkeypatch):
+    import subprocess
+    from rsi.device_health_probe import local_probe
+    def query(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs['timeout'], output=b'partial measurement', stderr=b'busy driver')
+    monkeypatch.setattr('rsi.device_health_probe.subprocess.run', query)
+    result = local_probe(physical_device=0, configuration=dict(product='a3', chip=0), remaining=lambda: 2)
+    assert result['failure']['type'] == 'query_timeout'
+    item = result['raw_measurements']['queries']['board']
+    assert item['stdout'] == 'partial measurement' and item['stderr'] == 'busy driver'
+
+
+def test_explicit_alarm_authority_is_ordinary_only_and_retains_faults(setup):
+    run, config, metadata, state = setup
+    config.update(product='a5', chip=None)
+    state['probe'] = probe('a5', health='Alarm', error='80F78009')
+    state['probe']['queries']['current-fault-event']['stdout'] = 'Fault Event Count : 1\nFault Event Information : event id=0x80F78009\n'
+    assert run()['failure']['type'] == 'unhealthy'
+    config['allow_alarm'] = True
+    admitted = run()
+    assert admitted['admitted'] and admitted['degraded']
+    assert admitted['measurements']['health'] == 'Alarm'
+    assert admitted['measurements']['hardware_error_code'] == '80F78009'
+    assert admitted['measurements']['fault_event_count'] == 1
+    assert admitted['raw_measurements']['probe'] == state['probe']
+    request = SimpleNamespace(operation_id='alarm-timing', category='timing', profile_path=None)
+    timing = guard(request, phase='command', metadata=metadata, configuration=config, remaining=lambda: 60)
+    assert timing['failure']['type'] == 'unhealthy'
+    state['probe'] = probe('a5', health='Alarm', error='80F78009', busy=True)
+    assert run()['failure']['type'] == 'device_busy'
+    state['probe'] = probe('a5', health='Failed', error='80F78009')
+    assert run()['failure']['type'] == 'unhealthy'
