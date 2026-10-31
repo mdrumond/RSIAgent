@@ -151,6 +151,12 @@ def _framework():
         action: Literal['rejected']
         redirection: str | None = None
 
+    class Investigation(BaseModel):
+        model_config = ConfigDict(extra='forbid', strict=True)
+        question: str = Field(min_length=1)
+        goal: str = Field(min_length=1)
+        why: str = Field(min_length=1)
+
     class Diagnostic(Proposal):
         proposal: DiagnosticProject
         negative_decisions: list[Annotated[
@@ -186,6 +192,11 @@ def _framework():
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
         async def research_queries(self, role_prompt: str, admitted_evidence: str) -> ResearchQueries:
             """Choose documentation/KDB queries before proposing a diagnostic project."""
+            ...
+
+        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
+        async def investigation(self, role_prompt: str, admitted_evidence: str) -> Investigation:
+            """Choose what smaller investigation would explain the failure and why."""
             ...
 
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
@@ -273,6 +284,9 @@ class NoncodingRoles:
     def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
 
+    def investigation(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('investigation', prompt, evidence, deadline, wall_deadline)
+
     def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
 
@@ -341,6 +355,12 @@ _PROPOSALS = {'research_queries': (QueryPlan, 'queries', ResearchQuery),
 
 def _proposal(role, data, admitted):
     """Validate the same typed wire result without loading NOOA in the host."""
+    if role == 'investigation':
+        from rsi.curriculum_research import InvestigationIdea
+        if (type(data) is not dict or set(data) != {'question', 'goal', 'why'}
+                or any(type(v) is not str or not v.strip() for v in data.values())):
+            raise ValueError('investigation requires question, goal and why')
+        return InvestigationIdea(**data)
     if role in ('research_queries', 'diagnostic'):
         from rsi.curriculum_research import parse_proposal
         return parse_proposal(role, data, admitted)
@@ -461,6 +481,9 @@ class IsolatedRoles:
 
     def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def investigation(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('investigation', prompt, evidence, deadline, wall_deadline)
 
     def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
@@ -630,7 +653,7 @@ def _worker():
                                                 models=[identity.backend_model], invalid_prompt_retries=0)
             roles = NoncodingRoles(provider, direct_profile(identity), observer=emit)
             evidence = [AdmittedEvidence(**e) for e in request['evidence']]
-            if request['role'] not in _PROPOSALS:
+            if request['role'] not in _PROPOSALS and request['role'] != 'investigation':
                 raise ValueError('unknown role')
             result = getattr(roles, request['role'])(request['prompt'], evidence,
                                                     deadline=time.monotonic() + request['seconds'],

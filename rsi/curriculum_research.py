@@ -21,6 +21,13 @@ class ResearchResult:
 
 
 @dataclass(frozen=True)
+class InvestigationIdea:
+    question: str
+    goal: str
+    why: str
+
+
+@dataclass(frozen=True)
 class ResearchQuery:
     query: str
     purpose: str
@@ -229,12 +236,13 @@ class Researcher:
                     templates=row.get('templates', context['templates']))))
             for ref in context.get('previous_rejections', []):
                 evidence.append(AdmittedEvidence(ref, self._facts(self.store.read_json(ref))))
-            plan = self.roles.research_queries(
-                steering + 'Choose documentation/KDB queries to investigate the admitted failures before proposing a diagnostic.',
-                evidence, deadline=remaining(), wall_deadline=wall_deadline)
-            if not isinstance(plan, QueryPlan) or not plan.queries:
-                raise ValueError('a diagnostic requires prior model-selected documentation research')
-            for query in plan.queries:
+            # Retrieval is host-owned and precedes the semantic curriculum decision.
+            # Include the observed failure, rather than asking the model to certify IDs.
+            queries = [ResearchQuery(
+                json.dumps(dict(goal=parent.goal, failure=self._facts(failure)),
+                           sort_keys=True)[:12000],
+                'Investigate observed failure using documents and latest negative memory')]
+            for query in queries:
                 remaining()
                 state['inflight_query'] = dict(query=asdict(query), deadline=remaining())
                 observe('research_query_started', state['inflight_query'])
@@ -262,30 +270,20 @@ class Researcher:
                 evidence.append(AdmittedEvidence(ref, dict(query=asdict(query), **shown,
                                                           provenance=response['provenance'])))
             remaining()
-            decision = self.roles.diagnostic(
-                steering + 'Use the actual retrieved documents and negatives to choose a simpler host-advertised diagnostic. '
-                'Cite every query receipt and the selected parent. Address every negative by query_ref/index; '
-                'reuse needs a changed-applicability redirection. Preserve original cases and outcomes.',
+            idea = self.roles.investigation(
+                steering + 'Read the retrieved documents and failure memories. Choose the question, '
+                'goal and reason for a smaller investigation that would inform the original task. '
+                'The controller owns all project binding and evidence bookkeeping.',
                 evidence, deadline=remaining(), wall_deadline=wall_deadline)
             remaining()
-            if not isinstance(decision, DiagnosticDecision):
-                raise ValueError('typed diagnostic decision required')
-            proposal = decision.proposal
-            selected = proposal.parent_project_id or parent.project_id
-            if selected not in parent_refs or not {*query_refs, parent_refs[selected]} <= set(decision.evidence_ids):
-                raise ValueError('diagnostic must cite retrieved research and its admitted parent')
-            selected_row = next(row for row in parents if row['project_id'] == selected)
-            self._validate_template(proposal, selected, selected_row.get('templates', context['templates']), artifacts=self.store)
-            seen = set()
-            for row in decision.negative_decisions:
-                key = (row.query_ref, row.index)
-                if (key not in negatives or key in seen or not row.reason.strip()
-                        or row.action not in ('used', 'rejected')
-                        or row.action == 'used' and not (row.redirection or '').strip()):
-                    raise ValueError('every negative needs a decision; reuse needs redirection')
-                seen.add(key)
-            if seen != negatives:
-                raise ValueError('diagnostic omitted a retrieved negative')
+            if not isinstance(idea, InvestigationIdea):
+                raise ValueError('typed semantic investigation required')
+            proposal = self._bind_investigation(idea, parents, context['templates'])
+            # This is controller provenance, not a model certification ledger.
+            decision = DiagnosticDecision(idea.why,
+                tuple([*query_refs, parent_refs[proposal.parent_project_id]]), proposal, ())
+            observe('investigation_bound', dict(idea=asdict(idea), proposal=asdict(proposal),
+                negative_coverage=[dict(query_ref=ref, index=i) for ref, i in sorted(negatives)]))
             return finish('accepted', proposal)
         except Exception as exc:
             if unknown or active and not finished:
@@ -298,6 +296,31 @@ class Researcher:
             raise ResearchRejected(result.receipt_ref, result.actor_seconds) from exc
         finally:
             self.roles.observer = original_observer
+
+    @staticmethod
+    def _bind_investigation(idea, parents, templates):
+        """Choose a smaller registered input; the materializer remains authoritative."""
+        for parent in parents:
+            parent_id = parent['project_id']
+            catalog = parent.get('templates', templates)
+            # Prefer a tiny shape when available, otherwise one frozen correctness case.
+            for entry in sorted(catalog, key=lambda row: 'shape' not in row['parameters']):
+                if entry.get('parent_project_id', parent_id) != parent_id:
+                    continue
+                rules = entry['parameters']
+                if set(rules) == {'shape'} and entry.get('shape_constraints'):
+                    rank = rules['shape']['minItems']
+                    parameters = dict(shape=[1] * rank)
+                elif set(rules) == {'case_indices'} and rules['case_indices']['items'].get('enum'):
+                    parameters = dict(case_indices=[rules['case_indices']['items']['enum'][0]])
+                else:
+                    continue
+                proposal = DiagnosticProposal(idea.question, idea.goal,
+                    'Pass the linked frozen host oracle on the selected diagnostic inputs.',
+                    entry['template_id'], parameters, parent_id)
+                Researcher._validate_template(proposal, parent_id, catalog)
+                return proposal
+        raise ValueError('no smaller registered diagnostic capability available')
 
     def _facts(self, row):
         """Useful bounded facts; complete documents and diagnostics stay in CAS."""
