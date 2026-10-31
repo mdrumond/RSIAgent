@@ -51,6 +51,7 @@ class SimplificationResult:
     spec: ProjectSpec
     actor_seconds: float
     receipt_ref: str
+    parent_project_id: str | None = None
 
     def __post_init__(self):
         if not isinstance(self.spec, ProjectSpec):
@@ -58,6 +59,18 @@ class SimplificationResult:
         if not isinstance(self.receipt_ref, str) or not self.receipt_ref.strip():
             raise ValueError('retained host timing receipt required')
         _seconds(self.actor_seconds)
+
+
+@dataclass(frozen=True)
+class SimplificationDeferred:
+    """Known elapsed exhaustion; retain the queue without inventing a child."""
+    actor_seconds: float
+    receipt_ref: str
+
+    def __post_init__(self):
+        _seconds(self.actor_seconds)
+        if not self.receipt_ref:
+            raise ValueError('retained exhaustion receipt required')
 
 
 @dataclass(frozen=True)
@@ -137,6 +150,7 @@ class CycleScheduler:
                  isolate=None, simplify=None, recover=True, wave_size=None,
                  wave_limit=None, recovery_limit=1, actor_seconds=None,
                  recovery_seconds=None, wall_seconds=None, tuning_every=5,
+                 recovery_feedback=False,
                  clock=time.time):
         if not isinstance(spec, CycleSpec):
             raise TypeError('CycleSpec required')
@@ -164,6 +178,8 @@ class CycleScheduler:
                       wave_limit=wave_limit, recovery_limit=recovery_limit,
                       actor_seconds=actor_seconds, recovery_seconds=recovery_seconds,
                       wall_seconds=wall_seconds, tuning_every=tuning_every)
+        if recovery_feedback:
+            config['recovery_feedback'] = True
         try:
             if self.path.exists():
                 self.state = json.loads(self.path.read_text())
@@ -209,6 +225,34 @@ class CycleScheduler:
 
     def resume(self):
         self.state['stopped'] = False
+        self._save()
+
+    def admit_failed_parents(self, rows, receipt_ref):
+        """Start a new diagnostic cycle from retained failures, never rerun parents."""
+        s = self.state
+        previous = s.get('failed_parent_admission')
+        if previous is not None:
+            if previous != dict(rows=rows, receipt_ref=receipt_ref):
+                raise ValueError('failed-parent admission differs from its retained receipt')
+            return
+        if (self.spec.mode != Mode.PHASE1 or not self.simplify or not self.config['recover']
+                or s['phase'] != 'original' or s['cursor'] or s['completed_operations']
+                or s['pending'] or s['originals'] or s['recoveries'] or s['spent'] or not receipt_ref):
+            raise WorkflowError('failed-parent admission requires a fresh configured Phase1 boundary')
+        if not any(self.config[key] is not None for key in ('actor_seconds', 'recovery_seconds')):
+            raise ValueError('diagnostic recovery requires an explicit finite elapsed allocation')
+        failed = []
+        for row in rows:
+            ProjectSpec.from_dict(row['project'])
+            if not row['artifact_ref'] or not row['operation_id']:
+                raise ValueError('retained failed-parent result identity required')
+            if row['outcome'] != 'accepted':
+                failed.append(dict(spec=row['project'], original_id=row['original_id'],
+                                   result=row, attempts=0))
+        s['failed_parent_admission'] = copy.deepcopy(dict(rows=rows, receipt_ref=receipt_ref))
+        s['recovery_queue'] = copy.deepcopy(failed)
+        s['cursor'] = len(self.spec.projects)
+        s['phase'] = 'simplify' if failed else 'complete'
         self._save()
 
     def remaining(self):
@@ -362,18 +406,27 @@ class CycleScheduler:
             raise WorkflowError('pending operation requires reconciliation')
         if s['stopped'] or s['phase'] in ('complete', 'wave_limit'):
             return None
+        if s['phase'] == 'recovery' and not s['recovery_queue']:
+            self._wave_end()
+            self._save()
+            return None
         remaining = self.remaining()
+        if (self.config.get('recovery_feedback') and s['phase'] in ('simplify', 'recovery', 'recovery_memory')
+                and any(value is not None and value <= 0 for value in remaining.values())):
+            s['stopped'] = True
+            s['events'].append(dict(kind='semantic_recovery_elapsed_exhausted', remaining=remaining))
+            self._save()
+            return None
         retained_original = (s['phase'] == 'original' and s.get('active_wave', {})
                              and s['active_wave']['phase'] == 'settled')
         if not retained_original and any(remaining[k] is not None and remaining[k] <= 0
                                         for k in ('actor_seconds', 'wall_seconds')):
             raise WorkflowError('parent elapsed allocation exhausted')
         phase = s['phase']
-        if phase == 'recovery' and not s['recovery_queue']:
-            self._wave_end()
-            self._save()
-            return None
-        operation = dict(id=uuid.uuid4().hex, kind=phase, recovery=phase in ('recovery', 'simplify'))
+        operation = dict(id=uuid.uuid4().hex, kind='memory' if phase == 'recovery_memory' else phase,
+                         recovery=phase in ('recovery', 'simplify', 'recovery_memory'))
+        if phase == 'recovery_memory':
+            operation['feedback'] = 'recovery'
         if phase == 'original':
             wave = s.get('active_wave')
             retained = next((op for op in wave['operations']
@@ -406,8 +459,9 @@ class CycleScheduler:
                                                 wall_seconds=min(wall) if wall else None))
         if phase in ('original', 'recovery'):
             result = self.runner(spec, s['memory'], s['skills'], ctx)
-        elif phase == 'memory':
-            rows = s['wave_results'] if self.spec.mode == Mode.PHASE1 else [s['originals'][-1]]
+        elif phase in ('memory', 'recovery_memory'):
+            rows = s['recovery_feedback_rows'] if phase == 'recovery_memory' else (
+                s['wave_results'] if self.spec.mode == Mode.PHASE1 else [s['originals'][-1]])
             result = self.memory_update(s['memory'], copy.deepcopy(rows), ctx)
         elif phase == 'skill':
             result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(s['originals'][-1]), ctx)
@@ -459,6 +513,10 @@ class CycleScheduler:
                 if result.outcome == 'accepted':
                     s['recovery_queue'].pop(0)
                 s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
+                if self.config.get('recovery_feedback'):
+                    s['after_recovery_memory'] = s['phase']
+                    s['recovery_feedback_rows'] = [copy.deepcopy(row)]
+                    s['phase'] = 'recovery_memory'
         elif kind in ('memory', 'skill'):
             if not isinstance(result, SnapshotUpdate):
                 raise TypeError('retained snapshot update required')
@@ -477,22 +535,63 @@ class CycleScheduler:
                 self._after_original()
             else:
                 s['memory'] = result.reference
-                if self.spec.mode != Mode.PHASE1:
+                if op.get('feedback') == 'recovery':
+                    s['recovery_spent'] += result.actor_seconds
+                    s['recovery_feedback_rows'] = []
+                    s['phase'] = s.pop('after_recovery_memory')
+                elif self.spec.mode != Mode.PHASE1:
                     s['phase'] = 'skill'
                 else:
+                    parents = {row['project']['project_id']: row for row in s.get('historical_failed_parents', [])}
+                    parents.update({row['project']['project_id']: row for row in s['wave_results']})
                     s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
                                                 result=r, attempts=0) for r in s['wave_results']
                                            if self.config['recover'] and r['outcome'] != 'accepted']
+                    if self.config.get('recovery_feedback'):
+                        s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
+                            result=r, attempts=0) for r in parents.values()
+                            if self.config['recover'] and r['outcome'] != 'accepted']
                     s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
         elif kind == 'simplify':
             original = ProjectSpec.from_dict(op['spec'])
+            if isinstance(result, SimplificationDeferred):
+                s['spent'] += result.actor_seconds
+                s['recovery_spent'] += result.actor_seconds
+                s['events'].append(dict(kind='simplification_deferred', operation_id=operation_id,
+                    receipt_ref=result.receipt_ref, actor_seconds=result.actor_seconds))
+                s['stopped'] = True
+                s['completed_operations'][operation_id] = kind
+                s['pending'] = None
+                self.needs_reconciliation = False
+                self._save()
+                return
             if not isinstance(result, SimplificationResult):
                 raise TypeError('host simplification result with elapsed receipt required')
+            index = 0
+            if result.parent_project_id is not None:
+                index = next((i for i, item in enumerate(s['recovery_queue'])
+                              if item['spec']['project_id'] == result.parent_project_id), None)
+                if index is None:
+                    raise ValueError('selected parent is outside the admitted failure queue')
+                selected = s['recovery_queue'][index]
+                original = ProjectSpec.from_dict(selected['spec'])
             revised = result.spec
+            if self.config.get('recovery_feedback'):
+                allowance = revised.budgets.actor_seconds
+                caps = [value - result.actor_seconds for key, value in self.remaining().items()
+                        if key in ('actor_seconds', 'recovery_seconds') and value is not None]
+                if allowance is None or allowance <= 0 or any(allowance > value for value in caps):
+                    raise ValueError('child allocation exceeds the measured remaining semantic pool')
             if revised.project_id == original.project_id:
                 raise ValueError('simplification requires a new linked project identity')
-            if revised.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
+            catalog = (s.get('failed_parent_admission', {}).get('rows', [])
+                       + s.get('historical_failed_parents', []))
+            if revised.project_id in {r['project']['project_id']
+                                      for r in s['originals'] + s['recoveries'] + catalog}:
                 raise ValueError('revised project identity already used')
+            selected = s['recovery_queue'].pop(index)
+            s['recovery_queue'].insert(0, selected)
+            op['original_id'] = selected['original_id']
             s['events'].append(dict(kind='project_revised', original_id=op['original_id'],
                                     parent_id=original.project_id, revised=revised.to_dict(),
                                     operation_id=operation_id, receipt_ref=result.receipt_ref,
