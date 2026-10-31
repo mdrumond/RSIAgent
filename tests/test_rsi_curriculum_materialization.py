@@ -131,16 +131,16 @@ def test_catalog_and_unknown_template_or_arbitrary_commands_are_rejected(cpu, tm
     assert not list(tmp_path.glob('bad-*'))
 
 
-def test_new_triton_id_has_own_device_table_and_resolves_actual_lease(tmp_path):
-    from rsi.project_wave import WaveRequest
-    from rsi.triton_worker_binding import bind_project, prepare_worker_bindings
+def _native_parent(tmp_path, case_rows=None):
+    from rsi.triton_worker_binding import prepare_worker_bindings
     source = tmp_path/'native-parent'
     source.mkdir()
     (source/'candidate.py').write_text('def candidate(*args): return args[0]\n')
     (source/'full-resource.txt').write_text('Preserve all original source context\n')
     cases = tmp_path/'native-cases.json'
     atomic_json(cases, dict(project_id='native-original', operation='add', cases=[
-        dict(case_id=str(i), shape=[i+1], seed=i, dtype='float32', layout='contiguous') for i in range(3)]))
+        dict(case_id=str(i), shape=[i+1], seed=i, dtype='float32', layout='contiguous')
+        for i in range(3)] if case_rows is None else case_rows))
     devices = {}
     for device in (0, 1):
         runtime = tmp_path/f'runtime-{device}.json'
@@ -154,6 +154,14 @@ def test_new_triton_id_has_own_device_table_and_resolves_actual_lease(tmp_path):
     old_bytes = Path(old_binding['manifest']).read_bytes()
     variant = json.loads(old_bytes)['projects'][parent.project_id]['variants']['0']
     parent, config = ProjectSpec.from_dict(variant['spec']), ProjectConfig.from_dict(variant['config'])
+    return parent, config, old_binding, devices, cases
+
+
+def test_new_triton_id_has_own_device_table_and_resolves_actual_lease(tmp_path):
+    from rsi.project_wave import WaveRequest
+    from rsi.triton_worker_binding import bind_project
+    parent, config, old_binding, devices, cases = _native_parent(tmp_path)
+    old_bytes = Path(old_binding['manifest']).read_bytes()
     idea = dict(name='tail',goal='Investigate one tail',acceptance='Independent oracle',
         template_id='triton.case-subset',parameters=dict(case_indices=[1]))
     child = materialize_child(parent,dict(config=asdict(config),binding=old_binding),idea,
@@ -175,3 +183,39 @@ def test_new_triton_id_has_own_device_table_and_resolves_actual_lease(tmp_path):
     assert Path(old_binding['manifest']).read_bytes() == old_bytes
     assert len(json.loads(cases.read_text())['cases']) == 3
     assert (Path(resolution['config']['source'])/'full-resource.txt').read_text() == 'Preserve all original source context\n'
+
+
+def test_single_case_shape_forks_preserve_template_oracle_and_can_shrink_again(tmp_path):
+    case = dict(case_id='matrix',shape=[257,33],seed=7,dtype='float32',layout='transpose',atol=1e-5,rtol=1e-4)
+    parent, config, binding, _, cases = _native_parent(tmp_path, [case])
+    original = cases.read_bytes()
+    for number, shape in enumerate(([2,4],[1,1])):
+        wrapper = dict(config=asdict(config),binding=binding)
+        catalog = capability_catalog(parent,wrapper)
+        template = next(row for row in catalog if row['template_id']=='triton.shape-reduction.case-0')
+        assert template['parameters']['shape']['minItems'] == template['parameters']['shape']['maxItems'] == 2
+        assert len(template['parameters']['shape']['items']['enum']) <= 12
+        idea = dict(name='tiny',goal='Investigate a tiny input',acceptance='Existing independent oracle',
+            template_id=template['template_id'],parameters=dict(shape=shape))
+        child = materialize_child(parent,wrapper,idea,root=tmp_path/f'shape-{number}',
+            remaining=8.,evidence_refs=('c'*64,),operation_id=f'shape-{number}')
+        contract = json.loads(Path(child.spec.correctness_ref).read_text())
+        assert contract['project_id']=='native-original' and contract['operation']=='add'
+        assert contract['cases']==[dict(case,shape=shape)]
+        assert Path(child.config.verifier).read_bytes()==Path(config.verifier).read_bytes()
+        assert child.spec.project_id!=parent.project_id
+        parent, config, binding = child.spec,child.config,child.provenance['binding']
+    assert capability_catalog(parent,dict(config=asdict(config),binding=binding)) == []
+    assert cases.read_bytes()==original
+
+
+@pytest.mark.parametrize('shape', [[4,8],[1],[1,1,1],[0,1],[-1,1],[True,1],[8,1],[1,16],[3,1]])
+def test_shape_choice_requires_rank_positive_advertised_per_axis_strict_reduction(tmp_path,shape):
+    parent,config,binding,_,cases=_native_parent(tmp_path,[dict(shape=[4,8],seed=0,dtype='float32',layout='contiguous')])
+    idea=dict(name='tiny',goal='A smaller input',acceptance='Same oracle',
+        template_id='triton.shape-reduction.case-0',parameters=dict(shape=shape))
+    root=tmp_path/'rejected-shape'
+    with pytest.raises(MaterializationRejected):
+        materialize_child(parent,dict(config=asdict(config),binding=binding),idea,
+            root=root,remaining=9.,evidence_refs=('d'*64,),operation_id='bad-shape')
+    assert not root.exists() and json.loads(cases.read_text())['cases'][0]['shape']==[4,8]

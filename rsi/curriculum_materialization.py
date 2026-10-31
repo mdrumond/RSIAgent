@@ -21,7 +21,8 @@ class MaterializationRejected(ValueError):
 
 HOST_CAPABILITY_CATALOG = tuple(dict(template_id=family + '.case-subset', parameters=dict(
     case_indices=dict(type='array', items=dict(type='integer'), minItems=1, uniqueItems=True)))
-    for family in ('cpu', 'triton'))
+    for family in ('cpu', 'triton')) + (dict(template_id='triton.shape-reduction', parameters=dict(
+        shape=dict(type='array', items=dict(type='integer'), minItems=1, uniqueItems=False))),)
 
 
 @dataclass(frozen=True)
@@ -72,13 +73,28 @@ def capability_catalog(parent_spec, parent_config):
         return []
     count = len(cases['cases'])
     triton = '--runtime-manifest' in config.commands['test']
-    if count < 2 or triton and not binding:
+    if not count or triton and (not binding or cases.get('operation') not in ('add', 'row_sum', 'strided_copy')):
         return []
-    entry = deepcopy(HOST_CAPABILITY_CATALOG[int(triton)])
-    entry['parent_project_id'] = parent_spec.project_id
-    entry['parameters']['case_indices'].update(maxItems=count - 1,
-        items=dict(type='integer', enum=list(range(count))))
-    return [entry]
+    templates = []
+    if count > 1:
+        entry = deepcopy(HOST_CAPABILITY_CATALOG[int(triton)])
+        entry['parameters']['case_indices'].update(maxItems=count - 1,
+            items=dict(type='integer', enum=list(range(count))))
+        templates.append(entry)
+    if triton:
+        for index, case in enumerate(cases['cases']):
+            shape = case.get('shape')
+            if (not isinstance(shape, list) or not shape
+                    or not all(type(n) is int and n > 0 for n in shape) or max(shape) == 1):
+                continue
+            choices = sorted({1, *shape, *(1 << i for i in range(max(shape).bit_length()))})
+            entry = deepcopy(HOST_CAPABILITY_CATALOG[2])
+            entry.update(template_id=entry['template_id'] + '.case-' + str(index),
+                         case_index=index, parent_shape=list(shape))
+            entry['parameters']['shape'].update(minItems=len(shape), maxItems=len(shape),
+                items=dict(type='integer', enum=choices))
+            templates.append(entry)
+    return [dict(entry, parent_project_id=parent_spec.project_id) for entry in templates]
 
 
 def _copy_source(config, destination, *, triton):
@@ -199,14 +215,27 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
                 for ref in evidence_refs), 'Retained research evidence references required')
     original_cases, case_data = _cases(config)
     catalog = capability_catalog(parent_spec, parent_config)
-    _require(catalog and idea['template_id'] == catalog[0]['template_id'], 'Unsupported host template')
+    template = next((t for t in catalog if t['template_id'] == idea['template_id']), None)
+    _require(template is not None, 'Unsupported host template')
     parameters = idea.get('parameters')
-    _require(isinstance(parameters, dict) and set(parameters) == {'case_indices'}, 'Only case_indices is supported')
-    indices = parameters['case_indices']
-    _require(isinstance(indices, list) and 0 < len(indices) < len(case_data['cases'])
-        and all(type(i) is int and 0 <= i < len(case_data['cases']) for i in indices)
-        and len(set(indices)) == len(indices), 'Choose a nonempty proper subset of parent cases')
-    triton = idea['template_id'] == 'triton.case-subset'
+    requested_shape = None
+    if 'shape' in template['parameters']:
+        _require(isinstance(parameters, dict) and set(parameters) == {'shape'}, 'Only shape is supported')
+        requested_shape, old = parameters['shape'], template['parent_shape']
+        allowed = template['parameters']['shape']['items']['enum']
+        _require(isinstance(requested_shape, list) and len(requested_shape) == len(old)
+            and all(type(n) is int and 0 < n <= maximum and n in allowed
+                    for n, maximum in zip(requested_shape, old))
+            and any(n < maximum for n, maximum in zip(requested_shape, old)),
+            'Shape must strictly shrink a parent dimension within the advertised choices')
+        indices = [template['case_index']]
+    else:
+        _require(isinstance(parameters, dict) and set(parameters) == {'case_indices'}, 'Only case_indices is supported')
+        indices = parameters['case_indices']
+        _require(isinstance(indices, list) and 0 < len(indices) < len(case_data['cases'])
+            and all(type(i) is int and 0 <= i < len(case_data['cases']) for i in indices)
+            and len(set(indices)) == len(indices), 'Choose a nonempty proper subset of parent cases')
+    triton = idea['template_id'].startswith('triton.')
     root = Path(root).resolve()
     source = Path(config.source).resolve()
     _require(not root.is_relative_to(source) and not source.is_relative_to(root), 'Child root must be independent')
@@ -236,7 +265,10 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
     # Preserve the verifier's template-family metadata, independently of the new
     # logical child ID. Only the curriculum-selected workload cases change.
     case_family = case_data.get('project_id', parent_spec.project_id)
-    case_data = dict(case_data, cases=[case_data['cases'][i] for i in indices])
+    selected = [deepcopy(case_data['cases'][i]) for i in indices]
+    if requested_shape is not None:
+        selected[0]['shape'] = list(requested_shape)
+    case_data = dict(case_data, cases=selected)
     cases = inputs/'cases.json' if triton else project/('diagnostic-cases-' + child_id.rsplit('-', 1)[-1] + '.json')
     _require(not cases.exists(), 'Child case path would overwrite a source resource')
     atomic_json(cases, case_data)
@@ -282,7 +314,7 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
     provenance = dict(parent_project_id=parent_spec.project_id, child_project_id=child_id,
         template_id=idea['template_id'], case_family_id=case_family, parent_source_hash=parent_source,
         parent_cases_sha256=identity['cases_sha256'], child_cases_sha256=_sha(cases),
-        oracle_sha256=_sha(oracle), case_indices=indices, evidence_refs=list(evidence_refs),
+        oracle_sha256=_sha(oracle), case_indices=indices, parameters=deepcopy(parameters), evidence_refs=list(evidence_refs),
         child_source_hash=source_identity(project, verifier=oracle, generated_paths=config.generated_paths),
         operation_id=operation_id, binding=child_binding, allocated_actor_seconds=allocated,
         setup_seconds=time.monotonic() - started, setup_excluded_from_actor_time=True)
