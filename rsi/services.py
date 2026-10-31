@@ -3,7 +3,7 @@
 Configuration uses project_configs[project_id] = ProjectConfig wire data and
 kdb_collections = [collection names]. Paths are resolved from the instance.
 ProjectSpec.command equals commands.test. Serial budgets cap per-project budgets.
-Opt-in waves reserve the explicit7200-second actor allocation per child.
+Opt-in waves preserve each project's actor allocation, defaulting to7200 when unset.
 Starting folders are copied by ProjectRunner at admission; existing contracts
 never re-read their original folders. New configuration revisions require an
 explicit task-boundary adoption; active and historical contracts remain frozen.

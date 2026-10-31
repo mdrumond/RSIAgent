@@ -317,21 +317,26 @@ class CycleScheduler:
         elif size:
             count = min(count, size - len(s['wave_results']))
         remaining = self.remaining()
-        if remaining['actor_seconds'] is not None:
-            count = min(count, int(remaining['actor_seconds'] // 7200))
-        if recovery and remaining['recovery_seconds'] is not None:
-            count = min(count, int(remaining['recovery_seconds'] // 7200))
         if count < 1 or remaining['wall_seconds'] is not None and remaining['wall_seconds'] <= 0:
             raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
         operations = []
+        reserved = 0.
+        caps = [value for value in (remaining['actor_seconds'],
+            remaining['recovery_seconds'] if recovery else None) if value is not None]
         for offset in range(count):
             spec = ProjectSpec.from_dict(first['spec']) if recovery else self.spec.projects[s['cursor'] + offset]
-            limits = replace(spec.budgets, actor_seconds=7200., design_iterations=None,
+            allowance = spec.budgets.actor_seconds if spec.budgets.actor_seconds is not None else 7200.
+            if any(reserved + allowance > cap for cap in caps):
+                break
+            reserved += allowance
+            limits = replace(spec.budgets, actor_seconds=allowance, design_iterations=None,
                              implementation_iterations=None, execution_tries=None)
             spec = replace(spec, budgets=limits)
             operations.append(dict(id=first['id'] if not offset else uuid.uuid4().hex,
                 kind=first['kind'], recovery=recovery,
                 original_id=first['original_id'] if recovery else spec.project_id, spec=spec.to_dict()))
+        if not operations:
+            raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
         wave = dict(id=uuid.uuid4().hex, operations=operations, memory=s['memory'], skills=s['skills'],
                     phase='executing', wall_deadline=(s['created'] + self.config['wall_seconds']
                     if self.config['wall_seconds'] is not None else None))

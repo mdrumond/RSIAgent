@@ -31,6 +31,7 @@ class WaveRequest:
     reopen: bool
     dispatch_id: str
     recovery_receipt: str | None = None
+    initial_actor_seconds: float = 7200.0
 
 
 def _read(path):
@@ -50,7 +51,7 @@ def _worker(factory, request):
     if not isinstance(runner, ProjectRunner) or runner.root.resolve() != request.root.resolve():
         raise TypeError('wave factory must return the assigned canonical ProjectRunner')
     limits = runner.workflow.limits
-    if (limits.actor_seconds != 7200.0
+    if (limits.actor_seconds != request.initial_actor_seconds
             or runner.workflow.actor_allocation() != request.actor_seconds or any(
             getattr(limits, name) is not None for name in
             ('design_iterations', 'implementation_iterations', 'execution_tries'))):
@@ -79,7 +80,8 @@ class ProjectWave:
     publish() returns a durable ordered result manifest for services to consume
     transactionally by its digest. It never mutates a shared memory/KDB itself.
     """
-    def __init__(self, root, projects, devices, memory, skills, *, max_parallel=1):
+    def __init__(self, root, projects, devices, memory, skills, *, max_parallel=1,
+                 actor_allowances=None):
         projects, devices = tuple(projects), tuple(devices)
         if (not projects or len(set(projects)) != len(projects) or any(
                 not isinstance(p, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', p)
@@ -92,10 +94,20 @@ class ProjectWave:
             raise ValueError('parallelism must fit admitted device leases')
         if not isinstance(memory, bytes) or not isinstance(skills, bytes):
             raise TypeError('wave snapshots must be immutable bytes')
+        supplied = {} if actor_allowances is None else dict(actor_allowances)
+        if supplied.keys() - set(projects):
+            raise ValueError('actor allowances must refer to admitted project identities')
+        allowances = {p: 7200. if supplied.get(p) is None else supplied[p] for p in projects}
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+               for value in allowances.values()):
+            raise ValueError('project actor allowances must be positive finite seconds')
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.plan = dict(projects=list(projects), devices=list(devices),
                          memory=memory.hex(), skills=skills.hex(), max_parallel=max_parallel)
+        # Keep the original default plan shape so retained legacy waves reopen.
+        if any(value != 7200. for value in allowances.values()):
+            self.plan['actor_allowances'] = allowances
         self.path = self.root / 'wave.json'
         with self._lock():
             if self.path.exists():
@@ -104,7 +116,7 @@ class ProjectWave:
             else:
                 self._save(dict(plan=self.plan, stopped=False, publication=None,
                     projects={p: dict(status='ready', device=None, dispatch_id=None,
-                        actor_seconds=0.0, allowance=7200.0, recovery=None, reopen=False)
+                        actor_seconds=0.0, allowance=allowances[p], recovery=None, reopen=False)
                         for p in projects}))
 
     def _lock(self):
@@ -133,7 +145,8 @@ class ProjectWave:
         return WaveRequest(project, self._branch(project) / 'runner', row['device'],
             bytes.fromhex(self.plan['memory']), bytes.fromhex(self.plan['skills']),
             row['allowance'], row['actor_seconds'], row['reopen'], row['dispatch_id'],
-            json.dumps(row['recovery'], sort_keys=True) if row['recovery'] else None)
+            json.dumps(row['recovery'], sort_keys=True) if row['recovery'] else None,
+            self.plan.get('actor_allowances', {}).get(project, 7200.))
 
     def _available(self, state, row):
         used = {r['device'] for r in state['projects'].values() if r['device'] is not None}
@@ -337,7 +350,7 @@ class ProjectWave:
                     or row['closure'].get('resume_ready') is not True
                     or row['recovery'] is not None or not observation.strip()):
                 raise ValueError('one observed harness recovery on a closed unfinished project required')
-            row.update(status='ready', device=None, reopen=True, allowance=14400.0,
+            row.update(status='ready', device=None, reopen=True, allowance=row['allowance'] + 7200.,
                 recovery=dict(observation=observation,
                 closure=row['closure'], dispatch_id=row['dispatch_id']))
             self._save(state)

@@ -248,7 +248,8 @@ class WaveBindings:
         return ProjectWave(cycle.root / 'waves' / wave['id'],
             [op['id'] for op in wave['operations']], [d['device'] for d in self.policy['devices']],
             cycle.store.read_bytes(wave['memory']), cycle.store.read_bytes(wave['skills']),
-            max_parallel=self.policy['max_parallel'])
+            max_parallel=self.policy['max_parallel'], actor_allowances={
+                op['id']: op['spec']['budgets'].get('actor_seconds') for op in wave['operations']})
 
     def _prepare(self, maximum):
         cycle = self.cycle
