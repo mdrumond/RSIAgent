@@ -172,6 +172,13 @@ class ProfileCommandGuard:
     def __call__(self, request, *, remaining):
         return self.profiles.guard(self.identity, request, phase='command', remaining=remaining)
 
+    def environment(self, request, *, inherited):
+        from types import SimpleNamespace
+        metadata = self.profiles.metadata(self.identity)
+        context = SimpleNamespace(root=request.project.parent,
+                                  device=str(metadata['physical_device']))
+        return self.profiles.worker_environment(self.identity, context, inherited=inherited)
+
 
 @dataclass(frozen=True)
 class FrozenExecutorFactory:

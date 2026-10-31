@@ -266,9 +266,20 @@ class ProjectWave:
             row.update(actor_seconds=elapsed, closure=proof)
             if (row['status'] != 'completed' and proof.get('resume_ready') is True
                     and elapsed < row['allowance']):
-                row.update(status='ready', device=None, reopen=True)
+                row.update(status='ready', device=None, reopen=proof.get('runner_exists', True))
             self._save(state)
             return self._status(state)
+
+    def retain_admission_elapsed(self, project, dispatch_id, elapsed, reference):
+        """Charge observed pre-runner probing without releasing an unknown lease."""
+        with self._lock():
+            state = self._load()
+            row = state['projects'][project]
+            if (row['status'] != 'pending' or row['dispatch_id'] != dispatch_id
+                    or not math.isfinite(elapsed) or elapsed < row['actor_seconds']):
+                raise ValueError('matching pending admission and monotonic elapsed required')
+            row.update(actor_seconds=elapsed, admission_ref=reference)
+            self._save(state)
 
     def settle_exhausted(self, project, runner):
         """Retain a canonical exhausted outcome after authoritative closure.

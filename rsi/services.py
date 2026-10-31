@@ -461,7 +461,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 self.store.put_json(resolution)
         runner = self.runner(root, memory_ref=binding['memory'],
                            backend_identity=self.store.put_json(binding), reopen=True,
-                           configuration_ref=binding['configuration'])
+                           configuration_ref=binding['configuration'],
+                           command_guard=self.local_command_guard(binding))
         if resolution:
             from core.artifacts import canonical_bytes
             from rsi.project_binding import attach_execution_context
@@ -536,9 +537,29 @@ class BoundCycle(ProjectComposition, TuningBindings):
         self.controller.learning = self.learning
         return receipt
 
+    def local_command_guard(self, binding):
+        profile = binding.get('worker_profile')
+        if not profile or binding.get('executor_identity') is not None:
+            return None
+        from rsi.executor_profiles import FrozenExecutorFactory, ProfileCommandGuard
+        provenance = binding['executor_provenance']
+        if self.services.executor_factory is None:
+            raise ValueError('retained local project requires its trusted worker profile')
+        profiles = FrozenExecutorFactory(self.services.executor_factory,
+            json.dumps({profile: provenance}, sort_keys=True))
+        profiles.metadata(profile)
+        return ProfileCommandGuard(profiles, profile)
+
     def trial(self, request, *, reopen):
+        trial_binding = self.store.read_json(request.backend_identity)
+        binding = self.store.read_json(trial_binding['backend'])
         runner = self.runner(request.root, spec=request.spec, bundle=request.bundle, config=request.config,
-            memory_ref=request.memory_ref, backend_identity=request.backend_identity, reopen=reopen)
+            memory_ref=request.memory_ref, backend_identity=request.backend_identity, reopen=reopen,
+            command_guard=self.local_command_guard(binding))
+        if binding.get('resolved_binding_ref'):
+            from rsi.project_binding import attach_execution_context
+            attach_execution_context(runner, binding,
+                self.store.read_json(binding['resolved_binding_ref']), None)
         canonical_run = runner.run
         def run_trial():
             self.active_runner = runner

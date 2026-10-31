@@ -517,6 +517,9 @@ class PythonExecution:
                             self._save(operation, record)
                         raise
                     self._save(operation, record)
+                    environment = getattr(self.command_guard, 'environment', None)
+                    if environment is not None:
+                        env = environment(request, inherited=env)
                     if any(x is not None and x <= 0 for x in self.workflow.remaining().values()):
                         raise WorkflowError('time budget exhausted during command admission')
                 process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
