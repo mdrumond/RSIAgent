@@ -6,6 +6,7 @@ import time
 from rsi.evidence_io import _references
 from rsi.instance_ingestion import load_ingestion_records
 from rsi.strategy import knowledge_db_query
+from rsi.memory_projection import project_memory
 
 
 def file_identity(path):
@@ -57,7 +58,7 @@ class ProjectComposition:
             raise ValueError('accepted memory snapshot required')
         ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
         records = snapshot['memories']
-        positives, negatives = [], []
+        positives, negatives, projection_refs = [], [], []
         for record in records:
             reference = record.get('provenance', {}).get('packet')
             packet = self.store.read_json(reference) if reference else {}
@@ -67,8 +68,9 @@ class ProjectComposition:
                 raise ValueError('accepted memory observation reference differs from retained facts')
             if observations is not None and packet.get('observations') not in (None, observations):
                 raise ValueError('accepted observations differ from admitted host packet')
-            metadata = dict(record, proposal={k: v for k, v in record['proposal'].items()
-                if k not in ('observations', 'observations_ref')})
+            metadata = project_memory(record, self.store)
+            projection_refs.extend((metadata['artifact_ref'], metadata['provenance']['reference'],
+                                    metadata['retained']['reference']))
             if record['proposal']['kind'] == 'correctness':
                 positives.append(dict(memory=metadata, observations=observations,
                     provenance=dict(snapshot=memory_ref, packet=reference, observations=observation_ref)))
@@ -106,6 +108,7 @@ class ProjectComposition:
             result['provenance'].update(memory_snapshot=memory_ref,
                                         ingestions=ingestion['provenance'])
             return result
+        query.artifact_refs = tuple(projection_refs)
         return query
 
     def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
@@ -151,7 +154,8 @@ class ProjectComposition:
             runner = runner_class(root, **injections) if reopen else runner_class.create(
                 root, spec, bundle, config, **injections)
             # Reuse export's reference contract to retain the query's artifact closure.
-            pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref]
+            pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref,
+                       *injections['query'].artifact_refs]
             for record in self.store.read_json(memory_ref)['memories']:
                 if record['proposal'].get('observations_ref'):
                     pending.append(record['proposal']['observations_ref'])
