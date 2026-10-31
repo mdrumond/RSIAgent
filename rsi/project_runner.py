@@ -732,7 +732,8 @@ class ProjectRunner:
             skill_bundle_hash=self.bundle.digest, actor_closure_ref=closure_ref)
         result['outcome_ref'] = self._outcome(result, closure_ref)
         result['events'] = tuple(self.event_refs)
-        self.event_journal.checkpoint()
+        with self.event_lock:
+            self.event_journal.checkpoint()
         if typed_error is not None:
             # Preserve the original typed admission failure for domain callers'
             # abort classification, after retaining outcome and actor closure.

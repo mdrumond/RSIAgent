@@ -3,9 +3,10 @@
 The production OptimizerHost freezes the baseline and owns every host effect.
 DomainRunner retains the actual workflow, receipts, source and recovery state.
 """
-import json
 from rsi.event_journal import read_event_refs
 from core.artifacts import canonical_bytes
+
+import json
 
 import pytest
 

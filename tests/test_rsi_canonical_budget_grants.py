@@ -1,7 +1,8 @@
 """Explicit elapsed grants on the one canonical workflow; CPU fixtures only."""
-import json
 from rsi.event_journal import read_event_refs
 from core.artifacts import canonical_bytes
+
+import json
 from types import SimpleNamespace
 
 import pytest

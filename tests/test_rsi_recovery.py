@@ -1,8 +1,9 @@
 """Real canonical runner trials; no second development loop in test or production."""
-from dataclasses import asdict, replace
-import json
 from rsi.event_journal import read_event_refs
 from core.artifacts import canonical_bytes
+
+from dataclasses import asdict, replace
+import json
 
 import pytest
 

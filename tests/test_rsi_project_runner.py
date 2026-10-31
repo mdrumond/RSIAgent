@@ -1,4 +1,7 @@
 """Production composition with scripted decisions and real CPU/KDB services."""
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
+
 import sys
 
 import pytest
@@ -352,8 +355,6 @@ def test_concurrent_event_append_preserves_every_cas_record(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
     import json
-from rsi.event_journal import read_event_refs
-from core.artifacts import canonical_bytes
     runner, _, database = make(tmp_path)
     barrier = Barrier(8)
     def append(index):

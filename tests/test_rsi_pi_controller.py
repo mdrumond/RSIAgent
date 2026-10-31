@@ -1,7 +1,8 @@
 """Actual pinned Pi runs completed host tools and its own compaction."""
-import json
 from rsi.event_journal import read_event_refs
 from core.artifacts import canonical_bytes
+
+import json
 import threading
 
 import pytest
