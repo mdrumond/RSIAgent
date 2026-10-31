@@ -491,12 +491,13 @@ def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
 
 
 def test_actual_typed_validation_emits_specific_finished_failure_detail():
+    from nooa.errors import GenerationError
     payload = dict(rationale='Use retained guidance', evidence_ids=['query'],
         proposal=dict(name='small', goal='goal', acceptance='oracle', template_id='cpu.case-subset',
                       parameters={'case_indices': [0]}),
         negative_decisions=[dict(query_ref='query', index=0, action='used', reason='Reuse')])
     roles, calls, events, _ = make_roles([payload])
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(GenerationError) as error:
         roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
     finished = [value for event, value in events if event == 'role_finished']
     assert len(calls) == 1 and len(finished) == 1
@@ -538,13 +539,14 @@ def test_diagnostic_provider_schema_and_typed_result_preserve_conditional_contra
 @pytest.mark.parametrize('fields', [{}, {'redirection': None}, {'redirection': ''},
                                     {'redirection': ' \t\n'}, {'redirection': 7}])
 def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
+    from nooa.errors import GenerationError
     decision = dict(query_ref='query', index=0, action='used', reason='Observed applicability')
     decision.update(fields)
     payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
         proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
         negative_decisions=[decision])
     roles, calls, events, _ = make_roles([payload])
-    with pytest.raises(ValueError):
+    with pytest.raises(GenerationError):
         roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
     assert len(calls) == 1
     assert not any(event == 'role_proposal' for event, _ in events)
