@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+from rsi.event_journal import event_files, read_event_refs
 import os
 from pathlib import Path
 import re
@@ -144,11 +145,14 @@ def export_task(task, destination, *, adapter=None):
     files = [task / name for name in ('runner.json', 'manifest.json', 'workflow.json', 'events.json')]
     if any(not path.is_file() or path.is_symlink() for path in files):
         raise ValueError('canonical task contract/state/event index required')
-    files += sorted((task / 'receipts').glob('*.json'))
+    receipts = sorted((task / 'receipts').glob('*.json'))
+    journals = event_files(task)
+    files += receipts + [path for path in journals if path not in files]
     if any(path.is_symlink() for path in files):
         raise ValueError('symlink receipt is not exportable')
     before = {path: path.read_bytes() for path in files}
     states = {path.name: json.loads(before[path]) for path in files[:4]}
+    states['events.json'] = read_event_refs(task)
     for name in ('runner.json', 'manifest.json'):
         store.read_json(states[name]['contract'])
     if not isinstance(states['events.json'], list):
@@ -168,9 +172,14 @@ def export_task(task, destination, *, adapter=None):
         rows.append(dict(schema=SCHEMA, sequence=len(rows), kind=kind, id=identity, data=value))
     for name in ('runner.json', 'manifest.json', 'workflow.json'):
         add('state', name, states[name])
+    head_path = task / 'events.head.json'
+    if head_path in before:
+        head = json.loads(before[head_path])
+        add('state', 'event-journal', dict(head=head, checkpoint=json.loads(before[task / 'events.json']),
+            committed_refs=before[task / 'events.refs'][:head['offset']].decode('ascii')))
     for index, reference in enumerate(states['events.json']):
         add('event', dict(index=index, reference=reference), store.read_json(reference))
-    for path in files[4:]:
+    for path in receipts:
         add('receipt', path.name, json.loads(before[path]))
     for reference, data in objects.items():
         try:
@@ -186,7 +195,8 @@ def export_task(task, destination, *, adapter=None):
         for reference in _references(value):
             if reference not in objects:
                 raise ValueError('referenced artifact is missing: ' + reference)
-    if (sorted((task / 'receipts').glob('*.json')) != files[4:]
+    if (sorted((task / 'receipts').glob('*.json')) != receipts
+            or event_files(task) != journals
             or {p.parent.name + p.name for p in store.objects.glob('*/*')} != set(objects)
             or any(path.read_bytes() != data for path, data in before.items())):
         raise ValueError('task changed during export; stop its writer first')

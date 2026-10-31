@@ -1,5 +1,7 @@
 """Explicit elapsed grants on the one canonical workflow; CPU fixtures only."""
 import json
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
 from types import SimpleNamespace
 
 import pytest
@@ -188,18 +190,18 @@ def test_invalid_domain_grant_leaves_no_durable_effect_and_same_key_can_be_corre
     from rsi.domain_execution import DomainRunner
     runner,host,_,_,injections=make(tmp_path)
     arguments=dict(key='controller-grant',seconds=2,authority=dict(controller='CPU'))
-    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),
+    before=(canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),
             set(runner.store.objects.glob('*/*')))
     with pytest.raises(ValueError):runner.grant_actor_seconds(**dict(arguments,**changed))
-    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),
+    assert (canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),
             set(runner.store.objects.glob('*/*')))==before
     reopened=DomainRunner(runner.root,host,**injections)
     reopened.grant_actor_seconds(**arguments)
     assert reopened.workflow.actor_allocation()==502
-    events=reopened.event_path.read_bytes()
+    events=canonical_bytes(read_event_refs(reopened.root))
     # Integer/float input normalize to the same receipt and authority key.
     reopened.grant_actor_seconds(**dict(arguments,seconds=2.0))
-    assert reopened.event_path.read_bytes()==events
+    assert canonical_bytes(read_event_refs(reopened.root))==events
     assert DomainRunner(runner.root,host,**injections).workflow.actor_allocation()==502
 
 
@@ -212,12 +214,12 @@ def test_invalid_duplicate_cannot_poison_existing_grant_or_prevent_reopen(tmp_pa
     runner,host,_,_,injections=make(tmp_path)
     arguments=dict(key='controller-grant',seconds=2,authority=dict(controller='CPU'))
     runner.grant_actor_seconds(**arguments)
-    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
+    before=(canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
     with pytest.raises((ValueError,WorkflowError)):runner.grant_actor_seconds(**dict(arguments,**changed))
-    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
+    assert (canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
     reopened=DomainRunner(runner.root,host,**injections)
     reopened.grant_actor_seconds(**arguments)
-    assert reopened.workflow.actor_allocation()==502 and reopened.event_path.read_bytes()==before[0]
+    assert reopened.workflow.actor_allocation()==502 and canonical_bytes(read_event_refs(reopened.root))==before[0]
 
 
 def test_grant_with_no_finite_base_allocation_is_refused_before_persistence(tmp_path):
@@ -228,9 +230,9 @@ def test_grant_with_no_finite_base_allocation_is_refused_before_persistence(tmp_
     _,host,_,_,injections=make(tmp_path)
     runner=DomainRunner.create(tmp_path/'unlimited',ProjectSpec('unlimited','CPU test',('CPU',),
         budgets=BudgetLimits(actor_seconds=None)),builtin_bundle(),host,**injections)
-    before=(runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
+    before=(canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))
     with pytest.raises(ValueError):runner.grant_actor_seconds('controller-grant',2,dict(controller='CPU'))
-    assert (runner.event_path.read_bytes(),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
+    assert (canonical_bytes(read_event_refs(runner.root)),runner.workflow.path.read_bytes(),set(runner.store.objects.glob('*/*')))==before
     assert DomainRunner(runner.root,host,**injections).workflow.actor_allocation() is None
 
 

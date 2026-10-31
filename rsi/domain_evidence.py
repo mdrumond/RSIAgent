@@ -7,6 +7,7 @@ import tempfile
 
 from core.artifacts import ContentAddressedArtifacts, canonical_bytes
 from rsi.runtime import WorkflowError
+from rsi.event_journal import event_files, read_event_refs
 
 
 def completed_effects(root, store, contract, state, events, backend, test_backend, identity, actual, *, actor_active=False):
@@ -98,9 +99,11 @@ class DomainExportAdapter:
 
     @contextmanager
     def view(self):
-        names = ('domain.json','workflow.json','events.json')
+        journals = event_files(self.root)
+        names = ['domain.json', 'workflow.json', *[path.name for path in journals]]
         before = {name:(self.root/name).read_bytes() for name in names}
-        pointer, state, refs = [json.loads(before[name]) for name in names]
+        pointer, state = [json.loads(before[name]) for name in ('domain.json', 'workflow.json')]
+        refs = read_event_refs(self.root)
         if 'store_root' not in pointer:
             raise WorkflowError('native task predates typed CAS export; explicit checkpoint migration required')
         location = Path(pointer['store_root'])
@@ -128,6 +131,9 @@ class DomainExportAdapter:
             metadata = dict(contract=pointer['contract'], domain_contract='rsi-domain-contract-v2')
             for name,value in (('runner.json',metadata),('manifest.json',metadata),('workflow.json',state),('events.json',refs)):
                 (view/name).write_bytes(canonical_bytes(value))
+            if 'events.head.json' in before:
+                for name in ('events.json', 'events.head.json', 'events.refs'):
+                    (view/name).write_bytes(before[name])
             for ref,data in objects.items():
                 path = view/'artifacts'/'objects'/ref[:2]/ref[2:]
                 path.parent.mkdir(parents=True,exist_ok=True)
@@ -135,7 +141,7 @@ class DomainExportAdapter:
                     os.link(store.objects/ref[:2]/ref[2:],path)
                 except OSError:
                     path.write_bytes(data)  # immutable export staging only
-            if any((self.root/name).read_bytes()!=data for name,data in before.items()) or any(
+            if event_files(self.root) != journals or any((self.root/name).read_bytes()!=data for name,data in before.items()) or any(
                     store.read_bytes(ref)!=data for ref,data in objects.items()):
                 raise WorkflowError('native task changed during export snapshot')
             yield view

@@ -1,5 +1,7 @@
 """Default public constructors, actual canonical stages, CPU-only host runtimes."""
 import json
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
 from types import SimpleNamespace
 
 import pytest
@@ -684,7 +686,7 @@ def test_optimizer_repeated_same_candidate_compile_probes_have_distinct_admitted
     assert backend.evaluations==['fast'] and store.get(key)['attempts']==1
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     cas=ContentAddressedArtifacts(owner.directory/'canonical-artifacts')
-    events=[cas.read_json(ref) for ref in json.loads((owner.directory/'canonical-1/events.json').read_text())]
+    events=[cas.read_json(ref) for ref in read_event_refs(owner.directory/'canonical-1')]
     probes=[cas.read_json(row['reference']) for row in events if row['type']=='domain-dispatch']
     probes=[row for row in probes if row['name']=='compile-diagnostic']
     assert len({row['reservation'] for row in probes})==3
@@ -961,7 +963,7 @@ def test_cached_public_task_result_rechecks_real_terminal_receipt_integrity(tmp_
         assert task.attempt('same-attempt')['verified']
         execution=task.job_directory/'execution'
         cas=ContentAddressedArtifacts(execution/'canonical-artifacts')
-        events=[cas.read_json(ref) for ref in json.loads((execution/'canonical-1/events.json').read_text())]
+        events=[cas.read_json(ref) for ref in read_event_refs(execution/'canonical-1')]
         terminal=next(row['reference'] for row in events if row['type']=='domain-result')
         (cas.objects/terminal[:2]/terminal[2:]).unlink()
         before=(backend.prepares,list(backend.evaluations),len(model.contexts))

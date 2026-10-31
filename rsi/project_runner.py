@@ -20,6 +20,7 @@ from coding.pi.schema import INTEGER, STRING, obj
 from rsi.actor import EvidenceTool, PiSessionAdapter, SourceSnapshot, StageResult, WorkflowActor
 from rsi.contracts import ProjectSpec, Stage, StepEvidence
 from rsi.python_execution import PythonExecution, atomic_json, digest
+from rsi.event_journal import EventJournal
 from rsi.runtime import Workflow, WorkflowError
 from rsi.skills import SkillBundle
 from rsi.strategy import QueryUnavailable, StrategyEvidence
@@ -99,7 +100,8 @@ class ProjectRunner:
             raise ValueError('executor identity differs between frozen contracts')
         self.event_lock = RLock()
         self.event_path = self.root / 'events.json'
-        self.event_refs = json.loads(self.event_path.read_text()) if self.event_path.exists() else []
+        self.event_journal = EventJournal(self.root)
+        self.event_refs = self.event_journal.refs
         self.events = [self.store.read_json(ref) for ref in self.event_refs]
         state_path = self.root / 'workflow.json'
         persisted = json.loads(state_path.read_text()) if state_path.exists() else None
@@ -138,8 +140,7 @@ class ProjectRunner:
     def append(self, event):
         with self.event_lock:
             ref = self.store.put_json(event)
-            atomic_json(self.event_path, [*self.event_refs, ref])
-            self.event_refs.append(ref)
+            self.event_journal.append(ref)
             self.events.append(event)
 
     def actor_event(self, kind, data):
@@ -731,6 +732,7 @@ class ProjectRunner:
             skill_bundle_hash=self.bundle.digest, actor_closure_ref=closure_ref)
         result['outcome_ref'] = self._outcome(result, closure_ref)
         result['events'] = tuple(self.event_refs)
+        self.event_journal.checkpoint()
         if typed_error is not None:
             # Preserve the original typed admission failure for domain callers'
             # abort classification, after retaining outcome and actor closure.

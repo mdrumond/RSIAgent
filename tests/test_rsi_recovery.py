@@ -1,6 +1,8 @@
 """Real canonical runner trials; no second development loop in test or production."""
 from dataclasses import asdict, replace
 import json
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
 
 import pytest
 
@@ -325,7 +327,7 @@ def test_closed_budget_checkpoint_pending_preserved_and_new_arms_scope(tmp_path)
         assert result['status'] == 'budget_exhausted' and result['pending']
         proof = original.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
         captured.update(proof=proof, state=(original.root / 'workflow.json').read_bytes(),
-            events=original.event_path.read_bytes(), files=(original.backend.project / 'solution.py').read_bytes())
+            events=canonical_bytes(read_event_refs(original.root)), files=(original.backend.project / 'solution.py').read_bytes())
         return store.put_json(proof)
     def trial(request, reopen, injections):
         if request.arm == 'incumbent':
@@ -353,7 +355,7 @@ def test_closed_budget_checkpoint_pending_preserved_and_new_arms_scope(tmp_path)
         assert store.read_json(proof['accounting_snapshot']) == state
         assert result['arms']['candidate']['outcome'] == 'accepted'
         assert captured['state'] == (original.root / 'workflow.json').read_bytes()
-        assert captured['events'] == original.event_path.read_bytes()
+        assert captured['events'] == canonical_bytes(read_event_refs(original.root))
         assert original.workflow.pending == captured['proof']['pending']
     finally:
         db.close()

@@ -5,6 +5,7 @@ They supply stage operations, not an actor/search loop. WorkflowActor is the
 only actor loop; ProjectRunner owns run/reconciliation and evidence tools.
 No target commands, remote transports or KDB implementation are introduced.
 """
+from rsi.event_journal import EventJournal
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -216,7 +217,8 @@ class DomainRunner(ProjectRunner):
         self.config = SimpleNamespace(editable_files=tuple(host.editable_files))
         self.selected_file = self.config.editable_files[0]
         self.event_lock, self.event_path = RLock(), self.root / 'events.json'
-        self.event_refs = json.loads(self.event_path.read_text()) if self.event_path.exists() else []
+        self.event_journal = EventJournal(self.root)
+        self.event_refs = self.event_journal.refs
         self.events = [self.store.read_json(ref) for ref in self.event_refs]
         if frozen.get('kind') == 'rsi-domain-contract-v2' and frozen['test_backend'] != test_backend:
             raise CanonicalConfigurationError('domain test/production backend changed on resume')
