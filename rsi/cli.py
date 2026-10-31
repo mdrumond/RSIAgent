@@ -65,7 +65,8 @@ def main(argv=None):
             return 0
         if args.command == "capabilities":
             print(json.dumps(dict(manual_tuning=True, skill_content_editing=True,
-                                  skill_map_editing=True, job_accounting=True)))
+                                  skill_map_editing=True, job_accounting=True,
+                                  project_waves=True, wave_reconciliation=True, harness_recovery=True)))
             return 0
         if args.command == "skills":
             print(json.dumps(execute_skills(args), indent=2, allow_nan=False))

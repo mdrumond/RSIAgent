@@ -66,22 +66,51 @@ env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(spec['physical_device']),
            PYTHONPATH=str(root / 'project'), PYTHONPYCACHEPREFIX=str(root / 'cache'),
            RSI_EXPECTED_SOURCE_HASH=spec['identity']['source_hash'],
            CATLASS_DSL_CACHE_DIR=str(root / 'catlass-cache'))
+def persist(name, value):
+    temporary = root / (name + '.tmp')
+    with temporary.open('w') as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(root / name)
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+producer = dict(version=2, identity=spec['identity'], runner_pid=os.getpid(),
+                child_pid=None, child_pgid=None, reaped=False, closed=False)
+persist('producer.json', producer)
+interrupted = None
+def terminate(signum, frame):
+    global interrupted
+    interrupted = signum
+signal.signal(signal.SIGTERM, terminate)
+signal.signal(signal.SIGINT, terminate)
 with (root / 'stdout').open('wb') as out, (root / 'stderr').open('wb') as err:
     process = None
     timed_out = False
     returncode = 127
-    def terminate(signum, frame):
-        raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, terminate)
-    signal.signal(signal.SIGINT, terminate)
     try:
         if limit is not None:
             limit = max(0, limit - (time.monotonic() - started))
             if limit <= 0:
                 raise subprocess.TimeoutExpired(spec['argv'], 0)
-        process = subprocess.Popen(spec['argv'], cwd=root / 'project', env=env,
-                                   stdout=out, stderr=err, start_new_session=True)
-        process.wait(timeout=limit)
+        deadline = None if limit is None else time.monotonic() + limit
+        if interrupted is None:
+            process = subprocess.Popen(spec['argv'], cwd=root / 'project', env=env,
+                                       stdout=out, stderr=err, start_new_session=True)
+            producer.update(child_pid=process.pid, child_pgid=process.pid)
+            def child_exited():
+                # Keep the leader waitable until the last group signal, so its
+                # PID/PGID cannot be recycled into an unrelated process group.
+                return os.waitid(os.P_PID, process.pid,
+                                 os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+            persist('producer.json', producer)
+            while not child_exited() and interrupted is None:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(spec['argv'], limit)
+                time.sleep(0.02)
     except subprocess.TimeoutExpired:
         timed_out = True
     except OSError as exc:
@@ -89,19 +118,50 @@ with (root / 'stdout').open('wb') as out, (root / 'stderr').open('wb') as err:
     finally:
         # Reap descendants even when the group leader exited normally.
         if process is not None:
+            if interrupted is not None:
+                try:
+                    os.killpg(process.pid, interrupted)
+                except ProcessLookupError:
+                    pass
+                grace_end = time.monotonic() + 0.2
+                while not child_exited() and time.monotonic() < grace_end:
+                    time.sleep(0.01)
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             returncode = process.wait()
+            if interrupted is not None and returncode == 0:
+                returncode = 128 + interrupted
+            producer['reaped'] = True
+            # A terminal wrapper or reaped leader alone cannot close descendants.
+            end = time.monotonic() + 1
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    producer['closed'] = True
+                    break
+                if time.monotonic() >= end:
+                    break
+                time.sleep(0.02)
+        else:
+            producer.update(reaped=True, closed=True)
+            if interrupted is not None:
+                returncode = 128 + interrupted
+        producer.update(returncode=returncode, signal=interrupted,
+                        elapsed=time.monotonic()-started)
+        persist('producer.json', producer)
 result = dict(identity=spec['identity'], returncode=returncode,
-              timed_out=timed_out, elapsed=time.monotonic()-started)
-(root / 'result.json').write_text(json.dumps(result))
-with tarfile.open(root / 'results.tar', 'w') as archive:
-    for name in ('result.json', 'stdout', 'stderr', 'project', 'verifier'):
+              timed_out=timed_out, elapsed=time.monotonic()-started,
+              producer=producer)
+persist('result.json', result)
+with tarfile.open(root / 'results.tar.tmp', 'w') as archive:
+    for name in ('result.json', 'producer.json', 'stdout', 'stderr', 'project', 'verifier'):
         archive.add(root / name, arcname=name)
     if (root / 'profile').exists():
         archive.add(root / 'profile', arcname='profile')
+(root / 'results.tar.tmp').replace(root / 'results.tar')
 '''
 
 
@@ -130,7 +190,7 @@ class CplExecutor:
             raise WorkflowError('CPL elapsed budget exhausted; reconcile retained work')
         return value
 
-    def _cli(self, args, remaining, response_file=None):
+    def _cli(self, args, remaining, response_file=None, *, result_path=None):
         # Read the installed policy afresh before *each* operation, not a copy.
         skill = self.config.installed_client.parent.parent / 'SKILL.md'
         skill.read_text()
@@ -140,17 +200,26 @@ class CplExecutor:
         try:
             result = subprocess.run([str(self.config.installed_client), '--json', *map(str, args)],
                                     capture_output=True, timeout=limit)
-            output, returncode = result.stdout, result.returncode
+            output, stderr, returncode = result.stdout, getattr(result, 'stderr', b''), result.returncode
         except subprocess.TimeoutExpired as exc:
-            output, returncode = exc.stdout or b'', 124
+            output, stderr, returncode = exc.stdout or b'', exc.stderr or b'', 124
+        destination = result_path if result_path is not None else response_file
+        if destination is not None:
+            destination = Path(destination)
+            # Preserve native CLI diagnostics before parsing or raising. A failed
+            # response is evidence, never a receipt proving backend submission.
+            Path(str(destination) + '.stdout').write_bytes(output)
+            Path(str(destination) + '.stderr').write_bytes(stderr)
+            atomic_json(Path(str(destination) + '.client.json'),
+                        dict(returncode=returncode, result_path=destination.name))
         try:
             value = json.loads(output)
         except (ValueError, UnicodeError) as exc:
             raise WorkflowError('invalid CPL response; reconcile retained work') from exc
         if not isinstance(value, dict):
             raise WorkflowError('CPL response must be an object')
-        if response_file is not None:
-            atomic_json(response_file, value)
+        if destination is not None:
+            atomic_json(destination, value)
         if returncode and not value.get('handle'):
             raise WorkflowError('CPL client failed; retain receipt and reconcile')
         return value
@@ -217,7 +286,8 @@ class CplExecutor:
             raise WorkflowError('CPL operation already reserved; use reconcile') from exc
         identity = self._identity(request)
         remote = str(PurePosixPath(self.config.workspace) / ('rsi-' + digest(str(directory.resolve()).encode())))
-        state = dict(identity=identity, remote=remote, status='packaging')
+        state = dict(identity=identity, remote=remote, status='packaging',
+                     producer_version=2, lease_retained=True)
         atomic_json(directory / 'transport.json', state)
         bundle = directory / 'bundle'
         bundle.mkdir()
@@ -341,9 +411,14 @@ class CplExecutor:
                     self._cli(['cancel', handle], cleanup, directory / 'deadline-cancel.json')
                 self._phase(observe, 'command', request, handle=handle, deadline_expired=True)
                 terminal = self._wait(handle, request, observe, cleanup)
-                state.update(handle=handle, terminal=terminal, status='deadline-terminal',
+                state.update(handle=handle, terminal=terminal, status='deadline-producer-unknown',
                              deadline_clock='controller_elapsed_remaining', cleanup_only=True,
-                             lease_retained=False)
+                             lease_retained=True)
+                atomic_json(directory / 'transport.json', state)
+                # Cleanup allowance retrieves proof only; it grants no work time.
+                self.reconcile(request, observe=observe, remaining=cleanup)
+                state = json.loads((directory / 'transport.json').read_text())
+                state.update(status='deadline-terminal', cleanup_only=True)
                 atomic_json(directory / 'transport.json', state)
 
     def _submit(self, request, directory, state, script, observe, remaining):
@@ -390,11 +465,19 @@ class CplExecutor:
         state = json.loads((directory / 'transport.json').read_text())
         if state['identity'] != self._identity(request):
             raise WorkflowError('CPL operation identity mismatch')
+        # Legacy outputs are readable only when completion was already established.
+        # Observing a newly terminal legacy wrapper cannot establish child closure.
+        legacy_complete = (state.get('producer_version') is None
+                           and (state.get('status') == 'complete'
+                                or state.get('legacy_completion_known') is True))
+        if legacy_complete:
+            state['legacy_completion_known'] = True
         receipt = json.loads((directory / 'submission.json').read_text())
         handle = self._handle(receipt)
         self._phase(observe, 'command', request, handle=handle)
         terminal = self._wait(handle, request, observe, remaining)
-        state.update(handle=handle, terminal=terminal, status='terminal')
+        state.update(handle=handle, terminal=terminal, status='producer-unknown',
+                     lease_retained=True)
         atomic_json(directory / 'transport.json', state)
         output = directory / 'results.tar'
         transfer_path = directory / 'download.json'
@@ -440,6 +523,14 @@ class CplExecutor:
                 or type(result.get('returncode')) is not int
                 or type(result.get('timed_out')) is not bool):
             raise WorkflowError('CPL terminal artifact identity mismatch')
+        producer = result.get('producer')
+        if not self._producer_closed(producer, state['identity']):
+            if not (legacy_complete and producer is None):
+                raise WorkflowError('CPL producer closure unknown; retain lease and reconcile')
+        else:
+            state['producer'] = producer
+        state.update(lease_retained=False, status='producer-closed')
+        atomic_json(directory / 'transport.json', state)
         self._limit(remaining)
         # Source mutations are returned for PythonExecution's normal classification.
         self._copy_back(extracted / 'project', request.project, remaining)
@@ -449,6 +540,18 @@ class CplExecutor:
         atomic_json(directory / 'transport.json', state)
         return CommandResult(result['returncode'], (extracted / 'stdout').read_bytes(),
                              (extracted / 'stderr').read_bytes(), result['timed_out'])
+
+    @staticmethod
+    def _producer_closed(producer, identity):
+        if not isinstance(producer, dict):
+            return False
+        child = producer.get('child_pid')
+        return (producer.get('version') == 2 and producer.get('identity') == identity
+                and type(producer.get('runner_pid')) is int and producer['runner_pid'] > 0
+                and producer.get('closed') is True and producer.get('reaped') is True
+                and ((child is None and producer.get('child_pgid') is None)
+                     or (type(child) is int and child > 0
+                         and producer.get('child_pgid') == child)))
 
     def _copy_back(self, source, destination, remaining):
         for path in destination.iterdir():

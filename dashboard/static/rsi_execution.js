@@ -39,6 +39,9 @@
     });
   }
   bind('phase-form', 'phase', value => {
+    if (['reconcile', 'recover'].includes(value.operation)) {
+      value.observation = value.observation.trim() ? JSON.parse(value.observation) : null;
+    } else { delete value.observation; delete value.operation_id; }
     if (value.mode === 'inference' && value.operation === 'start') {
       value.project = JSON.parse(value.project);
       value.recover = Boolean(value.recover);
@@ -100,6 +103,21 @@
       const node = document.createElement(tag); node.textContent = text; parent.append(node); return node;
     };
     if (!inspection.available) { add('p', inspection.reason); return; }
+    for (const wave of inspection.waves || []) {
+      add('h3', `Wave ${wave.wave_id}: ${wave.status}`);
+      const table = document.createElement('table'); ledger.append(table);
+      const header = document.createElement('tr'); table.append(header);
+      for (const label of ['Project / operation', 'Lifecycle / outcome', 'Device lease', 'Actor elapsed / allocation', 'Recovery']) add('th', label, header);
+      for (const project of wave.projects) {
+        const row = document.createElement('tr'); table.append(row);
+        add('td', `${project.project_id} / ${project.operation_id}`, row);
+        add('td', `${project.status} / ${project.outcome || 'not settled'} / ${project.stage || 'not started'}`, row);
+        add('td', project.device || (project.assigned_device ? `released ${project.assigned_device}` : 'unassigned'), row);
+        add('td', `${project.actor_seconds == null ? 'unknown' : project.actor_seconds} / ${project.actor_allocation} seconds`, row);
+        add('td', project.recovery_authorized ? 'one harness grant retained' : 'no harness grant', row);
+        if (project.pending) add('p', `Original pending handle: ${project.pending.handle || project.pending.id}`);
+      }
+    }
     for (const task of inspection.tasks) {
       add('h4', task.task_id || 'Retained task');
       add('p', `Accounting: ${task.accounting_state || 'not supplied'}`);

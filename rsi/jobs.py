@@ -136,7 +136,7 @@ def start(instance, request):
     root, directory = _directory(instance)
     machinery = _machinery(root)
     snapshot = show_configuration(root)
-    if request.get('action') == 'resume':
+    if request.get('action') in ('resume', 'reconcile', 'recover'):
         previous = status(root, request['previous_job'])
         if previous['request']['cycle_id'] != request['cycle_id']:
             raise ValueError('resume cannot change retained cycle identity')
@@ -157,7 +157,7 @@ def start(instance, request):
         superseded = {item['request'].get('previous_job') for item in previous_jobs}
         for previous in previous_jobs:
             if previous['state'] == 'interrupted' and previous['job_id'] not in superseded:
-                if request.get('action') not in ('resume', 'revisit') or request.get('previous_job') != previous['job_id']:
+                if request.get('action') not in ('resume', 'revisit', 'reconcile', 'recover') or request.get('previous_job') != previous['job_id']:
                     raise ValueError('interrupted job requires explicit resume/revisit with its retained ID')
         job_id = str(uuid.uuid4())
         request = dict(request)

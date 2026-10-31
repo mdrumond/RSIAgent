@@ -35,7 +35,8 @@ def setup(tmp_path, monkeypatch):
                          product='a3', chip=0)
     state = dict(probe=probe(), calls=[], terminal='completed', fail_submit=False)
     handle = 'remote:test-target:job:original'
-    def cli(args, remaining, response_file=None):
+    def cli(args, remaining, response_file=None, *, result_path=None):
+        response_file = result_path if result_path is not None else response_file
         assert remaining() > 0
         state['calls'].append(args)
         action = args[0]
@@ -265,3 +266,85 @@ def test_explicit_alarm_authority_is_ordinary_only_and_retains_faults(setup):
     assert run()['failure']['type'] == 'device_busy'
     state['probe'] = probe('a5', health='Failed', error='80F78009')
     assert run()['failure']['type'] == 'unhealthy'
+
+
+def test_invalid_cli_diagnostics_retained_unknown_submission_never_replayed(setup, monkeypatch):
+    run, config, _, _ = setup
+    executor = config['executor']
+    skill = executor.config.installed_client.parent.parent
+    skill.mkdir(parents=True)
+    (skill / 'SKILL.md').write_text('test-installed-policy')
+    monkeypatch.setattr(executor, '_cli', CplExecutor._cli.__get__(executor))
+    calls = []
+    def invalid(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=2, stdout=b'invalid json\n', stderr=b'native CLI rejected request\n')
+    monkeypatch.setattr('rsi.cpl_execution.subprocess.run', invalid)
+    first = run()
+    assert first['failure']['type'] == 'admission_unavailable'
+    evidence = first['raw_measurements']['client_results'][0]
+    assert evidence['stdout'] == 'invalid json\n'
+    assert evidence['stderr'] == 'native CLI rejected request\n' and evidence['returncode'] == 2
+    directory = Path(first['evidence_path']).parent
+    intent = (directory / 'intent.json').read_bytes()
+    assert not (directory / 'submission.json').exists()
+    second = run()
+    assert second['failure']['type'] == 'submission_unknown'
+    assert len(calls) == 1 and (directory / 'intent.json').read_bytes() == intent
+    assert 'submission' not in second['raw_measurements']
+
+
+def local_setup(setup, tmp_path, monkeypatch, *, health='OK', returncode=0):
+    run, config, metadata, state = setup
+    metadata.update(controller_placement='on', executor_identity=None,
+                    outer_handle='remote:test-target:job:outer')
+    receipt = tmp_path / 'outer.json'
+    atomic_json(receipt, dict(target='test-target', runtime='test-runtime',
+        handle=metadata['outer_handle'], npu=dict(devices=[2], pool='pool', checked_at='now')))
+    config.update(product='a5', chip=None, outer_receipt=receipt, outer_runtime='test-runtime')
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE', metadata['outer_handle'])
+    monkeypatch.setenv('RSI_CPL_RUNTIME', metadata['runtime'])
+    calls = []
+    def query(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(probe('a5', health=health)).encode(), stderr=b'')
+    monkeypatch.setattr('rsi.device_admission.subprocess.run', query)
+    return run, calls
+
+
+@pytest.mark.parametrize('health,returncode', [('OK', 0), ('Alarm', 0), ('OK', 7)])
+def test_completed_local_probe_reconciles_exact_evidence_without_requery_or_double_charge(
+        setup, tmp_path, monkeypatch, health, returncode):
+    run, calls = local_setup(setup, tmp_path, monkeypatch, health=health, returncode=returncode)
+    ticks = iter([100., 107., 200., 200.125])
+    monkeypatch.setattr('rsi.device_admission.time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    first = run()
+    directory = Path(first['evidence_path']).parent
+    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    second = run()
+    assert second['admitted'] == first['admitted'] == (health == 'OK' and returncode == 0)
+    assert second.get('failure') == first.get('failure')
+    assert second['raw_measurements'] == first['raw_measurements']
+    assert second['evidence_path'] == first['evidence_path'] and second['reconciled']
+    assert second['elapsed_seconds'] == 0.125 and second['retained_probe_elapsed_seconds'] == 7
+    assert len(calls) == 1
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.parametrize('keep_measurements', [True, False])
+def test_local_marker_reconciles_only_durable_completion(setup, tmp_path, monkeypatch, keep_measurements):
+    run, calls = local_setup(setup, tmp_path, monkeypatch)
+    first = run()
+    directory = Path(first['evidence_path']).parent
+    (directory / 'decision.json').unlink()  # Interruption after durable measurements, before final decision.
+    if not keep_measurements:
+        (directory / 'measurements.json').unlink()
+    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    second = run()
+    assert second['admitted'] is keep_measurements
+    if keep_measurements:
+        assert second['raw_measurements'] == json.loads(before['measurements.json'])
+    else:
+        assert second['failure']['type'] == 'probe_unknown'
+    assert len(calls) == 1 and not (directory / 'decision.json').exists()
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == before
