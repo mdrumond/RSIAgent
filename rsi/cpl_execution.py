@@ -51,8 +51,40 @@ class CplConfig:
 
 # Runs inside the selected registry runtime. Only this live Popen owns the group.
 _RUNNER = r'''
-import hashlib, json, os, pathlib, signal, subprocess, tarfile, time
+import hashlib, json, os, pathlib, select, signal, subprocess, sys, tarfile, time
 root = pathlib.Path(__file__).parent
+def process_start(pid):
+    return (pathlib.Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+if sys.argv[1:] == ['--cancel-owned']:
+    producer = json.loads((root / 'producer.json').read_text())
+    spec = json.loads((root / 'spec.json').read_text())
+    if producer['identity'] != spec['identity']:
+        raise RuntimeError('producer cancellation identity mismatch')
+    if producer.get('closed') is True and producer.get('reaped') is True:
+        sys.exit(0)
+    pid = producer['runner_pid']
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        sys.exit(0)
+    try:
+        # Pin before checking identity; a recycled PID must never receive a signal.
+        try:
+            same = process_start(pid) == producer['runner_start_ticks']
+            argv = (pathlib.Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
+            same = same and str(root / 'runner.py').encode() in argv
+        except FileNotFoundError:
+            sys.exit(0)
+        if not same:
+            raise RuntimeError('owned runner identity unavailable; retain lease')
+        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        if not poller.poll(5000):
+            raise RuntimeError('producer termination pending; retain lease')
+    finally:
+        os.close(descriptor)
+    sys.exit(0)
 started = time.monotonic()
 spec = json.loads((root / 'spec.json').read_text())
 for name, expected in spec['files'].items():
@@ -79,6 +111,7 @@ def persist(name, value):
     finally:
         os.close(descriptor)
 producer = dict(version=2, identity=spec['identity'], runner_pid=os.getpid(),
+                runner_start_ticks=process_start(os.getpid()),
                 child_pid=None, child_pgid=None, reaped=False, closed=False)
 persist('producer.json', producer)
 interrupted = None
@@ -358,7 +391,7 @@ class CplExecutor:
         script.write_text('#!/bin/bash\nset -eu\nSECONDS=0\n' +
                           f'mkdir -- {shlex.quote(remote)}\n' +
                           f'tar -xf {shlex.quote(remote + ".tar")} -C {shlex.quote(remote)}\n' +
-                          shlex.join(invocation) + (' \"$SECONDS\"' if limit is not None else '') + '\n')
+                          'exec ' + shlex.join(invocation) + (' \"$SECONDS\"' if limit is not None else '') + '\n')
         return self._supervise(request, directory, state, script, observe, remaining)
 
     def _supervise(self, request, directory, state, script, observe, remaining):
@@ -409,6 +442,7 @@ class CplExecutor:
                 atomic_json(directory / 'transport.json', state)
                 if not (directory / 'deadline-cancel.json').exists():
                     self._cli(['cancel', handle], cleanup, directory / 'deadline-cancel.json')
+                self._cancel_producer(request, directory, state, observe, cleanup)
                 self._phase(observe, 'command', request, handle=handle, deadline_expired=True)
                 terminal = self._wait(handle, request, observe, cleanup)
                 state.update(handle=handle, terminal=terminal, status='deadline-producer-unknown',
@@ -420,6 +454,27 @@ class CplExecutor:
                 state = json.loads((directory / 'transport.json').read_text())
                 state.update(status='deadline-terminal', cleanup_only=True)
                 atomic_json(directory / 'transport.json', state)
+
+    def _cancel_producer(self, request, directory, state, observe, remaining):
+        # Native cancellation can stop observation while leaving the remote shell
+        # alive. This is cleanup of the original producer, never command replay.
+        receipt = directory / 'producer-cancel-submission.json'
+        marker = directory / 'producer-cancel-started.json'
+        response = directory / 'producer-cancel-response.json'
+        if not receipt.exists():
+            if marker.exists():
+                raise WorkflowError('producer cancellation submission unknown; retain lease')
+            script = directory / 'cancel-producer.sh'
+            script.write_text('#!/bin/bash\nset -eu\nexec ' + shlex.join([
+                self.config.remote_python, state['remote'] + '/runner.py', '--cancel-owned']) + '\n')
+            atomic_json(marker, dict(identity=state['identity'], cleanup_only=True))
+            self._cli(['run', self.config.target, '--runtime', self.config.runtime,
+                       '--cwd', self.config.command_cwd, '--file', script,
+                       '--receipt-file', receipt], remaining, response)
+        handle = self._handle(json.loads(receipt.read_text()))
+        terminal = self._wait(handle, request, observe, remaining)
+        if terminal.get('state') != 'completed' or terminal.get('exit') not in (None, 0):
+            raise WorkflowError('producer cancellation unresolved; retain lease')
 
     def _submit(self, request, directory, state, script, observe, remaining):
         state['status'] = 'dispatching'
