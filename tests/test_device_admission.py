@@ -258,7 +258,7 @@ def test_explicit_alarm_authority_is_ordinary_only_and_retains_faults(setup):
     assert admitted['measurements']['hardware_error_code'] == '80F78009'
     assert admitted['measurements']['fault_event_count'] == 1
     assert admitted['raw_measurements']['probe'] == state['probe']
-    request = SimpleNamespace(operation_id='alarm-timing', category='timing', profile_path=None)
+    request = SimpleNamespace(operation_id='alarm-timing', command='timing', category='execution', profile_path=None)
     timing = guard(request, phase='command', metadata=metadata, configuration=config, remaining=lambda: 60)
     assert timing['failure']['type'] == 'unhealthy'
     state['probe'] = probe('a5', health='Alarm', error='80F78009', busy=True)

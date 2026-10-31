@@ -181,6 +181,7 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
         policy = dict(configuration)
         policy['require_idle'] = (configuration.get('require_idle', False) or
             category in ('profile', 'profiling', 'timing', 'benchmark') or
+            getattr(request, 'command', '') in ('profile', 'profiling', 'timing', 'benchmark') or
             bool(getattr(request, 'profile_path', None)))
         result['measurements'] = assess(raw['probe'], physical_device=device, configuration=policy)
         result.update(admitted=True, degraded=result['measurements']['degraded'],
