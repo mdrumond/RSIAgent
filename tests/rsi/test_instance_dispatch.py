@@ -186,7 +186,9 @@ def test_actual_pinned_cli_can_enter_setup_repair_with_failed_receipt(ready):
     assert row == {'repair': True, 'prefix': sys.prefix}
 
 
-def test_env_python_helpers_use_owned_dependencies_with_user_site_disabled(ready, tmp_path, monkeypatch):
+@pytest.mark.parametrize('shared_node_python_bin', [False, True])
+def test_env_python_helpers_use_owned_dependencies_with_user_site_disabled(
+        ready, tmp_path, monkeypatch, shared_node_python_bin):
     root, receipt = ready
     caller = tmp_path / 'caller-bin'
     caller.mkdir()
@@ -194,6 +196,11 @@ def test_env_python_helpers_use_owned_dependencies_with_user_site_disabled(ready
         executable = caller / name
         executable.write_text('#!/bin/sh\nexit 97\n')
         executable.chmod(0o700)
+    if shared_node_python_bin:
+        for name in ('python', 'python3'):
+            executable = Path(receipt['node']).parent / name
+            executable.write_text('#!/bin/sh\nexit 98\n')
+            executable.chmod(0o700)
     monkeypatch.setenv('PATH', str(caller))
     monkeypatch.setenv('PYTHONPATH', str(tmp_path / 'foreign-packages'))
     monkeypatch.setenv('PYTHONHOME', str(tmp_path / 'foreign-home'))
@@ -206,6 +213,7 @@ def test_env_python_helpers_use_owned_dependencies_with_user_site_disabled(ready
     helper.chmod(0o700)
     row = json.loads(subprocess.check_output([str(helper)], env=env, text=True, timeout=10))
     assert row == dict(prefix=str(root / 'runtime/python'), dependency=42, user_site=False)
+    assert shutil.which('node', path=env['PATH']) == receipt['node']
     assert subprocess.check_output(['node', '--version'], env=env, text=True,
                                    timeout=10).strip() == receipt['node_version']
     # Re-entering the launch context keeps owned executable precedence stable.

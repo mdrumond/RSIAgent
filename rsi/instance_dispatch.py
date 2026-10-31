@@ -47,8 +47,8 @@ def launch_context(instance, *, required=False, repair=False):
         raise ValueError(f'instance runtime unavailable: {exc}; run instance setup to repair') from None
     # Do not resolve this executable: its lexical venv location selects sys.prefix.
     # CPL and other env-python helpers must select the same owned environment.
-    # Keep the receipt's Node ahead of any executable in the Python bin directory.
-    prefixes = [str(node.parent), str(interpreter.parent)]
+    # Node may share a system bin directory with an unrelated Python.
+    prefixes = [str(interpreter.parent), str(node.parent)]
     inherited = env.get('PATH', os.defpath).split(os.pathsep)
     env['PATH'] = os.pathsep.join(prefixes + [p for p in inherited if p not in prefixes])
     env.pop('PYTHONPATH', None)
