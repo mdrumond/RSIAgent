@@ -157,6 +157,21 @@ class _UnboundExecutor:
         raise WorkflowError('reopen snapshot with its trusted executor factory before execution')
 
 
+def reconcile_recorded(root, workflow, operation, *, executor_factory, observation_seconds=45.):
+    """Host-only maintenance of an existing task root, without loading its machinery.
+
+    Pass its persisted Workflow and trusted frozen executor factory. This observes
+    only the original command; it neither runs actors nor completes their stage.
+    """
+    backend = PythonExecution(root, workflow, executor_factory=executor_factory)
+    record = json.loads(backend._receipt_path(operation).read_text())
+    if record.get('status') == 'complete':
+        return backend.receipt(operation)
+    return backend.reconcile_target(operation, dict(operation_id=operation,
+        source_hash=record['source_hash'], controller_recorded=True),
+        observation_seconds=observation_seconds)
+
+
 class PythonExecution:
     """Task snapshot, CAS command receipts, exact-source edits and verification.
 
@@ -596,18 +611,71 @@ class PythonExecution:
             raise interrupted
         return result
 
+    def _recorded_target_elapsed(self, record, timing):
+        """Verify the original closed controller phases, without placing a duration."""
+        clock = self.workflow.accounting
+        operation = record['operation_id']
+        if set(timing) != {'operation_id', 'source_hash', 'controller_recorded'}:
+            raise WorkflowError('recorded controller timing cannot be combined with timing claims')
+        measured = [record.get('elapsed'), record.get('observed_elapsed')]
+        # run() starts the first interval before _execute_target's monotonic
+        # observation begins; its measured prelude can exceed that span.
+        if any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in measured):
+            raise WorkflowError('original controller measurements required')
+        unknown = clock.uncertainties.get('executor:' + operation)
+        if (clock.unresolved or any(row[2] is None for row in clock.records.values())
+                or set(clock.uncertainties) - {'executor:' + operation}
+                or unknown is not None and unknown != dict(status='unknown',
+                    receipt=str(self._receipt_path(operation)))
+                or 'receipt:' + operation in clock.records or 'receipt:' + operation in clock.receipts):
+            raise WorkflowError('unresolved or conflicting controller accounting')
+        # _execute_target starts one interval, then closes/starts one per phase.
+        # JSON retains insertion order. Locate the original last token rather than
+        # including later reconciliation observations when this call is retried.
+        tokens = list(clock.records)
+        token = record.get('clock_token')
+        phases = [record['category']]
+        for observation in record.get('observations', []):
+            if observation.get('reconciliation'):
+                continue
+            phase = observation.get('phase')
+            if phase not in ('command', 'setup', 'transfer'):
+                raise WorkflowError('invalid retained controller phase')
+            phases.append(record['category'] if phase == 'command' else phase)
+        if token not in tokens or tokens.index(token) + 1 < len(phases):
+            raise WorkflowError('original closed controller token required')
+        end = tokens.index(token) + 1
+        rows = [clock.records[t] for t in tokens[end - len(phases):end]]
+        previous, charged = float('-inf'), 0.
+        for expected, (kind, start, stop) in zip(phases, rows):
+            if (kind != expected or any(type(x) not in (int, float) or not math.isfinite(x)
+                                        for x in (start, stop))
+                    or start < previous or stop < start or stop > clock.clock()):
+                raise WorkflowError('retained controller intervals do not match dispatch')
+            previous = stop
+            if kind in clock.BILLABLE:
+                charged += stop - start
+        if not math.isclose(charged, measured[0], rel_tol=0, abs_tol=1e-6):
+            raise WorkflowError('retained controller elapsed differs from phase ledger')
+        return measured[0]
+
     def reconcile_target(self, operation, timing, *, observation_seconds=45.):
         """Observe the original target command and finalize only verified timing.
 
         timing is a trusted host receipt in the original controller clock domain,
         never raw remote epoch arithmetic. Missing timing/closure stays pending.
         This method calls executor.reconcile only; execute is never a fallback.
+        controller_recorded=True reuses verified original controller phase timing;
+        it cannot be combined with producer timing or interval closure claims.
         """
         record = json.loads(self._receipt_path(operation).read_text())
         if record['status'] == 'complete':
             return self.receipt(operation)
         if (self.executor is None or not callable(getattr(self.executor, 'reconcile', None))
-                or timing['operation_id'] != operation or timing['source_hash'] != record['source_hash']
+                or timing.get('operation_id') != operation or record.get('operation_id') != operation
+                or timing.get('source_hash') != record['source_hash']
+                or record.get('status') != 'pending'
+                or 'controller_recorded' in timing and timing['controller_recorded'] is not True
                 or type(observation_seconds) not in (int, float) or not math.isfinite(observation_seconds)
                 or observation_seconds <= 0):
             raise WorkflowError('scoped authoritative timing and observation-capable executor required')
@@ -618,8 +686,18 @@ class PythonExecution:
         profile_path = self.root / 'receipts' / (digest(operation.encode()) + '.profile')
         if record['profiling']:
             argv = [argv[0], '-m', 'cProfile', '-o', str(profile_path), *argv[1:]]
-        if argv != record['argv'] or record['stage_operation'] != self.workflow.pending['id']:
+        if (argv != record['argv'] or not self.workflow.pending
+                or record['stage_operation'] != self.workflow.pending['id']):
             raise WorkflowError('pending target dispatch differs from frozen stage/command')
+        recorded = timing.get('controller_recorded') is True
+        if recorded:
+            if (record.get('executor_identity') != contract.get('executor_identity')
+                    or record.get('source_hash') != self.project_hash()
+                    or record.get('stage_source_hash') != self.workflow.source_hash
+                    or record['category'] != ('profiling' if record['profiling'] else
+                        'compilation' if record['command'] == 'compile' else 'execution')):
+                raise WorkflowError('recorded target identity differs from frozen dispatch')
+            self._recorded_target_elapsed(record, timing)
         request = CommandRequest(operation, record['command'], tuple(argv), self.project, self.verifier,
             record['source_hash'], contract['verifier'], record['category'],
             profile_path if record['profiling'] else None)
@@ -647,6 +725,13 @@ class PythonExecution:
                 or not isinstance(result.stdout, bytes) or not isinstance(result.stderr, bytes)
                 or type(result.timed_out) is not bool):
             raise WorkflowError('terminal target command observation required')
+        if recorded:
+            elapsed = self._recorded_target_elapsed(record, timing)
+            clock.uncertainties.pop('executor:' + operation, None)
+            clock.save()
+            clock.seconds()
+            return self._finalize(record, stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode, timed_out=result.timed_out, elapsed=elapsed)
         for token, ended_at in timing.get('closed_intervals', {}).items():
             if token != record['clock_token']:
                 raise WorkflowError('target observation cannot close unrelated actor intervals')
