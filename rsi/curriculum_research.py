@@ -147,7 +147,7 @@ class Researcher:
                 return ResearchResult(DiagnosticProposal(**row['proposal']) if row['proposal'] else None,
                     tuple(row['evidence_refs']), row['actor_seconds'], saved['receipt_ref'])
             error = ResearchRejected if saved['status'] == 'rejected' else ResearchPending
-            raise error(saved['receipt_ref'], saved.get('actor_seconds'))
+            raise error(saved['receipt_ref'], saved.get('actor_seconds') if saved['status'] == 'rejected' else None)
         deadline = context['deadline']
         if type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError('finite monotonic research deadline required')
@@ -156,6 +156,11 @@ class Researcher:
         state = dict(request_ref=request_ref, status='pending', actor_seconds=0., evidence_refs=[], events=[])
         state['receipt_ref'] = request_ref
         def save():
+            if state['status'] == 'pending' and not state.get('settled'):
+                state['receipt_ref'] = self.store.put_json(dict(schema='rsi-curriculum-research-v1',
+                    status='pending', request_ref=request_ref, actor_seconds=None,
+                    measured_actor_seconds=state['actor_seconds'], inflight_query=state.get('inflight_query'),
+                    artifact_refs=[request_ref, *state['events'], *state['evidence_refs']]))
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(path, state)
         save()  # Intent precedes either provider or retrieval dispatch.
@@ -191,7 +196,9 @@ class Researcher:
             receipt = dict(schema='rsi-curriculum-research-v1', operation_id=operation,
                 request_ref=request_ref, status=status, proposal=asdict(proposal) if proposal else None,
                 evidence_refs=state['evidence_refs'], actor_seconds=seconds,
-                artifact_refs=state['events'], error=error)
+                artifact_refs=[request_ref, *state['events'], *state['evidence_refs']],
+                measured_actor_seconds=state['actor_seconds'], error=error)
+            state['settled'] = True
             state.update(status='completed' if status in ('accepted', 'budget_exhausted') else status,
                          receipt_ref=self.store.put_json(receipt), actor_seconds=seconds)
             save()
@@ -208,7 +215,8 @@ class Researcher:
                 ref = self.store.put_json(row)
                 parent_refs[row['project_id']] = ref
                 evidence.append(AdmittedEvidence(ref, dict(project_id=row['project_id'],
-                    spec=row['spec'], failure=self._facts(row['failure']))))
+                    spec=row['spec'], failure=self._facts(row['failure']),
+                    templates=row.get('templates', context['templates']))))
             for ref in context.get('previous_rejections', []):
                 evidence.append(AdmittedEvidence(ref, self._facts(self.store.read_json(ref))))
             plan = self.roles.research_queries(
@@ -218,6 +226,8 @@ class Researcher:
                 raise ValueError('a diagnostic requires prior model-selected documentation research')
             for query in plan.queries:
                 remaining()
+                state['inflight_query'] = dict(query=asdict(query), deadline=remaining())
+                observe('research_query_started', state['inflight_query'])
                 started = self.clock()
                 try:
                     cutoff = remaining()
@@ -225,8 +235,10 @@ class Researcher:
                         cutoff = min(cutoff, wall_deadline)
                     response = self.query({'query': query.query}, deadline=cutoff)
                 finally:
-                    state['actor_seconds'] += max(0., self.clock() - started)
-                    save()
+                    elapsed = max(0., self.clock() - started)
+                    state['actor_seconds'] += elapsed
+                    state.pop('inflight_query', None)
+                    observe('research_query_finished', dict(query=asdict(query), elapsed_seconds=elapsed))
                 if (not isinstance(response, dict) or not isinstance(response.get('provenance'), dict)
                         or not response['provenance'] or any(not isinstance(response.get(k), list)
                         for k in ('results', 'negative_records'))):
@@ -252,7 +264,8 @@ class Researcher:
             selected = proposal.parent_project_id or parent.project_id
             if selected not in parent_refs or not {*query_refs, parent_refs[selected]} <= set(decision.evidence_ids):
                 raise ValueError('diagnostic must cite retrieved research and its admitted parent')
-            self._validate_template(proposal, selected, context['templates'])
+            selected_row = next(row for row in parents if row['project_id'] == selected)
+            self._validate_template(proposal, selected, selected_row.get('templates', context['templates']))
             seen = set()
             for row in decision.negative_decisions:
                 key = (row.query_ref, row.index)
