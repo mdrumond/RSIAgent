@@ -49,10 +49,25 @@ def project_hash(contract):
     return hashlib.sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest()
 
 
+def configure_target_python_paths(paths):
+    """Optional explicit registry-derived paths in target Python3.11 only."""
+    if not paths:
+        return
+    if sys.version_info[:2]!=(3,11):
+        raise ValueError('target Python paths must not enter a controller interpreter')
+    if not isinstance(paths,list) or any(not isinstance(path,str) or not Path(path).is_absolute()
+                                        or not Path(path).is_dir() for path in paths):
+        raise ValueError('target_python_paths must be explicit existing absolute registry paths')
+    for path in reversed(paths):
+        if path in sys.path:sys.path.remove(path)
+        sys.path.insert(0,path)
+
+
 def check_runtime(contract, capture_root=None):
     profile = contract['runtime_identity']
     if sys.version_info[:2] != (3, 11):
         raise ValueError('Catlass target requires Python 3.11')
+    configure_target_python_paths(profile.get('target_python_paths',[]))
     if checked_git(profile['catlass_source'], 'rev-parse', 'HEAD') != profile['source_revision']:
         raise ValueError('Catlass source revision mismatch')
     checked_git(profile['catlass_source'], 'diff', '--exit-code', 'HEAD')
@@ -75,9 +90,9 @@ def check_runtime(contract, capture_root=None):
             raise ValueError('runtime compiler path mismatch')
         if capture_root is not None:
             root = Path(capture_root).resolve()
-            owned = Path(__file__).resolve().parent / 'catlass-evidence'
+            owned = (Path.cwd() / 'outputs').resolve()
             if not root.is_relative_to(owned):
-                raise ValueError('capture wrappers must be in the trusted verifier evidence directory')
+                raise ValueError('capture wrappers must be inside the current trusted outputs tree')
             wrapper = root / 'wrappers' / name
             if not wrapper.is_file():
                 raise ValueError('trusted capture wrapper missing')
@@ -154,10 +169,10 @@ def load_kernel(path, allowed_helpers=()):
     return module.kernel
 
 
-def run(contract, mode, case_index=None, capture_root=None):
-    global capability_gate, compiler_repair_gate, launch_output
+def run(contract, mode, case_index=None, capture_root=None, profile_capture=False):
+    global capability_gate, compiler_repair_gate, launch_output, fresh_device_health, profile_validation
     if 'capability_gate' not in globals():
-        from rsi.catlass_capabilities import capability_gate, compiler_repair_gate, launch_output
+        from rsi.catlass_capabilities import capability_gate, compiler_repair_gate, launch_output, fresh_device_health, profile_validation
     started = time.monotonic()
     current_source = project_hash(contract)
     expected_source = os.environ.get('RSI_EXPECTED_SOURCE_HASH', current_source)
@@ -171,21 +186,43 @@ def run(contract, mode, case_index=None, capture_root=None):
         raise ValueError('outer CPL admission/runtime identity mismatch')
     if capture_root is not None and mode != 'compile':
         raise ValueError('capture wrapper execution is compile-only')
+    if contract['abi_version'] != ABI_VERSION:
+        raise ValueError('unknown Catlass kernel ABI')
+    physical = contract['physical_device']
+    if profile_capture:
+        if (mode!='test' or case_index!=0 or contract['exercise']['kind']!='msprof-basic'
+                or not contract.get('profile_capture')):
+            raise ValueError('direct-physical child requires frozen trusted msprof capture binding')
+        if any(os.environ.get(name) for name in ('ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES')):
+            raise ValueError('direct-physical profiler child must be unmasked')
+    elif contract.get('direct_physical') or os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!=str(physical):
+        raise ValueError('ordinary launch must mask the admitted physical device')
+    is_profile_validation=mode=='validation' and contract['exercise']['kind']=='msprof-basic'
+    fresh_device_health(contract,require_idle=profile_capture or is_profile_validation)
+    if is_profile_validation:
+        if case_index is not None:
+            raise ValueError('validation must cover all frozen cases')
+        result=profile_validation(contract,source_hash=expected_source,started=started)
+        if project_hash(contract)!=expected_source:
+            raise ValueError('source changed during profile validation')
+        return result
     identity = check_runtime(contract, capture_root)
     import torch
     import torch_npu  # noqa: F401 - registers NPU device support
     import catlass.tla as tla
     from catlass.tla.runtime import from_dlpack
-
-    if contract['abi_version'] != ABI_VERSION:
-        raise ValueError('unknown Catlass kernel ABI')
-    physical = contract['physical_device']
-    direct = contract.get('direct_physical', False)
-    if not direct and os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != str(physical):
-        raise ValueError('ordinary launch must mask the admitted physical device')
-    if direct:
-        raise ValueError('ABI v1 correctness driver does not perform direct-physical profiling')
-    torch.npu.set_device(0)
+    if mode=='preflight':
+        payload=dict(kind='target-runtime-preflight',python=sys.version.split()[0],
+            identity=identity,source_hash=expected_source,physical_device=physical,
+            outer_cpl_handle=contract['outer_cpl_handle'],correctness=False,device_launched=False,
+            target_python_paths=contract['runtime_identity'].get('target_python_paths',[]),
+            torch_module=str(torch.__file__),torch_npu_module=str(torch_npu.__file__))
+        Path('outputs').mkdir(exist_ok=True)
+        Path('outputs/runtime-preflight.json').write_text(json.dumps(payload,indent=2)+'\n')
+        print('RSI_CATLASS_PREFLIGHT='+json.dumps(payload,sort_keys=True))
+        return payload
+    application_device = physical if profile_capture else 0
+    torch.npu.set_device(application_device)
     candidate = Path('candidate.py')
     candidate_hash = sha(candidate)
     kernel = load_kernel(candidate, contract['allowed_helpers'])
@@ -210,7 +247,7 @@ def run(contract, mode, case_index=None, capture_root=None):
             raise ValueError('case exceeds ABI allocation capacity')
         a = torch.tensor(left + [0.] * (padded - len(left)), dtype=torch.float32, device='npu')
         b = torch.tensor(right + [0.] * (padded - len(right)), dtype=torch.float32, device='npu')
-        out = torch.full_like(a, float('nan'))
+        out = torch.tensor([float('nan')]*padded, dtype=torch.float32, device='npu')
         args = [from_dlpack(t, layout_tag=tla.arch.RowMajor).mark_compact_shape_dynamic(0)
                 for t in (a, b, out)]
         if mode == 'validation' and contract['exercise']['kind'] == 'compiler-repair' and repair_receipt is None:
@@ -221,9 +258,18 @@ def run(contract, mode, case_index=None, capture_root=None):
         artifact = tla.compile(kernel, *args, options='--npu-arch 3510')
         if repair_receipt is not None:
             repair_receipt['corrected_compiled'] = True
-        result = dict(case=case, compiled=True, launched=False, numeric_match=False)
+        export = None
+        attribute = contract['runtime_identity'].get('artifact_export_attribute')
+        if attribute:
+            export = artifact
+            for component in attribute.split('.'):
+                export = getattr(export,component)
+            if not isinstance(export,str) or not export:
+                raise ValueError('compiled artifact export metadata unavailable')
+        result = dict(case=case, compiled=True, launched=False, numeric_match=False,
+                      exported_kernel=export)
         if mode != 'compile':
-            with launch_output(Path('outputs') / ('case-' + str(len(results))) / 'device-output') as device_output:
+            with launch_output(Path('outputs') / ('profile-cases' if profile_capture else mode+'-cases') / ('case-' + str(len(results))) / 'device-output') as device_output:
                 artifact(*args, block_num=case['block_count'])
                 torch.npu.synchronize()
             values = out[:len(left)].cpu().tolist()
@@ -246,7 +292,9 @@ def run(contract, mode, case_index=None, capture_root=None):
     payload = dict(abi_version=ABI_VERSION, mode=mode, identity=identity,
                    source_hash=expected_source, candidate_sha256=candidate_hash,
                    outer_cpl_handle=contract['outer_cpl_handle'], physical_device=physical,
-                   execution_runtime=contract['execution_runtime'], logical_device=0,
+                   execution_runtime=contract['execution_runtime'], logical_device=0 if not profile_capture else None,
+                   application_device=application_device,
+                   device_addressing='direct-physical' if profile_capture else 'masked-logical-zero',
                    case_hash=contract['case_hash'],
                    cases=results, elapsed=time.monotonic() - started,
                    correctness=mode != 'compile', capability_evidence=capability,
@@ -262,12 +310,13 @@ def main(contract):
     if 'CapabilityUnavailable' not in globals():
         from rsi.catlass_capabilities import CapabilityUnavailable
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', required=True, choices=('compile', 'test', 'validation'))
+    parser.add_argument('--mode', required=True, choices=('preflight','compile', 'test', 'validation'))
     parser.add_argument('--case-index', type=int)
     parser.add_argument('--capture-root')
+    parser.add_argument('--profile-capture', action='store_true')
     args = parser.parse_args()
     try:
-        run(contract, args.mode, args.case_index, args.capture_root)
+        run(contract, args.mode, args.case_index, args.capture_root, args.profile_capture)
     except CapabilityUnavailable as error:
         payload = dict(outcome='capability-study-unavailable', exercise=contract['exercise']['kind'],
                        reason=str(error), exercise_validated=False,

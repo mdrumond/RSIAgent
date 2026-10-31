@@ -17,6 +17,7 @@ import ctypes
 import csv
 import re
 import tempfile
+import time
 
 
 if 'sha' not in globals():
@@ -73,10 +74,10 @@ def receipt_file(path):
 
 
 @contextlib.contextmanager
-def retained_evidence(common, exercise):
+def retained_evidence(common, exercise, *, outputs=None):
     """Retain raw negative evidence and typed receipt on every exit path."""
-    outputs = Path('outputs')
-    outputs.mkdir(exist_ok=True)
+    outputs = Path('outputs') if outputs is None else Path(outputs)
+    outputs.mkdir(parents=True,exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='capability-' + exercise + '-', dir=outputs))
     receipt = dict(common, exercise=exercise, outcome='pending')
     try:
@@ -158,7 +159,13 @@ def owned_command(spec, replacements, *, contract, env=None, evidence_directory=
                    stderr_sha256=hashlib.sha256(process.stderr).hexdigest())
     if process.returncode:
         raise ValueError('required tool command failed: ' + process.stderr.decode(errors='replace'))
-    markers = [line.split('=', 1)[1] for line in process.stdout.decode(errors='replace').splitlines()
+    child = verified_child_receipt(process.stdout,contract,[contract['cases'][0]])
+    receipt['launch_receipt'] = child
+    return process, receipt
+
+
+def verified_child_receipt(stdout,contract,expected_cases):
+    markers = [line.split('=', 1)[1] for line in stdout.decode(errors='replace').splitlines()
                if line.startswith('RSI_CATLASS_RESULT=')]
     if not markers:
         raise ValueError('tool run has no trusted child launch receipt')
@@ -168,12 +175,11 @@ def owned_command(spec, replacements, *, contract, env=None, evidence_directory=
             or child.get('identity', {}).get('source_revision') != contract['runtime_identity']['source_revision']
             or child.get('identity', {}).get('dependency_revision') != contract['runtime_identity']['dependency_revision']
             or child.get('identity', {}).get('cann_version') != contract['runtime_identity']['cann_version']
-            or [row['case'] for row in child.get('cases', [])] != [contract['cases'][0]]
+            or [row['case'] for row in child.get('cases', [])] != expected_cases
             or not child.get('correctness') or not child.get('cases')
             or any(not case['launched'] or not case['numeric_match'] for case in child['cases'])):
         raise ValueError('tool launch receipt is not a verified current-source execution')
-    receipt['launch_receipt'] = child
-    return process, receipt
+    return child
 
 
 def child_arguments(case_index=0, mode='test'):
@@ -251,27 +257,111 @@ def ir_gate(contract, temporary):
                 invocations=invocations)
 
 
+def fresh_device_health(contract, *, require_idle=False, remaining=lambda: None):
+    """Shared stdlib probe once per command, retaining actual outer identity."""
+    probe=globals().get('_shared_device_local_probe')
+    if probe is None:
+        from rsi.device_health_probe import local_probe as probe
+    profile=contract['runtime_identity'].get('device_admission')
+    if not profile:
+        raise ValueError('shared local A5 device_admission profile required before NPU commands')
+    outer=contract['outer_admission']
+    if (sha(outer['path'])!=outer['sha256'] or outer['handle']!=contract['outer_cpl_handle']
+            or outer['physical_device']!=contract['physical_device']
+            or outer['runtime']!=contract['execution_runtime']):
+        raise ValueError('actual frozen outer CPL admission changed')
+    configuration=dict(profile,product='a5',chip=None,require_idle=require_idle)
+    common=dict(physical_device=contract['physical_device'],outer_cpl_handle=contract['outer_cpl_handle'])
+    with retained_evidence(common,'device-health',outputs=contract.get('outputs_directory')) as (directory,retained):
+        result=probe(physical_device=contract['physical_device'],configuration=configuration,remaining=remaining)
+        for name,row in result.get('raw_measurements',{}).get('queries',{}).items():
+            for stream in ('stdout','stderr'):
+                (directory/(name+'.'+stream)).write_text(row.get(stream,''))
+        retained['shared_decision']=result
+        if result.get('admitted') is not True or result.get('physical_device')!=contract['physical_device']:
+            raise ValueError('shared device admission denied: '+str(result.get('observation')))
+        retained.update(outcome='device-admitted',measurements=result.get('measurements',{}))
+    return retained
+
+
+def profile_validation(contract, *, source_hash, started):
+    """No NPU imports in parent; numeric child exits before profiler starts."""
+    common=dict(source_hash=source_hash,case_hash=contract['case_hash'],
+                candidate_sha256=sha('candidate.py'),physical_device=contract['physical_device'],
+                outer_cpl_handle=contract['outer_cpl_handle'])
+    with retained_evidence(common,'msprof-validation') as (directory,retained):
+        process=run_retained([sys.executable,str(Path(__file__).resolve()),'--mode','test'],
+                             directory=directory/'numeric-child',prefix='command')
+        if process.returncode:
+            raise ValueError('numeric verification child failed before profiling')
+        numeric=verified_child_receipt(process.stdout,contract,contract['cases'])
+        if (numeric.get('candidate_sha256')!=common['candidate_sha256']
+                or numeric.get('device_addressing')!='masked-logical-zero'
+                or numeric.get('physical_device')!=contract['physical_device']
+                or numeric.get('outer_cpl_handle')!=contract['outer_cpl_handle']):
+            raise ValueError('numeric verification child has a different source/device/outer binding')
+        (directory/'numeric-child'/'receipt.json').write_text(json.dumps(numeric,indent=2)+'\n')
+        # run_retained/subprocess.run returned and reaped the child before this
+        # gate performs strict fresh isolation. Parent has imported no NPU code.
+        capability=capability_gate(contract,compile_original=None,
+                                   candidate_hash=common['candidate_sha256'])
+        if sha('candidate.py')!=common['candidate_sha256']:
+            raise ValueError('candidate changed between numeric and profile children')
+        retained.update(outcome='required-capability-verified',exercise_validated=True,
+                        numeric_child_exited=True,capability_evidence=capability)
+        payload=dict(numeric,mode='validation',exercise_validated=True,
+                     capability_evidence=capability,elapsed=time.monotonic()-started,
+                     numeric_child_exited_before_profile=True)
+    payload['orchestrator_evidence']=retained
+    Path('outputs/catlass-result.json').write_text(json.dumps(payload,indent=2)+'\n')
+    print('RSI_CATLASS_RESULT='+json.dumps(payload,sort_keys=True))
+    return payload
+
+
 def msprof_gate(contract, temporary):
     spec = contract['exercise']['tools']['msprof']
-    reports = temporary / 'msprof'
-    replacements = dict(report=str(reports), python=sys.executable,
-                        verifier=str(Path(__file__).resolve()),
-                        physical_device=str(contract['physical_device']),
-                        workload=__import__('shlex').join([sys.executable, *child_arguments()]))
-    _, receipt = owned_command(spec, replacements, contract=contract, evidence_directory=temporary / "tool-command")
-    selected = []
-    for path in reports.rglob('*.csv'):
+    if spec.get('device_mode')!='direct-physical' or not contract.get('profile_capture'):
+        raise ValueError('msprof requires the frozen direct-physical application/profiler binding')
+    fresh_device_health(contract,require_idle=True)
+    env=dict(os.environ)
+    for mask in ('ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'):
+        env.pop(mask,None)
+    workload=__import__('shlex').join([sys.executable,*child_arguments(),'--profile-capture'])
+    replacements=dict(report=str(temporary/'basic-info'),python=sys.executable,
+                      verifier=str(Path(__file__).resolve()),workload=workload,
+                      physical_device=str(contract['physical_device']))
+    # BasicInfo discovery is deliberately unfiltered: no pre-Actor export name.
+    if not any('{physical_device}' in arg for arg in spec['basic_info_arguments']):
+        raise ValueError('profiler argv must explicitly bind the admitted physical device')
+    discovery=dict(spec,arguments=spec['basic_info_arguments'])
+    _,receipt=owned_command(discovery,replacements,contract=contract,env=env,
+                            evidence_directory=temporary/'basic-command')
+    child=receipt['launch_receipt']
+    if (child.get('device_addressing')!='direct-physical'
+            or child.get('application_device')!=contract['physical_device']
+            or child.get('physical_device')!=contract['physical_device']):
+        raise ValueError('profiler and application physical-device mapping differs')
+    exports={case['exported_kernel'] for case in child['cases'] if case.get('exported_kernel')}
+    rows=[]
+    for path in (temporary/'basic-info').rglob('*.csv'):
         with path.open(newline='') as stream:
             for row in csv.DictReader(stream):
-                if row.get(spec['kernel_column']) == spec['kernel_name']:
-                    duration = float(row[spec['duration_column']])
-                    if not math.isfinite(duration) or duration <= 0:
-                        raise ValueError('invalid exact-kernel profiler duration')
-                    selected.append(dict(report=receipt_file(path), kernel=spec['kernel_name'], duration=duration))
-    if not selected:
-        raise ValueError('msprof produced no report for the frozen exact kernel selector')
-    return dict(command=receipt, case=contract['cases'][0], kernel=spec['kernel_name'],
-                reports=selected, metric='BasicInfo', instrumented=True)
+                name=row.get(spec['kernel_column'])
+                if not name or exports and name not in exports:continue
+                if int(row[spec['device_column']])!=contract['physical_device']:
+                    raise ValueError('BasicInfo report physical device differs from admitted device')
+                duration=float(row[spec['duration_column']])
+                if not math.isfinite(duration) or duration<=0:
+                    raise ValueError('invalid current-kernel profiler duration')
+                rows.append(dict(report=receipt_file(path),kernel=name,duration=duration))
+    names={row['kernel'] for row in rows}
+    if len(names)!=1:
+        raise ValueError('BasicInfo must identify one current compiled kernel; absent/ambiguous export evidence')
+    kernel=next(iter(names))
+    return dict(command=receipt,case=contract['cases'][0],kernel=kernel,reports=rows,
+                metric='BasicInfo',instrumented=True,selector_origin='current-artifact/BasicInfo',
+                physical_device=contract['physical_device'],source_hash=child['source_hash'],
+                case_hash=child['case_hash'],runtime=child['identity'])
 
 
 def diagnostic_tool_gate(contract, name, temporary):

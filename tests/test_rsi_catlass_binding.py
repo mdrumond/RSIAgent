@@ -12,6 +12,15 @@ from rsi.catlass_project_config import freeze_verifier, project_config, worker_e
 from rsi.catlass_verifier import case_inputs, project_hash, reference
 
 
+def _with_outer_admission(runtime,tmp_path,handle='remote:bz-a5:job:admitted',physical=2):
+    receipt=tmp_path/'outer-submission.json'
+    receipt.write_text(json.dumps({'handle':handle,'target':'bz-a5','runtime':'catlass-dsl',
+        'npu':{'devices':[physical],'pool':'fixture-pool','checked_at':'fixture-time'}}))
+    runtime['device_admission']={'outer_receipt':str(receipt),'outer_runtime':'catlass-dsl',
+                                 'allow_busy':False,'allow_alarm':True}
+    return runtime
+
+
 def test_conversion_cases_reject_identity_and_include_tie_rounding():
     left, right = case_inputs({'length':6, 'seed':17}, 'convert')
     expected = reference('convert', left, right)
@@ -46,15 +55,16 @@ def test_standalone_frozen_oracle_detaches_cases_from_actor_changes(tmp_path):
                    cann_version='9.3.0', cann_version_file='/profile/version', cann_version_contents='9.3.0',
                    pipeline_manifest='/profile/manifest', pipeline_manifest_sha256='hash',
                    catlass_module_sha256='hash', compiler_paths={'TlaCompile':'/profile/compiler','hivmc-a5':'/profile/backend'})
+    _with_outer_admission(runtime,tmp_path)
     seed = {'operation':'convert','exercise':{'kind':'conversion'},'cases':[{'length':6,'block_count':1,'seed':17}]}
     path = tmp_path/'verify.py'
-    digest = freeze_verifier(path, seed=seed, runtime_identity=runtime, physical_device=2, outer_cpl_handle='remote:bz-a5:session:admitted')
+    digest = freeze_verifier(path, seed=seed, runtime_identity=runtime, physical_device=2, outer_cpl_handle='remote:bz-a5:job:admitted')
     seed['cases'][0]['length'] = 1
     frozen = runpy.run_path(str(path))
     assert frozen['FROZEN_CONTRACT']['cases'][0]['length'] == 6
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
     with pytest.raises(FileExistsError):
-        freeze_verifier(path, seed=seed, runtime_identity=runtime, physical_device=2, outer_cpl_handle='remote:bz-a5:session:admitted')
+        freeze_verifier(path, seed=seed, runtime_identity=runtime, physical_device=2, outer_cpl_handle='remote:bz-a5:job:admitted')
 
 
 
@@ -67,6 +77,7 @@ def test_default_local_config_and_worker_env_do_not_rebind_controller(tmp_path):
     config = project_config(source=tmp_path/'source', verifier=tmp_path/'verify.py',
                             target_python='/profile/python3.11')
     assert config.executor_identity is None
+    assert config.retained_paths == ('outputs',)
     assert config.commands['validation'][0] == '/profile/python3.11'
     with pytest.raises(ValueError):
         worker_environment(inherited={}, outer_cpl_handle='invented', physical_device=3,
@@ -124,6 +135,11 @@ def test_actor_report_cannot_replace_a_tool_launch_receipt(tmp_path, monkeypatch
 def fake_consumer(tmp_path, monkeypatch):
     """Exercise the real driver decisions with fake target numerical operations."""
     from rsi import catlass_verifier as driver
+    from rsi import catlass_capabilities as gates
+    for name in ('capability_gate','compiler_repair_gate','launch_output','profile_validation'):
+        monkeypatch.setattr(driver,name,getattr(gates,name),raising=False)
+    monkeypatch.setattr(driver,'fresh_device_health',lambda *a,**kw:{},raising=False)
+    monkeypatch.setattr(gates,'fresh_device_health',lambda *a,**kw:{})
     root = tmp_path/'project'
     root.mkdir()
     (root/'candidate.py').write_text('pass\n')
@@ -183,33 +199,49 @@ def test_unavailable_study_exits_separately_and_never_claims_validation(fake_con
     trusted = tmp_path/'trusted'
     trusted.mkdir()
     monkeypatch.setattr(catlass_capabilities,'__file__',str(trusted/'verify.py'))
+    contract['profile_capture']=True
     contract['exercise'] = {'kind':'msprof-basic','tools':{'msprof':{
+        'device_mode':'direct-physical','basic_info_arguments':['--device','{physical_device}'],
         'path':str(tmp_path/'absent-msprof'),'sha256':'unused','allow_unavailable':True,'arguments':[]}}}
+    def unavailable(*args,**kwargs):
+        raise catlass_capabilities.CapabilityUnavailable('msprof unavailable after reaped numeric child')
+    monkeypatch.setattr(driver,'profile_validation',unavailable)
     monkeypatch.setattr(sys,'argv',['verify.py','--mode','validation'])
     with pytest.raises(SystemExit) as stopped:
         driver.main(contract)
     assert stopped.value.code == 78
     receipt = json.loads(Path('outputs/catlass-capability-study.json').read_text())
     assert receipt['outcome'] == 'capability-study-unavailable' and receipt['exercise_validated'] is False
-    assert ('launch',2) in calls
+    assert calls == []  # parent orchestrator never imports/launches NPU code
 
 
-def test_msprof_requires_exact_kernel_report_not_an_unrelated_csv(tmp_path, monkeypatch):
+def test_msprof_derives_current_export_and_rejects_stale_name_or_wrong_device(tmp_path, monkeypatch):
     from rsi import catlass_capabilities as gates
-    reports = tmp_path/'msprof'
+    reports = tmp_path/'basic-info'
     reports.mkdir()
     path = reports/'OpBasicInfo.csv'
-    path.write_text('Kernel Name,Duration(us)\nother_kernel,12.5\n')
-    contract = {'exercise':{'tools':{'msprof':{'kernel_name':'kernel_42',
-        'kernel_column':'Kernel Name','duration_column':'Duration(us)'}}},
-        'physical_device':2,'cases':[{'length':3,'block_count':2,'seed':17}]}
-    monkeypatch.setattr(gates,'owned_command',lambda *args,**kwargs:(None,{'tool_sha256':'tool'}))
-    with pytest.raises(ValueError, match='no report'):
+    path.write_text('Kernel Name,Duration(us),Device\nstale_kernel,12.5,2\n')
+    contract = {'exercise':{'tools':{'msprof':{'kernel_name':'obsolete_frozen_name',
+        'device_mode':'direct-physical','basic_info_arguments':['--device','{physical_device}'],
+        'kernel_column':'Kernel Name','duration_column':'Duration(us)','device_column':'Device'}}},
+        'profile_capture':True,'physical_device':2,'cases':[{'length':3,'block_count':2,'seed':17}]}
+    child={'device_addressing':'direct-physical','application_device':2,'physical_device':2,
+           'cases':[{'exported_kernel':'current_kernel'}],'source_hash':'current-source',
+           'case_hash':'cases','identity':{'cann_version':'9.3.0'}}
+    monkeypatch.setattr(gates,'fresh_device_health',lambda *a,**kw:{})
+    def command(*args,**kwargs):
+        assert 'ASCEND_RT_VISIBLE_DEVICES' not in kwargs['env']
+        assert '--profile-capture' in args[1]['workload']
+        return None,{'tool_sha256':'tool','launch_receipt':child}
+    monkeypatch.setattr(gates,'owned_command',command)
+    with pytest.raises(ValueError,match='one current compiled kernel'):
         gates.msprof_gate(contract,tmp_path)
-    path.write_text('Kernel Name,Duration(us)\nkernel_42,12.5\n')
+    path.write_text('Kernel Name,Duration(us),Device\ncurrent_kernel,12.5,2\n')
     evidence = gates.msprof_gate(contract,tmp_path)
-    assert evidence['reports'][0]['duration'] == 12.5
-    assert evidence['reports'][0]['report']['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert evidence['kernel']=='current_kernel' and evidence['source_hash']=='current-source'
+    path.write_text('Kernel Name,Duration(us),Device\ncurrent_kernel,12.5,0\n')
+    with pytest.raises(ValueError,match='report physical device'):
+        gates.msprof_gate(contract,tmp_path)
 
 
 def test_compile_only_never_launches_or_reports_correctness(fake_consumer):
@@ -303,9 +335,11 @@ def test_failed_tool_keeps_raw_reports_streams_and_typed_failure(tmp_path, monke
         (report/'failed-report.csv').write_text('retained partial vendor report')
         return SimpleNamespace(returncode=1,stdout=b'command stdout',stderr=b'actual tool error')
     monkeypatch.setattr(gates.subprocess,'run',process)
-    contract = {'exercise':{'kind':'msprof-basic','tools':{'msprof':{'path':str(tool),
+    monkeypatch.setattr(gates,'fresh_device_health',lambda *a,**kw:{})
+    contract = {'exercise':{'kind':'msprof-basic','tools':{'msprof':{'device_mode':'direct-physical',
+        'basic_info_arguments':['--device','{physical_device}','--report','{report}'],'path':str(tool),
         'sha256':hashlib.sha256(tool.read_bytes()).hexdigest(),'arguments':['--report','{report}']}}},
-        'case_hash':'cases','runtime_identity':{},'outer_cpl_handle':'remote:bz-a5:session:actual','physical_device':2}
+        'profile_capture':True,'case_hash':'cases','runtime_identity':{},'outer_cpl_handle':'remote:bz-a5:session:actual','physical_device':2}
     with pytest.raises(ValueError,match='required tool command failed'):
         gates.capability_gate(contract,compile_original=lambda path:None,candidate_hash='candidate')
     receipts = list(Path('outputs').glob('*-receipt.json'))
@@ -314,9 +348,9 @@ def test_failed_tool_keeps_raw_reports_streams_and_typed_failure(tmp_path, monke
     assert failure['outcome']=='capability-failure' and not failure['exercise_validated']
     assert failure['failure']['type']=='ValueError'
     with tarfile.open(failure['archive']['path']) as archive:
-        assert archive.extractfile('./tool-command/command.stdout').read()==b'command stdout'
-        assert archive.extractfile('./tool-command/command.stderr').read()==b'actual tool error'
-        assert archive.extractfile('./msprof/failed-report.csv').read()==b'retained partial vendor report'
+        assert archive.extractfile('./basic-command/command.stdout').read()==b'command stdout'
+        assert archive.extractfile('./basic-command/command.stderr').read()==b'actual tool error'
+        assert archive.extractfile('./basic-info/failed-report.csv').read()==b'retained partial vendor report'
 
 
 def test_language_conversion_binds_frozen_ascend_source_not_dtype_cast(fake_consumer, monkeypatch):
@@ -341,3 +375,295 @@ def test_language_conversion_binds_frozen_ascend_source_not_dtype_cast(fake_cons
     monkeypatch.delenv('RSI_EXPECTED_SOURCE_HASH')
     with pytest.raises(ValueError,match='translation source changed'):
         driver.run(contract,'validation')
+
+
+def _apply_context_in_real_child(context, parent_pid, sender):
+    import os
+    from rsi.catlass_project_config import apply_worker_context
+    receipt = apply_worker_context(context,parent_pid=parent_pid)
+    sender.send((receipt,{name:os.environ.get(name) for name in (
+        'ASCEND_RT_VISIBLE_DEVICES','CATLASS_DSL_CACHE_DIR','RSI_OUTER_CPL_HANDLE',
+        'RSI_CPL_RUNTIME','RSI_EXPECTED_SOURCE_HASH')}))
+    sender.close()
+
+
+def test_worker_context_applies_actual_child_environment_without_parent_mutation(tmp_path,monkeypatch):
+    import multiprocessing
+    import os
+    from rsi.catlass_project_config import apply_worker_context
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','parent-device')
+    monkeypatch.setenv('RSI_EXPECTED_SOURCE_HASH','stale-parent-command')
+    context = {'outer_cpl_handle':'remote:bz-a5:session:actual',
+               'physical_device':3,'cache_directory':str(tmp_path/'owned-cache')}
+    before = dict(os.environ)
+    with pytest.raises(ValueError,match='spawned child'):
+        apply_worker_context(context,parent_pid=os.getpid())
+    spawn = multiprocessing.get_context('spawn')
+    receiver,sender = spawn.Pipe(duplex=False)
+    process = spawn.Process(target=_apply_context_in_real_child,args=(context,os.getpid(),sender))
+    process.start()
+    sender.close()
+    try:
+        assert receiver.poll(10), 'spawned worker did not return environment receipt'
+        receipt,environment = receiver.recv()
+        process.join(10)
+        assert process.exitcode==0
+        assert receipt['pid']!=os.getpid() and receipt['physical_device']==3
+        assert environment['ASCEND_RT_VISIBLE_DEVICES']=='3'
+        assert environment['CATLASS_DSL_CACHE_DIR']==context['cache_directory']
+        assert environment['RSI_OUTER_CPL_HANDLE']==context['outer_cpl_handle']
+        assert environment['RSI_CPL_RUNTIME']=='catlass-dsl'
+        assert environment['RSI_EXPECTED_SOURCE_HASH'] is None
+        assert dict(os.environ)==before
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        receiver.close()
+
+
+def test_profile_child_is_unmasked_direct_physical_only_with_frozen_capture(fake_consumer,monkeypatch):
+    driver,contract,calls=fake_consumer
+    contract['exercise']={'kind':'msprof-basic'}
+    contract['profile_capture']=True
+    with pytest.raises(ValueError,match='must be unmasked'):
+        driver.run(contract,'test',case_index=0,profile_capture=True)
+    monkeypatch.delenv('ASCEND_RT_VISIBLE_DEVICES')
+    receipt=driver.run(contract,'test',case_index=0,profile_capture=True)
+    assert receipt['application_device']==2 and receipt['device_addressing']=='direct-physical'
+    assert receipt['logical_device'] is None
+    with pytest.raises(ValueError,match='frozen trusted msprof'):
+        driver.run(contract,'validation',profile_capture=True)
+
+
+def test_direct_verifier_reuses_shared_probe_and_preserves_alarm_policy(tmp_path,monkeypatch):
+    from rsi import catlass_capabilities as gates
+    monkeypatch.chdir(tmp_path)
+    runtime=_with_outer_admission({},tmp_path,physical=3)
+    outer=Path(runtime['device_admission']['outer_receipt'])
+    calls=[]
+    admitted=[True]
+    def shared(**kwargs):
+        calls.append(kwargs)
+        return {'admitted':admitted[0],'physical_device':3,'observation':'shared decision',
+                'raw_measurements':{'queries':{}},'measurements':{'health':'Alarm','degraded':True}}
+    monkeypatch.setattr(gates,'_shared_device_local_probe',shared,raising=False)
+    contract={'physical_device':3,'outer_cpl_handle':'remote:bz-a5:job:admitted',
+        'execution_runtime':'catlass-dsl','runtime_identity':runtime,
+        'outer_admission':{'path':str(outer),'sha256':hashlib.sha256(outer.read_bytes()).hexdigest(),
+            'handle':'remote:bz-a5:job:admitted','physical_device':3,'runtime':'catlass-dsl'}}
+    assert gates.fresh_device_health(contract)['measurements']['degraded'] is True
+    assert calls[0]['physical_device']==3 and calls[0]['configuration']['allow_alarm'] is True
+    assert calls[0]['configuration']['chip'] is None
+    gates.fresh_device_health(contract,require_idle=True)
+    assert calls[1]['configuration']['require_idle'] is True
+    admitted[0]=False
+    with pytest.raises(ValueError,match='shared device admission denied'):
+        gates.fresh_device_health(contract)
+
+
+def test_health_failure_precedes_catlass_runtime_and_npu_import_path(fake_consumer,monkeypatch):
+    driver,contract,calls=fake_consumer
+    def blocked(*args,**kwargs):
+        raise ValueError('fresh device probe blocked')
+    def runtime_imports(*args,**kwargs):
+        raise AssertionError('Catlass/NPU runtime imported before health gate')
+    monkeypatch.setattr(driver,'fresh_device_health',blocked)
+    monkeypatch.setattr(driver,'check_runtime',runtime_imports)
+    with pytest.raises(ValueError,match='fresh device probe blocked'):
+        driver.run(contract,'test')
+    assert not calls
+
+
+def test_builtin_hubble_guard_adapts_placement_and_reuses_shared_guard(tmp_path,monkeypatch):
+    from rsi.catlass_project_config import device_guard
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','3')
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE','remote:bz-a5:job:owned')
+    monkeypatch.setenv('RSI_CPL_RUNTIME','catlass-dsl')
+    calls=[]
+    def shared(request,**kwargs):
+        calls.append((request,kwargs))
+        return {'admitted':True,'physical_device':3,'observation':'shared guard'}
+    monkeypatch.setitem(sys.modules,'rsi.device_admission',SimpleNamespace(guard=shared))
+    metadata={'controller_placement':'local','physical_device':3,
+              'outer_handle':'remote:bz-a5:job:owned','runtime':'catlass-dsl'}
+    request=SimpleNamespace(project=tmp_path/'project',command='timing',profile_path=None)
+    receipt=device_guard(request,phase='command',metadata=metadata,
+                         configuration={'product':'a5','chip':None},remaining=lambda:100.)
+    assert receipt['admitted'] and receipt['physical_device']==3
+    assert calls[0][1]['metadata']['controller_placement']=='on'
+    assert calls[0][1]['metadata']['executor_identity'] is None
+    assert metadata['controller_placement']=='local'
+
+
+def test_health_runs_once_before_all_cases_not_after_own_context(fake_consumer,monkeypatch):
+    driver,contract,calls=fake_consumer
+    contract['cases'].append({'length':4,'block_count':1,'seed':19})
+    checks=[]
+    monkeypatch.setattr(driver,'fresh_device_health',lambda *a,**kw:checks.append('health'))
+    driver.run(contract,'test')
+    assert checks==['health']
+    assert calls.count('compile')==2
+
+
+def test_numeric_child_is_reaped_before_profile_without_parent_npu_context(tmp_path,monkeypatch):
+    from rsi import catlass_capabilities as gates
+    monkeypatch.chdir(tmp_path)
+    Path('candidate.py').write_text('pass\n')
+    monkeypatch.setenv('RSI_EXPECTED_SOURCE_HASH','source')
+    order=[]
+    cases=[{'length':3,'block_count':1,'seed':17}]
+    identity={'source_revision':'src','dependency_revision':'dep','cann_version':'9.3.0'}
+    contract={'cases':cases,'case_hash':'cases','physical_device':2,
+              'outer_cpl_handle':'remote:bz-a5:job:owned','runtime_identity':identity}
+    child={'source_hash':'source','candidate_sha256':hashlib.sha256(Path('candidate.py').read_bytes()).hexdigest(),
+           'case_hash':'cases','identity':identity,'correctness':True,
+           'physical_device':2,'outer_cpl_handle':contract['outer_cpl_handle'],
+           'device_addressing':'masked-logical-zero',
+           'cases':[{'case':cases[0],'launched':True,'numeric_match':True}]}
+    def completed_child(argv,**kwargs):
+        assert argv[-2:]==['--mode','test']
+        kwargs['directory'].mkdir(parents=True)
+        order.append('numeric-exited')
+        return SimpleNamespace(returncode=0,stdout=('RSI_CATLASS_RESULT='+json.dumps(child)).encode())
+    def profile(*args,**kwargs):
+        assert order==['numeric-exited']
+        order.append('profile')
+        return {'outcome':'required-capability-verified'}
+    monkeypatch.setattr(gates,'run_retained',completed_child)
+    monkeypatch.setattr(gates,'capability_gate',profile)
+    result=gates.profile_validation(contract,source_hash='source',started=0.)
+    assert order==['numeric-exited','profile']
+    assert result['numeric_child_exited_before_profile'] is True and result['exercise_validated'] is True
+
+
+def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(tmp_path,monkeypatch):
+    from rsi.catlass_project_config import bind_project,case_identity,elapsed_budget
+    from rsi.contracts import ProjectSpec
+    from rsi.project_runner import ProjectConfig
+    import runpy
+    handle='remote:bz-a5:job:leased'
+    outer=tmp_path/'outer.json'
+    outer.write_text(json.dumps({'handle':handle,'target':'bz-a5','runtime':'catlass-dsl',
+        'npu':{'devices':[0,1],'pool':'fixture','checked_at':'fixture'}}))
+    runtime=dict(catlass_source='/profile/source',source_revision='src',dependency_gitlink='dep',
+        dependency_revision='dep',consumer_files=[{'path':'/profile/compiler','sha256':'hash'}],
+        cann_version='9.3.0',cann_version_file='/profile/version',cann_version_contents='9.3.0',
+        pipeline_manifest='/profile/manifest',pipeline_manifest_sha256='hash',catlass_module_sha256='hash',
+        compiler_paths={'TlaCompile':'/profile/front','hivmc-a5':'/profile/back'},
+        device_admission={'outer_receipt':str(outer),'outer_runtime':'catlass-dsl','allow_alarm':True})
+    seed={'operation':'convert','exercise':{'kind':'conversion'},
+          'cases':[{'length':3,'block_count':1,'seed':17}]}
+    seed_path=tmp_path/'seed.json';seed_path.write_text(json.dumps(seed))
+    configuration={'runtime_identity':runtime,'target_python':'/profile/python3.11','projects':{}}
+    bindings=[]
+    # Lease0 remains occupied; lease1 finishes first and becomes the third task's
+    # next-free lease. There is no ordinal % device-count assignment in builder.
+    for ordinal,physical in enumerate((0,1,1)):
+        name='logical-'+str(ordinal)
+        source=tmp_path/(name+'-source');source.mkdir();(source/'candidate.py').write_text('pass\n')
+        branch=tmp_path/name;branch.mkdir()
+        request=SimpleNamespace(root=branch/'runner',device=str(physical),reopen=False,
+            dispatch_id='dispatch-'+name,project_id='operation-'+name)
+        import os
+        (branch/'worker.json').write_text(json.dumps({'pid':os.getpid(),'dispatch_id':request.dispatch_id}))
+        spec=ProjectSpec(name,'preserve exact goal',('staging-command',),budgets=elapsed_budget())
+        config=ProjectConfig(source=str(source),verifier='not-yet-bound',
+            commands={'compile':['old'],'test':['old'],'validation':['old']},editable_files=('candidate.py',),
+            generated_paths=('outputs','cache'),retained_paths=('outputs',))
+        configuration['projects'][name]={'seed_path':str(seed_path),'case_hash':case_identity(seed)}
+        metadata={'target':'bz-a5','runtime':'catlass-dsl','controller_placement':'local',
+                  'physical_device':physical,'outer_handle':handle}
+        monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES',str(physical))
+        monkeypatch.setenv('RSI_OUTER_CPL_HANDLE',handle)
+        monkeypatch.setenv('RSI_CPL_RUNTIME','catlass-dsl')
+        from dataclasses import asdict
+        from rsi.project_binding import validate_resolution
+        admission={'operation_id':request.project_id,'spec':spec.to_dict(),'config':asdict(config),
+                   'memory_ref':'memory','skills_ref':'skills','configuration_ref':'configuration'}
+        bound=bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:7200.)
+        frozen=runpy.run_path(bound['config']['verifier'])['FROZEN_CONTRACT']
+        assert frozen['physical_device']==physical and frozen['case_hash']==case_identity(seed)
+        assert bound['spec']['goal']==spec.goal and bound['spec']['budgets']==spec.budgets.to_dict()
+        assert bound['config']['source']!=config.source
+        assert bound['config']['retained_paths']==['outputs']
+        assert bound['spec']['command']==bound['config']['commands']['test']
+        assert not request.root.exists()
+        assert Path(bound['config']['verifier']).parent==branch/'lease-inputs'
+        assert (source/'candidate.py').read_text()=='pass\n'
+        evidence=bound['evidence']
+        assert evidence['logical_case_identity']==evidence['resolved_case_identity']
+        assert evidence['logical_source_identity']==evidence['resolved_source_identity']
+        assert validate_resolution(admission,bound,device=str(physical),executor_identity=None)==bound
+        original=Path(bound['config']['verifier']).read_bytes()
+        # Hubble stores this resolution and does not invoke binder on resume.
+        retained=json.loads(json.dumps(bound))
+        request.reopen=True
+        with pytest.raises(ValueError,match='resume uses stored resolution'):
+            bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:7200.)
+        assert Path(retained['config']['verifier']).read_bytes()==original
+        bindings.append(bound)
+    assert [b['evidence']['physical_device'] for b in bindings]==[0,1,1]
+
+
+
+@pytest.mark.parametrize('exitcode',[0,7])
+def test_catlass_config_retains_raw_outputs_cas_after_success_or_failure(tmp_path,exitcode):
+    from rsi.python_execution import PythonExecution
+    from rsi.runtime import Workflow
+    from rsi.catlass_project_config import elapsed_budget
+    source=tmp_path/'input';source.mkdir()
+    (source/'candidate.py').write_text('pass\n')
+    verifier=tmp_path/'verifier.py'
+    verifier.write_text('from pathlib import Path\nimport sys\n'
+        'Path("outputs").mkdir()\nPath("cache").mkdir()\n'
+        'Path("outputs/raw-report.bin").write_bytes(b"raw\\x00\\xffdiagnostic")\n'
+        'Path("cache/ignored").write_bytes(b"not-evidence")\n'
+        f'sys.exit({exitcode})\n')
+    config=project_config(source=source,verifier=verifier,target_python=sys.executable)
+    backend=PythonExecution.snapshot(tmp_path/'task',source,verifier,commands=config.commands,
+        editable_files=config.editable_files,generated_paths=config.generated_paths,
+        retained_paths=config.retained_paths)
+    backend.workflow=Workflow(tmp_path/'workflow.json',lambda *args:True,
+        source_hash=backend.project_hash(),limits=elapsed_budget())
+    receipt=backend.run('validation-evidence','validation')
+    assert receipt['returncode']==exitcode
+    manifest=backend.store.read_json(receipt['artifact_refs'][0])
+    assert [row['path'] for row in manifest['files']]==['outputs/raw-report.bin']
+    assert backend.store.read_bytes(manifest['files'][0]['reference'])==b'raw\x00\xffdiagnostic'
+
+
+def test_case_identity_excludes_physical_bindings_but_tracks_workload():
+    import copy
+    from rsi.catlass_project_config import case_identity
+    first={'operation':'add','cases':[{'length':3,'block_count':1,'seed':17}],
+           'exercise':{'kind':'msprof-basic','tools':{'msprof':{'path':'/first/tool','physical_device':0}}}}
+    rebound=copy.deepcopy(first)
+    rebound['exercise']['tools']['msprof']={'path':'/another/tool','physical_device':5,'arguments':['different']}
+    assert case_identity(first)==case_identity(rebound)
+    rebound['cases'][0]['length']=4
+    assert case_identity(first)!=case_identity(rebound)
+
+
+def test_optional_target_paths_resolve_package_without_pythonpath_and_reject_controller(tmp_path,monkeypatch):
+    from rsi.catlass_verifier import configure_target_python_paths
+    root=tmp_path/'registry-target-libs'
+    package=root/'fixture_target_package'
+    package.mkdir(parents=True)
+    (package/'__init__.py').write_text('identity="registry-derived-target"\n')
+    monkeypatch.setattr(sys,'path',list(sys.path))
+    monkeypatch.delenv('PYTHONPATH',raising=False)
+    before=list(sys.path)
+    monkeypatch.setattr(sys,'version_info',(3,12,0))
+    with pytest.raises(ValueError,match='controller interpreter'):
+        configure_target_python_paths([str(root)])
+    assert sys.path==before
+    configure_target_python_paths([])
+    assert sys.path==before
+    monkeypatch.setattr(sys,'version_info',(3,11,0))
+    configure_target_python_paths([str(root)])
+    import importlib
+    loaded=importlib.import_module('fixture_target_package')
+    assert loaded.identity=='registry-derived-target'
+    assert Path(loaded.__file__).is_relative_to(root)
+    sys.modules.pop('fixture_target_package',None)
