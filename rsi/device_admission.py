@@ -197,5 +197,9 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
                       observation='Device admission unavailable: ' + str(exc))
     result['elapsed_seconds'] = time.monotonic() - started
     if directory is not None:
+        raw['client_results'] = [dict(json.loads(path.read_text()),
+            stdout=Path(str(path)[:-len('.client.json')] + '.stdout').read_text(errors='replace'),
+            stderr=Path(str(path)[:-len('.client.json')] + '.stderr').read_text(errors='replace'))
+            for path in sorted(directory.glob('*.client.json'))]
         atomic_json(directory / 'decision.json', result)
     return result
