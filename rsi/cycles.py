@@ -236,6 +236,7 @@ class CycleScheduler:
                 raise ValueError('failed-parent admission differs from its retained receipt')
             return
         if (self.spec.mode != Mode.PHASE1 or not self.simplify or not self.config['recover']
+                or s['phase'] != 'original' or s['cursor'] or s['completed_operations']
                 or s['pending'] or s['originals'] or s['recoveries'] or s['spent'] or not receipt_ref):
             raise WorkflowError('failed-parent admission requires a fresh configured Phase1 boundary')
         if not any(self.config[key] is not None for key in ('actor_seconds', 'recovery_seconds')):
@@ -541,15 +542,9 @@ class CycleScheduler:
                 elif self.spec.mode != Mode.PHASE1:
                     s['phase'] = 'skill'
                 else:
-                    parents = {row['project']['project_id']: row for row in s.get('historical_failed_parents', [])}
-                    parents.update({row['project']['project_id']: row for row in s['wave_results']})
                     s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
                                                 result=r, attempts=0) for r in s['wave_results']
                                            if self.config['recover'] and r['outcome'] != 'accepted']
-                    if self.config.get('recovery_feedback'):
-                        s['recovery_queue'] = [dict(spec=r['project'], original_id=r['original_id'],
-                            result=r, attempts=0) for r in parents.values()
-                            if self.config['recover'] and r['outcome'] != 'accepted']
                     s['phase'] = 'simplify' if s['recovery_queue'] and self.simplify else 'recovery'
         elif kind == 'simplify':
             original = ProjectSpec.from_dict(op['spec'])
@@ -566,15 +561,14 @@ class CycleScheduler:
                 return
             if not isinstance(result, SimplificationResult):
                 raise TypeError('host simplification result with elapsed receipt required')
+            index = 0
             if result.parent_project_id is not None:
                 index = next((i for i, item in enumerate(s['recovery_queue'])
                               if item['spec']['project_id'] == result.parent_project_id), None)
                 if index is None:
                     raise ValueError('selected parent is outside the admitted failure queue')
-                selected = s['recovery_queue'].pop(index)
-                s['recovery_queue'].insert(0, selected)
+                selected = s['recovery_queue'][index]
                 original = ProjectSpec.from_dict(selected['spec'])
-                op['original_id'] = selected['original_id']
             revised = result.spec
             if self.config.get('recovery_feedback'):
                 allowance = revised.budgets.actor_seconds
@@ -584,8 +578,13 @@ class CycleScheduler:
                     raise ValueError('child allocation exceeds the measured remaining semantic pool')
             if revised.project_id == original.project_id:
                 raise ValueError('simplification requires a new linked project identity')
-            if revised.project_id in {r['project']['project_id'] for r in s['originals'] + s['recoveries']}:
+            catalog = s.get('failed_parent_admission', {}).get('rows', [])
+            if revised.project_id in {r['project']['project_id']
+                                      for r in s['originals'] + s['recoveries'] + catalog}:
                 raise ValueError('revised project identity already used')
+            selected = s['recovery_queue'].pop(index)
+            s['recovery_queue'].insert(0, selected)
+            op['original_id'] = selected['original_id']
             s['events'].append(dict(kind='project_revised', original_id=op['original_id'],
                                     parent_id=original.project_id, revised=revised.to_dict(),
                                     operation_id=operation_id, receipt_ref=result.receipt_ref,
