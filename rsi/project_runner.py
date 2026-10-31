@@ -35,6 +35,7 @@ class ProjectConfig:
     performance_seconds: float | None = None
     generated_paths: tuple[str, ...] = ()
     executor_identity: str | None = None
+    retained_paths: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, value):
@@ -44,6 +45,10 @@ class ProjectConfig:
         if not isinstance(generated, (list, tuple)) or any(not isinstance(p, str) for p in generated):
             raise ValueError('generated_paths must be an array of project-relative paths')
         value['generated_paths'] = tuple(generated)
+        retained = value.get('retained_paths', ())
+        if not isinstance(retained, (list, tuple)) or any(not isinstance(p, str) for p in retained):
+            raise ValueError('retained_paths must be an array of project-relative output paths')
+        value['retained_paths'] = tuple(retained)
         result = cls(**value)
         if result.executor_identity is not None and (
                 not isinstance(result.executor_identity, str) or not result.executor_identity.strip()):
@@ -73,7 +78,7 @@ class ProjectRunner:
         backend = PythonExecution.snapshot(root, config.source, config.verifier,
             commands=config.commands, editable_files=config.editable_files,
             performance_seconds=config.performance_seconds, generated_paths=config.generated_paths,
-            executor_identity=config.executor_identity)
+            executor_identity=config.executor_identity, retained_paths=config.retained_paths)
         frozen = dict(created=created, spec=spec.to_dict(), skills=bundle.to_dict(), config=asdict(config),
                       backend_identity=injections['backend_identity'])
         atomic_json(backend.root / 'runner.json', {'contract': backend.store.put_json(frozen)})
