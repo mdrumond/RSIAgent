@@ -178,4 +178,3 @@ class ProjectComposition:
         runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
                                       configuration_ref=configuration_ref)
         return runner
-
