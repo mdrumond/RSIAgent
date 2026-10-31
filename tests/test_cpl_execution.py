@@ -289,7 +289,10 @@ def test_queue_expiry_cancels_owned_handle_without_late_work(tmp_path, monkeypat
     assert not (Path(state['remote']) / 'project').exists()
     calls = [json.loads(line) for line in (installed / 'calls.jsonl').read_text().splitlines()]
     assert any(call[:2] == ['cancel', 'remote:fake:job:original'] for call in calls)
-    assert sum(call[0] == 'run' for call in calls) == 1
+    runs = [call for call in calls if call[0] == 'run']
+    assert len(runs) == 2
+    assert '--npu' not in runs[1]
+    assert runs[1][runs[1].index('--file') + 1].endswith('cancel-producer.sh')
 
 
 @pytest.mark.parametrize('kind,expected_billable', [('transfer', 0), ('job', 7)])
@@ -381,8 +384,9 @@ def stop_test_runner(process, root):
     process.communicate()
 
 
-@pytest.mark.parametrize('signum', [signal.SIGTERM, signal.SIGINT])
-def test_actual_runner_signal_closes_separate_child_group(tmp_path, signum):
+@pytest.mark.parametrize('route,signum', [
+    ('signal', signal.SIGTERM), ('signal', signal.SIGINT), ('cleanup', signal.SIGTERM)])
+def test_actual_runner_signal_closes_separate_child_group(tmp_path, route, signum):
     code = '''import os, pathlib, signal, sys, time
 def stop(signum, frame):
     print('forwarded ' + str(signum), flush=True)
@@ -402,7 +406,12 @@ while True:
         wait_for_file(heartbeat, process)
         child_pgid = int((tmp_path / 'project' / 'child-pgid').read_text())
         assert child_pgid != os.getpgid(process.pid)
-        process.send_signal(signum)
+        if route == 'cleanup':
+            cleanup = subprocess.run([sys.executable, str(tmp_path / 'runner.py'), '--cancel-owned'],
+                                     capture_output=True, timeout=6)
+            assert cleanup.returncode == 0, cleanup.stderr
+        else:
+            process.send_signal(signum)
         process.communicate(timeout=5)
         producer = json.loads((tmp_path / 'producer.json').read_text())
         assert producer['child_pgid'] == child_pgid
@@ -500,3 +509,65 @@ def test_new_terminal_outer_job_does_not_substitute_for_closure(tmp_path, proof)
     state = json.loads((directory / 'transport.json').read_text())
     assert state['lease_retained'] is True
     assert state['status'] == 'producer-unknown'
+
+
+def test_owned_cleanup_rejects_recycled_runner_identity(tmp_path):
+    process = start_runner(tmp_path, 'import pathlib,time\npathlib.Path("ready").touch()\ntime.sleep(30)')
+    try:
+        wait_for_file(tmp_path / 'project' / 'ready', process)
+        receipt = tmp_path / 'producer.json'
+        producer = json.loads(receipt.read_text())
+        producer['runner_start_ticks'] = 'different-process'
+        receipt.write_text(json.dumps(producer))
+        result = subprocess.run([sys.executable, str(tmp_path / 'runner.py'), '--cancel-owned'],
+                                capture_output=True, timeout=2)
+        assert result.returncode != 0
+        assert process.poll() is None
+        os.killpg(producer['child_pgid'], 0)
+    finally:
+        stop_test_runner(process, tmp_path)
+
+
+def test_executor_owned_cleanup_uses_existing_runner_without_replaying_work(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    remote = tmp_path / 'producer'
+    remote.mkdir()
+    process = start_runner(remote, 'import pathlib,time\npathlib.Path("ready").touch()\ntime.sleep(30)')
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    state = dict(identity=executor._identity(request), remote=str(remote))
+    calls = []
+    handle = 'remote:fake:job:cleanup'
+    def cli(args, remaining, response_file=None):
+        calls.append(args)
+        assert args[0] == 'run' and '--npu' not in args
+        script = args[args.index('--file') + 1]
+        result = subprocess.run(['bash', str(script)], capture_output=True, timeout=6)
+        assert result.returncode == 0, result.stderr
+        value = dict(target='fake', handle=handle, state='completed', exit=0)
+        Path(args[args.index('--receipt-file') + 1]).write_text(json.dumps(value))
+        return value
+    monkeypatch.setattr(executor, '_cli', cli)
+    monkeypatch.setattr(executor, '_wait', lambda *args: dict(state='completed', exit=0))
+    try:
+        wait_for_file(remote / 'project' / 'ready', process)
+        executor._cancel_producer(request, directory, state, observe, lambda: 10)
+        process.communicate(timeout=2)
+        producer = json.loads((remote / 'producer.json').read_text())
+        assert CplExecutor._producer_closed(producer, producer['identity'])
+        executor._cancel_producer(request, directory, state, observe, lambda: 10)
+        assert len(calls) == 1
+    finally:
+        stop_test_runner(process, remote)
+
+
+def test_ambiguous_cleanup_submission_is_not_replayed(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    (directory / 'producer-cancel-started.json').write_text('{}')
+    def unexpected(*args, **kwargs):
+        pytest.fail('ambiguous cleanup must not submit another job')
+    monkeypatch.setattr(executor, '_cli', unexpected)
+    with pytest.raises(WorkflowError, match='submission unknown'):
+        executor._cancel_producer(request, directory, {}, observe, lambda: 10)
