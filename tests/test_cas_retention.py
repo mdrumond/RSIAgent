@@ -117,6 +117,7 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen, layered)
     memory = store.put_json({'memories': [
         {'proposal': {'observations_ref': observations}, 'provenance': {'packet': packet}}]})
     configuration = store.put_json({'payload': {'provider': {}, 'prompts': {'actor': 'guidance'}}})
+    query_only = store.put_bytes(b'\xffquery projection evidence')
     measures = []
     def measure(label, scope):
         measures.append((label, scope))
@@ -130,7 +131,7 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen, layered)
     composition = ProjectComposition(services, tmp_path, {'config': {'payload': {}}},
                                      SimpleNamespace(configuration_ref=configuration))
     query = lambda payload: {}
-    query.artifact_refs = ()
+    query.artifact_refs = (query_only,)
     composition.query = lambda ref: query
     class Runner:
         def __init__(self, root, **injections):
@@ -142,7 +143,7 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen, layered)
     composition.runner_class = Runner
     runner = composition.runner(tmp_path / 'runner', memory_ref=memory,
                                 backend_identity='test', reopen=reopen)
-    for ref in (binary, nested, observations, memory, configuration):
+    for ref in (binary, nested, observations, memory, configuration, query_only):
         assert os.path.samefile(object_path(parent_store, ref), object_path(runner.store, ref))
     assert runner.context()['user_guidance'] == {'actor': 'guidance'}
     assert measures == [('project-open' if reopen else 'project-snapshot-copy-and-bind',
