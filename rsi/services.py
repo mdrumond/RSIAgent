@@ -2,7 +2,8 @@
 
 Configuration uses project_configs[project_id] = ProjectConfig wire data and
 kdb_collections = [collection names]. Paths are resolved from the instance.
-ProjectSpec.command equals commands.test. Global budgets cap per-project budgets.
+ProjectSpec.command equals commands.test. Serial budgets cap per-project budgets.
+Opt-in waves reserve the explicit7200-second actor allocation per child.
 Starting folders are copied by ProjectRunner at admission; existing contracts
 never re-read their original folders. New configuration revisions require an
 explicit task-boundary adoption; active and historical contracts remain frozen.
@@ -19,23 +20,20 @@ import time
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.subject_memory import SubjectMemory, digest as memory_digest
-from rsi.actor import PiSessionAdapter
 from rsi.configuration import _snapshot, show_configuration
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec, Stage
 from rsi.cycles import CycleScheduler, HostTaskResult
 from rsi.learning import Learning, ProposalRejected, RejectedOperation, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
+from rsi.project_composition import ProjectComposition
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
 from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
 from rsi.skills import SkillBundle
-from rsi.strategy import knowledge_db_query
 from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.service_tuning import TuningBindings
-from rsi.instance_ingestion import load_ingestion_records
-from rsi.evidence_io import _references
 from rsi.observations import capture as capture_observations
 from rsi.handoffs import capture_parent
 from rsi.evaluation import SkillEvaluation, TuningController, case_identity
@@ -57,10 +55,11 @@ class TestBindings:
 
 
 class InstanceServices:
-    def __init__(self, instance, *, environment=None, test_bindings=None):
+    def __init__(self, instance, *, environment=None, test_bindings=None, executor_factory=None):
         self.root = Path(instance).resolve(strict=True)
         self.environment = dict(os.environ if environment is None else environment)
         self.test = test_bindings
+        self.executor_factory = executor_factory
         if test_bindings is not None and not isinstance(test_bindings, TestBindings):
             raise TypeError('explicit TestBindings required')
         self.store = ContentAddressedArtifacts(self.root / 'artifacts')
@@ -196,11 +195,14 @@ class InstanceServices:
 
     def status(self, cycle_id):
         root = self.root / 'runs' / _name(cycle_id)
-        return {name: json.loads((root / name).read_text()) if (root / name).exists() else None
+        result = {name: json.loads((root / name).read_text()) if (root / name).exists() else None
                 for name in ('service.json', 'cycle.json', 'controller.json', 'learning.json', 'tuning.json', 'revision.pending.json')}
+        from rsi.wave_inspection import inspect_waves
+        result['waves'] = inspect_waves(root)
+        return result
 
 
-class BoundCycle(TuningBindings):
+class BoundCycle(ProjectComposition, TuningBindings):
     def __init__(self, services, root):
         self.services, self.root, self.store = services, root, services.store
         revisions.recover(root, self.store)
@@ -225,7 +227,9 @@ class BoundCycle(TuningBindings):
         if state.get('isolation'):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
-        policy = self.config.get('cycle_limits', {})
+        policy = dict(self.config.get('cycle_limits', {}))
+        if self.config.get('project_wave'):
+            policy.setdefault('recovery_limit', None)
         first_clock = not state_path.exists()
         def cycle_clock():
             nonlocal first_clock
@@ -253,6 +257,10 @@ class BoundCycle(TuningBindings):
             self.learning, artifacts=self.store, pair_factory=self.pair)
         self.tuning = TuningController(root / 'tuning.json', self.controller,
                                        evaluation_factory=self.evaluation)
+        self.waves = None
+        if self.config.get('project_wave'):
+            from rsi.service_wave import WaveBindings
+            self.waves = WaveBindings(self)
 
     def make_learning(self, path):
         return Learning(path, self.store, self.memory, self, load_project=self.load_project,
@@ -360,146 +368,9 @@ class BoundCycle(TuningBindings):
         finally:
             self.role_operation = None
 
-    def ingestion_evidence(self):
-        refs = self.config.get('kdb_ingestion_refs', [])
-        evidence = load_ingestion_records(self.store, refs)
-        previous = None
-        for i, reference in enumerate(refs):
-            receipt = self.store.read_json(reference)
-            if not self.services.test and receipt.get('test_backend') is not False:
-                raise ValueError('production query requires production ingestion provenance')
-            if (receipt.get('previous_ingestion_refs') != refs[:i]
-                    or previous is not None and receipt.get('previous_kdb_sha256') != previous
-                    or receipt['manifest'].get('collection') not in self.config.get('kdb_collections', [])):
-                raise ValueError('ingestion chain differs from frozen KDB configuration')
-            if self.database is not None and json.loads(self.database.manifest(
-                    receipt['manifest']['collection']).to_json()) != receipt['manifest']:
-                raise ValueError('ingestion source manifest differs from frozen KDB')
-            previous = receipt.get('kdb_sha256')
-        if refs and previous != self.config.get('kdb_sha256'):
-            raise ValueError('ingestion baseline checksum differs from frozen configuration')
-        return evidence
-
-    def query(self, memory_ref):
-        snapshot = self.store.read_json(memory_ref)
-        if snapshot.get('schema') != 'subject-memory-snapshot-v1':
-            raise ValueError('accepted memory snapshot required')
-        ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
-        records = snapshot['memories']
-        positives, negatives = [], []
-        for record in records:
-            reference = record.get('provenance', {}).get('packet')
-            packet = self.store.read_json(reference) if reference else {}
-            observations = record['proposal'].get('observations', packet.get('observations'))
-            observation_ref = record['proposal'].get('observations_ref', packet.get('observations_ref'))
-            if observation_ref and self.store.read_json(observation_ref) != observations:
-                raise ValueError('accepted memory observation reference differs from retained facts')
-            if observations is not None and packet.get('observations') not in (None, observations):
-                raise ValueError('accepted observations differ from admitted host packet')
-            metadata = dict(record, proposal={k: v for k, v in record['proposal'].items()
-                if k not in ('observations', 'observations_ref')})
-            if record['proposal']['kind'] == 'correctness':
-                positives.append(dict(memory=metadata, observations=observations,
-                    provenance=dict(snapshot=memory_ref, packet=reference, observations=observation_ref)))
-            else:
-                row = dict(metadata, observations=observations, observations_ref=observation_ref)
-                if packet:
-                    row['observed_evidence'] = packet['evidence']
-                negatives.append(row)
-        if self.services.test:
-            adapter = self.services.test.query
-        else:
-            if self.database is None:
-                from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
-                from benchmarks.a5kernels.knowledge import KnowledgeDB
-                path = self.root / 'knowledge.sqlite3'
-                if hashlib.sha256(path.read_bytes()).hexdigest() != self.binding['kdb']:
-                    raise ValueError('frozen KDB changed')
-                settings = dict(self.config.get('embeddings', {}))
-                if settings.get('cache_dir'):
-                    settings['cache_dir'] = self.services.path(settings['cache_dir'])
-                embeddings = PinnedBGEEmbeddings(**settings)
-                with self.services.setup.measure('bge-dependency-model-load', self.spec.cycle_id):
-                    embeddings._load()
-                self.database = KnowledgeDB.open_read_only(path, embeddings)
-            self.ingestion_evidence()  # Authenticate each indexed source manifest as well.
-            adapter = knowledge_db_query(self.database, tuple(self.config['kdb_collections']),
-                                         negative_query=lambda _: [])
-        def query(payload):
-            result = json.loads(json.dumps(adapter(payload), allow_nan=False))
-            result['negative_records'].extend([*negatives, *ingestion['negative_records']])
-            result['results'].extend(positives)
-            result['provenance'].update(memory_snapshot=memory_ref,
-                                        ingestions=ingestion['provenance'])
-            return result
-        return query
-
-    def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
-               backend_identity, reopen=False, configuration_ref=None):
-        admitted_at = time.time()
-        configuration_ref = configuration_ref or self.spec.configuration_ref
-        frozen_config = self.store.read_json(configuration_ref)['payload']
-        provider = frozen_config['provider']
-        if not self.services.test:
-            from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-            from benchmarks.a5kernels.phase1_provider import direct_profile
-            profiles = [direct_profile(i) for i in MODEL_IDENTITIES if i.profile_id == provider['profile_id']]
-            if len(profiles) != 1 or profiles[0].model != provider['model']:
-                raise ValueError('registered actor model/profile mismatch')
-        def session():
-            with self.services.setup.measure('actor-dependency-factory', str(root)):
-                adapter = (self.services.test.session_factory() if self.services.test else
-                    PiSessionAdapter(model=provider['model'], environ=self.services.environment))
-            prepare = adapter.prepare
-            def ready(*args, **kwargs):
-                with self.services.setup.measure('actor-process-readiness', str(root)):
-                    return prepare(*args, **kwargs)
-            adapter.prepare = ready
-            return adapter
-        injections = dict(query=self.query(memory_ref), backend_identity=backend_identity,
-                          session_factory=session, test_backend=self.services.test is not None)
-        if not reopen:
-            first = True
-            def clock():
-                nonlocal first
-                if first:
-                    first = False
-                    return admitted_at
-                return time.time()
-            injections['clock'] = clock
-        with self.services.setup.measure('project-open' if reopen else 'project-snapshot-copy-and-bind', str(root)):
-            runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
-                root, spec, bundle, config, **injections)
-            # Reuse export's reference contract to retain the query's artifact closure.
-            pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref]
-            for record in self.store.read_json(memory_ref)['memories']:
-                if record['proposal'].get('observations_ref'):
-                    pending.append(record['proposal']['observations_ref'])
-                packet_ref = record.get('provenance', {}).get('packet')
-                if packet_ref:
-                    packet = self.store.read_json(packet_ref)
-                    pending.extend(packet.get('observations', {}).get('artifact_refs', []))
-                    if packet.get('observations_ref'):
-                        pending.append(packet['observations_ref'])
-            copied = set()
-            while pending:
-                reference = pending.pop()
-                if reference in copied:
-                    continue
-                data = self.store.read_bytes(reference)
-                runner.store.put_bytes(data)
-                copied.add(reference)
-                try:
-                    value = json.loads(data)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                pending.extend(_references(value))
-        context = runner.context
-        runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
-                                      configuration_ref=configuration_ref)
-        return runner
-
     def run(self, spec, memory_ref, skills_ref, context):
+        if self.waves:
+            return self.waves.run(spec, context)
         operation = _name(context['operation_id'])
         root = self.root / 'projects' / operation
         if root.exists():
@@ -547,8 +418,21 @@ class BoundCycle(TuningBindings):
         return HostTaskResult(outcome, ref, delta)
 
     def open_project(self, operation):
-        root = self.root / 'projects' / _name(operation)
+        relative = self.scheduler.state.get('project_roots', {}).get(operation)
+        root = (self.root / relative).resolve() if relative else self.root / 'projects' / _name(operation)
+        if not root.is_relative_to(self.root.resolve()):
+            raise ValueError('project root escapes retained cycle')
         binding = json.loads((root / 'service-binding.json').read_text())
+        if binding.get('executor_provenance') is not None:
+            from rsi.executor_profiles import public_identity
+            if self.services.executor_factory is None or public_identity(
+                    self.services.executor_factory(binding['executor_identity'])) != binding['executor_provenance']:
+                raise ValueError('host executor differs from frozen project device/runtime')
+        if relative:
+            wave_id = Path(relative).parts[1]
+            waves = [*self.scheduler.state.get('wave_history', []), self.scheduler.state.get('active_wave')]
+            wave = next(w for w in waves if w and w['id'] == wave_id)
+            self.kdb_stat = self.store.read_json(wave['admission_ref'])['kdb_stat']
         return self.runner(root, memory_ref=binding['memory'],
                            backend_identity=self.store.put_json(binding), reopen=True,
                            configuration_ref=binding['configuration'])
@@ -673,8 +557,29 @@ class BoundCycle(TuningBindings):
         self.scheduler.reconcile_rejected_skill(rejection)
         return rejection
 
-    def reconcile(self):
+    def reconcile(self, *, dispatch_ready=False):
         """Observe existing project completion; no new provider dispatch."""
+        pending = self.scheduler.state['pending']
+        if self.waves and self.scheduler.state.get('active_wave') and pending and pending['kind'] in ('original', 'recovery'):
+            if dispatch_ready:
+                self.waves.continue_ready()
+            state = self.waves.observe()
+            if any(row['status'] != 'completed' for row in state['projects'].values()):
+                raise ValueError('wave requires observation of retained controller/target work')
+            row = state['projects'][pending['id']]
+            runner = self.open_project(pending['id'])
+            result = self.finish_project(runner, pending['id'], row['receipt']['result'])
+            self.scheduler.reconcile(pending['id'], result)
+            return result
+        if pending and pending['kind'] == 'memory':
+            if pending['id'] in self.learning.state['operations']:
+                result = self.learning.reconcile_memory(pending['id'])
+            else:
+                rows = self.scheduler.state['wave_results'] if self.spec.mode == Mode.PHASE1 else [self.scheduler.state['originals'][-1]]
+                result = self.learning.memory_update(self.scheduler.state['memory'], rows,
+                                                     self.scheduler._context(pending))
+            self.scheduler.reconcile(pending['id'], result)
+            return result
         if self.tuning.state['pending']:
             pending = self.tuning.state['pending']
             path = self.root / 'evaluations' / pending['operation_id'] / 'evaluation.json'
@@ -759,18 +664,31 @@ class BoundCycle(TuningBindings):
                     and not self.config.get('tuning', {}).get('at_wave_end', True)):
                 ref = self.store.put_json(dict(event=due['id'], decision='skipped', reason='wave_end_disabled'))
                 self.scheduler.complete_extension(due['id'], ref)
+                self._close_wave_boundary()
                 return dict(decision='skipped', evidence_ref=ref)
             self.tuning_settings()
             self.tuning_project(due)
 
         try:
-            return self.tuning.step()
+            result = self.tuning.step()
+            self._close_wave_boundary()
+            return result
         except (ProposalRejected, RejectedOperation):
             # The producer revalidates exact scope, semantic invalidity and genuine
             # role timing. Provider/storage/unknown failures never enter this path.
             return self.reject_writer()
 
+    def _close_wave_boundary(self):
+        if self.waves and not self.controller.state['pending'] and not self.tuning.state['pending']:
+            extensions = self.scheduler.extension_events()
+            if not any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due',
+                                     'tuning_due', 'manual_tuning') for e in extensions):
+                self.scheduler.close_original_wave()
+
     def run_project(self, operation_id):
+        if self.waves and self.scheduler.state.get('active_wave'):
+            self.waves.observe()
+            raise ValueError('use wave resume after observing retained project handles')
         pending = self.scheduler.state['pending']
         if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery'):
             raise ValueError('explicit continuation requires matching unfinished scheduler admission')

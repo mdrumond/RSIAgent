@@ -96,3 +96,63 @@ and export.json inventory/provenance/CAS reference/SkillBundle hash. Pending or
 quarantined candidates are not selected. Atomic publication cannot replace an
 existing destination. Use the folder as --baseline-skills and its map.json as
 --skill-map in fresh instance creation, without opaque-CAS manual reconstruction.
+
+## Opt-in project waves
+
+An optional saved configuration selects admitted physical-device/executor identities:
+
+```json
+{
+  "project_wave": {
+    "max_parallel": 2,
+    "devices": [
+      {"device": "0", "executor_identity": "admitted-device-0"},
+      {"device": "1", "executor_identity": "admitted-device-1"}
+    ]
+  }
+}
+```
+
+Use the normal phase start/stop/resume commands and dashboard. Each child runs the
+canonical `ProjectRunner` with the wave's frozen memory, skills, configuration and
+read-only KDB. Source snapshots retain the complete configured resource tree;
+`editable_files` still limits candidate edits. The parent admits memory only after
+all siblings settle and host validation verifies their retained outcomes. Rejected,
+exhausted and failed attempts remain distinct from accepted artifacts.
+
+Wave projects have a 7200-second actor allocation with iteration/attempt stopping
+limits disabled. Parent actor and absolute wall allocations still constrain wave
+admission and nested work. Explicit harness recovery can add 7200 seconds once,
+retaining elapsed accounting. Configured semantic recovery and skill-validation
+policies continue through the existing controllers with linked operation histories.
+
+`RSI_EXECUTOR_PROFILES` names an ignored host JSON file with a `profiles` object.
+A profile may contain the concrete `CplConfig` constructor settings, or a trusted
+`factory: "module:callable"` plus `configuration` object. That callable receives
+`(identity, configuration)` and returns a typed executor; this supports both a local
+controller with CPL target commands and an externally admitted device controller
+with local target commands. Credentials, machine routes, runtime directories and
+outer admission settings stay in host configuration. Only the executor's public
+identity/provenance is frozen in project receipts.
+
+Stop prevents new admissions and drains owned workers. Inspection shows draining,
+observation-required handles, unstarted siblings, true project outcomes, leases and
+remaining actor allocations. Resume reuses accepted results and may admit ready
+siblings; it never replays an unknown dispatch. Reconcile/recovery controls require
+the corresponding pinned CLI capability:
+
+```console
+rsi --instance PATH phase1 reconcile --job JOB_ID
+rsi --instance PATH phase1 reconcile --job JOB_ID --operation OPERATION --observation observed.json
+rsi --instance PATH phase1 recover --job JOB_ID --operation OPERATION --observation observed.json
+```
+
+The optional host observation contains `controller_proof`, explicit closed actor
+intervals when needed, and per-command `timing` receipts for target reconciliation.
+Timing binds the original operation/source and authoritative controller-domain
+execution bounds; remote epoch subtraction is insufficient. Target reconciliation
+observes the original handle and finalizes its existing receipt. Missing closure,
+source, or timing evidence keeps work pending. A harness continuation must close
+its canonical pending admission before a new actor step; otherwise use the
+configured, evidence-linked recovery workflow. Adoption and accepted-parent
+inheritance wait for the wave's parent publication boundary.

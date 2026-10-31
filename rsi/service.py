@@ -9,16 +9,19 @@ import signal
 import threading
 
 from rsi.services import InstanceServices
+from rsi.executor_profiles import ExecutorProfiles
 
 
 def run_job(instance, request, configuration=None, *, should_stop, emit):
     if threading.current_thread() is not threading.main_thread():
         raise ValueError('owned job service must run on the worker main thread')
     action = request['action']
-    if action not in ('start', 'resume', 'revisit', 'adopt', 'tune'):
+    if action not in ('start', 'resume', 'revisit', 'adopt', 'tune', 'reconcile', 'recover'):
         raise ValueError('unknown job action')
     snapshot = configuration if configuration is not None else request.get('configuration')
     services = InstanceServices(instance)
+    if services.executor_factory is None:
+        services.executor_factory = ExecutorProfiles.from_environment(services.environment)
     cycle_id = request['cycle_id']
     if should_stop():
         return dict(status='stopped', cycle_id=cycle_id, dispatched=False)
@@ -38,6 +41,17 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     manual = action == 'tune' or action == 'resume' and request.get('origin_action') == 'tune'
     event_id = request.get('request_id') if manual else None
     was_stopped = cycle.scheduler.state['stopped']
+    last_wave = None
+    def wave_progress(state):
+        nonlocal last_wave
+        summary = {p: dict(status=row['status'], device=row['device'],
+            outcome=row.get('receipt', {}).get('result', {}).get('status'),
+            pending=row.get('workflow_pending')) for p, row in state['projects'].items()}
+        if summary != last_wave:
+            emit(dict(event='wave_observed', cycle_id=cycle_id, stopped=state['stopped'], projects=summary))
+            last_wave = summary
+    cycle.should_stop = lambda: should_stop() or cycle.scheduler.remaining()['wall_seconds'] == 0
+    cycle.wave_progress = wave_progress
     def manual_result():
         receipt = cycle.scheduler.state.get('extension_receipts', {}).get(event_id)
         if not manual or receipt is None:
@@ -49,6 +63,22 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     try:
         if request.get('mode') not in (None, cycle.spec.mode.value):
             raise ValueError('request mode differs from retained cycle')
+        if action in ('reconcile', 'recover'):
+            if not cycle.waves:
+                if action == 'recover':
+                    raise ValueError('harness recovery requires a wave-bound project')
+                cycle.reconcile()
+            elif request.get('observation'):
+                cycle.waves.apply_observation(request['operation_id'], request['observation'],
+                                               continue_stage=action == 'recover')
+                if action == 'recover':
+                    cycle.waves.recover(request['operation_id'], request['observation']['controller_proof']['observation'])
+                else:
+                    cycle.reconcile()
+            else:
+                cycle.reconcile()
+            return dict(status='recovery_authorized' if action == 'recover' else 'reconciled',
+                        cycle_id=cycle_id, pending=cycle.scheduler.state['pending'])
         if action == 'tune':
             if cycle.scheduler.state['phase'] not in ('original', 'complete', 'wave_limit'):
                 raise ValueError('manual tuning requires an idle task/wave boundary')
@@ -58,6 +88,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             event_id = cycle.request_tuning(request.get('steering', {}), request_id=request.get('request_id'))
             emit(dict(event='tuning_requested', cycle_id=cycle_id, event_id=event_id))
             cycle.scheduler.resume()
+            if cycle.waves:
+                cycle.waves.resume()
         if action == 'adopt':
             if snapshot is None:
                 raise ValueError('explicit frozen adoption revision required')
@@ -71,11 +103,13 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             # Retained work is observed first. No pending provider/host work is replayed.
             if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
                 try:
-                    cycle.reconcile()
+                    cycle.reconcile(dispatch_ready=True) if cycle.waves else cycle.reconcile()
                 except (ValueError, RuntimeError) as exc:
                     return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
                                 pending=cycle.scheduler.state['pending'], tuning_pending=cycle.tuning.state['pending'])
             cycle.scheduler.resume()
+            if cycle.waves:
+                cycle.waves.resume()
         def interrupt(*_args):
             if dispatching:
                 raise KeyboardInterrupt('owned job stop requested')
@@ -84,6 +118,9 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             while not done.wait(.05):
                 wall = cycle.scheduler.remaining()['wall_seconds']
                 if should_stop() or wall is not None and wall <= 0:
+                    if cycle.waves:
+                        cycle.waves.stop()
+                        return
                     # Signal only this owned worker; canonical finally blocks own children.
                     os.kill(os.getpid(), signal.SIGINT)
                     return
@@ -118,6 +155,13 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         cycle.scheduler.stop()
         return dict(status='stopped', cycle_id=cycle_id, pending=cycle.scheduler.state['pending'])
     except (ValueError, RuntimeError) as exc:
+        if cycle.waves and should_stop():
+            cycle.scheduler.stop()
+            from rsi.wave_inspection import inspect_waves
+            waves = inspect_waves(cycle.root)
+            unknown = any(w['status'] == 'observation_required' for w in waves)
+            return dict(status='observation_required' if unknown else 'stopped', cycle_id=cycle_id,
+                        pending=cycle.scheduler.state['pending'], controller_drain_complete=True)
         if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
             emit(dict(event='cycle_suspended', cycle_id=cycle_id, error=str(exc)))
             return dict(status='suspended', cycle_id=cycle_id, error=str(exc),

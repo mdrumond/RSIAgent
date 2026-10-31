@@ -61,6 +61,29 @@ def validate_configuration(payload):
             _reference(payload[name], name)
     if 'budgets' in payload:
         BudgetLimits.from_dict(payload['budgets'])
+    if payload.get('project_wave') is not None:
+        wave = payload['project_wave']
+        _object(wave, 'project_wave')
+        if set(wave) - {'max_parallel', 'devices', 'wave_size'}:
+            raise ValueError('unknown project_wave setting')
+        devices = wave.get('devices')
+        if not isinstance(devices, list) or not devices:
+            raise ValueError('project_wave requires admitted device bindings')
+        for device in devices:
+            _object(device, 'wave device')
+            if set(device) - {'device', 'executor_identity'}:
+                raise ValueError('wave devices contain identities, never machine profiles')
+            _reference(device.get('device'), 'physical device identity')
+            if device.get('executor_identity') is not None:
+                _reference(device['executor_identity'], 'executor_identity')
+        if len({d['device'] for d in devices}) != len(devices):
+            raise ValueError('wave device leases must be unique')
+        parallel = wave.get('max_parallel')
+        if type(parallel) is not int or not 1 <= parallel <= len(devices):
+            raise ValueError('max_parallel must fit admitted device bindings')
+        size = wave.get('wave_size', parallel)
+        if type(size) is not int or size < 1:
+            raise ValueError('wave_size must be a positive workload size')
     for name in ('phase1_projects', 'phase2_projects'):
         if name not in payload:
             continue
