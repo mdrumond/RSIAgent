@@ -163,3 +163,20 @@ def test_typed_role_wire_is_compatible_and_negative_reuse_needs_redirection():
         parse_proposal('diagnostic', data, {'query'})
     data['negative_decisions'][0]['redirection'] = 'Use a smaller isolated shape'
     assert _proposal('diagnostic', data, {'query'}).proposal.parameters == {'case_indices': [0]}
+
+
+def test_historical_envelope_is_archival_but_actual_failure_proofs_are_retained(fixture):
+    researcher, parent, context, roles, _, _, _, store = fixture
+    old_event = 'f' * 64  # Kept in the original task, unavailable in this child CAS.
+    envelope = store.put_json({'result': {'events': [old_event]}})
+    with pytest.raises(ValueError):
+        researcher.research(parent, {'artifact_ref': envelope}, context)
+    assert not roles.calls
+    proof = store.put_json({'stage': 'test', 'classification': 'numeric_failure'})
+    failure = dict(outcome='failed', error='retained numeric mismatch', artifact_refs=[proof],
+        origin_task_archive={'scope': 'origin-task-archive', 'service_result': envelope})
+    result = researcher.research(parent, failure, context)
+    from rsi.evidence_io import _references
+    assert proof in set(_references(failure))
+    assert envelope not in set(_references(failure))
+    assert store.read_json(result.receipt_ref)['status'] == 'accepted'

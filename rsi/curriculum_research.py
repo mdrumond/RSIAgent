@@ -132,6 +132,8 @@ class Researcher:
         operation = context['operation_id']
         if not isinstance(operation, str) or not operation:
             raise ValueError('research operation identity required')
+        for row in [failure, *(r['failure'] for r in context.get('failed_parents', []))]:
+            self._validate_failure(row)
         request = dict(parent=parent.to_dict(), failure=failure,
             context={key: context[key] for key in ('templates', 'failed_parents', 'namespace',
                 'original_project_id', 'memory_ref', 'skills_ref', 'configuration_ref',
@@ -295,7 +297,8 @@ class Researcher:
             return str(row)[:2048]
         result = {k: v[:2048] if isinstance(v, str) else v for k, v in row.items()
                   if k in ('text', 'path', 'repository', 'revision', 'collection', 'goal', 'stage',
-                           'status', 'outcome', 'reason', 'summary', 'error', 'project_id')
+                           'status', 'outcome', 'reason', 'summary', 'error', 'project_id',
+                           'classification', 'host_outcome', 'source_hash')
                   and isinstance(v, (str, int, float, bool))}
         memory = row.get('memory', row)
         if isinstance(memory, dict) and isinstance(memory.get('proposal'), dict):
@@ -305,6 +308,18 @@ class Researcher:
             result['observations'] = dict(outcome=observed.get('outcome'),
                 applicability=observed.get('applicability'), limitations=observed.get('limitations'))
         return result
+
+    def _validate_failure(self, row):
+        """Historical service envelopes remain archival, never new payload roots."""
+        if not isinstance(row, dict):
+            raise ValueError('admitted failure facts must be an object')
+        def service_envelope(value):
+            return (isinstance(value, dict) and isinstance(value.get('result'), dict)
+                    and isinstance(value['result'].get('events'), list))
+        if service_envelope(row) or isinstance(row.get('events'), list):
+            raise ValueError('pass admitted failure facts; keep historical events in origin-task-archive')
+        if row.get('artifact_ref') and service_envelope(self.store.read_json(row['artifact_ref'])):
+            raise ValueError('historical service-result ID must use an archival identity field')
 
     @staticmethod
     def _validate_template(proposal, parent_id, templates):
