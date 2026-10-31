@@ -161,8 +161,10 @@ For an outer-admitted A5 controller using default local target execution, select
 `worker_profile` on each device and keep `executor_identity` absent or null. Its
 ignored profile supplies public `metadata` with `controller_placement: "local"`,
 `executor_identity: null`, physical device, runtime and actual `outer_handle`;
-`worker_environment` names `rsi.catlass_project_config:worker_environment`, and
-`worker_configuration` supplies that outer handle and physical device. The child
+`worker_environment` names an optional shipped target callback, and
+`worker_configuration` supplies that outer handle and physical device. Target
+callback modules are delivered and validated by their target-specific PRs; the
+generic integration neither imports nor ships a Catlass compiler/verifier. The child
 supplies its own cache path, applies the returned environment before runner/target
 imports, and never mutates the parent's environment. It preserves the helper's
 source-hash behavior: stale `RSI_EXPECTED_SOURCE_HASH` is removed and the local

@@ -26,13 +26,23 @@ def scripted_guard(request, *, phase, metadata, configuration, remaining):
                 observation='explicit test-only admission')
 
 
+def cpu_worker_environment(*, inherited, outer_cpl_handle, physical_device, cache_directory):
+    """Explicit test callback; no target compiler, registry or CANN module imports."""
+    result = dict(inherited)
+    result.pop('RSI_EXPECTED_SOURCE_HASH', None)
+    result.update(ASCEND_RT_VISIBLE_DEVICES=str(physical_device),
+        CATLASS_DSL_CACHE_DIR=str(cache_directory), RSI_OUTER_CPL_HANDLE=outer_cpl_handle,
+        RSI_CPL_RUNTIME='cpu-test-runtime')
+    return result
+
+
 def profiles(path):
-    outer = 'remote:bz-a5:session:test-only'
+    outer = 'remote:cpu-test:session:test-only'
     entries = {}
     for device in (0, 1):
-        entries[f'worker-{device}'] = dict(metadata=dict(target='test-only', runtime='catlass-dsl',
+        entries[f'worker-{device}'] = dict(metadata=dict(target='test-only', runtime='cpu-test-runtime',
             executor_identity=None, physical_device=device, controller_placement='local', outer_handle=outer),
-            worker_environment='rsi.catlass_project_config:worker_environment',
+            worker_environment='test_rsi_worker_admission:cpu_worker_environment',
             worker_configuration=dict(outer_cpl_handle=outer, physical_device=device),
             guard='test_rsi_worker_admission:scripted_guard')
     path.write_text(json.dumps({'profiles': entries}))
@@ -59,7 +69,7 @@ def test_two_real_service_children_get_owned_context_and_command_guards(wave_ins
             records = [json.loads(line) for line in (branch / 'scripted-guard.jsonl').read_text().splitlines()]
             assert [r['phase'] for r in records] == ['admission', 'command', 'command', 'command']
             assert {r['mask'] for r in records} == {row['lease_device']}
-            assert {r['outer'] for r in records} == {'remote:bz-a5:session:test-only'}
+            assert {r['outer'] for r in records} == {'remote:cpu-test:session:test-only'}
             assert all(r['expected_source'] is None for r in records)
             caches.add(records[0]['cache'])
             assert records[0]['cache'] == str(branch / 'target-cache')
