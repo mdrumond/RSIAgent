@@ -36,6 +36,22 @@ def _wall_remaining(clock, deadline):
     return remaining
 
 
+class RoleFailure(RuntimeError):
+    """A known-finished role failed; its elapsed receipt has already been retained."""
+
+    def __init__(self, role, error_type, message):
+        self.role, self.error_type, self.message = role, error_type, message
+        super().__init__(f'{role} {error_type}: {message}')
+
+
+def _error_details(exc, secret=None):
+    message = str(exc)
+    if secret:
+        message = message.replace(secret, '[redacted]')
+    return dict(type=type(exc).__name__.encode()[:128].decode(errors='ignore'),
+                message=message.encode()[:2048].decode(errors='ignore'))
+
+
 @dataclass(frozen=True)
 class AdmittedEvidence:
     evidence_id: str
@@ -285,7 +301,7 @@ class NoncodingRoles:
         started = self.clock()
         _wall_remaining(self.clock, wall_deadline)
         deadline = client.deadline = min(started + allowance, wall_deadline) if wall_deadline is not None else started + allowance
-        success = False
+        success, error = False, None
         self.observer('role_started', {'role': role, 'provider_identity': self.profile.identity.as_dict(),
                                        'prompt': prompt, 'evidence': rows})
         try:
@@ -295,9 +311,15 @@ class NoncodingRoles:
             self.observer('role_proposal', {'role': role, 'proposal': result.model_dump(mode='json')})
             success = True
             return proposal
+        except Exception as exc:
+            secret = getattr(self.provider, '_credentials', {}).get(self.profile.identity.credential_env)
+            error = _error_details(exc, secret)
+            raise
         finally:
-            self.observer('role_finished', {'role': role, 'success': success,
-                                           'elapsed_seconds': self.clock() - started})
+            receipt = dict(role=role, success=success, elapsed_seconds=self.clock() - started)
+            if error is not None:
+                receipt['error'] = error
+            self.observer('role_finished', receipt)
 
 
 from rsi.curriculum_research import DiagnosticDecision, DiagnosticProposal, QueryPlan, ResearchQuery
@@ -525,6 +547,14 @@ class IsolatedRoles:
                             if elapsed > allowance:
                                 raise TimeoutError('worker exceeded actor allowance')
                             if not payload['success']:
+                                error = payload.get('error')
+                                if error is not None:
+                                    if (type(error) is not dict or set(error) != {'type', 'message'}
+                                            or any(type(v) is not str for v in error.values())
+                                            or len(error['type'].encode()) > 128
+                                            or len(error['message'].encode()) > 2048):
+                                        raise ValueError('invalid bounded role failure detail')
+                                    raise RoleFailure(role, error['type'], error['message'])
                                 raise RuntimeError('role failed; elapsed receipt retained')
                             cutoff = self.clock() + self.setup_seconds
                         elif event == 'result':
