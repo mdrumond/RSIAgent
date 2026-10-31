@@ -34,6 +34,28 @@ def write(path, value):
     path.write_text(json.dumps(value, sort_keys=True, indent=2))
 
 
+def device_print_values(text):
+    """Parse inline output and Ascend HiIPU marker/next-line numeric blocks.
+
+    Native Vec indices and unrelated log numbers are not printed tensor values.
+    """
+    values, active = [], False
+    number = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?'
+    for line in text.splitlines():
+        if 'RSI_DEVICE_NUMERIC' in line:
+            line = line.split('RSI_DEVICE_NUMERIC', 1)[1].lstrip(': ')
+            active = True
+        elif not active:
+            continue
+        if not line.strip():
+            continue
+        if re.fullmatch(r'[\s\[\],+\-.\deE]+', line):
+            values.extend(float(value) for value in re.findall(number, line))
+        else:
+            active = False
+    return values
+
+
 class Producer:
     def __init__(self, args, contract, context):
         self.args, self.contract, self.context = args, contract, context
@@ -197,11 +219,7 @@ class Producer:
         child = self.child_result(directory, digest(instrumented))
         samples = [case['actual_sample'][0] for case in child['cases'] if case.get('actual_sample')]
         lines = '\n'.join(path.read_text(errors='replace') for path in directory.rglob('stdout.log'))
-        observed = []
-        for line in lines.splitlines():
-            if 'RSI_DEVICE_NUMERIC' in line:
-                observed.extend(float(x) for x in re.findall(r'(?<![A-Za-z_])[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?',
-                                                             line.split('RSI_DEVICE_NUMERIC', 1)[1]))
+        observed = device_print_values(lines)
         if not observed or not samples or not any(math.isclose(x, samples[0], rel_tol=1e-3, abs_tol=1e-3) for x in observed):
             raise StudyFailure('failed', 'Device printf did not match the independently verified output sample')
         self.fact(['device_printf', 'numeric_diagnosis'], {'status': 'passed', 'observed_values': observed,

@@ -322,3 +322,11 @@ def test_printf_child_enables_native_print_and_matches_verified_sample(tmp_path)
     producer.printf()
     assert producer.facts['device_printf']['status'] == 'passed'
     assert producer.facts['numeric_diagnosis']['verified_samples'] == [1.25]
+
+
+def test_native_hiipu_printf_blocks_exclude_vector_indices_and_log_numbers():
+    from rsi.triton_exercises import device_print_values
+    text = ('unrelated launch 2026\n=> Vec 712\n RSI_DEVICE_NUMERIC: \n-5.217217\n\n'
+            '=> Vec 42\n RSI_DEVICE_NUMERIC: \n22.669495\n\n'
+            'other diagnostic 900\nRSI_DEVICE_NUMERIC 1.25\n')
+    assert device_print_values(text) == [-5.217217, 22.669495, 1.25]
