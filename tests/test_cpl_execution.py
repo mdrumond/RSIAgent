@@ -3,6 +3,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -12,7 +13,7 @@ from rsi.runtime import WorkflowError
 
 
 FAKE = r'''#!/usr/bin/env python3
-import json, pathlib, shutil, subprocess, sys, time
+import json, os, pathlib, shutil, subprocess, sys, time
 args = sys.argv[2:]
 action = args.pop(0)
 root = pathlib.Path(__file__).parent.parent
@@ -32,7 +33,9 @@ elif action == 'run':
     value.update(handle='remote:fake:job:original', state='queued')
     receipt.write_text(json.dumps(value))
     script = args[args.index('--file') + 1]
-    worker = ('import pathlib,subprocess,sys; '
+    worker = ('import os,pathlib,subprocess,sys,time; '
+              'time.sleep(float(os.environ.get("CPL_FAKE_QUEUE_SECONDS",0))); '
+              'sys.exit(0) if pathlib.Path(sys.argv[2]+".cancel").exists() else None; '
               'r=subprocess.run(["bash",sys.argv[1]]); '
               'pathlib.Path(sys.argv[2]).write_text(str(r.returncode))')
     subprocess.Popen([sys.executable, '-c', worker, script, str(root / 'job-exit')],
@@ -45,11 +48,24 @@ elif action == 'observe':
             time.sleep(0.01)
         value['state'] = 'completed' if (root / 'job-exit').exists() else 'running'
     value.update(handle=args[0], exit=0)
+elif action == 'cancel':
+    (root / 'job-exit.cancel').touch()
+    (root / 'job-exit').write_text('-15')
+    value.update(handle=args[0], state='cancelled')
+elif action == 'fetch':
+    shutil.copyfile((root / 'download-source').read_text(), args[1])
+    value.update(handle=args[0])
 elif action == 'download':
     source = pathlib.Path(args[1])
     if not source.is_absolute():
         source = root.parent / 'remote' / source
-    shutil.copyfile(source, args[2])
+    if os.environ.get('CPL_FAKE_LONG_DOWNLOAD'):
+        assert '--timeout' in args
+        time.sleep(int(args[args.index('--timeout') + 1]))
+        (root / 'download-source').write_text(str(source))
+        value.update(handle='remote:fake:transfer:output', state='running')
+    else:
+        shutil.copyfile(source, args[2])
 else:
     raise RuntimeError(action)
 print(json.dumps(value))
@@ -241,3 +257,77 @@ def test_unknown_submission_receipt_never_dispatches_during_recovery(tmp_path):
         executor.reconcile(request, observe=observe, remaining=lambda: 0,
                            recovery_remaining=lambda: 60)
     assert not (installed / 'calls.jsonl').exists()
+
+
+def test_slow_download_returns_handle_before_client_deadline(tmp_path, monkeypatch):
+    monkeypatch.setenv('CPL_FAKE_LONG_DOWNLOAD', '1')
+    executor, request, observe, _, installed = fixture(tmp_path)
+    executor = CplExecutor('frozen', replace(executor.config, client_timeout_seconds=4))
+    result = executor.execute(request, observe=observe, remaining=lambda: 60)
+    assert result.returncode == 0
+    calls = [json.loads(line) for line in (installed / 'calls.jsonl').read_text().splitlines()]
+    download = next(call for call in calls if call[0] == 'download')
+    assert int(download[download.index('--timeout') + 1]) < 4
+    assert sum(call[0] == 'download' for call in calls) == 1
+    assert any(call[:2] == ['fetch', 'remote:fake:transfer:output'] for call in calls)
+
+
+def test_queue_expiry_cancels_owned_handle_without_late_work(tmp_path, monkeypatch):
+    monkeypatch.setenv('CPL_FAKE_QUEUE_SECONDS', '3')
+    executor, request, observe, _, installed = fixture(tmp_path)
+    deadline = time.monotonic() + 1.5
+    with pytest.raises(WorkflowError):
+        executor.execute(request, observe=observe, remaining=lambda: max(0, deadline-time.monotonic()))
+    state = json.loads((executor._directory(request) / 'transport.json').read_text())
+    assert state['status'] == 'deadline-terminal'
+    assert state['terminal']['handle'] == 'remote:fake:job:original'
+    assert not (Path(state['remote']) / 'project').exists()
+    calls = [json.loads(line) for line in (installed / 'calls.jsonl').read_text().splitlines()]
+    assert any(call[:2] == ['cancel', 'remote:fake:job:original'] for call in calls)
+    assert sum(call[0] == 'run' for call in calls) == 1
+
+
+@pytest.mark.parametrize('kind,expected_billable', [('transfer', 0), ('job', 7)])
+def test_retained_wait_accounts_transfer_copy_but_charges_job_queue(tmp_path, monkeypatch,
+                                                                 kind, expected_billable):
+    executor, request, _, _, _ = fixture(tmp_path)
+    now, phase, charged = 0, 'command', 0
+    def observe(next_phase, **metadata):
+        nonlocal phase
+        phase = next_phase
+    def cli(args, remaining, response_file=None):
+        nonlocal now, charged
+        assert remaining() == 100 - charged
+        now += 7
+        if phase == 'command':
+            charged += 7
+        return dict(target='fake', handle=f'remote:fake:{kind}:owned', state='completed')
+    monkeypatch.setattr(executor, '_cli', cli)
+    executor._wait(f'remote:fake:{kind}:owned', request, observe, lambda: 100-charged)
+    assert now == 7 and charged == expected_billable
+    assert phase == 'command'
+
+
+def test_disconnected_deadline_cancellation_retains_owned_lease(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    state = dict(identity=executor._identity(request), status='dispatching')
+    budget = [5]
+    def submit(*args):
+        (directory / 'submission.json').write_text(json.dumps(dict(
+            target='fake', handle='remote:fake:job:original', state='queued')))
+        budget[0] = 0
+        raise WorkflowError('submission observation disconnected')
+    seen = []
+    def cli(args, remaining, response_file=None):
+        seen.append(args)
+        raise WorkflowError('cancellation disconnected')
+    monkeypatch.setattr(executor, '_submit', submit)
+    monkeypatch.setattr(executor, '_cli', cli)
+    with pytest.raises(WorkflowError):
+        executor._supervise(request, directory, state, directory / 'run.sh', observe, lambda: budget[0])
+    saved = json.loads((directory / 'transport.json').read_text())
+    assert saved['handle'] == 'remote:fake:job:original'
+    assert saved['lease_retained'] and saved['status'] == 'deadline-observation-pending'
+    assert all(call == ['cancel', 'remote:fake:job:original'] for call in seen)
