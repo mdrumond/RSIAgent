@@ -16,7 +16,11 @@ def read_all(context, pointer):
         pieces.append(page['text'])
         offset = page['next_offset']
         if offset is None:
-            return json.loads(''.join(pieces))
+            raw = ''.join(pieces)
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return raw
 
 
 def dense_records(store):
