@@ -11,6 +11,8 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import threading
+import time
 
 from rsi.python_execution import CommandResult, PythonExecution, atomic_json, digest
 from rsi.runtime import WorkflowError
@@ -51,12 +53,15 @@ class CplConfig:
 _RUNNER = r'''
 import hashlib, json, os, pathlib, signal, subprocess, tarfile, time
 root = pathlib.Path(__file__).parent
+started = time.monotonic()
 spec = json.loads((root / 'spec.json').read_text())
 for name, expected in spec['files'].items():
     if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected:
         raise RuntimeError('staged input identity mismatch')
-started = time.monotonic()
 limit = float(__import__('sys').argv[1]) if len(__import__('sys').argv) > 1 else None
+if limit is not None and len(__import__('sys').argv) > 2:
+    # Shell-local extraction interval, rounded up conservatively. No host epochs.
+    limit -= int(__import__('sys').argv[2]) + 1
 env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(spec['physical_device']),
            PYTHONPATH=str(root / 'project'), PYTHONPYCACHEPREFIX=str(root / 'cache'),
            RSI_EXPECTED_SOURCE_HASH=spec['identity']['source_hash'],
@@ -65,7 +70,15 @@ with (root / 'stdout').open('wb') as out, (root / 'stderr').open('wb') as err:
     process = None
     timed_out = False
     returncode = 127
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
     try:
+        if limit is not None:
+            limit = max(0, limit - (time.monotonic() - started))
+            if limit <= 0:
+                raise subprocess.TimeoutExpired(spec['argv'], 0)
         process = subprocess.Popen(spec['argv'], cwd=root / 'project', env=env,
                                    stdout=out, stderr=err, start_new_session=True)
         process.wait(timeout=limit)
@@ -166,17 +179,24 @@ class CplExecutor:
             raise WorkflowError('CPL receipt target/handle mismatch')
         return handle
 
+    def _observation_seconds(self, remaining):
+        limit = self._limit(remaining)
+        return max(0, min(20, int(self.config.client_timeout_seconds / 2),
+                          int(limit / 2) if limit is not None else 20))
+
     def _wait(self, handle, request, observe, remaining):
         while True:
-            self._phase(observe, 'command', request, handle=handle)
-            limit = self._limit(remaining)
-            seconds = min(30, int(self.config.client_timeout_seconds / 2),
-                          int(limit / 2) if limit is not None else 30)
+            phase = 'transfer' if handle.split(':')[2] == 'transfer' else 'command'
+            self._phase(observe, phase, request, handle=handle)
+            seconds = self._observation_seconds(remaining)
             args = ['observe', handle]
             if seconds >= 1:
                 args += ['--wait', '--timeout', seconds]
-            value = self._cli(args, remaining,
-                              self._directory(request) / ('observe-' + digest(handle.encode()) + '.json'))
+            try:
+                value = self._cli(args, remaining,
+                                  self._directory(request) / ('observe-' + digest(handle.encode()) + '.json'))
+            finally:
+                self._phase(observe, 'command', request, handle=handle)
             if self._handle(value, handle.split(':')[2]) != handle:
                 raise WorkflowError('CPL observation changed handle')
             if value.get('state') in ('completed', 'failed', 'cancelled'):
@@ -265,10 +285,68 @@ class CplExecutor:
         invocation = [self.config.remote_python, remote + '/runner.py']
         if limit is not None:
             invocation.append(str(limit))
-        script.write_text('#!/bin/bash\nset -eu\n' +
+        script.write_text('#!/bin/bash\nset -eu\nSECONDS=0\n' +
                           f'mkdir -- {shlex.quote(remote)}\n' +
                           f'tar -xf {shlex.quote(remote + ".tar")} -C {shlex.quote(remote)}\n' +
-                          shlex.join(invocation) + '\n')
+                          shlex.join(invocation) + (' \"$SECONDS\"' if limit is not None else '') + '\n')
+        return self._supervise(request, directory, state, script, observe, remaining)
+
+    def _supervise(self, request, directory, state, script, observe, remaining):
+        # Supervise controller elapsed allocation through submission, queueing and
+        # producer setup. Producer durations never settle the controller ledger.
+        self._limit(remaining)
+        finished, expired = threading.Event(), threading.Event()
+        def cancel_at_expiry():
+            # remaining() is the authoritative controller allocation: transfer
+            # exclusions can extend the wall envelope, stop closes it immediately.
+            while not finished.wait(0.02):
+                allowance = remaining()
+                if allowance is not None and allowance <= 0:
+                    break
+            else:
+                return
+            expired.set()
+            receipt = directory / 'submission.json'
+            # The installed CLI writes this before waiting. No receipt is unknown,
+            # never permission to repeat submission or invent a cancellation ID.
+            if not receipt.exists():
+                return
+            cleanup_end = time.monotonic() + 15
+            cleanup = lambda: max(0, cleanup_end - time.monotonic())
+            try:
+                handle = self._handle(json.loads(receipt.read_text()))
+                atomic_json(directory / 'deadline-intent.json',
+                            dict(handle=handle, cleanup_only=True, status='cancellation-pending'))
+                self._cli(['cancel', handle], cleanup, directory / 'deadline-cancel.json')
+            except Exception as exc:
+                atomic_json(directory / 'deadline-unknown.json', dict(error=type(exc).__name__))
+        watcher = threading.Thread(target=cancel_at_expiry, daemon=True)
+        watcher.start()
+        try:
+            return self._submit(request, directory, state, script, observe, remaining)
+        finally:
+            allowance = remaining()
+            if allowance is not None and allowance <= 0:
+                expired.set()
+            finished.set()
+            watcher.join(timeout=16)
+            if expired.is_set() and (directory / 'submission.json').exists():
+                cleanup_end = time.monotonic() + 15
+                cleanup = lambda: max(0, cleanup_end - time.monotonic())
+                handle = self._handle(json.loads((directory / 'submission.json').read_text()))
+                state.update(handle=handle, status='deadline-observation-pending',
+                             cleanup_only=True, lease_retained=True)
+                atomic_json(directory / 'transport.json', state)
+                if not (directory / 'deadline-cancel.json').exists():
+                    self._cli(['cancel', handle], cleanup, directory / 'deadline-cancel.json')
+                self._phase(observe, 'command', request, handle=handle, deadline_expired=True)
+                terminal = self._wait(handle, request, observe, cleanup)
+                state.update(handle=handle, terminal=terminal, status='deadline-terminal',
+                             deadline_clock='controller_elapsed_remaining', cleanup_only=True,
+                             lease_retained=False)
+                atomic_json(directory / 'transport.json', state)
+
+    def _submit(self, request, directory, state, script, observe, remaining):
         state['status'] = 'dispatching'
         atomic_json(directory / 'transport.json', state)
         try:
@@ -336,7 +414,8 @@ class CplExecutor:
             self._phase(observe, 'transfer', request, handle=handle)
             try:
                 value = self._cli(['download', self.config.target,
-                                   self._transfer_path(state['remote'] + '/results.tar'), output],
+                                   self._transfer_path(state['remote'] + '/results.tar'), output,
+                                   '--timeout', self._observation_seconds(remaining)],
                                   remaining, transfer_path)
                 if value.get('handle'):
                     atomic_json(transfer_path, value)
