@@ -180,3 +180,50 @@ def test_historical_envelope_is_archival_but_actual_failure_proofs_are_retained(
     assert proof in set(_references(failure))
     assert envelope not in set(_references(failure))
     assert store.read_json(result.receipt_ref)['status'] == 'accepted'
+
+
+def test_rank_fixed_shape_catalog_uses_generic_array_parameters(fixture):
+    _, parent, _, _, _, _, _, _ = fixture
+    template = dict(template_id='triton.shape-reduction.case-0', parent_project_id=parent.project_id,
+        parameters={'shape': dict(type='array', items={'type': 'integer', 'enum': [1, 2, 4, 8]},
+                                 minItems=2, maxItems=2, uniqueItems=False)})
+    proposal = DiagnosticProposal('tiny', 'Investigate a tiny shape', 'Same independent oracle',
+                                 template['template_id'], {'shape': [1, 1]})
+    Researcher._validate_template(proposal, parent.project_id, [template])
+    with pytest.raises(ValueError):
+        Researcher._validate_template(replace(proposal, parameters={'shape': [1]}), parent.project_id, [template])
+
+
+def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(fixture):
+    pytest.importorskip('nooa')
+    from test_rsi_roles import make_roles
+    from benchmarks.a5kernels.phase1_provider import DirectCompletion
+    _, parent, context, _, queried, _, clock, store = fixture
+    roles, _, events, _ = make_roles([], clock=clock)
+    def transport(**kwargs):
+        clock.now += 1
+        started = next(payload for event, payload in reversed(events) if event == 'role_started')
+        evidence = started['evidence']
+        ids = [row['evidence_id'] for row in evidence]
+        if started['role'] == 'research_queries':
+            value = dict(rationale='Read retained documentation', evidence_ids=ids,
+                queries=[dict(query='reduction constraints', purpose='Investigate the numeric failure')])
+        else:
+            retrieved = [r for r in evidence if 'negative_records' in r['data']]
+            assert retrieved and retrieved[0]['data']['results'][0]['facts']['path'] == 'reference-skills/guide.md'
+            value = dict(rationale='Isolate a documented case', evidence_ids=ids,
+                proposal=dict(name='small', goal='Investigate one case', acceptance='Existing independent oracle',
+                    template_id='cpu.case-subset', parameters={'case_indices': [0]}),
+                negative_decisions=[dict(query_ref=r['evidence_id'], index=n['index'], action='rejected',
+                    reason='The retained failure must not be repeated')
+                    for r in retrieved for n in r['data']['negative_records']])
+        return DirectCompletion(json.dumps(value), 20)
+    roles.provider.transport = transport
+    def query(payload, *, deadline):
+        queried.append(payload)
+        clock.now += 3
+        return dict(results=[dict(path='reference-skills/guide.md', text='Retained documentation')],
+                    negative_records=[dict(reason='Numeric mismatch')], provenance={'backend': 'TEST'})
+    result = Researcher(roles, query, store, clock=clock).research(parent, {}, context)
+    assert result.actor_seconds == 5 and len(queried) == 1
+    assert [p['role'] for e, p in events if e == 'role_finished'] == ['research_queries', 'diagnostic']
