@@ -183,7 +183,9 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
             category in ('profile', 'profiling', 'timing', 'benchmark') or
             bool(getattr(request, 'profile_path', None)))
         result['measurements'] = assess(raw['probe'], physical_device=device, configuration=policy)
-        result.update(admitted=True, observation='Fresh bounded device measurements admitted')
+        result.update(admitted=True, degraded=result['measurements']['degraded'],
+            observation=('Explicitly authorized Alarm device admitted for ordinary work (degraded)'
+                         if result['measurements']['degraded'] else 'Fresh bounded device measurements admitted'))
     except AdmissionFailure as exc:
         result.update(failure=dict(type=exc.kind, detail=str(exc)), observation=str(exc))
     except (KeyError, TypeError, ValueError, OSError, WorkflowError, subprocess.SubprocessError) as exc:

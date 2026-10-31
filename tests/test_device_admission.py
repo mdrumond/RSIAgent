@@ -243,3 +243,25 @@ def test_standalone_probe_preserves_unavailable_output(monkeypatch):
     assert result['failure']['type'] == 'query_timeout'
     item = result['raw_measurements']['queries']['board']
     assert item['stdout'] == 'partial measurement' and item['stderr'] == 'busy driver'
+
+
+def test_explicit_alarm_authority_is_ordinary_only_and_retains_faults(setup):
+    run, config, metadata, state = setup
+    config.update(product='a5', chip=None)
+    state['probe'] = probe('a5', health='Alarm', error='80F78009')
+    state['probe']['queries']['current-fault-event']['stdout'] = 'Fault Event Count : 1\nFault Event Information : event id=0x80F78009\n'
+    assert run()['failure']['type'] == 'unhealthy'
+    config['allow_alarm'] = True
+    admitted = run()
+    assert admitted['admitted'] and admitted['degraded']
+    assert admitted['measurements']['health'] == 'Alarm'
+    assert admitted['measurements']['hardware_error_code'] == '80F78009'
+    assert admitted['measurements']['fault_event_count'] == 1
+    assert admitted['raw_measurements']['probe'] == state['probe']
+    request = SimpleNamespace(operation_id='alarm-timing', category='timing', profile_path=None)
+    timing = guard(request, phase='command', metadata=metadata, configuration=config, remaining=lambda: 60)
+    assert timing['failure']['type'] == 'unhealthy'
+    state['probe'] = probe('a5', health='Alarm', error='80F78009', busy=True)
+    assert run()['failure']['type'] == 'device_busy'
+    state['probe'] = probe('a5', health='Failed', error='80F78009')
+    assert run()['failure']['type'] == 'unhealthy'
