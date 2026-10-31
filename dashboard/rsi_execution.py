@@ -12,7 +12,8 @@ from .control import ControlError
 from .rsi_ledger import inspection as _inspection
 
 
-CAPABILITIES = {'manual_tuning': False, 'skill_content_editing': False}
+CAPABILITIES = {'manual_tuning': False, 'skill_content_editing': False,
+                'project_waves': False, 'wave_reconciliation': False, 'harness_recovery': False}
 UNAVAILABLE = 'This instance interface has no registered CLI command for that capability.'
 
 
@@ -38,7 +39,8 @@ def _public_job(row):
     service_status = result.get('status', result.get('state'))
     if not isinstance(service_status, str) or service_status not in {'complete', 'completed', 'wave_limit', 'suspended', 'stopped',
                               'tuned', 'adopted', 'awaiting_tuning', 'blocked', 'budget_exhausted',
-                              'failed', 'running', 'launching'}:
+                              'failed', 'running', 'launching', 'draining', 'observation_required',
+                              'reconciled', 'recovery_authorized'}:
         service_status = None
     return {**{key: row.get(key) for key in ('job_id', 'state')},
             'mode': request_data.get('mode'), 'cycle_id': request_data.get('cycle_id'),
@@ -80,8 +82,17 @@ def register_rsi_execution(app, controls, csrf_token, cli):
         if action == 'phase':
             if payload.get('mode') not in ('phase1', 'phase2', 'inference'):
                 raise ControlError('Unknown phase.')
-            if payload.get('operation') not in ('start', 'stop', 'resume', 'revisit', 'adopt'):
+            if payload.get('operation') not in ('start', 'stop', 'resume', 'revisit', 'adopt', 'reconcile', 'recover'):
                 raise ControlError('Unknown phase operation.')
+            if payload['operation'] in ('reconcile', 'recover'):
+                capability = 'harness_recovery' if payload['operation'] == 'recover' else 'wave_reconciliation'
+                if not capabilities()[capability]:
+                    raise ControlError(UNAVAILABLE)
+                _text(payload, 'operation_id', required=payload['operation'] == 'recover')
+                if payload.get('observation') is not None and not isinstance(payload['observation'], dict):
+                    raise ControlError('Structured host observation required.')
+                if payload['operation'] == 'recover' and not payload.get('observation'):
+                    raise ControlError('Harness recovery requires retained host closure evidence.')
             if payload['operation'] != 'start':
                 _text(payload, 'job_id')
             if payload['operation'] == 'revisit':
@@ -150,6 +161,15 @@ def register_rsi_execution(app, controls, csrf_token, cli):
                     args += ['--inheritance', payload['inheritance']]
                 for value in dict.fromkeys(payload.get('input_overrides', [])):
                     args += ['--input-override', value]
+            if operation in ('reconcile', 'recover'):
+                if payload.get('operation_id'):
+                    args += ['--operation', payload['operation_id']]
+                with tempfile.TemporaryDirectory(prefix='rsi-wave-observation-') as directory:
+                    if payload.get('observation') is not None:
+                        path = Path(directory) / 'observation.json'
+                        path.write_text(json.dumps(payload['observation'], allow_nan=False))
+                        args += ['--observation', str(path)]
+                    return _public_job(cli(*args))
             if payload['mode'] == 'inference' and operation == 'start':
                 with tempfile.TemporaryDirectory(prefix='rsi-inference-') as directory:
                     project = Path(directory) / 'project.json'

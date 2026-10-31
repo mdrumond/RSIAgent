@@ -215,9 +215,13 @@ class CycleScheduler:
         elapsed = self.clock() - self.state['created']
         if not math.isfinite(elapsed) or elapsed < 0:
             raise WorkflowError('invalid elapsed clock')
+        wave = self.state.get('active_wave') or {}
+        retained = sum(seconds for operation, seconds in wave.get('retained_actor_seconds', {}).items()
+                       if operation not in self.state['completed_operations'])
+        recovering = any(op['kind'] == 'recovery' for op in wave.get('operations', []))
         return {name: None if self.config[name] is None else max(0, self.config[name] - spent)
-                for name, spent in [('actor_seconds', self.state['spent']),
-                                    ('recovery_seconds', self.state['recovery_spent']),
+                for name, spent in [('actor_seconds', self.state['spent'] + retained),
+                                    ('recovery_seconds', self.state['recovery_spent'] + (retained if recovering else 0)),
                                     ('wall_seconds', elapsed)]}
 
     def _context(self, operation):
@@ -297,6 +301,55 @@ class CycleScheduler:
         else:
             self.state['phase'] = 'original'
 
+    def reserve_original_wave(self, maximum):
+        """Reserve authored siblings under the existing first original admission."""
+        s = self.state
+        if s.get('active_wave'):
+            return copy.deepcopy(s['active_wave'])
+        first = s['pending']
+        if not first or first['kind'] not in ('original', 'recovery'):
+            raise WorkflowError('wave requires the first canonical original admission')
+        recovery = first['kind'] == 'recovery'
+        size = self.config['wave_size']
+        count = min(maximum, len(self.spec.projects) - s['cursor'])
+        if recovery:
+            count = 1
+        elif size:
+            count = min(count, size - len(s['wave_results']))
+        remaining = self.remaining()
+        if remaining['actor_seconds'] is not None:
+            count = min(count, int(remaining['actor_seconds'] // 7200))
+        if recovery and remaining['recovery_seconds'] is not None:
+            count = min(count, int(remaining['recovery_seconds'] // 7200))
+        if count < 1 or remaining['wall_seconds'] is not None and remaining['wall_seconds'] <= 0:
+            raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
+        operations = []
+        for offset in range(count):
+            spec = ProjectSpec.from_dict(first['spec']) if recovery else self.spec.projects[s['cursor'] + offset]
+            limits = replace(spec.budgets, actor_seconds=7200., design_iterations=None,
+                             implementation_iterations=None, execution_tries=None)
+            spec = replace(spec, budgets=limits)
+            operations.append(dict(id=first['id'] if not offset else uuid.uuid4().hex,
+                kind=first['kind'], recovery=recovery,
+                original_id=first['original_id'] if recovery else spec.project_id, spec=spec.to_dict()))
+        wave = dict(id=uuid.uuid4().hex, operations=operations, memory=s['memory'], skills=s['skills'],
+                    phase='executing', wall_deadline=(s['created'] + self.config['wall_seconds']
+                    if self.config['wall_seconds'] is not None else None))
+        s['pending'] = operations[0]
+        s['active_wave'] = wave
+        self._save()
+        return copy.deepcopy(wave)
+
+    def close_original_wave(self):
+        wave = self.state.get('active_wave')
+        if (not wave or self.state['pending'] or self.state['phase'] in ('memory', 'skill')
+                or any(op['id'] not in self.state['completed_operations'] for op in wave['operations'])):
+            return False
+        self.state.setdefault('wave_history', []).append(wave)
+        self.state['active_wave'] = None
+        self._save()
+        return True
+
     def step(self):
         """Dispatch once; pending failures must be reconciled, never replayed."""
         s = self.state
@@ -305,8 +358,10 @@ class CycleScheduler:
         if s['stopped'] or s['phase'] in ('complete', 'wave_limit'):
             return None
         remaining = self.remaining()
-        if any(remaining[k] is not None and remaining[k] <= 0
-               for k in ('actor_seconds', 'wall_seconds')):
+        retained_original = (s['phase'] == 'original' and s.get('active_wave', {})
+                             and s['active_wave']['phase'] == 'settled')
+        if not retained_original and any(remaining[k] is not None and remaining[k] <= 0
+                                        for k in ('actor_seconds', 'wall_seconds')):
             raise WorkflowError('parent elapsed allocation exhausted')
         phase = s['phase']
         if phase == 'recovery' and not s['recovery_queue']:
@@ -315,8 +370,14 @@ class CycleScheduler:
             return None
         operation = dict(id=uuid.uuid4().hex, kind=phase, recovery=phase in ('recovery', 'simplify'))
         if phase == 'original':
-            operation['spec'] = self.spec.projects[s['cursor']].to_dict()
-            operation['original_id'] = operation['spec']['project_id']
+            wave = s.get('active_wave')
+            retained = next((op for op in wave['operations']
+                if op['id'] not in s['completed_operations']), None) if wave else None
+            if retained:
+                operation = copy.deepcopy(retained)
+            else:
+                operation['spec'] = self.spec.projects[s['cursor']].to_dict()
+                operation['original_id'] = operation['spec']['project_id']
         elif phase in ('recovery', 'simplify'):
             item = s['recovery_queue'][0]
             if ((self.config['recovery_limit'] is not None and item['attempts'] >= self.config['recovery_limit'])
@@ -332,6 +393,7 @@ class CycleScheduler:
         ctx = self._context(operation)
         if phase in ('original', 'recovery', 'simplify'):
             spec = ProjectSpec.from_dict(operation['spec'])
+        if phase in ('original', 'recovery', 'simplify') and not retained_original:
             caps = [v for v in (spec.budgets.actor_seconds, remaining['actor_seconds'],
                                 remaining['recovery_seconds'] if operation['recovery'] else None) if v is not None]
             wall = [v for v in (spec.budgets.wall_seconds, remaining['wall_seconds']) if v is not None]

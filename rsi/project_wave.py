@@ -39,8 +39,12 @@ def _read(path):
 
 def _worker(factory, request):
     # Only the canonical runner owns stage progression and elapsed accounting.
+    from rsi.jobs import _identity
     atomic_json(request.root.parent / 'worker.json', dict(
-        dispatch_id=request.dispatch_id, pid=os.getpid()))
+        dispatch_id=request.dispatch_id, pid=os.getpid(), process=_identity(os.getpid())))
+    prepare = getattr(factory, 'prepare_worker', None)
+    if prepare is not None:
+        prepare(request)
     from rsi.project_runner import ProjectRunner
     runner = factory(request)
     if not isinstance(runner, ProjectRunner) or runner.root.resolve() != request.root.resolve():
@@ -157,7 +161,7 @@ class ProjectWave:
             self._save(state)
         return True
 
-    def run(self, runner_factory):
+    def run(self, runner_factory, *, should_stop=None, progress=None):
         """Drain admitted workers; a stop request prevents further admission.
 
         Abrupt parent loss leaves pending reservations intact. Children retain
@@ -172,11 +176,15 @@ class ProjectWave:
             active = {}
             try:
                 while True:
+                    if should_stop is not None and should_stop():
+                        self.stop()
                     if (self.root / 'stop.json').exists():
                         state['stopped'] = True
                         self._save(state)
                     used = {r['device'] for r in state['projects'].values() if r['device'] is not None}
                     for project, row in state['projects'].items():
+                        if should_stop is not None and should_stop():
+                            self.stop()
                         if (self.root / 'stop.json').exists():
                             state['stopped'] = True
                             self._save(state)
@@ -204,6 +212,8 @@ class ProjectWave:
                         process.join()
                         del active[project]
                         self._retain(state, project)
+                    if progress is not None:
+                        progress(self._status(state))
                     if not active:
                         used = {r["device"] for r in state["projects"].values() if r["device"] is not None}
                         if (not state["stopped"] and len(used) < self.plan["max_parallel"]
@@ -256,9 +266,20 @@ class ProjectWave:
             row.update(actor_seconds=elapsed, closure=proof)
             if (row['status'] != 'completed' and proof.get('resume_ready') is True
                     and elapsed < row['allowance']):
-                row.update(status='ready', device=None, reopen=True)
+                row.update(status='ready', device=None, reopen=proof.get('runner_exists', True))
             self._save(state)
             return self._status(state)
+
+    def retain_admission_elapsed(self, project, dispatch_id, elapsed, reference):
+        """Charge observed pre-runner probing without releasing an unknown lease."""
+        with self._lock():
+            state = self._load()
+            row = state['projects'][project]
+            if (row['status'] != 'pending' or row['dispatch_id'] != dispatch_id
+                    or not math.isfinite(elapsed) or elapsed < row['actor_seconds']):
+                raise ValueError('matching pending admission and monotonic elapsed required')
+            row.update(actor_seconds=elapsed, admission_ref=reference)
+            self._save(state)
 
     def settle_exhausted(self, project, runner):
         """Retain a canonical exhausted outcome after authoritative closure.
@@ -267,6 +288,13 @@ class ProjectWave:
         must verify its retained run/closure/source/accounting failure proof.
         No actor is dispatched and no additional allocation is granted.
         """
+        return self._settle_failure(project, runner, exhausted=True)
+
+    def settle_failure(self, project, runner):
+        """Settle a host-proven failed attempt without claiming stage acceptance."""
+        return self._settle_failure(project, runner, exhausted=False)
+
+    def _settle_failure(self, project, runner, *, exhausted):
         from rsi.project_runner import ProjectRunner
         with self._lock():
             state = self._load()
@@ -280,12 +308,12 @@ class ProjectWave:
                 raise ValueError('retained canonical outcome required')
             outcome = runner.store.read_json(event['reference'])
             result = outcome['result']
-            if result['status'] != 'budget_exhausted':
+            if exhausted and result['status'] != 'budget_exhausted':
                 raise ValueError('only an observed exhausted outcome can settle exhaustion')
             failure = runner.terminal_failure_proof(closure_ref=outcome['closure_ref'])
             elapsed = runner.workflow.accounting.seconds()
-            if (elapsed < row['actor_seconds'] or elapsed < row['allowance']
-                    or runner.workflow.remaining()['actor_seconds'] != 0):
+            if (elapsed < row['actor_seconds'] or exhausted and (
+                    elapsed < row['allowance'] or runner.workflow.remaining()['actor_seconds'] != 0)):
                 raise ValueError('authoritative exhausted elapsed accounting required')
             proof_ref = runner.store.put_json(failure)
             row.update(status='completed', device=None, actor_seconds=elapsed,
@@ -304,11 +332,13 @@ class ProjectWave:
         with self._lock():
             state = self._load()
             row = state['projects'][project]
-            if (row['status'] != 'ready' or not row.get('closure')
+            if (row['status'] not in ('ready', 'pending') or not row.get('closure')
                     or row['closure'].get('harness_failure') is not True
+                    or row['closure'].get('resume_ready') is not True
                     or row['recovery'] is not None or not observation.strip()):
                 raise ValueError('one observed harness recovery on a closed unfinished project required')
-            row.update(allowance=14400.0, recovery=dict(observation=observation,
+            row.update(status='ready', device=None, reopen=True, allowance=14400.0,
+                recovery=dict(observation=observation,
                 closure=row['closure'], dispatch_id=row['dispatch_id']))
             self._save(state)
 

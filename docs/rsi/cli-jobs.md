@@ -96,3 +96,115 @@ and export.json inventory/provenance/CAS reference/SkillBundle hash. Pending or
 quarantined candidates are not selected. Atomic publication cannot replace an
 existing destination. Use the folder as --baseline-skills and its map.json as
 --skill-map in fresh instance creation, without opaque-CAS manual reconstruction.
+
+## Opt-in project waves
+
+An optional saved configuration selects admitted physical-device/executor identities:
+
+```json
+{
+  "project_wave": {
+    "max_parallel": 2,
+    "devices": [
+      {"device": "0", "executor_identity": "admitted-device-0"},
+      {"device": "1", "executor_identity": "admitted-device-1"}
+    ]
+  }
+}
+```
+
+Use the normal phase start/stop/resume commands and dashboard. Each child runs the
+canonical `ProjectRunner` with the wave's frozen memory, skills, configuration and
+read-only KDB. Source snapshots retain the complete configured resource tree;
+`editable_files` still limits candidate edits. The parent admits memory only after
+all siblings settle and host validation verifies their retained outcomes. Rejected,
+exhausted and failed attempts remain distinct from accepted artifacts.
+
+Wave projects have a 7200-second actor allocation with iteration/attempt stopping
+limits disabled. Parent actor and absolute wall allocations still constrain wave
+admission and nested work. Explicit harness recovery can add 7200 seconds once,
+retaining elapsed accounting. Configured semantic recovery and skill-validation
+policies continue through the existing controllers with linked operation histories.
+
+`RSI_EXECUTOR_PROFILES` names an ignored host JSON file with a `profiles` object.
+A profile may contain the concrete `CplConfig` constructor settings, or a trusted
+`factory: "module:callable"` plus `configuration` object. That callable receives
+`(identity, configuration)` and returns a typed executor; this supports both a local
+controller with CPL target commands and an externally admitted device controller
+with local target commands. Credentials, machine routes, runtime directories and
+outer admission settings stay in host configuration. Only the executor's public
+identity/provenance is frozen in project receipts.
+
+Stop prevents new admissions and drains owned workers. Inspection shows draining,
+observation-required handles, unstarted siblings, true project outcomes, leases and
+remaining actor allocations. Resume reuses accepted results and may admit ready
+siblings; it never replays an unknown dispatch. Reconcile/recovery controls require
+the corresponding pinned CLI capability:
+
+```console
+rsi --instance PATH phase1 reconcile --job JOB_ID
+rsi --instance PATH phase1 reconcile --job JOB_ID --operation OPERATION --observation observed.json
+rsi --instance PATH phase1 recover --job JOB_ID --operation OPERATION --observation observed.json
+```
+
+The optional host observation contains `controller_proof`, explicit closed actor
+intervals when needed, and per-command `timing` receipts for target reconciliation.
+Timing binds the original operation/source and authoritative controller-domain
+execution bounds; remote epoch subtraction is insufficient. Target reconciliation
+observes the original handle and finalizes its existing receipt. Missing closure,
+source, or timing evidence keeps work pending. A harness continuation must close
+its canonical pending admission before a new actor step; otherwise use the
+configured, evidence-linked recovery workflow. Adoption and accepted-parent
+inheritance wait for the wave's parent publication boundary.
+
+For an outer-admitted A5 controller using default local target execution, select
+`worker_profile` on each device and keep `executor_identity` absent or null. Its
+ignored profile supplies public `metadata` with `controller_placement: "local"`,
+`executor_identity: null`, physical device, runtime and actual `outer_handle`;
+`worker_environment` names an optional shipped target callback, and
+`worker_configuration` supplies that outer handle and physical device. Target
+callback modules are delivered and validated by their target-specific PRs; the
+generic integration neither imports nor ships a Catlass compiler/verifier. The child
+supplies its own cache path, applies the returned environment before runner/target
+imports, and never mutates the parent's environment. It preserves the helper's
+source-hash behavior: stale `RSI_EXPECTED_SOURCE_HASH` is removed and the local
+trusted verifier checks its own current project hash before/after command work.
+
+Every NPU profile selects a shipped, host-trusted target guard using
+`guard: "module:callable"` and optional `guard_configuration`. Profiles configure
+the supplied implementation; users do not implement device-health callbacks. The callback accepts `(request, *, phase,
+metadata, configuration, remaining)` for `admission` and each `command`. It must
+perform fresh bounded per-device health and policy checks and return a public
+receipt containing `admitted: true`, nonempty `observation` and the matching
+`physical_device`. Missing guards or denied health leave work undispatched.
+Concrete target guard/verifier implementations own actual bounded local or
+registered-target probes and idle/memory/isolation policy. Frozen target verifier
+gates run before Torch/NPU work under the admitted CPL route. The profile callback
+must align with those same gates; metadata alone is never health evidence. Guard time is actor-billable.
+
+The shipped guard is `rsi.device_admission:guard`, backed by the same stdlib-only
+probe that target builders embed in frozen verifiers. `allow_alarm: true` permits
+only explicitly authorized ordinary functional work on measured Alarm devices;
+the receipt remains degraded and retains actual faults. It neither permits busy
+devices nor relaxes healthy-idle requirements for timing/profiling. Defaults deny
+Alarm, and terminal, unavailable or unknown devices remain excluded.
+
+NPU profiles also select a shipped `project_binder: "module:bind_project"` with
+`project_configuration` containing its ignored host builder inputs. After a
+physical lease is selected, the child calls
+`bind_project(request, logical_admission, *, metadata, configuration, remaining)`
+before creating the runner. The binder creates/selects source/runtime inputs and
+an independent verifier for that actual device; it never rewrites the baseline
+or precreates the runner root. Its resolved spec/config and logical case/source
+proof are sealed in CAS and linked to the runner's frozen backend identity.
+Resume reuses the exact saved binding without running the binder again.
+
+Logical case/oracle identity excludes physical argv and filesystem locations;
+physical binding changes do not invent a different task. Parent validation checks
+that proof and `commands.test == ProjectSpec.command`, preserving the original
+logical goal, cases, budgets and edit/retention policies. The canonical actor task
+context includes a whitelisted `execution_context` with actual target/runtime,
+SoC/device, revisions and public admission facts. Private profiles, credentials
+and target package paths are not copied into that context. Controllers do not
+restore target Python paths globally; any registry-derived pre-import paths belong
+to the target-only frozen verifier builder and need applicable runtime evidence.
