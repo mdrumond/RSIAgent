@@ -139,7 +139,7 @@ class ControllerSession(PiCodingSession):
         def task_identity(task):
             if not isinstance(task, dict):
                 return {}
-            pinned = {key: task[key] for key in ('user_guidance', 'execution_context', 'configuration_ref')
+            pinned = {key: task[key] for key in ('user_guidance', 'execution_context', 'configuration_ref', 'curriculum_context')
                       if key in task}
             project = task.get('project')
             if isinstance(project, dict):

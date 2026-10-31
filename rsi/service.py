@@ -31,7 +31,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         cycle = services.create_cycle(cycle_id, request['mode'],
             projects=request.get('projects'), configuration=snapshot, recover=request.get('recover'),
             from_cycle=request.get('from_cycle'), inheritance=request.get('inheritance', 'auto'),
-            input_overrides=request.get('input_overrides', ()))
+            input_overrides=request.get('input_overrides', ()), failed_parent_refs=request.get('failed_parent_refs', ()),
+            curriculum_only=request.get('curriculum_only', False))
     else:
         cycle = services.open_cycle(cycle_id)
     done = threading.Event()
@@ -144,6 +145,9 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             if state['pending'] or cycle.controller.state['pending']:
                 return dict(status='observation_required' if cycle.waves else 'suspended',
                             cycle_id=cycle_id, pending=state['pending'])
+            if state['stopped']:
+                return dict(status='stopped', cycle_id=cycle_id, remaining=cycle.scheduler.remaining(),
+                            queued_failed_parents=len(state['recovery_queue']))
             if state['phase'] in ('complete', 'wave_limit'):
                 extensions = cycle.scheduler.extension_events()
                 actionable = [e for e in extensions if e['kind'] in (

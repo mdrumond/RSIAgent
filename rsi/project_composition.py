@@ -109,7 +109,8 @@ class ProjectComposition:
         return query
 
     def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
-               backend_identity, reopen=False, configuration_ref=None, command_guard=None):
+               backend_identity, reopen=False, configuration_ref=None, command_guard=None,
+               executor_factory=None):
         from rsi.actor import PiSessionAdapter
         from rsi.project_runner import ProjectRunner
         runner_class = getattr(self, 'runner_class', ProjectRunner)
@@ -135,7 +136,7 @@ class ProjectComposition:
             return adapter
         injections = dict(query=self.query(memory_ref), backend_identity=backend_identity,
                           session_factory=session, test_backend=self.services.test is not None,
-                          executor_factory=self.services.executor_factory)
+                          executor_factory=executor_factory or self.services.executor_factory)
         if command_guard is not None:
             injections['command_guard'] = command_guard
         if not reopen:
@@ -176,5 +177,7 @@ class ProjectComposition:
                 pending.extend(_references(value))
         context = runner.context
         runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
-                                      configuration_ref=configuration_ref)
+                                      configuration_ref=configuration_ref,
+                                      **({'curriculum_context': frozen_config['curriculum_context']}
+                                         if frozen_config.get('curriculum_context') else {}))
         return runner
