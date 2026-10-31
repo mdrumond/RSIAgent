@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sys
 
+import pytest
 
 from rsi.configuration import set_configuration, show_configuration
 from rsi.project_binding import admission_hash, source_identity
@@ -113,3 +114,81 @@ def test_three_projects_bind_actual_non_modulo_lease_and_reopen_exact_binding(wa
                    for p in ('answer', 'other', 'third'))
     finally:
         reopened.close()
+
+
+def test_unfinished_resume_uses_saved_binding_without_baseline_or_builder(wave_instance, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from test_rsi_service_wave import Decisions, FailedDecisions
+    path = tmp_path / 'resume-profiles.json'
+    resolver = profiles(path)
+    values = json.loads(path.read_text())
+    coordination = tmp_path / 'resume-order'
+    for profile in values['profiles'].values():
+        profile['project_binder'] = 'test_rsi_lease_binding:cpu_bind_project'
+        profile['project_configuration'] = {'coordination': str(coordination)}
+    path.write_text(json.dumps(values))
+    settings = show_configuration(wave_instance.root)['payload']
+    settings['phase1_projects'] = [settings['phase1_projects'][1]]  # No first-project rendezvous.
+    settings['project_wave'].update(max_parallel=1, wave_size=1, devices=[
+        dict(device='0', worker_profile='worker-0')])
+    set_configuration(wave_instance.root, settings)
+    wave_instance.executor_factory = resolver
+    wave_instance.test = replace(wave_instance.test, session_factory=FailedDecisions)
+    cycle = wave_instance.create_cycle('resume-binding', 'phase1')
+    try:
+        observe = cycle.waves.observe
+        monkeypatch.setattr(cycle.waves, 'observe', lambda: None)  # Retain the closed unfinished attempt.
+        with pytest.raises(RuntimeError):
+            cycle.step()
+        wave = cycle.scheduler.state['active_wave']
+        operation = wave['operations'][0]['id']
+        pool = cycle.waves._pool(wave)
+        runner = cycle.open_project(operation)
+        binding = json.loads((runner.root / 'service-binding.json').read_text())
+        original = binding['resolved_binding_ref']
+        pending = runner.workflow.pending
+        closure = runner.store.read_json(runner.latest('actor-closure')['reference'])['observation']
+        proof = dict(closure, handle=pending['handle'], actor_closed=True,
+                     no_host_effects=True, observation='actual closed test session before host work')
+        reference = runner.record_admission_failure(pending['id'], controller_proof=proof,
+                                                    observed_source_hash=runner.backend.project_hash())
+        runner.workflow.reject_operation(pending['id'], reference, runner.backend.project_hash())
+        pool.reconcile(operation, lambda request, retained: dict(closed=True, resume_ready=True,
+            observation='original worker reaped and actual no-effects closure retained',
+            actor_seconds=runner.workflow.accounting.seconds()))
+        shutil.rmtree(wave_instance.root / 'source')
+        (wave_instance.root / 'verify.py').unlink()
+        # Even a changed builder configuration must not be used to reopen an
+        # already frozen runner; its actual lease/runtime metadata is unchanged.
+        values['profiles']['worker-0']['project_configuration'] = {'must_not_run': True}
+        path.write_text(json.dumps(values))
+        wave_instance.test = replace(wave_instance.test, session_factory=Decisions)
+        state = pool.run(cycle.waves._factory(wave))
+        assert state['projects'][operation]['receipt']['result']['status'] == 'accepted'
+        assert json.loads((runner.root / 'service-binding.json').read_text())['resolved_binding_ref'] == original
+        assert (coordination / 'other.bindings').read_text().splitlines() == ['0']
+        monkeypatch.setattr(cycle.waves, 'observe', observe)
+        cycle.reconcile()
+        assert cycle.scheduler.state['originals'][0]['outcome'] == 'accepted'
+    finally:
+        cycle.close()
+
+
+def test_parent_rejects_changed_logical_case_proof(wave_instance, tmp_path):
+    from rsi.project_binding import validate_resolution
+    logical = dict(operation_id='op', spec=show_configuration(wave_instance.root)['payload']['phase1_projects'][0],
+                   config={}, memory_ref='m', skills_ref='s', configuration_ref='c')
+    # Reuse ordinary configured input parsing; a valid trusted binder is exercised
+    # above, while this check verifies the admission boundary rejects changed cases.
+    from rsi.contracts import ProjectSpec
+    from dataclasses import asdict
+    logical['config'] = asdict(wave_instance.project_config(show_configuration(wave_instance.root)['payload'],
+                                                         ProjectSpec.from_dict(logical['spec'])))
+    config = dict(logical['config'])
+    digest = source_identity(config['source'], verifier=config['verifier'])
+    resolution = dict(spec=logical['spec'], config=config, evidence=dict(
+        logical_admission_hash=admission_hash(logical), logical_project_id=logical['spec']['project_id'],
+        physical_device='1', logical_case_identity='a' * 64, resolved_case_identity='b' * 64,
+        logical_source_identity=digest, resolved_source_identity=digest, public_runtime={}))
+    with pytest.raises(ValueError):
+        validate_resolution(logical, resolution, device='1', executor_identity=None)

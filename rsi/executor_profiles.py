@@ -50,7 +50,8 @@ class ExecutorProfiles:
             return _callable(value['factory'])(identity, value.get('configuration', {}))
         from rsi.cpl_execution import CplConfig, CplExecutor
         options = {k: v for k, v in value.items() if k not in {
-            'metadata', 'guard', 'guard_configuration', 'worker_environment', 'worker_configuration'}}
+            'metadata', 'guard', 'guard_configuration', 'worker_environment', 'worker_configuration',
+            'project_binder', 'project_configuration'}}
         options['installed_client'] = Path(options['installed_client']).expanduser()
         options['trusted_resources'] = tuple(Path(p).expanduser() for p in options.get('trusted_resources', ()))
         return CplExecutor(identity, CplConfig(**options))

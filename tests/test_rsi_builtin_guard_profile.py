@@ -53,3 +53,17 @@ def test_builtin_profile_passes_alarm_permission_and_keeps_timing_healthy_only(s
     with pytest.raises(GuardDenied) as denied:
         resolver.guard('frozen', request, phase='command', remaining=lambda: 60)
     assert denied.value.admission_receipt['failure']['type'] == 'unhealthy'
+
+
+def test_cpl_profile_constructs_without_importing_or_forwarding_lease_binder_settings(tmp_path):
+    path = tmp_path / 'binding-profile.json'
+    path.write_text(json.dumps({'profiles': {'frozen': dict(
+        target='test-target', runtime='test-runtime', workspace='/workspace', physical_device=2,
+        installed_client=str(tmp_path / 'skill/scripts/cpl-remote'), profile_identity='frozen',
+        command_cwd='/workspace/commands', guard='rsi.device_admission:guard',
+        project_binder='not_imported_before_lease:bind_project',
+        project_configuration={'private_host_builder_setting': 'configured'})}}))
+    resolver = ExecutorProfiles(str(path))
+    assert resolver.metadata('frozen')['physical_device'] == 2
+    assert resolver('frozen').metadata['runtime'] == 'test-runtime'
+    assert len(resolver.binding_contract('frozen')) == 64
