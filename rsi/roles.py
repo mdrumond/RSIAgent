@@ -36,6 +36,22 @@ def _wall_remaining(clock, deadline):
     return remaining
 
 
+class RoleFailure(RuntimeError):
+    """A known-finished role failed; its elapsed receipt has already been retained."""
+
+    def __init__(self, role, error_type, message):
+        self.role, self.error_type, self.message = role, error_type, message
+        super().__init__(f'{role} {error_type}: {message}')
+
+
+def _error_details(exc, secret=None):
+    message = str(exc)
+    if secret:
+        message = message.replace(secret, '[redacted]')
+    return dict(type=type(exc).__name__.encode()[:128].decode(errors='ignore'),
+                message=message.encode()[:2048].decode(errors='ignore'))
+
+
 @dataclass(frozen=True)
 class AdmittedEvidence:
     evidence_id: str
@@ -108,6 +124,31 @@ def _framework():
         goal: str = Field(min_length=1)
         acceptance: str = Field(min_length=1)
 
+    class ResearchQueryModel(BaseModel):
+        model_config = ConfigDict(extra='forbid', strict=True)
+        query: str = Field(min_length=1)
+        purpose: str = Field(min_length=1)
+
+    class ResearchQueries(Proposal):
+        queries: list[ResearchQueryModel] = Field(min_length=1)
+
+    class DiagnosticProject(Project):
+        template_id: str = Field(min_length=1)
+        parameters: dict[str, Any]
+        parent_project_id: str | None = None
+
+    class NegativeDecisionModel(BaseModel):
+        model_config = ConfigDict(extra='forbid', strict=True)
+        query_ref: str
+        index: int
+        action: Literal['used', 'rejected']
+        reason: str = Field(min_length=1)
+        redirection: str | None = None
+
+    class Diagnostic(Proposal):
+        proposal: DiagnosticProject
+        negative_decisions: list[NegativeDecisionModel]
+
     class Edit(BaseModel):
         model_config = ConfigDict(extra='forbid', strict=True)
         skill: str = Field(min_length=1)
@@ -133,6 +174,16 @@ def _framework():
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
         async def curriculum(self, role_prompt: str, admitted_evidence: str) -> Curriculum:
             """Propose a curriculum from the role prompt and admitted evidence. Cite evidence IDs."""
+            ...
+
+        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
+        async def research_queries(self, role_prompt: str, admitted_evidence: str) -> ResearchQueries:
+            """Choose documentation/KDB queries before proposing a diagnostic project."""
+            ...
+
+        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
+        async def diagnostic(self, role_prompt: str, admitted_evidence: str) -> Diagnostic:
+            """Use actual retrieved facts and address every negative before choosing a host template."""
             ...
 
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
@@ -212,6 +263,12 @@ class NoncodingRoles:
     def curriculum(self, role_prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('curriculum', role_prompt, evidence, deadline, wall_deadline)
 
+    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
+
     def skillwriter(self, role_prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('skillwriter', role_prompt, evidence, deadline, wall_deadline)
 
@@ -244,7 +301,7 @@ class NoncodingRoles:
         started = self.clock()
         _wall_remaining(self.clock, wall_deadline)
         deadline = client.deadline = min(started + allowance, wall_deadline) if wall_deadline is not None else started + allowance
-        success = False
+        success, error = False, None
         self.observer('role_started', {'role': role, 'provider_identity': self.profile.identity.as_dict(),
                                        'prompt': prompt, 'evidence': rows})
         try:
@@ -254,18 +311,32 @@ class NoncodingRoles:
             self.observer('role_proposal', {'role': role, 'proposal': result.model_dump(mode='json')})
             success = True
             return proposal
+        except Exception as exc:
+            secret = getattr(self.provider, '_credentials', {}).get(self.profile.identity.credential_env)
+            error = _error_details(exc, secret)
+            raise
         finally:
-            self.observer('role_finished', {'role': role, 'success': success,
-                                           'elapsed_seconds': self.clock() - started})
+            receipt = dict(role=role, success=success, elapsed_seconds=self.clock() - started)
+            if error is not None:
+                receipt['error'] = error
+            self.observer('role_finished', receipt)
 
 
-_PROPOSALS = {'curriculum': (CurriculumProposal, 'projects', ProjectIdea),
+from rsi.curriculum_research import DiagnosticDecision, DiagnosticProposal, QueryPlan, ResearchQuery
+
+
+_PROPOSALS = {'research_queries': (QueryPlan, 'queries', ResearchQuery),
+              'diagnostic': (DiagnosticDecision, 'proposal', DiagnosticProposal),
+              'curriculum': (CurriculumProposal, 'projects', ProjectIdea),
               'skillwriter': (SkillProposal, 'edits', SkillEdit),
               'review': (ReviewProposal, 'findings', ReviewFinding)}
 
 
 def _proposal(role, data, admitted):
     """Validate the same typed wire result without loading NOOA in the host."""
+    if role in ('research_queries', 'diagnostic'):
+        from rsi.curriculum_research import parse_proposal
+        return parse_proposal(role, data, admitted)
     outer, name, inner = _PROPOSALS[role]
     if type(data) is not dict or set(data) != {'rationale', 'evidence_ids', name}:
         raise ValueError('invalid proposal fields')
@@ -355,7 +426,7 @@ class IsolatedRoles:
     """
 
     def __init__(self, roles_python, profile, *, observer, environment,
-                 setup_seconds=60, clock=time.monotonic):
+                 setup_seconds=60, receipt_grace_seconds=2, clock=time.monotonic):
         from benchmarks.a5kernels.phase1_provider import direct_profile
         if profile != direct_profile(profile.identity):
             raise ValueError('unregistered role provider')
@@ -364,6 +435,10 @@ class IsolatedRoles:
             raise ValueError('roles_python must be an explicit existing absolute executable')
         if type(setup_seconds) not in (int, float) or not math.isfinite(setup_seconds) or setup_seconds <= 0:
             raise ValueError('setup_seconds must be positive finite seconds')
+        if (type(receipt_grace_seconds) not in (int, float) or not math.isfinite(receipt_grace_seconds)
+                or receipt_grace_seconds < 0):
+            raise ValueError('receipt_grace_seconds must be finite nonnegative seconds')
+        self.receipt_grace_seconds = receipt_grace_seconds
         key = profile.identity.credential_env
         secret = environment.get(key)
         if not isinstance(secret, str) or not secret.strip():
@@ -376,6 +451,12 @@ class IsolatedRoles:
 
     def curriculum(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('curriculum', prompt, evidence, deadline, wall_deadline)
+
+    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
 
     def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('skillwriter', prompt, evidence, deadline, wall_deadline)
@@ -412,6 +493,7 @@ class IsolatedRoles:
         _wall_remaining(self.clock, wall_deadline)
         started = self.clock()
         cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
+        draining = False
         process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    env={**self.environment, 'PYTHONPATH': str(root)}, cwd=root)
@@ -426,8 +508,18 @@ class IsolatedRoles:
                     effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
                     remaining = effective - self.clock()
                     ready = selector.select(max(0, remaining))
-                    if remaining <= 0 or not ready:
-                        raise TimeoutError('roles worker deadline exhausted')
+                    now = self.clock()
+                    if now >= effective:
+                        if (active and not finished and not draining and self.receipt_grace_seconds
+                                and (wall_deadline is None or now < wall_deadline)):
+                            # The worker's API deadline is unchanged. Collect only
+                            # authoritative completion/accounting; never admit a late proposal.
+                            draining = True
+                            cutoff += self.receipt_grace_seconds
+                        else:
+                            raise TimeoutError('roles worker deadline exhausted')
+                    if not ready:
+                        continue
                     if any(key.fileobj is process.stdin for key, _ in ready):
                         sent = os.write(process.stdin.fileno(), outgoing[:65536])
                         outgoing = outgoing[sent:]
@@ -467,9 +559,17 @@ class IsolatedRoles:
                                 raise ValueError('invalid worker outcome')
                             finished = True
                             self.observer(event, payload)
-                            if elapsed > allowance:
-                                raise TimeoutError('worker exceeded actor allowance')
+                            if elapsed > allowance or draining:
+                                raise TimeoutError('worker actor cutoff reached; actual elapsed receipt retained')
                             if not payload['success']:
+                                error = payload.get('error')
+                                if error is not None:
+                                    if (type(error) is not dict or set(error) != {'type', 'message'}
+                                            or any(type(v) is not str for v in error.values())
+                                            or len(error['type'].encode()) > 128
+                                            or len(error['message'].encode()) > 2048):
+                                        raise ValueError('invalid bounded role failure detail')
+                                    raise RoleFailure(role, error['type'], error['message'])
                                 raise RuntimeError('role failed; elapsed receipt retained')
                             cutoff = self.clock() + self.setup_seconds
                         elif event == 'result':
