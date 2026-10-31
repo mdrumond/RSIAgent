@@ -213,7 +213,8 @@ def spawned_runner(request):
                              implementation_iterations=None, execution_tries=None))
     return ProjectRunner.create(request.root, spec, builtin_bundle(),
         dict(source=str(source), verifier=str(verifier),
-             commands={name: command for name in ('compile', 'test', 'validation')}),
+             commands=dict(compile=command, test=[sys.executable, '{verifier}'],
+                           validation=[sys.executable, '{verifier}'])),
         query=lambda *args: None, backend_identity='TEST-WAVE',
         session_factory=ClosedScriptedSession, test_backend=True)
 
@@ -232,3 +233,64 @@ def test_real_spawn_retains_canonical_pending_without_provider(tmp_path):
     # Reopening must not spawn another controller for that retained operation.
     reopened = wave(tmp_path, ('a',), parallel=1)
     assert reopened.run(spawned_runner)['projects']['a']['worker'] == row['worker']
+
+
+def successful_spawned_runner(request):
+    import time
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from rsi.project_runner import ProjectRunner
+    from rsi.strategy import knowledge_db_query
+    from test_rsi_project_runner import Session, TestEmbedding
+    runner = spawned_runner(request)
+    database = KnowledgeDB(request.root.parent / 'knowledge.sqlite3', TestEmbedding())
+    source = request.root.parent / 'input'
+    database.index(source, [source / 'solution.py'], collection='examples',
+                   language='python', revision='test-wave')
+    atomic_json(request.root.parent / 'observed-snapshots.json', dict(
+        memory=request.memory.hex(), skills=request.skills.hex()))
+    deadline = time.monotonic() + 10
+    while not all((request.root.parent.parent / p / 'observed-snapshots.json').exists()
+                  for p in ('a', 'b')):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('both real children must overlap before either actor runs')
+        time.sleep(.01)
+
+    class IsolatedSession(Session):
+        def next_action(self, context, allowed, **kwargs):
+            name, args = super().next_action(context, allowed, **kwargs)
+            if context['stage'] == 'implementation' and name == 'perform':
+                snapshot = context['source']
+                args['edit'] = dict(path=snapshot['path'], sha256=snapshot['sha256'],
+                    source=f'value = {request.project_id!r}\n')
+            return name, args
+
+    runner = ProjectRunner(request.root,
+        query=knowledge_db_query(database, ('examples',), negative_query=lambda _: []), backend_identity='TEST-WAVE',
+        session_factory=IsolatedSession, test_backend=True)
+    canonical_run = runner.run
+    def run_and_close():
+        try:
+            return canonical_run()
+        finally:
+            database.close()
+    runner.run = run_and_close
+    return runner
+
+
+def test_two_spawned_children_keep_snapshots_results_and_sources_isolated(tmp_path):
+    pool = wave(tmp_path)
+    state = pool.run(successful_spawned_runner)
+    rows = state['projects']
+    assert all(row['status'] == 'completed' for row in rows.values()), rows
+    assert all(row['receipt']['result']['status'] == 'accepted' for row in rows.values())
+    assert rows['a']['worker']['pid'] != rows['b']['worker']['pid']
+    for project in ('a', 'b'):
+        branch = tmp_path / 'projects' / project
+        assert json.loads((branch / 'observed-snapshots.json').read_text()) == dict(
+            memory=b'frozen memory'.hex(), skills=b'frozen skills'.hex())
+        assert (branch / 'runner/project/solution.py').read_text() == f'value = {project!r}\n'
+        assert (branch / 'input/solution.py').read_text() == 'value = 1\n'
+    published = pool.publish()
+    reopened = wave(tmp_path)
+    assert reopened.run(successful_spawned_runner)['projects'] == rows
+    assert reopened.publish() == published
