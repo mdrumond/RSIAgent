@@ -107,8 +107,8 @@ correctness until the admitted target has actually compiled and run the cases.
 For parallel waves, `rsi.triton_worker_binding.prepare_worker_bindings` constructs
 host-owned per-device variants before dispatch, with each device's actual public
 metadata, runtime manifest, target interpreter and executor identity. Its returned
-path/hash is the ignored `binding_configuration`; `profile_fields` supplies
-`bind_project = rsi.triton_worker_binding:bind_project` and that configuration.
+path/hash is the ignored `project_configuration`; `profile_fields` supplies
+`project_binder = rsi.triton_worker_binding:bind_project` and that configuration.
 The owning child calls the shipped `bind_project(request, logical_admission,
 metadata=..., configuration=..., remaining=...)` after receiving its actual lease.
 The hook selects by `request.device`, never project ordinal, checks all frozen

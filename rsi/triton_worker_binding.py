@@ -98,8 +98,8 @@ def prepare_worker_bindings(projects, devices, destination):
 
 def profile_fields(configuration):
     """Ignored ExecutorProfiles fields referencing this shipped target resolver."""
-    return {'bind_project': 'rsi.triton_worker_binding:bind_project',
-            'binding_configuration': {'manifest': configuration['manifest'], 'sha256': configuration['sha256']}}
+    return {'project_binder': 'rsi.triton_worker_binding:bind_project',
+            'project_configuration': {'manifest': configuration['manifest'], 'sha256': configuration['sha256']}}
 
 
 def bind_project(request, logical_admission, *, metadata, configuration, remaining):

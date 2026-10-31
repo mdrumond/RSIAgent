@@ -11,7 +11,7 @@ from rsi.contracts import ProjectSpec
 from rsi.project_binding import admission_hash, source_identity, validate_resolution
 from rsi.python_execution import atomic_json
 from rsi.triton_project_config import budgets
-from rsi.triton_worker_binding import bind_project, prepare_worker_bindings
+from rsi.triton_worker_binding import bind_project, prepare_worker_bindings, profile_fields
 
 
 def _child(root, admission, metadata, configuration, queue, release, hold=False, unlock=False):
@@ -126,3 +126,29 @@ def test_resume_cannot_rebuild_lease_inputs(tmp_path):
     with pytest.raises(ValueError):
         bind_project(request, {}, metadata={}, configuration={}, remaining=lambda: 20.0)
     assert not (tmp_path/'lease-inputs').exists()
+
+
+def test_executor_profile_resolves_and_invokes_lease_binder(tmp_path):
+    from rsi.executor_profiles import ExecutorProfiles
+
+    configuration, admissions, devices = _inputs(tmp_path)
+    identity = devices['1']['executor_identity']
+    profile = tmp_path/'executor-profiles.json'
+    atomic_json(profile, {'profiles': {identity: {
+        **profile_fields(configuration), 'metadata': devices['1']['metadata'],
+        'guard': 'rsi.device_admission:guard'}}})
+    profiles = ExecutorProfiles(str(profile))
+    root = tmp_path/'callback-worker'
+    root.mkdir()
+    request = SimpleNamespace(root=root/'runner', project_id='project-0', device='1',
+                              dispatch_id='callback-dispatch', reopen=False)
+    atomic_json(root/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
+    assert profiles.binding_contract(identity) is not None
+    resolution = profiles.bind_project(identity, request, admissions[0], remaining=lambda: 30.0)
+    config = resolution['config']
+    assert config['executor_identity'] == identity
+    assert resolution['evidence']['physical_device'] == '1'
+    assert resolution['spec']['command'] == config['commands']['test']
+    runtime = Path(config['source'])/config['commands']['test'][config['commands']['test'].index('--runtime-manifest')+1]
+    assert json.loads(runtime.read_text())['physical_device'] == 1
+    assert not request.root.exists()
