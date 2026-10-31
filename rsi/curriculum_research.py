@@ -90,15 +90,16 @@ def parse_proposal(role, data, admitted):
     decisions = []
     if type(data['negative_decisions']) is not list:
         raise ValueError('negative decisions must be an array')
-    for row in data['negative_decisions']:
+    for index, row in enumerate(data['negative_decisions']):
         required = {'query_ref', 'index', 'action', 'reason'}
         if (type(row) is not dict or not required <= row.keys() or row.keys() - required - {'redirection'}
                 or type(row['index']) is not int or row['index'] < 0
                 or row['action'] not in ('used', 'rejected')):
             raise ValueError('invalid negative decision')
         text(row['query_ref']); text(row['reason'])
-        if row['action'] == 'used':
-            text(row.get('redirection'))
+        if row['action'] == 'used' and (not isinstance(row.get('redirection'), str)
+                                      or not row['redirection'].strip()):
+            raise ValueError(f'negative_decisions[{index}].redirection must be nonempty when action is used')
         decisions.append(NegativeDecision(**row))
     return DiagnosticDecision(rationale, tuple(ids), proposal, tuple(decisions))
 

@@ -316,3 +316,42 @@ def test_runtime_curriculum_guidance_reaches_both_typed_stages_and_is_frozen(fix
     assert request['context']['user_guidance'] == guidance
     with pytest.raises(ValueError):
         researcher.research(parent, {}, {**context, 'user_guidance': {'curriculum': uuid4().hex}})
+
+
+
+def test_specific_validation_failure_reaches_next_research_without_refund(fixture):
+    from rsi.roles import RoleFailure, _error_details
+    researcher, parent, context, roles, _, _, clock, store = fixture
+    original = roles.diagnostic
+    def invalid_diagnostic(prompt, evidence, **kwargs):
+        roles.observer('role_started', {'role': 'diagnostic'})
+        clock.now += 2
+        payload = dict(rationale='Try a changed case', evidence_ids=[e.evidence_id for e in evidence],
+            proposal=dict(name='small', goal='goal', acceptance='oracle', template_id='cpu.case-subset',
+                          parameters={'case_indices': [0]}),
+            negative_decisions=[dict(query_ref=evidence[-1].evidence_id, index=0, action='used', reason='Reuse')])
+        try:
+            parse_proposal('diagnostic', payload, set(payload['evidence_ids']))
+        except ValueError as exc:
+            detail = _error_details(exc)
+            roles.observer('role_finished', dict(role='diagnostic', success=False, elapsed_seconds=2., error=detail))
+            raise RoleFailure('diagnostic', detail['type'], detail['message']) from exc
+    roles.diagnostic = invalid_diagnostic
+    with pytest.raises(ResearchRejected) as rejected:
+        researcher.research(parent, {}, context)
+    receipt = store.read_json(rejected.value.receipt_ref)
+    assert receipt['actor_seconds'] == 7
+    assert 'negative_decisions[0].redirection' in receipt['error']  # Actual validation error wire contract.
+    roles.diagnostic = original
+    original_query = roles.research_queries
+    delivered = []
+    def receive(prompt, evidence, **kwargs):
+        delivered.extend(evidence)
+        return original_query(prompt, evidence, **kwargs)
+    roles.research_queries = receive
+    result = researcher.research(parent, {}, dict(context, operation_id='after-rejection',
+        deadline=clock.now + 20, previous_rejections=[rejected.value.receipt_ref]))
+    feedback = next(e for e in delivered if e.evidence_id == rejected.value.receipt_ref)
+    assert feedback.data['error'] == receipt['error']
+    assert result.actor_seconds == 7
+    assert store.read_json(rejected.value.receipt_ref) == receipt
