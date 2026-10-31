@@ -127,12 +127,12 @@ def bind_project(request, logical_admission, *, metadata, configuration, remaini
     if manifest.get('schema_version') != 1:
         raise ValueError('Unsupported worker-binding manifest')
     original = ProjectSpec.from_dict(logical_admission['spec'])
-    if request.project_id != original.project_id:
-        raise ValueError('Lease request and logical project differ')
+    if request.project_id != logical_admission['operation_id']:
+        raise ValueError('Lease request and admitted operation differ')
     device = str(request.device)
     if str(metadata['physical_device']) != device:
         raise ValueError('Profile metadata differs from the actual physical lease')
-    project = manifest['projects'][request.project_id]
+    project = manifest['projects'][original.project_id]
     if logical(original) != project['logical']:
         raise ValueError('Binding would change the frozen logical project')
     variant = project['variants'][device]
@@ -233,7 +233,7 @@ def bind_project(request, logical_admission, *, metadata, configuration, remaini
               if key in PUBLIC_RUNTIME and (value is None or isinstance(value, (str, int, float, bool)))}
     public.update(physical_device=int(device), logical_device=0)
     evidence = {'logical_admission_hash': admission_hash(logical_admission),
-                'logical_project_id': request.project_id, 'physical_device': device,
+                'logical_project_id': original.project_id, 'physical_device': device,
                 'logical_case_identity': project['logical_case_identity'],
                 'resolved_case_identity': resolved_case,
                 'logical_source_identity': initial_source(before),

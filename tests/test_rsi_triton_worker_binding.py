@@ -2,6 +2,7 @@
 import json
 import multiprocessing
 import os
+from uuid import uuid4
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,22 +11,24 @@ import pytest
 from rsi.contracts import ProjectSpec
 from rsi.project_binding import admission_hash, source_identity, validate_resolution
 from rsi.python_execution import atomic_json
+from rsi.project_wave import WaveRequest
 from rsi.triton_project_config import budgets
 from rsi.triton_worker_binding import bind_project, prepare_worker_bindings, profile_fields
 
 
 def _child(root, admission, metadata, configuration, queue, release, hold=False, unlock=False):
     root = Path(root)
-    request = SimpleNamespace(root=root, project_id=admission['spec']['project_id'],
-                              device=str(metadata['physical_device']), dispatch_id=root.parent.name,
-                              reopen=False)
+    request = WaveRequest(root=root, project_id=admission['operation_id'],
+                          device=str(metadata['physical_device']), dispatch_id=root.parent.name,
+                          reopen=False, memory=b'', skills=b'', actor_seconds=7200.0, actor_elapsed=0.0)
     atomic_json(root.parent/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
     try:
         result = bind_project(request, admission, metadata=metadata, configuration=configuration,
                               remaining=lambda: 30.0)
         if hold and not release.wait(15):
             raise RuntimeError('Third project never acquired the actually freed lease')
-        queue.put({'device': request.device, 'root': str(root), 'resolution': result})
+        queue.put({'device': request.device, 'root': str(root), 'resolution': result,
+                   'operation_id': request.project_id})
     finally:
         if unlock:
             release.set()
@@ -58,7 +61,7 @@ def _inputs(tmp_path):
     admissions = []
     for row in projects:
         variant = manifest['projects'][row['spec'].project_id]['variants']['0']
-        admissions.append({'operation_id': row['spec'].project_id, 'spec': variant['spec'], 'config': variant['config'],
+        admissions.append({'operation_id': uuid4().hex, 'spec': variant['spec'], 'config': variant['config'],
                            'memory_ref': 'frozen-memory', 'skills_ref': 'frozen-skills',
                            'configuration_ref': 'frozen-configuration'})
     return configuration, admissions, devices
@@ -100,6 +103,9 @@ def test_three_projects_two_leases_use_completion_device_not_modulo(tmp_path):
             assert str(runtime_data['physical_device']) == result['device']
             assert 'private_profile' not in runtime_data
             assert evidence['logical_admission_hash'] == admission_hash(admissions[index])
+            assert result['operation_id'] == admissions[index]['operation_id']
+            assert result['operation_id'] != spec['project_id']
+            assert evidence['logical_project_id'] == spec['project_id']
             assert evidence['logical_case_identity'] == evidence['resolved_case_identity']
             assert evidence['logical_source_identity'] != evidence['resolved_source_identity']
             assert evidence['resolved_source_identity'] == source_identity(config['source'],
@@ -140,15 +146,33 @@ def test_executor_profile_resolves_and_invokes_lease_binder(tmp_path):
     profiles = ExecutorProfiles(str(profile))
     root = tmp_path/'callback-worker'
     root.mkdir()
-    request = SimpleNamespace(root=root/'runner', project_id='project-0', device='1',
-                              dispatch_id='callback-dispatch', reopen=False)
+    request = WaveRequest(root=root/'runner', project_id=admissions[0]['operation_id'], device='1',
+                          dispatch_id='callback-dispatch', reopen=False,
+                          memory=b'', skills=b'', actor_seconds=7200.0, actor_elapsed=0.0)
     atomic_json(root/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
     assert profiles.binding_contract(identity) is not None
     resolution = profiles.bind_project(identity, request, admissions[0], remaining=lambda: 30.0)
     config = resolution['config']
     assert config['executor_identity'] == identity
     assert resolution['evidence']['physical_device'] == '1'
+    assert resolution['evidence']['logical_project_id'] == 'project-0'
+    assert request.project_id != resolution['spec']['project_id']
     assert resolution['spec']['command'] == config['commands']['test']
     runtime = Path(config['source'])/config['commands']['test'][config['commands']['test'].index('--runtime-manifest')+1]
     assert json.loads(runtime.read_text())['physical_device'] == 1
+    assert not request.root.exists()
+
+
+def test_mismatched_service_operation_is_rejected_before_creating_lease_inputs(tmp_path):
+    configuration, admissions, devices = _inputs(tmp_path)
+    root = tmp_path/'wrong-operation-worker'
+    root.mkdir()
+    request = WaveRequest(root=root/'runner', project_id=uuid4().hex, device='0',
+                          dispatch_id='wrong-operation-dispatch', reopen=False,
+                          memory=b'', skills=b'', actor_seconds=7200.0, actor_elapsed=0.0)
+    atomic_json(root/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
+    with pytest.raises(ValueError):
+        bind_project(request, admissions[0], metadata=devices['0']['metadata'],
+                     configuration=configuration, remaining=lambda: 30.0)
+    assert not (root/'lease-inputs').exists()
     assert not request.root.exists()
