@@ -229,7 +229,7 @@ class Phase1Recovery:
                 cap = c.config['curriculum'].get('project_actor_seconds')
                 if cap is not None:
                     limits['actor_seconds'] = min(cap, limits['actor_seconds']) if limits['actor_seconds'] is not None else cap
-                return limits
+                return min(value for value in limits.values() if value is not None)
             try:
                 with c.services.setup.measure('curriculum-materialization', context['operation_id']):
                     child = (self.materializer or materialize_child)(spec, config, proposal,
