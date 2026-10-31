@@ -406,6 +406,10 @@ class CycleScheduler:
             raise WorkflowError('pending operation requires reconciliation')
         if s['stopped'] or s['phase'] in ('complete', 'wave_limit'):
             return None
+        if s['phase'] == 'recovery' and not s['recovery_queue']:
+            self._wave_end()
+            self._save()
+            return None
         remaining = self.remaining()
         if (self.config.get('recovery_feedback') and s['phase'] in ('simplify', 'recovery', 'recovery_memory')
                 and any(value is not None and value <= 0 for value in remaining.values())):
@@ -419,10 +423,6 @@ class CycleScheduler:
                                         for k in ('actor_seconds', 'wall_seconds')):
             raise WorkflowError('parent elapsed allocation exhausted')
         phase = s['phase']
-        if phase == 'recovery' and not s['recovery_queue']:
-            self._wave_end()
-            self._save()
-            return None
         operation = dict(id=uuid.uuid4().hex, kind='memory' if phase == 'recovery_memory' else phase,
                          recovery=phase in ('recovery', 'simplify', 'recovery_memory'))
         if phase == 'recovery_memory':

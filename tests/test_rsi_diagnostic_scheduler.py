@@ -248,3 +248,21 @@ def test_invalid_selected_child_does_not_reorder_queue_or_change_lineage(tmp_pat
         assert scheduler.state['spent'] == 0
     finally:
         scheduler.close()
+
+
+@pytest.mark.parametrize('actor_seconds', [2, 10])
+def test_finished_recovery_advances_at_exact_elapsed_boundary(tmp_path, actor_seconds):
+    scheduler = CycleScheduler(tmp_path/'cycle', spec(count=1),
+        lambda *_: HostTaskResult('accepted', 'child', 1),
+        lambda *_: SnapshotUpdate('memory1', .5),
+        simplify=lambda parent, *_: SimplificationResult(replace(parent, project_id='child',
+            budgets=BudgetLimits(actor_seconds=1)), .5, 'research'),
+        recovery_feedback=True, actor_seconds=actor_seconds, recovery_seconds=2)
+    try:
+        scheduler.admit_failed_parents(retained_rows(spec(count=1)), 'catalog')
+        finish(scheduler)
+        assert scheduler.state['phase'] == 'complete'
+        assert not scheduler.state['stopped']
+        assert scheduler.state['spent'] == scheduler.state['recovery_spent'] == 2
+    finally:
+        scheduler.close()
