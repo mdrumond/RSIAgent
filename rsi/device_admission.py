@@ -72,7 +72,7 @@ def _remote(executor, spec, directory, remaining, raw):
         try:
             value = executor._cli(['run', executor.config.target, '--runtime', executor.config.runtime,
                 '--cwd', executor.config.command_cwd, '--npu', spec['device'], '--file', script,
-                '--receipt-file', receipt], remaining, response)
+                '--receipt-file', receipt], remaining, result_path=response)
             if not receipt.exists() and value.get('handle'):
                 executor._handle(value)
                 atomic_json(receipt, value)
@@ -91,7 +91,7 @@ def _remote(executor, spec, directory, remaining, raw):
     seconds = executor._observation_seconds(remaining)
     if seconds >= 1:
         args += ['--wait', '--timeout', seconds]
-    terminal = executor._cli(args, remaining, directory / 'observe.json')
+    terminal = executor._cli(args, remaining, result_path=directory / 'observe.json')
     raw['terminal'] = terminal
     _require(executor._handle(terminal) == handle, 'identity_mismatch', 'Probe handle changed')
     _require(terminal.get('state') in ('completed', 'failed', 'cancelled'),
@@ -99,7 +99,7 @@ def _remote(executor, spec, directory, remaining, raw):
     _require(terminal.get('state') == 'completed' and terminal.get('exit') == 0,
              'probe_failed', 'CPL probe did not complete successfully')
     logs = executor._cli(['logs', handle, '--stream', 'stdout', '--tail', 100],
-                         remaining, directory / 'logs.json')
+                         remaining, result_path=directory / 'logs.json')
     raw['logs'] = logs
     _require(executor._handle(logs) == handle, 'identity_mismatch', 'Probe log handle changed')
     return json.loads(logs['content'])
