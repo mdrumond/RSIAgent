@@ -130,7 +130,7 @@ class CplExecutor:
             raise WorkflowError('CPL elapsed budget exhausted; reconcile retained work')
         return value
 
-    def _cli(self, args, remaining, response_file=None):
+    def _cli(self, args, remaining, response_file=None, *, result_path=None):
         # Read the installed policy afresh before *each* operation, not a copy.
         skill = self.config.installed_client.parent.parent / 'SKILL.md'
         skill.read_text()
@@ -140,17 +140,26 @@ class CplExecutor:
         try:
             result = subprocess.run([str(self.config.installed_client), '--json', *map(str, args)],
                                     capture_output=True, timeout=limit)
-            output, returncode = result.stdout, result.returncode
+            output, stderr, returncode = result.stdout, getattr(result, 'stderr', b''), result.returncode
         except subprocess.TimeoutExpired as exc:
-            output, returncode = exc.stdout or b'', 124
+            output, stderr, returncode = exc.stdout or b'', exc.stderr or b'', 124
+        destination = result_path if result_path is not None else response_file
+        if destination is not None:
+            destination = Path(destination)
+            # Preserve native CLI diagnostics before parsing or raising. A failed
+            # response is evidence, never a receipt proving backend submission.
+            Path(str(destination) + '.stdout').write_bytes(output)
+            Path(str(destination) + '.stderr').write_bytes(stderr)
+            atomic_json(Path(str(destination) + '.client.json'),
+                        dict(returncode=returncode, result_path=destination.name))
         try:
             value = json.loads(output)
         except (ValueError, UnicodeError) as exc:
             raise WorkflowError('invalid CPL response; reconcile retained work') from exc
         if not isinstance(value, dict):
             raise WorkflowError('CPL response must be an object')
-        if response_file is not None:
-            atomic_json(response_file, value)
+        if destination is not None:
+            atomic_json(destination, value)
         if returncode and not value.get('handle'):
             raise WorkflowError('CPL client failed; retain receipt and reconcile')
         return value
