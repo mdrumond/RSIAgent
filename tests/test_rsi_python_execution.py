@@ -1,5 +1,6 @@
 """Behavioral backend tests; run only under the coordinator's serial token."""
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -105,6 +106,54 @@ def test_remote_durations_ignore_producer_epoch_and_union_overlap(tmp_path):
         with pytest.raises(WorkflowError):
             ingest_elapsed(workflow.accounting, 'bad', receipt,
                            observed_start=102., observed_end=110., category='execution')
+
+
+@pytest.mark.parametrize('elapsed', [.1, .01, .2])
+@pytest.mark.parametrize('authoritative', [False, True])
+def test_epoch_quantized_envelope_preserves_measured_duration(tmp_path, elapsed, authoritative):
+    start = 1700000000.
+    end = start + elapsed
+    workflow = Workflow(tmp_path / 'clock.json', lambda *a: True, source_hash='x',
+                        clock=lambda: end)
+    bounds = (dict(observed_execution_start=start, observed_execution_end=end)
+              if authoritative else {})
+    ingest_elapsed(workflow.accounting, 'quantized', {'elapsed': elapsed},
+                   observed_start=start, observed_end=end, category='execution', **bounds)
+    reopened = Workflow(workflow.path, lambda *a: True, source_hash='x', clock=lambda: end)
+    receipt = reopened.accounting.receipts['receipt:quantized']
+    assert receipt['elapsed'] == elapsed
+    assert receipt['envelope'] == [start, end]
+    assert receipt['placement'] == ('authoritative_host_interval' if authoritative
+                                    else 'synthetic_union_equivalent')
+    assert reopened.accounting.records['receipt:quantized'] == ['execution', start, end]
+    assert abs(reopened.accounting.seconds() - elapsed) <= math.ulp(start) + math.ulp(end)
+
+
+@pytest.mark.parametrize('start,end,elapsed,now', [
+    (1700000000., 1700000000.1, .100002, 1700000001.),  # Above epoch quantum.
+    (1., 1.1, .100000001, 2.),  # Below 1us but above the endpoint quantum.
+    (1e12, 1e12 + .1, .10001, 1e12 + 1.),  # Coarse ULP cannot bypass 1us cap.
+    (1700000000., 1700000000.1, .1, 1700000000.),  # Future envelope.
+    (1700000000.1, 1700000000., 0., 1700000001.),  # Backward envelope.
+    (1700000000., 1700000000.1, -.1, 1700000001.),
+    (1700000000., 1700000000.1, float('nan'), 1700000001.),
+    (1700000000., 1700000000.1, float('inf'), 1700000001.),
+    (1700000000., 1700000000.1, True, 1700000001.),
+    (1700000000., 1700000000.1, '0.1', 1700000001.),
+    (1700000000., float('inf'), .1, 1700000001.),
+])
+def test_envelope_tolerance_rejects_invalid_receipts_durably(tmp_path, start, end, elapsed, now):
+    workflow = Workflow(tmp_path / 'clock.json', lambda *a: True, source_hash='x',
+                        clock=lambda: now)
+    with pytest.raises(WorkflowError):
+        ingest_elapsed(workflow.accounting, 'invalid', {'elapsed': elapsed},
+                       observed_start=start, observed_end=end, category='execution')
+    reopened = Workflow(workflow.path, lambda *a: True, source_hash='x', clock=lambda: now)
+    assert 'receipt:invalid' in reopened.accounting.uncertainties
+    assert 'receipt:invalid' not in reopened.accounting.receipts
+    assert 'receipt:invalid' not in reopened.accounting.records
+    with pytest.raises(WorkflowError):
+        reopened.accounting.seconds()
 
 
 def test_profile_and_performance_goal_are_retained(tmp_path):

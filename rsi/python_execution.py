@@ -57,7 +57,11 @@ def ingest_elapsed(clock, operation_id, receipt, *, observed_start, observed_end
     if (type(elapsed) not in (int, float) or not math.isfinite(elapsed)
             or elapsed < 0 or not all(math.isfinite(x) for x in (observed_start, observed_end))
             or observed_end > clock.clock() or observed_end < observed_start
-            or elapsed > observed_end - observed_start or category not in clock.BILLABLE):
+            # Epoch endpoints can round down a valid producer duration. Bound
+            # that loss by their float spacing and the authoritative interval cap.
+            or elapsed - (observed_end - observed_start)
+                > min(1e-6, math.ulp(observed_start) + math.ulp(observed_end))
+            or category not in clock.BILLABLE):
         clock.uncertainties[key] = {'error': 'invalid duration or envelope'}
         clock.save()
         raise WorkflowError('missing or invalid producer duration/observation envelope')
