@@ -219,9 +219,11 @@ def run(contract, mode, case_index=None, capture_root=None):
                 tla.compile(original, *args, options='--npu-arch 3510')
             repair_receipt = compiler_repair_gate(contract, compile_failed_original, candidate_hash)
         artifact = tla.compile(kernel, *args, options='--npu-arch 3510')
+        if repair_receipt is not None:
+            repair_receipt['corrected_compiled'] = True
         result = dict(case=case, compiled=True, launched=False, numeric_match=False)
         if mode != 'compile':
-            with launch_output() as device_output:
+            with launch_output(Path('outputs') / ('case-' + str(len(results))) / 'device-output') as device_output:
                 artifact(*args, block_num=case['block_count'])
                 torch.npu.synchronize()
             values = out[:len(left)].cpu().tolist()

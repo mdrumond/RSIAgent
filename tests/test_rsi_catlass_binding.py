@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rsi.catlass_project_config import freeze_verifier, project_config, worker_environment
+from rsi.catlass_project_config import freeze_verifier, project_config, worker_environment, project_spec
 from rsi.catlass_verifier import case_inputs, project_hash, reference
 
 
@@ -81,7 +81,8 @@ def test_exercise_gate_does_not_accept_an_unregistered_numeric_task(monkeypatch)
         capability_gate(contract, compile_original=lambda path:None, candidate_hash='candidate')
 
 
-def test_repair_requires_real_expected_failure_and_binds_both_sources():
+def test_repair_requires_real_expected_failure_and_binds_both_sources(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     from rsi.catlass_capabilities import compiler_repair_gate
     original = 'invalid original kernel'
     contract = {'exercise':{'original_source':original,'diagnostic_pattern':'staged-loop type mismatch'}}
@@ -224,3 +225,119 @@ def test_validation_cannot_reduce_the_frozen_case_set(fake_consumer):
     with pytest.raises(ValueError, match='must cover all'):
         driver.run(contract,'validation',case_index=0)
     assert not any(isinstance(call,tuple) and call[0]=='launch' for call in calls)
+
+
+def test_final_project_command_uses_config_test_argv(tmp_path):
+    config = project_config(source=tmp_path/'source', verifier=tmp_path/'frozen.py',
+                            target_python='/profile/python3.11')
+    spec = project_spec(project_id='translation', goal='Translate frozen Ascend C', config=config)
+    assert spec.command == tuple(config.commands['test'])
+    assert spec.correctness_ref == config.verifier
+    assert spec.budgets.actor_seconds == 7200
+
+
+def test_resource_reads_use_existing_snapshot_and_cannot_be_edited(tmp_path):
+    from rsi.python_execution import PythonExecution
+    source = tmp_path/'source'
+    reference = source/'.reference-skills'
+    reference.mkdir(parents=True)
+    (source/'candidate.py').write_text('pass\n')
+    resource = reference/'guide.md'
+    resource.write_text('A complete owned programming guide.')
+    verifier = tmp_path/'verifier.py'
+    verifier.write_text('pass\n')
+    backend = PythonExecution.snapshot(tmp_path/'snapshot',source,verifier,
+        commands={'test':['python','{verifier}']},editable_files=['candidate.py'])
+    read = backend.read('.reference-skills/guide.md')
+    assert read['content'] == resource.read_text()
+    assert read['file_hash'] == hashlib.sha256(resource.read_bytes()).hexdigest()
+    with pytest.raises(ValueError,match='not in the frozen editable manifest'):
+        backend.edit('.reference-skills/guide.md','replacement',
+                     expected_file_hash=read['file_hash'],expected_project_hash=read['project_hash'])
+
+
+def test_ir_gate_rejects_unpinned_helper_even_with_no_shim_boolean(tmp_path):
+    from rsi.catlass_capabilities import ir_gate
+    helper = tmp_path/'installed-like.py'
+    helper.write_text('raise RuntimeError("must never run")\n')
+    contract = {'exercise':{'capture_tool':{'path':str(helper),
+        'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),'no_absolute_shims':True}},
+        'runtime_identity':{'compiler_paths':{'TlaCompile':'/not-run/frontend','hivmc-a5':'/not-run/backend'}}}
+    with pytest.raises(ValueError,match='exact owned no-shim helper identity'):
+        ir_gate(contract,tmp_path)
+
+
+def test_compiler_repair_captures_native_and_child_stderr(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from rsi.catlass_capabilities import compiler_repair_gate
+    monkeypatch.chdir(tmp_path)
+    contract = {'exercise':{'original_source':'frozen failing source',
+                            'diagnostic_pattern':'child compiler staged type mismatch'}}
+    def compile_original(path):
+        os.write(2, b'native compiler diagnostic\n')
+        subprocess.run([sys.executable,'-c',
+                        'import sys; sys.stderr.write("child compiler staged type mismatch\\n")'],check=True)
+        raise RuntimeError('generic compilation failure')
+    receipt = compiler_repair_gate(contract,compile_original,'corrected-source')
+    stderr = Path(receipt['original_output']['stderr_path']).read_bytes()
+    assert b'native compiler diagnostic' in stderr
+    assert b'child compiler staged type mismatch' in stderr
+    assert receipt['corrected_compiled'] is False
+    assert Path(receipt['archive']['path']).is_file()
+
+
+def test_failed_tool_keeps_raw_reports_streams_and_typed_failure(tmp_path, monkeypatch):
+    import tarfile
+    from rsi import catlass_capabilities as gates
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('RSI_EXPECTED_SOURCE_HASH','source')
+    tool = tmp_path/'msprof-fixture'
+    tool.write_text('trusted fake process fixture')
+    calls = []
+    def process(argv, **kwargs):
+        calls.append(argv)
+        if len(calls)==1:
+            return SimpleNamespace(returncode=0,stdout=b'probe stdout',stderr=b'probe stderr')
+        report = Path(argv[-1]);report.mkdir(parents=True)
+        (report/'failed-report.csv').write_text('retained partial vendor report')
+        return SimpleNamespace(returncode=1,stdout=b'command stdout',stderr=b'actual tool error')
+    monkeypatch.setattr(gates.subprocess,'run',process)
+    contract = {'exercise':{'kind':'msprof-basic','tools':{'msprof':{'path':str(tool),
+        'sha256':hashlib.sha256(tool.read_bytes()).hexdigest(),'arguments':['--report','{report}']}}},
+        'case_hash':'cases','runtime_identity':{},'outer_cpl_handle':'remote:bz-a5:session:actual','physical_device':2}
+    with pytest.raises(ValueError,match='required tool command failed'):
+        gates.capability_gate(contract,compile_original=lambda path:None,candidate_hash='candidate')
+    receipts = list(Path('outputs').glob('*-receipt.json'))
+    assert len(receipts)==1
+    failure = json.loads(receipts[0].read_text())
+    assert failure['outcome']=='capability-failure' and not failure['exercise_validated']
+    assert failure['failure']['type']=='ValueError'
+    with tarfile.open(failure['archive']['path']) as archive:
+        assert archive.extractfile('./tool-command/command.stdout').read()==b'command stdout'
+        assert archive.extractfile('./tool-command/command.stderr').read()==b'actual tool error'
+        assert archive.extractfile('./msprof/failed-report.csv').read()==b'retained partial vendor report'
+
+
+def test_language_conversion_binds_frozen_ascend_source_not_dtype_cast(fake_consumer, monkeypatch):
+    driver, contract, calls = fake_consumer
+    source = Path('.reference-skills')
+    source.mkdir()
+    original = source/'original.cpp'
+    original.write_text('void vector_add(float *out, const float *a, const float *b, int n) {\n'
+                        '  for (int i=0;i<n;++i) out[i]=a[i]+b[i];\n}\n')
+    provenance = {'repository':'fixture-repository','revision':'frozen-source-revision',
+                  'path':'original.cpp','symbol':'vector_add',
+                  'sha256':hashlib.sha256(original.read_bytes()).hexdigest()}
+    metadata = source/'provenance.json'
+    metadata.write_text(json.dumps(provenance))
+    contract['exercise'] = {'kind':'language-conversion','source_path':str(original),
+                           'provenance_path':str(metadata),'provenance':provenance}
+    receipt = driver.run(contract,'validation')
+    evidence = receipt['capability_evidence']['evidence']
+    assert receipt['exercise_validated'] and evidence['source_language']=='ascend-c'
+    assert evidence['original_source']['sha256']==provenance['sha256']
+    original.write_text('different source')
+    monkeypatch.delenv('RSI_EXPECTED_SOURCE_HASH')
+    with pytest.raises(ValueError,match='translation source changed'):
+        driver.run(contract,'validation')

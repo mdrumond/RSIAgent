@@ -15,7 +15,6 @@ import sys
 import contextlib
 import ctypes
 import csv
-import io
 import re
 import tempfile
 
@@ -24,14 +23,20 @@ if 'sha' not in globals():
     from rsi.catlass_verifier import sha, case_inputs, reference
 
 
+OWNED_CAPTURE_HELPER_SHA256 = '1d362c3c862c7d59569290d4c3b9068b867a354d67ca86a43e4bdb4453efde59'
+
+
 class CapabilityUnavailable(RuntimeError):
     """Explicit capability-study outcome; never an exercise-validation pass."""
 
 
 @contextlib.contextmanager
-def launch_output():
+def launch_output(directory=None):
     """Capture actual launch/synchronize fds, excluding staging/compiler output."""
     captured = {}
+    if directory is not None:
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -51,7 +56,12 @@ def launch_output():
             for name, stream in [('stdout',stdout), ('stderr',stderr)]:
                 stream.seek(0)
                 content = stream.read()
-                captured[name] = content.decode(errors='replace')
+                captured[name] = content.decode(errors='replace')[:8192]
+                captured[name + '_truncated'] = len(content) > 8192
+                if directory is not None:
+                    path = directory / (name + '.log')
+                    path.write_bytes(content)
+                    captured[name + '_path'] = str(path)
                 captured[name + '_sha256'] = hashlib.sha256(content).hexdigest()
 
 
@@ -62,7 +72,67 @@ def receipt_file(path):
     return dict(path=str(path), sha256=sha(path), bytes=path.stat().st_size)
 
 
-def tool_command(spec, arguments, *, env=None):
+@contextlib.contextmanager
+def retained_evidence(common, exercise):
+    """Retain raw negative evidence and typed receipt on every exit path."""
+    outputs = Path('outputs')
+    outputs.mkdir(exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix='capability-' + exercise + '-', dir=outputs))
+    receipt = dict(common, exercise=exercise, outcome='pending')
+    try:
+        yield directory, receipt
+    except BaseException as error:
+        receipt.update(outcome='capability-study-unavailable' if isinstance(error, CapabilityUnavailable)
+                       else 'capability-failure',
+                       failure=dict(type=type(error).__name__, message=str(error)[:8192]),
+                       exercise_validated=False)
+        raise
+    finally:
+        # Preserve the raw directory even if archive creation itself fails.
+        (directory / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        try:
+            archive = shutil.make_archive(str(directory) + '-raw', 'gztar', directory)
+            receipt['archive'] = receipt_file(archive)
+        except Exception as archive_error:
+            receipt['archive_error'] = dict(type=type(archive_error).__name__, message=str(archive_error))
+        (outputs / (directory.name + '-receipt.json')).write_text(json.dumps(receipt, indent=2) + '\n')
+
+
+def persist_process(process, directory, prefix):
+    if directory is None:
+        return
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for stream in ('stdout', 'stderr'):
+        (directory / (prefix + '.' + stream)).write_bytes(getattr(process, stream))
+    (directory / (prefix + '.json')).write_text(json.dumps(dict(returncode=process.returncode)) + '\n')
+
+
+def run_retained(argv, *, directory, prefix='command', env=None):
+    """Stream tool output to owned files before checking completion or verdict."""
+    if directory is None:
+        return subprocess.run(argv, capture_output=True, env=env)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    stdout_path, stderr_path = (directory / (prefix + '.' + stream) for stream in ('stdout','stderr'))
+    try:
+        with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:
+            process = subprocess.run(argv, stdout=stdout, stderr=stderr, env=env)
+    except BaseException as error:
+        (directory / (prefix + '.failure.json')).write_text(json.dumps(dict(
+            type=type(error).__name__, message=str(error)[:8192])) + '\n')
+        raise
+    # Fake-consumer fixtures may return bytes directly; real subprocess output
+    # was already streamed to these files, including before any interruption.
+    if process.stdout is None:
+        process.stdout = stdout_path.read_bytes()
+    if process.stderr is None:
+        process.stderr = stderr_path.read_bytes()
+    persist_process(process, directory, prefix)
+    return process
+
+
+def tool_command(spec, arguments, *, env=None, evidence_directory=None, prefix="command"):
     tool = Path(spec['path'])
     if not tool.is_file():
         if spec.get('allow_unavailable', False):
@@ -70,18 +140,18 @@ def tool_command(spec, arguments, *, env=None):
         raise ValueError('required installed tool is missing: ' + tool.name)
     if sha(tool) != spec['sha256']:
         raise ValueError('trusted tool identity changed')
-    process = subprocess.run([str(tool), *arguments], capture_output=True, env=env)
+    process = run_retained([str(tool), *arguments], directory=evidence_directory, prefix=prefix, env=env)
     return process
 
 
-def owned_command(spec, replacements, *, contract, env=None):
+def owned_command(spec, replacements, *, contract, env=None, evidence_directory=None):
     # All command templates originate in the frozen trusted profile, not source.
     arguments = [arg.format_map(replacements) for arg in spec['arguments']]
-    probe = tool_command(spec, spec.get('probe_arguments', ['--help']), env=env)
+    probe = tool_command(spec, spec.get('probe_arguments', ['--help']), env=env, evidence_directory=evidence_directory, prefix='probe')
     if probe.returncode:
         # A failed invocation is not proof that a feature is unsupported.
         raise ValueError('tool discovery failed; preserve diagnostic, not unavailable')
-    process = tool_command(spec, arguments, env=env)
+    process = tool_command(spec, arguments, env=env, evidence_directory=evidence_directory)
     receipt = dict(tool_sha256=spec['sha256'], arguments=arguments,
                    returncode=process.returncode,
                    stdout_sha256=hashlib.sha256(process.stdout).hexdigest(),
@@ -115,22 +185,29 @@ def compiler_repair_gate(contract, compile_original, candidate_hash):
     original = exercise.get('original_source')
     if not original or hashlib.sha256(original.encode()).hexdigest() == candidate_hash:
         raise ValueError('compile repair requires distinct frozen original and corrected source')
-    with tempfile.TemporaryDirectory(prefix='rsi-catlass-original-') as directory:
-        path = Path(directory) / 'candidate.py'
+    common = dict(corrected_sha256=candidate_hash, case_hash=contract.get('case_hash'),
+                  runtime=contract.get('runtime_identity'), outer_cpl_handle=contract.get('outer_cpl_handle'))
+    with retained_evidence(common, 'compiler-original') as (directory, retained):
+        path = directory / 'candidate.py'
         path.write_text(original)
-        try:
-            with contextlib.redirect_stderr(io.StringIO()) as diagnostic, contextlib.redirect_stdout(io.StringIO()) as output:
+        failure = None
+        with launch_output(directory / 'compiler-output') as captured:
+            try:
                 compile_original(path)
-        except Exception as error:
-            text = output.getvalue() + diagnostic.getvalue() + repr(error)
-            # The frozen expected diagnostic selects the real compiler failure,
-            # not an arbitrary staging/import/transport exception.
-            if not re.search(exercise['diagnostic_pattern'], text):
-                raise ValueError('original failed outside the frozen compiler diagnostic') from error
-            return dict(original_sha256=sha(path), original_diagnostic=text,
+            except Exception as error:
+                failure = error
+        if failure is None:
+            raise ValueError('original compile unexpectedly succeeded; no compiler repair demonstrated')
+        text = ''.join((directory / 'compiler-output' / (stream + '.log')).read_text(errors='replace')
+                       for stream in ('stdout', 'stderr')) + repr(failure)
+        (directory / 'exception.txt').write_text(repr(failure))
+        if not re.search(exercise['diagnostic_pattern'], text):
+            raise ValueError('original failed outside the frozen compiler diagnostic') from failure
+        retained.update(outcome='expected-compiler-failure-observed', original_sha256=sha(path),
                         original_diagnostic_sha256=hashlib.sha256(text.encode()).hexdigest(),
-                        corrected_sha256=candidate_hash, corrected_compiled=True)
-    raise ValueError('original compile unexpectedly succeeded; no compiler repair demonstrated')
+                        original_output=captured, corrected_sha256=candidate_hash,
+                        corrected_compiled=False)
+    return retained
 
 
 def ir_gate(contract, temporary):
@@ -142,13 +219,14 @@ def ir_gate(contract, temporary):
                  '--real-tool', 'hivmc-a5=' + tools['hivmc-a5'], '--',
                  sys.executable, *child_arguments(mode='compile'), '--capture-root', str(capture)]
     # The capture helper is a trusted Python resource, invoked via this runtime.
-    if sha(spec['path']) != spec['sha256']:
-        raise ValueError('compiler capture helper identity changed')
+    if (spec['sha256'] != OWNED_CAPTURE_HELPER_SHA256
+            or sha(spec['path']) != OWNED_CAPTURE_HELPER_SHA256):
+        raise ValueError('IR capture requires the exact owned no-shim helper identity')
     if spec.get('no_absolute_shims') is not True:
         raise ValueError('IR capture requires owned path-wrapper-only helper; shared compiler shims forbidden')
     env = dict(os.environ, CATLASS_DSL_CACHE_DIR=str(temporary / 'fresh-ir-cache'),
                CPL_CAPTURE_NO_ABSOLUTE_SHIMS='1')
-    process = subprocess.run([sys.executable, spec['path'], *arguments], capture_output=True, env=env)
+    process = run_retained([sys.executable, spec['path'], *arguments], directory=temporary, prefix='capture-helper', env=env)
     if process.returncode:
         raise ValueError('actual compiler capture failed: ' + process.stderr.decode(errors='replace'))
     manifest = json.loads((capture / 'capture-manifest.json').read_text())
@@ -180,7 +258,7 @@ def msprof_gate(contract, temporary):
                         verifier=str(Path(__file__).resolve()),
                         physical_device=str(contract['physical_device']),
                         workload=__import__('shlex').join([sys.executable, *child_arguments()]))
-    _, receipt = owned_command(spec, replacements, contract=contract)
+    _, receipt = owned_command(spec, replacements, contract=contract, evidence_directory=temporary / "tool-command")
     selected = []
     for path in reports.rglob('*.csv'):
         with path.open(newline='') as stream:
@@ -203,7 +281,7 @@ def diagnostic_tool_gate(contract, name, temporary):
                         verifier=str(Path(__file__).resolve()),
                         workload=__import__('shlex').join([sys.executable, *child_arguments()]),
                         physical_device=str(contract['physical_device']))
-    process, receipt = owned_command(spec, replacements, contract=contract)
+    process, receipt = owned_command(spec, replacements, contract=contract, evidence_directory=temporary / (name + "-command"))
     # Version-matched patterns bind actual CLI diagnostics/breakpoint observations,
     # not a receipt supplied by the Actor. Empty success output is not sufficient.
     diagnostic = process.stdout.decode(errors='replace') + process.stderr.decode(errors='replace')
@@ -229,19 +307,25 @@ def diagnostic_tool_gate(contract, name, temporary):
 def capability_gate(contract, *, compile_original, candidate_hash, repair_receipt=None):
     exercise = contract['exercise']
     kind = exercise['kind']
-    if kind not in {'conversion','compiler-repair','api-ast-ir','msprof-basic','msdebug-mssanitizer',
+    if kind not in {'language-conversion','conversion','compiler-repair','api-ast-ir','msprof-basic','msdebug-mssanitizer',
                     'printf-numeric','missing-feature','device-environment-5xxxx'}:
         raise ValueError('unregistered exercise; numeric-only validation is not admitted')
     common = dict(source_hash=os.environ['RSI_EXPECTED_SOURCE_HASH'], candidate_sha256=candidate_hash,
                   case_hash=contract['case_hash'], runtime=contract['runtime_identity'],
                   outer_cpl_handle=contract['outer_cpl_handle'], physical_device=contract['physical_device'])
-    # These artifacts live outside the Actor project. Persist them beside the
-    # frozen verifier so the generic CPL collector can retain them explicitly.
-    evidence = Path(__file__).parent / 'catlass-evidence'
-    evidence.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='capture-', dir=evidence) as directory:
-        temporary = Path(directory)
-        if kind == 'conversion':
+    with retained_evidence(common, kind) as (temporary, retained):
+        if kind == 'language-conversion':
+            original = Path(exercise['source_path'])
+            provenance = exercise['provenance']
+            if sha(original) != provenance['sha256']:
+                raise ValueError('frozen Ascend C translation source changed')
+            if json.loads(Path(exercise['provenance_path']).read_text()) != provenance:
+                raise ValueError('Ascend C source provenance changed')
+            result = dict(source_language='ascend-c', target_language='catlass-dsl',
+                          original_source=receipt_file(original), provenance=provenance,
+                          translated_candidate_sha256=candidate_hash,
+                          semantic_oracle='independent host elementwise addition')
+        elif kind == 'conversion':
             tree = ast.parse(Path('candidate.py').read_text())
             calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                      and isinstance(node.func, ast.Attribute) and node.func.attr == 'to']
@@ -280,7 +364,7 @@ def capability_gate(contract, *, compile_original, candidate_hash, repair_receip
         elif kind == 'device-environment-5xxxx':
             # A simulated fixture is explicitly distinct from hardware evidence.
             spec = exercise['tools']['environment-diagnostic']
-            process, command = owned_command(spec, dict(report=str(temporary / 'environment')), contract=contract)
+            process, command = owned_command(spec, dict(report=str(temporary / 'environment')), contract=contract, evidence_directory=temporary / 'environment-command')
             text = process.stdout.decode(errors='replace') + process.stderr.decode(errors='replace')
             if not re.search(exercise['diagnostic_pattern'], text):
                 raise ValueError('version-specific environment diagnostic not observed')
@@ -289,8 +373,5 @@ def capability_gate(contract, *, compile_original, candidate_hash, repair_receip
             result = dict(command=command, diagnostic=text, recovered_numeric=True)
         else:
             raise ValueError('unregistered exercise; numeric-only validation is not admitted')
-        # Copy raw tool evidence before TemporaryDirectory removes its live tree.
-        Path('outputs').mkdir(exist_ok=True)
-        archive = shutil.make_archive(str(Path('outputs').resolve() / ('capability-' + candidate_hash)), 'gztar', temporary)
-        return dict(**common, exercise=kind, outcome='required-capability-verified',
-                    evidence=result, archive=receipt_file(archive))
+        retained.update(outcome='required-capability-verified', exercise_validated=True, evidence=result)
+    return retained

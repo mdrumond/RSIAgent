@@ -16,7 +16,7 @@ def case_identity(seed):
 
 
 def freeze_verifier(destination, *, seed, runtime_identity, physical_device, outer_cpl_handle,
-                    execution_inputs=('candidate.py',), generated_paths=('outputs', 'cache')):
+                    execution_inputs=('candidate.py',), generated_paths=('outputs', 'cache'), source=None):
     """Write outside Actor-editable source; profiles supply all machine paths.
 
     The generated Python file embeds cases and identity, so PythonExecution's
@@ -41,7 +41,7 @@ def freeze_verifier(destination, *, seed, runtime_identity, physical_device, out
                 'pipeline_manifest', 'pipeline_manifest_sha256', 'catlass_module_sha256', 'compiler_paths'}
     if set(runtime_identity) != required or not runtime_identity['consumer_files']:
         raise ValueError('complete discovered runtime and compiler identity required')
-    kinds = {'conversion', 'compiler-repair', 'printf-numeric', 'api-ast-ir', 'missing-feature',
+    kinds = {'language-conversion', 'conversion', 'compiler-repair', 'printf-numeric', 'api-ast-ir', 'missing-feature',
              'msprof-basic', 'msdebug-mssanitizer', 'device-environment-5xxxx'}
     exercise = seed['exercise']
     required_operation = {'conversion':'convert', 'api-ast-ir':'multiply', 'missing-feature':'relu'}
@@ -49,12 +49,28 @@ def freeze_verifier(destination, *, seed, runtime_identity, physical_device, out
         raise ValueError('exercise and independent numeric operation disagree')
     if exercise['kind'] not in kinds:
         raise ValueError('explicit registered exercise required; numeric-only acceptance forbidden')
+    if exercise['kind'] == 'language-conversion':
+        provenance = exercise.get('provenance', {})
+        if not all(provenance.get(k) for k in ('repository', 'revision', 'path', 'symbol', 'sha256')):
+            raise ValueError('language conversion requires exact pinned Ascend C provenance')
+        if not all(exercise.get(k) for k in ('source_path', 'provenance_path')):
+            raise ValueError('language conversion requires Actor-readable frozen source inputs')
     if exercise['kind'] == 'compiler-repair' and not all(exercise.get(k) for k in ('original_source', 'diagnostic_pattern')):
         raise ValueError('compile repair needs frozen original source and original diagnostic selector')
     if exercise['kind'] in {'printf-numeric', 'msprof-basic', 'msdebug-mssanitizer', 'device-environment-5xxxx'} and not exercise.get('tools'):
         raise ValueError('exercise needs version-matched trusted tool commands')
-    if exercise['kind'] == 'api-ast-ir' and not exercise.get('capture_tool'):
-        raise ValueError('IR exercise needs trusted capture helper identity')
+    if exercise['kind'] == 'api-ast-ir':
+        from rsi.catlass_capabilities import OWNED_CAPTURE_HELPER_SHA256
+        tool = exercise.get('capture_tool', {})
+        if tool.get('sha256') != OWNED_CAPTURE_HELPER_SHA256:
+            raise ValueError('IR exercise requires the pinned owned no-shim helper, not the installed helper')
+        helper = Path(tool['path'])
+        if not helper.is_absolute():
+            if source is None:
+                raise ValueError('source directory required to verify the actual project-local IR helper')
+            helper = Path(source) / helper
+        if not helper.is_file() or hashlib.sha256(helper.read_bytes()).hexdigest() != OWNED_CAPTURE_HELPER_SHA256:
+            raise ValueError('actual IR helper does not implement the pinned owned no-shim capability')
     contract = dict(abi_version=ABI_VERSION, operation=seed['operation'], cases=seed['cases'],
                     physical_device=physical_device, outer_cpl_handle=outer_cpl_handle,
                     execution_runtime='catlass-dsl', direct_physical=False, case_hash=case_identity(seed),
@@ -113,3 +129,14 @@ def worker_environment(*, inherited, outer_cpl_handle, physical_device, cache_di
                   RSI_OUTER_CPL_HANDLE=outer_cpl_handle,
                   RSI_CPL_RUNTIME='catlass-dsl')
     return result
+
+
+def project_spec(*, project_id, goal, config):
+    """Finalize launch argv from the canonical config, never staging placeholders."""
+    from rsi.contracts import ProjectSpec
+
+    if config.executor_identity is not None:
+        raise ValueError('A5 on-host binding uses default local execution')
+    return ProjectSpec(project_id=project_id, goal=goal,
+                       command=tuple(config.commands['test']), budgets=elapsed_budget(),
+                       starting_folder=config.source, correctness_ref=config.verifier)
