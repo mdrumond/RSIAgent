@@ -254,8 +254,44 @@ class ProjectWave:
             if elapsed < row['actor_seconds']:
                 raise ValueError('closure accounting precedes retained result')
             row.update(actor_seconds=elapsed, closure=proof)
-            if row['status'] != 'completed' and proof.get('resume_ready') is True:
+            if (row['status'] != 'completed' and proof.get('resume_ready') is True
+                    and elapsed < row['allowance']):
                 row.update(status='ready', device=None, reopen=True)
+            self._save(state)
+            return self._status(state)
+
+    def settle_exhausted(self, project, runner):
+        """Retain a canonical exhausted outcome after authoritative closure.
+
+        Reopening or a caller-supplied status is insufficient. The same runner
+        must verify its retained run/closure/source/accounting failure proof.
+        No actor is dispatched and no additional allocation is granted.
+        """
+        from rsi.project_runner import ProjectRunner
+        with self._lock():
+            state = self._load()
+            row = state['projects'][project]
+            if (row['status'] != 'pending' or not row.get('closure', {}).get('closed')
+                    or not isinstance(runner, ProjectRunner)
+                    or runner.root.resolve() != (self._branch(project) / 'runner').resolve()):
+                raise ValueError('same canonical runner and authoritative closure required')
+            event = runner.latest('project-run-outcome')
+            if not event:
+                raise ValueError('retained canonical outcome required')
+            outcome = runner.store.read_json(event['reference'])
+            result = outcome['result']
+            if result['status'] != 'budget_exhausted':
+                raise ValueError('only an observed exhausted outcome can settle exhaustion')
+            failure = runner.terminal_failure_proof(closure_ref=outcome['closure_ref'])
+            elapsed = runner.workflow.accounting.seconds()
+            if (elapsed < row['actor_seconds'] or elapsed < row['allowance']
+                    or runner.workflow.remaining()['actor_seconds'] != 0):
+                raise ValueError('authoritative exhausted elapsed accounting required')
+            proof_ref = runner.store.put_json(failure)
+            row.update(status='completed', device=None, actor_seconds=elapsed,
+                receipt=dict(dispatch_id=row['dispatch_id'], result=result, actor_seconds=elapsed,
+                    settled=True, terminal_failure_proof=proof_ref,
+                    original_receipt=row.get('receipt')))
             self._save(state)
             return self._status(state)
 

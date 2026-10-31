@@ -297,3 +297,40 @@ def test_two_spawned_children_keep_snapshots_results_and_sources_isolated(tmp_pa
     reopened = wave(tmp_path)
     assert reopened.run(successful_spawned_runner)['projects'] == rows
     assert reopened.publish() == published
+
+
+def test_exhaustion_closure_can_publish_without_recovery_allocation(tmp_path, monkeypatch):
+    from rsi.project_runner import ProjectRunner
+    from rsi.runtime import WorkflowError
+    pool = wave(tmp_path, ('a',), parallel=1)
+    requests, _ = processes(monkeypatch, failures=('a',))
+    pool.run(None)
+    request = requests[0]
+    initial = spawned_runner(request)
+    now = [initial.workflow.state['created']]
+
+    class ExhaustedSession(ClosedScriptedSession):
+        def next_action(self, *args, **kwargs):
+            now[0] += 7201.
+            raise WorkflowError('time budget exhausted')
+
+    runner = ProjectRunner(request.root, query=lambda *args: None,
+        backend_identity='TEST-WAVE', session_factory=ExhaustedSession,
+        test_backend=True, clock=lambda: now[0])
+    result = runner.run()
+    assert result['status'] == 'budget_exhausted'
+    elapsed = runner.workflow.accounting.seconds()
+    atomic_json(request.root.parent / 'wave-result.json', dict(
+        dispatch_id=request.dispatch_id, result=result, actor_seconds=elapsed, settled=False))
+    with pytest.raises(ValueError):
+        pool.settle_exhausted('a', runner)
+    pool.reconcile('a', lambda req, row: dict(closed=True,
+        observation='original worker and canonical actor closed',
+        actor_seconds=elapsed, resume_ready=True))
+    assert pool.status()['projects']['a']['status'] == 'pending'
+    pool.settle_exhausted('a', runner)
+    outcome = pool.publish()['outcomes'][0]
+    assert outcome['result']['status'] == 'budget_exhausted'
+    assert outcome['actor_seconds'] == elapsed
+    assert outcome['terminal_failure_proof']
+    assert pool.status()['projects']['a']['recovery'] is None
