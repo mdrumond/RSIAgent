@@ -515,7 +515,7 @@ class IsolatedRoles:
                             # The worker's API deadline is unchanged. Collect only
                             # authoritative completion/accounting; never admit a late proposal.
                             draining = True
-                            cutoff = now + self.receipt_grace_seconds
+                            cutoff += self.receipt_grace_seconds
                         else:
                             raise TimeoutError('roles worker deadline exhausted')
                     if not ready:
