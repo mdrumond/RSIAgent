@@ -103,7 +103,10 @@ def test_real_service_children_keep_carried_spec_through_strict_host_binder(wave
             project_configuration=dict(coordination=str(tmp_path / 'order'), expected=expected))
     path.write_text(json.dumps(values))
     settings = show_configuration(wave_instance.root)['payload']
-    settings['phase1_projects'].append(dict(settings['phase1_projects'][0], project_id='third'))
+    settings['budgets'] = dict(design_iterations=None, implementation_iterations=None,
+        execution_tries=None, actor_seconds=None, wall_seconds=None)
+    first = settings['phase1_projects'][0]
+    settings['phase1_projects'].append(dict(first, project_id='third', budgets=dict(first['budgets'])))
     settings['project_configs']['third'] = dict(settings['project_configs']['answer'])
     for spec in settings['phase1_projects']:
         spec['budgets']['actor_seconds'] = None if spec['project_id'] == 'third' else expected[spec['project_id']]
