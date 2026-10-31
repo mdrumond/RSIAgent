@@ -281,7 +281,7 @@ def test_invalid_cli_diagnostics_retained_unknown_submission_never_replayed(setu
         return SimpleNamespace(returncode=2, stdout=b'invalid json\n', stderr=b'native CLI rejected request\n')
     monkeypatch.setattr('rsi.cpl_execution.subprocess.run', invalid)
     first = run()
-    assert first['failure']['type'] == 'admission_unavailable'
+    assert first['failure']['type'] == 'submission_unknown'
     evidence = first['raw_measurements']['client_results'][0]
     assert evidence['stdout'] == 'invalid json\n'
     assert evidence['stderr'] == 'native CLI rejected request\n' and evidence['returncode'] == 2
