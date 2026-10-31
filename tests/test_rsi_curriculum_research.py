@@ -323,6 +323,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
     from rsi.roles import RoleFailure, _error_details
     researcher, parent, context, roles, _, _, clock, store = fixture
     original = roles.diagnostic
+    emitted_errors = []
     def invalid_diagnostic(prompt, evidence, **kwargs):
         roles.observer('role_started', {'role': 'diagnostic'})
         clock.now += 2
@@ -334,6 +335,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
             parse_proposal('diagnostic', payload, set(payload['evidence_ids']))
         except ValueError as exc:
             detail = _error_details(exc)
+            emitted_errors.append(detail)
             roles.observer('role_finished', dict(role='diagnostic', success=False, elapsed_seconds=2., error=detail))
             raise RoleFailure('diagnostic', detail['type'], detail['message']) from exc
     roles.diagnostic = invalid_diagnostic
@@ -341,7 +343,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
         researcher.research(parent, {}, context)
     receipt = store.read_json(rejected.value.receipt_ref)
     assert receipt['actor_seconds'] == 7
-    assert 'negative_decisions[0].redirection' in receipt['error']  # Actual validation error wire contract.
+    assert receipt['error'] == str(RoleFailure('diagnostic', emitted_errors[0]['type'], emitted_errors[0]['message']))
     roles.diagnostic = original
     original_query = roles.research_queries
     delivered = []
