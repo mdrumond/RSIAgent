@@ -480,7 +480,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def retain(self, runner):
         for path in runner.store.objects.glob('*/*'):
-            self.store.put_bytes(runner.store.read_bytes(path.parent.name + path.name))
+            self.store.retain_from(runner.store, path.parent.name + path.name)
 
     def load_project(self, row):
         operation = row['operation_id']

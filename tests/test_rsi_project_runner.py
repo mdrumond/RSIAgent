@@ -69,11 +69,14 @@ class Session:
         pass
 
 
-def make(tmp_path, session=None, *, config_overrides=None, budgets=None, source_text=None, **overrides):
+def make(tmp_path, session=None, *, config_overrides=None, budgets=None, source_text=None,
+         extra_files=None, **overrides):
     source = tmp_path / 'input'
     source.mkdir()
     (source / 'solution.py').write_text(source_text or 'def solve(xs):\n    total = 0.0\n    for x in xs: total += x\n    return total\n')
     (source / 'helper.py').write_text('value = 1\n')
+    for name, content in (extra_files or {}).items():
+        (source / name).write_bytes(content)
     verifier = tmp_path / 'verify.py'
     verifier.write_text("import runpy\nsolve = runpy.run_path('solution.py')['solve']\n"
                         "assert solve([1e16, 1., -1e16]) == 1., 'numeric cancellation'\n")
@@ -488,8 +491,11 @@ def test_explicit_redesign_has_scoped_cas_reason_and_new_design_evidence(tmp_pat
         database.close()
 
 
-@pytest.mark.parametrize('requested_path', ['guidance.md', '../guidance.md'])
-def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path):
+@pytest.mark.parametrize(('requested_path', 'error_type'), [
+    ('guidance.md', 'FileNotFoundError'), ('../guidance.md', 'ValueError'),
+    ('.', 'IsADirectoryError'), ('solution.py/child', 'NotADirectoryError'),
+    ('artifact.bin', 'UnicodeDecodeError')])
+def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, requested_path, error_type):
     class CorrectPath(Session):
         def next_action(self, context, allowed, **kwargs):
             if context['stage'] == Stage.TASK_CONSTRUCTION.value:
@@ -501,6 +507,9 @@ def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, re
                     return 'read_project_file', dict(path=requested_path)
                 assert reads[0]['status'] == 'error'
                 assert reads[0]['evidence']['path'] == requested_path
+                assert reads[0]['evidence']['error_type'] == error_type
+                assert reads[0]['evidence']['selected_file'] == 'solution.py'
+                assert reads[0]['evidence']['editable_files'] == ['solution.py', 'helper.py']
                 assert 'content' not in reads[0]['evidence']
                 if len(reads) == 1:
                     assert context['source']['path'] == 'solution.py'
@@ -511,29 +520,52 @@ def test_readonly_path_error_is_durable_feedback_and_model_corrects(tmp_path, re
                 if len(reads) == 2:
                     return 'read_project_file', dict(path='solution.py')
             return super().next_action(context, allowed, **kwargs)
-    runner, _, database = make(tmp_path, CorrectPath())
+    runner, _, database = make(tmp_path, CorrectPath(), extra_files={'artifact.bin': b'\xff\xfe\x00'})
     try:
         result = runner.run()
         assert result['status'] == 'accepted', result
         errors = [e for e in runner.events if e['type'] == 'project-tool' and e['status'] == 'error']
         assert len(errors) == 1
         payload = runner.store.read_json(errors[0]['reference'])
-        assert payload['error_type'] in ('ValueError', 'FileNotFoundError')
+        assert payload['error_type'] == error_type
         assert payload['editable_files'] == ['solution.py', 'helper.py']
         assert result['pending'] is None
     finally:
         database.close()
 
 
-def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch):
+@pytest.mark.parametrize('failure', [PermissionError('unreadable protected input'), OSError(5, 'backend I/O failed')])
+def test_readonly_recovery_does_not_swallow_other_errors(tmp_path, monkeypatch, failure):
     runner, _, database = make(tmp_path)
     try:
         def denied(_):
-            raise PermissionError('unreadable protected input')
+            raise failure
         monkeypatch.setattr(runner.backend, 'read', denied)
-        with pytest.raises(PermissionError):
+        with pytest.raises(type(failure)) as caught:
             runner.tool('read_project_file', Stage.PREFLIGHT, dict(path='solution.py'), 'unused')
+        assert caught.value is failure
+        assert runner.selected_file == 'solution.py'
         assert runner.events == []
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(('path', 'error_type'), [('.', 'IsADirectoryError'),
+    ('helper.py/child', 'NotADirectoryError'), ('artifact.bin', 'UnicodeDecodeError')])
+def test_invalid_read_preserves_nondefault_selection_and_next_valid_read(tmp_path, path, error_type):
+    runner, _, database = make(tmp_path, extra_files={'artifact.bin': b'\xff\x00'})
+    try:
+        runner.tool('read_project_file', Stage.DESIGN, dict(path='helper.py'), 'read-fixture')
+        failed = runner.tool('read_project_file', Stage.DESIGN, dict(path=path), 'read-fixture')
+        assert failed['status'] == 'error' and failed['evidence']['error_type'] == error_type
+        assert failed['evidence']['selected_file'] == runner.selected_file == 'helper.py'
+        event = runner.events[-1]
+        assert event['status'] == 'error' and event['reference'] == failed['reference']
+        assert runner.store.read_json(event['reference']) == failed['evidence']
+        valid = runner.tool('read_project_file', Stage.DESIGN, dict(path='solution.py'), 'read-fixture')
+        assert valid['status'] == 'ok'
+        assert valid['evidence']['content'] == (runner.backend.project / 'solution.py').read_text()
+        assert runner.selected_file == 'solution.py'
     finally:
         database.close()
 

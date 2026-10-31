@@ -272,12 +272,14 @@ class ProjectRunner:
         elif name == 'read_project_file':
             try:
                 row = self.backend.read(args['path'])
-            except (FileNotFoundError, ValueError) as exc:
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError, ValueError) as exc:
                 read_error = True
                 ref = self.store.put_json(dict(status='error', path=args['path'],
                     error_type=type(exc).__name__, message=str(exc),
                     editable_files=list(self.config.editable_files),
-                    hint='Choose a project path; KDB citation paths are not project files.'))
+                    selected_file=self.selected_file,
+                    hint='Choose a UTF-8 regular project file, for example one of editable_files. '
+                         'Directories, binary files and KDB citation paths cannot be read as project text.'))
             else:
                 self.selected_file = args['path']
                 ref = self.store.put_json(dict(path=self.selected_file, **row))
