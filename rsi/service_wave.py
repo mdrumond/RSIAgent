@@ -180,7 +180,7 @@ class ProjectWorkerFactory:
         runner = composition.runner(request.root, spec=ProjectSpec.from_dict(spec),
             bundle=SkillBundle.from_dict(json.loads(request.skills)), config=config,
             memory_ref=admitted['memory'], backend_identity=backend, reopen=request.reopen,
-            configuration_ref=admitted['configuration'], command_guard=(
+            configuration_ref=operation['binding']['configuration'], command_guard=(
                 ProfileCommandGuard(self.executor_factory, profile)
                 if profile and device.get('executor_identity') is None else None))
         if resolution:
@@ -471,9 +471,16 @@ class WaveBindings:
         self.active_pool = pool
         try:
             if wave['phase'] == 'executing':
-                pool.run(self._factory(wave), should_stop=getattr(cycle, 'should_stop', None),
-                         progress=getattr(cycle, 'wave_progress', None))
-                self.observe()
+                while True:
+                    pool.run(self._factory(wave), should_stop=getattr(cycle, 'should_stop', None),
+                             progress=getattr(cycle, 'wave_progress', None))
+                    before = pool.status()
+                    observed = self.observe()
+                    # A closed failed worker releases its lease only through host
+                    # observation. Drain READY siblings on that proven free slot.
+                    if (observed['stopped'] or not any(r['status'] == 'ready' for r in observed['projects'].values())
+                            or before == observed):
+                        break
             rows = pool.status()['projects']
             if any(row['status'] != 'completed' for row in rows.values()):
                 raise RuntimeError('wave unsettled; observe retained controllers and target handles')
