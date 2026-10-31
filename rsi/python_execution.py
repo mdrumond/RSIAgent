@@ -7,6 +7,7 @@ verification remains outside the editable project and is hash-checked each run.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -16,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Protocol
 
 from core.artifacts import ContentAddressedArtifacts
 from rsi.contracts import Stage
@@ -111,6 +113,49 @@ def ingest_elapsed(clock, operation_id, receipt, *, observed_start, observed_end
     clock.save()
 
 
+@dataclass(frozen=True)
+class CommandRequest:
+    operation_id: str
+    command: str
+    argv: tuple[str, ...]
+    project: Path
+    verifier: Path
+    source_hash: str
+    verifier_hash: str
+    category: str
+    profile_path: Path | None
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: bytes = b''
+    stderr: bytes = b''
+    timed_out: bool = False
+
+
+class TrustedExecutor(Protocol):
+    """Host injection; owns target path mapping, frozen verifier and transfers.
+
+    observe(phase, **metadata) marks entry into that phase in controller time;
+    it is not a retrospective duration report. Call observe('command', ...) before
+    running/observing command work, including after setup or output transfers.
+    execute must observe actual CPL handles before waiting, retain target/runtime/
+    physical-device/candidate-case identity in observation metadata, and honor
+    remaining() before each nested command. Only observed setup/transfer phases
+    are excluded. Return only after terminal observation and output/source sync.
+    An exception means unknown work: callers retain pending and never redispatch.
+    No credentials or transport implementation belong in this protocol.
+    """
+
+    def execute(self, request: CommandRequest, *, observe, remaining) -> CommandResult: ...
+
+
+class _UnboundExecutor:
+    def execute(self, request, *, observe, remaining):
+        raise WorkflowError('reopen snapshot with its trusted executor factory before execution')
+
+
 class PythonExecution:
     """Task snapshot, CAS command receipts, exact-source edits and verification.
 
@@ -119,7 +164,7 @@ class PythonExecution:
     observed/reconciled by the owner and must never be dispatched again.
     """
 
-    def __init__(self, root, workflow=None):
+    def __init__(self, root, workflow=None, *, executor_factory=None):
         self.root = Path(root).resolve()
         self.project = self.root / 'project'
         self.verifier = self.root / 'frozen' / 'verify.py'
@@ -127,10 +172,19 @@ class PythonExecution:
         self.workflow = workflow
         self.manifest = json.loads((self.root / 'manifest.json').read_text())
         self.contract = self.store.read_json(self.manifest['contract'])
+        identity = self.contract.get('executor_identity')
+        if identity is not None and executor_factory is None:
+            raise ValueError('frozen executor binding requires a trusted executor factory')
+        self.executor = executor_factory(identity) if identity is not None else None
+        if identity is not None and not callable(getattr(self.executor, 'execute', None)):
+            raise ValueError('trusted executor must implement execute')
 
     @classmethod
     def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None, editable_files=None,
-                 generated_paths=()):
+                 generated_paths=(), executor_identity=None):
+        if executor_identity is not None and (
+                not isinstance(executor_identity, str) or not executor_identity.strip()):
+            raise ValueError('executor_identity must be a nonblank trusted binding')
         root, source, verifier = Path(root).absolute(), Path(source).resolve(), Path(verifier).resolve()
         if root.exists() or root.resolve().is_relative_to(source):
             raise ValueError('task must be new and outside the input folder')
@@ -182,8 +236,11 @@ class PythonExecution:
                             generated_paths=generated_paths, verifier_name=verifier_name,
                             verifier=digest(verifier.read_bytes()),
                             performance_seconds=performance_seconds)
+            if executor_identity is not None:
+                contract['executor_identity'] = executor_identity
             atomic_json(root / 'manifest.json', {'contract': store.put_json(contract)})
-            return cls(root)
+            # Snapshotting must not construct a target adapter or dispatch work.
+            return cls(root, executor_factory=lambda identity: _UnboundExecutor())
         except BaseException:
             shutil.rmtree(root)
             raise
@@ -263,6 +320,62 @@ class PythonExecution:
         """Run the frozen independent correctness verifier with numeric classification."""
         return self.run(operation, 'test', numeric=True)
 
+    def _execute_target(self, request, record, timeout):
+        """Persist observations before further target effects; failures stay pending."""
+        clock = self.workflow.accounting
+        token = record['clock_token']
+        started = time.monotonic()
+        charged = 0.0
+
+        def close_interval():
+            nonlocal charged
+            clock.end(token)
+            kind, start, end = clock.records[token]
+            if kind in clock.BILLABLE:
+                charged += end - start
+
+        def observe(phase, **metadata):
+            nonlocal token
+            if phase not in ('setup', 'transfer', 'command'):
+                raise ValueError('executor phase must be setup, transfer or command')
+            # Save even handle-only observations; never synthesize a CPL handle.
+            record.setdefault('observations', []).append(dict(phase=phase, **metadata))
+            self._save(request.operation_id, record)
+            close_interval()
+            token = clock.start(request.category if phase == 'command' else phase)
+            record['clock_token'] = token
+            self._save(request.operation_id, record)
+
+        def remaining():
+            if self.workflow.state['stopped'] or self.workflow.outcome:
+                return 0.
+            limits = [value for value in self.workflow.remaining().values() if value is not None]
+            if timeout is not None:
+                active = (clock.now() - clock.records[token][1]
+                          if clock.records[token][0] in clock.BILLABLE else 0.)
+                limits.append(max(0, timeout - charged - active))
+            return min(limits) if limits else None
+
+        try:
+            result = self.executor.execute(request, observe=observe, remaining=remaining)
+            if not isinstance(result, CommandResult):
+                raise TypeError('executor must return a terminal CommandResult')
+            if not isinstance(result.stdout, bytes) or not isinstance(result.stderr, bytes):
+                raise TypeError('command output must be bytes')
+            if (type(result.returncode) is not int or type(result.timed_out) is not bool):
+                raise TypeError('terminal command requires integer returncode and boolean timed_out')
+            return result
+        except BaseException:
+            clock.uncertainties['executor:' + request.operation_id] = dict(
+                status='unknown', receipt=str(self._receipt_path(request.operation_id)))
+            clock.save()
+            raise
+        finally:
+            close_interval()
+            record['elapsed'] = charged
+            record['observed_elapsed'] = time.monotonic() - started
+            self._save(request.operation_id, record)
+
     def run(self, operation, command, *, numeric=False, profile=False, timeout=None):
         if self._receipt_path(operation).exists():
             previous = self.receipt(operation)
@@ -300,6 +413,8 @@ class PythonExecution:
                       argv=argv, status='pending', category=category, numeric=numeric, profiling=profile,
                       stage_source_hash=self.workflow.source_hash,
                       stage_operation=self.workflow.pending['id'] if self.workflow.pending else None)
+        if self.executor is not None:
+            record['executor_identity'] = contract['executor_identity']
         if not self.workflow.reserve_execution(operation):
             raise WorkflowError('reserved command has no receipt; reconcile before dispatch')
         self._save(operation, record)
@@ -309,43 +424,55 @@ class PythonExecution:
         started = time.monotonic()
         process, timed_out, stdout, stderr, returncode = None, False, b'', b'', None
         interrupted = None
-        try:
-            process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True)
-            record['pid'] = process.pid
-            self._save(operation, record)
+        if self.executor is not None:
+            request = CommandRequest(operation, command, tuple(argv), self.project, self.verifier,
+                source_hash, contract['verifier'], category, profile_path if profile else None)
+            target_result = self._execute_target(request, record, timeout)
+            stdout, stderr = target_result.stdout, target_result.stderr
+            returncode, timed_out = target_result.returncode, target_result.timed_out
+            elapsed = record['elapsed']
+        else:
             try:
-                stdout, stderr = process.communicate(
-                    timeout=None if limit is None else max(0, limit - (time.monotonic() - started)))
-            except subprocess.TimeoutExpired:
-                timed_out = True
+                process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, start_new_session=True)
+                record['pid'] = process.pid
+                self._save(operation, record)
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                stdout, stderr = process.communicate()
-            returncode = process.returncode
-        except OSError as exc:
-            stderr = str(exc).encode()
-        except BaseException as exc:
-            interrupted = exc
-            # Only this live Popen instance establishes process-group ownership.
-            # Never act on a persisted PID after restart.
-            if process is not None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                stdout, stderr = process.communicate()
-                returncode = process.returncode
-        finally:
-            elapsed = time.monotonic() - started
-            # Producer elapsed is authoritative, never a subtraction of wall epochs.
-            ended = self.workflow.accounting.records[token][1] + elapsed
-            record['elapsed'] = elapsed
-            self._save(operation, record)
-            self.workflow.accounting.reconcile(token, ended)
+                    if process is not None:
+                        stdout, stderr = process.communicate(
+                            timeout=None if limit is None else max(0, limit - (time.monotonic() - started)))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    stdout, stderr = process.communicate()
+                if process is not None:
+                    returncode = process.returncode
+            except OSError as exc:
+                stderr = str(exc).encode()
+            except BaseException as exc:
+                interrupted = exc
+                # Only this live Popen instance establishes process-group ownership.
+                # Never act on a persisted PID after restart.
+                if process is not None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    stdout, stderr = process.communicate()
+                    returncode = process.returncode
+            finally:
+                elapsed = time.monotonic() - started
+                # Producer elapsed is authoritative, never a subtraction of wall epochs.
+                ended = self.workflow.accounting.records[token][1] + elapsed
+                record['elapsed'] = elapsed
+                self._save(operation, record)
+                self.workflow.accounting.reconcile(token, ended)
         current = self.project_hash()
+        if digest(self.verifier.read_bytes()) != contract['verifier']:
+            raise WorkflowError('frozen verifier changed during command; reconcile pending execution')
         if current != source_hash:
             # Composition must reconcile pending Workflow source edits itself.
             if not self.workflow.pending:
@@ -358,7 +485,9 @@ class PythonExecution:
         if classification == 'passed' and command in ('timing', 'profile') and goal is not None and elapsed > goal:
             classification = 'performance_shortfall'
         result = dict(record, status='complete', returncode=returncode, timed_out=timed_out,
-                      elapsed=elapsed, clock_domain='producer_monotonic', current_hash=current,
+                      elapsed=elapsed,
+                      clock_domain='controller_intervals' if self.executor is not None else 'producer_monotonic',
+                      current_hash=current,
                       classification=classification, stdout=self.store.put_bytes(stdout),
                       stderr=self.store.put_bytes(stderr))
         if profile_path.exists():
