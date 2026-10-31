@@ -92,14 +92,11 @@ class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
                  budget=None, own_process_group=True, system_prompt=SYSTEM,
                  first_action_only=False, context_factory=ContextRecords,
-                 context_window=65536, request_bytes=196608):
-        # Finite production capacities, deliberately below the registered
-        # DeepSeek Flash 1M context. Smaller native stress limits are explicit.
-        # These are admission settings, never history-pruning instructions.
+                 context_window=65536, request_bytes=None):
+        # Generic snapshot/reviewer callers retain their historical byte limits.
+        # The canonical controller explicitly selects production capacities.
         if type(context_window) is not int or not 0 < context_window <= 65536:
             raise ValueError("context_window must be an integer in 1..65536")
-        if type(request_bytes) is not int or not 0 < request_bytes <= 196608:
-            raise ValueError("request_bytes must be an integer in 1..196608")
         self.context_window = context_window
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
@@ -112,6 +109,10 @@ class PiCodingSession:
         if self.profile.generation.max_tokens >= context_window:
             raise ValueError("context_window must leave room beyond the registered output allowance")
         provider = "deepseek" if self.model == BackendModel.DEEPSEEK_FLASH.value else "openai"
+        if request_bytes is None:
+            request_bytes = 49152 if provider == 'deepseek' else 196608
+        if type(request_bytes) is not int or not 0 < request_bytes <= 196608:
+            raise ValueError("request_bytes must be an integer in 1..196608")
         environment = os.environ if environ is None else environ
         key = environment.get(PROVIDERS[provider]["key"])
         if not key:
