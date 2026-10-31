@@ -186,7 +186,7 @@ class Researcher:
             save()
             original_observer(event, payload)
         self.roles.observer = observe
-        query_refs, negatives = [], set()
+        query_refs, negatives, decision = [], set(), None
         def exhausted():
             return (state['actor_seconds'] >= allowance or
                     wall_deadline is not None and self.clock() >= wall_deadline)
@@ -200,7 +200,8 @@ class Researcher:
                 request_ref=request_ref, status=status, proposal=asdict(proposal) if proposal else None,
                 evidence_refs=state['evidence_refs'], actor_seconds=seconds,
                 artifact_refs=[request_ref, *state['events'], *state['evidence_refs']],
-                measured_actor_seconds=state['actor_seconds'], error=error)
+                measured_actor_seconds=state['actor_seconds'], error=error,
+                decision=asdict(decision) if status == 'accepted' else None)
             state['settled'] = True
             state.update(status='completed' if status in ('accepted', 'budget_exhausted') else status,
                          receipt_ref=self.store.put_json(receipt), actor_seconds=seconds)
@@ -291,8 +292,7 @@ class Researcher:
         finally:
             self.roles.observer = original_observer
 
-    @staticmethod
-    def _facts(row):
+    def _facts(self, row):
         """Useful bounded facts; complete documents and diagnostics stay in CAS."""
         if not isinstance(row, dict):
             return str(row)[:2048]
@@ -303,14 +303,104 @@ class Researcher:
                   and isinstance(v, (str, int, float, bool))}
         memory = row.get('memory', row)
         if isinstance(memory, dict) and isinstance(memory.get('proposal'), dict):
-            result['memory'] = Researcher._facts(memory['proposal'])
+            result['memory'] = self._facts(memory['proposal'])
         if isinstance(row.get('proof_scope'), dict):
-            result['proof_scope'] = Researcher._facts(row['proof_scope'])
+            result['proof_scope'] = self._facts(row['proof_scope'])
         observed = row.get('observations')
+        observation_ref = row.get('observations_ref')
+        if observation_ref:
+            retained = self.store.read_json(observation_ref)
+            if (not isinstance(retained, dict) or retained.get('schema') != 'rsi-project-observations-v1'
+                    or observed is not None and observed != retained):
+                raise ValueError('admitted observation reference differs from host facts')
+            observed = retained
         if isinstance(observed, dict):
-            result['observations'] = dict(outcome=observed.get('outcome'),
-                applicability=observed.get('applicability'), limitations=observed.get('limitations'))
+            observation_ref = observation_ref or self.store.put_json(observed)
+            commands = observed.get('commands', {}).get('items', [])
+            shown = []
+            for command in commands[-3:]:
+                fact = {k: command[k] for k in ('command', 'classification', 'returncode', 'numeric',
+                    'source_hash', 'final_source_scope') if k in command}
+                fact['artifact_ref'] = self.store.put_json(command)
+                for stream in ('stdout', 'stderr'):
+                    preview = command.get(stream, {})
+                    preview = preview if isinstance(preview, dict) else {'text': str(preview)}
+                    text = preview.get('text', '')
+                    fact[stream] = dict(text=text[:1024], truncated=len(text) > 1024 or preview.get('truncated', False))
+                    if isinstance(preview, dict) and preview.get('reference'):
+                        fact[stream]['reference'] = preview['reference']
+                    if stream == 'stdout' and len(text.encode()) <= 2048:
+                        import json
+                        try:
+                            value = json.loads(text, parse_constant=lambda value: value)
+                        except ValueError:
+                            pass
+                        else:
+                            if isinstance(value, (dict, list)):
+                                fact['structured_stdout'] = value
+                shown.append(fact)
+            result['observations'] = dict(artifact_ref=observation_ref, outcome=observed.get('outcome'),
+                applicability=observed.get('applicability'), limitations=observed.get('limitations'),
+                validation=observed.get('validation'), commands=dict(items=shown,
+                    total=observed.get('commands', {}).get('total', len(commands)),
+                    truncated=len(commands) > len(shown) or observed.get('commands', {}).get('truncated', False)))
         return result
+
+    def actor_context(self, receipt_ref):
+        """Give the canonical child useful research facts, not only opaque hashes."""
+        import json
+        from core.artifacts import canonical_bytes
+        receipt = self.store.read_json(receipt_ref)
+        if receipt.get('status') != 'accepted':
+            raise ValueError('actor research context requires an accepted decision')
+        decision = receipt.get('decision') or {}
+        if not decision:
+            for ref in receipt['artifact_refs']:
+                event = self.store.read_json(ref)
+                payload = event.get('payload', {})
+                if event.get('event') == 'role_proposal' and payload.get('role') == 'diagnostic':
+                    decision = payload['proposal']
+        request = self.store.read_json(receipt['request_ref'])
+        selected = receipt['proposal'].get('parent_project_id') or request['parent']['project_id']
+        failure = next((r['failure'] for r in request['context'].get('failed_parents', [])
+                        if r['project_id'] == selected), request['failure'])
+        facts = self._facts(failure)
+        commands = facts.get('observations', {}).get('commands', {}).get('items', [])
+        queries, documents = [], []
+        for ref in receipt['evidence_refs'][:2]:
+            query = self.store.read_json(ref)
+            queries.append(dict(reference=ref, query=query['query']['query']))
+            for row in query['response']['results'][:1]:
+                documents.append(dict(artifact_ref=self.store.put_json(row), facts=self._facts(row)))
+        negatives = decision.get('negative_decisions', [])
+        value = dict(receipt_ref=receipt_ref, rationale=decision.get('rationale', ''),
+            template_id=receipt['proposal']['template_id'], parent_project_id=selected,
+            host_failure={k: facts[k] for k in ('outcome', 'classification', 'error', 'source_hash') if k in facts},
+            commands=commands[-2:], queries=queries, documents=documents[:1],
+            negative_decisions=negatives[:1], negative_decision_count=len(negatives),
+            query_count=len(receipt['evidence_refs']),
+            presentation='Bounded excerpts; complete role/query/command records are retained in CAS.')
+        # Do not repeat unrelated observations or source bodies from document hits.
+        for doc in value['documents']:
+            doc['facts'] = {k: v for k, v in doc['facts'].items()
+                            if k in ('text', 'path', 'repository', 'revision', 'collection', 'summary', 'reason')}
+        identities = {'receipt_ref', 'reference', 'artifact_ref', 'query_ref', 'source_hash',
+                      'template_id', 'parent_project_id', 'path'}
+        def bounded(item, size, key=None):
+            if isinstance(item, str) and key not in identities:
+                return item.encode()[:size].decode(errors='ignore')
+            if isinstance(item, dict):
+                return {k: bounded(v, size, k) for k, v in item.items()}
+            if isinstance(item, list):
+                return [bounded(v, size) for v in item]
+            return item
+        for size in (240, 160, 96, 48):
+            shown = bounded(value, size)
+            if len(canonical_bytes(shown)) <= 2500:
+                return shown
+        if len(canonical_bytes(shown)) <= 4096:
+            return shown
+        raise ValueError('mandatory research context identities exceed the actor handoff budget')
 
     def _validate_failure(self, row):
         """Historical service envelopes remain archival, never new payload roots."""
