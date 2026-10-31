@@ -39,14 +39,16 @@ def response(actions, index, tokens=100, *, summary=None, finish=None, completio
     return result
 
 
-def native_actor(tmp_path, events, perform, tools=None, *, clock=None, limits=None):
+def native_actor(tmp_path, events, perform, tools=None, *, clock=None, limits=None,
+                 context_window=16384, request_bytes=49152):
     from coding.pi.session import runtime_preflight, RuntimeUnavailable
     try: runtime_preflight()
     except RuntimeUnavailable: pytest.skip('cached pinned Pi/Node22 required')
     workflow = Workflow(tmp_path/'workflow.json', lambda *_:False, source_hash='project-v1',
                         limits=limits, **({'clock':clock} if clock is not None else {}))
     actor = WorkflowActor(workflow, builtin_bundle(),
-        lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
+        lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'},
+                               context_window=context_window,request_bytes=request_bytes),
         perform=perform,preflight=lambda *_:StageResult(),evidence_tools=tools,
         emit=lambda kind,data:events.append((kind,data)))
     return actor, workflow
