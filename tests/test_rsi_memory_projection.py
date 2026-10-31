@@ -36,6 +36,11 @@ def dense_records(store):
                     command='test', classification='numeric_failure', final_source_scope=True,
                     stderr={'text': f'expected {i}, got -1'})]))),
             provenance=dict(raw_refs=[raw] * (65625 if i == 0 else 7795), queries=[evidence])))
+    for record in records:
+        observed = record['proposal']['observations']
+        observed['artifact_refs'] = [raw, evidence]
+        record['provenance']['packet'] = store.put_json(dict(
+            observations=observed, evidence={evidence: {'kind': 'failure'}}))
     return records, raw, evidence
 
 
@@ -108,7 +113,8 @@ def test_projection_retains_evidence_beyond_inline_preview(tmp_path):
     row = project_memory(original, store)
     assert row['proposal']['evidence'] == refs[:8]
     assert row['proposal']['evidence_count'] == 12
-    assert store.read_json(row['retained']['reference'])['artifact_refs'] == refs
+    assert row['proposal']['evidence_scope'] == 'origin-task-archive'
+    assert store.read_json(row['retained']['reference'])['artifact_refs'] == []
     assert store.read_json(row['artifact_ref']) == original
 
 
@@ -176,4 +182,62 @@ def test_archival_raw_identities_do_not_import_origin_task_into_descendants(tmp_
     assert row['provenance']['counts']['raw_refs'] == 1000
     assert store.read_json(row['artifact_ref']) == original
     assert historical not in set(_references(original))
-    assert evidence in store.read_json(row['retained']['reference'])['artifact_refs']
+    assert row['proposal']['evidence'] == [evidence]
+    assert row['proposal']['evidence_scope'] == 'origin-task-archive'
+
+
+def test_archived_service_result_does_not_require_historical_events_in_child(tmp_path):
+    origin = ContentAddressedArtifacts(tmp_path / 'origin')
+    event = origin.put_json({'type': 'old-provider-delta', 'content': 'original SFT'})
+    envelope = origin.put_json({'result': {'events': [event]}})
+    child = ContentAddressedArtifacts(tmp_path / 'child')
+    original = dict(memory_id='accepted', proposal=dict(kind='failure', evidence=[envelope]),
+                    provenance={'raw_refs': [event]})
+    row = project_memory(original, child)
+    pending, copied = list(_references(row)), set()
+    while pending:
+        ref = pending.pop()
+        if ref in copied:
+            continue
+        copied.add(ref)
+        pending.extend(_references(child.read_json(ref)))
+    assert envelope not in copied and event not in copied
+    assert row['proposal']['evidence_scope'] == 'origin-task-archive'
+    assert child.read_json(row['artifact_ref']) == original
+    assert origin.read_json(envelope)['result']['events'] == [event]
+
+
+from test_rsi_services import instance as memory_instance
+import pytest
+
+
+@pytest.mark.parametrize('required', ['packet', 'queries', 'observations_ref'])
+def test_canonical_runner_still_rejects_missing_required_memory_payload(memory_instance, required):
+    from benchmarks.ascend.subject_memory import SubjectMemory
+    from rsi.skills import builtin_bundle
+    from rsi.configuration import show_configuration, set_configuration
+    import hashlib
+    missing = 'e' * 64
+    proposal = dict(base_versions=[], kind='failure', project_id='previous',
+                    summary='numeric failure', evidence=[])
+    provenance = {}
+    if required == 'observations_ref':
+        proposal[required] = missing
+    else:
+        provenance[required] = [missing] if required == 'queries' else missing
+    memory = SubjectMemory(memory_instance.root / 'prior-memory')
+    memory.accept('accepted-failure', proposal, provenance)
+    snapshot = memory.snapshot()
+    (memory_instance.root / 'accepted.json').write_bytes(snapshot)
+    config = show_configuration(memory_instance.root)['payload']
+    config.update(memory_snapshot='accepted.json', memory_sha256=hashlib.sha256(snapshot).hexdigest())
+    set_configuration(memory_instance.root, config)
+    cycle = memory_instance.create_cycle('missing-required-payload', 'phase1')
+    try:
+        with pytest.raises(FileNotFoundError):
+            cycle.runner(memory_instance.root / 'probe-runner',
+                spec=cycle.spec.projects[0], bundle=builtin_bundle(),
+                config=memory_instance.project_config(config, cycle.spec.projects[0]),
+                memory_ref=cycle.spec.baseline_kdb, backend_identity='explicit-test-binding')
+    finally:
+        cycle.close()

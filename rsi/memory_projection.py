@@ -14,8 +14,11 @@ def project_memory(record, artifacts):
         values = proposal.get(key, [])
         projected[key] = values[:8]
         projected[key + '_count'] = len(values)
+    projected['evidence_scope'] = 'origin-task-archive'
+    # Accepted service-result IDs retain their original archival meaning. Their
+    # result.events must not import the originating actor's SFT into descendants.
     roots = [provenance.get('packet'), provenance.get('baseline'),
-             *provenance.get('queries', []), *proposal.get('evidence', [])]
+             *provenance.get('queries', [])]
     closure = artifacts.put_json(dict(schema='rsi-memory-retrieval-closure-v1',
         artifact_refs=[ref for ref in roots if isinstance(ref, str) and len(ref) == 64
                        and all(c in '0123456789abcdef' for c in ref)]))
