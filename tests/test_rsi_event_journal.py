@@ -101,8 +101,9 @@ def test_reference_write_bytes_grow_linearly_not_per_delta_full_index(tmp_path, 
         return result
     def count_atomic(path, value):
         category = 'head' if Path(path).name == 'events.head.json' else 'checkpoint'
-        written[category] += len(canonical_bytes(value))
-        return real_atomic(path, value)
+        result = real_atomic(path, value)
+        written[category] += Path(path).stat().st_size
+        return result
     monkeypatch.setattr(module.os, 'write', count_write)
     monkeypatch.setattr(module, 'atomic_json', count_atomic)
     journal = EventJournal(tmp_path)
@@ -113,8 +114,11 @@ def test_reference_write_bytes_grow_linearly_not_per_delta_full_index(tmp_path, 
     assert read_event_refs(tmp_path) == refs(count)
     assert written['journal'] == count * 65
     assert sum(written.values()) < count * 400
-    quadratic = sum(67 * n + 1 for n in range(1, count + 1))
+    quadratic = 68 * count * (count + 1) // 2
     assert quadratic > 100 * sum(written.values())
+    (tmp_path / 'write-evidence.json').write_text(json.dumps(dict(events=count,
+        serialized_bytes=written, total=sum(written.values()),
+        previous_full_index_bytes=quadratic), indent=2))
 
 
 def test_project_runner_reopen_retains_stream_usage_and_typed_host_events(tmp_path):
