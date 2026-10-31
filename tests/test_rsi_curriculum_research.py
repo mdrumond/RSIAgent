@@ -323,6 +323,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
     from rsi.roles import RoleFailure, _error_details
     researcher, parent, context, roles, _, _, clock, store = fixture
     original = roles.diagnostic
+    emitted_errors = []
     def invalid_diagnostic(prompt, evidence, **kwargs):
         roles.observer('role_started', {'role': 'diagnostic'})
         clock.now += 2
@@ -334,6 +335,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
             parse_proposal('diagnostic', payload, set(payload['evidence_ids']))
         except ValueError as exc:
             detail = _error_details(exc)
+            emitted_errors.append(detail)
             roles.observer('role_finished', dict(role='diagnostic', success=False, elapsed_seconds=2., error=detail))
             raise RoleFailure('diagnostic', detail['type'], detail['message']) from exc
     roles.diagnostic = invalid_diagnostic
@@ -341,7 +343,7 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
         researcher.research(parent, {}, context)
     receipt = store.read_json(rejected.value.receipt_ref)
     assert receipt['actor_seconds'] == 7
-    assert 'negative_decisions[0].redirection' in receipt['error']  # Actual validation error wire contract.
+    assert receipt['error'] == str(RoleFailure('diagnostic', emitted_errors[0]['type'], emitted_errors[0]['message']))
     roles.diagnostic = original
     original_query = roles.research_queries
     delivered = []
@@ -355,3 +357,49 @@ def test_specific_validation_failure_reaches_next_research_without_refund(fixtur
     assert feedback.data['error'] == receipt['error']
     assert result.actor_seconds == 7
     assert store.read_json(rejected.value.receipt_ref) == receipt
+
+
+def test_admitted_parameter_failure_details_reach_next_decision(fixture):
+    researcher, parent, context, roles, _, _, clock, store = fixture
+    original = roles.diagnostic
+    def invalid_parameters(*args, **kwargs):
+        decision = original(*args, **kwargs)
+        return replace(decision, proposal=replace(decision.proposal,
+            parameters={'case_indices': [0], 'parent_project_id': parent.project_id}))
+    roles.diagnostic = invalid_parameters
+    with pytest.raises(ResearchRejected) as rejected:
+        researcher.research(parent, {}, context)
+    receipt = store.read_json(rejected.value.receipt_ref)
+    detail = receipt['validation_error']
+    assert detail['field'] == 'proposal.parameters'
+    assert detail['expected'] == list(context['templates'][0]['parameters'])
+    assert detail['provided'] == ['case_indices', 'parent_project_id']
+    assert store.read_json(detail['admitted_schema']['artifact_ref']) == context['templates'][0]
+    seen = []
+    query = roles.research_queries
+    def receive(prompt, evidence, **kwargs):
+        seen.extend(evidence)
+        return query(prompt, evidence, **kwargs)
+    roles.research_queries, roles.diagnostic = receive, original
+    result = researcher.research(parent, {}, dict(context, operation_id='correct-parameters',
+        deadline=clock.now + 20, previous_rejections=[rejected.value.receipt_ref]))
+    feedback = next(e for e in seen if e.evidence_id == rejected.value.receipt_ref)
+    assert feedback.data['validation_error'] == detail
+    assert receipt['actor_seconds'] == result.actor_seconds == 7
+    assert result.proposal.parameters == {'case_indices': [0]}
+    assert store.read_json(rejected.value.receipt_ref) == receipt
+
+
+@pytest.mark.parametrize('parameters,field,expected,provided', [
+    ({'case_indices': []}, 'proposal.parameters.case_indices', {'minItems': 1, 'maxItems': 2}, 0),
+    ({'case_indices': [99]}, 'proposal.parameters.case_indices[0]', [0, 1, 2], 99),
+    ({'case_indices': [True]}, 'proposal.parameters.case_indices[0]', 'integer', 'bool'),
+])
+def test_parameter_constraint_feedback_is_exact_host_data(fixture, parameters, field, expected, provided):
+    researcher, parent, context, _, _, _, _, store = fixture
+    proposal = DiagnosticProposal('child', 'goal', 'oracle', 'cpu.case-subset', parameters)
+    with pytest.raises(ValueError) as error:
+        researcher._validate_template(proposal, parent.project_id, context['templates'], artifacts=store)
+    detail = error.value.details
+    assert (detail['field'], detail['expected'], detail['provided']) == (field, expected, provided)
+    assert store.read_json(detail['admitted_schema']['artifact_ref']) == context['templates'][0]
