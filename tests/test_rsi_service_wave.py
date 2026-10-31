@@ -204,3 +204,54 @@ def test_phase2_keeps_parent_learning_callbacks_after_siblings_settle(wave_insta
         assert cycle.learning.active == cycle.scheduler.state['skills'] == baseline
     finally:
         cycle.close()
+
+
+class UnclosedDecisions(Decisions):
+    def close(self):
+        from coding.pi.rpc import PiProviderError
+        raise PiProviderError('scripted unresolved actor closure')
+
+
+def test_cli_unknown_child_closure_is_bounded_and_resume_never_replays(wave_instance, monkeypatch, capsys):
+    import signal
+    import time
+    import rsi.cli
+    import rsi.job_cli
+    import rsi.pinned_cli
+    import rsi.service
+    wave_instance.test = replace(wave_instance.test, session_factory=UnclosedDecisions)
+    monkeypatch.setattr(rsi.service, 'InstanceServices', lambda _: wave_instance)
+    monkeypatch.setattr(rsi.pinned_cli, 'dispatch', lambda *args: None)
+    def launch(root, request):
+        return rsi.service.run_job(root, request, show_configuration(root),
+                                  should_stop=lambda: False, emit=lambda event: None)
+    monkeypatch.setattr(rsi.job_cli.jobs, 'start', launch)
+    monkeypatch.setattr(rsi.job_cli.jobs, 'status', lambda *args: dict(request={
+        'action': 'start', 'mode': 'phase1', 'cycle_id': 'unknown-closure'}))
+    started = time.monotonic()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    def expired(*args):
+        raise TimeoutError('CLI did not return while child closure remained unknown')
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, min(30., previous_timer[0]) if previous_timer[0] else 30.)
+    try:
+        assert rsi.cli.main(['--instance', str(wave_instance.root), 'phase1',
+                             'start', '--cycle', 'unknown-closure']) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result['status'] == 'observation_required'
+        path = wave_instance.root / 'runs/unknown-closure'
+        before = {p.parent.name: json.loads(p.read_text()) for p in path.glob('waves/*/projects/*/worker.json')}
+        assert len(before) == 2
+        assert rsi.cli.main(['--instance', str(wave_instance.root), 'phase1',
+                             'resume', '--job', 'original-job']) == 0
+        assert json.loads(capsys.readouterr().out)['status'] == 'observation_required'
+        after = {p.parent.name: json.loads(p.read_text()) for p in path.glob('waves/*/projects/*/worker.json')}
+        assert after == before
+        assert not wave_instance.status('unknown-closure')['cycle.json']['originals']
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                max(.000001, previous_timer[0] - (time.monotonic() - started)), previous_timer[1])

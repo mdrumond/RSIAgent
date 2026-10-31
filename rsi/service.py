@@ -105,7 +105,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
                 try:
                     cycle.reconcile(dispatch_ready=True) if cycle.waves else cycle.reconcile()
                 except (ValueError, RuntimeError) as exc:
-                    return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
+                    return dict(status='observation_required' if cycle.waves else 'suspended', cycle_id=cycle_id, error=str(exc),
                                 pending=cycle.scheduler.state['pending'], tuning_pending=cycle.tuning.state['pending'])
             cycle.scheduler.resume()
             if cycle.waves:
@@ -142,7 +142,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
             emit(dict(event='cycle_observed', cycle_id=cycle_id, phase=state['phase'],
                       cursor=state['cursor'], wave=state['wave'], spent=state['spent']))
             if state['pending'] or cycle.controller.state['pending']:
-                return dict(status='suspended', cycle_id=cycle_id, pending=state['pending'])
+                return dict(status='observation_required' if cycle.waves else 'suspended',
+                            cycle_id=cycle_id, pending=state['pending'])
             if state['phase'] in ('complete', 'wave_limit'):
                 extensions = cycle.scheduler.extension_events()
                 actionable = [e for e in extensions if e['kind'] in (
@@ -164,7 +165,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
                         pending=cycle.scheduler.state['pending'], controller_drain_complete=True)
         if cycle.scheduler.state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending']:
             emit(dict(event='cycle_suspended', cycle_id=cycle_id, error=str(exc)))
-            return dict(status='suspended', cycle_id=cycle_id, error=str(exc),
+            return dict(status='observation_required' if cycle.waves else 'suspended', cycle_id=cycle_id, error=str(exc),
                         pending=cycle.scheduler.state['pending'],
                         controller_pending=cycle.controller.state['pending'], tuning_pending=cycle.tuning.state['pending'])
         raise
