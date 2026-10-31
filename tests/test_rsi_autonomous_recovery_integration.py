@@ -109,3 +109,22 @@ def test_autonomy_requires_explicit_finite_semantic_pool(pool):
     with pytest.raises(ValueError):
         validate_configuration(dict(curriculum=dict(enabled=True),
             cycle_limits=dict(actor_seconds=7200, recovery_seconds=pool)))
+
+
+def test_exhausted_host_catalog_defers_without_research_or_setup(autonomous, monkeypatch):
+    from rsi.cycles import SimplificationDeferred
+    cycle, parent, config, calls, archive, facts = autonomous
+    cases = Path(parent.correctness_ref)
+    payload = json.loads(cases.read_text())
+    payload['cases'] = payload['cases'][:1]
+    cases.write_text(json.dumps(payload))
+    def forbidden(*args, **kwargs):
+        pytest.fail('Exhausted templates must not load research dependencies or dispatch a model')
+    monkeypatch.setattr(cycle, 'query', forbidden)
+    result = cycle.step()
+    assert isinstance(result, SimplificationDeferred)
+    assert result.actor_seconds == 0 and calls == []
+    receipt = cycle.store.read_json(result.receipt_ref)
+    assert receipt['reason'] == 'no-admitted-simpler-template'
+    assert cycle.scheduler.state['recovery_queue']
+    assert not cycle.scheduler.state.get('derived_projects')

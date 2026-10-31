@@ -169,10 +169,6 @@ class Phase1Recovery:
         state = json.loads(path.read_text()) if path.exists() else dict(history=[], rejections=[])
         if state.get('complete'):
             return self.result(state)
-        # Eager BGE loading is setup and precedes actor-deadline anchoring.
-        self.query_adapter = c.query(c.scheduler.state['memory'])
-        if self.researcher is None:
-            self.researcher = Researcher(c.roles(), self.query, c.store)
         parents = []
         inputs = {}
         failures = {}
@@ -182,7 +178,16 @@ class Phase1Recovery:
             failures[spec.project_id] = self.failure(row['result'])
             parents.append(dict(project_id=spec.project_id, spec=spec.to_dict(),
                 failure=failures[spec.project_id], templates=capability_catalog(spec, config)))
+        exhausted = not any(item['templates'] for item in parents)
+        if not exhausted:
+            # Eager BGE loading is setup and precedes actor-deadline anchoring.
+            self.query_adapter = c.query(c.scheduler.state['memory'])
+            if self.researcher is None:
+                self.researcher = Researcher(c.roles(), self.query, c.store)
         while True:
+            if exhausted:
+                state.update(complete=True, deferred=True, reason='no-admitted-simpler-template')
+                break
             spent = sum(item['actor_seconds'] for item in state['history'])
             remaining = self.remaining(context, spent)
             bounds = [remaining[key] for key in ('actor_seconds', 'recovery_seconds') if remaining[key] is not None]
