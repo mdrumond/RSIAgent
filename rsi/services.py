@@ -558,8 +558,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
         raw = list(result['events'])
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
-        return dict(project_id=runner.spec.project_id, outcome=host_outcome,
-            **(dict(parent_project_id=row['original_id']) if runner.spec.project_id != row['original_id'] else {}),
+        return dict(project_id=row['original_id'], outcome=host_outcome,
             evidence={row['artifact_ref']: dict(kind=kind, summary=summary)},
             queries=queries, usage=usage, raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
             observations=observations, observations_ref=observations_ref)

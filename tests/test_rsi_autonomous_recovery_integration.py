@@ -71,12 +71,18 @@ def test_derived_config_executes_canonical_stages_and_feeds_memory_without_root_
     with pytest.raises(FileNotFoundError):
         runner.store.read_bytes(archive)
     child_result = cycle.load_project(row)
-    assert child_result['project_id'] == revised.spec.project_id
-    assert child_result['parent_project_id'] == parent.project_id
+    assert child_result['project_id'] == parent.project_id  # Existing family identity contract remains intact.
+    scope = child_result['observations']['applicability']
+    assert scope['project_id'] == revised.spec.project_id
+    assert scope['project_contract_ref'] == runner.contract_ref
+    assert scope['final_source_hash'] == runner.backend.project_hash()
     memory = cycle.step()
     assert cycle.scheduler.state['memory'] != baseline
     assert cycle.scheduler.state['recovery_spent'] == pytest.approx(.5 + result.actor_seconds + memory.actor_seconds)
     assert cycle.scheduler.state['originals'] == []
+    positive = cycle.memory.records()[-1]['proposal']
+    assert positive['kind'] == 'correctness'
+    assert positive['observations']['applicability']['project_id'] == revised.spec.project_id
     assert original == {path: path.read_bytes() for path in original}
 
 
