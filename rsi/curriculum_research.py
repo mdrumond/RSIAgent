@@ -9,6 +9,7 @@ class DiagnosticProposal:
     acceptance: str
     template_id: str
     parameters: dict
+    parent_project_id: str | None = None
 
 
 @dataclass(frozen=True)
