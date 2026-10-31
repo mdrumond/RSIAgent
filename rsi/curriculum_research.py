@@ -195,14 +195,15 @@ class Researcher:
             if exhausted():
                 raise TimeoutError('curriculum research elapsed allocation exhausted')
             return self.clock() + allowance - state['actor_seconds']
-        def finish(status, proposal=None, error=None):
+        def finish(status, proposal=None, error=None, validation_error=None):
             seconds = None if unknown or active and not finished else state['actor_seconds']
             receipt = dict(schema='rsi-curriculum-research-v1', operation_id=operation,
                 request_ref=request_ref, status=status, proposal=asdict(proposal) if proposal else None,
                 evidence_refs=state['evidence_refs'], actor_seconds=seconds,
                 artifact_refs=[request_ref, *state['events'], *state['evidence_refs']],
                 measured_actor_seconds=state['actor_seconds'], error=error,
-                decision=asdict(decision) if status == 'accepted' else None)
+                decision=asdict(decision) if status == 'accepted' else None,
+                validation_error=validation_error)
             state['settled'] = True
             state.update(status='completed' if status in ('accepted', 'budget_exhausted') else status,
                          receipt_ref=self.store.put_json(receipt), actor_seconds=seconds)
@@ -274,7 +275,7 @@ class Researcher:
             if selected not in parent_refs or not {*query_refs, parent_refs[selected]} <= set(decision.evidence_ids):
                 raise ValueError('diagnostic must cite retrieved research and its admitted parent')
             selected_row = next(row for row in parents if row['project_id'] == selected)
-            self._validate_template(proposal, selected, selected_row.get('templates', context['templates']))
+            self._validate_template(proposal, selected, selected_row.get('templates', context['templates']), artifacts=self.store)
             seen = set()
             for row in decision.negative_decisions:
                 key = (row.query_ref, row.index)
@@ -292,7 +293,8 @@ class Researcher:
                 raise ResearchPending(result.receipt_ref, result.actor_seconds) from exc
             if isinstance(exc, TimeoutError) and exhausted():
                 return finish('budget_exhausted')
-            result = finish('rejected', error=str(exc))
+            result = finish('rejected', error=str(exc),
+                validation_error=exc.details if isinstance(exc, _TemplateValidationError) else None)
             raise ResearchRejected(result.receipt_ref, result.actor_seconds) from exc
         finally:
             self.roles.observer = original_observer
@@ -306,6 +308,14 @@ class Researcher:
                            'status', 'outcome', 'reason', 'summary', 'error', 'project_id',
                            'classification', 'host_outcome', 'source_hash', 'memory_id', 'kind')
                   and isinstance(v, (str, int, float, bool))}
+        if isinstance(row.get('validation_error'), dict):
+            from core.artifacts import canonical_bytes
+            result['validation_error'] = {}
+            for key, value in row['validation_error'].items():
+                raw = canonical_bytes(value)
+                result['validation_error'][key] = value if len(raw) <= 1024 else dict(
+                    artifact_ref=self.store.put_bytes(raw), bytes=len(raw),
+                    preview=raw[:512].decode(errors='ignore'))
         memory = row.get('memory', row)
         if isinstance(memory, dict) and isinstance(memory.get('proposal'), dict):
             result['memory'] = self._facts(memory['proposal'])
@@ -420,22 +430,47 @@ class Researcher:
             raise ValueError('historical service-result ID must use an archival identity field')
 
     @staticmethod
-    def _validate_template(proposal, parent_id, templates):
+    def _validate_template(proposal, parent_id, templates, *, artifacts=None):
         from core.artifacts import canonical_bytes
         if not isinstance(proposal, DiagnosticProposal):
             raise ValueError('typed diagnostic project required')
         canonical_bytes(proposal.parameters)
         candidates = [r for r in templates if r['template_id'] == proposal.template_id
                       and r.get('parent_project_id', parent_id) == parent_id]
+        admitted = candidates[0] if len(candidates) == 1 else dict(templates=templates)
+        def reject(field, constraint, expected, provided):
+            details = dict(field=field, constraint=constraint, expected=expected, provided=provided,
+                           template_id=proposal.template_id, parent_project_id=parent_id)
+            if artifacts is not None:
+                details['admitted_schema'] = dict(artifact_ref=artifacts.put_json(admitted))
+            raise _TemplateValidationError(details)
         if len(candidates) != 1:
-            raise ValueError('diagnostic must use an advertised template for its selected parent')
+            reject('proposal.template_id', 'advertised template for selected parent',
+                [r['template_id'] for r in templates if r.get('parent_project_id', parent_id) == parent_id],
+                proposal.template_id)
         schema = candidates[0]['parameters']
         if type(proposal.parameters) is not dict or set(proposal.parameters) != set(schema):
-            raise ValueError('diagnostic parameters differ from host template')
+            reject('proposal.parameters', 'exact admitted parameter keys', sorted(schema),
+                   sorted(proposal.parameters) if isinstance(proposal.parameters, dict) else type(proposal.parameters).__name__)
         for key, rule in schema.items():
-            values = proposal.parameters[key]
-            if (rule['type'] != 'array' or type(values) is not list
-                    or not rule['minItems'] <= len(values) <= rule['maxItems']
-                    or any(type(v) is not int or v not in rule['items']['enum'] for v in values)
-                    or rule.get('uniqueItems') and len(set(values)) != len(values)):
-                raise ValueError('diagnostic parameters exceed advertised parent cases')
+            values, field = proposal.parameters[key], 'proposal.parameters.' + key
+            if rule['type'] != 'array' or type(values) is not list:
+                reject(field, 'parameter type', rule['type'], type(values).__name__)
+            if not rule['minItems'] <= len(values) <= rule['maxItems']:
+                reject(field, 'array length', {k: rule[k] for k in ('minItems', 'maxItems')}, len(values))
+            for index, value in enumerate(values):
+                if type(value) is not int:
+                    reject(f'{field}[{index}]', 'item type', 'integer', type(value).__name__)
+                if value not in rule['items']['enum']:
+                    reject(f'{field}[{index}]', 'admitted item enum', rule['items']['enum'], value)
+            if rule.get('uniqueItems') and len(set(values)) != len(values):
+                reject(field, 'uniqueItems', True, values)
+
+
+class _TemplateValidationError(ValueError):
+    def __init__(self, details):
+        import json
+        self.details = details
+        super().__init__(details['field'] + ': ' + details['constraint'] + '; expected=' +
+            json.dumps(details['expected'], ensure_ascii=False) + '; provided=' +
+            json.dumps(details['provided'], ensure_ascii=False))
