@@ -199,11 +199,21 @@ def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(
     from test_rsi_roles import make_roles
     from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
     _, parent, context, _, queried, _, clock, store = fixture
+    from uuid import uuid4
+    guidance = dict(curriculum=uuid4().hex, waves=uuid4().hex)
+    context.update(user_guidance=guidance, configuration_ref=store.put_json({'prompts': guidance}),
+                   skills_ref='retained-skills', skill_guidance={'debug': uuid4().hex},
+                   kdb_guidance={'collections': ['frozen-docs']})
     roles, _, events, _ = make_roles([], clock=clock)
     def transport(**kwargs):
         clock.now += 1
         started = next(payload for event, payload in reversed(events) if event == 'role_started')
         evidence = started['evidence']
+        assert evidence[0]['data']['user_guidance'] == guidance
+        assert evidence[0]['data']['configuration_ref'] == context['configuration_ref']
+        assert evidence[0]['data']['skills_ref'] == context['skills_ref']
+        assert evidence[0]['data']['skill_guidance'] == context['skill_guidance']
+        assert evidence[0]['data']['kdb_guidance'] == context['kdb_guidance']
         ids = [row['evidence_id'] for row in evidence]
         if started['role'] == 'research_queries':
             value = dict(rationale='Read retained documentation', evidence_ids=ids,
@@ -228,3 +238,81 @@ def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(
     result = Researcher(roles, query, store, clock=clock).research(parent, {}, context)
     assert result.actor_seconds == 5 and len(queried) == 1
     assert [p['role'] for e, p in events if e == 'role_finished'] == ['research_queries', 'diagnostic']
+
+
+def test_host_command_diagnostics_reach_research_and_child_despite_provider_abort(fixture):
+    researcher, parent, context, roles, _, response, _, store = fixture
+    compiler_error = 'AttributeError: compiler API build_kernel is unavailable'
+    numeric = dict(case_id='frozen-case-2', max_absolute_error=0.125, expected=1.0, actual=0.875)
+    observations = dict(schema='rsi-project-observations-v1', outcome='budget_exhausted',
+        applicability={'project_id': parent.project_id, 'final_source_hash': 'a' * 64},
+        commands=dict(items=[
+            dict(command='compile', classification='execution_failure', returncode=1, numeric=False,
+                 source_hash='a' * 64, final_source_scope=True,
+                 stderr={'text': compiler_error}, stdout={'text': ''}),
+            dict(command='test', classification='numeric_failure', returncode=1, numeric=True,
+                 source_hash='a' * 64, final_source_scope=True,
+                 stderr={'text': ''}, stdout={'text': json.dumps(numeric)})], total=2))
+    observation_ref = store.put_json(observations)
+    archive = store.put_json({'result': {'events': ['f' * 64]}})
+    failure = dict(error='provider aborted after command execution', outcome='budget_exhausted',
+        source_hash='a' * 64, observations_ref=observation_ref,
+        origin_task_archive={'scope': 'origin-task-archive', 'service_result': archive})
+    response['negative_records'] = [dict(error=failure['error'], observations_ref=observation_ref)]
+    selected_inputs = []
+    original_queries = roles.research_queries
+    def select_query(prompt, evidence, **kwargs):
+        selected_inputs.extend(evidence)
+        plan = original_queries(prompt, evidence, **kwargs)
+        facts = evidence[0].data['failure']
+        assert facts['error'] == failure['error']
+        commands = facts['observations']['commands']['items']
+        assert commands[0]['stderr']['text'] == compiler_error
+        assert commands[1]['structured_stdout'] == numeric
+        return replace(plan, queries=(ResearchQuery(commands[0]['stderr']['text'], 'Investigate the host API error'),))
+    roles.research_queries = select_query
+    result = researcher.research(parent, failure, context)
+    received = next(e for e in roles.delivered if 'negative_records' in e.data)
+    negative = received.data['negative_records'][0]['facts']['observations']
+    assert negative['commands']['items'][1]['structured_stdout']['case_id'] == numeric['case_id']
+    assert negative['artifact_ref'] == observation_ref
+    assert store.read_json(observation_ref) == observations
+    from rsi.evidence_io import _references
+    assert observation_ref in set(_references(selected_inputs[0].data))
+    assert archive not in set(_references(selected_inputs[0].data))
+    child = researcher.actor_context(result.receipt_ref)
+    assert len(json.dumps(child).encode()) <= 2500
+    assert child['rationale'] == 'Isolate one retained case'
+    assert child['documents'][0]['facts']['text'] == response['results'][0]['text']
+    assert child['commands'][0]['stderr']['text'] == compiler_error
+    assert child['commands'][1]['structured_stdout']['max_absolute_error'] == numeric['max_absolute_error']
+
+
+@pytest.mark.parametrize('missing', [True, False])
+def test_missing_or_non_observation_payload_never_starts_research(fixture, missing):
+    researcher, parent, context, roles, _, _, _, store = fixture
+    reference = 'e' * 64 if missing else store.put_json({'result': {'events': ['f' * 64]}})
+    with pytest.raises(ResearchRejected) as error:
+        researcher.research(parent, {'observations_ref': reference}, context)
+    assert error.value.actor_seconds == 0 and not roles.calls
+
+
+def test_runtime_curriculum_guidance_reaches_both_typed_stages_and_is_frozen(fixture):
+    from uuid import uuid4
+    researcher, parent, context, roles, _, _, _, store = fixture
+    guidance = {'curriculum': uuid4().hex, 'waves': uuid4().hex}
+    context.update(user_guidance=guidance, configuration_ref=store.put_json({'prompts': guidance}))
+    seen = []
+    for name in ('research_queries', 'diagnostic'):
+        original = getattr(roles, name)
+        def receive(prompt, evidence, _original=original, **kwargs):
+            seen.append(evidence[0].data['user_guidance'])
+            assert evidence[0].data['configuration_ref'] == context['configuration_ref']
+            return _original(prompt, evidence, **kwargs)
+        setattr(roles, name, receive)
+    result = researcher.research(parent, {}, context)
+    assert seen == [guidance, guidance]
+    request = store.read_json(store.read_json(result.receipt_ref)['request_ref'])
+    assert request['context']['user_guidance'] == guidance
+    with pytest.raises(ValueError):
+        researcher.research(parent, {}, {**context, 'user_guidance': {'curriculum': uuid4().hex}})
