@@ -111,7 +111,8 @@ def test_autonomy_requires_explicit_finite_semantic_pool(pool):
             cycle_limits=dict(actor_seconds=7200, recovery_seconds=pool)))
 
 
-def test_exhausted_host_catalog_defers_without_research_or_setup(autonomous, monkeypatch):
+@pytest.mark.parametrize('prior_seconds', [0., .5])
+def test_exhausted_host_catalog_defers_without_research_or_setup(autonomous, monkeypatch, prior_seconds):
     from rsi.cycles import SimplificationDeferred
     cycle, parent, config, calls, archive, facts = autonomous
     cases = Path(parent.correctness_ref)
@@ -121,9 +122,20 @@ def test_exhausted_host_catalog_defers_without_research_or_setup(autonomous, mon
     def forbidden(*args, **kwargs):
         pytest.fail('Exhausted templates must not load research dependencies or dispatch a model')
     monkeypatch.setattr(cycle, 'query', forbidden)
+    original_simplify = cycle.scheduler.simplify
+    def resumed(spec, failure, context):
+        from rsi.python_execution import atomic_json
+        root = cycle.root / 'curriculum' / context['operation_id']
+        root.mkdir(parents=True)
+        receipt = cycle.store.put_json(dict(kind='known-prior-research-fixture', actor_seconds=prior_seconds))
+        atomic_json(root / 'integration.json', dict(history=[dict(receipt_ref=receipt,
+            actor_seconds=prior_seconds)], rejections=[]))
+        return original_simplify(spec, failure, context)
+    monkeypatch.setattr(cycle.scheduler, 'simplify', resumed)
     result = cycle.step()
     assert isinstance(result, SimplificationDeferred)
-    assert result.actor_seconds == 0 and calls == []
+    assert result.actor_seconds == prior_seconds and calls == []
+    assert cycle.scheduler.state['recovery_spent'] == prior_seconds
     receipt = cycle.store.read_json(result.receipt_ref)
     assert receipt['reason'] == 'no-admitted-simpler-template'
     assert cycle.scheduler.state['recovery_queue']
