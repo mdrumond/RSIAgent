@@ -105,6 +105,42 @@ def _remote(executor, spec, directory, remaining, raw):
     return json.loads(logs['content'])
 
 
+def _admit(result, request, configuration):
+    policy = dict(configuration)
+    policy['require_idle'] = (configuration.get('require_idle', False) or
+        getattr(request, 'category', '') in ('profile', 'profiling', 'timing', 'benchmark') or
+        getattr(request, 'command', '') in ('profile', 'profiling', 'timing', 'benchmark') or
+        bool(getattr(request, 'profile_path', None)))
+    result['measurements'] = assess(result['raw_measurements']['probe'],
+        physical_device=result['physical_device'], configuration=policy)
+    result.update(admitted=True, degraded=result['measurements']['degraded'],
+        observation=('Explicitly authorized Alarm device admitted for ordinary work (degraded)'
+                     if result['measurements']['degraded'] else 'Fresh bounded device measurements admitted'))
+
+
+def _local_reconciliation(directory, result, request, configuration, started):
+    """Read retained completion only. Never rewrite evidence or charge probe time twice."""
+    decision = directory / 'decision.json'
+    retained = json.loads(decision.read_text()) if decision.exists() else {}
+    raw = retained.get('raw_measurements', {})
+    if type(raw.get('local', {}).get('exit')) is int:
+        result = dict(retained)
+        result['retained_probe_elapsed_seconds'] = retained.get('elapsed_seconds')
+    else:
+        completion = directory / 'measurements.json'
+        raw = json.loads(completion.read_text()) if completion.exists() else {}
+        result.update(raw_measurements=raw, evidence_path=str(completion if completion.exists() else directory))
+        try:
+            _require(type(raw.get('local', {}).get('exit')) is int, 'probe_unknown',
+                     'Local probe started without durable completion; never redispatch')
+            _require(raw['local']['exit'] == 0, 'probe_failed', 'Local probe failed')
+            _admit(result, request, configuration)
+        except AdmissionFailure as exc:
+            result.update(failure=dict(type=exc.kind, detail=str(exc)), observation=str(exc))
+    result.update(reconciled=True, elapsed_seconds=time.monotonic() - started)
+    return result
+
+
 def guard(request, *, phase='admission', metadata, configuration, remaining):
     """Return a persisted decision. Host wiring owns CAS/SFT ingestion of it.
 
@@ -141,6 +177,9 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
         _require(isinstance(identity, str) and bool(identity), 'configuration_invalid', 'Stable probe identity required')
         binding = dict(phase=phase, identity=identity, metadata=dict(metadata), product=product, chip=chip)
         directory = root / ('device-' + digest(json.dumps(binding, sort_keys=True).encode()))
+        if (metadata.get('controller_placement') in ('on', 'local') and
+                (directory / 'local-started.json').exists()):
+            return _local_reconciliation(directory, result, request, configuration, started)
         directory.mkdir(exist_ok=True)
         atomic_json(directory / 'identity.json', binding)
         result['evidence_path'] = str(directory / 'decision.json')
@@ -177,16 +216,7 @@ def guard(request, *, phase='admission', metadata, configuration, remaining):
             raise AdmissionFailure('configuration_invalid', 'Controller placement must be here or on')
         atomic_json(directory / 'measurements.json', raw)
         _limit(remaining)
-        category = getattr(request, 'category', '')
-        policy = dict(configuration)
-        policy['require_idle'] = (configuration.get('require_idle', False) or
-            category in ('profile', 'profiling', 'timing', 'benchmark') or
-            getattr(request, 'command', '') in ('profile', 'profiling', 'timing', 'benchmark') or
-            bool(getattr(request, 'profile_path', None)))
-        result['measurements'] = assess(raw['probe'], physical_device=device, configuration=policy)
-        result.update(admitted=True, degraded=result['measurements']['degraded'],
-            observation=('Explicitly authorized Alarm device admitted for ordinary work (degraded)'
-                         if result['measurements']['degraded'] else 'Fresh bounded device measurements admitted'))
+        _admit(result, request, configuration)
     except AdmissionFailure as exc:
         result.update(failure=dict(type=exc.kind, detail=str(exc)), observation=str(exc))
     except (KeyError, TypeError, ValueError, OSError, WorkflowError, subprocess.SubprocessError) as exc:
