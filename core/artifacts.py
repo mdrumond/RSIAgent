@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Mapping
 
 
@@ -73,6 +74,48 @@ class ContentAddressedArtifacts:
                 stream.flush()
                 os.fsync(stream.fileno())
         return digest
+
+    def retain_from(self, source_store: ContentAddressedArtifacts, digest: str) -> str:
+        """Retain verified immutable CAS bytes, sharing storage when possible.
+
+        Only CAS objects may be linked: callers must never mutate stored bytes.
+        Removing the source name does not remove the retained object.
+        """
+        source = source_store._path(digest)
+        target = self._path(digest)
+        self._verify_path(source, digest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+        except FileExistsError:
+            self._verify_path(target, digest)
+        except OSError:
+            # Cross-device links and filesystems without link support still retain
+            # an independent copy. Exclusive creation never overwrites a CAS inode.
+            try:
+                descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                self._verify_path(target, digest)
+            else:
+                try:
+                    with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_stream:
+                        shutil.copyfileobj(input_stream, output, length=1024 * 1024)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    self._verify_path(target, digest)
+                except BaseException:
+                    target.unlink()
+                    raise
+        return digest
+
+    @staticmethod
+    def _verify_path(path: Path, digest: str) -> None:
+        sha = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                sha.update(block)
+        if sha.hexdigest() != digest:
+            raise ValueError("artifact content does not match its SHA-256")
 
     def put_json(self, value: Any) -> str:
         return self.put_bytes(canonical_bytes(value))
