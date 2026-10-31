@@ -103,7 +103,8 @@ def test_failed_fallback_removes_partial_target(stores, monkeypatch):
 
 
 @pytest.mark.parametrize('reopen', [False, True])
-def test_composition_retains_transitive_query_closure(tmp_path, reopen):
+@pytest.mark.parametrize('layered', [False, True])
+def test_composition_retains_transitive_query_closure(tmp_path, reopen, layered):
     from rsi.project_composition import ProjectComposition
     from rsi.services import BoundCycle
 
@@ -120,6 +121,10 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen):
     def measure(label, scope):
         measures.append((label, scope))
         return nullcontext()
+    parent_store = store
+    if layered:
+        from rsi.service_wave import WorkerArtifacts
+        store = WorkerArtifacts(tmp_path / 'worker', parent_store.root)
     services = SimpleNamespace(store=store, test=SimpleNamespace(),
                                setup=SimpleNamespace(measure=measure), executor_factory=None)
     composition = ProjectComposition(services, tmp_path, {'config': {'payload': {}}},
@@ -136,14 +141,45 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen):
     runner = composition.runner(tmp_path / 'runner', memory_ref=memory,
                                 backend_identity='test', reopen=reopen)
     for ref in (binary, nested, observations, memory, configuration):
-        assert os.path.samefile(object_path(store, ref), object_path(runner.store, ref))
+        assert os.path.samefile(object_path(parent_store, ref), object_path(runner.store, ref))
     assert runner.context()['user_guidance'] == {'actor': 'guidance'}
     assert measures == [('project-open' if reopen else 'project-snapshot-copy-and-bind',
                          str(tmp_path / 'runner'))]
     result = runner.store.put_json({'artifact_ref': binary, 'result': 'retained'})
     BoundCycle.retain(services, runner)
     assert os.path.samefile(object_path(store, result), object_path(runner.store, result))
-    for path in store.objects.glob('*/*'):
-        path.unlink()
+    for source_store in {store, parent_store}:
+        for path in source_store.objects.glob('*/*'):
+            path.unlink()
     assert runner.store.read_bytes(binary) == b'\xff\x00host evidence'
     assert runner.store.read_json(result)['result'] == 'retained'
+
+
+@pytest.mark.parametrize('local', [False, True])
+def test_layered_store_retention_uses_verified_backing_object(tmp_path, local):
+    from rsi.service_wave import WorkerArtifacts
+    parent = ContentAddressedArtifacts(tmp_path / 'parent')
+    worker = WorkerArtifacts(tmp_path / 'worker', parent.root)
+    target = ContentAddressedArtifacts(tmp_path / 'target')
+    ref = parent.put_bytes(b'parent evidence')
+    if local:
+        worker.put_bytes(b'parent evidence')
+    backing = worker if local else parent
+    target.retain_from(worker, ref)
+    assert os.path.samefile(object_path(backing, ref), object_path(target, ref))
+    object_path(backing, ref).unlink()
+    assert target.read_bytes(ref) == b'parent evidence'
+
+
+def test_layered_retention_rejects_corrupt_local_shadow(tmp_path):
+    from rsi.service_wave import WorkerArtifacts
+    parent = ContentAddressedArtifacts(tmp_path / 'parent')
+    worker = WorkerArtifacts(tmp_path / 'worker', parent.root)
+    target = ContentAddressedArtifacts(tmp_path / 'target')
+    ref = parent.put_bytes(b'parent evidence')
+    worker.put_bytes(b'parent evidence')
+    object_path(worker, ref).write_bytes(b'corrupt child shadow')
+    with pytest.raises(ValueError):
+        target.retain_from(worker, ref)
+    assert not object_path(target, ref).exists()
+    assert parent.read_bytes(ref) == b'parent evidence'

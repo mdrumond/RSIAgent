@@ -23,6 +23,10 @@ class WorkerArtifacts(ContentAddressedArtifacts):
         super().__init__(root)
         self.parent = ContentAddressedArtifacts(parent)
 
+    def _retention_path(self, reference):
+        local = self._path(reference)
+        return local if local.exists() else self.parent._retention_path(reference)
+
     def read_bytes(self, reference):
         if self._path(reference).exists():
             return super().read_bytes(reference)

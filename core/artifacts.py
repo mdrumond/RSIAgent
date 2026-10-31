@@ -81,7 +81,7 @@ class ContentAddressedArtifacts:
         Only CAS objects may be linked: callers must never mutate stored bytes.
         Removing the source name does not remove the retained object.
         """
-        source = source_store._path(digest)
+        source = source_store._retention_path(digest)
         target = self._path(digest)
         self._verify_path(source, digest)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -107,6 +107,10 @@ class ContentAddressedArtifacts:
                     target.unlink()
                     raise
         return digest
+
+    def _retention_path(self, digest: str) -> Path:
+        """Resolve immutable backing storage; layered stores may override this."""
+        return self._path(digest)
 
     @staticmethod
     def _verify_path(path: Path, digest: str) -> None:
