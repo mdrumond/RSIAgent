@@ -182,7 +182,7 @@ class PythonExecution:
 
     @classmethod
     def snapshot(cls, root, source, verifier, *, commands, performance_seconds=None, editable_files=None,
-                 generated_paths=(), executor_identity=None):
+                 generated_paths=(), executor_identity=None, retained_paths=()):
         if executor_identity is not None and (
                 not isinstance(executor_identity, str) or not executor_identity.strip()):
             raise ValueError('executor_identity must be a nonblank trusted binding')
@@ -210,10 +210,27 @@ class PythonExecution:
         for name in generated_paths:
             if not name or Path(name).is_absolute() or '..' in Path(name).parts or name == '.':
                 raise ValueError('generated paths must be explicit project-relative paths')
+        if not isinstance(retained_paths, (list, tuple)) or any(
+                not isinstance(name, str) for name in retained_paths):
+            raise ValueError('retained_paths must be an array of project-relative output paths')
+        retained_paths = sorted(set(retained_paths))
+        for name in retained_paths:
+            path = Path(name)
+            if (not name or '\0' in name or path.is_absolute() or '..' in path.parts
+                    or path == Path('.') or any(part in {'.git', '__pycache__', '.pytest_cache'}
+                                               for part in path.parts)):
+                raise ValueError('retained paths must select explicit outputs, not source or caches')
+            # Retention declares future outputs, never reclassifies input files.
+            selected = source / path
+            if selected.is_file() or any(p.is_file() for p in selected.rglob('*')):
+                raise ValueError('retained paths must not contain initial source files')
+            if verifier_name and (verifier_name == name or Path(verifier_name).is_relative_to(path)):
+                raise ValueError('retained paths must not include frozen verifier')
+        retained_paths = sorted({Path(name).as_posix() for name in retained_paths})
         def generated(name):
             return (any(part in {'__pycache__', '.pytest_cache'} for part in Path(name).parts)
                     or any(name == item or name.startswith(item.rstrip('/') + '/')
-                           for item in generated_paths))
+                           for item in (*generated_paths, *retained_paths)))
         execution_inputs = sorted(p.relative_to(source).as_posix() for p in source.rglob('*')
                                   if p.is_file() and '.git' not in p.relative_to(source).parts
                                   and p.relative_to(source).as_posix() != verifier_name
@@ -239,6 +256,8 @@ class PythonExecution:
                             performance_seconds=performance_seconds)
             if executor_identity is not None:
                 contract['executor_identity'] = executor_identity
+            if retained_paths:
+                contract['retained_paths'] = retained_paths
             atomic_json(root / 'manifest.json', {'contract': store.put_json(contract)})
             # Snapshotting must not construct a target adapter or dispatch work.
             return cls(root, executor_factory=lambda identity: _UnboundExecutor())
@@ -256,7 +275,8 @@ class PythonExecution:
             name = path.relative_to(self.project).as_posix()
             if (any(part in {'__pycache__', '.pytest_cache'} for part in Path(name).parts)
                     or any(name == item or name.startswith(item.rstrip('/') + '/')
-                           for item in self.contract.get('generated_paths', ()))):
+                           for item in (*self.contract.get('generated_paths', ()),
+                                        *self.contract.get('retained_paths', ())))):
                 continue
             if path.is_file() or path.is_symlink():
                 names.add(name)
@@ -307,6 +327,56 @@ class PythonExecution:
 
     def _receipt_path(self, operation):
         return self.root / 'receipts' / (digest(operation.encode()) + '.json')
+
+    def _retain_outputs(self, result, contract):
+        """Collect only frozen output selections; terminal failures count too.
+
+        Executors must synchronize these outputs before returning a terminal
+        result. Missing outputs are explicit observations, never fabricated data.
+        Collection errors leave the existing receipt pending, preventing replay.
+        The reference keys deliberately reuse the canonical export closure.
+        """
+        selections = contract.get('retained_paths', ())
+        if not selections:
+            return
+        def checked_name(path):
+            name = path.relative_to(self.project).as_posix()
+            # Check every component before traversing: even an internal symlink
+            # can expose source/verifier material outside the selected subtree.
+            parent = self.project
+            for part in Path(name).parts:
+                parent = parent / part
+                if parent.is_symlink():
+                    raise ValueError('retained output must not contain symlinks: ' + name)
+            if not path.resolve().is_relative_to(self.project):
+                raise ValueError('retained output escapes project: ' + name)
+            return name
+        files, missing = {}, []
+        for selection in selections:
+            selected = self.project / selection
+            checked_name(selected)
+            paths = [selected]
+            if selected.is_dir():
+                paths.extend(sorted(selected.rglob('*')))
+            if not selected.exists():
+                missing.append(selection)
+            for path in paths:
+                name = path.relative_to(self.project).as_posix()
+                if any(part in {'.git', '__pycache__', '.pytest_cache'} for part in Path(name).parts):
+                    continue
+                checked_name(path)
+                if path.is_dir() or not path.exists():
+                    continue
+                if not path.is_file():
+                    raise ValueError('retained output must be a regular file: ' + name)
+                data = path.read_bytes()
+                files[name] = dict(path=name, bytes=len(data), reference=self.store.put_bytes(data))
+        manifest = dict(kind='rsi-retained-output-v1', operation_id=result['operation_id'],
+            command=result['command'], source_hash=result['source_hash'],
+            classification=result['classification'], returncode=result['returncode'],
+            retained_paths=list(selections), missing_paths=missing,
+            files=[files[name] for name in sorted(files)])
+        result.setdefault('artifact_refs', []).append(self.store.put_json(manifest))
 
     def _save(self, operation, value):
         atomic_json(self._receipt_path(operation), value)
@@ -501,6 +571,7 @@ class PythonExecution:
                       stderr=self.store.put_bytes(stderr))
         if profile_path.exists():
             result['profile'] = self.store.put_bytes(profile_path.read_bytes())
+        self._retain_outputs(result, contract)
         artifact = self.store.put_json(result)
         self._save(operation, dict(status='complete', artifact=artifact))
         if interrupted is not None:
