@@ -492,13 +492,18 @@ def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monk
     adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
     store = ContentAddressedArtifacts(tmp_path / 'artifacts')
     def query(*args, **kwargs):
-        pytest.fail('no retrieval or new proposal may start after the role cutoff')
+        return dict(results=[], negative_records=[], provenance={'source': 'retained docs'})
     researcher = Researcher(adapter, query, store)
     context = dict(operation_id='cutoff', root=tmp_path, deadline=time.monotonic() + .04, templates=[])
     parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
     if finished:
         result = researcher.research(parent, {}, context)
-        assert result.proposal is None and result.actor_seconds == .08
+        assert result.proposal is None
+        receipt = store.read_json(result.receipt_ref)
+        query_seconds = sum(store.read_json(ref).get('payload', {}).get('elapsed_seconds', 0)
+            for ref in receipt['artifact_refs']
+            if store.read_json(ref).get('event') == 'research_query_finished')
+        assert result.actor_seconds == .08 + query_seconds
         assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
         assert not any(e == 'accounting_incomplete' for e, _ in events)
     else:
@@ -568,3 +573,19 @@ def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
     finished = [p for e, p in events if e == 'role_finished']
     assert len(finished) == 1 and finished[0]['success'] is False
     assert finished[0]['elapsed_seconds'] == 2 and finished[0]['error']
+
+
+def test_semantic_investigation_real_framework_needs_no_identifiers_or_ledger():
+    payload = dict(question='Which small input isolates the discrepancy?',
+                   goal='Distinguish input-dependent behavior', why='Observed mismatch requires isolation')
+    roles, calls, events, _ = make_roles([payload])
+    result = roles.investigation('Choose an investigation',
+        [AdmittedEvidence('host-owned', {'text': 'Retrieved fact', 'negative_records': [{'reason': 'Mismatch'}]})],
+        deadline=110)
+    from rsi.curriculum_research import InvestigationIdea
+    assert result == InvestigationIdea(**payload)
+    assert len(calls) == 1
+    assert next(p for e, p in events if e == 'role_started')['evidence'][0]['data']['text'] == 'Retrieved fact'
+    assert next(p for e, p in events if e == 'role_finished')['elapsed_seconds'] == 2
+    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
+    assert set(schema['properties']) == {'question', 'goal', 'why'}
