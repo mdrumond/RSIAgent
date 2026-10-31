@@ -8,12 +8,13 @@ supports add, row sum and strided copy foundation cases.
 
 Use the shared `rsi.cpl_execution.CplExecutor`, not another transport. Construct
 its `CplConfig` from the ignored registered profile and current device admission.
-Include frozen cases, runtime manifest and any exercise evidence directory in
-`trusted_resources`. `command_cwd` is the existing admitted listener/runtime
+Use `trusted_resources(config)` to include the frozen cases, runtime manifest,
+standalone exercise producer, frozen tool-command profile and shared health probe. `command_cwd` is the existing admitted listener/runtime
 subdirectory; `workspace` is the absolute staging base. Select transfer flags
 from the actual backend configuration. The interpreter argv must be compatible
-with the selected named runtime. The factory returned by `executor_factory`
-resolves only the explicitly supplied opaque binding IDs and works on reopen.
+with the selected named runtime. Production uses Hubble's mandatory `ExecutorProfiles` admission/command guard
+factory on create and reopen; the domain binding does not bypass it with a raw
+executor factory.
 
 The standalone `rsi/triton_verifier.py` is copied by ProjectRunner as its frozen
 verifier. Each command invokes it through `{verifier}`, so the controller can
@@ -36,28 +37,96 @@ The frozen runtime manifest contains the admitted `physical_device` and
 `soc` and `expected_compiler_target`. The driver masks the selected physical
 device and addresses logical zero. It probes and retains the active Triton
 compiler target and runtime device name separately from the registry alias and
-admitted SoC. An alias is never used to infer a compiler architecture. Main must
-supply fresh admission; this driver does not reserve or diagnose shared devices.
+admitted SoC. An alias is never used to infer a compiler architecture. Main supplies the actual version-matched health profile and Jason's shared
+standalone probe. The driver executes that probe before Torch/NPU imports and
+before each device command; it never substitutes an old main health receipt.
+Device selection/reservation remains with the canonical host admission.
 
 Compile executes the first frozen case, causing actual Triton JIT compilation or
 cache reuse and a native launch. Test and validation execute every case. A
 scoped JIT run hook records returned dispatches and available compiler outputs;
 warmup-only calls do not count. The hook is restored after failure. Per-operation
-compiler caches and generated artifacts stay under the declared output folder.
+compiler caches stay under `caches/triton/`, separately from retained artifacts.
 Numerical equivalence without an observed Triton dispatch fails.
 
-Validation additionally checks the contract's `required_evidence`. Compilation,
-launch, numeric verification and AST admission are produced by the driver. Other
-exercise evidence must be supplied from trusted host producers in an immutable
-manifest. That manifest binds `source_sha256`, `cases_sha256`, and
-`runtime_manifest_sha256`; its `artifacts` entries carry relative `path`, `sha256`
-and `producer_operation_id`. Artifact paths must stay inside its staged evidence
-directory. Missing tools, stale source identity or changed artifacts fail
-validation; a candidate-written status is not evidence. Native profiler commands
-are separately frozen inputs and must not use controller `profile=True`, which
-inserts Python cProfile rather than native msprof.
+Each invocation retains its inputs, raw Python/native stdout and stderr, launch
+and case events, available compiler outputs, tensor inputs/goldens/outputs, result
+JSON and a hash manifest in a unique `outputs/triton/` subdirectory. Exceptions
+preserve partial files and their original traceback before propagating failure.
+No failure cleanup deletes these records. Stdout outside the captured log contains
+only a small result/manifest reference, never an embedded binary archive. Frozen exercise command profiles, source fixtures and dynamically produced raw
+reports remain in the retained tree on success and failure. The common
+execution backend captures `retained_paths=('outputs/',)` into CAS on success and
+failure; the binding opts into that shared implementation. Merely excluding
+generated outputs from the source hash would not retain them. Caches
+are excluded from retention.
+
+Validation produces the contract's `required_evidence` for the current candidate.
+It first runs native correctness in a trusted child that exits before profiler or
+debugger work, avoiding an idle NPU context in the validation orchestrator. The
+standalone producer is hash checked and loaded from a frozen trusted resource.
+It executes compiler-recovery and missing-feature probes, derives a printf
+instrumentation copy from the current kernel, captures matching IR, and dispatches
+version-matched native tool commands. Fresh facts bind the current source, cases,
+runtime and compiler target. Historical failure/source fixtures are immutable
+inputs; no candidate-specific evidence manifest is frozen before editing.
+
+`exercise_profile.tools` freezes tool argv and raw report contracts, not outcomes.
+Each tool has `steps` (argv arrays and optional literal environment), optional
+`probe_argv`, elapsed `seconds`, and `required_files` relative globs. Placeholders
+are `python`, `candidate`, `verifier`, `application` (safely quoted child argv),
+`workload` (trusted wrapper that forwards retained text logs), `output_dir`,
+`project`, `physical_device`, and `logical_device`. Captures must invoke the
+current application/workload; analysis steps may use owned read-only helpers.
+Profiler CSV parsing also freezes `kernel_column`, `duration_column` and
+`duration_unit`; it requires a positive measurement of the verified kernel.
+The isolation record comes from the actual shared health probe immediately before
+the command. Debugger profiles supply `source_location_regex`. Sanitizer profiles
+run a trusted parser and supply `summary_json` plus `errors_field`; nonzero errors
+fail. IR capture must retain actual TTIR, TTAdapter and last-pass MLIR. Unsupported
+and unconfigured studies produce typed non-passing records, never fabricated
+success. Native msprof does not use controller `profile=True`/Python cProfile.
+
+The compiler failure input freezes `compiler_failure.project_path`, `sha256`,
+`diagnostic`, and expected `returncodes`. Conversion freezes `ascendc_reference`
+with the real Ascend C source path/hash and pinned commit. A target-specific
+missing-feature fixture may use `feature_probe`; otherwise the producer measures
+whether a documented API is actually absent and reproduces that absence. If all
+frozen API probes are supported it reports the study as not applicable, rather
+than inventing a missing API. An environment study requires a real, provenance-
+bearing `historical_environment` input and compares it with freshly executed
+shared health/fault/runtime observations and the current verified candidate.
+No shared-device fault is induced.
 
 The shared executor owns CPL handles, submission receipts and reconciliation.
 Unknown exceptions stay pending; callers reconcile retained work instead of
 submitting again. This binding's source and unit tests do not establish device
 correctness until the admitted target has actually compiled and run the cases.
+
+
+For parallel waves, `rsi.triton_worker_binding.prepare_worker_bindings` constructs
+host-owned per-device variants before dispatch, with each device's actual public
+metadata, runtime manifest, target interpreter and executor identity. Its returned
+path/hash is the ignored `binding_configuration`; `profile_fields` supplies
+`bind_project = rsi.triton_worker_binding:bind_project` and that configuration.
+The owning child calls the shipped `bind_project(request, logical_admission,
+metadata=..., configuration=..., remaining=...)` after receiving its actual lease.
+The hook selects by `request.device`, never project ordinal, checks all frozen
+resources and logical workload identities, and creates only dispatch-specific
+`request.root.parent/lease-inputs/`. It never creates the Runner root or baseline.
+Runtime/case/producer/health files become read-only project execution inputs and
+the verifier remains external, so the generic transport needs no mutable
+per-worker resource profile. The returned spec command equals commands.test.
+The parent validates the resolution using the common project_binding helpers.
+Resume reuses the exact saved resolution and never calls the binder again.
+
+The builder freezes the actual shared `device_health_probe.standalone_source()`
+and `standalone_hash()` into a content-addressed host resource. Targets verify and
+execute that stdlib-only source, calling local_probe with physical_device,
+configuration and remaining. There is no target import of the controller package
+and no literal old guard hash. Ignored device_health may explicitly allow Alarm
+for ordinary functional work; its actual degraded measurements are retained.
+Alarm permission does not imply busy permission. Profiler probes set require_idle
+and cannot admit Alarm, busy or unknown devices. Probes occur once per native
+command before imports; there are no per-case re-probes after creating our own
+context. Numeric children exit before strict profiler admission.

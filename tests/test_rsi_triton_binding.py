@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from rsi.triton_project_config import budgets, executor_factory, project_config, project_spec
+from rsi.triton_project_config import budgets, project_config, project_spec, trusted_resources
 from rsi.triton_verifier import audit_candidate, exercise_evidence, launch_capture
 
 
@@ -19,15 +19,20 @@ def test_config_freezes_commands_inputs_and_elapsed_budget(tmp_path):
     (source/'candidate.py').write_text('candidate source')
     cases, runtime = tmp_path/'cases.json', tmp_path/'runtime.json'
     write_json(cases, {'cases': [{'case_id': 'tail'}]})
-    write_json(runtime, {'physical_device': 3})
+    write_json(runtime, {'physical_device': 3, 'device_health': {'product': 'a3', 'chip': 0}})
+    guard = tmp_path/'guard.py'
     config = project_config(source, cases, runtime, executor_identity='admitted-triton',
-                            python='/runtime/python', physical_device=3)
+                            python='/runtime/python', physical_device=3, health_guard=guard)
     assert config.editable_files == ('candidate.py',)
-    assert config.generated_paths == ('artifacts/',)
+    assert config.generated_paths == ('outputs', 'caches')
+    assert config.retained_paths == ('outputs',)
     spec = project_spec('conversion', 'Translate a frozen Ascend C kernel to Triton', config,
                         correctness_ref=str(cases))
     assert spec.command == tuple(config.commands['test'])
     assert spec.starting_folder == config.source
+    resources = trusted_resources(config)
+    assert cases in resources and runtime in resources and guard in resources
+    assert Path(config.commands['validation'][config.commands['validation'].index('--exercise-producer')+1]) in resources
     for mode in ('compile', 'test', 'validation'):
         argv = config.commands[mode]
         assert argv[:4] == ['/runtime/python', '{verifier}', '--mode', mode]
@@ -39,7 +44,7 @@ def test_config_freezes_commands_inputs_and_elapsed_budget(tmp_path):
     runtime.write_text('{"physical_device":4}')
     with pytest.raises(ValueError):
         project_config(source, cases, runtime, executor_identity='admitted-triton',
-                       python='/runtime/python', physical_device=3)
+                       python='/runtime/python', physical_device=3, health_guard=guard)
 
 
 def test_config_keeps_trusted_cases_outside_actor_snapshot(tmp_path):
@@ -49,7 +54,7 @@ def test_config_keeps_trusted_cases_outside_actor_snapshot(tmp_path):
     write_json(runtime, {'physical_device': 0})
     with pytest.raises(ValueError):
         project_config(tmp_path, cases, runtime, executor_identity='binding',
-                       python='python3', physical_device=0)
+                       python='python3', physical_device=0, health_guard=tmp_path/'guard.py')
 
 
 @pytest.mark.parametrize('expression', ['x + y', 'torch.add(x, y)', 'x.sum()'])
@@ -94,45 +99,115 @@ def test_launch_capture_excludes_warmup_archives_and_restores_after_failure(tmp_
     assert Jit.run is original
 
 
-def test_validation_requires_source_bound_host_artifacts(tmp_path):
+def test_validation_produces_new_source_binding_after_candidate_edits(tmp_path):
     from types import SimpleNamespace
-    args = SimpleNamespace(exercise_evidence=None, exercise_evidence_sha256=None,
-                           cases_sha256='frozen-cases', runtime_sha256='frozen-runtime')
-    contract = {'required_evidence': ['numeric_verification', 'device_printf']}
-    with pytest.raises(ValueError):
-        exercise_evidence(args, contract, 'candidate-head')
-    output = tmp_path/'device.txt'
-    output.write_bytes(b'device observation')
-    manifest = tmp_path/'evidence.json'
-    value = {'source_sha256': 'candidate-head', 'cases_sha256': 'frozen-cases',
-             'runtime_manifest_sha256': 'frozen-runtime',
-             'artifacts': {'device_printf': {'producer_operation_id': 'retained-op',
-                            'path': output.name, 'sha256': hashlib.sha256(output.read_bytes()).hexdigest()}}}
-    args.exercise_evidence = str(manifest)
-    args.exercise_evidence_sha256 = write_json(manifest, value)
-    assert exercise_evidence(args, contract, 'candidate-head') == value['artifacts']
-    output.write_bytes(b'changed observation')
-    with pytest.raises(ValueError):
-        exercise_evidence(args, contract, 'candidate-head')
-    with pytest.raises(ValueError):
-        exercise_evidence(args, contract, 'new-candidate-head')
+    producer = Path(__file__).parents[1]/'rsi/triton_exercises.py'
+    candidate = tmp_path/'candidate.py'
+    args = SimpleNamespace(exercise_profile=None, exercise_producer=str(producer),
+                           exercise_producer_sha256=hashlib.sha256(producer.read_bytes()).hexdigest())
+    results = []
+    for index, text in enumerate(('first candidate', 'repaired candidate')):
+        candidate.write_text(text)
+        context = {'source_sha256': hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                   'cases_sha256': 'frozen-cases', 'runtime_manifest_sha256': 'frozen-runtime',
+                   'compiler_target': {'backend': 'ascend'}, 'observed_api': {'device_print': True}}
+        directory = tmp_path/str(index)
+        directory.mkdir()
+        write_json(directory/'native-result.json', context)
+        args.artifacts = str(directory)
+        result = exercise_evidence(args, {'required_evidence': ['numeric_verification']}, context)
+        results.append(result)
+        assert result['facts']['numeric_verification']['source_sha256'] == context['source_sha256']
+    assert results[0]['source_sha256'] != results[1]['source_sha256']
+    assert results[0]['cases_sha256'] == results[1]['cases_sha256']
 
 
-def test_factory_binds_common_executor_without_dispatch(tmp_path, monkeypatch):
-    from rsi.cpl_execution import CplConfig, CplExecutor
+def test_missing_study_profile_is_not_a_passing_attestation(tmp_path):
+    from types import SimpleNamespace
+    from rsi.triton_exercises import Producer, StudyFailure
+    context = {'source_sha256': 'current', 'cases_sha256': 'cases',
+               'runtime_manifest_sha256': 'runtime', 'compiler_target': {'backend': 'ascend'},
+               'observed_api': {'device_print': True}}
+    write_json(tmp_path/'native-result.json', context)
+    args = SimpleNamespace(artifacts=str(tmp_path), exercise_profile=None)
+    producer = Producer(args, {'required_evidence': ['msprof_capability', 'profile_raw']}, context)
+    with pytest.raises(StudyFailure) as failure:
+        producer.produce()
+    assert failure.value.facts['facts']['profile_raw']['status'] == 'unconfigured'
+    assert (tmp_path/'exercises/evidence.json').is_file()
 
-    def reject_dispatch(*args, **kwargs):
-        raise AssertionError('Factory construction must not dispatch')
 
-    monkeypatch.setattr('rsi.cpl_execution.subprocess.run', reject_dispatch)
-    config = CplConfig(target='registered-target', runtime='named-runtime',
-                       workspace='/owned/workspace', physical_device=2,
-                       installed_client=tmp_path/'cpl-remote', profile_identity='admitted',
-                       command_cwd='admitted-runtime')
-    factory = executor_factory({'admitted': config})
-    executor = factory('admitted')
-    assert isinstance(executor, CplExecutor)
-    assert executor.metadata['physical_device'] == 2
-    assert executor.metadata['logical_device'] == 0
+@pytest.mark.parametrize('fails', [False, True])
+def test_driver_retains_raw_output_and_artifacts_on_both_outcomes(tmp_path, monkeypatch, fails):
+    import os
+    from types import SimpleNamespace
+    from rsi import triton_verifier as driver
+
+    candidate = tmp_path/'candidate.py'
+    candidate.write_text('frozen candidate')
+    args = SimpleNamespace(mode='test', artifacts=str(tmp_path/'outputs'),
+                           candidate=str(candidate), cases=None, runtime_manifest=None,
+                           exercise_evidence=None)
+
+    def execute(request):
+        print('python output')
+        os.write(2, b'native diagnostic\n')
+        (Path(request.artifacts)/'kernel.bin').write_bytes(b'raw binary')
+        if fails:
+            raise ValueError('compile failure')
+        return {'status': 'passed'}
+
+    monkeypatch.setattr(driver, 'execute', execute)
+    if fails:
+        with pytest.raises(ValueError):
+            driver.run_driver(args)
+    else:
+        driver.run_driver(args)
+    folder = Path(args.artifacts)
+    assert (folder/'stdout.log').read_text() == 'python output\n'
+    assert b'native diagnostic\n' in (folder/'stderr.log').read_bytes()
+    assert (folder/'kernel.bin').read_bytes() == b'raw binary'
+    assert (folder/'inputs/candidate.py').read_bytes() == candidate.read_bytes()
+    outcome = json.loads((folder/'result.json').read_text())
+    assert outcome['status'] == ('failed' if fails else 'passed')
+    manifest = json.loads((folder/'manifest.json').read_text())
+    for artifact in manifest['artifacts']:
+        assert hashlib.sha256((folder/artifact['path']).read_bytes()).hexdigest() == artifact['sha256']
+    if fails:
+        assert outcome['error_type'] == 'ValueError'
+
+
+def test_shared_probe_alarm_permission_is_preserved_but_profile_is_strict(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from rsi.device_health_probe import standalone_hash, standalone_source
+    from rsi.triton_verifier import fresh_device_health
+
+    source = tmp_path/'probe.py'
+    source.write_text(standalone_source())
+    args = SimpleNamespace(health_guard=str(source), health_guard_sha256=standalone_hash(),
+                           physical_device='2')
+    identity = {'device_health': {'product': 'a3', 'chip': 0, 'allow_alarm': True}}
+    responses = {
+        'board': 'NPU ID : 2\nChip Name : 910B4-1\n',
+        'health': 'Health Status : Alarm\nError Code : 0x9999\n',
+        'usages': 'HBM Capacity(MB) : 32768\nHBM Usage Rate(%) : 5\n'
+                  'Aicore Usage Rate(%) : 0\nAivector Usage Rate(%) : 0\n',
+        'proc-mem': 'No process in device.\n',
+    }
+    calls = []
+
+    def query(argv, **kwargs):
+        calls.append(argv)
+        assert argv[argv.index('-i')+1] == '2'
+        assert argv[argv.index('-c')+1] == '0'
+        return SimpleNamespace(returncode=0, stdout=responses[argv[argv.index('-t')+1]].encode(), stderr=b'')
+
+    monkeypatch.setattr('subprocess.run', query)
+    ordinary = fresh_device_health(args, identity, tmp_path/'ordinary')
+    assert ordinary['admitted'] and ordinary['degraded']
+    assert ordinary['measurements']['hardware_error_code'] == '0x9999'
+    assert (tmp_path/'ordinary/health.stdout').read_text() == responses['health']
     with pytest.raises(ValueError):
-        factory('unknown')
+        fresh_device_health(args, identity, tmp_path/'profile', require_idle=True)
+    assert json.loads((tmp_path/'profile/guard.json').read_text())['admitted'] is False
+    assert len(calls) == 8

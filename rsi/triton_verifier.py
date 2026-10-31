@@ -8,18 +8,28 @@ from __future__ import annotations
 
 import argparse
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import ctypes
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
 import time
+import traceback
+import uuid
 
 
 def sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def frozen_json(path, expected):
@@ -27,6 +37,80 @@ def frozen_json(path, expected):
     if hashlib.sha256(data).hexdigest() != expected:
         raise ValueError('Frozen host input hash mismatch')
     return json.loads(data)
+
+
+def load_module(name, path):
+    """Register modules before executing decorators that inspect their module."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def record(directory, name, value):
+    """Append evidence before later work can fail."""
+    with (directory / name).open('a') as stream:
+        stream.write(json.dumps(value, sort_keys=True) + '\n')
+        stream.flush()
+
+
+def snapshot_inputs(args, directory):
+    inputs = directory / 'inputs'
+    inputs.mkdir()
+    for field in ('candidate', 'cases', 'runtime_manifest', 'exercise_profile', 'exercise_producer', 'health_guard'):
+        source = getattr(args, field, None)
+        if source and Path(source).is_file():
+            shutil.copyfile(source, inputs / (field + Path(source).suffix))
+
+
+def run_driver(args):
+    """Retain Python/native output, inputs and partial artifacts on every outcome."""
+    started = time.monotonic()
+    directory = Path(args.artifacts) / (args.mode + '-' + uuid.uuid4().hex)
+    directory.mkdir(parents=True)
+    args.artifacts = str(directory)
+    outcome = {'status': 'failed', 'mode': args.mode}
+    try:
+        with (directory/'stdout.log').open('w') as out, (directory/'stderr.log').open('w') as err:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            descriptors = [os.dup(1), os.dup(2)]
+            try:
+                os.dup2(out.fileno(), 1)
+                os.dup2(err.fileno(), 2)
+                with redirect_stdout(out), redirect_stderr(err):
+                    try:
+                        snapshot_inputs(args, directory)
+                        outcome = execute(args)
+                    except BaseException as exc:
+                        outcome.update(error_type=type(exc).__name__, error=str(exc))
+                        outcome['status'] = getattr(exc, 'status', 'failed')
+                        if getattr(exc, 'facts', None):
+                            outcome['exercise_failure'] = exc.facts
+                        traceback.print_exc(file=err)
+                        raise
+            finally:
+                out.flush()
+                err.flush()
+                ctypes.CDLL(None).fflush(None)
+                for descriptor, original in zip((1, 2), descriptors):
+                    os.dup2(original, descriptor)
+                    os.close(original)
+    finally:
+        outcome['elapsed_seconds'] = time.monotonic() - started
+        (directory/'result.json').write_text(json.dumps(outcome, sort_keys=True, allow_nan=False))
+        artifacts = [{'path': path.relative_to(directory).as_posix(), 'sha256': sha256(path),
+                      'bytes': path.stat().st_size} for path in sorted(directory.rglob('*')) if path.is_file()]
+        (directory/'manifest.json').write_text(json.dumps({'artifacts': artifacts}, sort_keys=True))
+        print(json.dumps({'status': outcome['status'], 'result': str(directory/'result.json'),
+                          'manifest': str(directory/'manifest.json'),
+                          'manifest_sha256': sha256(directory/'manifest.json')}))
+    return outcome
 
 
 def audit_candidate(path):
@@ -99,7 +183,12 @@ def launch_capture(jit_type, directory):
     launches = []
 
     def run(kernel, *args, **kwargs):
-        compiled = original(kernel, *args, **kwargs)
+        record(directory, 'launches.jsonl', {'phase': 'dispatch', 'warmup': bool(kwargs.get('warmup', False))})
+        try:
+            compiled = original(kernel, *args, **kwargs)
+        except BaseException as exc:
+            record(directory, 'launches.jsonl', {'phase': 'failed', 'error_type': type(exc).__name__, 'error': str(exc)})
+            raise
         if not kwargs.get('warmup', False):
             event = {'kernel': getattr(kernel, '__name__', getattr(kernel, 'name', type(kernel).__name__)),
                      'artifacts': {}}
@@ -113,6 +202,7 @@ def launch_capture(jit_type, directory):
                 dest.write_bytes(data)
                 event['artifacts'][str(name)] = {'file': dest.name, 'sha256': digest}
             launches.append(event)
+            record(directory, 'launches.jsonl', dict(event, phase='returned'))
         return compiled
 
     jit_type.run = run
@@ -140,34 +230,98 @@ def make_case(torch, operation, case):
     raise ValueError('Unsupported frozen operation')
 
 
-def exercise_evidence(args, contract, source_hash):
-    """Check host-staged exercise artifacts, never candidate-written attestations."""
-    required = set(contract.get('required_evidence', ()))
-    generated = {'successful_compile', 'kernel_launch', 'numeric_verification', 'ast_audit'}
-    missing = required - generated
-    if not missing:
-        return {}
-    if not args.exercise_evidence or not args.exercise_evidence_sha256:
-        raise ValueError('Validation requires host-owned exercise evidence: ' + ', '.join(sorted(missing)))
-    manifest = frozen_json(args.exercise_evidence, args.exercise_evidence_sha256)
-    for name, expected in (('source_sha256', source_hash), ('cases_sha256', args.cases_sha256),
-                           ('runtime_manifest_sha256', args.runtime_sha256)):
-        if manifest.get(name) != expected:
-            raise ValueError('Exercise evidence identity mismatch: ' + name)
-    root = Path(args.exercise_evidence).resolve().parent
-    retained = {}
-    for name in sorted(missing):
-        artifact = manifest['artifacts'].get(name)
-        if not artifact or not artifact.get('producer_operation_id'):
-            raise ValueError('Missing host producer receipt for exercise evidence: ' + name)
-        path = (root / artifact['path']).resolve()
-        if not path.is_relative_to(root) or sha256(path) != artifact['sha256']:
-            raise ValueError('Exercise artifact is missing or changed: ' + name)
-        retained[name] = artifact
-    return retained
+def exercise_evidence(args, contract, context):
+    """Produce fresh evidence, using a frozen producer and candidate-agnostic argv."""
+    if not args.exercise_producer or sha256(args.exercise_producer) != args.exercise_producer_sha256:
+        raise ValueError('Validation requires its frozen exercise producer')
+    producer = load_module('_rsi_triton_exercises', args.exercise_producer)
+    args.verifier_path = __file__
+    args.native_command = lambda directory, candidate=None: native_command(args, directory, candidate=candidate)
+    return producer.produce(args, contract, context)
+
+
+def remaining():
+    deadline = os.environ.get('RSI_COMMAND_DEADLINE_MONOTONIC')
+    return max(0.0, float(deadline)-time.monotonic()) if deadline else None
+
+
+def fresh_device_health(args, identity, directory, *, require_idle=False):
+    """Consume the common standalone admission probe; never trust cached health."""
+    if not args.health_guard or sha256(args.health_guard) != args.health_guard_sha256:
+        raise ValueError('Fresh device admission requires the frozen common probe')
+    profile = identity.get('device_health')
+    if not profile:
+        raise ValueError('Runtime identity requires an actual per-device health profile')
+    namespace = {'__name__': '_rsi_device_health', '__file__': str(Path(args.health_guard).resolve())}
+    exec(compile(Path(args.health_guard).read_text(), args.health_guard, 'exec'), namespace)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    configuration = dict(profile, require_idle=bool(require_idle or profile.get('require_idle', False)))
+    receipt = namespace['local_probe'](physical_device=int(args.physical_device),
+                                       configuration=configuration, remaining=remaining)
+    (directory/'guard.json').write_text(json.dumps(receipt, sort_keys=True))
+    for query, result in receipt.get('raw_measurements', {}).get('queries', {}).items():
+        for stream in ('stdout', 'stderr'):
+            (directory/(query+'.'+stream)).write_text(result.get(stream, ''))
+    if (not isinstance(receipt, dict) or receipt.get('admitted') is not True
+            or str(receipt.get('physical_device')) != args.physical_device
+            or not receipt.get('observation') or not receipt.get('raw_measurements')):
+        raise ValueError('Fresh bounded device probe did not admit the physical device')
+    return receipt
+
+
+def native_command(args, directory, *, candidate=None):
+    """One fresh native child, inheriting the outer CPL command's owned group."""
+    return [sys.executable, str(Path(__file__).resolve()), '--mode', 'test',
+            '--candidate', str(Path(candidate or args.candidate).resolve()),
+            '--cases', str(Path(args.cases).resolve()), '--cases-sha256', args.cases_sha256,
+            '--runtime-manifest', str(Path(args.runtime_manifest).resolve()),
+            '--runtime-sha256', args.runtime_sha256, '--physical-device', args.physical_device,
+            '--artifacts', str(directory/'application'), '--cache',
+            str(Path(args.cache).resolve()/'studies'/hashlib.sha256(str(directory).encode()).hexdigest()),
+            '--health-guard', str(Path(args.health_guard).resolve()),
+            '--health-guard-sha256', args.health_guard_sha256]
 
 
 def execute(args):
+    if args.mode != 'validation':
+        return execute_native(args)
+    contract = frozen_json(args.cases, args.cases_sha256)
+    identity = frozen_json(args.runtime_manifest, args.runtime_sha256)
+    directory = Path(args.artifacts)
+    source_hash = sha256(args.candidate)
+    native = directory/'native'
+    native.mkdir()
+    with (native/'stdout.log').open('wb') as out, (native/'stderr.log').open('wb') as err:
+        result = subprocess.run(native_command(args, native), stdout=out, stderr=err, timeout=remaining())
+    if result.returncode:
+        raise ValueError('Fresh native correctness child failed; raw diagnostics retained')
+    context = None
+    for path in (native/'application').rglob('result.json'):
+        value = json.loads(path.read_text())
+        if (value.get('status') == 'passed' and value.get('source_sha256') == source_hash
+                and value.get('cases_sha256') == args.cases_sha256
+                and value.get('runtime_manifest_sha256') == args.runtime_sha256):
+            context = value
+            for case in context['cases']:
+                for launch in case['launches']:
+                    for artifact in launch['artifacts'].values():
+                        artifact['file'] = str((path.parent/artifact['file']).relative_to(directory))
+            break
+    if context is None:
+        raise ValueError('Native child did not retain a matching verified result')
+    (directory/'native-result.json').write_text(json.dumps(context, sort_keys=True, allow_nan=False))
+    args.health_probe = lambda path, require_idle=False: fresh_device_health(args, identity, path, require_idle=require_idle)
+    context['exercise_evidence'] = exercise_evidence(args, contract, context)
+    if sha256(args.candidate) != source_hash:
+        raise ValueError('Candidate source changed during exercise production')
+    frozen_json(args.cases, args.cases_sha256)
+    frozen_json(args.runtime_manifest, args.runtime_sha256)
+    context.update(mode='validation', scope='native launch/numerics plus current-candidate trusted exercise production')
+    return context
+
+
+def execute_native(args):
     contract = frozen_json(args.cases, args.cases_sha256)
     identity = frozen_json(args.runtime_manifest, args.runtime_sha256)
     if str(identity['physical_device']) != args.physical_device:
@@ -176,8 +330,22 @@ def execute(args):
     if mask is not None and mask != args.physical_device:
         raise ValueError('Existing physical-device mask differs from the frozen binding')
     os.environ['ASCEND_RT_VISIBLE_DEVICES'] = args.physical_device
-    os.environ['TRITON_CACHE_DIR'] = str(Path(args.artifacts).resolve() / 'jit-cache')
+    os.environ['TRITON_CACHE_DIR'] = str(Path(args.cache).resolve())
     kernels = audit_candidate(args.candidate)
+    directory = Path(args.artifacts)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory/'candidate.ast.txt').write_text(ast.dump(ast.parse(Path(args.candidate).read_text()),
+                                                      include_attributes=True, indent=2))
+    fresh_device_health(args, identity, directory/'health-before-runtime')
+    consumers = identity.get('compiler_consumer_files')
+    if not consumers:
+        raise ValueError('Actual preflight compiler consumer fingerprints are required')
+    for consumer in consumers:
+        if sha256(consumer['path']) != consumer['sha256']:
+            raise ValueError('Installed compiler consumer differs from frozen runtime preflight: ' + consumer['path'])
+    for metadata in identity.get('cann_metadata', []):
+        if sha256(metadata['path']) != metadata['sha256']:
+            raise ValueError('CANN metadata differs from frozen runtime preflight')
     # Runtime imports occur only in the admitted target process, after mask setup.
     import torch
     import torch_npu
@@ -200,19 +368,19 @@ def execute(args):
     device_name = torch.npu.get_device_name(0)
     candidate_path = Path(args.candidate).resolve()
     source_hash = sha256(candidate_path)
-    module_spec = importlib.util.spec_from_file_location('_rsi_triton_candidate', candidate_path)
-    module = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
+    module = load_module('_rsi_triton_candidate', candidate_path)
     candidate = module.ModelNew().eval()
-    directory = Path(args.artifacts)
-    directory.mkdir(parents=True, exist_ok=True)
     results = []
     cases = contract['cases'][:1] if args.mode == 'compile' else contract['cases']
     if not cases:
         raise ValueError('Frozen correctness cases must not be empty')
     with torch.no_grad(), launch_capture(JITFunction, directory) as launches:
         for case in cases:
+            record(directory, 'cases.jsonl', {'case_id': case['case_id'], 'status': 'started'})
             inputs, golden = make_case(torch, contract['operation'], case)
+            case_file = directory / ('case-' + hashlib.sha256(case['case_id'].encode()).hexdigest() + '.pt')
+            raw_case = {'inputs': inputs, 'expected': golden}
+            torch.save(raw_case, case_file)
             device_inputs = [value.to('npu:0', memory_format=torch.preserve_format) for value in inputs]
             snapshots = [value.clone() for value in device_inputs]
             torch.npu.synchronize()
@@ -221,6 +389,9 @@ def execute(args):
             torch.npu.synchronize()
             if len(launches) == before:
                 raise ValueError('No actual Triton JIT launch was observed for the case')
+            if isinstance(output, torch.Tensor):
+                raw_case['actual'] = output.detach().cpu()
+                torch.save(raw_case, case_file)
             if not isinstance(output, torch.Tensor) or output.device.type != 'npu':
                 raise ValueError('Candidate must return an NPU tensor')
             if output.shape != golden.shape or output.dtype != golden.dtype:
@@ -232,13 +403,16 @@ def execute(args):
             results.append({'case_id': case['case_id'], 'status': 'passed',
                             'launches': launches[before:], 'shape': list(actual.shape),
                             'dtype': str(actual.dtype),
+                            'actual_sample': actual.reshape(-1)[:8].tolist(),
+                            'expected_sample': golden.reshape(-1)[:8].tolist(),
                             'max_absolute_error': float((actual.float()-golden.float()).abs().max())})
+            record(directory, 'cases.jsonl', results[-1])
     if sha256(candidate_path) != source_hash:
         raise ValueError('Candidate source changed during execution')
     frozen_json(args.cases, args.cases_sha256)
     frozen_json(args.runtime_manifest, args.runtime_sha256)
-    evidence = exercise_evidence(args, contract, source_hash) if args.mode == 'validation' else {}
-    return {'schema_version': 1, 'mode': args.mode, 'status': 'passed',
+    import triton.language as language
+    result = {'schema_version': 1, 'mode': args.mode, 'status': 'passed',
             'project_id': contract['project_id'], 'source_sha256': source_hash,
             'verifier_sha256': sha256(__file__), 'cases_sha256': args.cases_sha256,
             'runtime_manifest_sha256': args.runtime_sha256, 'observed_versions': observed,
@@ -246,9 +420,13 @@ def execute(args):
             'admitted_soc': identity.get('soc'),
             'declared_runtime_identity': identity, 'physical_device': args.physical_device,
             'logical_device': 0, 'kernel_names': kernels, 'cases': results,
-            'exercise_evidence': evidence,
+            'observed_api': {name: callable(getattr(language, name, None))
+                             for name in ('load', 'store', 'sum', 'arange', 'device_print',
+                                          'gather', 'histogram', 'associative_scan', 'sort')},
             'expected_project_hash': os.environ.get('RSI_EXPECTED_SOURCE_HASH'),
-            'scope': 'native launch/numerics' if args.mode != 'validation' else 'native launch/numerics plus frozen host exercise artifacts'}
+            'scope': 'native launch/numerics'}
+    (directory/'native-result.json').write_text(json.dumps(result, sort_keys=True, allow_nan=False))
+    return result
 
 
 def main():
@@ -260,14 +438,16 @@ def main():
     parser.add_argument('--runtime-manifest', required=True)
     parser.add_argument('--runtime-sha256', required=True)
     parser.add_argument('--physical-device', required=True)
-    parser.add_argument('--artifacts', default='artifacts/triton')
-    parser.add_argument('--exercise-evidence')
-    parser.add_argument('--exercise-evidence-sha256')
+    parser.add_argument('--artifacts', default='outputs/triton')
+    parser.add_argument('--cache', default='caches/triton')
+    parser.add_argument('--exercise-profile')
+    parser.add_argument('--exercise-profile-sha256')
+    parser.add_argument('--exercise-producer')
+    parser.add_argument('--exercise-producer-sha256')
+    parser.add_argument('--health-guard', required=True)
+    parser.add_argument('--health-guard-sha256', required=True)
     args = parser.parse_args()
-    started = time.monotonic()
-    result = execute(args)
-    result['elapsed_seconds'] = time.monotonic() - started
-    print(json.dumps(result, sort_keys=True, allow_nan=False))
+    run_driver(args)
 
 
 if __name__ == '__main__':

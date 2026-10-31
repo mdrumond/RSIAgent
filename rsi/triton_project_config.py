@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from rsi.contracts import BudgetLimits, ProjectSpec
+from rsi.device_health_probe import standalone_hash, standalone_source
 from rsi.project_runner import ProjectConfig
 
 
@@ -24,11 +25,12 @@ def budgets():
 
 
 def project_config(source, cases, runtime_manifest, *, executor_identity, python, physical_device,
-                   exercise_evidence=None):
+                   health_guard=None, exercise_profile=None):
     """Build executable compile/test/validation commands against a frozen verifier.
 
-    The caller includes the immutable cases and runtime_manifest files in the
-    common CplConfig.trusted_resources. Only candidate.py is actor editable.
+    The caller includes trusted_resources(config) in CplConfig.trusted_resources.
+    The exercise profile freezes tool commands, not candidate attestations.
+    Only candidate.py is actor editable.
     Python is the selected registered runtime's interpreter, supplied by the host.
     """
     source, cases, runtime_manifest = (Path(p).resolve() for p in (source, cases, runtime_manifest))
@@ -42,41 +44,41 @@ def project_config(source, cases, runtime_manifest, *, executor_identity, python
         raise ValueError('Cases or runtime identity do not match the binding')
     if not executor_identity or not python:
         raise ValueError('Frozen executor identity and target interpreter are required')
+    probe_source = standalone_source().encode('utf-8')
+    probe_hash = standalone_hash()
+    if hashlib.sha256(probe_source).hexdigest() != probe_hash:
+        raise ValueError('Shared health source changed while building frozen inputs')
+    health_guard = Path(health_guard).resolve() if health_guard else cases.parent/'health-probes'/(probe_hash+'.py')
+    if health_guard.is_relative_to(source) or not isinstance(identity.get('device_health'), dict):
+        raise ValueError('Frozen common health probe and runtime device-health configuration are required')
+    health_guard.parent.mkdir(parents=True, exist_ok=True)
+    if health_guard.exists() and health_guard.read_bytes() != probe_source:
+        raise ValueError('Existing health resource differs from the current shared export')
+    if not health_guard.exists():
+        with health_guard.open('xb') as stream:
+            stream.write(probe_source)
     case_hash = hashlib.sha256(cases.read_bytes()).hexdigest()
     runtime_hash = hashlib.sha256(runtime_manifest.read_bytes()).hexdigest()
     common = ['--candidate', 'candidate.py', '--cases', str(cases), '--cases-sha256', case_hash,
               '--runtime-manifest', str(runtime_manifest), '--runtime-sha256', runtime_hash,
-              '--physical-device', str(physical_device), '--artifacts', 'artifacts/triton']
+              '--physical-device', str(physical_device), '--artifacts', 'outputs/triton',
+              '--cache', 'caches/triton', '--health-guard', str(health_guard),
+              '--health-guard-sha256', probe_hash]
     commands = {mode: [python, '{verifier}', '--mode', mode, *common]
                 for mode in ('compile', 'test', 'validation')}
-    if exercise_evidence is not None:
-        exercise_evidence = Path(exercise_evidence).resolve()
-        if exercise_evidence.is_relative_to(source):
-            raise ValueError('Exercise evidence must be outside the actor project')
-        commands['validation'] += ['--exercise-evidence', str(exercise_evidence),
-                                   '--exercise-evidence-sha256', hashlib.sha256(exercise_evidence.read_bytes()).hexdigest()]
+    producer = Path(__file__).with_name('triton_exercises.py')
+    commands['validation'] += ['--exercise-producer', str(producer),
+                               '--exercise-producer-sha256', hashlib.sha256(producer.read_bytes()).hexdigest()]
+    if exercise_profile is not None:
+        exercise_profile = Path(exercise_profile).resolve()
+        if exercise_profile.is_relative_to(source):
+            raise ValueError('Exercise command profile must be outside the actor project')
+        commands['validation'] += ['--exercise-profile', str(exercise_profile),
+                                   '--exercise-profile-sha256', hashlib.sha256(exercise_profile.read_bytes()).hexdigest()]
     return ProjectConfig(source=str(source), verifier=str(Path(__file__).with_name('triton_verifier.py')),
                          commands=commands, editable_files=('candidate.py',),
-                         generated_paths=('artifacts/',), executor_identity=executor_identity)
-
-
-def executor_factory(bindings):
-    """Bind opaque identities to the one shared CPL implementation, without dispatch.
-
-    bindings maps host-approved identity strings to common CplConfig objects.
-    Supply this factory both when creating and reopening a ProjectRunner snapshot.
-    """
-    frozen = dict(bindings)
-
-    def create(identity):
-        from rsi.cpl_execution import CplExecutor
-        try:
-            config = frozen[identity]
-        except KeyError as exc:
-            raise ValueError('Unknown trusted Triton executor identity') from exc
-        return CplExecutor(identity, config)
-
-    return create
+                         generated_paths=('outputs', 'caches'), retained_paths=('outputs',),
+                         executor_identity=executor_identity)
 
 
 def project_spec(project_id, goal, config, *, correctness_ref):
@@ -84,3 +86,13 @@ def project_spec(project_id, goal, config, *, correctness_ref):
     return ProjectSpec(project_id=project_id, goal=goal, command=tuple(config.commands['test']),
                        budgets=budgets(), starting_folder=config.source,
                        correctness_ref=correctness_ref)
+
+
+def trusted_resources(config):
+    """Files required by the shared transport, including the standalone producer."""
+    flags = {'--cases', '--runtime-manifest', '--exercise-producer', '--exercise-profile', '--health-guard'}
+    def resolve(value):
+        path = Path(value)
+        return path.resolve() if path.is_absolute() else (Path(config.source)/path).resolve()
+    return tuple(sorted({resolve(argv[i+1]) for argv in config.commands.values()
+                         for i, token in enumerate(argv[:-1]) if token in flags}))
