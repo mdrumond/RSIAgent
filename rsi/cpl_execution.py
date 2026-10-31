@@ -537,6 +537,25 @@ class CplExecutor:
             shutil.copy2(source, destination)
         self._limit(remaining)
 
+    def recorded_closure(self, request, *, ended_at):
+        """Prove terminal observation preceded the original controller end.
+
+        The host download marker is written only after _wait observes the original
+        job terminal. It is never overwritten during same-transfer recovery. Its
+        host mtime is a boundary witness, not a remote epoch or producer duration.
+        reconcile must still verify the retrieved producer's actual closure.
+        """
+        directory = self._directory(request)
+        marker = directory / 'download-started.json'
+        if not marker.is_file() or marker.stat().st_mtime > ended_at:
+            return False
+        state = json.loads((directory / 'transport.json').read_text())
+        receipt = json.loads((directory / 'submission.json').read_text())
+        return (state['identity'] == self._identity(request)
+                and state.get('terminal', {}).get('state') == 'completed'
+                and state['terminal'].get('exit') == 0
+                and json.loads(marker.read_text()).get('handle') == self._handle(receipt))
+
     def reconcile(self, request, *, observe, remaining, recovery_remaining=None):
         """Observe the original receipt and retrieve results; never submit work."""
         # Recovery allowance only funds observation/retrieval, never dispatch.
