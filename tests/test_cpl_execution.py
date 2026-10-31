@@ -331,3 +331,18 @@ def test_disconnected_deadline_cancellation_retains_owned_lease(tmp_path, monkey
     assert saved['handle'] == 'remote:fake:job:original'
     assert saved['lease_retained'] and saved['status'] == 'deadline-observation-pending'
     assert all(call == ['cancel', 'remote:fake:job:original'] for call in seen)
+
+
+def test_invalid_client_response_retains_native_stderr_before_raising(tmp_path, monkeypatch):
+    executor, *_ = fixture(tmp_path)
+    def run(argv, **kwargs):
+        return type('Result', (), dict(returncode=2, stdout=b'not json\n',
+                                      stderr=b'HTTP 400: cwd must be relative\n'))()
+    monkeypatch.setattr('rsi.cpl_execution.subprocess.run', run)
+    path = tmp_path / 'invalid-response.json'
+    with pytest.raises(WorkflowError, match='invalid CPL response'):
+        executor._cli(['preflight', 'fake'], lambda: 10, result_path=path)
+    assert Path(str(path) + '.stdout').read_bytes() == b'not json\n'
+    assert Path(str(path) + '.stderr').read_bytes() == b'HTTP 400: cwd must be relative\n'
+    assert json.loads(Path(str(path) + '.client.json').read_text())['returncode'] == 2
+    assert not path.exists()
