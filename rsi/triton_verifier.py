@@ -151,6 +151,59 @@ def audit_candidate(path):
                 name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else None
                 if name in definitions and id(definitions[name]) not in reachable:
                     pending.append(definitions[name])
+    # Follow actual helper arguments: shape arithmetic is scalar, while wrapper
+    # inputs and their aliases remain tensors. A helper may be reached with both.
+    taints = {id(function): set() for function in functions}
+    returns_tensor = {name: False for name in definitions}
+    for root in roots:
+        taints[id(root)].update(arg.arg for arg in root.args.args if arg.arg != 'self')
+
+    def tensor(expression, names):
+        if expression is None:
+            return False
+        if isinstance(expression, ast.Name):
+            return expression.id in names
+        if isinstance(expression, ast.Attribute):
+            return False if expression.attr in {'shape', 'dtype', 'device', 'ndim'} else tensor(expression.value, names)
+        if isinstance(expression, ast.Call):
+            if isinstance(expression.func, ast.Attribute):
+                if expression.func.attr in {'numel', 'size', 'stride', 'dim', 'ndimension'}:
+                    return False
+                if expression.func.attr in allocation:
+                    return True
+            name = expression.func.id if isinstance(expression.func, ast.Name) else getattr(expression.func, 'attr', None)
+            if name in definitions:
+                return returns_tensor[name]
+            return any(tensor(child, names) for child in ast.iter_child_nodes(expression))
+        return any(tensor(child, names) for child in ast.iter_child_nodes(expression))
+
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            if id(function) not in reachable:
+                continue
+            names = taints[id(function)]
+            before = len(names)
+            for node in ast.walk(function):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and tensor(node.value, names):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names.update(child.id for target in targets for child in ast.walk(target) if isinstance(child, ast.Name))
+                if isinstance(node, ast.Call):
+                    name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, 'attr', None)
+                    if name in definitions:
+                        callee = definitions[name]
+                        params = [arg.arg for arg in callee.args.args if arg.arg != 'self']
+                        bindings = dict(zip(params, node.args))
+                        bindings.update((kw.arg, kw.value) for kw in node.keywords if kw.arg is not None)
+                        prior = len(taints[id(callee)])
+                        taints[id(callee)].update(key for key, value in bindings.items() if tensor(value, names))
+                        changed |= len(taints[id(callee)]) != prior
+                if isinstance(node, ast.Return) and node.value is not None and tensor(node.value, names):
+                    if not returns_tensor[function.name]:
+                        returns_tensor[function.name] = True
+                        changed = True
+            changed |= len(names) != before
     for function in functions:
         is_kernel = any(isinstance(decorator, ast.Attribute) and decorator.attr == 'jit'
                         or isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute)
@@ -160,7 +213,7 @@ def audit_candidate(path):
             continue
         if id(function) not in reachable:
             continue
-        parameters = {arg.arg for arg in function.args.args} - {'self'}
+        parameters = taints[id(function)]
         for node in ast.walk(function):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 owner, method = node.func.value, node.func.attr
@@ -168,8 +221,7 @@ def audit_candidate(path):
                     raise ValueError('Framework compute is not permitted in a candidate wrapper')
                 if method in forbidden and method not in metadata:
                     raise ValueError('Tensor compute or host data reads are not permitted in wrappers')
-            if isinstance(node, ast.BinOp) and any(isinstance(value, ast.Name) and value.id in parameters
-                                                  for value in (node.left, node.right)):
+            if isinstance(node, ast.BinOp) and tensor(node, parameters):
                 raise ValueError('Direct tensor arithmetic belongs in a Triton kernel')
     if not kernel_names:
         raise ValueError('Candidate has no Triton JIT kernel')
@@ -228,6 +280,11 @@ def make_case(torch, operation, case):
     if operation == 'strided_copy':
         return [x], x.contiguous().clone()
     raise ValueError('Unsupported frozen operation')
+
+
+def check_output_layout(output, operation):
+    if operation == 'strided_copy' and not output.is_contiguous():
+        raise ValueError('Strided copy must return contiguous output')
 
 
 def exercise_evidence(args, contract, context):
@@ -394,6 +451,7 @@ def execute_native(args):
                 torch.save(raw_case, case_file)
             if not isinstance(output, torch.Tensor) or output.device.type != 'npu':
                 raise ValueError('Candidate must return an NPU tensor')
+            check_output_layout(output, contract['operation'])
             if output.shape != golden.shape or output.dtype != golden.dtype:
                 raise ValueError('Output shape or dtype differs from the frozen oracle')
             if any(not torch.equal(a, b) for a, b in zip(snapshots, device_inputs)):

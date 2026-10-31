@@ -24,6 +24,26 @@ def budgets():
                         execution_tries=None, actor_seconds=ACTOR_SECONDS, wall_seconds=None)
 
 
+def validate_fixture_closure(source, contract):
+    """Frozen case fixtures travel inside the snapshotted read-only project."""
+    for field in ('compiler_failure', 'ascendc_reference', 'feature_probe', 'historical_environment'):
+        fixture = contract.get(field)
+        if fixture is None:
+            continue
+        name = fixture.get('project_path')
+        if not isinstance(name, str) or not name:
+            raise ValueError('Frozen fixture requires a project-relative path: ' + field)
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('Frozen fixture must be portable and project-relative: ' + field)
+        path = (source / relative).resolve()
+        if (not path.is_relative_to(source) or not path.is_file() or relative == Path('candidate.py')
+                or relative.parts[0] in ('outputs', 'caches')):
+            raise ValueError('Frozen fixture must be an immutable source input: ' + field)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != fixture.get('sha256'):
+            raise ValueError('Frozen fixture content differs from its declared hash: ' + field)
+
+
 def project_config(source, cases, runtime_manifest, *, executor_identity, python, physical_device,
                    health_guard=None, exercise_profile=None):
     """Build executable compile/test/validation commands against a frozen verifier.
@@ -39,6 +59,7 @@ def project_config(source, cases, runtime_manifest, *, executor_identity, python
     if cases.is_relative_to(source) or runtime_manifest.is_relative_to(source):
         raise ValueError('Frozen cases and runtime identity must be outside the actor project')
     contract = json.loads(cases.read_text())
+    validate_fixture_closure(source, contract)
     identity = json.loads(runtime_manifest.read_text())
     if not contract.get('cases') or str(identity['physical_device']) != str(physical_device):
         raise ValueError('Cases or runtime identity do not match the binding')

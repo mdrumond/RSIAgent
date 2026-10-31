@@ -211,3 +211,86 @@ def test_shared_probe_alarm_permission_is_preserved_but_profile_is_strict(tmp_pa
         fresh_device_health(args, identity, tmp_path/'profile', require_idle=True)
     assert json.loads((tmp_path/'profile/guard.json').read_text())['admitted'] is False
     assert len(calls) == 8
+
+
+@pytest.mark.parametrize('call', ['ceil_div(x.numel(), 256)', 'ceil_div(x.shape[0], block=256)'])
+def test_scalar_helper_arguments_admit_shape_arithmetic(tmp_path, call):
+    path = tmp_path/'candidate.py'
+    path.write_text('import torch\nimport triton\n'
+        'def ceil_div(n, block):\n    quotient = (n + block - 1) // block\n    return quotient\n'
+        '@triton.jit\ndef kernel(X, O):\n    pass\n'
+        'class ModelNew:\n    def forward(self, x):\n'
+        '        output = torch.empty_like(x)\n'
+        f'        kernel[({call},)](x, output)\n        return output\n')
+    assert audit_candidate(path) == ['kernel']
+
+
+@pytest.mark.parametrize('body', ['return x + 1', 'alias = x\n    return alias * 2'])
+def test_helper_tensor_arguments_still_reject_host_compute(tmp_path, body):
+    path = tmp_path/'candidate.py'
+    path.write_text('import triton\ndef helper(x):\n    '+body+'\n'
+        '@triton.jit\ndef kernel(X):\n    pass\n'
+        'class ModelNew:\n    def forward(self, x):\n        return helper(x)\n')
+    with pytest.raises(ValueError):
+        audit_candidate(path)
+
+
+def test_copy_layout_requires_contiguous_output():
+    from types import SimpleNamespace
+    from rsi.triton_verifier import check_output_layout
+    transposed = SimpleNamespace(is_contiguous=lambda: False)
+    with pytest.raises(ValueError):
+        check_output_layout(transposed, 'strided_copy')
+    check_output_layout(SimpleNamespace(is_contiguous=lambda: True), 'strided_copy')
+    check_output_layout(transposed, 'add')
+
+
+@pytest.mark.parametrize('path_kind', ['absolute', 'parent', 'missing', 'hash_changed'])
+def test_fixture_closure_rejects_nonportable_or_changed_inputs(tmp_path, path_kind):
+    from rsi.triton_project_config import validate_fixture_closure
+    source = tmp_path/'source'
+    source.mkdir()
+    fixture = source/'fixture.cpp'
+    fixture.write_text('frozen original')
+    value = {'project_path': 'fixture.cpp', 'sha256': hashlib.sha256(fixture.read_bytes()).hexdigest()}
+    if path_kind == 'absolute': value['project_path'] = str(fixture)
+    if path_kind == 'parent': value['project_path'] = '../source/fixture.cpp'
+    if path_kind == 'missing': value['project_path'] = 'missing.cpp'
+    if path_kind == 'hash_changed': fixture.write_text('changed')
+    with pytest.raises(ValueError):
+        validate_fixture_closure(source, {'ascendc_reference': value})
+
+
+def test_actual_cpl_staging_preserves_external_case_fixture_closure(tmp_path):
+    from dataclasses import replace
+    import sys
+    from test_cpl_execution import fixture
+    from rsi.cpl_execution import CplExecutor
+    from rsi.python_execution import PythonExecution
+    from rsi.triton_project_config import validate_fixture_closure
+
+    code = ('import hashlib,json,pathlib,sys\n'
+            'contract=json.loads(pathlib.Path(sys.argv[1]).read_text())\n'
+            'for value in contract.values():\n'
+            ' p=pathlib.Path(value["project_path"])\n'
+            ' assert not p.is_absolute()\n'
+            ' assert hashlib.sha256(p.read_bytes()).hexdigest()==value["sha256"]\n'
+            'print("fixture closure verified after transfer")\n')
+    executor, request, observe, observations, _ = fixture(tmp_path, code)
+    cases = tmp_path/'external-cases.json'
+    contract = {}
+    for name in ('compiler_failure', 'ascendc_reference', 'feature_probe', 'historical_environment'):
+        file = request.project/(name+'.txt')
+        file.write_text('immutable '+name)
+        contract[name] = {'project_path': file.name, 'sha256': hashlib.sha256(file.read_bytes()).hexdigest()}
+    cases.write_text(json.dumps(contract))
+    validate_fixture_closure(request.project, contract)
+    backend = PythonExecution(request.project.parent)
+    request = replace(request, source_hash=backend.project_hash(), argv=(sys.executable, 'main.py', str(cases)))
+    executor = CplExecutor('frozen', replace(executor.config, trusted_resources=(cases,)))
+    result = executor.execute(request, observe=observe, remaining=lambda: 60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b'fixture closure verified after transfer\n'
+    remote = next((tmp_path/'remote').glob('rsi-*/project'))
+    assert remote != request.project
+    assert all((remote/value['project_path']).is_file() for value in contract.values())
