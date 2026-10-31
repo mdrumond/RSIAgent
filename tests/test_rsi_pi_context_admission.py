@@ -14,7 +14,8 @@ from rsi.skills import builtin_bundle
 from test_rsi_pi_controller import native_actor, response
 
 
-@pytest.mark.parametrize('limits', [{}, dict(context_window=16384, request_bytes=49152)])
+@pytest.mark.parametrize('limits', [{}, dict(context_window=16384, request_bytes=49152),
+                                  dict(context_window=65536, request_bytes=196608)])
 def test_adoption_preserves_capacity_deadline_and_dispatch_guard(monkeypatch, limits):
     monkeypatch.setattr('coding.pi.session.runtime_preflight', lambda: 'unused-no-process')
     deadline = time.monotonic() + 120
@@ -27,7 +28,7 @@ def test_adoption_preserves_capacity_deadline_and_dispatch_guard(monkeypatch, li
         assert controller.deadline == controller.gateway.deadline == deadline
         assert controller.context_window == limits.get('context_window', 65536)
         payload = dict(model='deepseek-flash', messages=[dict(role='user', content='x' * 60000)])
-        if limits:
+        if gateway.hard_bytes < 60000:
             with pytest.raises(RequestContextLimit):
                 gateway.prepare(payload)
         else:
@@ -38,6 +39,22 @@ def test_adoption_preserves_capacity_deadline_and_dispatch_guard(monkeypatch, li
         assert gateway.calls == 0 and gateway.records == []
         assert controller.rpc is None and session.closed
     finally:
+        controller.close()
+
+
+def test_direct_controller_uses_production_capacity_without_widening_generic_defaults(monkeypatch):
+    monkeypatch.setattr('coding.pi.session.runtime_preflight', lambda: 'unused-no-process')
+    generic = PiCodingSession(model='deepseek-flash', schemas={}, environ={'DEEPSEEK_API_KEY': 'fake'})
+    controller = ControllerSession(model='deepseek-flash', schemas={}, environ={'DEEPSEEK_API_KEY': 'fake'})
+    payload = dict(model='deepseek-flash', messages=[dict(role='user', content='x' * 60000)])
+    try:
+        with pytest.raises(RequestContextLimit):
+            generic.gateway.prepare(payload)
+        controller.gateway.prepare(payload)
+        assert controller.context_window == 65536
+        assert generic.gateway.calls == controller.gateway.calls == 0
+    finally:
+        generic.close()
         controller.close()
 
 

@@ -20,6 +20,8 @@ from .session import ActionError, PiCodingSession, ROOT
 
 class ControllerSession(PiCodingSession):
     def __init__(self, *, wall_deadline=None, **kwargs):
+        kwargs.setdefault('context_window', 65536)
+        kwargs.setdefault('request_bytes', 196608)
         super().__init__(**kwargs)
         self.request_deadline_provenance = dict(session=self.deadline, gateway=self.gateway.deadline)
         self.enclosing_deadline = wall_deadline
