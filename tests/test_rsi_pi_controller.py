@@ -1,4 +1,7 @@
 """Actual pinned Pi runs completed host tools and its own compaction."""
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
+
 import json
 import threading
 
@@ -548,7 +551,7 @@ def test_real_project_runner_durably_records_native_pi_event_envelopes(monkeypat
     try:
         runner.actor.step(runner.context())
         runner.actor.step(runner.context())
-        persisted=[runner.store.read_json(ref) for ref in json.loads(runner.event_path.read_text())]
+        persisted=[runner.store.read_json(ref) for ref in read_event_refs(runner.root)]
         pi_events=[row for row in persisted if row['type']=='pi-event']
         assert pi_events and any(row['event']['type']=='agent_settled' for row in pi_events)
         assert runner.workflow.stage==Stage.DESIGN and runner.workflow.pending is None

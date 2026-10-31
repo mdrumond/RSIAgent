@@ -1,4 +1,7 @@
 """Production composition with scripted decisions and real CPU/KDB services."""
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
+
 import sys
 
 import pytest
@@ -360,7 +363,7 @@ def test_concurrent_event_append_preserves_every_cas_record(tmp_path):
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(append, range(8)))
-        refs = json.loads(runner.event_path.read_text())
+        refs = read_event_refs(runner.root)
         assert refs == runner.event_refs
         assert [runner.store.read_json(ref) for ref in refs] == runner.events
         assert {e['index'] for e in runner.events} == set(range(8))
@@ -699,7 +702,7 @@ def test_terminal_failure_proof_preserves_pending_and_completed_effects(tmp_path
     runner, injections, database, result = failed_after_query(tmp_path, after_commands=after_commands)
     try:
         before_state = (runner.root / 'workflow.json').read_bytes()
-        before_index = runner.event_path.read_bytes()
+        before_index = canonical_bytes(read_event_refs(runner.root))
         before_objects = set(runner.store.objects.rglob('*'))
         proof = runner.terminal_failure_proof(closure_ref=result['actor_closure_ref'])
         assert proof['outcome'] == 'failed' and proof['classification'] == 'provider_timeout'
@@ -709,7 +712,7 @@ def test_terminal_failure_proof_preserves_pending_and_completed_effects(tmp_path
         assert len(proof['command_receipts']) == (2 if after_commands else 0)
         assert proof['actor_seconds_total'] == runner.workflow.accounting.seconds()
         assert before_state == (runner.root / 'workflow.json').read_bytes()
-        assert before_index == runner.event_path.read_bytes()
+        assert before_index == canonical_bytes(read_event_refs(runner.root))
         assert before_objects == set(runner.store.objects.rglob('*'))
         reopened = ProjectRunner(runner.root, **injections)
         assert reopened.terminal_failure_proof() == proof

@@ -1,5 +1,6 @@
 """Read-only A3 retry admission from observed canonical receipts."""
 import json
+from rsi.event_journal import read_event_refs
 from hashlib import sha256
 from pathlib import Path
 
@@ -27,7 +28,7 @@ def observed_prelaunch_root(root):
     store = ContentAddressedArtifacts(location if location.is_absolute() else root/location)
     frozen = store.read_json(pointer['contract'])
     state = json.loads((root/'workflow.json').read_text())
-    events = [store.read_json(ref) for ref in json.loads((root/'events.json').read_text())]
+    events = [store.read_json(ref) for ref in read_event_refs(root)]
     if not state['pending']:
         return False
     if sha256((root.parent/'canonical-source').read_bytes()).hexdigest() != state['source']:

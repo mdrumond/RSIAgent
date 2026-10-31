@@ -3,6 +3,9 @@
 The production OptimizerHost freezes the baseline and owns every host effect.
 DomainRunner retains the actual workflow, receipts, source and recovery state.
 """
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
+
 import json
 
 import pytest
@@ -152,7 +155,7 @@ def retained_native(execution):
     store = ContentAddressedArtifacts(directory / 'canonical-artifacts')
     return SimpleNamespace(root=root, store=store,
         workflow=json.loads((root / 'workflow.json').read_bytes()),
-        events=[store.read_json(reference) for reference in json.loads((root / 'events.json').read_bytes())])
+        events=[store.read_json(reference) for reference in read_event_refs(root)])
 
 
 def scripted_optimizer_http(monkeypatch, agent, *, compile_if_offered=False):
