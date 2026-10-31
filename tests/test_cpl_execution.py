@@ -1,13 +1,18 @@
 """Local CLI behavior tests; no target, provider or hardware required."""
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import signal
+import shutil
+import subprocess
 import sys
+import tarfile
 import time
 
 import pytest
 
-from rsi.cpl_execution import CplConfig, CplExecutor
+from rsi.cpl_execution import CplConfig, CplExecutor, _RUNNER
 from rsi.python_execution import CommandRequest, PythonExecution, digest
 from rsi.runtime import WorkflowError
 
@@ -279,12 +284,16 @@ def test_queue_expiry_cancels_owned_handle_without_late_work(tmp_path, monkeypat
     with pytest.raises(WorkflowError):
         executor.execute(request, observe=observe, remaining=lambda: max(0, deadline-time.monotonic()))
     state = json.loads((executor._directory(request) / 'transport.json').read_text())
-    assert state['status'] == 'deadline-terminal'
+    assert state['status'] == 'producer-unknown'
+    assert state['lease_retained'] is True
     assert state['terminal']['handle'] == 'remote:fake:job:original'
     assert not (Path(state['remote']) / 'project').exists()
     calls = [json.loads(line) for line in (installed / 'calls.jsonl').read_text().splitlines()]
     assert any(call[:2] == ['cancel', 'remote:fake:job:original'] for call in calls)
-    assert sum(call[0] == 'run' for call in calls) == 1
+    runs = [call for call in calls if call[0] == 'run']
+    assert len(runs) == 2
+    assert '--npu' not in runs[1]
+    assert runs[1][runs[1].index('--file') + 1].endswith('cancel-producer.sh')
 
 
 @pytest.mark.parametrize('kind,expected_billable', [('transfer', 0), ('job', 7)])
@@ -331,6 +340,392 @@ def test_disconnected_deadline_cancellation_retains_owned_lease(tmp_path, monkey
     assert saved['handle'] == 'remote:fake:job:original'
     assert saved['lease_retained'] and saved['status'] == 'deadline-observation-pending'
     assert all(call == ['cancel', 'remote:fake:job:original'] for call in seen)
+
+
+def start_runner(root, code, limit=10, *, wrapper=None, identity=None):
+    """Run the shipped producer, independently of the fake CPL client."""
+    (root / 'project').mkdir()
+    (root / 'project' / 'main.py').write_text(code)
+    (root / 'verifier').write_text('verifier')
+    (root / 'runner.py').write_text(_RUNNER)
+    identity = identity or dict(source_hash='frozen', operation_id='owned')
+    (root / 'spec.json').write_text(json.dumps(dict(
+        identity=identity, files={}, physical_device=0,
+        argv=[sys.executable, '-u', 'main.py'])))
+    command = [sys.executable, str(root / 'runner.py'), str(limit)]
+    if wrapper is not None:
+        command = [sys.executable, '-c', wrapper, *command]
+    return subprocess.Popen(command,
+                            start_new_session=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+
+
+def wait_for_file(path, process):
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        assert process.poll() is None, process.communicate()
+        assert time.monotonic() < deadline, str(path)
+        time.sleep(0.01)
+
+
+def stop_test_runner(process, root):
+    # Only IDs belonging to this test's runner and its recorded child are eligible.
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            receipt = root / 'producer.json'
+            if receipt.exists():
+                child = json.loads(receipt.read_text()).get('child_pgid')
+                if child:
+                    try:
+                        os.killpg(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.kill()
+            process.wait(timeout=3)
+    process.communicate()
+
+
+@pytest.mark.parametrize('route,signum', [
+    ('signal', signal.SIGTERM), ('signal', signal.SIGINT), ('cleanup', signal.SIGTERM)])
+def test_actual_runner_signal_closes_separate_child_group(tmp_path, route, signum):
+    code = '''import os, pathlib, signal, sys, time
+def stop(signum, frame):
+    print('forwarded ' + str(signum), flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+print('partial stdout', flush=True)
+print('partial stderr', file=sys.stderr, flush=True)
+pathlib.Path('child-pgid').write_text(str(os.getpgrp()))
+while True:
+    pathlib.Path('heartbeat').write_text(str(time.monotonic_ns()))
+    time.sleep(0.01)
+'''
+    process = start_runner(tmp_path, code)
+    try:
+        heartbeat = tmp_path / 'project' / 'heartbeat'
+        wait_for_file(heartbeat, process)
+        child_pgid = int((tmp_path / 'project' / 'child-pgid').read_text())
+        assert child_pgid != os.getpgid(process.pid)
+        if route == 'cleanup':
+            cleanup = subprocess.run([sys.executable, str(tmp_path / 'runner.py'), '--cancel-owned'],
+                                     capture_output=True, timeout=6)
+            assert cleanup.returncode == 0, cleanup.stderr
+        else:
+            process.send_signal(signum)
+        process.communicate(timeout=5)
+        producer = json.loads((tmp_path / 'producer.json').read_text())
+        assert producer['child_pgid'] == child_pgid
+        assert producer['signal'] == signum
+        assert CplExecutor._producer_closed(producer, producer['identity'])
+        with pytest.raises(ProcessLookupError):
+            os.killpg(child_pgid, 0)
+        final_heartbeat = heartbeat.read_bytes()
+        time.sleep(0.05)
+        assert heartbeat.read_bytes() == final_heartbeat
+        with tarfile.open(tmp_path / 'results.tar') as archive:
+            result = json.load(archive.extractfile('result.json'))
+            assert result['producer'] == producer
+            assert result['returncode'] != 0
+            assert archive.extractfile('stdout').read() == (
+                'partial stdout\nforwarded ' + str(signum) + '\n').encode()
+            assert archive.extractfile('stderr').read() == b'partial stderr\n'
+    finally:
+        stop_test_runner(process, tmp_path)
+
+
+@pytest.mark.parametrize('code,limit,returncode,timed_out', [
+    ('print("ordinary")', 5, 0, False),
+    ('import sys; print("nonzero"); sys.exit(7)', 5, 7, False),
+    ('import time; print("partial", flush=True); time.sleep(30)', 0.5, -9, True),
+])
+def test_actual_runner_terminal_artifacts(tmp_path, code, limit, returncode, timed_out):
+    process = start_runner(tmp_path, code, limit)
+    try:
+        process.communicate(timeout=5)
+        result = json.loads((tmp_path / 'result.json').read_text())
+        assert result['returncode'] == returncode
+        assert result['timed_out'] is timed_out
+        assert CplExecutor._producer_closed(result['producer'], result['identity'])
+        assert (tmp_path / 'stdout').read_bytes()
+        assert (tmp_path / 'results.tar').exists()
+    finally:
+        stop_test_runner(process, tmp_path)
+
+
+@pytest.mark.parametrize('legacy_complete', [False, True])
+def test_legacy_artifact_requires_previously_known_completion(tmp_path, legacy_complete):
+    executor, request, observe, _, installed = fixture(tmp_path)
+    executor.execute(request, observe=observe, remaining=lambda: 60)
+    directory = executor._directory(request)
+    output = directory / 'results.tar'
+    unpacked = directory / 'legacy'
+    with tarfile.open(output) as archive:
+        archive.extractall(unpacked, filter='data')
+    result_path = unpacked / 'result.json'
+    result = json.loads(result_path.read_text())
+    del result['producer']
+    result_path.write_text(json.dumps(result))
+    with tarfile.open(output, 'w') as archive:
+        for path in unpacked.iterdir():
+            archive.add(path, arcname=path.name)
+    state_path = directory / 'transport.json'
+    state = json.loads(state_path.read_text())
+    state.pop('producer_version')
+    state.pop('producer')
+    state.update(status='complete' if legacy_complete else 'terminal')
+    state_path.write_text(json.dumps(state))
+    if legacy_complete:
+        assert executor.reconcile(request, observe=observe, remaining=lambda: 60).returncode == 0
+    else:
+        with pytest.raises(WorkflowError, match='closure unknown'):
+            executor.reconcile(request, observe=observe, remaining=lambda: 60)
+        assert json.loads(state_path.read_text())['lease_retained'] is True
+    calls = [json.loads(line) for line in (installed / 'calls.jsonl').read_text().splitlines()]
+    assert sum(call[0] == 'run' for call in calls) == 1
+
+
+@pytest.mark.parametrize('proof', ['missing', 'open', 'different-operation'])
+def test_new_terminal_outer_job_does_not_substitute_for_closure(tmp_path, proof):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    executor.execute(request, observe=observe, remaining=lambda: 60)
+    directory = executor._directory(request)
+    unpacked = directory / 'unproven'
+    with tarfile.open(directory / 'results.tar') as archive:
+        archive.extractall(unpacked, filter='data')
+    result_path = unpacked / 'result.json'
+    result = json.loads(result_path.read_text())
+    if proof == 'missing':
+        result.pop('producer')
+    elif proof == 'open':
+        result['producer']['closed'] = False
+    else:
+        result['producer']['identity'] = dict(operation_id='another')
+    result_path.write_text(json.dumps(result))
+    with tarfile.open(directory / 'results.tar', 'w') as archive:
+        for path in unpacked.iterdir():
+            archive.add(path, arcname=path.name)
+    with pytest.raises(WorkflowError, match='closure unknown'):
+        executor.reconcile(request, observe=observe, remaining=lambda: 60)
+    state = json.loads((directory / 'transport.json').read_text())
+    assert state['lease_retained'] is True
+    assert state['status'] == 'producer-unknown'
+
+
+def test_owned_cleanup_rejects_recycled_runner_identity(tmp_path):
+    process = start_runner(tmp_path, 'import pathlib,time\npathlib.Path("ready").touch()\ntime.sleep(30)')
+    try:
+        wait_for_file(tmp_path / 'project' / 'ready', process)
+        receipt = tmp_path / 'producer.json'
+        producer = json.loads(receipt.read_text())
+        producer['runner_start_ticks'] = 'different-process'
+        receipt.write_text(json.dumps(producer))
+        result = subprocess.run([sys.executable, str(tmp_path / 'runner.py'), '--cancel-owned'],
+                                capture_output=True, timeout=2)
+        assert result.returncode != 0
+        assert process.poll() is None
+        os.killpg(producer['child_pgid'], 0)
+    finally:
+        stop_test_runner(process, tmp_path)
+
+
+def test_executor_owned_cleanup_uses_existing_runner_without_replaying_work(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    remote = tmp_path / 'producer'
+    remote.mkdir()
+    process = start_runner(remote, 'import pathlib,time\npathlib.Path("ready").touch()\ntime.sleep(30)')
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    state = dict(identity=executor._identity(request), remote=str(remote))
+    calls = []
+    handle = 'remote:fake:job:cleanup'
+    def cli(args, remaining, response_file=None):
+        calls.append(args)
+        assert args[0] == 'run' and '--npu' not in args
+        script = args[args.index('--file') + 1]
+        result = subprocess.run(['bash', str(script)], capture_output=True, timeout=6)
+        assert result.returncode == 0, result.stderr
+        value = dict(target='fake', handle=handle, state='completed', exit=0)
+        Path(args[args.index('--receipt-file') + 1]).write_text(json.dumps(value))
+        return value
+    monkeypatch.setattr(executor, '_cli', cli)
+    monkeypatch.setattr(executor, '_wait', lambda *args: dict(state='completed', exit=0))
+    try:
+        wait_for_file(remote / 'project' / 'ready', process)
+        executor._cancel_producer(request, directory, state, observe, lambda: 10)
+        process.communicate(timeout=2)
+        producer = json.loads((remote / 'producer.json').read_text())
+        assert CplExecutor._producer_closed(producer, producer['identity'])
+        executor._cancel_producer(request, directory, state, observe, lambda: 10)
+        assert len(calls) == 1
+    finally:
+        stop_test_runner(process, remote)
+
+
+def test_ambiguous_cleanup_submission_is_not_replayed(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    (directory / 'producer-cancel-started.json').write_text('{}')
+    def unexpected(*args, **kwargs):
+        pytest.fail('ambiguous cleanup must not submit another job')
+    monkeypatch.setattr(executor, '_cli', unexpected)
+    with pytest.raises(WorkflowError, match='submission unknown'):
+        executor._cancel_producer(request, directory, {}, observe, lambda: 10)
+
+
+def test_real_worker_zombie_does_not_permanently_quarantine_group(tmp_path):
+    # A private subreaper deliberately delays adopting/reaping the worker until
+    # the runner finishes. This reproduces a slow init reaper deterministically.
+    wrapper = '''import ctypes,json,os,subprocess,sys
+assert ctypes.CDLL(None).prctl(36,1,0,0,0)==0
+p=subprocess.Popen(sys.argv[1:])
+p.wait(timeout=6)
+reaped=0
+while True:
+    try:
+        os.waitpid(-1,0)
+        reaped+=1
+    except ChildProcessError:
+        break
+print(json.dumps(dict(adopted_workers_reaped=reaped)),flush=True)
+'''
+    code = '''import pathlib,subprocess,sys,time
+p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])
+pathlib.Path('worker-pid').write_text(str(p.pid))
+'''
+    process = start_runner(tmp_path, code, wrapper=wrapper)
+    try:
+        stdout, stderr = process.communicate(timeout=8)
+        assert process.returncode == 0, stderr
+        assert json.loads(stdout)['adopted_workers_reaped'] == 1
+        producer = json.loads((tmp_path / 'producer.json').read_text())
+        assert CplExecutor._producer_closed(producer, producer['identity'])
+        with pytest.raises(ProcessLookupError):
+            os.killpg(producer['child_pgid'], 0)
+        assert (tmp_path / 'results.tar').exists()
+    finally:
+        stop_test_runner(process, tmp_path)
+
+
+def test_owned_cleanup_waits_for_delayed_archive_publication(tmp_path):
+    wrapper = '''import pathlib,runpy,sys,tarfile,time
+sys.argv=sys.argv[2:]
+root=pathlib.Path(sys.argv[0]).parent
+original=tarfile.TarFile.add
+def delayed(self,*args,**kwargs):
+    if not (root/'archiving').exists():
+        (root/'archiving').touch()
+        time.sleep(1.5)
+    return original(self,*args,**kwargs)
+tarfile.TarFile.add=delayed
+runpy.run_path(sys.argv[0],run_name='__main__')
+'''
+    process = start_runner(tmp_path, 'print("retained output")', wrapper=wrapper)
+    cleanup = None
+    try:
+        wait_for_file(tmp_path / 'archiving', process)
+        producer = json.loads((tmp_path / 'producer.json').read_text())
+        assert producer['closed'] and producer['reaped']
+        cleanup = subprocess.Popen([sys.executable, str(tmp_path / 'runner.py'), '--cancel-owned'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.1)
+        assert cleanup.poll() is None
+        _, stderr = cleanup.communicate(timeout=5)
+        assert cleanup.returncode == 0, stderr
+        assert (tmp_path / 'results.tar').exists()
+        with tarfile.open(tmp_path / 'results.tar') as archive:
+            assert archive.extractfile('stdout').read() == b'retained output\n'
+    finally:
+        stop_test_runner(process, tmp_path)
+        if cleanup is not None:
+            cleanup.communicate(timeout=5)
+
+
+def test_reconcile_waits_existing_cleanup_before_starting_download(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    state = dict(identity=executor._identity(request), cleanup_only=True, lease_retained=True)
+    (directory / 'transport.json').write_text(json.dumps(state))
+    (directory / 'producer-cancel-started.json').write_text('{}')
+    calls = []
+    def cleanup(*args):
+        calls.append('cleanup')
+        raise WorkflowError('cleanup still running')
+    monkeypatch.setattr(executor, '_cancel_producer', cleanup)
+    with pytest.raises(WorkflowError, match='still running'):
+        executor.reconcile(request, observe=observe, remaining=lambda: 5)
+    assert calls == ['cleanup']
+    assert not (directory / 'download-started.json').exists()
+
+
+def test_supervisor_deadline_during_archive_retains_then_releases_lease(tmp_path, monkeypatch):
+    executor, request, observe, _, _ = fixture(tmp_path)
+    remote = tmp_path / 'producer'
+    remote.mkdir()
+    wrapper = '''import pathlib,runpy,sys,tarfile,time
+sys.argv=sys.argv[2:]
+root=pathlib.Path(sys.argv[0]).parent
+original=tarfile.TarFile.add
+def delayed(self,*args,**kwargs):
+    if not (root/'archiving').exists():
+        (root/'archiving').touch()
+        time.sleep(1.5)
+    return original(self,*args,**kwargs)
+tarfile.TarFile.add=delayed
+runpy.run_path(sys.argv[0],run_name='__main__')
+'''
+    process = start_runner(remote, 'print("retained")', wrapper=wrapper,
+                           identity=executor._identity(request))
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    state = dict(identity=executor._identity(request), remote=str(remote), producer_version=2)
+    original, cleanup = 'remote:fake:job:original', 'remote:fake:job:cleanup'
+    budget = [10]
+    def submit(*args):
+        (directory / 'submission.json').write_text(json.dumps(dict(target='fake', handle=original)))
+        budget[0] = 0
+        raise WorkflowError('deadline during archive')
+    def cli(args, remaining, response_file=None):
+        if args[0] == 'cancel':
+            value = dict(target='fake', handle=original, state='cancelled')
+        elif args[0] == 'run':
+            saved = json.loads((directory / 'transport.json').read_text())
+            assert saved['lease_retained'] is True
+            result = subprocess.run(['bash', str(args[args.index('--file') + 1])],
+                                    capture_output=True, timeout=5)
+            assert result.returncode == 0, result.stderr
+            assert (remote / 'results.tar').exists()
+            value = dict(target='fake', handle=cleanup, state='completed', exit=0)
+            Path(args[args.index('--receipt-file') + 1]).write_text(json.dumps(value))
+        else:
+            assert args[0] == 'download'
+            assert (remote / 'results.tar').exists()
+            shutil.copyfile(args[2], args[3])
+            value = dict(target='fake', state='completed')
+        if response_file is not None:
+            response_file.write_text(json.dumps(value))
+        return value
+    monkeypatch.setattr(executor, '_submit', submit)
+    monkeypatch.setattr(executor, '_cli', cli)
+    monkeypatch.setattr(executor, '_wait', lambda handle, *args: dict(
+        target='fake', handle=handle, state='completed', exit=0))
+    try:
+        wait_for_file(remote / 'archiving', process)
+        (remote / 'verifier').write_bytes(request.verifier.read_bytes())
+        assert not (remote / 'results.tar').exists()
+        with pytest.raises(WorkflowError, match='deadline during archive'):
+            executor._supervise(request, directory, state, directory / 'run.sh', observe,
+                                lambda: budget[0])
+        saved = json.loads((directory / 'transport.json').read_text())
+        assert saved['status'] == 'deadline-terminal' and saved['lease_retained'] is False
+        assert (directory / 'retrieved/stdout').read_bytes() == b'retained\n'
+    finally:
+        stop_test_runner(process, remote)
 
 
 def test_invalid_client_response_retains_native_stderr_before_raising(tmp_path, monkeypatch):
