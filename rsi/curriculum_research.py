@@ -132,7 +132,8 @@ class Researcher:
         operation = context['operation_id']
         if not isinstance(operation, str) or not operation:
             raise ValueError('research operation identity required')
-        for row in [failure, *(r['failure'] for r in context.get('failed_parents', []))]:
+        for row in [failure, *(r['failure'] for r in context.get('failed_parents', [])),
+                    *(r.get('provenance', {}) for r in context.get('failed_parents', []))]:
             self._validate_failure(row)
         request = dict(parent=parent.to_dict(), failure=failure,
             context={key: context[key] for key in ('templates', 'failed_parents', 'namespace',
@@ -298,11 +299,13 @@ class Researcher:
         result = {k: v[:2048] if isinstance(v, str) else v for k, v in row.items()
                   if k in ('text', 'path', 'repository', 'revision', 'collection', 'goal', 'stage',
                            'status', 'outcome', 'reason', 'summary', 'error', 'project_id',
-                           'classification', 'host_outcome', 'source_hash')
+                           'classification', 'host_outcome', 'source_hash', 'memory_id', 'kind')
                   and isinstance(v, (str, int, float, bool))}
         memory = row.get('memory', row)
         if isinstance(memory, dict) and isinstance(memory.get('proposal'), dict):
             result['memory'] = Researcher._facts(memory['proposal'])
+        if isinstance(row.get('proof_scope'), dict):
+            result['proof_scope'] = Researcher._facts(row['proof_scope'])
         observed = row.get('observations')
         if isinstance(observed, dict):
             result['observations'] = dict(outcome=observed.get('outcome'),
