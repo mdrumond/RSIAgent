@@ -100,10 +100,13 @@ def test_native_compaction_continues_with_atomic_large_tool_batch(monkeypatch, t
     assert set(intents) == set(settled) and len(settled) == len(set(settled)) == len(requests)
 
 
-def test_native_wire_keeps_operator_context_visible_when_feedback_is_paged(monkeypatch, tmp_path):
+@pytest.mark.parametrize('oversized_guidance', [False, True])
+def test_native_wire_keeps_operator_context_visible_when_feedback_is_paged(monkeypatch, tmp_path, oversized_guidance):
     events, requests = [], []
     guidance = dict(actor='Use the already frozen cases and write only candidate.py',
                     supervisor='Preserve target evidence', curator='Retain rejected memory')
+    if oversized_guidance:
+        guidance['supervisor_notes'] = {f'fact-{i}': 'operator observation ' * 10 for i in range(60)}
     execution = dict(physical_device=3, soc='Ascend910B4-1', runtime='py311-torch',
                      admission=dict(admitted=True, degraded=False, measurements=dict(memory_percent=5)))
     identity = dict(project_id='conversion-001', goal='Translate the frozen AscendC reference to Triton')
@@ -114,14 +117,21 @@ def test_native_wire_keeps_operator_context_visible_when_feedback_is_paged(monke
                   configuration_ref='a' * 64)
     names = builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
     reference = None
+    pages = {}
 
     def provider(*_, **kwargs):
         nonlocal reference
         request = json.loads(kwargs['data'])
         requests.append(request)
-        prompt = json.loads(next(row['content'] for row in request['messages'] if row['role'] == 'user'))
+        content = next(row['content'] for row in request['messages'] if row['role'] == 'user')
+        prompt = json.loads(content if isinstance(content, str) else
+                            ''.join(part['text'] for part in content if part['type'] == 'text'))
         delivered = prompt['task']
-        assert delivered['user_guidance'] == guidance
+        assert delivered['user_guidance']['actor'] == guidance['actor']
+        if not oversized_guidance:
+            assert delivered['user_guidance'] == guidance
+        else:
+            assert 'full_observation' in delivered['user_guidance']
         assert delivered['execution_context'] == execution
         assert {key: delivered['project'][key] for key in identity} == identity
         assert delivered['configuration_ref'] == 'a' * 64
@@ -137,8 +147,11 @@ def test_native_wire_keeps_operator_context_visible_when_feedback_is_paged(monke
             assert 'user_guidance' not in result['state']
         if len(requests) == 2:
             return response([('read_context', dict(record=reference, limit=3072))], len(requests))
-        page = next(result['observation'] for result in results if result['observation'].get('record') == reference)
-        assert json.loads(page['text']) == pinned and page['next_offset'] is None
+        page = [result['observation'] for result in results if result['observation'].get('record') == reference][-1]
+        pages[page['offset']] = page['text']
+        if page['next_offset'] is not None:
+            return response([('read_context', dict(record=reference, offset=page['next_offset'], limit=3072))], len(requests))
+        assert json.loads(''.join(pages[offset] for offset in sorted(pages))) == pinned
         return response([('perform', {'proposal': 'complete context delivery fixture'})], len(requests))
 
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
@@ -148,5 +161,5 @@ def test_native_wire_keeps_operator_context_visible_when_feedback_is_paged(monke
         actor.step(task)
     finally:
         actor.close()
-    assert flow.stage == Stage.DESIGN and len(requests) == 3
+    assert flow.stage == Stage.DESIGN and (len(requests) > 3 if oversized_guidance else len(requests) == 3)
     assert any(kind == 'pi-context-read' and row['record'] == reference for kind, row in events)

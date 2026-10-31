@@ -159,6 +159,8 @@ class ControllerSession(PiCodingSession):
                         result[key] = project
                     else:
                         result[key] = resource(value)
+                        if key == 'user_guidance' and isinstance(value, dict) and 'actor' in value:
+                            result[key]['actor'] = resource(value['actor'])
             return result
         def execute(name, args):
             nonlocal current
