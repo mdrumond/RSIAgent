@@ -498,7 +498,12 @@ def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monk
     parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
     if finished:
         result = researcher.research(parent, {}, context)
-        assert result.proposal is None and result.actor_seconds == .08
+        assert result.proposal is None
+        receipt = store.read_json(result.receipt_ref)
+        query_seconds = sum(store.read_json(ref).get('payload', {}).get('elapsed_seconds', 0)
+            for ref in receipt['artifact_refs']
+            if store.read_json(ref).get('event') == 'research_query_finished')
+        assert result.actor_seconds == .08 + query_seconds
         assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
         assert not any(e == 'accounting_incomplete' for e, _ in events)
     else:
