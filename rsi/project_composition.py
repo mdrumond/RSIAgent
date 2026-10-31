@@ -3,10 +3,8 @@ import hashlib
 import json
 import time
 
-from rsi.actor import PiSessionAdapter
 from rsi.evidence_io import _references
 from rsi.instance_ingestion import load_ingestion_records
-from rsi.project_runner import ProjectRunner
 from rsi.strategy import knowledge_db_query
 
 
@@ -111,7 +109,10 @@ class ProjectComposition:
         return query
 
     def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
-               backend_identity, reopen=False, configuration_ref=None):
+               backend_identity, reopen=False, configuration_ref=None, command_guard=None):
+        from rsi.actor import PiSessionAdapter
+        from rsi.project_runner import ProjectRunner
+        runner_class = getattr(self, 'runner_class', ProjectRunner)
         admitted_at = time.time()
         configuration_ref = configuration_ref or self.spec.configuration_ref
         frozen_config = self.store.read_json(configuration_ref)['payload']
@@ -135,6 +136,8 @@ class ProjectComposition:
         injections = dict(query=self.query(memory_ref), backend_identity=backend_identity,
                           session_factory=session, test_backend=self.services.test is not None,
                           executor_factory=self.services.executor_factory)
+        if command_guard is not None:
+            injections['command_guard'] = command_guard
         if not reopen:
             first = True
             def clock():
@@ -145,7 +148,7 @@ class ProjectComposition:
                 return time.time()
             injections['clock'] = clock
         with self.services.setup.measure('project-open' if reopen else 'project-snapshot-copy-and-bind', str(root)):
-            runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
+            runner = runner_class(root, **injections) if reopen else runner_class.create(
                 root, spec, bundle, config, **injections)
             # Reuse export's reference contract to retain the query's artifact closure.
             pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref]

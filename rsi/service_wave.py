@@ -1,15 +1,17 @@
 """Instance wave binding: canonical child composition, parent-only publication."""
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
+import time
 
 from core.artifacts import ContentAddressedArtifacts
 from rsi.contracts import CycleSpec, ProjectSpec
-from rsi.executor_profiles import FrozenExecutorFactory, public_identity
+from rsi.executor_profiles import FrozenExecutorFactory, ProfileCommandGuard
 from rsi.jobs import _alive
 from rsi.project_composition import ProjectComposition, file_identity, verify_kdb
 from rsi.project_wave import ProjectWave
-from rsi.python_execution import atomic_json
+from rsi.python_execution import atomic_json, ingest_elapsed
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.skills import SkillBundle
 
@@ -34,7 +36,56 @@ class ProjectWorkerFactory:
     test_bindings: object = None
     executor_factory: object = None
 
+    def prepare_worker(self, request):
+        """Apply target context only in the dedicated child, before runner imports."""
+        worker = json.loads((request.root.parent / 'worker.json').read_text())
+        if worker['pid'] != os.getpid() or worker['dispatch_id'] != request.dispatch_id:
+            raise ValueError('worker environment may only be prepared by its owning child')
+        path = request.root.parent / 'worker-admission.json'
+        if path.exists():
+            previous = json.loads(path.read_text())
+            if previous['dispatch_id'] == request.dispatch_id and previous['pid'] == os.getpid():
+                if previous['receipt'].get('admitted') is True:
+                    return
+                raise ValueError('original worker admission was denied; no implicit retry')
+        admitted = json.loads(self.admission_json)
+        device = next(d for d in admitted['devices'] if d['device'] == request.device)
+        identity = device.get('worker_profile') or device.get('executor_identity')
+        if identity is None:
+            if self.test_bindings is None:
+                raise ValueError('production NPU worker requires a trusted host admission profile')
+            return
+        if self.executor_factory is None:
+            raise ValueError('trusted NPU worker environment/guard resolver required')
+        inherited = dict(os.environ)
+        environment = self.executor_factory.worker_environment(identity, request, inherited=inherited)
+        # This process belongs exclusively to the project; parent env is untouched.
+        os.environ.clear()
+        os.environ.update(environment)
+        deadline = time.monotonic() + max(0., request.actor_seconds - request.actor_elapsed)
+        def remaining():
+            limits = [max(0., deadline - time.monotonic())]
+            if admitted['wall_deadline'] is not None:
+                limits.append(max(0., admitted['wall_deadline'] - time.time()))
+            return min(limits)
+        started, monotonic_start = time.time(), time.monotonic()
+        receipt = None
+        try:
+            receipt = self.executor_factory.guard(identity, request, phase='admission', remaining=remaining)
+        except Exception as exc:
+            receipt = getattr(exc, 'admission_receipt', dict(admitted=False,
+                observation='worker admission failed', error_type=type(exc).__name__))
+            raise
+        finally:
+            elapsed = time.monotonic() - monotonic_start
+            record = dict(dispatch_id=request.dispatch_id, pid=os.getpid(),
+                profile=identity, receipt=receipt, started=started, elapsed=elapsed,
+                ended=max(time.time(), started + elapsed))
+            atomic_json(path.with_name('worker-admission-' + request.dispatch_id + '.json'), record)
+            atomic_json(path, record)
+
     def __call__(self, request):
+        self.prepare_worker(request)
         from rsi.services import InstanceServices
         admitted = json.loads(self.admission_json)
         operation = admitted['operations'][request.project_id]
@@ -51,8 +102,10 @@ class ProjectWorkerFactory:
         composition.kdb_stat = admitted['kdb_stat']
         project_binding = dict(operation['binding'])
         device = next(d for d in admitted['devices'] if d['device'] == request.device)
+        profile = device.get('worker_profile') or device.get('executor_identity')
         project_binding['executor_identity'] = device.get('executor_identity')
-        project_binding['executor_provenance'] = admitted['identities'].get(device.get('executor_identity'))
+        project_binding['worker_profile'] = profile
+        project_binding['executor_provenance'] = admitted['identities'].get(profile)
         backend = services.store.put_json(project_binding)
         config = dict(operation['config'], executor_identity=device.get('executor_identity'))
         if request.reopen:
@@ -62,11 +115,21 @@ class ProjectWorkerFactory:
         runner = composition.runner(request.root, spec=ProjectSpec.from_dict(operation['spec']),
             bundle=SkillBundle.from_dict(json.loads(request.skills)), config=config,
             memory_ref=admitted['memory'], backend_identity=backend, reopen=request.reopen,
-            configuration_ref=admitted['configuration'])
+            configuration_ref=admitted['configuration'], command_guard=(
+                ProfileCommandGuard(self.executor_factory, profile)
+                if profile and device.get('executor_identity') is None else None))
         if not request.reopen:
             from rsi.evaluation import case_identity
             atomic_json(request.root / 'service-binding.json', project_binding)
             atomic_json(request.root / 'training-identity.json', case_identity(runner))
+        admission_path = request.root.parent / 'worker-admission.json'
+        if admission_path.exists():
+            admission = json.loads(admission_path.read_text())
+            ingest_elapsed(runner.workflow.accounting, 'worker-admission:' + request.dispatch_id,
+                {'elapsed': admission['elapsed']}, category='execution',
+                observed_start=admission['started'], observed_end=admission['ended'],
+                observed_execution_start=admission['started'],
+                observed_execution_end=admission['started'] + admission['elapsed'])
         if admitted['wall_deadline'] is not None:
             runner.workflow.constrain_wall_deadline('instance-wave', admitted['wall_deadline'])
         if request.recovery_receipt:
@@ -115,16 +178,22 @@ class WaveBindings:
                 atomic_json(admission, dict(sha256=cycle.binding['kdb'], stat=kdb_stat))
             identities = {}
             for device in self.policy['devices']:
-                identity = device.get('executor_identity')
+                identity = device.get('worker_profile') or device.get('executor_identity')
                 if identity is None:
                     if cycle.services.test is None:
                         raise ValueError('production wave devices require trusted executor bindings')
                     continue
                 if cycle.services.executor_factory is None:
                     raise ValueError('ignored host executor profile resolver required')
-                metadata = public_identity(cycle.services.executor_factory(identity))
+                resolver = cycle.services.executor_factory
+                if not all(callable(getattr(resolver, name, None)) for name in
+                           ('metadata', 'worker_environment', 'guard')):
+                    raise ValueError('NPU profiles must provide trusted worker context and health/policy guards')
+                metadata = resolver.metadata(identity)
                 if str(metadata['physical_device']) != device['device']:
                     raise ValueError('executor profile physical device differs from admitted lease')
+                if metadata['executor_identity'] != device.get('executor_identity'):
+                    raise ValueError('worker placement differs from configured local/target execution binding')
                 identities[identity] = metadata
             admissions = {}
             for op in wave['operations']:
@@ -166,6 +235,15 @@ class WaveBindings:
         worker = json.loads(path.read_text())
         if worker['dispatch_id'] != row['dispatch_id'] or not worker.get('process') or _alive(worker['process']):
             return False
+        admission = pool._branch(operation) / 'worker-admission.json'
+        if admission.exists():
+            record = json.loads(admission.read_text())
+            if record['dispatch_id'] == row['dispatch_id']:
+                reference = self.cycle.store.put_json(record)
+                self.cycle.scheduler.state['active_wave'].setdefault('admission_receipts', {})[operation] = reference
+                self.cycle.scheduler._save()
+        if not (pool._branch(operation) / 'runner' / 'service-binding.json').exists():
+            return False  # No canonical actor admission; retain the actual negative gate.
         runner = self._runner(operation)
         try:
             proof = runner.terminal_failure_proof()

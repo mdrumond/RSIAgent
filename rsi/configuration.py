@@ -71,11 +71,15 @@ def validate_configuration(payload):
             raise ValueError('project_wave requires admitted device bindings')
         for device in devices:
             _object(device, 'wave device')
-            if set(device) - {'device', 'executor_identity'}:
+            if set(device) - {'device', 'executor_identity', 'worker_profile'}:
                 raise ValueError('wave devices contain identities, never machine profiles')
             _reference(device.get('device'), 'physical device identity')
             if device.get('executor_identity') is not None:
                 _reference(device['executor_identity'], 'executor_identity')
+            if device.get('worker_profile') is not None:
+                _reference(device['worker_profile'], 'worker_profile')
+                if device.get('executor_identity') not in (None, device['worker_profile']):
+                    raise ValueError('target executor profile must also own its worker admission')
         if len({d['device'] for d in devices}) != len(devices):
             raise ValueError('wave device leases must be unique')
         parallel = wave.get('max_parallel')

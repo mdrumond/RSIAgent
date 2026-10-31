@@ -165,7 +165,8 @@ class PythonExecution:
     observed/reconciled by the owner and must never be dispatched again.
     """
 
-    def __init__(self, root, workflow=None, *, executor_factory=None):
+    def __init__(self, root, workflow=None, *, executor_factory=None, command_guard=None):
+        self.command_guard = command_guard
         self.root = Path(root).resolve()
         self.project = self.root / 'project'
         self.verifier = self.root / 'frozen' / 'verify.py'
@@ -504,6 +505,20 @@ class PythonExecution:
             elapsed = record['elapsed']
         else:
             try:
+                if self.command_guard is not None:
+                    request = CommandRequest(operation, command, tuple(argv), self.project, self.verifier,
+                        source_hash, contract['verifier'], category, profile_path if profile else None)
+                    try:
+                        record['guard_receipt'] = self.command_guard(request,
+                            remaining=lambda: min((x for x in self.workflow.remaining().values() if x is not None), default=None))
+                    except Exception as exc:
+                        if hasattr(exc, 'admission_receipt'):
+                            record['guard_receipt'] = exc.admission_receipt
+                            self._save(operation, record)
+                        raise
+                    self._save(operation, record)
+                    if any(x is not None and x <= 0 for x in self.workflow.remaining().values()):
+                        raise WorkflowError('time budget exhausted during command admission')
                 process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, start_new_session=True)
                 record['pid'] = process.pid

@@ -203,6 +203,10 @@ class InstanceServices:
 
 
 class BoundCycle(ProjectComposition, TuningBindings):
+    @property
+    def runner_class(self):
+        return ProjectRunner  # Preserve the existing host runner/clock injection boundary.
+
     def __init__(self, services, root):
         self.services, self.root, self.store = services, root, services.store
         revisions.recover(root, self.store)
@@ -424,9 +428,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
             raise ValueError('project root escapes retained cycle')
         binding = json.loads((root / 'service-binding.json').read_text())
         if binding.get('executor_provenance') is not None:
-            from rsi.executor_profiles import public_identity
-            if self.services.executor_factory is None or public_identity(
-                    self.services.executor_factory(binding['executor_identity'])) != binding['executor_provenance']:
+            profile = binding.get('worker_profile') or binding['executor_identity']
+            if self.services.executor_factory is None or self.services.executor_factory.metadata(
+                    profile) != binding['executor_provenance']:
                 raise ValueError('host executor differs from frozen project device/runtime')
         if relative:
             wave_id = Path(relative).parts[1]

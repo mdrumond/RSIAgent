@@ -42,6 +42,9 @@ def _worker(factory, request):
     from rsi.jobs import _identity
     atomic_json(request.root.parent / 'worker.json', dict(
         dispatch_id=request.dispatch_id, pid=os.getpid(), process=_identity(os.getpid())))
+    prepare = getattr(factory, 'prepare_worker', None)
+    if prepare is not None:
+        prepare(request)
     from rsi.project_runner import ProjectRunner
     runner = factory(request)
     if not isinstance(runner, ProjectRunner) or runner.root.resolve() != request.root.resolve():

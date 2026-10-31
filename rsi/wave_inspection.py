@@ -31,6 +31,10 @@ def inspect_waves(cycle):
                 status = 'running' if alive else 'observation_required'
             result = row.get('receipt', {}).get('result', {})
             outcome = result.get('status')
+            admission_path = branch / 'worker-admission.json'
+            admission = json.loads(admission_path.read_text()).get('receipt') if admission_path.exists() else None
+            if not outcome and admission and admission.get('admitted') is False:
+                outcome = 'admission_denied'
             if row.get('receipt', {}).get('terminal_failure_proof') and outcome == 'suspended':
                 outcome = 'failed'
             path = branch / 'runner' / 'workflow.json'
@@ -44,6 +48,7 @@ def inspect_waves(cycle):
                 status=status, outcome=outcome, device=row.get('device'),
                 assigned_device=row.get('lease_device'), dispatch_id=row.get('dispatch_id'),
                 stage=workflow.get('stage'), pending=pending,
+                admission=admission,
                 actor_seconds=elapsed, actor_allocation=allowance,
                 remaining_actor_seconds=None if elapsed is None else max(0., allowance - elapsed),
                 recovery_authorized=row.get('recovery') is not None))

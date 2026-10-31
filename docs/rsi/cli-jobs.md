@@ -156,3 +156,26 @@ source, or timing evidence keeps work pending. A harness continuation must close
 its canonical pending admission before a new actor step; otherwise use the
 configured, evidence-linked recovery workflow. Adoption and accepted-parent
 inheritance wait for the wave's parent publication boundary.
+
+For an outer-admitted A5 controller using default local target execution, select
+`worker_profile` on each device and keep `executor_identity` absent or null. Its
+ignored profile supplies public `metadata` with `controller_placement: "local"`,
+`executor_identity: null`, physical device, runtime and actual `outer_handle`;
+`worker_environment` names `rsi.catlass_project_config:worker_environment`, and
+`worker_configuration` supplies that outer handle and physical device. The child
+supplies its own cache path, applies the returned environment before runner/target
+imports, and never mutates the parent's environment. It preserves the helper's
+source-hash behavior: stale `RSI_EXPECTED_SOURCE_HASH` is removed and the local
+trusted verifier checks its own current project hash before/after command work.
+
+Every NPU profile selects a shipped, host-trusted target guard using
+`guard: "module:callable"` and optional `guard_configuration`. Profiles configure
+the supplied implementation; users do not implement device-health callbacks. The callback accepts `(request, *, phase,
+metadata, configuration, remaining)` for `admission` and each `command`. It must
+perform fresh bounded per-device health and policy checks and return a public
+receipt containing `admitted: true`, nonempty `observation` and the matching
+`physical_device`. Missing guards or denied health leave work undispatched.
+Concrete target guard/verifier implementations own actual bounded local or
+registered-target probes and idle/memory/isolation policy. Frozen target verifier
+gates run before Torch/NPU work under the admitted CPL route. The profile callback
+must align with those same gates; metadata alone is never health evidence. Guard time is actor-billable.

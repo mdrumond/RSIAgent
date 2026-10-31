@@ -85,8 +85,8 @@ class ProjectRunner:
         return cls(root, **injections)
 
     def __init__(self, root, *, query, backend_identity, session_factory, test_backend=False, clock=time.time,
-                 executor_factory=None):
-        self.backend = PythonExecution(root, executor_factory=executor_factory)
+                 executor_factory=None, command_guard=None):
+        self.backend = PythonExecution(root, executor_factory=executor_factory, command_guard=command_guard)
         self.root, self.store = self.backend.root, self.backend.store
         self.contract_ref = json.loads((self.root / 'runner.json').read_text())['contract']
         frozen = self.store.read_json(self.contract_ref)
