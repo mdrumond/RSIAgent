@@ -119,3 +119,47 @@ def test_mixed_legacy_negatives_remain_recoverable():
     assert result['omitted'] == 3
     index = read_all(context, result['index'])
     assert [read_all(context, item['full']) for item in index] == rows
+
+
+def test_export_preserves_projected_original_and_complete_raw_instrumentation(tmp_path):
+    import base64
+    from test_rsi_evidence_io import task_fixture
+    from rsi.evidence_io import export_task
+    task, store, _, _, _ = task_fixture(tmp_path)
+    records, raw, _ = dense_records(store)
+    projected = [project_memory(record, store) for record in records]
+    query = store.put_json(dict(type='retrieval', response=dict(results=[], negative_records=projected)))
+    events = json.loads((task / 'events.json').read_text())
+    (task / 'events.json').write_bytes(canonical_bytes([*events, query]))
+    export = tmp_path / 'export'
+    export_task(task, export)
+    exported = {row['id']: base64.b64decode(row['data'])
+                for line in (export / 'evidence.jsonl').read_text().splitlines()
+                if (row := json.loads(line))['kind'] == 'artifact'}
+    assert exported[raw] == store.read_bytes(raw)
+    assert json.loads(exported[query])['response']['negative_records'] == projected
+    for original, row in zip(records, projected):
+        assert json.loads(exported[row['artifact_ref']]) == original
+        assert json.loads(exported[row['provenance']['reference']]) == original['provenance']
+
+
+from test_rsi_strategy import setup as strategy_setup
+
+
+def test_all_eight_decisions_still_required_and_used_negative_needs_redirection(strategy_setup):
+    import pytest
+    from rsi.strategy import StrategyRejected
+    from test_rsi_strategy import prepare, decisions, select
+    _, make, _, _, store, skill, _ = strategy_setup
+    service = make(query=lambda _: dict(results=[], negative_records=[
+        {'reason': f'numeric failure {i}'} for i in range(8)], provenance={'source': 'accepted'}))
+    query, retro = prepare(service, skill)
+    choices = decisions(service, query, reuse=True)
+    with pytest.raises(StrategyRejected):
+        select(service, skill, query, retro, choices[:-1])
+    del choices[-1]['redirection']
+    with pytest.raises(StrategyRejected):
+        select(service, skill, query, retro, choices)
+    choices[-1]['redirection'] = 'Change reduction order for this shape'
+    ref = select(service, skill, query, retro, choices)
+    assert len(store.read_json(ref)['payload']['decisions']) == 8
