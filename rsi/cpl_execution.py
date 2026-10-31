@@ -64,7 +64,16 @@ if sys.argv[1:] == ['--cancel-owned']:
         sys.exit(0)
     pid = producer['runner_pid']
     try:
-        descriptor = os.pidfd_open(pid)
+        if hasattr(os, 'pidfd_open'):
+            descriptor = os.pidfd_open(pid)
+        else:
+            # Some Python builds omit the wrapper despite libc/kernel support.
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            descriptor = libc.pidfd_open(pid, 0)
+            if descriptor < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
     except ProcessLookupError:
         sys.exit(0)
     try:
