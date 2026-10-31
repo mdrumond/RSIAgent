@@ -65,15 +65,17 @@ def _measure(raw, product, device):
     health = _fields(queries['health']['stdout'])
     status = health.get('health status', health.get('hw health status'))
     _require(status is not None, 'metric_unavailable', 'Health status unavailable')
-    _require(status.upper() == 'OK', 'unhealthy', 'Device health: ' + status)
+    _require(status.upper() in ('OK', 'ALARM'), 'unhealthy', 'Device health: ' + status)
+    degraded = status.upper() == 'ALARM'
     # A3 exposes hardware errors in health, rather than current-fault-event.
     error = health.get('error code', health.get('hw error code', health.get('hw health code')))
     _require(error is not None, 'metric_unavailable', 'Hardware error code unavailable')
-    _require(error.upper() in ('NA', '0', '0X0', 'NONE'), 'unhealthy',
-             'Device hardware error: ' + error)
+    _require(degraded or error.upper() in ('NA', '0', '0X0', 'NONE'),
+             'unhealthy', 'Device hardware error: ' + error)
+    faults = None
     if product == 'a5':
         faults = _number(_fields(queries['current-fault-event']['stdout']), 'fault event count')
-        _require(faults == 0, 'unhealthy', 'Current fault events present')
+        _require(degraded or faults == 0, 'unhealthy', 'Current fault events present')
     usages = _fields(queries['usages']['stdout'])
     capacity = _number(usages, 'HBM Capacity(MB)')
     memory = _number(usages, 'HBM Usage Rate(%)')
@@ -89,7 +91,8 @@ def _measure(raw, product, device):
     pids = re.findall(r'Process id\s*:\s*(\d+)', processes, flags=re.I)
     _require(bool(pids) or 'No process in device.' in processes,
              'metric_unavailable', 'Process occupancy unavailable')
-    return dict(health=status, memory_percent=memory, memory_capacity_mb=capacity,
+    return dict(health=status, degraded=degraded, hardware_error_code=error,
+                fault_event_count=faults, memory_percent=memory, memory_capacity_mb=capacity,
                 utilization_percent=utilization, process_ids=[int(pid) for pid in pids],
                 idle=not pids and utilization == 0)
 
@@ -109,6 +112,9 @@ def assess(raw, *, physical_device, configuration):
     """Apply the same strict parser and admission policy to retained raw queries."""
     product, _, _ = _configuration(configuration)
     measurements = _measure(raw, product, physical_device)
+    _require(not measurements['degraded'] or (configuration.get('allow_alarm') is True and
+             not configuration.get('require_idle', False)), 'unhealthy',
+             'Alarm device requires explicit ordinary-work authorization; timing requires healthy idle')
     _require(measurements['idle'] or (not configuration.get('require_idle', False) and
              configuration.get('allow_busy') is True and measurements['memory_percent'] < 50),
              'device_busy', 'Healthy idle device required; configured ordinary sharing requires memory below 50%')
@@ -120,7 +126,9 @@ def local_probe(*, physical_device, configuration, remaining):
 
     remaining() is the caller's actual elapsed allocation (or None for unlimited).
     Settings: product='a3'/'a5', chip=0/None, query_timeout_seconds (default 8),
-    allow_busy=False, require_idle=False. No registry, CPL or controller imports.
+    allow_busy=False, allow_alarm=False, require_idle=False. Alarm authorization
+    is ordinary-work only and does not grant busy-device permission.
+    No registry, CPL or controller imports.
     """
     started = time.monotonic()
     raw = dict(physical_device=physical_device, queries={})
@@ -152,7 +160,9 @@ def local_probe(*, physical_device, configuration, remaining):
                 raise AdmissionFailure('query_unavailable', 'Unavailable query: ' + query)
             _limit(remaining)
         result['measurements'] = assess(raw, physical_device=physical_device, configuration=configuration)
-        result.update(admitted=True, observation='Fresh bounded device measurements admitted')
+        result.update(admitted=True, degraded=result['measurements']['degraded'],
+            observation=('Explicitly authorized Alarm device admitted for ordinary work (degraded)'
+                         if result['measurements']['degraded'] else 'Fresh bounded device measurements admitted'))
     except AdmissionFailure as exc:
         result.update(failure=dict(type=exc.kind, detail=str(exc)), observation=str(exc))
     except (KeyError, TypeError, ValueError, OSError) as exc:
