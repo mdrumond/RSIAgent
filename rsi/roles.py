@@ -426,7 +426,7 @@ class IsolatedRoles:
     """
 
     def __init__(self, roles_python, profile, *, observer, environment,
-                 setup_seconds=60, clock=time.monotonic):
+                 setup_seconds=60, receipt_grace_seconds=2, clock=time.monotonic):
         from benchmarks.a5kernels.phase1_provider import direct_profile
         if profile != direct_profile(profile.identity):
             raise ValueError('unregistered role provider')
@@ -435,6 +435,10 @@ class IsolatedRoles:
             raise ValueError('roles_python must be an explicit existing absolute executable')
         if type(setup_seconds) not in (int, float) or not math.isfinite(setup_seconds) or setup_seconds <= 0:
             raise ValueError('setup_seconds must be positive finite seconds')
+        if (type(receipt_grace_seconds) not in (int, float) or not math.isfinite(receipt_grace_seconds)
+                or receipt_grace_seconds < 0):
+            raise ValueError('receipt_grace_seconds must be finite nonnegative seconds')
+        self.receipt_grace_seconds = receipt_grace_seconds
         key = profile.identity.credential_env
         secret = environment.get(key)
         if not isinstance(secret, str) or not secret.strip():
@@ -489,6 +493,7 @@ class IsolatedRoles:
         _wall_remaining(self.clock, wall_deadline)
         started = self.clock()
         cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
+        draining = False
         process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    env={**self.environment, 'PYTHONPATH': str(root)}, cwd=root)
@@ -503,8 +508,18 @@ class IsolatedRoles:
                     effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
                     remaining = effective - self.clock()
                     ready = selector.select(max(0, remaining))
-                    if remaining <= 0 or not ready:
-                        raise TimeoutError('roles worker deadline exhausted')
+                    now = self.clock()
+                    if now >= effective:
+                        if (active and not finished and not draining and self.receipt_grace_seconds
+                                and (wall_deadline is None or now < wall_deadline)):
+                            # The worker's API deadline is unchanged. Collect only
+                            # authoritative completion/accounting; never admit a late proposal.
+                            draining = True
+                            cutoff = now + self.receipt_grace_seconds
+                        else:
+                            raise TimeoutError('roles worker deadline exhausted')
+                    if not ready:
+                        continue
                     if any(key.fileobj is process.stdin for key, _ in ready):
                         sent = os.write(process.stdin.fileno(), outgoing[:65536])
                         outgoing = outgoing[sent:]
@@ -544,8 +559,8 @@ class IsolatedRoles:
                                 raise ValueError('invalid worker outcome')
                             finished = True
                             self.observer(event, payload)
-                            if elapsed > allowance:
-                                raise TimeoutError('worker exceeded actor allowance')
+                            if elapsed > allowance or draining:
+                                raise TimeoutError('worker actor cutoff reached; actual elapsed receipt retained')
                             if not payload['success']:
                                 error = payload.get('error')
                                 if error is not None:

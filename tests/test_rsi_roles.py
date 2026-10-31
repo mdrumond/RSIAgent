@@ -160,7 +160,7 @@ def test_active_async_loop_rejected_before_dispatch():
     assert calls == []
 
 
-def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5):
+def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5, receipt_grace_seconds=2):
     """Use a real subprocess with scripted receipts, never the network."""
     import os
     import rsi.roles as module
@@ -177,7 +177,8 @@ def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5):
     adapter = module.IsolatedRoles(sys.executable, roles.profile,
         observer=lambda e, p: events.append((e, p)),
         environment={**os.environ, 'DEEPSEEK_API_KEY': 'test-only-secret',
-                     'OPENAI_API_KEY': 'must-not-inherit'}, setup_seconds=setup_seconds)
+                     'OPENAI_API_KEY': 'must-not-inherit'}, setup_seconds=setup_seconds,
+        receipt_grace_seconds=receipt_grace_seconds)
     return adapter, events, captured
 
 
@@ -472,3 +473,48 @@ def test_actual_typed_validation_emits_specific_finished_failure_detail():
     assert finished[0]['error']['type'] == type(error.value).__name__
     assert finished[0]['error']['message'] == str(error.value)
     assert 'negative_decisions[0].redirection' in str(error.value)
+
+
+
+@pytest.mark.parametrize('finished', [True, False])
+def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monkeypatch, tmp_path, finished):
+    import time
+    from core.artifacts import ContentAddressedArtifacts
+    from rsi.contracts import ProjectSpec
+    from rsi.curriculum_research import Researcher, ResearchPending
+    script = worker_script().replace("'role': 'review'", "'role': request['role']")
+    if finished:
+        script = script.replace('time.sleep(0.02)', 'time.sleep(0.08)').replace(
+            "'elapsed_seconds': 0.02", "'elapsed_seconds': 0.08").replace("'success': True", "'success': False")
+    else:
+        script = script.split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    def query(*args, **kwargs):
+        pytest.fail('no retrieval or new proposal may start after the role cutoff')
+    researcher = Researcher(adapter, query, store)
+    context = dict(operation_id='cutoff', root=tmp_path, deadline=time.monotonic() + .04, templates=[])
+    parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
+    if finished:
+        result = researcher.research(parent, {}, context)
+        assert result.proposal is None and result.actor_seconds == .08
+        assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
+        assert not any(e == 'accounting_incomplete' for e, _ in events)
+    else:
+        with pytest.raises(ResearchPending) as error:
+            researcher.research(parent, {}, context)
+        assert error.value.actor_seconds is None
+        assert any(e == 'accounting_incomplete' and p['start_receipt_received'] for e, p in events)
+        assert not any(e == 'role_finished' for e, _ in events)
+    assert len(captured) == 1
+
+
+def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
+    import time
+    script = worker_script().split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, _ = isolated(monkeypatch, script, receipt_grace_seconds=2)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        adapter.review('review', [], deadline=started + .04, wall_deadline=started + .5)
+    assert time.monotonic() - started < 1.5
+    assert not any(e == 'role_finished' for e, _ in events)
