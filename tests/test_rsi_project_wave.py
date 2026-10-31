@@ -181,8 +181,11 @@ def test_orphan_completion_requires_closure_before_publication(tmp_path, monkeyp
     with pytest.raises(RuntimeError):
         reopened.publish()
     reopened.reconcile('a', lambda req, row: dict(closed=True,
-        observation='original worker reaped and target closed', actor_seconds=60.))
-    assert reopened.publish()['outcomes'][0]['actor_seconds'] == 60.
+        observation='original worker reaped and target closed', actor_seconds=75.))
+    outcome = reopened.publish()['outcomes'][0]
+    assert outcome['actor_seconds'] == 75.
+    assert outcome['original_receipt']['actor_seconds'] == 60.
+    assert reopened.status()['projects']['a']['receipt']['actor_seconds'] == 60.
 
 
 class ClosedScriptedSession:

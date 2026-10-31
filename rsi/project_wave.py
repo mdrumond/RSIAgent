@@ -286,7 +286,8 @@ class ProjectWave:
                 raise RuntimeError('wave publication requires all siblings settled')
             packet = dict(memory_sha256=digest(bytes.fromhex(self.plan['memory'])),
                 skills_sha256=digest(bytes.fromhex(self.plan['skills'])),
-                outcomes=[dict(project_id=p, **r['receipt']) for p, r in state['projects'].items()])
+                outcomes=[dict(r['receipt'], project_id=p, actor_seconds=r['actor_seconds'],
+                               original_receipt=r['receipt']) for p, r in state['projects'].items()])
             payload = json.dumps(packet, sort_keys=True, allow_nan=False).encode()
             state['publication'] = dict(identity=digest(payload), **packet)
             self._save(state)
