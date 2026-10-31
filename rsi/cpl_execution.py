@@ -55,13 +55,26 @@ import hashlib, json, os, pathlib, select, signal, subprocess, sys, tarfile, tim
 root = pathlib.Path(__file__).parent
 def process_start(pid):
     return (pathlib.Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+def group_live(pgid):
+    # Zombies cannot execute work; their adoption/reaping can lag group cleanup.
+    # Inspect only: never signal a group after reaping its owned leader.
+    for entry in pathlib.Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            return True
+        if int(stat[2]) == pgid and stat[0] not in ('Z', 'X'):
+            return True
+    return False
 if sys.argv[1:] == ['--cancel-owned']:
     producer = json.loads((root / 'producer.json').read_text())
     spec = json.loads((root / 'spec.json').read_text())
     if producer['identity'] != spec['identity']:
         raise RuntimeError('producer cancellation identity mismatch')
-    if producer.get('closed') is True and producer.get('reaped') is True:
-        sys.exit(0)
     pid = producer['runner_pid']
     try:
         if hasattr(os, 'pidfd_open'):
@@ -75,6 +88,8 @@ if sys.argv[1:] == ['--cancel-owned']:
                 error = ctypes.get_errno()
                 raise OSError(error, os.strerror(error))
     except ProcessLookupError:
+        if not (root / 'results.tar').exists():
+            raise RuntimeError('producer artifacts unavailable; retain lease')
         sys.exit(0)
     try:
         # Pin before checking identity; a recycled PID must never receive a signal.
@@ -83,14 +98,20 @@ if sys.argv[1:] == ['--cancel-owned']:
             argv = (pathlib.Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
             same = same and str(root / 'runner.py').encode() in argv
         except FileNotFoundError:
+            if not (root / 'results.tar').exists():
+                raise RuntimeError('producer artifacts unavailable; retain lease')
             sys.exit(0)
         if not same:
             raise RuntimeError('owned runner identity unavailable; retain lease')
-        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        if not (producer.get('closed') is True and producer.get('reaped') is True):
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
         poller = select.poll()
         poller.register(descriptor, select.POLLIN)
-        if not poller.poll(5000):
-            raise RuntimeError('producer termination pending; retain lease')
+        # This retained cleanup job stays observable beyond the controller's
+        # finite observation allowance. No new command execution is authorized.
+        poller.poll()
+        if not (root / 'results.tar').exists():
+            raise RuntimeError('producer artifacts unavailable; retain lease')
     finally:
         os.close(descriptor)
     sys.exit(0)
@@ -176,17 +197,12 @@ with (root / 'stdout').open('wb') as out, (root / 'stderr').open('wb') as err:
             if interrupted is not None and returncode == 0:
                 returncode = 128 + interrupted
             producer['reaped'] = True
-            # A terminal wrapper or reaped leader alone cannot close descendants.
-            end = time.monotonic() + 1
-            while True:
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
-                    producer['closed'] = True
-                    break
-                if time.monotonic() >= end:
-                    break
+            # Keep proof pending while live workers remain. The controller may
+            # stop observing, but this producer and cleanup handle remain owned.
+            persist('producer.json', producer)
+            while group_live(process.pid):
                 time.sleep(0.02)
+            producer['closed'] = True
         else:
             producer.update(reaped=True, closed=True)
             if interrupted is not None:
@@ -475,6 +491,8 @@ class CplExecutor:
         terminal = self._wait(handle, request, observe, remaining)
         if terminal.get('state') != 'completed' or terminal.get('exit') not in (None, 0):
             raise WorkflowError('producer cancellation unresolved; retain lease')
+        state['producer_cleanup_complete'] = True
+        atomic_json(directory / 'transport.json', state)
 
     def _submit(self, request, directory, state, script, observe, remaining):
         state['status'] = 'dispatching'
@@ -520,6 +538,10 @@ class CplExecutor:
         state = json.loads((directory / 'transport.json').read_text())
         if state['identity'] != self._identity(request):
             raise WorkflowError('CPL operation identity mismatch')
+        if (state.get('cleanup_only') and not state.get('producer_cleanup_complete')
+                and (directory / 'producer-cancel-started.json').exists()):
+            # Resume the same retained cleanup before any archive download.
+            self._cancel_producer(request, directory, state, observe, remaining)
         # Legacy outputs are readable only when completion was already established.
         # Observing a newly terminal legacy wrapper cannot establish child closure.
         legacy_complete = (state.get('producer_version') is None
