@@ -30,3 +30,26 @@ def test_builtin_profile_keeps_raw_pending_handle_and_observes_it_once(setup, tm
     assert result['raw_measurements']['logs']['content']
     assert sum(args[0] == 'run' for args in state['calls']) == 1
     assert resolver('frozen').metadata == metadata
+
+
+def test_builtin_profile_passes_alarm_permission_and_keeps_timing_healthy_only(setup, tmp_path, monkeypatch):
+    from rsi.executor_profiles import GuardDenied
+    from test_device_admission import probe
+    _, configuration, metadata, state = setup
+    path = tmp_path / 'alarm-profiles.json'
+    path.write_text(json.dumps({'profiles': {'frozen': dict(metadata=metadata,
+        guard='rsi.device_admission:guard', guard_configuration={
+            'product': 'a3', 'chip': 0, 'allow_alarm': True})}}))
+    resolver = ExecutorProfiles(str(path))
+    monkeypatch.setattr(ExecutorProfiles, '_executor', lambda *args: configuration['executor'])
+    state['probe'] = probe(health='Alarm', error='81B18603')
+    request = SimpleNamespace(project=tmp_path / 'worker/runner/project',
+        operation_id='ordinary', command='test', category='execution', profile_path=None)
+    result = resolver.guard('frozen', request, phase='command', remaining=lambda: 60)
+    assert result['admitted'] and result['degraded']
+    assert result['measurements']['health'] == 'Alarm'
+    assert result['measurements']['hardware_error_code'] == '81B18603'
+    request.operation_id, request.command = 'timing', 'timing'
+    with pytest.raises(GuardDenied) as denied:
+        resolver.guard('frozen', request, phase='command', remaining=lambda: 60)
+    assert denied.value.admission_receipt['failure']['type'] == 'unhealthy'

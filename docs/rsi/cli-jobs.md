@@ -179,3 +179,10 @@ Concrete target guard/verifier implementations own actual bounded local or
 registered-target probes and idle/memory/isolation policy. Frozen target verifier
 gates run before Torch/NPU work under the admitted CPL route. The profile callback
 must align with those same gates; metadata alone is never health evidence. Guard time is actor-billable.
+
+The shipped guard is `rsi.device_admission:guard`, backed by the same stdlib-only
+probe that target builders embed in frozen verifiers. `allow_alarm: true` permits
+only explicitly authorized ordinary functional work on measured Alarm devices;
+the receipt remains degraded and retains actual faults. It neither permits busy
+devices nor relaxes healthy-idle requirements for timing/profiling. Defaults deny
+Alarm, and terminal, unavailable or unknown devices remain excluded.
