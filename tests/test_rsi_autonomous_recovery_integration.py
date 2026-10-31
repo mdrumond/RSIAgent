@@ -31,6 +31,8 @@ def autonomous(instance, cpu):
     set_configuration(instance.root, settings)
     calls = []
     class ScriptedResearch:
+        def actor_context(self, receipt):
+            return dict(query='independent sum oracle', evidence_refs=[facts], rationale='Study one frozen case')
         def research(self, spec, failure, context):
             calls.append(context)
             assert failure['host_failure_ref'] == facts and 'result' not in failure

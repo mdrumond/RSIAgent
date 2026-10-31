@@ -190,7 +190,8 @@ class Phase1Recovery:
                 if result.proposal is None:
                     state.update(complete=True, deferred=True)
                     break
-                selected = dict(proposal=asdict(result.proposal), evidence_refs=list(result.evidence_refs), operation_id=operation)
+                selected = dict(proposal=asdict(result.proposal), evidence_refs=list(result.evidence_refs),
+                                operation_id=operation, research_receipt_ref=result.receipt_ref)
                 state['selected'] = selected
                 atomic_json(path, state)
             proposal = DiagnosticProposal(**selected['proposal'])
@@ -224,12 +225,18 @@ class Phase1Recovery:
                 waves='Execute this frozen derived project; historical parent cases and outcomes remain unchanged.')
             for role, guidance in additions.items():
                 derived['prompts'][role] = derived['prompts'].get(role, '') + '\n' + guidance
+            research = self.researcher.actor_context(selected['research_receipt_ref'])
+            rendered = json.dumps(research, ensure_ascii=False)
+            if len(rendered.encode()) > 4096:
+                raise ValueError('curriculum actor handoff exceeds its bounded wire contract')
+            derived['prompts']['actor'] += '\nCurriculum research:\n' + rendered
             provenance_ref = c.store.put_json(child.provenance)
             receipt = child.provenance['receipt']
             if c.store.put_bytes(Path(receipt['path']).read_bytes()) != receipt['sha256']:
                 raise ValueError('materialization receipt differs from its retained hash')
             derived['curriculum_context'] = dict(parent_project_id=chosen, project_id=child.spec.project_id,
-                allocation_class='semantic-diagnostic-recovery', artifact_refs=[provenance_ref, receipt['sha256'],
+                allocation_class='semantic-diagnostic-recovery', research=research,
+                artifact_refs=[provenance_ref, receipt['sha256'],
                     *selected['evidence_refs'], *(item['receipt_ref'] for item in state['history'])])
             entry = dict(config_ref=c.store.put_json(config), provenance_ref=provenance_ref,
                          configuration_ref=c.store.put_json(_snapshot(derived)))
