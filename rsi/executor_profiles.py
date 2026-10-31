@@ -28,6 +28,10 @@ class GuardDenied(ValueError):
         self.admission_receipt = receipt
 
 
+class GuardPending(GuardDenied):
+    """The original probe remains observable; no replacement admission is allowed."""
+
+
 @dataclass(frozen=True)
 class ExecutorProfiles:
     path: str
@@ -61,7 +65,11 @@ class ExecutorProfiles:
         value = self._record(identity)
         if not value.get('guard'):
             raise ValueError('NPU executor profile requires a trusted per-command health/policy guard')
-        return GuardedExecutor(self._executor(identity, value), self, identity)
+        executor, metadata = self._executor(identity, value), self.metadata(identity)
+        if any(executor.metadata.get(k) != metadata[k] for k in
+               ('target', 'runtime', 'physical_device', 'executor_identity')):
+            raise ValueError('executor differs from declared host profile identity')
+        return GuardedExecutor(executor, self, identity, json.dumps(metadata, sort_keys=True))
 
     def guard(self, identity, request, *, phase, remaining):
         value = self._record(identity)
@@ -69,7 +77,7 @@ class ExecutorProfiles:
             raise ValueError('trusted bounded NPU admission guard and elapsed allocation required')
         metadata = self.metadata(identity)
         configuration = dict(value.get('guard_configuration', {}))
-        if metadata.get('controller_placement') != 'local':
+        if metadata.get('controller_placement') not in ('local', 'on'):
             configuration['executor'] = self._executor(identity, value)
         scope = request.root.parent if hasattr(request, 'root') else request.project.parent.parent
         evidence = Path(configuration.setdefault('evidence_root', str(scope / 'device-admission')))
@@ -83,6 +91,9 @@ class ExecutorProfiles:
         if (not isinstance(result, dict) or result.get('admitted') is not True
                 or not result.get('observation', '').strip()
                 or str(result.get('physical_device')) != str(metadata['physical_device'])):
+            if isinstance(result, dict) and result.get('failure', {}).get('type') in (
+                    'probe_pending', 'probe_unknown', 'submission_unknown'):
+                raise GuardPending(result)
             raise GuardDenied(result if isinstance(result, dict) else dict(admitted=False,
                 physical_device=metadata['physical_device'], observation='invalid guard response'))
         return result
@@ -92,7 +103,7 @@ class ExecutorProfiles:
         metadata = self.metadata(identity)
         if str(metadata['physical_device']) != request.device:
             raise ValueError('worker profile does not bind the leased physical device')
-        if metadata.get('controller_placement') != 'local':
+        if metadata.get('controller_placement') not in ('local', 'on'):
             return dict(inherited)  # GZ runtime activation and mask belong to target executor.
         if not value.get('worker_environment'):
             raise ValueError('local NPU worker requires trusted environment admission')
@@ -115,13 +126,14 @@ class GuardedExecutor:
     executor: object
     profiles: ExecutorProfiles
     identity: str
+    metadata_json: str
 
     @property
     def metadata(self):
-        return self.executor.metadata
+        return json.loads(self.metadata_json)
 
     def execute(self, request, *, observe, remaining):
-        if self.profiles.metadata(self.identity) != public_identity(self.executor):
+        if self.profiles.metadata(self.identity) != self.metadata:
             raise ValueError('target profile changed since the frozen executor was constructed')
         try:
             receipt = self.profiles.guard(self.identity, request, phase='command', remaining=remaining)

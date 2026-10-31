@@ -129,13 +129,24 @@ def test_stop_drains_first_child_then_explicit_resume_runs_only_ready_sibling(wa
         reopened.close()
 
 
-def test_cli_owned_service_reaches_parallel_memory_publication(wave_instance, monkeypatch):
+def test_actual_cli_parser_reaches_two_child_service_and_memory_publication(wave_instance, monkeypatch, capsys):
+    import rsi.cli
+    import rsi.job_cli
+    import rsi.pinned_cli
     import rsi.service
     monkeypatch.setattr(rsi.service, 'InstanceServices', lambda _: wave_instance)
+    # The test instance intentionally has no installed provider/runtime. Replace
+    # only pinned dispatch and the outer owned-job launcher with TestBindings;
+    # actual CLI parsing, handler, service, scheduler and spawned actors execute.
+    monkeypatch.setattr(rsi.pinned_cli, 'dispatch', lambda *args: None)
     events = []
-    result = rsi.service.run_job(wave_instance.root,
-        dict(action='start', mode='phase1', cycle_id='cli-wave'),
-        show_configuration(wave_instance.root), should_stop=lambda: False, emit=events.append)
+    def launch(root, request):
+        return rsi.service.run_job(root, request, show_configuration(root),
+                                   should_stop=lambda: False, emit=events.append)
+    monkeypatch.setattr(rsi.job_cli.jobs, 'start', launch)
+    assert rsi.cli.main(['--instance', str(wave_instance.root), 'phase1',
+                         'start', '--cycle', 'cli-wave']) == 0
+    result = json.loads(capsys.readouterr().out)
     assert result['status'] == 'complete'
     assert any(event['event'] == 'wave_observed' for event in events)
     status = wave_instance.status('cli-wave')

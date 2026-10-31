@@ -34,7 +34,8 @@ def inspect_waves(cycle):
             admission_path = branch / 'worker-admission.json'
             admission = json.loads(admission_path.read_text()).get('receipt') if admission_path.exists() else None
             if not outcome and admission and admission.get('admitted') is False:
-                outcome = 'admission_denied'
+                outcome = ('admission_pending' if admission.get('failure', {}).get('type') in
+                           ('probe_pending', 'probe_unknown', 'submission_unknown') else 'admission_denied')
             if row.get('receipt', {}).get('terminal_failure_proof') and outcome == 'suspended':
                 outcome = 'failed'
             path = branch / 'runner' / 'workflow.json'
