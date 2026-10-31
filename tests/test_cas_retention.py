@@ -129,7 +129,9 @@ def test_composition_retains_transitive_query_closure(tmp_path, reopen, layered)
                                setup=SimpleNamespace(measure=measure), executor_factory=None)
     composition = ProjectComposition(services, tmp_path, {'config': {'payload': {}}},
                                      SimpleNamespace(configuration_ref=configuration))
-    composition.query = lambda ref: (lambda payload: {})
+    query = lambda payload: {}
+    query.artifact_refs = ()
+    composition.query = lambda ref: query
     class Runner:
         def __init__(self, root, **injections):
             self.store = ContentAddressedArtifacts(root / 'artifacts')
