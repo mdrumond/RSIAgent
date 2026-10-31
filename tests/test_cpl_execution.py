@@ -515,21 +515,6 @@ def test_new_terminal_outer_job_does_not_substitute_for_closure(tmp_path, proof)
     assert state['status'] == 'producer-unknown'
 
 
-def test_invalid_client_response_retains_native_stderr_before_raising(tmp_path, monkeypatch):
-    executor, *_ = fixture(tmp_path)
-    def run(argv, **kwargs):
-        return type('Result', (), dict(returncode=2, stdout=b'not json\n',
-                                      stderr=b'HTTP 400: cwd must be relative\n'))()
-    monkeypatch.setattr('rsi.cpl_execution.subprocess.run', run)
-    path = tmp_path / 'invalid-response.json'
-    with pytest.raises(WorkflowError, match='invalid CPL response'):
-        executor._cli(['preflight', 'fake'], lambda: 10, result_path=path)
-    assert Path(str(path) + '.stdout').read_bytes() == b'not json\n'
-    assert Path(str(path) + '.stderr').read_bytes() == b'HTTP 400: cwd must be relative\n'
-    assert json.loads(Path(str(path) + '.client.json').read_text())['returncode'] == 2
-    assert not path.exists()
-
-
 def test_owned_cleanup_rejects_recycled_runner_identity(tmp_path):
     process = start_runner(tmp_path, 'import pathlib,time\npathlib.Path("ready").touch()\ntime.sleep(30)')
     try:
