@@ -50,7 +50,7 @@ def composition(tmp_path):
     return composed, reference, records, raw, evidence
 
 
-def test_dense_query_projects_metadata_without_changing_original_or_raw_closure(tmp_path):
+def test_dense_query_projects_metadata_without_changing_original_or_evidence_closure(tmp_path):
     composed, reference, records, raw, evidence = composition(tmp_path)
     before = composed.store.read_bytes(reference)
     query = composed.query(reference)
@@ -163,3 +163,17 @@ def test_all_eight_decisions_still_required_and_used_negative_needs_redirection(
     choices[-1]['redirection'] = 'Change reduction order for this shape'
     ref = select(service, skill, query, retro, choices)
     assert len(store.read_json(ref)['payload']['decisions']) == 8
+
+
+def test_archival_raw_identities_do_not_import_origin_task_into_descendants(tmp_path):
+    store = ContentAddressedArtifacts(tmp_path)
+    historical = 'd' * 64  # Original task archive, deliberately outside this runner's CAS.
+    evidence = store.put_bytes(b'host failure facts')
+    original = dict(memory_id='old-task', proposal=dict(kind='failure', evidence=[evidence]),
+                    provenance=dict(raw_refs=[historical] * 1000))
+    row = project_memory(original, store)
+    assert row['provenance']['raw_refs_scope'] == 'origin-task-archive'
+    assert row['provenance']['counts']['raw_refs'] == 1000
+    assert store.read_json(row['artifact_ref']) == original
+    assert historical not in set(_references(original))
+    assert evidence in store.read_json(row['retained']['reference'])['artifact_refs']

@@ -2,6 +2,9 @@
 
 
 def project_memory(record, artifacts):
+    # raw_refs identify the original task's archived instrumentation. Preserve
+    # them in the immutable record, without importing that task into every
+    # descendant runner. Packet/evidence dependencies keep their existing closure.
     proposal, provenance = record['proposal'], record.get('provenance', {})
     projected = {key: value for key in ('kind', 'project_id', 'summary')
                  if isinstance((value := proposal.get(key)), str)}
@@ -19,6 +22,7 @@ def project_memory(record, artifacts):
     return dict(retained=dict(reference=closure), memory_id=record['memory_id'], proposal=projected,
         artifact_ref=artifacts.put_json(record),
         provenance=dict(reference=artifacts.put_json(provenance),
+            raw_refs_scope='origin-task-archive',
             counts={key: len(value) for key, value in provenance.items()
                     if isinstance(value, (list, dict))},
             packet=provenance.get('packet'), baseline=provenance.get('baseline')))
