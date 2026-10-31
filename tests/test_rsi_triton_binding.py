@@ -294,3 +294,31 @@ def test_actual_cpl_staging_preserves_external_case_fixture_closure(tmp_path):
     remote = next((tmp_path/'remote').glob('rsi-*/project'))
     assert remote != request.project
     assert all((remote/value['project_path']).is_file() for value in contract.values())
+
+
+def test_printf_child_enables_native_print_and_matches_verified_sample(tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from rsi.triton_exercises import Producer
+    source = tmp_path/'candidate.py'
+    source.write_text('@triton.jit\ndef kernel(O, value):\n    tl.store(O, value)\n')
+    context = {'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+               'cases_sha256': 'cases', 'runtime_manifest_sha256': 'runtime',
+               'compiler_target': {'backend': 'npu'}, 'observed_api': {'device_print': True}}
+    def native_command(directory, candidate):
+        # Real stdlib child: the flag must cross the subprocess environment
+        # boundary. No candidate/kernel or framework is executed in this test.
+        program = ('import hashlib,json,os,pathlib,sys\n'
+            'assert os.environ.get("TRITON_DEVICE_PRINT")=="1"\n'
+            'directory=pathlib.Path(sys.argv[1]);directory.mkdir(parents=True)\n'
+            'result={"status":"passed","source_sha256":hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest(),'
+            '"cases_sha256":"cases","runtime_manifest_sha256":"runtime","cases":[{"actual_sample":[1.25]}]}\n'
+            '(directory/"result.json").write_text(json.dumps(result))\n'
+            'print("RSI_DEVICE_NUMERIC 1.250000")\n')
+        return [sys.executable, '-c', program, str(directory/'application'), str(candidate)]
+    args = SimpleNamespace(artifacts=str(tmp_path), candidate=str(source), exercise_profile=None,
+                           native_command=native_command, cases_sha256='cases', runtime_sha256='runtime')
+    producer = Producer(args, {}, context)
+    producer.printf()
+    assert producer.facts['device_printf']['status'] == 'passed'
+    assert producer.facts['numeric_diagnosis']['verified_samples'] == [1.25]

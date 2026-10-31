@@ -192,7 +192,8 @@ class Producer:
             raise StudyFailure('unsupported', 'No supported Triton store observation point for printf study')
         instrumented = directory/'instrumented.py'
         instrumented.write_text(ast.unparse(ast.fix_missing_locations(tree))+'\n')
-        self.run(self.child(directory, instrumented), directory)
+        self.run(self.child(directory, instrumented), directory,
+                 environment={'TRITON_DEVICE_PRINT': '1'})
         child = self.child_result(directory, digest(instrumented))
         samples = [case['actual_sample'][0] for case in child['cases'] if case.get('actual_sample')]
         lines = '\n'.join(path.read_text(errors='replace') for path in directory.rglob('stdout.log'))
