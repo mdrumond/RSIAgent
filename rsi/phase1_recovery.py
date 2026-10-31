@@ -33,6 +33,25 @@ class Phase1Recovery:
             return config
         return self.cycle.services.project_config(self.cycle.config, spec)
 
+    def observed_proof(self, admitted, facts):
+        proof = dict(facts.get('proof_scope', {}))
+        if proof.get('provider_settled') is not True:
+            origin = facts['origin_task_archive']
+            if origin['scope'] != 'origin-task-archive':
+                raise ValueError('historical archive scope required')
+            archive = ContentAddressedArtifacts(Path(origin['instance']) / 'artifacts')
+            packet = archive.read_json(origin['service_result'])
+            if (packet['operation_id'] != admitted['operation_id'] or packet['original_id'] != admitted['original_id']
+                    or packet['result']['source_hash'] != facts['source_hash']
+                    or packet['result']['contract_ref'] != origin['original_contract']):
+                raise ValueError('historical host outcome differs from the failed-parent admission')
+            closure = archive.read_json(packet['result']['actor_closure_ref'])
+            if closure['source_hash'] != facts['source_hash'] or closure['contract_ref'] != origin['original_contract']:
+                raise ValueError('historical closure does not authenticate the admitted source')
+            proof.update({key: closure['observation'][key] for key in
+                ('actor_closed', 'actor_absent', 'provider_settled', 'accounting_unknown') if key in closure['observation']})
+        return proof
+
     def seed(self, references, *, only_derived=False):
         if not references:
             if only_derived:
@@ -43,17 +62,22 @@ class Phase1Recovery:
             admitted = self.cycle.store.read_json(reference)
             facts = self.cycle.store.read_json(admitted['host_failure_ref'])
             spec = ProjectSpec.from_dict(admitted['project'])
-            proof = facts.get('proof_scope', {})
+            proof = self.observed_proof(admitted, facts)
             if (facts['project_id'] != spec.project_id or facts['outcome'] not in ('failed', 'budget_exhausted', 'rejected')
                     or proof.get('provider_settled') is not True or proof.get('accounting_unknown') is True
                     or not (proof.get('actor_closed') is True or proof.get('actor_absent') is True)):
                 raise ValueError('failed-parent facts differ from the admitted project')
-            self.cycle.store.read_json(facts['observations_ref'])
+            observations = self.cycle.store.read_json(facts['observations_ref'])
+            applicability = observations['applicability']
+            if applicability['project_id'] != spec.project_id or applicability['final_source_hash'] != facts['source_hash']:
+                raise ValueError('admitted observations differ from the failed source')
             for artifact in facts.get('artifact_refs', ()):
                 self.cycle.store.read_bytes(artifact)
+            facts = dict(facts, proof_scope=proof)
+            host_failure_ref = self.cycle.store.put_json(facts)
             rows.append(dict(project=spec.to_dict(), original_id=admitted['original_id'],
                 operation_id=admitted['operation_id'], outcome=facts['outcome'],
-                artifact_ref=admitted['host_failure_ref'], host_failure_ref=admitted['host_failure_ref'],
+                artifact_ref=host_failure_ref, host_failure_ref=host_failure_ref,
                 original_actor_seconds_total=facts.get('original_actor_seconds_total', facts.get('actor_seconds_total')),
                 parent_config=admitted['parent_config'], actor_seconds=0.))
         receipt = self.cycle.store.put_json(dict(failed_parent_refs=list(references), only_derived=only_derived))
@@ -173,7 +197,8 @@ class Phase1Recovery:
                     wall_deadline=None if remaining['wall_seconds'] is None else time.monotonic() + remaining['wall_seconds'],
                     failed_parents=parents, templates=parents[0]['templates'],
                     memory_ref=c.scheduler.state['memory'], skills_ref=c.scheduler.state['skills'],
-                    configuration_ref=c.spec.configuration_ref, previous_rejections=state['rejections'])
+                    configuration_ref=c.spec.configuration_ref, previous_rejections=state['rejections'],
+                    user_guidance={role: c.config.get('prompts', {}).get(role, '') for role in ('curriculum', 'waves')})
                 atomic_json(path, state)  # Producer owns durable pending/completed research receipts.
                 previous_operation = c.role_operation
                 c.role_operation = operation

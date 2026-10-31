@@ -31,8 +31,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         cycle = services.create_cycle(cycle_id, request['mode'],
             projects=request.get('projects'), configuration=snapshot, recover=request.get('recover'),
             from_cycle=request.get('from_cycle'), inheritance=request.get('inheritance', 'auto'),
-            input_overrides=request.get('input_overrides', ()), failed_parent_refs=request.get('failed_parent_refs', ()),
-            curriculum_only=request.get('curriculum_only', False))
+            input_overrides=request.get('input_overrides', ()),
+            **{key: request[key] for key in ('failed_parent_refs', 'curriculum_only') if request.get(key)})
     else:
         cycle = services.open_cycle(cycle_id)
     done = threading.Event()

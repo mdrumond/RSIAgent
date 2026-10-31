@@ -66,7 +66,8 @@ def execute(args):
         request = {'action': 'start', 'mode': args.command,
                    'cycle_id': args.cycle or str(uuid.uuid4())}
         if args.command == 'phase1':
-            request.update(failed_parent_refs=args.failed_parent_ref, curriculum_only=args.curriculum_only)
+            request.update(failed_parent_refs=getattr(args, 'failed_parent_ref', []),
+                           curriculum_only=getattr(args, 'curriculum_only', False))
         if args.command == 'inference':
             request['projects'] = [ProjectSpec.from_dict(
                 json.loads(args.project.read_text())).to_dict()]

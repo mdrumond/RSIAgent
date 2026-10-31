@@ -416,9 +416,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
                        kdb=self.binding['kdb'], provider=self.config['provider'],
                        test_identity=self.binding['test_identity'], actor_seconds_baseline=0.0)
         backend = self.store.put_json(binding)
+        overrides = dict(configuration_ref=binding['configuration'],
+                         executor_factory=self.project_executor_factory(spec)) if self.curriculum else {}
         runner = self.runner(root, spec=spec, bundle=SkillBundle.from_dict(self.store.read_json(skills_ref)),
-            config=self.project_config(spec), memory_ref=memory_ref, backend_identity=backend,
-            executor_factory=self.project_executor_factory(spec), configuration_ref=binding['configuration'])
+            config=self.project_config(spec), memory_ref=memory_ref, backend_identity=backend, **overrides)
         atomic_json(root / 'training-identity.json', case_identity(runner))
         atomic_json(root / 'service-binding.json', binding)
         result = self.execute(runner)

@@ -16,9 +16,10 @@ from test_rsi_curriculum_materialization import cpu
 def autonomous(instance, cpu):
     parent, config, _ = cpu
     archive = 'a' * 64  # Deliberately absent: historical SFT is not a child dependency.
-    observations = instance.store.put_json(dict(project_id=parent.project_id, artifact_refs=[]))
+    observations = instance.store.put_json(dict(applicability=dict(project_id=parent.project_id,
+        final_source_hash='c'*64, project_contract_ref='b'*64), artifact_refs=[]))
     facts = instance.store.put_json(dict(project_id=parent.project_id, outcome='budget_exhausted',
-        original_actor_seconds_total=7200., observations_ref=observations, artifact_refs=[observations],
+        original_actor_seconds_total=7200., source_hash='c'*64, observations_ref=observations, artifact_refs=[observations],
         error='scripted historical fixture, not a production failure witness',
         proof_scope=dict(actor_closed=True, provider_settled=True, accounting_unknown=False),
         origin_task_archive=dict(scope='origin-task-archive', service_result=archive)))
