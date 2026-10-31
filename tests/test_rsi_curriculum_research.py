@@ -199,11 +199,21 @@ def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(
     from test_rsi_roles import make_roles
     from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
     _, parent, context, _, queried, _, clock, store = fixture
+    from uuid import uuid4
+    guidance = dict(curriculum=uuid4().hex, waves=uuid4().hex)
+    context.update(user_guidance=guidance, configuration_ref=store.put_json({'prompts': guidance}),
+                   skills_ref='retained-skills', skill_guidance={'debug': uuid4().hex},
+                   kdb_guidance={'collections': ['frozen-docs']})
     roles, _, events, _ = make_roles([], clock=clock)
     def transport(**kwargs):
         clock.now += 1
         started = next(payload for event, payload in reversed(events) if event == 'role_started')
         evidence = started['evidence']
+        assert evidence[0]['data']['user_guidance'] == guidance
+        assert evidence[0]['data']['configuration_ref'] == context['configuration_ref']
+        assert evidence[0]['data']['skills_ref'] == context['skills_ref']
+        assert evidence[0]['data']['skill_guidance'] == context['skill_guidance']
+        assert evidence[0]['data']['kdb_guidance'] == context['kdb_guidance']
         ids = [row['evidence_id'] for row in evidence]
         if started['role'] == 'research_queries':
             value = dict(rationale='Read retained documentation', evidence_ids=ids,
@@ -285,3 +295,24 @@ def test_missing_or_non_observation_payload_never_starts_research(fixture, missi
     with pytest.raises(ResearchRejected) as error:
         researcher.research(parent, {'observations_ref': reference}, context)
     assert error.value.actor_seconds == 0 and not roles.calls
+
+
+def test_runtime_curriculum_guidance_reaches_both_typed_stages_and_is_frozen(fixture):
+    from uuid import uuid4
+    researcher, parent, context, roles, _, _, _, store = fixture
+    guidance = {'curriculum': uuid4().hex, 'waves': uuid4().hex}
+    context.update(user_guidance=guidance, configuration_ref=store.put_json({'prompts': guidance}))
+    seen = []
+    for name in ('research_queries', 'diagnostic'):
+        original = getattr(roles, name)
+        def receive(prompt, evidence, _original=original, **kwargs):
+            seen.append(evidence[0].data['user_guidance'])
+            assert evidence[0].data['configuration_ref'] == context['configuration_ref']
+            return _original(prompt, evidence, **kwargs)
+        setattr(roles, name, receive)
+    result = researcher.research(parent, {}, context)
+    assert seen == [guidance, guidance]
+    request = store.read_json(store.read_json(result.receipt_ref)['request_ref'])
+    assert request['context']['user_guidance'] == guidance
+    with pytest.raises(ValueError):
+        researcher.research(parent, {}, {**context, 'user_guidance': {'curriculum': uuid4().hex}})

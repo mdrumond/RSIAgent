@@ -138,7 +138,7 @@ class Researcher:
         request = dict(parent=parent.to_dict(), failure=failure,
             context={key: context[key] for key in ('templates', 'failed_parents', 'namespace',
                 'original_project_id', 'memory_ref', 'skills_ref', 'configuration_ref',
-                'previous_rejections') if key in context})
+                'previous_rejections', 'user_guidance', 'skill_guidance', 'kdb_guidance') if key in context})
         request_ref = self.store.put_json(request)
         path = Path(context['root']) / 'research' / (hashlib.sha256(operation.encode()).hexdigest() + '.json')
         if path.exists():
@@ -209,9 +209,13 @@ class Researcher:
             return ResearchResult(proposal, tuple(state['evidence_refs']), seconds, state['receipt_ref'])
         try:
             remaining()
+            guidance = {key: context[key] for key in ('user_guidance', 'configuration_ref', 'skills_ref',
+                        'skill_guidance', 'kdb_guidance') if key in context}
+            steering = 'Host-provided curriculum steering and frozen guidance:\n' + json.dumps(
+                guidance, sort_keys=True, allow_nan=False) + '\n'
             evidence = [AdmittedEvidence(request_ref, dict(parent=parent.to_dict(),
                 failure=self._facts(failure), templates=context['templates'],
-                memory_ref=context.get('memory_ref')))]
+                memory_ref=context.get('memory_ref'), **guidance))]
             parents = context.get('failed_parents') or [dict(project_id=parent.project_id,
                                                             spec=parent.to_dict(), failure=failure)]
             parent_refs = {}
@@ -224,7 +228,7 @@ class Researcher:
             for ref in context.get('previous_rejections', []):
                 evidence.append(AdmittedEvidence(ref, self._facts(self.store.read_json(ref))))
             plan = self.roles.research_queries(
-                'Choose documentation/KDB queries to investigate the admitted failures before proposing a diagnostic.',
+                steering + 'Choose documentation/KDB queries to investigate the admitted failures before proposing a diagnostic.',
                 evidence, deadline=remaining(), wall_deadline=wall_deadline)
             if not isinstance(plan, QueryPlan) or not plan.queries:
                 raise ValueError('a diagnostic requires prior model-selected documentation research')
@@ -257,7 +261,7 @@ class Researcher:
                                                           provenance=response['provenance'])))
             remaining()
             decision = self.roles.diagnostic(
-                'Use the actual retrieved documents and negatives to choose a simpler host-advertised diagnostic. '
+                steering + 'Use the actual retrieved documents and negatives to choose a simpler host-advertised diagnostic. '
                 'Cite every query receipt and the selected parent. Address every negative by query_ref/index; '
                 'reuse needs a changed-applicability redirection. Preserve original cases and outcomes.',
                 evidence, deadline=remaining(), wall_deadline=wall_deadline)
