@@ -197,7 +197,7 @@ def test_rank_fixed_shape_catalog_uses_generic_array_parameters(fixture):
 def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(fixture):
     pytest.importorskip('nooa')
     from test_rsi_roles import make_roles
-    from benchmarks.a5kernels.phase1_provider import DirectCompletion
+    from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
     _, parent, context, _, queried, _, clock, store = fixture
     roles, _, events, _ = make_roles([], clock=clock)
     def transport(**kwargs):
@@ -218,7 +218,8 @@ def test_real_nooa_typed_research_consumes_actual_retrieval_with_mock_transport(
                     reason='The retained failure must not be repeated')
                     for r in retrieved for n in r['data']['negative_records']])
         return DirectCompletion(json.dumps(value), 20)
-    roles.provider.transport = transport
+    roles.provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': 'test-only-secret'},
+        transport=transport, models=[roles.profile.identity.backend_model], clock=clock, invalid_prompt_retries=0)
     def query(payload, *, deadline):
         queried.append(payload)
         clock.now += 3
