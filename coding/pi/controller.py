@@ -120,20 +120,7 @@ class ControllerSession(PiCodingSession):
                 unread_skills=payload['unread_skills'], read_skill_names=payload['read_skill_names'],
                 source=resource(payload['source']), remaining_seconds=remaining())
         def resource(value):
-            compact = self.context.compact(value, threshold=3072)
-            if len(encoded(compact)) <= 6144:
-                return compact
-            # Page large raw results, retaining authoritative IDs/summaries.
-            result = {'full_observation': self.context.admit(value)}
-            if isinstance(value, dict):
-                for key in ('reference', 'receipt_id', 'action', 'executed', 'status',
-                            'path', 'sha256', 'project_hash', 'project_id', 'goal', 'contract'):
-                    if key in value:
-                        result[key] = value[key] if len(encoded(value[key])) <= 512 else self.context.admit(value[key])
-                if 'summary' in value:
-                    summary = value['summary']
-                    result['summary'] = summary if len(encoded(summary)) <= 2048 else self.context.admit(summary)
-            return result
+            return self.context.resource(value, threshold=3072, limit=6144)
         def execute(name, args):
             nonlocal current
             if name == 'read_context':

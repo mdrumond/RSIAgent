@@ -6,6 +6,7 @@ import time
 from rsi.evidence_io import _references
 from rsi.instance_ingestion import load_ingestion_records
 from rsi.strategy import knowledge_db_query
+from rsi.memory_projection import project_memory
 
 
 def file_identity(path):
@@ -67,8 +68,7 @@ class ProjectComposition:
                 raise ValueError('accepted memory observation reference differs from retained facts')
             if observations is not None and packet.get('observations') not in (None, observations):
                 raise ValueError('accepted observations differ from admitted host packet')
-            metadata = dict(record, proposal={k: v for k, v in record['proposal'].items()
-                if k not in ('observations', 'observations_ref')})
+            metadata = project_memory(record, self.store)
             if record['proposal']['kind'] == 'correctness':
                 positives.append(dict(memory=metadata, observations=observations,
                     provenance=dict(snapshot=memory_ref, packet=reference, observations=observation_ref)))

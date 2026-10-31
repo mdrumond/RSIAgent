@@ -19,8 +19,9 @@ TEXT_SUFFIXES = {'.py', '.md', '.rst', '.txt', '.c', '.cc', '.cpp', '.h', '.hpp'
                  '.cu', '.cuh', '.mlir', '.toml'}
 REF_KEYS = {'reference', 'contract', 'contract_ref', 'execution_contract_ref',
             'host_failure_ref', 'query_ref', 'retrospective_ref', 'stdout', 'stderr',
-            'profile', 'artifact', 'artifact_ref', 'selection_ref'}
-REF_LISTS = {'artifact_refs', 'skill_refs', 'retrieval_refs', 'events'}
+            'profile', 'artifact', 'artifact_ref', 'selection_ref', 'packet', 'baseline',
+            'memory_snapshot', 'observations_ref'}
+REF_LISTS = {'artifact_refs', 'skill_refs', 'retrieval_refs', 'events', 'raw_refs', 'queries', 'evidence'}
 
 
 def _digest(data):
