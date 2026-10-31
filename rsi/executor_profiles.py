@@ -163,6 +163,10 @@ class GuardedExecutor:
     def reconcile(self, request, **kwargs):
         return self.executor.reconcile(request, **kwargs)
 
+    def recorded_closure(self, request, **kwargs):
+        closure = getattr(self.executor, 'recorded_closure', None)
+        return callable(closure) and closure(request, **kwargs)
+
 
 @dataclass(frozen=True)
 class ProfileCommandGuard:

@@ -13,9 +13,12 @@ def recorded(target):
     snapshot, workflow, now, bind = target
     workflow.begin()
     calls = []
-    state = dict(closed=True)
+    state = dict(closed=True, closed_before_error=True)
 
     class Executor:
+        def recorded_closure(self, request, *, ended_at):
+            return state['closed_before_error']
+
         def execute(self, request, *, observe, remaining):
             calls.append(('execute', request))
             observe('setup')
@@ -154,6 +157,9 @@ def test_command_only_lost_ack_retains_measured_prelude_outside_observed_span(ta
     calls = []
 
     class Executor:
+        def recorded_closure(self, request, *, ended_at):
+            return True  # This executor lost only the acknowledgement, not closure.
+
         def execute(self, request, *, observe, remaining):
             calls.append(('execute', request))
             now[0] += 2
@@ -187,3 +193,48 @@ def test_command_only_lost_ack_retains_measured_prelude_outside_observed_span(ta
     assert not workflow.accounting.receipts and not workflow.accounting.uncertainties
     assert calls[0][1] == calls[1][1]
     assert workflow.pending is not None and workflow.outcome is None
+
+
+def test_late_producer_completion_cannot_reuse_original_controller_elapsed(recorded):
+    backend, workflow, now, calls, state, path, original, timing = recorded
+    state['closed_before_error'] = False
+    now[0] += 60  # Producer continued outside the recorded intervals.
+    with pytest.raises(WorkflowError, match='closure before original controller end'):
+        backend.reconcile_target('original', timing)
+    assert [action for action, _ in calls] == ['execute']
+    assert 'executor:original' in workflow.accounting.uncertainties
+    assert json.loads(path.read_text())['status'] == 'pending'
+
+
+@pytest.mark.parametrize('proof', ['missing', 'late', 'foreign_handle', 'foreign_identity', 'valid'])
+def test_cpl_recorded_closure_uses_original_host_download_boundary(tmp_path, proof):
+    from test_cpl_execution import fixture
+    from rsi.executor_profiles import GuardedExecutor
+    executor, request, observe, observations, installed = fixture(tmp_path)
+    directory = executor._directory(request)
+    directory.mkdir(parents=True)
+    handle = 'remote:fake:job:original'
+    atomic_json(directory / 'submission.json', dict(target='fake', handle=handle))
+    identity = executor._identity(request)
+    if proof == 'foreign_identity':
+        identity['operation_id'] = 'another'
+    atomic_json(directory / 'transport.json', dict(identity=identity))
+    marker = directory / 'download-started.json'
+    ended_at = 100.
+    if proof != 'missing':
+        import os
+        atomic_json(marker, dict(handle='remote:fake:job:another' if proof == 'foreign_handle' else handle))
+        os.utime(marker, (101. if proof == 'late' else 99.,) * 2)
+    assert executor.recorded_closure(request, ended_at=ended_at) is (proof == 'valid')
+    guarded = GuardedExecutor(executor, None, 'frozen', '{}')
+    assert guarded.recorded_closure(request, ended_at=ended_at) is (proof == 'valid')
+    assert not (installed / 'calls.jsonl').exists()  # Proof inspection cannot dispatch.
+
+
+def test_executor_without_original_closure_proof_stays_pending(recorded, monkeypatch):
+    backend, workflow, now, calls, state, path, original, timing = recorded
+    monkeypatch.setattr(backend.executor, 'recorded_closure', None)
+    with pytest.raises(WorkflowError, match='closure before original controller end'):
+        backend.reconcile_target('original', timing)
+    assert [action for action, _ in calls] == ['execute']
+    assert 'executor:original' in workflow.accounting.uncertainties

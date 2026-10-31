@@ -667,6 +667,8 @@ class PythonExecution:
         This method calls executor.reconcile only; execute is never a fallback.
         controller_recorded=True reuses verified original controller phase timing;
         it cannot be combined with producer timing or interval closure claims.
+        The executor must prove original producer closure with recorded_closure
+        before that ledger ended; later completion cannot settle unmeasured work.
         """
         record = json.loads(self._receipt_path(operation).read_text())
         if record['status'] == 'complete':
@@ -702,6 +704,11 @@ class PythonExecution:
             record['source_hash'], contract['verifier'], record['category'],
             profile_path if record['profiling'] else None)
         clock = self.workflow.accounting
+        if recorded:
+            closure = getattr(self.executor, 'recorded_closure', None)
+            if (not callable(closure) or closure(request,
+                    ended_at=clock.records[record['clock_token']][2]) is not True):
+                raise WorkflowError('producer closure before original controller end is required')
         deadline = time.monotonic() + observation_seconds
         intervals, phase, start = [], record['category'], clock.now()
         def observe(next_phase, **metadata):
