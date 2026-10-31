@@ -403,7 +403,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             except WorkflowError:
                 pass  # Unknown effects remain suspended; no fabricated closure.
         self.retain(runner)
-        baseline = json.loads((runner.root / 'service-binding.json').read_text()).get('actor_seconds_baseline', 0.0)
+        service_binding = json.loads((runner.root / 'service-binding.json').read_text())
+        baseline = service_binding.get('actor_seconds_baseline', 0.0)
         total = runner.workflow.accounting.seconds()
         if type(baseline) not in (int, float) or not 0 <= baseline <= total:
             raise ValueError('invalid previously charged actor baseline')
@@ -414,6 +415,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
             failure_proof_ref=proof_ref, actor_seconds_total=total,
             actor_seconds_baseline=baseline, actor_seconds_delta=delta,
             workflow_valid=False if failure else runner.workflow.outcome == 'accepted')
+        if service_binding.get('resolved_binding_ref'):
+            resolved = runner.store.read_json(service_binding['resolved_binding_ref'])
+            packet.update(resolved_binding_ref=service_binding['resolved_binding_ref'],
+                          logical_case_identity=resolved['evidence']['logical_case_identity'])
         ref = self.store.put_json(packet)
         atomic_json(runner.root / 'service-result.json', dict(reference=ref))
         if outcome not in ('accepted', 'rejected', 'budget_exhausted', 'failed') or (
@@ -427,6 +432,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
         if not root.is_relative_to(self.root.resolve()):
             raise ValueError('project root escapes retained cycle')
         binding = json.loads((root / 'service-binding.json').read_text())
+        resolution = None
         if binding.get('executor_provenance') is not None:
             profile = binding.get('worker_profile') or binding['executor_identity']
             if self.services.executor_factory is None or self.services.executor_factory.metadata(
@@ -436,10 +442,40 @@ class BoundCycle(ProjectComposition, TuningBindings):
             wave_id = Path(relative).parts[1]
             waves = [*self.scheduler.state.get('wave_history', []), self.scheduler.state.get('active_wave')]
             wave = next(w for w in waves if w and w['id'] == wave_id)
-            self.kdb_stat = self.store.read_json(wave['admission_ref'])['kdb_stat']
-        return self.runner(root, memory_ref=binding['memory'],
+            admitted = self.store.read_json(wave['admission_ref'])
+            self.kdb_stat = admitted['kdb_stat']
+            if binding.get('resolved_binding_ref'):
+                from rsi.project_binding import admission_hash, validate_resolution
+                op = admitted['operations'][operation]
+                logical = dict(operation_id=operation, spec=op['spec'], config=op['config'],
+                    memory_ref=admitted['memory'], skills_ref=admitted['skills'],
+                    configuration_ref=admitted['configuration'])
+                if binding.get('logical_admission_hash') != admission_hash(logical):
+                    raise ValueError('resolved project differs from admitted logical operation')
+                row = json.loads((self.root / 'waves' / wave_id / 'wave.json').read_text())['projects'][operation]
+                resolution = ContentAddressedArtifacts(root / 'artifacts').read_json(binding['resolved_binding_ref'])
+                resolution = validate_resolution(logical, resolution, device=row['lease_device'],
+                                                 executor_identity=binding['executor_identity'])
+                if resolution['evidence']['logical_source_identity'] != op['logical_source_identity']:
+                    raise ValueError('resolved binding does not authenticate the original logical source')
+                self.store.put_json(resolution)
+        runner = self.runner(root, memory_ref=binding['memory'],
                            backend_identity=self.store.put_json(binding), reopen=True,
                            configuration_ref=binding['configuration'])
+        if resolution:
+            from core.artifacts import canonical_bytes
+            from rsi.project_binding import attach_execution_context
+            event = runner.latest('lease-binding')
+            if (runner.spec.to_dict() != resolution['spec']
+                    or canonical_bytes(asdict(runner.config)) != canonical_bytes(resolution['config'])
+                    or not event or event['reference'] != binding['resolved_binding_ref']
+                    or event['source_hash'] != resolution['evidence']['resolved_source_identity']
+                    or event['artifact_ref'] != runner.service.backend_identity):
+                raise ValueError('runner contract or initial source differs from trusted lease binding')
+            path = root.parent / 'worker-admission.json'
+            admission = json.loads(path.read_text())['receipt'] if path.exists() else None
+            attach_execution_context(runner, binding, resolution, admission)
+        return runner
 
     def retain(self, runner):
         for path in runner.store.objects.glob('*/*'):

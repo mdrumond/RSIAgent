@@ -11,6 +11,7 @@ from rsi.executor_profiles import FrozenExecutorFactory, ProfileCommandGuard
 from rsi.jobs import _alive
 from rsi.project_composition import ProjectComposition, file_identity, verify_kdb
 from rsi.project_wave import ProjectWave
+from rsi.project_binding import admission_hash, source_identity, validate_resolution, attach_execution_context
 from rsi.python_execution import atomic_json, ingest_elapsed
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.skills import SkillBundle
@@ -62,7 +63,9 @@ class ProjectWorkerFactory:
         # This process belongs exclusively to the project; parent env is untouched.
         os.environ.clear()
         os.environ.update(environment)
-        deadline = time.monotonic() + max(0., request.actor_seconds - request.actor_elapsed)
+        source_elapsed = (admitted['operations'][request.project_id].get('source_interval', {}).get('elapsed', 0.)
+                          if not request.reopen else 0.)
+        deadline = time.monotonic() + max(0., request.actor_seconds - request.actor_elapsed - source_elapsed)
         def remaining():
             limits = [max(0., deadline - time.monotonic())]
             if admitted['wall_deadline'] is not None:
@@ -106,30 +109,106 @@ class ProjectWorkerFactory:
         project_binding['executor_identity'] = device.get('executor_identity')
         project_binding['worker_profile'] = profile
         project_binding['executor_provenance'] = admitted['identities'].get(profile)
-        backend = services.store.put_json(project_binding)
-        config = dict(operation['config'], executor_identity=device.get('executor_identity'))
+        logical = dict(operation_id=request.project_id, spec=operation['spec'], config=operation['config'],
+            memory_ref=admitted['memory'], skills_ref=admitted['skills'], configuration_ref=admitted['configuration'])
+        resolution = None
+        binding_interval = None
         if request.reopen:
             retained = json.loads((request.root / 'service-binding.json').read_text())
-            if retained != project_binding:
+            if any(retained.get(k) != v for k, v in project_binding.items()):
                 raise ValueError('continuation differs from original service/executor binding')
-        runner = composition.runner(request.root, spec=ProjectSpec.from_dict(operation['spec']),
+            if retained.get('resolved_binding_ref'):
+                store = ContentAddressedArtifacts(request.root / 'artifacts')
+                resolution = validate_resolution(logical, store.read_json(retained['resolved_binding_ref']),
+                    device=request.device, executor_identity=device.get('executor_identity'))
+            elif admitted.get('binding_contracts', {}).get(profile):
+                raise ValueError('existing runner lacks a frozen lease binding; never regenerate on resume')
+            project_binding = retained
+        elif admitted.get('binding_contracts', {}).get(profile):
+            started, monotonic_start = time.time(), time.monotonic()
+            admission_path = request.root.parent / 'worker-admission.json'
+            admission_elapsed = json.loads(admission_path.read_text())['elapsed'] if admission_path.exists() else 0.
+            source_elapsed = operation.get('source_interval', {}).get('elapsed', 0.)
+            deadline = monotonic_start + max(0., request.actor_seconds - request.actor_elapsed - admission_elapsed - source_elapsed)
+            def remaining():
+                limits = [max(0., deadline - time.monotonic())]
+                if admitted['wall_deadline'] is not None:
+                    limits.append(max(0., admitted['wall_deadline'] - time.time()))
+                return min(limits)
+            resolution = self.executor_factory.bind_project(profile, request, logical, remaining=remaining)
+            if request.root.exists():
+                raise ValueError('host binder must not precreate the canonical runner root')
+            resolution = validate_resolution(logical, resolution, device=request.device,
+                                               executor_identity=device.get('executor_identity'))
+            evidence = resolution['evidence']
+            if evidence['logical_source_identity'] != operation['logical_source_identity']:
+                raise ValueError('host binder differs from the parent-frozen logical source identity')
+            public = evidence.get('public_runtime', {})
+            metadata = admitted['identities'][profile]
+            if any(k in public and str(public[k]) != str(metadata[k]) for k in
+                   ('target', 'runtime', 'physical_device', 'logical_device', 'outer_handle', 'controller_placement')
+                   if k in metadata):
+                raise ValueError('public runtime facts differ from the actual leased profile')
+            for config, key in ((operation['config'], 'logical_source_identity'),
+                                (resolution['config'], 'resolved_source_identity')):
+                if source_identity(config['source'], verifier=config['verifier'],
+                                   generated_paths=config.get('generated_paths', ())) != evidence[key]:
+                    raise ValueError('host binder source identity differs from actual input tree')
+            elapsed = time.monotonic() - monotonic_start
+            binding_interval = dict(started=started, elapsed=elapsed, ended=max(time.time(), started + elapsed))
+            project_binding['resolved_binding_ref'] = services.store.put_json(resolution)
+            project_binding['logical_admission_hash'] = admission_hash(logical)
+        config = (resolution['config'] if resolution else
+                  dict(operation['config'], executor_identity=device.get('executor_identity')))
+        spec = resolution['spec'] if resolution else operation['spec']
+        if resolution and resolution['evidence']['logical_source_identity'] != operation['logical_source_identity']:
+            raise ValueError('resolved source no longer authenticates the frozen logical admission')
+        backend = services.store.put_json(project_binding)
+        runner = composition.runner(request.root, spec=ProjectSpec.from_dict(spec),
             bundle=SkillBundle.from_dict(json.loads(request.skills)), config=config,
             memory_ref=admitted['memory'], backend_identity=backend, reopen=request.reopen,
             configuration_ref=admitted['configuration'], command_guard=(
                 ProfileCommandGuard(self.executor_factory, profile)
                 if profile and device.get('executor_identity') is None else None))
+        if resolution:
+            from core.artifacts import canonical_bytes
+            if (runner.spec.to_dict() != resolution['spec']
+                    or canonical_bytes(asdict(runner.config)) != canonical_bytes(resolution['config'])):
+                raise ValueError('canonical runner differs from the exact retained lease binding')
         if not request.reopen:
             from rsi.evaluation import case_identity
+            if resolution:
+                if runner.backend.project_hash() != resolution['evidence']['resolved_source_identity']:
+                    raise ValueError('canonical source snapshot differs from trusted lease resolution')
+                runner.store.put_json(project_binding)
+                runner.store.put_json(resolution)
+                runner.append(dict(type='lease-binding', reference=project_binding['resolved_binding_ref'],
+                                   artifact_ref=backend, source_hash=runner.backend.project_hash()))
             atomic_json(request.root / 'service-binding.json', project_binding)
             atomic_json(request.root / 'training-identity.json', case_identity(runner))
         admission_path = request.root.parent / 'worker-admission.json'
-        if admission_path.exists():
-            admission = json.loads(admission_path.read_text())
+        admission = json.loads(admission_path.read_text()) if admission_path.exists() else None
+        if admission:
             ingest_elapsed(runner.workflow.accounting, 'worker-admission:' + request.dispatch_id,
                 {'elapsed': admission['elapsed']}, category='execution',
                 observed_start=admission['started'], observed_end=admission['ended'],
                 observed_execution_start=admission['started'],
                 observed_execution_end=admission['started'] + admission['elapsed'])
+        if binding_interval:
+            ingest_elapsed(runner.workflow.accounting, 'lease-binding:' + request.dispatch_id,
+                {'elapsed': binding_interval['elapsed']}, category='execution',
+                observed_start=binding_interval['started'], observed_end=binding_interval['ended'],
+                observed_execution_start=binding_interval['started'],
+                observed_execution_end=binding_interval['started'] + binding_interval['elapsed'])
+        source_interval = operation.get('source_interval')
+        if source_interval:
+            ingest_elapsed(runner.workflow.accounting, 'logical-source:' + request.project_id,
+                {'elapsed': source_interval['elapsed']}, category='execution',
+                observed_start=source_interval['started'], observed_end=source_interval['ended'],
+                observed_execution_start=source_interval['started'],
+                observed_execution_end=source_interval['started'] + source_interval['elapsed'])
+        attach_execution_context(runner, project_binding, resolution,
+                                 admission['receipt'] if admission else None)
         if admitted['wall_deadline'] is not None:
             runner.workflow.constrain_wall_deadline('instance-wave', admitted['wall_deadline'])
         if request.recovery_receipt:
@@ -176,7 +255,7 @@ class WaveBindings:
             else:
                 kdb_stat = verify_kdb(kdb_path, cycle.binding['kdb'])
                 atomic_json(admission, dict(sha256=cycle.binding['kdb'], stat=kdb_stat))
-            identities = {}
+            identities, binding_contracts = {}, {}
             for device in self.policy['devices']:
                 identity = device.get('worker_profile') or device.get('executor_identity')
                 if identity is None:
@@ -195,6 +274,11 @@ class WaveBindings:
                 if metadata['executor_identity'] != device.get('executor_identity'):
                     raise ValueError('worker placement differs from configured local/target execution binding')
                 identities[identity] = metadata
+                contract = resolver.binding_contract(identity) if callable(getattr(resolver, 'binding_contract', None)) else None
+                if contract:
+                    binding_contracts[identity] = contract
+                elif cycle.services.test is None:
+                    raise ValueError('production NPU profiles require a shipped lease-bound project binder')
             admissions = {}
             for op in wave['operations']:
                 spec = ProjectSpec.from_dict(op['spec'])
@@ -202,15 +286,21 @@ class WaveBindings:
                     configuration=cycle.spec.configuration_ref, kdb=cycle.binding['kdb'],
                     provider=cycle.config['provider'], test_identity=cycle.binding['test_identity'],
                     actor_seconds_baseline=0.)
-                admissions[op['id']] = dict(spec=op['spec'], binding=binding,
-                    config=asdict(cycle.services.project_config(cycle.config, spec)))
+                config = asdict(cycle.services.project_config(cycle.config, spec))
+                started, monotonic_start = time.time(), time.monotonic()
+                source_hash = source_identity(config['source'], verifier=config['verifier'],
+                                              generated_paths=config.get('generated_paths', ()))
+                elapsed = time.monotonic() - monotonic_start
+                admissions[op['id']] = dict(spec=op['spec'], binding=binding, config=config,
+                    logical_source_identity=source_hash, source_interval=dict(started=started,
+                    elapsed=elapsed, ended=max(time.time(), started + elapsed)))
                 relative = Path('waves') / wave['id'] / 'projects' / op['id'] / 'runner'
                 state.setdefault('project_roots', {})[op['id']] = relative.as_posix()
             admitted = dict(binding=cycle.binding, operations=admissions,
                 configuration=cycle.spec.configuration_ref, memory=wave['memory'], skills=wave['skills'],
                 memory_bytes=cycle.store.read_bytes(wave['memory']).hex(),
                 skills_bytes=cycle.store.read_bytes(wave['skills']).hex(), devices=self.policy['devices'],
-                identities=identities, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
+                identities=identities, binding_contracts=binding_contracts, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
             wave['admission_ref'] = cycle.store.put_json(admitted)
             state['active_wave'] = wave
             cycle.scheduler._save()
@@ -221,7 +311,8 @@ class WaveBindings:
         admitted = cycle.store.read_json(wave['admission_ref'])
         resolver = cycle.services.executor_factory
         if admitted['identities']:
-            resolver = FrozenExecutorFactory(resolver, json.dumps(admitted['identities'], sort_keys=True))
+            resolver = FrozenExecutorFactory(resolver, json.dumps(admitted['identities'], sort_keys=True),
+                json.dumps(admitted.get('binding_contracts', {}), sort_keys=True))
         return ProjectWorkerFactory(str(cycle.services.root), str(cycle.root),
             json.dumps(admitted), cycle.services.test, resolver)
 

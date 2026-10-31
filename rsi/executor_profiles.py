@@ -61,6 +61,22 @@ class ExecutorProfiles:
             raise ValueError('NPU profile requires a trusted admission/command health guard')
         return _public(value['metadata']) if 'metadata' in value else public_identity(self._executor(identity, value))
 
+    def binding_contract(self, identity):
+        value = self._record(identity)
+        if not value.get('project_binder'):
+            return None
+        from rsi.project_binding import admission_hash
+        return admission_hash(dict(binder=value['project_binder'],
+                                   configuration=value.get('project_configuration', {})))
+
+    def bind_project(self, identity, request, logical_admission, *, remaining):
+        value = self._record(identity)
+        if not value.get('project_binder'):
+            raise ValueError('NPU worker profile requires a shipped lease-bound project builder')
+        return _callable(value['project_binder'])(request, logical_admission,
+            metadata=self.metadata(identity), configuration=value.get('project_configuration', {}),
+            remaining=remaining)
+
     def __call__(self, identity):
         value = self._record(identity)
         if not value.get('guard'):
@@ -160,6 +176,7 @@ class ProfileCommandGuard:
 class FrozenExecutorFactory:
     factory: object
     identities_json: str
+    bindings_json: str = '{}'
 
     def metadata(self, identity):
         metadata = self.factory.metadata(identity)
@@ -176,6 +193,13 @@ class FrozenExecutorFactory:
     def worker_environment(self, identity, request, **kwargs):
         self.metadata(identity)
         return self.factory.worker_environment(identity, request, **kwargs)
+
+    def bind_project(self, identity, request, logical_admission, **kwargs):
+        self.metadata(identity)
+        expected = json.loads(self.bindings_json).get(identity)
+        if not expected or self.factory.binding_contract(identity) != expected:
+            raise ValueError('trusted project builder/configuration differs from frozen wave admission')
+        return self.factory.bind_project(identity, request, logical_admission, **kwargs)
 
     def guard(self, identity, request, **kwargs):
         self.metadata(identity)

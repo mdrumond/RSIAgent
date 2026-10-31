@@ -186,3 +186,23 @@ only explicitly authorized ordinary functional work on measured Alarm devices;
 the receipt remains degraded and retains actual faults. It neither permits busy
 devices nor relaxes healthy-idle requirements for timing/profiling. Defaults deny
 Alarm, and terminal, unavailable or unknown devices remain excluded.
+
+NPU profiles also select a shipped `project_binder: "module:bind_project"` with
+`project_configuration` containing its ignored host builder inputs. After a
+physical lease is selected, the child calls
+`bind_project(request, logical_admission, *, metadata, configuration, remaining)`
+before creating the runner. The binder creates/selects source/runtime inputs and
+an independent verifier for that actual device; it never rewrites the baseline
+or precreates the runner root. Its resolved spec/config and logical case/source
+proof are sealed in CAS and linked to the runner's frozen backend identity.
+Resume reuses the exact saved binding without running the binder again.
+
+Logical case/oracle identity excludes physical argv and filesystem locations;
+physical binding changes do not invent a different task. Parent validation checks
+that proof and `commands.test == ProjectSpec.command`, preserving the original
+logical goal, cases, budgets and edit/retention policies. The canonical actor task
+context includes a whitelisted `execution_context` with actual target/runtime,
+SoC/device, revisions and public admission facts. Private profiles, credentials
+and target package paths are not copied into that context. Controllers do not
+restore target Python paths globally; any registry-derived pre-import paths belong
+to the target-only frozen verifier builder and need applicable runtime evidence.
