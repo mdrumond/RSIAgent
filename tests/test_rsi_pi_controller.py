@@ -571,7 +571,7 @@ def test_native_concise_summary_covers_long_history_and_recovers_length_failure(
         assert len(kwargs['data'])<=49152
         if not request.get('tools'):
             summaries.append(request)
-            assert request['max_tokens']==1536
+            assert request['max_tokens']==6553
             if len(summaries)==1:
                 return response([],len(requests),len(kwargs['data'])//4,summary=long_summary[:7000],
                                 finish='length',completion_tokens=request['max_tokens'])
@@ -595,7 +595,7 @@ def test_native_concise_summary_covers_long_history_and_recovers_length_failure(
     compactions=[row['event'] for kind,row in events if kind=='pi-event' and row['event']['type']=='compaction_end']
     attempts=[row['event'] for kind,row in events if kind=='pi-native-event' and row['event']['kind']=='compaction-summary']
     assert any(not row['successful'] and row.get('stopReason')=='length' for row in attempts)
-    assert any(not row.get('result') for row in compactions)
+    assert any(row.get('fallback')=='pi-native' for row in attempts if not row['successful'])
     successful=[row for row in compactions if row.get('result')]
     assert successful and all(row['result']['usage']['output']<=1000 for row in successful)
     assert all(len(row['result']['summary'].encode())<=6144 for row in successful)

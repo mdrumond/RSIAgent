@@ -58,6 +58,10 @@ export default function (pi: ExtensionAPI) {
     // Pi's cutpoint; never leave the split-turn prefix on the verbose path.
     const messages = [...p.messagesToSummarize, ...p.turnPrefixMessages];
     const conversation = serializeConversation(convertToLlm(messages));
+    // Match Pi's native history-summary allowance. 1536 repeatedly cut off
+    // real checkpoints; a token-limited fragment must never replace history.
+    const maxTokens = Math.min(Math.floor(0.8 * p.settings.reserveTokens),
+      ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY);
     try {
     const response = await ctx.modelRegistry.complete(ctx.model, {
       systemPrompt: "Write a concise RSI continuation checkpoint, at most about 1000 tokens. " +
@@ -68,21 +72,26 @@ export default function (pi: ExtensionAPI) {
       messages: [{ role: "user", content: [{ type: "text", text:
         `<previous-summary>\n${p.previousSummary ?? ""}\n</previous-summary>\n` +
         `<conversation>\n${conversation}\n</conversation>` }], timestamp: Date.now() }],
-    }, { maxTokens: 1536, signal: event.signal, cacheRetention: "none" });
+    }, { maxTokens, signal: event.signal, cacheRetention: "none" });
     const summary = response.content.filter(c => c.type === "text").map(c => c.text).join("\n");
     const successful = response.stopReason === "stop" && !!summary.trim() && Buffer.byteLength(summary) <= 6144;
     await host("native_event", { kind: "compaction-summary", successful,
       stopReason: response.stopReason, summary, usage: response.usage,
-      firstKeptEntryId: p.firstKeptEntryId, tokensBefore: p.tokensBefore });
-    if (!successful) return { cancel: true }; // Never silently use a truncated checkpoint.
+      firstKeptEntryId: p.firstKeptEntryId, tokensBefore: p.tokensBefore,
+      maxTokens, fallback: successful ? null : "pi-native" });
+    // An unusable custom checkpoint is not a request to cancel compaction.
+    // Let Pi summarize the original preparation with its own cutpoint and
+    // complete-summary checks. No transcript is shortened or rewritten here.
+    if (!successful) return event.signal.aborted ? { cancel: true } : undefined;
     const modifiedFiles = [...new Set([...p.fileOps.written, ...p.fileOps.edited])];
     return { compaction: { summary, firstKeptEntryId: p.firstKeptEntryId,
       tokensBefore: p.tokensBefore, usage: response.usage,
       details: { readFiles: [...p.fileOps.read].filter(path => !modifiedFiles.includes(path)), modifiedFiles } } };
     } catch (error) {
       if (!event.signal.aborted) await host("native_event", { kind: "compaction-summary", successful: false,
-        error: error instanceof Error ? error.message : String(error), usage: null });
-      return { cancel: true };
+        error: error instanceof Error ? error.message : String(error), usage: null,
+        maxTokens, fallback: "pi-native" });
+      return event.signal.aborted ? { cancel: true } : undefined;
     }
   });
   // No context hook: native tool exchanges, recovery and compaction remain Pi's.
