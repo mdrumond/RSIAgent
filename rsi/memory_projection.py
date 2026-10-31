@@ -11,7 +11,12 @@ def project_memory(record, artifacts):
         values = proposal.get(key, [])
         projected[key] = values[:8]
         projected[key + '_count'] = len(values)
-    return dict(memory_id=record['memory_id'], proposal=projected,
+    roots = [provenance.get('packet'), provenance.get('baseline'),
+             *provenance.get('queries', []), *proposal.get('evidence', [])]
+    closure = artifacts.put_json(dict(schema='rsi-memory-retrieval-closure-v1',
+        artifact_refs=[ref for ref in roots if isinstance(ref, str) and len(ref) == 64
+                       and all(c in '0123456789abcdef' for c in ref)]))
+    return dict(retained=dict(reference=closure), memory_id=record['memory_id'], proposal=projected,
         artifact_ref=artifacts.put_json(record),
         provenance=dict(reference=artifacts.put_json(provenance),
             counts={key: len(value) for key, value in provenance.items()

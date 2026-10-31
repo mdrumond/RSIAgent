@@ -32,21 +32,24 @@ class ContextRecords:
         entries = []
         def text(value, size=256):
             return value.encode()[:size].decode(errors='ignore') if isinstance(value, str) else None
+        def mapping(value):
+            return value if isinstance(value, dict) else {}
         for index, row in enumerate(rows):
-            value = row if isinstance(row, dict) else {}
-            memory = value.get('memory', value)
-            proposal = memory.get('proposal', {})
-            observed = value.get('observations') or {}
-            scope = observed.get('applicability', {})
+            value = mapping(row)
+            memory = mapping(value.get('memory', value))
+            proposal = mapping(memory.get('proposal'))
+            observed = mapping(value.get('observations'))
+            scope = mapping(observed.get('applicability'))
             facts = {key: shown for key, item in dict(
                 memory_id=memory.get('memory_id'), project_id=proposal.get('project_id', value.get('project_id')),
-                kind=proposal.get('kind'), summary=proposal.get('summary', value.get('reason', value.get('text'))),
+                kind=proposal.get('kind'), summary=proposal.get('summary', value.get('reason', value.get('text', row))),
                 outcome=observed.get('outcome', value.get('outcome')), goal=scope.get('goal'),
                 source_hash=scope.get('final_source_hash')).items() if (shown := text(item)) is not None}
-            commands = observed.get('commands', {}).get('items', [])
+            commands = mapping(observed.get('commands')).get('items', [])
+            commands = commands if isinstance(commands, list) else []
             facts['commands'] = [dict(command=text(r.get('command'), 64),
                 result=text(r.get('classification'), 80), final_source_scope=r.get('final_source_scope'),
-                stderr=text(r.get('stderr', {}).get('text'), 160)) for r in commands[-3:]]
+                stderr=text(mapping(r.get('stderr')).get('text'), 160)) for r in commands[-3:] if isinstance(r, dict)]
             entries.append(dict(index=index, facts=facts, full=self._pointer(row)))
         visible = []
         for entry in entries:
@@ -70,12 +73,20 @@ class ContextRecords:
         if 'summary' in value:
             result['summary'] = value['summary'] if len(encoded(value['summary'])) <= 2048 else self.admit(value['summary'])
         evidence = value.get('evidence', {})
-        response = evidence.get('payload', {}).get('response', {}) if isinstance(evidence, dict) else {}
+        payload = evidence.get('payload') if isinstance(evidence, dict) else None
+        response = payload.get('response') if isinstance(payload, dict) else None
+        response = response if isinstance(response, dict) else {}
         if all(isinstance(response.get(key), list) for key in ('results', 'negative_records')):
             result['retrieval'] = {key: self.retrieval_rows(response[key], budget=1400)
                                    for key in ('results', 'negative_records')}
             if len(encoded(result)) > limit and 'summary' in value:
                 result['summary'] = self._pointer(value['summary'])
+            while len(encoded(result)) > limit:
+                largest = max(result['retrieval'].values(), key=lambda group: len(encoded(group['items'])))
+                if not largest['items']:
+                    raise ContextLimitError('mandatory retrieval handles exceed resource budget')
+                largest['items'].pop()
+                largest['omitted'] += 1
         return result
 
     def compact(self, value, threshold=1024):
