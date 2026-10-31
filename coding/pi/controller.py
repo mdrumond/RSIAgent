@@ -117,7 +117,8 @@ class ControllerSession(PiCodingSession):
                 operation_id=payload['operation_id'], skill_receipts=payload['skill_receipts'],
                 evidence_receipts=payload['evidence_receipts'],
                 unread_skills=payload['unread_skills'], read_skill_names=payload['read_skill_names'],
-                source=resource(payload['source']), remaining_seconds=remaining())
+                source=resource(payload['source']), remaining_seconds=remaining(),
+                task_context=task_context(payload['task']))
         def resource(value):
             compact = self.context.compact(value, threshold=3072)
             if len(encoded(compact)) <= 6144:
@@ -132,6 +133,32 @@ class ControllerSession(PiCodingSession):
                 if 'summary' in value:
                     summary = value['summary']
                     result['summary'] = summary if len(encoded(summary)) <= 2048 else self.context.admit(summary)
+            return result
+        def task_identity(task):
+            if not isinstance(task, dict):
+                return {}
+            pinned = {key: task[key] for key in ('user_guidance', 'execution_context', 'configuration_ref')
+                      if key in task}
+            project = task.get('project')
+            if isinstance(project, dict):
+                pinned['project'] = {key: project[key] for key in ('project_id', 'goal') if key in project}
+            return pinned
+        def task_context(task):
+            # A stable readable reference survives native compaction without
+            # repeating the full operator guidance in every completed tool.
+            reference = self.context.admit(task_identity(task))
+            return {key: reference[key] for key in ('record', 'bytes', 'read_with')}
+        def task_resource(task):
+            result = resource(task)
+            if isinstance(result, dict):
+                pinned = task_identity(task)
+                for key, value in pinned.items():
+                    if key == 'project':
+                        project = resource(task['project'])
+                        project.update({name: resource(item) for name, item in value.items()})
+                        result[key] = project
+                    else:
+                        result[key] = resource(value)
             return result
         def execute(name, args):
             nonlocal current
@@ -170,7 +197,7 @@ class ControllerSession(PiCodingSession):
             if (current[0]['observation'] or {}).get('event') == 'action-superseded':
                 # The initial prompt is sent once. Deliver changed host inputs
                 # through Pi's actual tool conversation before another decision.
-                response['task'] = resource(current[0]['task'])
+                response['task'] = task_resource(current[0]['task'])
                 response['terminate'] = True
             return response
         def handle(name, args):
@@ -238,7 +265,7 @@ class ControllerSession(PiCodingSession):
         self.rpc.timeout = threading.TIMEOUT_MAX
         resume()
         try:
-            prompt = dict(task=resource(turn[0]['task']), **status())
+            prompt = dict(task=task_resource(turn[0]['task']), **status())
             self.rpc.prompt(json.dumps(prompt), pump=pump, remaining_seconds=remaining,
                 on_event=lambda event:record('pi-event',dict(event=event)))
             while not self.gateway.finished.is_set() or not self.requests.empty():
