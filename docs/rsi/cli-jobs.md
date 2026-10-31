@@ -120,7 +120,8 @@ read-only KDB. Source snapshots retain the complete configured resource tree;
 all siblings settle and host validation verifies their retained outcomes. Rejected,
 exhausted and failed attempts remain distinct from accepted artifacts.
 
-Wave projects have a 7200-second actor allocation with iteration/attempt stopping
+Wave projects preserve their frozen per-project actor allowance (7200 seconds
+when unset), with iteration/attempt stopping
 limits disabled. Parent actor and absolute wall allocations still constrain wave
 admission and nested work. Explicit harness recovery can add 7200 seconds once,
 retaining elapsed accounting. Configured semantic recovery and skill-validation
