@@ -24,6 +24,71 @@ class ContextRecords:
                 "preview": raw[:384].decode(errors="ignore"),
                 "read_with": "read_context"}
 
+    def _pointer(self, value):
+        return {key: value for key, value in self.admit(value).items() if key != 'preview'}
+
+    def retrieval_rows(self, rows, *, budget=1800):
+        """Stable decision indices and useful facts, with individually paged rows."""
+        entries = []
+        def text(value, size=256):
+            return value.encode()[:size].decode(errors='ignore') if isinstance(value, str) else None
+        def mapping(value):
+            return value if isinstance(value, dict) else {}
+        for index, row in enumerate(rows):
+            value = mapping(row)
+            memory = mapping(value.get('memory', value))
+            proposal = mapping(memory.get('proposal'))
+            observed = mapping(value.get('observations'))
+            scope = mapping(observed.get('applicability'))
+            facts = {key: shown for key, item in dict(
+                memory_id=memory.get('memory_id'), project_id=proposal.get('project_id', value.get('project_id')),
+                kind=proposal.get('kind'), summary=proposal.get('summary', value.get('reason', value.get('text', row))),
+                outcome=observed.get('outcome', value.get('outcome')), goal=scope.get('goal'),
+                source_hash=scope.get('final_source_hash')).items() if (shown := text(item)) is not None}
+            commands = mapping(observed.get('commands')).get('items', [])
+            commands = commands if isinstance(commands, list) else []
+            facts['commands'] = [dict(command=text(r.get('command'), 64),
+                result=text(r.get('classification'), 80), final_source_scope=r.get('final_source_scope'),
+                stderr=text(mapping(r.get('stderr')).get('text'), 160)) for r in commands[-3:] if isinstance(r, dict)]
+            entries.append(dict(index=index, facts=facts, full=self._pointer(row)))
+        visible = []
+        for entry in entries:
+            if len(encoded([*visible, entry])) > budget:
+                break
+            visible.append(entry)
+        return dict(count=len(rows), items=visible, omitted=len(rows) - len(visible),
+                    index=self._pointer(entries), all_records=self._pointer(rows))
+
+    def resource(self, value, *, threshold=3072, limit=6144):
+        compact = self.compact(value, threshold)
+        if len(encoded(compact)) <= limit:
+            return compact
+        result = {'full_observation': self.admit(value)}
+        if not isinstance(value, dict):
+            return result
+        for key in ('reference', 'receipt_id', 'action', 'executed', 'status',
+                    'path', 'sha256', 'project_hash', 'project_id', 'goal', 'contract'):
+            if key in value:
+                result[key] = value[key] if len(encoded(value[key])) <= 512 else self.admit(value[key])
+        if 'summary' in value:
+            result['summary'] = value['summary'] if len(encoded(value['summary'])) <= 2048 else self.admit(value['summary'])
+        evidence = value.get('evidence', {})
+        payload = evidence.get('payload') if isinstance(evidence, dict) else None
+        response = payload.get('response') if isinstance(payload, dict) else None
+        response = response if isinstance(response, dict) else {}
+        if all(isinstance(response.get(key), list) for key in ('results', 'negative_records')):
+            result['retrieval'] = {key: self.retrieval_rows(response[key], budget=1400)
+                                   for key in ('results', 'negative_records')}
+            if len(encoded(result)) > limit and 'summary' in value:
+                result['summary'] = self._pointer(value['summary'])
+            while len(encoded(result)) > limit:
+                largest = max(result['retrieval'].values(), key=lambda group: len(encoded(group['items'])))
+                if not largest['items']:
+                    raise ContextLimitError('mandatory retrieval handles exceed resource budget')
+                largest['items'].pop()
+                largest['omitted'] += 1
+        return result
+
     def compact(self, value, threshold=1024):
         if isinstance(value, str):
             # Host outcomes and optimizer previews carry JSON strings. Preserve
@@ -48,6 +113,9 @@ class ContextRecords:
         if isinstance(value, dict):
             result = {}
             for key, item in value.items():
+                if key == 'negative_records' and isinstance(item, list) and len(encoded(item)) > 4096:
+                    result[key] = self.retrieval_rows(item)
+                    continue
                 if key in {"diagnostic", "compile_diagnostic", "detail"} and isinstance(item, str) and len(item.encode()) > threshold:
                     # Keep compiler errors visible even after a long warning preamble.
                     errors = [line for line in item.splitlines()
