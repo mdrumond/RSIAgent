@@ -552,6 +552,8 @@ class CplExecutor:
         state = json.loads((directory / 'transport.json').read_text())
         receipt = json.loads((directory / 'submission.json').read_text())
         return (state['identity'] == self._identity(request)
+                and state.get('terminal', {}).get('state') == 'completed'
+                and state['terminal'].get('exit') == 0
                 and json.loads(marker.read_text()).get('handle') == self._handle(receipt))
 
     def reconcile(self, request, *, observe, remaining, recovery_remaining=None):

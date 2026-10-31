@@ -206,7 +206,8 @@ def test_late_producer_completion_cannot_reuse_original_controller_elapsed(recor
     assert json.loads(path.read_text())['status'] == 'pending'
 
 
-@pytest.mark.parametrize('proof', ['missing', 'late', 'foreign_handle', 'foreign_identity', 'valid'])
+@pytest.mark.parametrize('proof', [
+    'missing', 'late', 'foreign_handle', 'foreign_identity', 'cancelled', 'failed', 'valid'])
 def test_cpl_recorded_closure_uses_original_host_download_boundary(tmp_path, proof):
     from test_cpl_execution import fixture
     from rsi.executor_profiles import GuardedExecutor
@@ -218,7 +219,8 @@ def test_cpl_recorded_closure_uses_original_host_download_boundary(tmp_path, pro
     identity = executor._identity(request)
     if proof == 'foreign_identity':
         identity['operation_id'] = 'another'
-    atomic_json(directory / 'transport.json', dict(identity=identity))
+    terminal = dict(state=proof if proof in ('cancelled', 'failed') else 'completed', exit=0)
+    atomic_json(directory / 'transport.json', dict(identity=identity, terminal=terminal))
     marker = directory / 'download-started.json'
     ended_at = 100.
     if proof != 'missing':
