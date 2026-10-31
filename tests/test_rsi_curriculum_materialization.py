@@ -195,6 +195,10 @@ def test_single_case_shape_forks_preserve_template_oracle_and_can_shrink_again(t
         template = next(row for row in catalog if row['template_id']=='triton.shape-reduction.case-0')
         assert template['parameters']['shape']['minItems'] == template['parameters']['shape']['maxItems'] == 2
         assert len(template['parameters']['shape']['items']['enum']) <= 12
+        maxima = template['shape_constraints']['maximum_per_dimension']
+        assert maxima == json.loads(Path(parent.correctness_ref).read_text())['cases'][0]['shape']
+        assert all(n <= maximum for n, maximum in zip(shape, maxima))
+        assert any(n < maximum for n, maximum in zip(shape, maxima))
         idea = dict(name='tiny',goal='Investigate a tiny input',acceptance='Existing independent oracle',
             template_id=template['template_id'],parameters=dict(shape=shape))
         child = materialize_child(parent,wrapper,idea,root=tmp_path/f'shape-{number}',

@@ -90,7 +90,9 @@ def capability_catalog(parent_spec, parent_config):
             choices = sorted({1, *shape, *(1 << i for i in range(max(shape).bit_length()))})
             entry = deepcopy(HOST_CAPABILITY_CATALOG[2])
             entry.update(template_id=entry['template_id'] + '.case-' + str(index),
-                         case_index=index, parent_shape=list(shape))
+                         case_index=index, parent_shape=list(shape),
+                         shape_constraints=dict(maximum_per_dimension=list(shape),
+                             at_least_one_strictly_smaller=True))
             entry['parameters']['shape'].update(minItems=len(shape), maxItems=len(shape),
                 items=dict(type='integer', enum=choices))
             templates.append(entry)
