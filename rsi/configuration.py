@@ -100,6 +100,9 @@ def validate_configuration(payload):
     for name in ('prompts', 'provider', 'roles', 'recovery', 'tuning', 'dashboard', 'curriculum'):
         if name in payload:
             _object(payload[name], name)
+    failed_limit = payload.get('recovery', {}).get('max_failed_attempts', 5)
+    if type(failed_limit) is not int or failed_limit <= 0:
+        raise ValueError('recovery.max_failed_attempts must be a positive integer')
     curriculum = payload.get('curriculum', {})
     if 'enabled' in curriculum and type(curriculum['enabled']) is not bool:
         raise ValueError('curriculum.enabled must be boolean')
@@ -153,7 +156,7 @@ def _defaults(bootstrap):
         'prompts': {'curriculum': '', 'actor': '', 'waves': '', 'skillwriter': ''},
         'provider': {'profile_id': 'deepseek-flash-native-v1', 'model': 'deepseek-flash'},
         'roles': {}, 'roles_python': None, 'budgets': BudgetLimits().to_dict(),
-        'recovery': {'enabled': True},
+        'recovery': {'enabled': True, 'max_failed_attempts': 5},
         'tuning': {'every_projects': 5, 'at_wave_end': True,
                    'heldout_projects': 5, 'runs_per_arm': 2},
         'browser_roots': ['.'], **bootstrap,
