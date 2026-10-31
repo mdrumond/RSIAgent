@@ -34,6 +34,7 @@ class ProjectConfig:
     editable_files: tuple[str, ...] = ('solution.py',)
     performance_seconds: float | None = None
     generated_paths: tuple[str, ...] = ()
+    executor_identity: str | None = None
 
     @classmethod
     def from_dict(cls, value):
@@ -44,6 +45,9 @@ class ProjectConfig:
             raise ValueError('generated_paths must be an array of project-relative paths')
         value['generated_paths'] = tuple(generated)
         result = cls(**value)
+        if result.executor_identity is not None and (
+                not isinstance(result.executor_identity, str) or not result.executor_identity.strip()):
+            raise ValueError('executor_identity must be a nonblank trusted binding')
         if not {'compile', 'test', 'validation'} <= result.commands.keys():
             raise ValueError('compile, test and validation commands required')
         if result.performance_seconds is not None and 'timing' not in result.commands:
@@ -64,16 +68,20 @@ class ProjectRunner:
     def create(cls, root, spec, bundle, config, **injections):
         created = injections.get('clock', time.time)()
         config = ProjectConfig.from_dict(asdict(config) if isinstance(config, ProjectConfig) else config)
+        if config.executor_identity is not None and injections.get('executor_factory') is None:
+            raise ValueError('frozen executor binding requires a trusted executor factory')
         backend = PythonExecution.snapshot(root, config.source, config.verifier,
             commands=config.commands, editable_files=config.editable_files,
-            performance_seconds=config.performance_seconds, generated_paths=config.generated_paths)
+            performance_seconds=config.performance_seconds, generated_paths=config.generated_paths,
+            executor_identity=config.executor_identity)
         frozen = dict(created=created, spec=spec.to_dict(), skills=bundle.to_dict(), config=asdict(config),
                       backend_identity=injections['backend_identity'])
         atomic_json(backend.root / 'runner.json', {'contract': backend.store.put_json(frozen)})
         return cls(root, **injections)
 
-    def __init__(self, root, *, query, backend_identity, session_factory, test_backend=False, clock=time.time):
-        self.backend = PythonExecution(root)
+    def __init__(self, root, *, query, backend_identity, session_factory, test_backend=False, clock=time.time,
+                 executor_factory=None):
+        self.backend = PythonExecution(root, executor_factory=executor_factory)
         self.root, self.store = self.backend.root, self.backend.store
         self.contract_ref = json.loads((self.root / 'runner.json').read_text())['contract']
         frozen = self.store.read_json(self.contract_ref)
@@ -82,6 +90,8 @@ class ProjectRunner:
         self.spec = ProjectSpec.from_dict(frozen['spec'])
         self.bundle = SkillBundle.from_dict(frozen['skills'])
         self.config = ProjectConfig.from_dict(frozen['config'])
+        if self.config.executor_identity != self.backend.contract.get('executor_identity'):
+            raise ValueError('executor identity differs between frozen contracts')
         self.event_lock = RLock()
         self.event_path = self.root / 'events.json'
         self.event_refs = json.loads(self.event_path.read_text()) if self.event_path.exists() else []

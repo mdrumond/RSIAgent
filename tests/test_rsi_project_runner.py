@@ -1029,3 +1029,50 @@ def test_strategy_rejection_reuses_real_receipts_and_original_budget(tmp_path, c
         assert runner.workflow.accounting.seconds('thinking') >= session.calls * 2 + 2
     finally:
         database.close()
+
+
+def test_trusted_executor_binding_is_frozen_across_create_and_reopen(tmp_path):
+    from rsi.python_execution import CommandResult
+
+    identities, commands = [], []
+
+    class Executor:
+        def execute(self, request, *, observe, remaining):
+            commands.append(request)
+            observe('command', handle='remote:test:job:retained')
+            assert remaining() > 0
+            return CommandResult(0)
+
+    def factory(identity):
+        identities.append(identity)
+        return Executor()
+
+    runner, injections, database = make(tmp_path,
+        config_overrides={'executor_identity': 'test-runtime@revision'},
+        executor_factory=factory, budgets=BudgetLimits(actor_seconds=10))
+    try:
+        receipt = runner.backend.run('injected', 'compile')
+        reopened = ProjectRunner(runner.root, **injections)
+        assert identities == ['test-runtime@revision', 'test-runtime@revision']
+        assert reopened.config.executor_identity == 'test-runtime@revision'
+        assert reopened.backend.run('injected', 'compile') == receipt
+        assert len(commands) == 1
+        missing_factory = {key: value for key, value in injections.items() if key != 'executor_factory'}
+        with pytest.raises(ValueError, match='trusted executor factory'):
+            ProjectRunner(runner.root, **missing_factory)
+    finally:
+        database.close()
+
+
+def test_local_project_does_not_construct_optional_executor(tmp_path):
+    def factory(identity):
+        pytest.fail('local project must not construct an executor')
+
+    runner, _, database = make(tmp_path, executor_factory=factory)
+    try:
+        receipt = runner.backend.run('local-compile', 'compile')
+        assert receipt['classification'] == 'passed'
+        assert receipt['pid'] > 0
+        assert 'executor_identity' not in receipt
+    finally:
+        database.close()
