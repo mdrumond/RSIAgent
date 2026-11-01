@@ -133,7 +133,14 @@ def bind_project(request, logical_admission, *, metadata, configuration, remaini
     if str(metadata['physical_device']) != device:
         raise ValueError('Profile metadata differs from the actual physical lease')
     project = manifest['projects'][original.project_id]
-    if logical(original) != project['logical']:
+    admitted, frozen = logical(original), project['logical']
+    elapsed_limits = {'actor_seconds', 'wall_seconds'}
+    if (dict(admitted, budgets=frozen['budgets']) != frozen
+            or any(admitted['budgets'][key] != limit for key, limit in frozen['budgets'].items()
+                   if key not in elapsed_limits)
+            or any(limit is not None and (admitted['budgets'][key] is None
+                                         or admitted['budgets'][key] > limit)
+                   for key, limit in frozen['budgets'].items() if key in elapsed_limits)):
         raise ValueError('Binding would change the frozen logical project')
     variant = project['variants'][device]
     for key in ('target', 'runtime', 'physical_device', 'executor_identity'):
@@ -147,6 +154,7 @@ def bind_project(request, logical_admission, *, metadata, configuration, remaini
             or resolved_config.executor_identity != metadata.get('executor_identity')
             or variant['physical_device'] != device):
         raise ValueError('Resolved variant does not match the frozen project and lease')
+    resolved = replace(resolved, budgets=original.budgets)
     before = ProjectConfig.from_dict(logical_admission['config'])
     for field in ('source', 'verifier', 'editable_files', 'generated_paths', 'retained_paths', 'performance_seconds'):
         if getattr(before, field) != getattr(resolved_config, field):
