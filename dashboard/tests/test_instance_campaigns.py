@@ -113,6 +113,24 @@ const detail={job,inspection:{available:true,tasks:[],waves:[{wave_id:'wave-one'
   assert.ok(list.textContent.includes('Retained evidence unavailable'));
   assert.ok(list.textContent.includes('running'));
 
+  // Historical cycles stay visible without reopening their heavy evidence on each poll.
+  const history=Array.from({length:25},(_,i)=>({job_id:'historical-'+i,cycle_id:'past-'+i,
+    mode:'phase1',state:i%2?'completed':'interrupted',service_status:i%2?'complete':'observation_required'}));
+  const before=requests.length;
+  sequence=[{body:{jobs:[...history,job]}},{body:detail}];
+  await nextTimer();
+  assert.deepEqual(requests.slice(before),['/api/rsi/jobs','/api/rsi/jobs/current%20%2F%20job']);
+  assert.equal(list.children.length,26);
+  for(const item of history) assert.ok(list.textContent.includes(item.cycle_id));
+
+  // Once the current job closes, refresh does not read even that job's detail.
+  const closed={...job,state:'completed',service_status:'complete'};
+  const closedBefore=requests.length;
+  sequence=[{body:{jobs:[...history,closed]}}];
+  await nextTimer();
+  assert.deepEqual(requests.slice(closedBefore),['/api/rsi/jobs']);
+  assert.equal(list.children.length,26);
+
   // A genuinely empty successful response clears obsolete job cards.
   sequence=[{body:{jobs:[]}}];
   await nextTimer();

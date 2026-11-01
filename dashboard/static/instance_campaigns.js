@@ -70,7 +70,8 @@
       (job.service_status ? ' / ' + job.service_status : ''));
     const link = add(article, 'a', 'Inspect in RSI execution');
     link.href = root.dataset.executionUrl;
-    if (evidence.error) add(article, 'p', evidence.error);
+    if (evidence.deferred) add(article, 'p', 'Open execution to inspect retained project evidence.');
+    else if (evidence.error) add(article, 'p', evidence.error);
     else projects(article, evidence.inspection || {});
     return article;
   }
@@ -87,9 +88,11 @@
       const current = value.jobs.filter(job => !superseded.has(job.job_id));
       const cards = [];
       for (const job of current) {
-        let evidence;
-        try { evidence = await api('/api/rsi/jobs/' + encodeURIComponent(job.job_id)); }
-        catch (error) { evidence = {error: error.message}; }
+        let evidence = {deferred: true};
+        if (['running', 'launching', 'draining'].includes(job.state)) {
+          try { evidence = await api('/api/rsi/jobs/' + encodeURIComponent(job.job_id)); }
+          catch (error) { evidence = {error: error.message}; }
+        }
         cards.push(card(evidence.job || job, evidence));
       }
       list.replaceChildren(...cards);
