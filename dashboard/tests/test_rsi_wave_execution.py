@@ -38,3 +38,21 @@ def test_projection_retains_unstarted_sibling_and_true_failed_outcome():
     assert result['available'] is True
     assert result['waves'] == waves
     assert result['tasks'] == []
+
+
+def test_projection_keeps_effective_allocation_for_current_cli():
+    task = dict(task_id='runner', actor_allocation=3593, actor_union_seconds=3600,
+                remaining=dict(actor_seconds=0), accounting_state='complete')
+    result = inspection(dict(inspection=dict(tasks=[task], waves=[])))
+    assert result['tasks'][0]['actor_allocation'] == 3593
+    assert result['tasks'][0]['actor_union_seconds'] == 3600
+    assert result['tasks'][0]['remaining']['actor_seconds'] == 0
+
+
+def test_public_jobs_preserve_safe_resume_chain(execution):
+    app, client, _, _ = execution
+    app.config['TEST_JOB'] = dict(job_id='new', state='running', request=dict(
+        cycle_id='cycle', mode='phase1', action='resume', previous_job='old', provider='private'))
+    row = client.get('/api/rsi/jobs').json['jobs'][0]
+    assert row['previous_job'] == 'old'
+    assert 'provider' not in row
