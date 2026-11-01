@@ -155,6 +155,9 @@ def _baseline(root, config, store, needed):
         kdb = path(config.get('baseline_kdb', config.get('kdb')))
         if kdb.is_dir():
             kdb = kdb / config.get('kdb_filename', 'knowledge.sqlite3')
+        wal = Path(str(kdb) + '-wal')
+        if wal.exists() and wal.stat().st_size:
+            raise ValueError('baseline KDB has active WAL; finalize an immutable snapshot before admission')
         data = kdb.read_bytes()
         manifest = _json(root / 'instance.json')
         relative = str(kdb.relative_to(root)) if kdb.is_relative_to(root) else None

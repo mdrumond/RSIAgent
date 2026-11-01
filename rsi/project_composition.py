@@ -88,7 +88,8 @@ class ProjectComposition:
                 path = getattr(self, 'kdb_path', self.root / 'knowledge.sqlite3')
                 frozen_stat = getattr(self, 'kdb_stat', None)
                 if frozen_stat is not None and file_identity(path) != frozen_stat:
-                    raise ValueError('frozen KDB changed')
+                    # Linking another cycle changes ctime, not snapshot bytes.
+                    self.kdb_stat = verify_kdb(path, self.binding['kdb'])
                 if frozen_stat is None:
                     verify_kdb(path, self.binding['kdb'])
                 settings = dict(self.config.get('embeddings', {}))
