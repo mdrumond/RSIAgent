@@ -128,7 +128,7 @@ def test_actor_report_cannot_replace_a_tool_launch_receipt(tmp_path, monkeypatch
         SimpleNamespace(returncode=0,stdout=b'{"success":true}',stderr=b''))
     spec = {'path':str(tool),'sha256':hashlib.sha256(tool.read_bytes()).hexdigest(),'arguments':[]}
     with pytest.raises(ValueError, match='no trusted child launch receipt'):
-        owned_command(spec, {}, contract={})
+        owned_command(spec, {}, contract={'cases':[{'length':1,'block_count':1,'seed':17}]})
 
 
 @pytest.fixture
