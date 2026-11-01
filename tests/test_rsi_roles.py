@@ -160,7 +160,7 @@ def test_active_async_loop_rejected_before_dispatch():
     assert calls == []
 
 
-def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5):
+def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5, receipt_grace_seconds=2):
     """Use a real subprocess with scripted receipts, never the network."""
     import os
     import rsi.roles as module
@@ -177,7 +177,8 @@ def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5):
     adapter = module.IsolatedRoles(sys.executable, roles.profile,
         observer=lambda e, p: events.append((e, p)),
         environment={**os.environ, 'DEEPSEEK_API_KEY': 'test-only-secret',
-                     'OPENAI_API_KEY': 'must-not-inherit'}, setup_seconds=setup_seconds)
+                     'OPENAI_API_KEY': 'must-not-inherit'}, setup_seconds=setup_seconds,
+        receipt_grace_seconds=receipt_grace_seconds)
     return adapter, events, captured
 
 
@@ -418,3 +419,173 @@ def test_skillwriter_real_predict_accepts_typed_append_without_normalisation():
     assert len(calls) == 1
     emitted = [payload for event, payload in events if event == 'role_proposal']
     assert emitted[0]['proposal']['edits'] == [dict(skill='debug', operation='append', content='Retest cancellation.')]
+
+
+def test_isolated_finished_failure_retains_detail_scope_and_known_elapsed(monkeypatch):
+    import time
+    from rsi.roles import RoleFailure
+    detail = {'type': 'ValueError', 'message': 'negative_decisions[0].redirection is required'}
+    script = worker_script().replace("'success': True", "'success': False")
+    script = script.replace("'elapsed_seconds': 0.02}", "'elapsed_seconds': 0.02, 'error': " + repr(detail) + "}")
+    adapter, events, _ = isolated(monkeypatch, script)
+    with pytest.raises(RoleFailure) as error:
+        adapter.review('review', [AdmittedEvidence('run', {})], deadline=time.monotonic() + 5)
+    assert error.value.role == 'review'
+    assert error.value.error_type == detail['type']
+    assert error.value.message == detail['message']
+    finished = [payload for event, payload in events if event == 'role_finished']
+    assert len(finished) == 1 and finished[0]['elapsed_seconds'] == 0.02
+    assert finished[0]['error'] == detail
+    assert not any(event == 'accounting_incomplete' for event, _ in events)
+
+
+def test_isolated_legacy_failure_still_retains_elapsed(monkeypatch):
+    import time
+    adapter, events, _ = isolated(monkeypatch, worker_script().replace("'success': True", "'success': False"))
+    with pytest.raises(RuntimeError):
+        adapter.review('review', [], deadline=time.monotonic() + 5)
+    assert [payload['elapsed_seconds'] for event, payload in events if event == 'role_finished'] == [0.02]
+    assert not any(event == 'accounting_incomplete' for event, _ in events)
+
+
+def test_isolated_error_detail_is_bounded_and_selected_secret_redacted():
+    from rsi.roles import _error_details
+    from uuid import uuid4
+    secret = uuid4().hex
+    value = _error_details(ValueError('field: ' + secret + '🙂' * 3000), secret)
+    assert value['type'] == 'ValueError'
+    assert len(value['message'].encode()) <= 2048
+    assert secret not in json.dumps(value)
+
+
+
+def test_actual_typed_validation_emits_specific_finished_failure_detail():
+    from nooa.errors import GenerationError
+    payload = dict(rationale='Use retained guidance', evidence_ids=['query'],
+        proposal=dict(name='small', goal='goal', acceptance='oracle', template_id='cpu.case-subset',
+                      parameters={'case_indices': [0]}),
+        negative_decisions=[dict(query_ref='query', index=0, action='used', reason='Reuse')])
+    roles, calls, events, _ = make_roles([payload])
+    with pytest.raises(GenerationError) as error:
+        roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
+    finished = [value for event, value in events if event == 'role_finished']
+    assert len(calls) == 1 and len(finished) == 1
+    assert finished[0]['success'] is False and finished[0]['elapsed_seconds'] == 2
+    assert finished[0]['error']['type'] == type(error.value).__name__
+    assert finished[0]['error']['message'] == str(error.value)
+    assert not any(event == 'role_proposal' for event, _ in events)
+
+
+
+@pytest.mark.parametrize('finished', [True, False])
+def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monkeypatch, tmp_path, finished):
+    import time
+    from core.artifacts import ContentAddressedArtifacts
+    from rsi.contracts import ProjectSpec
+    from rsi.curriculum_research import Researcher, ResearchPending
+    script = worker_script().replace("'role': 'review'", "'role': request['role']")
+    if finished:
+        script = script.replace('time.sleep(0.02)', 'time.sleep(0.08)').replace(
+            "'elapsed_seconds': 0.02", "'elapsed_seconds': 0.08").replace("'success': True", "'success': False")
+    else:
+        script = script.split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    def query(*args, **kwargs):
+        return dict(results=[], negative_records=[], provenance={'source': 'retained docs'})
+    researcher = Researcher(adapter, query, store)
+    context = dict(operation_id='cutoff', root=tmp_path, deadline=time.monotonic() + .04, templates=[])
+    parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
+    if finished:
+        result = researcher.research(parent, {}, context)
+        assert result.proposal is None
+        receipt = store.read_json(result.receipt_ref)
+        query_seconds = sum(store.read_json(ref).get('payload', {}).get('elapsed_seconds', 0)
+            for ref in receipt['artifact_refs']
+            if store.read_json(ref).get('event') == 'research_query_finished')
+        assert result.actor_seconds == .08 + query_seconds
+        assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
+        assert not any(e == 'accounting_incomplete' for e, _ in events)
+    else:
+        with pytest.raises(ResearchPending) as error:
+            researcher.research(parent, {}, context)
+        assert error.value.actor_seconds is None
+        assert any(e == 'accounting_incomplete' and p['start_receipt_received'] for e, p in events)
+        assert not any(e == 'role_finished' for e, _ in events)
+    assert len(captured) == 1
+
+
+def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
+    import time
+    script = worker_script().split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, _ = isolated(monkeypatch, script, receipt_grace_seconds=2)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        adapter.review('review', [], deadline=started + .04, wall_deadline=started + .5)
+    assert time.monotonic() - started < 1.5
+    assert not any(e == 'role_finished' for e, _ in events)
+
+
+
+@pytest.mark.parametrize('action, fields', [('used', {'redirection': 'Isolate the documented case'}),
+    ('rejected', {}), ('rejected', {'redirection': None}), ('rejected', {'redirection': ''})])
+def test_diagnostic_provider_schema_and_typed_result_preserve_conditional_contract(action, fields):
+    import re
+    decision = dict(query_ref='query', index=0, action=action, reason='Observed applicability')
+    decision.update(fields)
+    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
+        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
+        negative_decisions=[decision])
+    roles, calls, events, _ = make_roles([payload])
+    result = roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
+    assert result.negative_decisions[0].action == action
+    assert result.negative_decisions[0].redirection == fields.get('redirection')
+    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
+    items = schema['properties']['negative_decisions']['items']
+    branches = {key: schema['$defs'][ref.rsplit('/', 1)[1]]
+                for key, ref in items['discriminator']['mapping'].items()}
+    used, rejected = branches['used'], branches['rejected']
+    assert 'redirection' in used['required']
+    field = used['properties']['redirection']
+    assert field['type'] == 'string' and field['minLength'] >= 1
+    assert re.search(field['pattern'], 'Use an isolated case')
+    assert re.search(field['pattern'], ' \t\n') is None
+    assert 'redirection' not in rejected['required']
+    assert {row.get('type') for row in rejected['properties']['redirection']['anyOf']} == {'string', 'null'}
+    assert len(calls) == 1
+    assert [p['success'] for e, p in events if e == 'role_finished'] == [True]
+
+
+@pytest.mark.parametrize('fields', [{}, {'redirection': None}, {'redirection': ''},
+                                    {'redirection': ' \t\n'}, {'redirection': 7}])
+def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
+    from nooa.errors import GenerationError
+    decision = dict(query_ref='query', index=0, action='used', reason='Observed applicability')
+    decision.update(fields)
+    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
+        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
+        negative_decisions=[decision])
+    roles, calls, events, _ = make_roles([payload])
+    with pytest.raises(GenerationError):
+        roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
+    assert len(calls) == 1
+    assert not any(event == 'role_proposal' for event, _ in events)
+    finished = [p for e, p in events if e == 'role_finished']
+    assert len(finished) == 1 and finished[0]['success'] is False
+    assert finished[0]['elapsed_seconds'] == 2 and finished[0]['error']
+
+
+def test_semantic_investigation_real_framework_needs_no_identifiers_or_ledger():
+    payload = dict(question='Which small input isolates the discrepancy?',
+                   goal='Distinguish input-dependent behavior', why='Observed mismatch requires isolation')
+    roles, calls, events, _ = make_roles([payload])
+    result = roles.investigation('Choose an investigation',
+        [AdmittedEvidence('host-owned', {'text': 'Retrieved fact', 'negative_records': [{'reason': 'Mismatch'}]})],
+        deadline=110)
+    from rsi.curriculum_research import InvestigationIdea
+    assert result == InvestigationIdea(**payload)
+    assert len(calls) == 1
+    assert next(p for e, p in events if e == 'role_started')['evidence'][0]['data']['text'] == 'Retrieved fact'
+    assert next(p for e, p in events if e == 'role_finished')['elapsed_seconds'] == 2
+    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
+    assert set(schema['properties']) == {'question', 'goal', 'why'}

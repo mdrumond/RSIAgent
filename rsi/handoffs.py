@@ -79,6 +79,8 @@ def _parent(root, store, expected=None, *, require_memory_boundary=True):
     with _locked(root):
         binding, state = _json(root / 'service.json'), _json(root / 'cycle.json')
         spec = CycleSpec.from_dict(binding['spec'])
+        if state.get('active_wave'):
+            raise ValueError('parent wave is unsettled or its publication requires reconciliation')
         if (expected is not None and spec.mode != expected) or spec.cycle_id != root.name:
             raise ValueError('parent cycle identity/mode differs')
         configuration = checked_snapshot(binding['config'])

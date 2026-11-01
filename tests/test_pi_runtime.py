@@ -330,7 +330,7 @@ def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete
         return stream('read_context', {'record': packet['context']['host']['guide']['record'],
                                       'offset': index*4096, 'limit': 4096}, index)
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    with session() as pi:
+    with session(request_bytes=49152) as pi:
         assert pi.next_action({'guide': guide}, ['write']) == ('write', {'source': 'bounded kernel'})
     assert len(requests) == 11
 
@@ -563,7 +563,7 @@ def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(mo
         return stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
                                           offset=index * 7400, limit=7400), index)
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    with session() as pi:
+    with session(request_bytes=49152) as pi:
         assert pi.next_action(context, ['write']) == ('write', {'source': 'selected after bounded paging'})
     assert len(requests) == 3
 

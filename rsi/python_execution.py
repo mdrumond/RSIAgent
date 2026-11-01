@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from typing import Protocol
 
 from core.artifacts import ContentAddressedArtifacts
@@ -56,7 +57,11 @@ def ingest_elapsed(clock, operation_id, receipt, *, observed_start, observed_end
     if (type(elapsed) not in (int, float) or not math.isfinite(elapsed)
             or elapsed < 0 or not all(math.isfinite(x) for x in (observed_start, observed_end))
             or observed_end > clock.clock() or observed_end < observed_start
-            or elapsed > observed_end - observed_start or category not in clock.BILLABLE):
+            # Epoch endpoints can round down a valid producer duration. Bound
+            # that loss by their float spacing and the authoritative interval cap.
+            or elapsed - (observed_end - observed_start)
+                > min(1e-6, math.ulp(observed_start) + math.ulp(observed_end))
+            or category not in clock.BILLABLE):
         clock.uncertainties[key] = {'error': 'invalid duration or envelope'}
         clock.save()
         raise WorkflowError('missing or invalid producer duration/observation envelope')
@@ -156,6 +161,21 @@ class _UnboundExecutor:
         raise WorkflowError('reopen snapshot with its trusted executor factory before execution')
 
 
+def reconcile_recorded(root, workflow, operation, *, executor_factory, observation_seconds=45.):
+    """Host-only maintenance of an existing task root, without loading its machinery.
+
+    Pass its persisted Workflow and trusted frozen executor factory. This observes
+    only the original command; it neither runs actors nor completes their stage.
+    """
+    backend = PythonExecution(root, workflow, executor_factory=executor_factory)
+    record = json.loads(backend._receipt_path(operation).read_text())
+    if record.get('status') == 'complete':
+        return backend.receipt(operation)
+    return backend.reconcile_target(operation, dict(operation_id=operation,
+        source_hash=record['source_hash'], controller_recorded=True),
+        observation_seconds=observation_seconds)
+
+
 class PythonExecution:
     """Task snapshot, CAS command receipts, exact-source edits and verification.
 
@@ -164,7 +184,8 @@ class PythonExecution:
     observed/reconciled by the owner and must never be dispatched again.
     """
 
-    def __init__(self, root, workflow=None, *, executor_factory=None):
+    def __init__(self, root, workflow=None, *, executor_factory=None, command_guard=None):
+        self.command_guard = command_guard
         self.root = Path(root).resolve()
         self.project = self.root / 'project'
         self.verifier = self.root / 'frozen' / 'verify.py'
@@ -503,6 +524,23 @@ class PythonExecution:
             elapsed = record['elapsed']
         else:
             try:
+                if self.command_guard is not None:
+                    request = CommandRequest(operation, command, tuple(argv), self.project, self.verifier,
+                        source_hash, contract['verifier'], category, profile_path if profile else None)
+                    try:
+                        record['guard_receipt'] = self.command_guard(request,
+                            remaining=lambda: min((x for x in self.workflow.remaining().values() if x is not None), default=None))
+                    except Exception as exc:
+                        if hasattr(exc, 'admission_receipt'):
+                            record['guard_receipt'] = exc.admission_receipt
+                            self._save(operation, record)
+                        raise
+                    self._save(operation, record)
+                    environment = getattr(self.command_guard, 'environment', None)
+                    if environment is not None:
+                        env = environment(request, inherited=env)
+                    if any(x is not None and x <= 0 for x in self.workflow.remaining().values()):
+                        raise WorkflowError('time budget exhausted during command admission')
                 process = subprocess.Popen(argv, cwd=self.project, env=env, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, start_new_session=True)
                 record['pid'] = process.pid
@@ -540,6 +578,14 @@ class PythonExecution:
                 record['elapsed'] = elapsed
                 self._save(operation, record)
                 self.workflow.accounting.reconcile(token, ended)
+        return self._finalize(record, stdout=stdout, stderr=stderr, returncode=returncode,
+                              timed_out=timed_out, elapsed=elapsed, interrupted=interrupted)
+
+    def _finalize(self, record, *, stdout, stderr, returncode, timed_out, elapsed, interrupted=None):
+        operation, command = record['operation_id'], record['command']
+        source_hash, numeric = record['source_hash'], record['numeric']
+        contract = self.store.read_json(self.manifest['contract'])
+        profile_path = self.root / 'receipts' / (digest(operation.encode()) + '.profile')
         current = self.project_hash()
         if digest(self.verifier.read_bytes()) != contract['verifier']:
             raise WorkflowError('frozen verifier changed during command; reconcile pending execution')
@@ -568,3 +614,148 @@ class PythonExecution:
         if interrupted is not None:
             raise interrupted
         return result
+
+    def _recorded_target_elapsed(self, record, timing):
+        """Verify the original closed controller phases, without placing a duration."""
+        clock = self.workflow.accounting
+        operation = record['operation_id']
+        if set(timing) != {'operation_id', 'source_hash', 'controller_recorded'}:
+            raise WorkflowError('recorded controller timing cannot be combined with timing claims')
+        measured = [record.get('elapsed'), record.get('observed_elapsed')]
+        # run() starts the first interval before _execute_target's monotonic
+        # observation begins; its measured prelude can exceed that span.
+        if any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in measured):
+            raise WorkflowError('original controller measurements required')
+        unknown = clock.uncertainties.get('executor:' + operation)
+        if (clock.unresolved or any(row[2] is None for row in clock.records.values())
+                or set(clock.uncertainties) - {'executor:' + operation}
+                or unknown is not None and unknown != dict(status='unknown',
+                    receipt=str(self._receipt_path(operation)))
+                or 'receipt:' + operation in clock.records or 'receipt:' + operation in clock.receipts):
+            raise WorkflowError('unresolved or conflicting controller accounting')
+        # _execute_target starts one interval, then closes/starts one per phase.
+        # JSON retains insertion order. Locate the original last token rather than
+        # including later reconciliation observations when this call is retried.
+        tokens = list(clock.records)
+        token = record.get('clock_token')
+        phases = [record['category']]
+        for observation in record.get('observations', []):
+            if observation.get('reconciliation'):
+                continue
+            phase = observation.get('phase')
+            if phase not in ('command', 'setup', 'transfer'):
+                raise WorkflowError('invalid retained controller phase')
+            phases.append(record['category'] if phase == 'command' else phase)
+        if token not in tokens or tokens.index(token) + 1 < len(phases):
+            raise WorkflowError('original closed controller token required')
+        end = tokens.index(token) + 1
+        rows = [clock.records[t] for t in tokens[end - len(phases):end]]
+        previous, charged = float('-inf'), 0.
+        for expected, (kind, start, stop) in zip(phases, rows):
+            if (kind != expected or any(type(x) not in (int, float) or not math.isfinite(x)
+                                        for x in (start, stop))
+                    or start < previous or stop < start or stop > clock.clock()):
+                raise WorkflowError('retained controller intervals do not match dispatch')
+            previous = stop
+            if kind in clock.BILLABLE:
+                charged += stop - start
+        if not math.isclose(charged, measured[0], rel_tol=0, abs_tol=1e-6):
+            raise WorkflowError('retained controller elapsed differs from phase ledger')
+        return measured[0]
+
+    def reconcile_target(self, operation, timing, *, observation_seconds=45.):
+        """Observe the original target command and finalize only verified timing.
+
+        timing is a trusted host receipt in the original controller clock domain,
+        never raw remote epoch arithmetic. Missing timing/closure stays pending.
+        This method calls executor.reconcile only; execute is never a fallback.
+        controller_recorded=True reuses verified original controller phase timing;
+        it cannot be combined with producer timing or interval closure claims.
+        The executor must prove original producer closure with recorded_closure
+        before that ledger ended; later completion cannot settle unmeasured work.
+        """
+        record = json.loads(self._receipt_path(operation).read_text())
+        if record['status'] == 'complete':
+            return self.receipt(operation)
+        if (self.executor is None or not callable(getattr(self.executor, 'reconcile', None))
+                or timing.get('operation_id') != operation or record.get('operation_id') != operation
+                or timing.get('source_hash') != record['source_hash']
+                or record.get('status') != 'pending'
+                or 'controller_recorded' in timing and timing['controller_recorded'] is not True
+                or type(observation_seconds) not in (int, float) or not math.isfinite(observation_seconds)
+                or observation_seconds <= 0):
+            raise WorkflowError('scoped authoritative timing and observation-capable executor required')
+        contract = self.store.read_json(self.manifest['contract'])
+        if digest(self.verifier.read_bytes()) != contract['verifier']:
+            raise WorkflowError('frozen verifier changed')
+        argv = [arg.replace('{verifier}', str(self.verifier)) for arg in contract['commands'][record['command']]]
+        profile_path = self.root / 'receipts' / (digest(operation.encode()) + '.profile')
+        if record['profiling']:
+            argv = [argv[0], '-m', 'cProfile', '-o', str(profile_path), *argv[1:]]
+        if (argv != record['argv'] or not self.workflow.pending
+                or record['stage_operation'] != self.workflow.pending['id']):
+            raise WorkflowError('pending target dispatch differs from frozen stage/command')
+        recorded = timing.get('controller_recorded') is True
+        if recorded:
+            if (record.get('executor_identity') != contract.get('executor_identity')
+                    or record.get('source_hash') != self.project_hash()
+                    or record.get('stage_source_hash') != self.workflow.source_hash
+                    or record['category'] != ('profiling' if record['profiling'] else
+                        'compilation' if record['command'] == 'compile' else 'execution')):
+                raise WorkflowError('recorded target identity differs from frozen dispatch')
+            self._recorded_target_elapsed(record, timing)
+        request = CommandRequest(operation, record['command'], tuple(argv), self.project, self.verifier,
+            record['source_hash'], contract['verifier'], record['category'],
+            profile_path if record['profiling'] else None)
+        clock = self.workflow.accounting
+        if recorded:
+            closure = getattr(self.executor, 'recorded_closure', None)
+            if (not callable(closure) or closure(request,
+                    ended_at=clock.records[record['clock_token']][2]) is not True):
+                raise WorkflowError('producer closure before original controller end is required')
+        deadline = time.monotonic() + observation_seconds
+        intervals, phase, start = [], record['category'], clock.now()
+        def observe(next_phase, **metadata):
+            nonlocal phase, start
+            if next_phase not in ('command', 'setup', 'transfer'):
+                raise ValueError('unknown executor observation phase')
+            ended = clock.now()
+            intervals.append([phase, start, ended])
+            phase, start = record['category'] if next_phase == 'command' else next_phase, ended
+            record.setdefault('observations', []).append(dict(phase=next_phase, reconciliation=True, **metadata))
+            self._save(operation, record)
+        try:
+            result = self.executor.reconcile(request, observe=observe,
+                remaining=lambda: max(0., deadline - time.monotonic()))
+        finally:
+            intervals.append([phase, start, clock.now()])
+            for index, interval in enumerate(intervals):
+                clock.records['observation:' + uuid.uuid4().hex + ':' + str(index)] = interval
+            clock.save()
+        if (not isinstance(result, CommandResult) or type(result.returncode) is not int
+                or not isinstance(result.stdout, bytes) or not isinstance(result.stderr, bytes)
+                or type(result.timed_out) is not bool):
+            raise WorkflowError('terminal target command observation required')
+        if recorded:
+            elapsed = self._recorded_target_elapsed(record, timing)
+            clock.uncertainties.pop('executor:' + operation, None)
+            clock.save()
+            clock.seconds()
+            return self._finalize(record, stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode, timed_out=result.timed_out, elapsed=elapsed)
+        for token, ended_at in timing.get('closed_intervals', {}).items():
+            if token != record['clock_token']:
+                raise WorkflowError('target observation cannot close unrelated actor intervals')
+            if token in clock.unresolved:
+                clock.reconcile(token, ended_at)
+            elif clock.records[token][2] != ended_at:
+                raise WorkflowError('retained target interval differs from authoritative closure')
+        ingest_elapsed(clock, operation, timing['producer'],
+            observed_start=timing['observed_start'], observed_end=timing['observed_end'],
+            observed_execution_start=timing['execution_start'], observed_execution_end=timing['execution_end'],
+            category=record['category'])
+        clock.uncertainties.pop('executor:' + operation, None)
+        clock.save()
+        clock.seconds()  # Unrelated unknown work cannot be silently discarded.
+        return self._finalize(record, stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, timed_out=result.timed_out, elapsed=timing['producer']['elapsed'])

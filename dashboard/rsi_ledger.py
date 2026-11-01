@@ -42,6 +42,7 @@ def task_inspection(task):
 
 def inspection(value):
     supplied = value.get('inspection')
+    waves = supplied.get('waves', []) if isinstance(supplied, dict) else []
     tasks = supplied.get('tasks', []) if isinstance(supplied, dict) else []
     if not tasks:
         latest = {}
@@ -51,5 +52,8 @@ def inspection(value):
                 latest[event['task_id']] = event
         tasks = list(latest.values())
     if not tasks:
+        if waves:
+            return {'available': True, 'tasks': [], 'waves': waves}
         return {'available': False, 'reason': 'No authoritative task time/skill snapshots in CLI evidence.'}
-    return {'available': True, 'tasks': [task_inspection(task) for task in tasks if isinstance(task, dict)]}
+    return {'available': True, 'tasks': [task_inspection(task) for task in tasks if isinstance(task, dict)],
+            'waves': waves}

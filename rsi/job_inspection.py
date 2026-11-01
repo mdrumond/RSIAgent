@@ -24,6 +24,8 @@ def inspect_task(path, *, clock=time.time):
     except WorkflowError:
         condition = 'uncertain' if not accounting.unresolved else condition
     cap = state['limits']['actor_seconds']
+    if cap is not None:
+        cap += sum(row['seconds'] for row in state.get('actor_grants', {}).values())
     if cap is None:
         remaining['actor_seconds'] = None
     elif union is not None:
@@ -76,6 +78,8 @@ def inspect_cycle(instance, request):
         task['task_id'] = str(Path(folder).relative_to(cycle))
         tasks.append(task)
     result = {'tasks': tasks}
+    from .wave_inspection import inspect_waves
+    result['waves'] = inspect_waves(cycle)
     learning_path = cycle / 'learning.json'
     for name in ('cycle.json', 'learning.json'):
         path = cycle / name if name == 'cycle.json' else learning_path

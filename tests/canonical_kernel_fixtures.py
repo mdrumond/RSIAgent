@@ -123,6 +123,8 @@ def canonical_kernel(tmp_path, monkeypatch):
         state.profile = direct_profile(next(model for model in MODEL_IDENTITIES
             if model.backend_model.value == 'deepseek-flash'))
         class Adapter(native_adapter):
+            def __init__(self, **kwargs):
+                super().__init__(context_window=16384, request_bytes=49152, **kwargs)
             def prepare(self, timeout, *, schemas):
                 state.session.prepare(timeout, schemas=schemas)
                 return super().prepare(timeout, schemas=schemas)

@@ -14,12 +14,20 @@ def register(commands):
         start = actions.add_parser('start')
         start.add_argument('--cycle', default=None)
         _inheritance_flags(start)
+        if mode == 'phase1':
+            start.add_argument('--failed-parent-ref', action='append', default=[])
+            start.add_argument('--curriculum-only', action='store_true')
         if mode == 'inference':
             start.add_argument('--project', type=Path, required=True)
             start.add_argument('--no-recovery', action='store_true')
-        for action in ('stop', 'resume', 'revisit', 'adopt'):
+        for action in ('stop', 'resume', 'revisit', 'adopt', 'reconcile', 'recover'):
             entry = actions.add_parser(action)
             entry.add_argument('--job', required=True)
+            if action == 'resume' and mode == 'phase1':
+                entry.add_argument('--reopen-project', action='append', default=[])
+            if action in ('reconcile', 'recover'):
+                entry.add_argument('--operation')
+                entry.add_argument('--observation', type=Path)
             if action == 'revisit':
                 entry.add_argument('--cycle', required=True)
                 _inheritance_flags(entry)
@@ -59,6 +67,9 @@ def execute(args):
     if args.action == 'start':
         request = {'action': 'start', 'mode': args.command,
                    'cycle_id': args.cycle or str(uuid.uuid4())}
+        if args.command == 'phase1':
+            request.update(failed_parent_refs=getattr(args, 'failed_parent_ref', []),
+                           curriculum_only=getattr(args, 'curriculum_only', False))
         if args.command == 'inference':
             request['projects'] = [ProjectSpec.from_dict(
                 json.loads(args.project.read_text())).to_dict()]
@@ -70,6 +81,15 @@ def execute(args):
         if args.action == 'stop':
             return jobs.stop(args.instance, args.job)
         request = dict(previous['request'], action=args.action, previous_job=args.job)
+        if args.action == 'resume':
+            request.pop('reopen_projects', None)
+            if getattr(args, 'reopen_project', []):
+                request['reopen_projects'] = list(args.reopen_project)
+        if args.action in ('reconcile', 'recover'):
+            request['operation_id'] = args.operation
+            request['observation'] = json.loads(args.observation.read_text()) if args.observation else None
+            if args.action == 'recover' and (not args.operation or not request['observation']):
+                raise ValueError('harness recovery requires a retained operation and host observation')
         if args.action == 'resume' and previous['request'].get(
                 'origin_action', previous['request'].get('action')) == 'tune':
             request['origin_action'] = 'tune'

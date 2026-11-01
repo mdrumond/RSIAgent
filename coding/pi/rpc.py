@@ -19,6 +19,10 @@ class PiProviderError(PiError):
     pass
 
 
+class PiCompactionError(PiProviderError):
+    """Native compaction settled without resolving a provider context overflow."""
+
+
 class PiDeadlineError(PiError, TimeoutError):
     pass
 
@@ -66,6 +70,7 @@ class PiRPC:
         deadline = time.monotonic() + self.timeout
         accepted = settled = False
         failure = None
+        context_overflow = failed_overflow_compaction = False
         while not (accepted and settled):
             if pump is not None:
                 pump()
@@ -103,11 +108,21 @@ class PiRPC:
                 if msg.get("role") == "assistant":
                     stop = msg.get("stopReason")
                     failure = (PiCancelled if stop == "aborted" else PiProviderError) if stop in ("error", "aborted") else None
+                    context_overflow = bool(stop == 'error' and
+                        'context_length_exceeded' in msg.get('errorMessage', ''))
+            if event.get('type') == 'compaction_end':
+                if (event.get('reason') == 'overflow' and event.get('willRetry') is False
+                        and (event.get('aborted') or event.get('errorMessage'))):
+                    failed_overflow_compaction = True
+                elif event.get('result'):
+                    failed_overflow_compaction = False
             if event.get("type") == "agent_settled":
                 settled = True
                 if event.get("aborted"):
                     failure = PiCancelled
         if failure:
+            if failure is PiProviderError and context_overflow and failed_overflow_compaction:
+                raise PiCompactionError('Pi settled after context overflow and unsuccessful native compaction')
             raise failure("Pi provider request failed or was aborted")
         return self.events
 

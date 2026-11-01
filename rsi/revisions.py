@@ -72,6 +72,8 @@ def recover(root, store, *, locked=False):
 def adopt(cycle, snapshot):
     snapshot = checked(snapshot)
     scheduler, state = cycle.scheduler, cycle.scheduler.state
+    if state.get('active_wave'):
+        raise ValueError('configuration adoption requires a completed wave publication boundary')
     if state['pending'] or cycle.controller.state['pending'] or cycle.tuning.state['pending'] or state['phase'] not in ('original', 'complete'):
         raise ValueError('configuration adoption requires an idle task/wave boundary')
     if any('result' not in op for op in cycle.learning.state['operations'].values()):

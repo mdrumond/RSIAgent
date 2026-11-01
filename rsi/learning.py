@@ -225,6 +225,19 @@ class Learning:
         cached = self._begin(identity, request)
         if cached is not None:
             return SnapshotUpdate(**cached)
+        return self._apply_memory(identity, request)
+
+    def reconcile_memory(self, identity):
+        """Repair the same local deterministic admission, never a provider call."""
+        operation = self.state['operations'][identity]
+        if operation['request']['kind'] != 'memory':
+            raise ValueError('only retained local memory admissions can be reconciled here')
+        if 'result' in operation:
+            return SnapshotUpdate(**operation['result'])
+        return self._apply_memory(identity, operation['request'])
+
+    def _apply_memory(self, identity, request):
+        baseline, results = request['baseline'], request['results']
         self.store.read_bytes(baseline)
         for row in results:
             packet = self._packet(row)
@@ -239,7 +252,7 @@ class Learning:
                 proposal['observations'] = packet['observations']
             self.memory.accept(identity + ':' + project, proposal,
                 dict(packet=packet_ref, baseline=baseline, queries=packet['queries'], raw_refs=packet['raw_refs']))
-            if not ctx.get('recovery'):
+            if not request['recovery']:
                 # Unique originals, not calls or recoveries, determine exposure age.
                 self.state['projects'].setdefault(project, packet_ref)
         reference = self.store.put_bytes(self.memory.snapshot())

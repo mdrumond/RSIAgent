@@ -10,9 +10,12 @@
 <form id="phase-form" class="control-panel"><fieldset {% if not enabled %}disabled{% endif %}>
 <legend>Phase or inference project</legend>
 <label>Mode<select name="mode"><option>phase1</option><option>phase2</option><option>inference</option></select></label>
-<label>Operation<select name="operation"><option>start</option><option>stop</option><option>resume</option><option>revisit</option><option>adopt</option></select></label>
+<label>Operation<select name="operation"><option>start</option><option>stop</option><option>resume</option><option>revisit</option><option>adopt</option>{% if capabilities.wave_reconciliation %}<option>reconcile</option>{% endif %}{% if capabilities.harness_recovery %}<option value="recover">Authorize harness recovery</option>{% endif %}</select></label>
 <label>Retained job<select name="job_id" id="retained-job"><option value="">Select a job for stop, resume or revisit</option></select></label>
 <label>Cycle identity (optional for start; new identity required for revisit)<input name="cycle_id"></label>
+<label>Retained project operation (reconcile/recovery)<input name="operation_id"></label>
+<label>Host closure/timing observation JSON (optional for reconcile)<textarea name="observation" rows="4" spellcheck="false"></textarea></label>
+<p>Wave stop stops admission and drains owned children. Draining and work that requires observation remain visible per project. A settled failed attempt is retained as failure evidence. Recovery observes original handles first; the harness grant adds 7200 seconds once and preserves consumed time. Configured project recovery remains a separate controller operation.</p>
 <fieldset id="inheritance-fields"><legend>Starting inputs (start and revisit only)</legend>
 <label>Parent cycle, optional<input name="from_cycle"></label>
 <label>Inheritance policy<select name="inheritance"><option value="">CLI default (revisit preserves accepted parent)</option><option value="auto">Automatic accepted parent selection</option><option value="parent">Require accepted parent</option><option value="baseline">Use configured baselines</option></select></label>

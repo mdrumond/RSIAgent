@@ -61,6 +61,33 @@ def validate_configuration(payload):
             _reference(payload[name], name)
     if 'budgets' in payload:
         BudgetLimits.from_dict(payload['budgets'])
+    if payload.get('project_wave') is not None:
+        wave = payload['project_wave']
+        _object(wave, 'project_wave')
+        if set(wave) - {'max_parallel', 'devices', 'wave_size'}:
+            raise ValueError('unknown project_wave setting')
+        devices = wave.get('devices')
+        if not isinstance(devices, list) or not devices:
+            raise ValueError('project_wave requires admitted device bindings')
+        for device in devices:
+            _object(device, 'wave device')
+            if set(device) - {'device', 'executor_identity', 'worker_profile'}:
+                raise ValueError('wave devices contain identities, never machine profiles')
+            _reference(device.get('device'), 'physical device identity')
+            if device.get('executor_identity') is not None:
+                _reference(device['executor_identity'], 'executor_identity')
+            if device.get('worker_profile') is not None:
+                _reference(device['worker_profile'], 'worker_profile')
+                if device.get('executor_identity') not in (None, device['worker_profile']):
+                    raise ValueError('target executor profile must also own its worker admission')
+        if len({d['device'] for d in devices}) != len(devices):
+            raise ValueError('wave device leases must be unique')
+        parallel = wave.get('max_parallel')
+        if type(parallel) is not int or not 1 <= parallel <= len(devices):
+            raise ValueError('max_parallel must fit admitted device bindings')
+        size = wave.get('wave_size', parallel)
+        if type(size) is not int or size < 1:
+            raise ValueError('wave_size must be a positive workload size')
     for name in ('phase1_projects', 'phase2_projects'):
         if name not in payload:
             continue
@@ -70,9 +97,24 @@ def validate_configuration(payload):
         parsed = [ProjectSpec.from_dict(project) for project in projects]
         if len({project.project_id for project in parsed}) != len(parsed):
             raise ValueError(f'{name}: project IDs must be unique')
-    for name in ('prompts', 'provider', 'roles', 'recovery', 'tuning', 'dashboard'):
+    for name in ('prompts', 'provider', 'roles', 'recovery', 'tuning', 'dashboard', 'curriculum'):
         if name in payload:
             _object(payload[name], name)
+    failed_limit = payload.get('recovery', {}).get('max_failed_attempts', 5)
+    if type(failed_limit) is not int or failed_limit <= 0:
+        raise ValueError('recovery.max_failed_attempts must be a positive integer')
+    curriculum = payload.get('curriculum', {})
+    if 'enabled' in curriculum and type(curriculum['enabled']) is not bool:
+        raise ValueError('curriculum.enabled must be boolean')
+    if curriculum.get('enabled'):
+        for name in ('actor_seconds', 'recovery_seconds'):
+            value = payload.get('cycle_limits', {}).get(name)
+            if type(value) not in (int, float) or not 0 < value < float('inf'):
+                raise ValueError('autonomous curriculum requires finite positive cycle_limits.' + name)
+    if 'project_actor_seconds' in curriculum:
+        value = curriculum['project_actor_seconds']
+        if type(value) not in (int, float) or not 0 < value < float('inf'):
+            raise ValueError('curriculum.project_actor_seconds must be finite and positive')
     for name in ('curriculum', 'actor', 'waves', 'skillwriter'):
         prompts = payload.get('prompts', {})
         if name in prompts and not isinstance(prompts[name], str):
@@ -114,7 +156,7 @@ def _defaults(bootstrap):
         'prompts': {'curriculum': '', 'actor': '', 'waves': '', 'skillwriter': ''},
         'provider': {'profile_id': 'deepseek-flash-native-v1', 'model': 'deepseek-flash'},
         'roles': {}, 'roles_python': None, 'budgets': BudgetLimits().to_dict(),
-        'recovery': {'enabled': True},
+        'recovery': {'enabled': True, 'max_failed_attempts': 5},
         'tuning': {'every_projects': 5, 'at_wave_end': True,
                    'heldout_projects': 5, 'runs_per_arm': 2},
         'browser_roots': ['.'], **bootstrap,

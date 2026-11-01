@@ -2,7 +2,8 @@
 
 Configuration uses project_configs[project_id] = ProjectConfig wire data and
 kdb_collections = [collection names]. Paths are resolved from the instance.
-ProjectSpec.command equals commands.test. Global budgets cap per-project budgets.
+ProjectSpec.command equals commands.test. Serial budgets cap per-project budgets.
+Opt-in waves preserve each project's actor allocation, defaulting to7200 when unset.
 Starting folders are copied by ProjectRunner at admission; existing contracts
 never re-read their original folders. New configuration revisions require an
 explicit task-boundary adoption; active and historical contracts remain frozen.
@@ -19,23 +20,20 @@ import time
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.subject_memory import SubjectMemory, digest as memory_digest
-from rsi.actor import PiSessionAdapter
 from rsi.configuration import _snapshot, show_configuration
 from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec, Stage
 from rsi.cycles import CycleScheduler, HostTaskResult
 from rsi.learning import Learning, ProposalRejected, RejectedOperation, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
+from rsi.project_composition import ProjectComposition
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
 from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
 from rsi.skills import SkillBundle
-from rsi.strategy import knowledge_db_query
 from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.service_tuning import TuningBindings
-from rsi.instance_ingestion import load_ingestion_records
-from rsi.evidence_io import _references
 from rsi.observations import capture as capture_observations
 from rsi.handoffs import capture_parent
 from rsi.evaluation import SkillEvaluation, TuningController, case_identity
@@ -57,10 +55,14 @@ class TestBindings:
 
 
 class InstanceServices:
-    def __init__(self, instance, *, environment=None, test_bindings=None):
+    def __init__(self, instance, *, environment=None, test_bindings=None, executor_factory=None,
+                 curriculum_researcher=None, curriculum_materializer=None):
         self.root = Path(instance).resolve(strict=True)
         self.environment = dict(os.environ if environment is None else environment)
         self.test = test_bindings
+        self.executor_factory = executor_factory
+        self.curriculum_researcher = curriculum_researcher
+        self.curriculum_materializer = curriculum_materializer
         if test_bindings is not None and not isinstance(test_bindings, TestBindings):
             raise TypeError('explicit TestBindings required')
         self.store = ContentAddressedArtifacts(self.root / 'artifacts')
@@ -79,7 +81,7 @@ class InstanceServices:
         return path.absolute()
 
     def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None,
-                     from_cycle=None, inheritance='auto', input_overrides=()):
+                     from_cycle=None, inheritance='auto', input_overrides=(), failed_parent_refs=(), curriculum_only=False):
         created = time.time()
         mode = Mode(mode)
         input_overrides = tuple(input_overrides)
@@ -90,12 +92,20 @@ class InstanceServices:
             raise FileExistsError(root)
         snapshot = revisions.checked(configuration) if configuration is not None else show_configuration(self.root)
         config = snapshot['payload']
+        curriculum_only = curriculum_only or config.get('curriculum', {}).get('only_derived', False)
+        failed_parent_refs = tuple(failed_parent_refs or config.get('curriculum', {}).get('failed_parent_refs', ()))
+        if (curriculum_only or failed_parent_refs) and (
+                mode != Mode.PHASE1 or config.get('curriculum', {}).get('enabled') is not True):
+            raise ValueError('failed-parent admission requires configured autonomous Phase1')
         projects = revisions.projects(config, mode, projects)
+        if not projects and curriculum_only:
+            projects = tuple(ProjectSpec.from_dict(self.store.read_json(ref)['project']) for ref in failed_parent_refs)
         if not projects:
             raise ValueError('cycle requires explicit curriculum projects')
         # Validate every configured host command before publishing the cycle.
-        for spec in projects:
-            self.project_config(config, spec)
+        if not curriculum_only:
+            for spec in projects:
+                self.project_config(config, spec)
         with self.setup.measure('accepted-input-capture', cycle_id):
             parent = capture_parent(self.root, mode, from_cycle, inheritance=inheritance,
                                     overrides=input_overrides, configuration=snapshot)
@@ -142,6 +152,7 @@ class InstanceServices:
             kdb=parent.kdb_ref, initial=initial.decode(), recover=recover, created=created,
             requested_configuration_ref=requested_config, input_handoff=asdict(parent),
             input_policy=dict(inheritance=inheritance, overrides=list(input_overrides), from_cycle=from_cycle),
+            failed_parent_refs=list(failed_parent_refs), curriculum_only=curriculum_only,
             test_identity=self.test.identity if self.test else None))
         return self.open_cycle(cycle_id)
 
@@ -196,11 +207,18 @@ class InstanceServices:
 
     def status(self, cycle_id):
         root = self.root / 'runs' / _name(cycle_id)
-        return {name: json.loads((root / name).read_text()) if (root / name).exists() else None
+        result = {name: json.loads((root / name).read_text()) if (root / name).exists() else None
                 for name in ('service.json', 'cycle.json', 'controller.json', 'learning.json', 'tuning.json', 'revision.pending.json')}
+        from rsi.wave_inspection import inspect_waves
+        result['waves'] = inspect_waves(root)
+        return result
 
 
-class BoundCycle(TuningBindings):
+class BoundCycle(ProjectComposition, TuningBindings):
+    @property
+    def runner_class(self):
+        return ProjectRunner  # Preserve the existing host runner/clock injection boundary.
+
     def __init__(self, services, root):
         self.services, self.root, self.store = services, root, services.store
         revisions.recover(root, self.store)
@@ -225,7 +243,19 @@ class BoundCycle(TuningBindings):
         if state.get('isolation'):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
-        policy = self.config.get('cycle_limits', {})
+        policy = dict(self.config.get('cycle_limits', {}))
+        from rsi.phase1_recovery import Phase1Recovery, configured
+        self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
+        if self.curriculum:
+            allowance = policy.get('recovery_seconds')
+            if type(allowance) not in (int, float) or not 0 < allowance < float('inf'):
+                raise ValueError('autonomous curriculum requires an explicit finite recovery_seconds pool')
+            policy['recovery_limit'] = None
+            policy['recovery_feedback'] = True
+            policy['retry_original'] = self.curriculum.original_retry
+            policy['max_failed_recovery_attempts'] = self.config.get('recovery', {}).get('max_failed_attempts', 5)
+        if self.config.get('project_wave'):
+            policy.setdefault('recovery_limit', None)
         first_clock = not state_path.exists()
         def cycle_clock():
             nonlocal first_clock
@@ -236,8 +266,9 @@ class BoundCycle(TuningBindings):
         self.scheduler = CycleScheduler(state_path, self.spec, self.run,
             lambda *args: self.learning.memory_update(*args),
             skill_update=self.write_skills, isolate=self.isolate,
+            simplify=self.curriculum.simplify if self.curriculum else None,
             recover=self.binding.get('recover') if self.binding.get('recover') is not None else
-                self.config.get('recovery', {}).get('enabled', True),
+                True if self.curriculum else self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
         try:
             with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
@@ -253,12 +284,28 @@ class BoundCycle(TuningBindings):
             self.learning, artifacts=self.store, pair_factory=self.pair)
         self.tuning = TuningController(root / 'tuning.json', self.controller,
                                        evaluation_factory=self.evaluation)
+        self.waves = None
+        if self.config.get('project_wave'):
+            from rsi.service_wave import WaveBindings
+            self.waves = WaveBindings(self)
+        if self.curriculum:
+            self.curriculum.seed(self.binding.get('failed_parent_refs') or self.config['curriculum'].get('failed_parent_refs', ()),
+                only_derived=self.binding.get('curriculum_only', False) or self.config['curriculum'].get('only_derived', False))
 
     def make_learning(self, path):
         return Learning(path, self.store, self.memory, self, load_project=self.load_project,
             validate=self.validate, mode=self.spec.mode.value,
             role_elapsed=self.role_elapsed,
             unused_window=self.config.get('learning', {}).get('unused_window', 10))
+
+    def project_config(self, spec):
+        return self.curriculum.project_config(spec) if self.curriculum else self.services.project_config(self.config, spec)
+
+    def project_executor_factory(self, spec):
+        return self.curriculum.executor_factory(spec) if self.curriculum else self.services.executor_factory
+
+    def project_configuration(self, spec):
+        return self.curriculum.configuration_ref(spec) if self.curriculum else self.spec.configuration_ref
 
     def observe_role(self, event, payload):
         if event == 'role_started' and self.role_setup_started is not None:
@@ -360,156 +407,21 @@ class BoundCycle(TuningBindings):
         finally:
             self.role_operation = None
 
-    def ingestion_evidence(self):
-        refs = self.config.get('kdb_ingestion_refs', [])
-        evidence = load_ingestion_records(self.store, refs)
-        previous = None
-        for i, reference in enumerate(refs):
-            receipt = self.store.read_json(reference)
-            if not self.services.test and receipt.get('test_backend') is not False:
-                raise ValueError('production query requires production ingestion provenance')
-            if (receipt.get('previous_ingestion_refs') != refs[:i]
-                    or previous is not None and receipt.get('previous_kdb_sha256') != previous
-                    or receipt['manifest'].get('collection') not in self.config.get('kdb_collections', [])):
-                raise ValueError('ingestion chain differs from frozen KDB configuration')
-            if self.database is not None and json.loads(self.database.manifest(
-                    receipt['manifest']['collection']).to_json()) != receipt['manifest']:
-                raise ValueError('ingestion source manifest differs from frozen KDB')
-            previous = receipt.get('kdb_sha256')
-        if refs and previous != self.config.get('kdb_sha256'):
-            raise ValueError('ingestion baseline checksum differs from frozen configuration')
-        return evidence
-
-    def query(self, memory_ref):
-        snapshot = self.store.read_json(memory_ref)
-        if snapshot.get('schema') != 'subject-memory-snapshot-v1':
-            raise ValueError('accepted memory snapshot required')
-        ingestion = self.ingestion_evidence()  # CAS/schema/source binding, never an external store.
-        records = snapshot['memories']
-        positives, negatives = [], []
-        for record in records:
-            reference = record.get('provenance', {}).get('packet')
-            packet = self.store.read_json(reference) if reference else {}
-            observations = record['proposal'].get('observations', packet.get('observations'))
-            observation_ref = record['proposal'].get('observations_ref', packet.get('observations_ref'))
-            if observation_ref and self.store.read_json(observation_ref) != observations:
-                raise ValueError('accepted memory observation reference differs from retained facts')
-            if observations is not None and packet.get('observations') not in (None, observations):
-                raise ValueError('accepted observations differ from admitted host packet')
-            metadata = dict(record, proposal={k: v for k, v in record['proposal'].items()
-                if k not in ('observations', 'observations_ref')})
-            if record['proposal']['kind'] == 'correctness':
-                positives.append(dict(memory=metadata, observations=observations,
-                    provenance=dict(snapshot=memory_ref, packet=reference, observations=observation_ref)))
-            else:
-                row = dict(metadata, observations=observations, observations_ref=observation_ref)
-                if packet:
-                    row['observed_evidence'] = packet['evidence']
-                negatives.append(row)
-        if self.services.test:
-            adapter = self.services.test.query
-        else:
-            if self.database is None:
-                from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
-                from benchmarks.a5kernels.knowledge import KnowledgeDB
-                path = self.root / 'knowledge.sqlite3'
-                if hashlib.sha256(path.read_bytes()).hexdigest() != self.binding['kdb']:
-                    raise ValueError('frozen KDB changed')
-                settings = dict(self.config.get('embeddings', {}))
-                if settings.get('cache_dir'):
-                    settings['cache_dir'] = self.services.path(settings['cache_dir'])
-                embeddings = PinnedBGEEmbeddings(**settings)
-                with self.services.setup.measure('bge-dependency-model-load', self.spec.cycle_id):
-                    embeddings._load()
-                self.database = KnowledgeDB.open_read_only(path, embeddings)
-            self.ingestion_evidence()  # Authenticate each indexed source manifest as well.
-            adapter = knowledge_db_query(self.database, tuple(self.config['kdb_collections']),
-                                         negative_query=lambda _: [])
-        def query(payload):
-            result = json.loads(json.dumps(adapter(payload), allow_nan=False))
-            result['negative_records'].extend([*negatives, *ingestion['negative_records']])
-            result['results'].extend(positives)
-            result['provenance'].update(memory_snapshot=memory_ref,
-                                        ingestions=ingestion['provenance'])
-            return result
-        return query
-
-    def runner(self, root, *, spec=None, bundle=None, config=None, memory_ref,
-               backend_identity, reopen=False, configuration_ref=None):
-        admitted_at = time.time()
-        configuration_ref = configuration_ref or self.spec.configuration_ref
-        frozen_config = self.store.read_json(configuration_ref)['payload']
-        provider = frozen_config['provider']
-        if not self.services.test:
-            from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-            from benchmarks.a5kernels.phase1_provider import direct_profile
-            profiles = [direct_profile(i) for i in MODEL_IDENTITIES if i.profile_id == provider['profile_id']]
-            if len(profiles) != 1 or profiles[0].model != provider['model']:
-                raise ValueError('registered actor model/profile mismatch')
-        def session():
-            with self.services.setup.measure('actor-dependency-factory', str(root)):
-                adapter = (self.services.test.session_factory() if self.services.test else
-                    PiSessionAdapter(model=provider['model'], environ=self.services.environment))
-            prepare = adapter.prepare
-            def ready(*args, **kwargs):
-                with self.services.setup.measure('actor-process-readiness', str(root)):
-                    return prepare(*args, **kwargs)
-            adapter.prepare = ready
-            return adapter
-        injections = dict(query=self.query(memory_ref), backend_identity=backend_identity,
-                          session_factory=session, test_backend=self.services.test is not None)
-        if not reopen:
-            first = True
-            def clock():
-                nonlocal first
-                if first:
-                    first = False
-                    return admitted_at
-                return time.time()
-            injections['clock'] = clock
-        with self.services.setup.measure('project-open' if reopen else 'project-snapshot-copy-and-bind', str(root)):
-            runner = ProjectRunner(root, **injections) if reopen else ProjectRunner.create(
-                root, spec, bundle, config, **injections)
-            # Reuse export's reference contract to retain the query's artifact closure.
-            pending = [*frozen_config.get('kdb_ingestion_refs', []), memory_ref, configuration_ref]
-            for record in self.store.read_json(memory_ref)['memories']:
-                if record['proposal'].get('observations_ref'):
-                    pending.append(record['proposal']['observations_ref'])
-                packet_ref = record.get('provenance', {}).get('packet')
-                if packet_ref:
-                    packet = self.store.read_json(packet_ref)
-                    pending.extend(packet.get('observations', {}).get('artifact_refs', []))
-                    if packet.get('observations_ref'):
-                        pending.append(packet['observations_ref'])
-            copied = set()
-            while pending:
-                reference = pending.pop()
-                if reference in copied:
-                    continue
-                data = self.store.read_bytes(reference)
-                runner.store.put_bytes(data)
-                copied.add(reference)
-                try:
-                    value = json.loads(data)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                pending.extend(_references(value))
-        context = runner.context
-        runner.context = lambda: dict(context(), user_guidance=frozen_config.get('prompts', {}),
-                                      configuration_ref=configuration_ref)
-        return runner
-
     def run(self, spec, memory_ref, skills_ref, context):
+        if self.waves:
+            return self.waves.run(spec, context)
         operation = _name(context['operation_id'])
         root = self.root / 'projects' / operation
         if root.exists():
             raise ValueError('existing admitted operation requires reconciliation')
-        binding = dict(memory=memory_ref, skills=skills_ref, configuration=self.spec.configuration_ref,
+        binding = dict(memory=memory_ref, skills=skills_ref, configuration=self.project_configuration(spec),
                        kdb=self.binding['kdb'], provider=self.config['provider'],
                        test_identity=self.binding['test_identity'], actor_seconds_baseline=0.0)
         backend = self.store.put_json(binding)
+        overrides = dict(configuration_ref=binding['configuration'],
+                         executor_factory=self.project_executor_factory(spec)) if self.curriculum else {}
         runner = self.runner(root, spec=spec, bundle=SkillBundle.from_dict(self.store.read_json(skills_ref)),
-            config=self.services.project_config(self.config, spec), memory_ref=memory_ref, backend_identity=backend)
+            config=self.project_config(spec), memory_ref=memory_ref, backend_identity=backend, **overrides)
         atomic_json(root / 'training-identity.json', case_identity(runner))
         atomic_json(root / 'service-binding.json', binding)
         result = self.execute(runner)
@@ -517,7 +429,7 @@ class BoundCycle(TuningBindings):
 
     def finish_project(self, runner, operation, result, original_id=None):
         pending = self.scheduler.state['pending']
-        if not pending or pending['id'] != operation or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['id'] != operation or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('no matching scheduler admission')
         original_id = original_id or pending['original_id']
         outcome, failure = result['status'], None
@@ -528,7 +440,8 @@ class BoundCycle(TuningBindings):
             except WorkflowError:
                 pass  # Unknown effects remain suspended; no fabricated closure.
         self.retain(runner)
-        baseline = json.loads((runner.root / 'service-binding.json').read_text()).get('actor_seconds_baseline', 0.0)
+        service_binding = json.loads((runner.root / 'service-binding.json').read_text())
+        baseline = service_binding.get('actor_seconds_baseline', 0.0)
         total = runner.workflow.accounting.seconds()
         if type(baseline) not in (int, float) or not 0 <= baseline <= total:
             raise ValueError('invalid previously charged actor baseline')
@@ -539,6 +452,10 @@ class BoundCycle(TuningBindings):
             failure_proof_ref=proof_ref, actor_seconds_total=total,
             actor_seconds_baseline=baseline, actor_seconds_delta=delta,
             workflow_valid=False if failure else runner.workflow.outcome == 'accepted')
+        if service_binding.get('resolved_binding_ref'):
+            resolved = runner.store.read_json(service_binding['resolved_binding_ref'])
+            packet.update(resolved_binding_ref=service_binding['resolved_binding_ref'],
+                          logical_case_identity=resolved['evidence']['logical_case_identity'])
         ref = self.store.put_json(packet)
         atomic_json(runner.root / 'service-result.json', dict(reference=ref))
         if outcome not in ('accepted', 'rejected', 'budget_exhausted', 'failed') or (
@@ -547,15 +464,60 @@ class BoundCycle(TuningBindings):
         return HostTaskResult(outcome, ref, delta)
 
     def open_project(self, operation):
-        root = self.root / 'projects' / _name(operation)
+        relative = self.scheduler.state.get('project_roots', {}).get(operation)
+        root = (self.root / relative).resolve() if relative else self.root / 'projects' / _name(operation)
+        if not root.is_relative_to(self.root.resolve()):
+            raise ValueError('project root escapes retained cycle')
         binding = json.loads((root / 'service-binding.json').read_text())
-        return self.runner(root, memory_ref=binding['memory'],
+        resolution = None
+        if binding.get('executor_provenance') is not None:
+            profile = binding.get('worker_profile') or binding['executor_identity']
+            if self.services.executor_factory is None or self.services.executor_factory.metadata(
+                    profile) != binding['executor_provenance']:
+                raise ValueError('host executor differs from frozen project device/runtime')
+        if relative:
+            wave_id = Path(relative).parts[1]
+            waves = [*self.scheduler.state.get('wave_history', []), self.scheduler.state.get('active_wave')]
+            wave = next(w for w in waves if w and w['id'] == wave_id)
+            admitted = self.store.read_json(wave['admission_ref'])
+            self.kdb_stat = admitted['kdb_stat']
+            if binding.get('resolved_binding_ref'):
+                from rsi.project_binding import admission_hash, validate_resolution
+                op = admitted['operations'][operation]
+                logical = dict(operation_id=operation, spec=op['spec'], config=op['config'],
+                    memory_ref=admitted['memory'], skills_ref=admitted['skills'],
+                    configuration_ref=admitted['configuration'])
+                if binding.get('logical_admission_hash') != admission_hash(logical):
+                    raise ValueError('resolved project differs from admitted logical operation')
+                row = json.loads((self.root / 'waves' / wave_id / 'wave.json').read_text())['projects'][operation]
+                resolution = ContentAddressedArtifacts(root / 'artifacts').read_json(binding['resolved_binding_ref'])
+                resolution = validate_resolution(logical, resolution, device=row['lease_device'],
+                                                 executor_identity=binding['executor_identity'])
+                if resolution['evidence']['logical_source_identity'] != op['logical_source_identity']:
+                    raise ValueError('resolved binding does not authenticate the original logical source')
+                self.store.put_json(resolution)
+        runner = self.runner(root, memory_ref=binding['memory'],
                            backend_identity=self.store.put_json(binding), reopen=True,
-                           configuration_ref=binding['configuration'])
+                           configuration_ref=binding['configuration'],
+                           command_guard=self.local_command_guard(binding))
+        if resolution:
+            from core.artifacts import canonical_bytes
+            from rsi.project_binding import attach_execution_context
+            event = runner.latest('lease-binding')
+            if (runner.spec.to_dict() != resolution['spec']
+                    or canonical_bytes(asdict(runner.config)) != canonical_bytes(resolution['config'])
+                    or not event or event['reference'] != binding['resolved_binding_ref']
+                    or event['source_hash'] != resolution['evidence']['resolved_source_identity']
+                    or event['artifact_ref'] != runner.service.backend_identity):
+                raise ValueError('runner contract or initial source differs from trusted lease binding')
+            path = root.parent / 'worker-admission.json'
+            admission = json.loads(path.read_text())['receipt'] if path.exists() else None
+            attach_execution_context(runner, binding, resolution, admission)
+        return runner
 
     def retain(self, runner):
         for path in runner.store.objects.glob('*/*'):
-            self.store.put_bytes(runner.store.read_bytes(path.parent.name + path.name))
+            self.store.retain_from(runner.store, path.parent.name + path.name)
 
     def load_project(self, row):
         operation = row['operation_id']
@@ -599,9 +561,15 @@ class BoundCycle(TuningBindings):
         raw = list(result['events'])
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
+        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
+        investigation = row.get('investigation_receipt_ref')
+        if investigation:
+            receipt = self.store.read_json(investigation)
+            evidence[investigation] = dict(kind='failure', summary='Host investigation did not produce a runnable diagnostic')
+            raw.append(investigation)
         return dict(project_id=row['original_id'], outcome=host_outcome,
-            evidence={row['artifact_ref']: dict(kind=kind, summary=summary)},
-            queries=queries, usage=usage, raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
+            evidence=evidence, queries=queries, usage=usage,
+            raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
             observations=observations, observations_ref=observations_ref)
 
     def isolate(self, memory, skills, context):
@@ -612,9 +580,29 @@ class BoundCycle(TuningBindings):
         self.controller.learning = self.learning
         return receipt
 
+    def local_command_guard(self, binding):
+        profile = binding.get('worker_profile')
+        if not profile or binding.get('executor_identity') is not None:
+            return None
+        from rsi.executor_profiles import FrozenExecutorFactory, ProfileCommandGuard
+        provenance = binding['executor_provenance']
+        if self.services.executor_factory is None:
+            raise ValueError('retained local project requires its trusted worker profile')
+        profiles = FrozenExecutorFactory(self.services.executor_factory,
+            json.dumps({profile: provenance}, sort_keys=True))
+        profiles.metadata(profile)
+        return ProfileCommandGuard(profiles, profile)
+
     def trial(self, request, *, reopen):
+        trial_binding = self.store.read_json(request.backend_identity)
+        binding = self.store.read_json(trial_binding['backend'])
         runner = self.runner(request.root, spec=request.spec, bundle=request.bundle, config=request.config,
-            memory_ref=request.memory_ref, backend_identity=request.backend_identity, reopen=reopen)
+            memory_ref=request.memory_ref, backend_identity=request.backend_identity, reopen=reopen,
+            command_guard=self.local_command_guard(binding))
+        if binding.get('resolved_binding_ref'):
+            from rsi.project_binding import attach_execution_context
+            attach_execution_context(runner, binding,
+                self.store.read_json(binding['resolved_binding_ref']), None)
         canonical_run = runner.run
         def run_trial():
             self.active_runner = runner
@@ -673,8 +661,41 @@ class BoundCycle(TuningBindings):
         self.scheduler.reconcile_rejected_skill(rejection)
         return rejection
 
-    def reconcile(self):
+    def reconcile(self, *, dispatch_ready=False):
         """Observe existing project completion; no new provider dispatch."""
+        pending = self.scheduler.state['pending']
+        if pending and pending['kind'] == 'prepare_retry' and self.curriculum:
+            entry = self.scheduler.state.get('original_retry_inputs', {}).get(pending['original_id'])
+            if not entry or entry['operation_id'] != pending['id']:
+                raise WorkflowError('original input preparation requires host observation')
+            spec = ProjectSpec.from_dict(entry['spec'])
+            self.scheduler.reconcile(pending['id'], spec)
+            return spec
+        if pending and pending['kind'] == 'simplify' and self.curriculum:
+            result = self.curriculum.retained(pending['id'])
+            self.scheduler.reconcile(pending['id'], result)
+            return result
+        if self.waves and self.scheduler.state.get('active_wave') and pending and pending['kind'] in ('original', 'recovery', 'root_retry'):
+            if dispatch_ready:
+                self.waves.continue_ready()
+            state = self.waves.observe()
+            if any(row['status'] != 'completed' for row in state['projects'].values()):
+                raise ValueError('wave requires observation of retained controller/target work')
+            row = state['projects'][pending['id']]
+            runner = self.open_project(pending['id'])
+            result = self.finish_project(runner, pending['id'], row['receipt']['result'])
+            self.scheduler.reconcile(pending['id'], result)
+            return result
+        if pending and pending['kind'] == 'memory':
+            if pending['id'] in self.learning.state['operations']:
+                result = self.learning.reconcile_memory(pending['id'])
+            else:
+                rows = self.scheduler.state['recovery_feedback_rows'] if pending.get('feedback') == 'recovery' else (
+                    self.scheduler.state['wave_results'] if self.spec.mode == Mode.PHASE1 else [self.scheduler.state['originals'][-1]])
+                result = self.learning.memory_update(self.scheduler.state['memory'], rows,
+                                                     self.scheduler._context(pending))
+            self.scheduler.reconcile(pending['id'], result)
+            return result
         if self.tuning.state['pending']:
             pending = self.tuning.state['pending']
             path = self.root / 'evaluations' / pending['operation_id'] / 'evaluation.json'
@@ -698,7 +719,7 @@ class BoundCycle(TuningBindings):
         pending = self.scheduler.state['pending']
         if pending and pending['kind'] == 'skill':
             return self.reject_writer()
-        if not pending or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('explicit learning/absence reconciliation required')
         runner = self.open_project(pending['id'])
         path = runner.root / 'service-result.json'
@@ -759,20 +780,33 @@ class BoundCycle(TuningBindings):
                     and not self.config.get('tuning', {}).get('at_wave_end', True)):
                 ref = self.store.put_json(dict(event=due['id'], decision='skipped', reason='wave_end_disabled'))
                 self.scheduler.complete_extension(due['id'], ref)
+                self._close_wave_boundary()
                 return dict(decision='skipped', evidence_ref=ref)
             self.tuning_settings()
             self.tuning_project(due)
 
         try:
-            return self.tuning.step()
+            result = self.tuning.step()
+            self._close_wave_boundary()
+            return result
         except (ProposalRejected, RejectedOperation):
             # The producer revalidates exact scope, semantic invalidity and genuine
             # role timing. Provider/storage/unknown failures never enter this path.
             return self.reject_writer()
 
+    def _close_wave_boundary(self):
+        if self.waves and not self.controller.state['pending'] and not self.tuning.state['pending']:
+            extensions = self.scheduler.extension_events()
+            if not any(e['kind'] in ('paired_recovery_due', 'candidate_validation_due',
+                                     'tuning_due', 'manual_tuning') for e in extensions):
+                self.scheduler.close_original_wave()
+
     def run_project(self, operation_id):
+        if self.waves and self.scheduler.state.get('active_wave'):
+            self.waves.observe()
+            raise ValueError('use wave resume after observing retained project handles')
         pending = self.scheduler.state['pending']
-        if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('explicit continuation requires matching unfinished scheduler admission')
         runner = self.open_project(operation_id)
         # Observation may finish a durable receipt, but must never replay unknown work.

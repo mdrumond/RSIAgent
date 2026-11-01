@@ -186,3 +186,19 @@ def test_concurrent_cli_writers_cannot_lose_update(instance, tmp_path):
     winner = next(payload for result, payload in results if result.returncode == 0)
     assert show_configuration(instance) == winner
     assert len(list((instance / 'config/revisions').glob('*.json'))) == 2
+
+
+def test_failed_recovery_limit_roundtrips_public_config_editor_payload(instance, tmp_path):
+    value=show_configuration(instance)['payload']
+    assert value['recovery']['max_failed_attempts']==5
+    value['recovery']['max_failed_attempts']=2
+    path=write_input(tmp_path,value)
+    result,configured=cli(instance,'config','set','--file',path)
+    assert result.returncode==0
+    assert configured['payload']['recovery']['max_failed_attempts']==2
+    for invalid in (0,-1,True,None):
+        value['recovery']['max_failed_attempts']=invalid
+        path=write_input(tmp_path,value)
+        result,_=cli(instance,'config','set','--file',path)
+        assert result.returncode!=0
+    assert show_configuration(instance)['payload']['recovery']['max_failed_attempts']==2

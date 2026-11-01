@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
 from hashlib import sha256
 import json
+from rsi.event_journal import read_event_refs
 from pathlib import Path
 import time
 
@@ -523,7 +524,7 @@ class A3Host(SourceHost):
         # bytes; subsequent journal changes must still invalidate the baseline.
         event_path = owner.workdir / 'canonical' / 'events.json'
         if event_path.exists():
-            events = [self.store.read_json(ref) for ref in json.loads(event_path.read_text())]
+            events = [self.store.read_json(ref) for ref in read_event_refs(event_path.parent)]
             commit = next((row for row in reversed(events) if row.get('type') == 'domain-memory-commit'), None)
             if commit is not None:
                 if memory_context.encode() != self.store.read_bytes(commit['after']):

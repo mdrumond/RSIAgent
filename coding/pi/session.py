@@ -91,7 +91,13 @@ class RequestAccounting:
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
                  budget=None, own_process_group=True, system_prompt=SYSTEM,
-                 first_action_only=False, context_factory=ContextRecords):
+                 first_action_only=False, context_factory=ContextRecords,
+                 context_window=65536, request_bytes=None):
+        # Generic snapshot/reviewer callers retain their historical byte limits.
+        # The canonical controller explicitly selects production capacities.
+        if type(context_window) is not int or not 0 < context_window <= 65536:
+            raise ValueError("context_window must be an integer in 1..65536")
+        self.context_window = context_window
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
         self.system_prompt = system_prompt
@@ -100,7 +106,13 @@ class PiCodingSession:
         from benchmarks.a3_experiments import BackendModel
         from benchmarks.a3_model_profiles import load_a3_model_profile
         self.profile = load_a3_model_profile(BackendModel(self.model))
+        if self.profile.generation.max_tokens >= context_window:
+            raise ValueError("context_window must leave room beyond the registered output allowance")
         provider = "deepseek" if self.model == BackendModel.DEEPSEEK_FLASH.value else "openai"
+        if request_bytes is None:
+            request_bytes = 49152 if provider == 'deepseek' else 196608
+        if type(request_bytes) is not int or not 0 < request_bytes <= 196608:
+            raise ValueError("request_bytes must be an integer in 1..196608")
         environment = os.environ if environ is None else environ
         key = environment.get(PROVIDERS[provider]["key"])
         if not key:
@@ -110,7 +122,7 @@ class PiCodingSession:
         self.gateway = Gateway(provider, key, RequestAccounting(), "production-pi",
                                max_calls=max_calls, deadline=self.deadline,
                                max_output_tokens=8192 if provider == "deepseek" else 32768,
-                               hard_bytes=49152 if provider == "deepseek" else 196608)
+                               hard_bytes=request_bytes)
         self.schemas = dict(schemas)
         self.schemas["read_context"] = obj({"record": STRING, "offset": INTEGER,
                                            "limit": {"type": "integer", "minimum": 1, "maximum": 8192}},

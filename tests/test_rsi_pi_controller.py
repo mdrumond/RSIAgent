@@ -1,4 +1,7 @@
 """Actual pinned Pi runs completed host tools and its own compaction."""
+from rsi.event_journal import read_event_refs
+from core.artifacts import canonical_bytes
+
 import json
 import threading
 
@@ -36,14 +39,16 @@ def response(actions, index, tokens=100, *, summary=None, finish=None, completio
     return result
 
 
-def native_actor(tmp_path, events, perform, tools=None, *, clock=None, limits=None):
+def native_actor(tmp_path, events, perform, tools=None, *, clock=None, limits=None,
+                 context_window=16384, request_bytes=49152):
     from coding.pi.session import runtime_preflight, RuntimeUnavailable
     try: runtime_preflight()
     except RuntimeUnavailable: pytest.skip('cached pinned Pi/Node22 required')
     workflow = Workflow(tmp_path/'workflow.json', lambda *_:False, source_hash='project-v1',
                         limits=limits, **({'clock':clock} if clock is not None else {}))
     actor = WorkflowActor(workflow, builtin_bundle(),
-        lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
+        lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fake-provider-secret'},
+                               context_window=context_window,request_bytes=request_bytes),
         perform=perform,preflight=lambda *_:StageResult(),evidence_tools=tools,
         emit=lambda kind,data:events.append((kind,data)))
     return actor, workflow
@@ -548,7 +553,7 @@ def test_real_project_runner_durably_records_native_pi_event_envelopes(monkeypat
     try:
         runner.actor.step(runner.context())
         runner.actor.step(runner.context())
-        persisted=[runner.store.read_json(ref) for ref in json.loads(runner.event_path.read_text())]
+        persisted=[runner.store.read_json(ref) for ref in read_event_refs(runner.root)]
         pi_events=[row for row in persisted if row['type']=='pi-event']
         assert pi_events and any(row['event']['type']=='agent_settled' for row in pi_events)
         assert runner.workflow.stage==Stage.DESIGN and runner.workflow.pending is None
@@ -571,7 +576,7 @@ def test_native_concise_summary_covers_long_history_and_recovers_length_failure(
         assert len(kwargs['data'])<=49152
         if not request.get('tools'):
             summaries.append(request)
-            assert request['max_tokens']==1536
+            assert request['max_tokens']==6553
             if len(summaries)==1:
                 return response([],len(requests),len(kwargs['data'])//4,summary=long_summary[:7000],
                                 finish='length',completion_tokens=request['max_tokens'])
@@ -595,7 +600,7 @@ def test_native_concise_summary_covers_long_history_and_recovers_length_failure(
     compactions=[row['event'] for kind,row in events if kind=='pi-event' and row['event']['type']=='compaction_end']
     attempts=[row['event'] for kind,row in events if kind=='pi-native-event' and row['event']['kind']=='compaction-summary']
     assert any(not row['successful'] and row.get('stopReason')=='length' for row in attempts)
-    assert any(not row.get('result') for row in compactions)
+    assert any(row.get('fallback')=='pi-native' for row in attempts if not row['successful'])
     successful=[row for row in compactions if row.get('result')]
     assert successful and all(row['result']['usage']['output']<=1000 for row in successful)
     assert all(len(row['result']['summary'].encode())<=6144 for row in successful)

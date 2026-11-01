@@ -1,6 +1,7 @@
 """Read-only admission of task results from the existing canonical CAS."""
 from hashlib import sha256
 import json
+from rsi.event_journal import read_event_refs
 from pathlib import Path
 
 from core.artifacts import ContentAddressedArtifacts
@@ -24,7 +25,7 @@ def require_settled_candidate(execution, state, *, stop_requested, historical=Fa
     store = ContentAddressedArtifacts(location if location.is_absolute() else root/location)
     contract = pointer['contract']
     frozen = store.read_json(contract)
-    events = [store.read_json(ref) for ref in json.loads((root/'events.json').read_text())]
+    events = [store.read_json(ref) for ref in read_event_refs(root)]
     actual = (workflow['source'] if historical else
               sha256((Path(execution)/'canonical-candidate.json').read_bytes()).hexdigest())
     try:
