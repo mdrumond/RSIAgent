@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import time
 
-from core.artifacts import ContentAddressedArtifacts
+from core.artifacts import ContentAddressedArtifacts, canonical_bytes
 from rsi.contracts import CycleSpec, ProjectSpec
 from rsi.executor_profiles import FrozenExecutorFactory, ProfileCommandGuard
 from rsi.jobs import _alive
@@ -15,6 +15,16 @@ from rsi.project_binding import admission_hash, source_identity, validate_resolu
 from rsi.python_execution import atomic_json, ingest_elapsed
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.skills import SkillBundle
+
+
+def memory_wire(admitted):
+    """New waves carry a CAS identity; retained legacy plans keep their bytes."""
+    if 'memory_wire' not in admitted:
+        return bytes.fromhex(admitted['memory_bytes'])
+    expected = dict(schema='rsi-wave-memory-cas-v1', reference=admitted['memory'])
+    if admitted['memory_wire'] != expected:
+        raise ValueError('wave Memory reference differs from frozen admission')
+    return canonical_bytes(expected)
 
 
 class WorkerArtifacts(ContentAddressedArtifacts):
@@ -104,7 +114,7 @@ class ProjectWorkerFactory:
         from rsi.services import InstanceServices
         admitted = json.loads(self.admission_json)
         operation = admitted['operations'][request.project_id]
-        if request.memory != bytes.fromhex(admitted['memory_bytes']) or request.skills != bytes.fromhex(admitted['skills_bytes']):
+        if request.memory != memory_wire(admitted) or request.skills != bytes.fromhex(admitted['skills_bytes']):
             raise ValueError('worker snapshots differ from frozen service admission')
         services = InstanceServices(self.instance, test_bindings=self.test_bindings,
                                    executor_factory=self.executor_factory)
@@ -249,9 +259,10 @@ class WaveBindings:
 
     def _pool(self, wave):
         cycle = self.cycle
+        admitted = cycle.store.read_json(wave['admission_ref'])
         return ProjectWave(cycle.root / 'waves' / wave['id'],
             [op['id'] for op in wave['operations']], [d['device'] for d in self.policy['devices']],
-            cycle.store.read_bytes(wave['memory']), cycle.store.read_bytes(wave['skills']),
+            memory_wire(admitted), cycle.store.read_bytes(wave['skills']),
             max_parallel=self.policy['max_parallel'], actor_allowances={
                 op['id']: op['spec']['budgets'].get('actor_seconds') for op in wave['operations']})
 
@@ -315,7 +326,7 @@ class WaveBindings:
             admitted = dict(binding=cycle.binding, operations=admissions,
                 configuration=admissions[wave['operations'][0]['id']]['binding']['configuration'],
                 memory=wave['memory'], skills=wave['skills'],
-                memory_bytes=cycle.store.read_bytes(wave['memory']).hex(),
+                memory_wire=dict(schema='rsi-wave-memory-cas-v1', reference=wave['memory']),
                 skills_bytes=cycle.store.read_bytes(wave['skills']).hex(), devices=self.policy['devices'],
                 identities=identities, binding_contracts=binding_contracts, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
             wave['admission_ref'] = cycle.store.put_json(admitted)
