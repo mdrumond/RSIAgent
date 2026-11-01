@@ -1,4 +1,4 @@
-"""Host-only binding contracts; no NPU or provider calls. Not yet executed."""
+"""Host-only binding contracts; no NPU or provider calls."""
 import hashlib
 import json
 import sys
@@ -70,7 +70,7 @@ def test_standalone_frozen_oracle_detaches_cases_from_actor_changes(tmp_path):
 
 def test_default_local_config_and_worker_env_do_not_rebind_controller(tmp_path):
     inherited = {'PATH':'/registry/bin','ASCEND_RT_VISIBLE_DEVICES':'old'}
-    env = worker_environment(inherited=inherited, outer_cpl_handle='remote:bz-a5:session:actual',
+    env = worker_environment(inherited=inherited, outer_cpl_handle='remote:bz-a5:job:actual',
                              physical_device=3, cache_directory=tmp_path/'project-cache')
     assert inherited['ASCEND_RT_VISIBLE_DEVICES'] == 'old'
     assert env['ASCEND_RT_VISIBLE_DEVICES'] == '3' and env['PATH'] == '/registry/bin'
@@ -145,7 +145,7 @@ def fake_consumer(tmp_path, monkeypatch):
     (root/'candidate.py').write_text('pass\n')
     monkeypatch.chdir(root)
     monkeypatch.delenv('RSI_EXPECTED_SOURCE_HASH', raising=False)
-    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE', 'remote:bz-a5:session:owned')
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE', 'remote:bz-a5:job:owned')
     monkeypatch.setenv('RSI_CPL_RUNTIME', 'catlass-dsl')
     monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '2')
     monkeypatch.setenv('CATLASS_DSL_CACHE_DIR', str(tmp_path/'bc-cache'))
@@ -175,7 +175,7 @@ def fake_consumer(tmp_path, monkeypatch):
     monkeypatch.setattr(driver,'load_kernel',lambda *args:object())
     monkeypatch.setattr(driver.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0))
     contract = {'abi_version':1,'operation':'add','case_hash':'cases',
-        'outer_cpl_handle':'remote:bz-a5:session:owned','execution_runtime':'catlass-dsl',
+        'outer_cpl_handle':'remote:bz-a5:job:owned','execution_runtime':'catlass-dsl',
         'physical_device':2,'allowed_helpers':[],
         'runtime_identity':{}, 'cases':[{'length':3,'block_count':2,'seed':17}],
         'execution_inputs':['candidate.py'],'generated_paths':['outputs','cache'],
@@ -339,7 +339,7 @@ def test_failed_tool_keeps_raw_reports_streams_and_typed_failure(tmp_path, monke
     contract = {'exercise':{'kind':'msprof-basic','tools':{'msprof':{'device_mode':'direct-physical',
         'basic_info_arguments':['--device','{physical_device}','--report','{report}'],'path':str(tool),
         'sha256':hashlib.sha256(tool.read_bytes()).hexdigest(),'arguments':['--report','{report}']}}},
-        'profile_capture':True,'case_hash':'cases','runtime_identity':{},'outer_cpl_handle':'remote:bz-a5:session:actual','physical_device':2}
+        'profile_capture':True,'case_hash':'cases','runtime_identity':{},'outer_cpl_handle':'remote:bz-a5:job:actual','physical_device':2}
     with pytest.raises(ValueError,match='required tool command failed'):
         gates.capability_gate(contract,compile_original=lambda path:None,candidate_hash='candidate')
     receipts = list(Path('outputs').glob('*-receipt.json'))
@@ -393,7 +393,7 @@ def test_worker_context_applies_actual_child_environment_without_parent_mutation
     from rsi.catlass_project_config import apply_worker_context
     monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','parent-device')
     monkeypatch.setenv('RSI_EXPECTED_SOURCE_HASH','stale-parent-command')
-    context = {'outer_cpl_handle':'remote:bz-a5:session:actual',
+    context = {'outer_cpl_handle':'remote:bz-a5:job:actual',
                'physical_device':3,'cache_directory':str(tmp_path/'owned-cache')}
     before = dict(os.environ)
     with pytest.raises(ValueError,match='spawned child'):
@@ -537,9 +537,13 @@ def test_numeric_child_is_reaped_before_profile_without_parent_npu_context(tmp_p
     assert result['numeric_child_exited_before_profile'] is True and result['exercise_validated'] is True
 
 
-def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(tmp_path,monkeypatch):
-    from rsi.catlass_project_config import bind_project,case_identity,elapsed_budget
-    from rsi.contracts import ProjectSpec
+@pytest.mark.parametrize('actor_seconds,wall_seconds',
+    [(7200.,None),(900.,5400.),(731.25,5170.5),(300.,420.)],
+    ids=['legacy','root','carried-remaining','diagnostic-child'])
+def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(
+        tmp_path,monkeypatch,actor_seconds,wall_seconds):
+    from rsi.catlass_project_config import bind_project,case_identity
+    from rsi.contracts import BudgetLimits,ProjectSpec
     from rsi.project_runner import ProjectConfig
     import runpy
     handle='remote:bz-a5:job:leased'
@@ -567,7 +571,10 @@ def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(tmp
             dispatch_id='dispatch-'+name,project_id='operation-'+name)
         import os
         (branch/'worker.json').write_text(json.dumps({'pid':os.getpid(),'dispatch_id':request.dispatch_id}))
-        spec=ProjectSpec(name,'preserve exact goal',('staging-command',),budgets=elapsed_budget())
+        budget=BudgetLimits(design_iterations=None,implementation_iterations=None,execution_tries=None,
+                            actor_seconds=actor_seconds,wall_seconds=wall_seconds)
+        spec=ProjectSpec(name,'preserve exact goal',('staging-command',),budgets=budget,
+                         repository_ref='retained-input-lineage',performance_goal='preserve numeric contract')
         config=ProjectConfig(source=str(source),verifier='not-yet-bound',
             commands={'compile':['old'],'test':['old'],'validation':['old']},editable_files=('candidate.py',),
             generated_paths=('outputs','cache'),retained_paths=('outputs',))
@@ -581,10 +588,13 @@ def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(tmp
         from rsi.project_binding import validate_resolution
         admission={'operation_id':request.project_id,'spec':spec.to_dict(),'config':asdict(config),
                    'memory_ref':'memory','skills_ref':'skills','configuration_ref':'configuration'}
-        bound=bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:7200.)
+        bound=bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:actor_seconds)
         frozen=runpy.run_path(bound['config']['verifier'])['FROZEN_CONTRACT']
         assert frozen['physical_device']==physical and frozen['case_hash']==case_identity(seed)
-        assert bound['spec']['goal']==spec.goal and bound['spec']['budgets']==spec.budgets.to_dict()
+        assert all(bound['spec'][key]==value for key,value in spec.to_dict().items()
+                   if key not in ('command','starting_folder','correctness_ref'))
+        assert admission['spec']==spec.to_dict()
+        assert frozen['cases']==seed['cases'] and frozen['operation']==seed['operation']
         assert bound['config']['source']!=config.source
         assert bound['config']['retained_paths']==['outputs']
         assert bound['spec']['command']==bound['config']['commands']['test']
@@ -600,7 +610,7 @@ def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(tmp
         retained=json.loads(json.dumps(bound))
         request.reopen=True
         with pytest.raises(ValueError,match='resume uses stored resolution'):
-            bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:7200.)
+            bind_project(request,admission,metadata=metadata,configuration=configuration,remaining=lambda:actor_seconds)
         assert Path(retained['config']['verifier']).read_bytes()==original
         bindings.append(bound)
     assert [b['evidence']['physical_device'] for b in bindings]==[0,1,1]
@@ -667,3 +677,12 @@ def test_optional_target_paths_resolve_package_without_pythonpath_and_reject_con
     assert loaded.identity=='registry-derived-target'
     assert Path(loaded.__file__).is_relative_to(root)
     sys.modules.pop('fixture_target_package',None)
+
+
+@pytest.mark.parametrize('outer_handle', ['remote:bz-a5:session:owned', 'remote:bz-a5:screen:owned'])
+def test_worker_environment_requires_actual_outer_job(tmp_path, outer_handle):
+    inherited = {'ASCEND_RT_VISIBLE_DEVICES': 'unchanged'}
+    with pytest.raises(ValueError):
+        worker_environment(inherited=inherited, outer_cpl_handle=outer_handle,
+                           physical_device=2, cache_directory=tmp_path/'cache')
+    assert inherited == {'ASCEND_RT_VISIBLE_DEVICES': 'unchanged'}

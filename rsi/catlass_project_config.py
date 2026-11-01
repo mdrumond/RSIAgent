@@ -152,10 +152,10 @@ def worker_environment(*, inherited, outer_cpl_handle, physical_device, cache_di
     """Return env for a dedicated host worker, never mutate controller/global env.
 
     Main spawns the existing canonical worker with this env inside the outer
-    registry-activated CPL session. This is not a worker loop or process runner.
+    registry-activated CPL job. This is not a worker loop or process runner.
     Environment activation and target interpreter selection remain profile-owned.
     """
-    if not re.fullmatch(r'remote:bz-a5:(?:job|session):[^\s]+', outer_cpl_handle):
+    if not re.fullmatch(r'remote:bz-a5:job:[^\s]+', outer_cpl_handle):
         raise ValueError('actual outer BZ-A5 CPL admission handle required')
     if type(physical_device) is not int or physical_device < 0:
         raise ValueError('freshly admitted physical device required')
@@ -252,9 +252,9 @@ def bind_project(request, logical_admission, *, metadata, configuration, remaini
             or os.environ.get('RSI_OUTER_CPL_HANDLE')!=metadata['outer_handle']
             or os.environ.get('RSI_CPL_RUNTIME')!=metadata['runtime']):
         raise ValueError('binder must run in the selected child environment')
-    if (spec.budgets!=elapsed_budget() or tuple(config.editable_files)!=('candidate.py',)
+    if (tuple(config.editable_files)!=('candidate.py',)
             or tuple(config.retained_paths)!=('outputs',)):
-        raise ValueError('logical config must declare elapsed budget, candidate-only edits and outputs retention')
+        raise ValueError('logical config must declare candidate-only edits and outputs retention')
     project=configuration['projects'][spec.project_id]
     seed=json.loads(Path(project['seed_path']).read_text())
     logical_case=case_identity(seed)
