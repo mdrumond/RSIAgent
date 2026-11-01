@@ -34,7 +34,7 @@ def _child(root, admission, metadata, configuration, queue, release, hold=False,
             release.set()
 
 
-def _inputs(tmp_path):
+def _inputs(tmp_path, limits=None):
     projects, devices = [], {}
     for device in (0, 1):
         runtime = tmp_path/f'runtime-{device}.json'
@@ -54,7 +54,7 @@ def _inputs(tmp_path):
         atomic_json(cases, {'project_id': f'project-{index}', 'operation': 'add',
                             'cases': [{'case_id': 'tail', 'shape': [17], 'seed': index}]})
         spec = ProjectSpec(f'project-{index}', 'Preserve the logical workload', ('logical-template',),
-                           budgets=budgets(), starting_folder=str(source), correctness_ref=str(cases))
+                           budgets=limits or budgets(), starting_folder=str(source), correctness_ref=str(cases))
         projects.append({'spec': spec, 'source': str(source), 'cases': str(cases)})
     configuration = prepare_worker_bindings(projects, devices, tmp_path/'bindings.json')
     manifest = json.loads(Path(configuration['manifest']).read_text())
@@ -124,6 +124,55 @@ def test_three_projects_two_leases_use_completion_device_not_modulo(tmp_path):
                 process.join()
         queue.close()
     assert all(process.exitcode == 0 for process in processes)
+
+
+@pytest.mark.parametrize('frozen_wall,actor,wall', [
+    (None, 900., 5384.413945674896), (None, 731.25, 5384.),
+    (6000., 731.25, 5384.), (None, 900., None),
+])
+def test_binding_preserves_admitted_elapsed_budget_narrowing(tmp_path, frozen_wall, actor, wall):
+    from dataclasses import replace
+    limits = replace(budgets(), actor_seconds=900., wall_seconds=frozen_wall)
+    configuration, admissions, devices = _inputs(tmp_path, limits)
+    admission = admissions[0]
+    admission['spec']['budgets'].update(actor_seconds=actor, wall_seconds=wall)
+    root = tmp_path/'budget-worker'
+    root.mkdir()
+    request = SimpleNamespace(root=root/'runner', dispatch_id='budget-dispatch',
+                              project_id=admission['operation_id'], device='0', reopen=False)
+    atomic_json(root/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
+    resolution = bind_project(request, admission, metadata=devices['0']['metadata'],
+                              configuration=configuration, remaining=lambda: 30.)
+    assert resolution['spec']['budgets'] == admission['spec']['budgets']
+    assert resolution['spec']['goal'] == admission['spec']['goal']
+    assert resolution['spec']['project_id'] == admission['spec']['project_id']
+    assert resolution['evidence']['logical_admission_hash'] == admission_hash(admission)
+    assert resolution['evidence']['resolved_case_identity'] == resolution['evidence']['logical_case_identity']
+    validate_resolution(admission, resolution, device='0', executor_identity=devices['0']['executor_identity'])
+
+
+@pytest.mark.parametrize('field,value', [
+    ('actor_seconds', 901.), ('actor_seconds', None),
+    ('wall_seconds', 6001.), ('wall_seconds', None), ('execution_tries', 1),
+    ('goal', 'Different goal'), ('project_id', 'different-project'),
+    ('correctness_ref', 'different-cases.json'), ('starting_folder', 'different-source'),
+])
+def test_binding_rejects_budget_widening_and_other_logical_changes(tmp_path, field, value):
+    from dataclasses import replace
+    configuration, admissions, devices = _inputs(tmp_path,
+        replace(budgets(), actor_seconds=900., wall_seconds=6000.))
+    admission = admissions[0]
+    target = admission['spec']['budgets'] if field.endswith('_seconds') or field == 'execution_tries' else admission['spec']
+    target[field] = value
+    root = tmp_path/'invalid-budget-worker'
+    root.mkdir()
+    request = SimpleNamespace(root=root/'runner', dispatch_id='invalid-budget-dispatch',
+                              project_id=admission['operation_id'], device='0', reopen=False)
+    atomic_json(root/'worker.json', {'pid': os.getpid(), 'dispatch_id': request.dispatch_id})
+    with pytest.raises((ValueError, KeyError)):
+        bind_project(request, admission, metadata=devices['0']['metadata'],
+                     configuration=configuration, remaining=lambda: 30.)
+    assert not (root/'lease-inputs').exists()
 
 
 def test_resume_cannot_rebuild_lease_inputs(tmp_path):
