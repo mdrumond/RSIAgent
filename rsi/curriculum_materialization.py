@@ -54,12 +54,20 @@ def _argument(config, flag, *, mode='test'):
     return path.resolve() if path.is_absolute() else (Path(config.source)/path).resolve()
 
 
-def _cases(config):
-    path = _argument(config, '--cases')
-    argv = config.commands['test']
-    if '--cases-sha256' in argv:
-        _require(_sha(path) == argv[argv.index('--cases-sha256') + 1], 'Parent cases changed')
-    data = json.loads(path.read_bytes())
+def _catlass(binding):
+    return bool(binding and 'catlass_source' in binding.get('runtime_identity', {}))
+
+
+def _cases(config, binding=None, project_id=None):
+    if _catlass(binding):
+        from rsi.catlass_project_config import frozen_cases
+        path, data = frozen_cases(project_id, binding)
+    else:
+        path = _argument(config, '--cases')
+        argv = config.commands['test']
+        if '--cases-sha256' in argv:
+            _require(_sha(path) == argv[argv.index('--cases-sha256') + 1], 'Parent cases changed')
+        data = json.loads(path.read_bytes())
     _require(isinstance(data, dict) and isinstance(data.get('cases'), list), 'Frozen case list required')
     return path, data
 
@@ -68,7 +76,7 @@ def capability_catalog(parent_spec, parent_config):
     """JSON host capabilities for context.templates, with actual frozen bounds."""
     config, binding = _unpack(parent_config)
     try:
-        _, cases = _cases(config)
+        _, cases = _cases(config, binding, parent_spec.project_id)
     except MaterializationRejected:
         return []
     count = len(cases['cases'])
@@ -78,6 +86,8 @@ def capability_catalog(parent_spec, parent_config):
     templates = []
     if count > 1:
         entry = deepcopy(HOST_CAPABILITY_CATALOG[int(triton)])
+        if _catlass(binding):
+            entry['template_id'] = 'catlass.case-subset'
         entry['parameters']['case_indices'].update(maxItems=count - 1,
             items=dict(type='integer', enum=list(range(count))))
         templates.append(entry)
@@ -178,7 +188,7 @@ def _read_child(path):
         and _sha(config.verifier) == proof['oracle_sha256']
         and _sha(value['spec']['correctness_ref']) == proof['child_cases_sha256'],
         'Admitted child inputs changed')
-    if proof['binding']:
+    if proof['binding'] and not _catlass(proof['binding']):
         _require(_sha(proof['binding']['manifest']) == proof['binding']['sha256'], 'Child binding changed')
     provenance = dict(value['provenance'], receipt=dict(path=str(path), sha256=_sha(path)))
     return MaterializedChild(ProjectSpec.from_dict(value['spec']), config, provenance)
@@ -196,6 +206,7 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
 
     Triton parent_config is host-only {'config': ProjectConfig wire data,
     'binding': {'manifest': path, 'sha256': hash}}. Plain CPU configs are supported.
+    Catlass uses its registered logical seed and a child-scoped lease binder.
     Completed admissions are idempotent; partial directories are never overwritten.
     The returned receipt supplies the new config and child-only binding manifest
     to service integration, without changing global frozen project/profile tables.
@@ -215,7 +226,7 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
     _require(isinstance(evidence_refs, (list, tuple)) and bool(evidence_refs)
         and all(isinstance(ref, str) and len(ref) == 64 and all(c in '0123456789abcdef' for c in ref)
                 for ref in evidence_refs), 'Retained research evidence references required')
-    original_cases, case_data = _cases(config)
+    original_cases, case_data = _cases(config, binding, parent_spec.project_id)
     catalog = capability_catalog(parent_spec, parent_config)
     template = next((t for t in catalog if t['template_id'] == idea['template_id']), None)
     _require(template is not None, 'Unsupported host template')
@@ -296,12 +307,15 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
                 argv[argv.index('--cases-sha256') + 1] = _sha(cases)
         child_config = replace(config, source=str(project), verifier=str(oracle), commands=commands)
         child = replace(child, command=tuple(commands['test']))
+        if _catlass(binding):
+            from rsi.catlass_project_config import subset_configuration
+            child_binding = subset_configuration(binding, child_id, cases)
     allocated = min(allocated, allowance())
     limits = replace(parent_spec.budgets, actor_seconds=allocated,
                      wall_seconds=min(parent_spec.budgets.wall_seconds, allocated)
                      if parent_spec.budgets.wall_seconds is not None else None)
     child = replace(child, budgets=limits)
-    if child_binding:
+    if child_binding and triton:
         table = json.loads(Path(child_binding['manifest']).read_bytes())
         entry = table['projects'][child_id]
         entry['logical']['budgets'] = limits.to_dict()

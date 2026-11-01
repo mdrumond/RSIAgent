@@ -24,6 +24,29 @@ def case_identity(seed):
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
+def frozen_cases(project_id, configuration):
+    """Read the trusted logical seed, not an Actor-provided path or CLI flag."""
+    from rsi.curriculum_materialization import MaterializationRejected
+    entry = configuration.get('projects', {}).get(project_id)
+    if not entry:
+        raise MaterializationRejected('Catlass parent has no registered logical seed')
+    path = Path(entry['seed_path']).resolve()
+    seed = json.loads(path.read_bytes())
+    if (not isinstance(seed, dict) or not isinstance(seed.get('cases'), list)
+            or case_identity(seed) != entry['case_hash']):
+        raise MaterializationRejected('Catlass frozen seed differs from its registered identity')
+    return path, seed
+
+
+def subset_configuration(configuration, child_id, cases):
+    """Scope the existing registered binder to one owned diagnostic seed."""
+    from copy import deepcopy
+    result = deepcopy(configuration)
+    result['projects'] = {child_id: dict(seed_path=str(cases),
+        case_hash=case_identity(json.loads(Path(cases).read_bytes())))}
+    return result
+
+
 def freeze_verifier(destination, *, seed, runtime_identity, physical_device, outer_cpl_handle,
                     execution_inputs=('candidate.py',), generated_paths=('outputs', 'cache'), source=None):
     """Write outside Actor-editable source; profiles supply all machine paths.

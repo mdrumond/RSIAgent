@@ -686,3 +686,167 @@ def test_worker_environment_requires_actual_outer_job(tmp_path, outer_handle):
         worker_environment(inherited=inherited, outer_cpl_handle=outer_handle,
                            physical_device=2, cache_directory=tmp_path/'cache')
     assert inherited == {'ASCEND_RT_VISIBLE_DEVICES': 'unchanged'}
+
+
+@pytest.fixture
+def catlass_parent(tmp_path):
+    from dataclasses import replace
+    from rsi.catlass_project_config import case_identity
+    from rsi.contracts import BudgetLimits
+    source = tmp_path/'catlass-parent'
+    (source/'reference-skills').mkdir(parents=True)
+    (source/'candidate.py').write_text('def kernel(): pass\n')
+    (source/'reference-skills/oracle.txt').write_text('Retain the independent numeric oracle.\n')
+    seed = dict(operation='convert', exercise={'kind':'conversion'},
+        cases=[dict(length=n,block_count=1,seed=17+n) for n in (3,7,11)],
+        input_dtype='float32',output_dtype='float16',layout='row-major',
+        atol=.001,rtol=.0001,capacity=512,padding_multiple=64,
+        provenance={'source':'retained-parent','oracle':'independent-host'})
+    cases = tmp_path/'catlass-seed.json'
+    cases.write_text(json.dumps(seed))
+    runtime = dict(catlass_source='/profile/source',source_revision='src',dependency_gitlink='dep',
+        dependency_revision='dep',consumer_files=[{'path':'/profile/compiler','sha256':'hash'}],
+        cann_version='9.3.0',cann_version_file='/profile/version',cann_version_contents='9.3.0',
+        pipeline_manifest='/profile/manifest',pipeline_manifest_sha256='hash',catlass_module_sha256='hash',
+        compiler_paths={'TlaCompile':'/profile/front','hivmc-a5':'/profile/back'})
+    _with_outer_admission(runtime,tmp_path)
+    outer = Path(runtime['device_admission']['outer_receipt'])
+    receipt = json.loads(outer.read_text())
+    receipt['npu']['devices'] = [2,3]
+    outer.write_text(json.dumps(receipt))
+    verifier = tmp_path/'catlass-verify.py'
+    freeze_verifier(verifier,seed=seed,runtime_identity=runtime,physical_device=2,
+                    outer_cpl_handle='remote:bz-a5:job:admitted')
+    config = project_config(source=source,verifier=verifier,target_python='/profile/python3.11')
+    spec = replace(project_spec(project_id='catlass-original',goal='Preserve original full workload',config=config),
+                   budgets=BudgetLimits(actor_seconds=900,wall_seconds=5400))
+    binding = dict(runtime_identity=runtime,target_python='/profile/python3.11',projects={
+        spec.project_id:dict(seed_path=str(cases),case_hash=case_identity(seed))})
+    return spec,config,binding,cases,seed
+
+
+def test_catlass_semantic_subset_uses_scoped_factory_and_actual_lease(catlass_parent,tmp_path,monkeypatch):
+    from dataclasses import asdict
+    import os
+    from rsi.curriculum_materialization import capability_catalog,materialize_child,read_materialized_child
+    from rsi.curriculum_research import InvestigationIdea,Researcher
+    from rsi.executor_profiles import ExecutorProfiles
+    from rsi.catlass_project_config import case_identity
+    spec,config,binding,cases,seed = catlass_parent
+    parent_bytes = {p:p.read_bytes() for p in (cases,Path(config.verifier),*Path(config.source).rglob('*')) if p.is_file()}
+    parent_binding = json.loads(json.dumps(binding))
+    wrapper = dict(config=asdict(config),binding=binding)
+    catalog = capability_catalog(spec,wrapper)
+    assert len(catalog)==1 and catalog[0]['template_id']=='catlass.case-subset'
+    assert catalog[0]['parameters']['case_indices']['items']['enum']==[0,1,2]
+    assert catalog[0]['parameters']['case_indices']['maxItems']==2
+    idea = Researcher._bind_investigation(InvestigationIdea('Which case isolates the issue?',
+        'Investigate one frozen case','Inform the original task'),
+        [dict(project_id=spec.project_id,templates=catalog)],catalog)
+    options = dict(root=tmp_path/'catlass-diagnostic',remaining=300.,evidence_refs=('a'*64,),operation_id='semantic-child')
+    child = materialize_child(spec,wrapper,idea,**options)
+    assert materialize_child(spec,wrapper,idea,**options)==child
+    assert read_materialized_child(child.provenance['receipt']['path'],sha256=child.provenance['receipt']['sha256'])==child
+    child_seed = json.loads(Path(child.spec.correctness_ref).read_text())
+    assert child_seed==dict(seed,cases=[seed['cases'][0]])
+    assert child.spec.budgets.actor_seconds==300 and child.spec.command==tuple(child.config.commands['test'])
+    assert Path(child.config.verifier).read_bytes()==parent_bytes[Path(config.verifier)]
+    assert (Path(child.config.source)/'reference-skills/oracle.txt').read_bytes()==parent_bytes[Path(config.source)/'reference-skills/oracle.txt']
+    scoped = child.provenance['binding']
+    assert set(scoped['projects'])=={child.spec.project_id} and binding==parent_binding
+    assert scoped['runtime_identity']==binding['runtime_identity']
+    assert capability_catalog(child.spec,dict(config=asdict(child.config),binding=scoped))==[]
+    metadata = dict(target='bz-a5',runtime='catlass-dsl',physical_device=3,executor_identity=None,
+                    controller_placement='local',outer_handle='remote:bz-a5:job:admitted')
+    profiles = tmp_path/'profiles.json'
+    profiles.write_text(json.dumps(dict(profiles={'target':dict(metadata=metadata,
+        guard='rsi.catlass_project_config:device_guard',project_binder='rsi.catlass_project_config:bind_project',
+        project_configuration=binding)})))
+    from core.artifacts import ContentAddressedArtifacts
+    from rsi.phase1_recovery import Phase1Recovery
+    from rsi.python_execution import PythonExecution
+    import shutil
+    archived = tmp_path/'failed-original-runner'
+    shutil.copytree(config.source,archived/'project')
+    (archived/'frozen').mkdir()
+    shutil.copyfile(config.verifier,archived/'frozen/verify.py')
+    local = ContentAddressedArtifacts(archived/'artifacts')
+    contract = local.put_json(dict(spec=spec.to_dict(),config=asdict(config)))
+    (archived/'runner.json').write_text(json.dumps(dict(contract=contract)))
+    (archived/'service-binding.json').write_text(json.dumps(dict(worker_profile='target')))
+    store = ContentAddressedArtifacts(tmp_path/'instance-artifacts')
+    cycle = SimpleNamespace(store=store,services=SimpleNamespace(
+        executor_factory=ExecutorProfiles(str(profiles)),curriculum_researcher=None,curriculum_materializer=None),
+        scheduler=SimpleNamespace(state={'derived_projects':{child.spec.project_id:{
+            'provenance_ref':store.put_json(child.provenance)}}}))
+    recovery = Phase1Recovery(cycle)
+    failed_spec,failed_config = recovery.parent(dict(artifact_ref=store.put_json(dict(root=str(archived)))))
+    assert failed_config['binding']==parent_binding
+    assert capability_catalog(failed_spec,failed_config)==catalog
+    factory = recovery.executor_factory(child.spec)
+    assert factory.configuration==scoped
+    backend = PythonExecution.snapshot(tmp_path/'readonly-seed-snapshot',child.config.source,child.config.verifier,
+        commands=child.config.commands,editable_files=child.config.editable_files,
+        generated_paths=child.config.generated_paths,retained_paths=child.config.retained_paths)
+    seed_name = Path(child.spec.correctness_ref).relative_to(child.config.source).as_posix()
+    shown = backend.read(seed_name)
+    assert json.loads(shown['content'])==child_seed
+    with pytest.raises(ValueError,match='not in the frozen editable manifest'):
+        backend.edit(seed_name,'{}',expected_file_hash=shown['file_hash'],expected_project_hash=shown['project_hash'])
+    branch = tmp_path/'actual-child-lease' 
+    branch.mkdir()
+    request = SimpleNamespace(root=branch/'runner',reopen=False,device='3',project_id='child-operation',dispatch_id='child-dispatch')
+    (branch/'worker.json').write_text(json.dumps(dict(pid=os.getpid(),dispatch_id=request.dispatch_id)))
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','3')
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE',metadata['outer_handle'])
+    monkeypatch.setenv('RSI_CPL_RUNTIME','catlass-dsl')
+    admission = dict(operation_id=request.project_id,spec=child.spec.to_dict(),config=asdict(child.config))
+    resolved = factory.bind_project('target',request,admission,remaining=lambda:300.)
+    actual = runpy.run_path(resolved['config']['verifier'])
+    frozen = actual['FROZEN_CONTRACT']
+    assert frozen['physical_device']==3 and frozen['cases']==child_seed['cases']
+    assert frozen['case_hash']==case_identity(child_seed)
+    assert frozen['runtime_identity']==binding['runtime_identity'] and frozen['exercise']==seed['exercise']
+    assert resolved['spec']['budgets']==child.spec.budgets.to_dict()
+    assert resolved['spec']['command']==resolved['config']['commands']['test']
+    original = runpy.run_path(config.verifier)
+    left,right = original['case_inputs'](seed['cases'][0],seed['operation'])
+    assert actual['reference'](seed['operation'],left,right)==original['reference'](seed['operation'],left,right)
+    assert all(p.read_bytes()==data for p,data in parent_bytes.items()) and binding==parent_binding
+    assert json.loads(profiles.read_text())['profiles']['target']['project_configuration']==parent_binding
+
+
+@pytest.mark.parametrize('indices',[[],[0,1,2],[1,1],[-1],[True],[3]])
+def test_catlass_materialization_rejects_invalid_subsets_before_writes(catlass_parent,tmp_path,indices):
+    from dataclasses import asdict
+    from rsi.curriculum_materialization import MaterializationRejected,materialize_child
+    spec,config,binding,_,_ = catlass_parent
+    root = tmp_path/'invalid-child'
+    with pytest.raises(MaterializationRejected):
+        materialize_child(spec,dict(config=asdict(config),binding=binding),
+            dict(name='child',goal='Investigate one case',acceptance='Same oracle',
+                 template_id='catlass.case-subset',parameters=dict(case_indices=indices)),
+            root=root,remaining=300,evidence_refs=('a'*64,),operation_id='invalid')
+    assert not root.exists()
+
+
+def test_catlass_materialization_rejects_changed_parent_seed(catlass_parent,tmp_path):
+    from dataclasses import asdict
+    from rsi.curriculum_materialization import capability_catalog
+    spec,config,binding,cases,seed = catlass_parent
+    seed['cases'][0]['length']=4
+    cases.write_text(json.dumps(seed))
+    assert capability_catalog(spec,dict(config=asdict(config),binding=binding))==[]
+
+
+def test_catlass_admitted_seed_tampering_is_rejected(catlass_parent,tmp_path):
+    from dataclasses import asdict
+    from rsi.curriculum_materialization import MaterializationRejected,materialize_child,read_materialized_child
+    spec,config,binding,_,_ = catlass_parent
+    child = materialize_child(spec,dict(config=asdict(config),binding=binding),
+        dict(name='child',goal='Investigate one case',acceptance='Same oracle',
+            template_id='catlass.case-subset',parameters=dict(case_indices=[1])),
+        root=tmp_path/'tampered-child',remaining=300,evidence_refs=('a'*64,),operation_id='tamper')
+    Path(child.spec.correctness_ref).write_text('{}')
+    with pytest.raises(MaterializationRejected):
+        read_materialized_child(child.provenance['receipt']['path'],sha256=child.provenance['receipt']['sha256'])
