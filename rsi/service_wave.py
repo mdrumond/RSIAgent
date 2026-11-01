@@ -264,9 +264,10 @@ class WaveBindings:
             admission = cycle.root / 'kdb-admission.json'
             if admission.exists():
                 identity = json.loads(admission.read_text())
-                if identity['sha256'] != cycle.binding['kdb'] or identity['stat'] != file_identity(kdb_path):
+                if identity['sha256'] != cycle.binding['kdb']:
                     raise ValueError('shared read-only wave KDB differs from admitted identity')
-                kdb_stat = identity['stat']
+                kdb_stat = (identity['stat'] if identity['stat'] == file_identity(kdb_path)
+                            else verify_kdb(kdb_path, cycle.binding['kdb']))
             else:
                 kdb_stat = verify_kdb(kdb_path, cycle.binding['kdb'])
                 atomic_json(admission, dict(sha256=cycle.binding['kdb'], stat=kdb_stat))

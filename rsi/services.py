@@ -11,11 +11,13 @@ Credentials are supplied by environment, never saved in contracts. Production
 requires an existing pinned KnowledgeDB; tests must opt into TestBindings.
 """
 from dataclasses import asdict, dataclass, replace
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -25,7 +27,7 @@ from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec, Stage
 from rsi.cycles import CycleScheduler, HostTaskResult
 from rsi.learning import Learning, ProposalRejected, RejectedOperation, Validation
 from rsi.project_runner import ProjectConfig, ProjectRunner
-from rsi.project_composition import ProjectComposition
+from rsi.project_composition import ProjectComposition, verify_kdb
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
@@ -136,10 +138,17 @@ class InstanceServices:
         initial = self.store.read_bytes(parent.memory_ref)
         root.mkdir(parents=True)
         with self.setup.measure('baseline-kdb-copy', cycle_id):
-            with (root / 'knowledge.sqlite3').open('xb') as stream:
-                stream.write(self.store.read_bytes(parent.kdb_ref))
-                stream.flush()
-                os.fsync(stream.fileno())
+            # Only immutable CAS storage is shared; never link the mutable baseline.
+            snapshot_path = self.store._retention_path(parent.kdb_ref)
+            verify_kdb(snapshot_path, parent.kdb_ref)
+            try:
+                os.link(snapshot_path, root / 'knowledge.sqlite3')
+            except OSError as exc:
+                if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
+                    raise
+                shutil.copyfile(snapshot_path, root / 'knowledge.sqlite3')
+                with (root / 'knowledge.sqlite3').open('rb') as stream:
+                    os.fsync(stream.fileno())
         with self.setup.measure('accepted-memory-load', cycle_id):
             memory = self._memory(root / 'memory', initial)
         memory_ref = self.store.put_bytes(memory.snapshot())
