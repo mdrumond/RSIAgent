@@ -48,6 +48,10 @@ class ProjectWorkerFactory:
     admission_json: str
     test_bindings: object = None
     executor_factory: object = None
+    operation_executors: dict | None = None
+
+    def executor_for(self, operation):
+        return self.operation_executors[operation] if self.operation_executors is not None else self.executor_factory
 
     def prepare_worker(self, request):
         """Apply target context only in the dedicated child, before runner imports."""
@@ -68,10 +72,11 @@ class ProjectWorkerFactory:
             if self.test_bindings is None:
                 raise ValueError('production NPU worker requires a trusted host admission profile')
             return
-        if self.executor_factory is None:
+        executor = self.executor_for(request.project_id)
+        if executor is None:
             raise ValueError('trusted NPU worker environment/guard resolver required')
         inherited = dict(os.environ)
-        environment = self.executor_factory.worker_environment(identity, request, inherited=inherited)
+        environment = executor.worker_environment(identity, request, inherited=inherited)
         # This process belongs exclusively to the project; parent env is untouched.
         os.environ.clear()
         os.environ.update(environment)
@@ -86,7 +91,7 @@ class ProjectWorkerFactory:
         started, monotonic_start = time.time(), time.monotonic()
         receipt = None
         try:
-            receipt = self.executor_factory.guard(identity, request, phase='admission', remaining=remaining)
+            receipt = executor.guard(identity, request, phase='admission', remaining=remaining)
         except Exception as exc:
             receipt = getattr(exc, 'admission_receipt', dict(admitted=False,
                 observation='worker admission failed', error_type=type(exc).__name__))
@@ -104,10 +109,12 @@ class ProjectWorkerFactory:
         from rsi.services import InstanceServices
         admitted = json.loads(self.admission_json)
         operation = admitted['operations'][request.project_id]
+        executor = self.executor_for(request.project_id)
+        contracts = operation.get('binding_contracts', admitted.get('binding_contracts', {}))
         if request.memory != bytes.fromhex(admitted['memory_bytes']) or request.skills != bytes.fromhex(admitted['skills_bytes']):
             raise ValueError('worker snapshots differ from frozen service admission')
         services = InstanceServices(self.instance, test_bindings=self.test_bindings,
-                                   executor_factory=self.executor_factory)
+                                   executor_factory=executor)
         services.store = WorkerArtifacts(request.root.parent / 'service-artifacts', services.store.root)
         services.setup = SetupTelemetry(services.store)
         binding = admitted['binding']
@@ -122,7 +129,7 @@ class ProjectWorkerFactory:
         project_binding['worker_profile'] = profile
         project_binding['executor_provenance'] = admitted['identities'].get(profile)
         logical = dict(operation_id=request.project_id, spec=operation['spec'], config=operation['config'],
-            memory_ref=admitted['memory'], skills_ref=admitted['skills'], configuration_ref=admitted['configuration'])
+            memory_ref=admitted['memory'], skills_ref=admitted['skills'], configuration_ref=operation['binding']['configuration'])
         resolution = None
         binding_interval = None
         if request.reopen:
@@ -133,10 +140,10 @@ class ProjectWorkerFactory:
                 store = ContentAddressedArtifacts(request.root / 'artifacts')
                 resolution = validate_resolution(logical, store.read_json(retained['resolved_binding_ref']),
                     device=request.device, executor_identity=device.get('executor_identity'))
-            elif admitted.get('binding_contracts', {}).get(profile):
+            elif contracts.get(profile):
                 raise ValueError('existing runner lacks a frozen lease binding; never regenerate on resume')
             project_binding = retained
-        elif admitted.get('binding_contracts', {}).get(profile):
+        elif contracts.get(profile):
             started, monotonic_start = time.time(), time.monotonic()
             admission_path = request.root.parent / 'worker-admission.json'
             admission_elapsed = json.loads(admission_path.read_text())['elapsed'] if admission_path.exists() else 0.
@@ -148,7 +155,7 @@ class ProjectWorkerFactory:
                 if admitted['wall_deadline'] is not None:
                     limits.append(max(0., admitted['wall_deadline'] - time.time()))
                 return min(limits)
-            resolution = self.executor_factory.bind_project(profile, request, logical, remaining=remaining)
+            resolution = executor.bind_project(profile, request, logical, remaining=remaining)
             if request.root.exists():
                 raise ValueError('host binder must not precreate the canonical runner root')
             resolution = validate_resolution(logical, resolution, device=request.device,
@@ -180,8 +187,8 @@ class ProjectWorkerFactory:
         runner = composition.runner(request.root, spec=ProjectSpec.from_dict(spec),
             bundle=SkillBundle.from_dict(json.loads(request.skills)), config=config,
             memory_ref=admitted['memory'], backend_identity=backend, reopen=request.reopen,
-            configuration_ref=admitted['configuration'], command_guard=(
-                ProfileCommandGuard(self.executor_factory, profile)
+            configuration_ref=operation['binding']['configuration'], command_guard=(
+                ProfileCommandGuard(executor, profile)
                 if profile and device.get('executor_identity') is None else None))
         if resolution:
             from core.artifacts import canonical_bytes
@@ -270,7 +277,7 @@ class WaveBindings:
             else:
                 kdb_stat = verify_kdb(kdb_path, cycle.binding['kdb'])
                 atomic_json(admission, dict(sha256=cycle.binding['kdb'], stat=kdb_stat))
-            identities, binding_contracts = {}, {}
+            identities = {}
             for device in self.policy['devices']:
                 identity = device.get('worker_profile') or device.get('executor_identity')
                 if identity is None:
@@ -279,7 +286,7 @@ class WaveBindings:
                     continue
                 if cycle.services.executor_factory is None:
                     raise ValueError('ignored host executor profile resolver required')
-                resolver = cycle.project_executor_factory(ProjectSpec.from_dict(wave['operations'][0]['spec']))
+                resolver = cycle.services.executor_factory
                 if not all(callable(getattr(resolver, name, None)) for name in
                            ('metadata', 'worker_environment', 'guard')):
                     raise ValueError('NPU profiles must provide trusted worker context and health/policy guards')
@@ -289,14 +296,19 @@ class WaveBindings:
                 if metadata['executor_identity'] != device.get('executor_identity'):
                     raise ValueError('worker placement differs from configured local/target execution binding')
                 identities[identity] = metadata
-                contract = resolver.binding_contract(identity) if callable(getattr(resolver, 'binding_contract', None)) else None
-                if contract:
-                    binding_contracts[identity] = contract
-                elif cycle.services.test is None:
-                    raise ValueError('production NPU profiles require a shipped lease-bound project binder')
             admissions = {}
             for op in wave['operations']:
                 spec = ProjectSpec.from_dict(op['spec'])
+                resolver = cycle.project_executor_factory(spec)
+                contracts = {}
+                for identity, metadata in identities.items():
+                    if resolver.metadata(identity) != metadata:
+                        raise ValueError('operation resolver differs from admitted device/runtime identity')
+                    contract = resolver.binding_contract(identity) if callable(getattr(resolver, 'binding_contract', None)) else None
+                    if contract:
+                        contracts[identity] = contract
+                    elif cycle.services.test is None:
+                        raise ValueError('production NPU profiles require a shipped lease-bound project binder')
                 binding = dict(memory=wave['memory'], skills=wave['skills'],
                     configuration=cycle.project_configuration(spec), kdb=cycle.binding['kdb'],
                     provider=cycle.config['provider'], test_identity=cycle.binding['test_identity'],
@@ -306,7 +318,7 @@ class WaveBindings:
                 source_hash = source_identity(config['source'], verifier=config['verifier'],
                                               generated_paths=config.get('generated_paths', ()))
                 elapsed = time.monotonic() - monotonic_start
-                admissions[op['id']] = dict(spec=op['spec'], binding=binding, config=config,
+                admissions[op['id']] = dict(spec=op['spec'], binding=binding, config=config, binding_contracts=contracts,
                     logical_source_identity=source_hash, source_interval=dict(started=started,
                     elapsed=elapsed, ended=max(time.time(), started + elapsed)))
                 relative = Path('waves') / wave['id'] / 'projects' / op['id'] / 'runner'
@@ -316,7 +328,7 @@ class WaveBindings:
                 memory=wave['memory'], skills=wave['skills'],
                 memory_bytes=cycle.store.read_bytes(wave['memory']).hex(),
                 skills_bytes=cycle.store.read_bytes(wave['skills']).hex(), devices=self.policy['devices'],
-                identities=identities, binding_contracts=binding_contracts, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
+                identities=identities, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
             wave['admission_ref'] = cycle.store.put_json(admitted)
             state['active_wave'] = wave
             cycle.scheduler._save()
@@ -325,12 +337,16 @@ class WaveBindings:
     def _factory(self, wave):
         cycle = self.cycle
         admitted = cycle.store.read_json(wave['admission_ref'])
-        resolver = cycle.project_executor_factory(ProjectSpec.from_dict(wave['operations'][0]['spec']))
-        if admitted['identities']:
-            resolver = FrozenExecutorFactory(resolver, json.dumps(admitted['identities'], sort_keys=True),
-                json.dumps(admitted.get('binding_contracts', {}), sort_keys=True))
+        executors = {}
+        for operation, row in admitted['operations'].items():
+            resolver = cycle.project_executor_factory(ProjectSpec.from_dict(row['spec']))
+            if admitted['identities']:
+                contracts = row.get('binding_contracts', admitted.get('binding_contracts', {}))
+                resolver = FrozenExecutorFactory(resolver, json.dumps(admitted['identities'], sort_keys=True),
+                    json.dumps(contracts, sort_keys=True))
+            executors[operation] = resolver
         return ProjectWorkerFactory(str(cycle.services.root), str(cycle.root),
-            json.dumps(admitted), cycle.services.test, resolver)
+            json.dumps(admitted), cycle.services.test, cycle.services.executor_factory, executors)
 
     def _runner(self, operation):
         return self.cycle.open_project(operation)
@@ -407,7 +423,7 @@ class WaveBindings:
                 return False
             deadline = monotonic_start + min(45., remaining)
             try:
-                receipt = self._factory(wave).executor_factory.guard(record['profile'], request,
+                receipt = self._factory(wave).executor_for(operation).guard(record['profile'], request,
                     phase='admission', remaining=lambda: max(0., deadline - time.monotonic()))
             except Exception as exc:
                 receipt = getattr(exc, 'admission_receipt', dict(admitted=False,
@@ -471,9 +487,16 @@ class WaveBindings:
         self.active_pool = pool
         try:
             if wave['phase'] == 'executing':
-                pool.run(self._factory(wave), should_stop=getattr(cycle, 'should_stop', None),
-                         progress=getattr(cycle, 'wave_progress', None))
-                self.observe()
+                while True:
+                    pool.run(self._factory(wave), should_stop=getattr(cycle, 'should_stop', None),
+                             progress=getattr(cycle, 'wave_progress', None))
+                    before = pool.status()
+                    observed = self.observe()
+                    # A closed failed worker releases its lease only through host
+                    # observation. Drain READY siblings on that proven free slot.
+                    if (observed['stopped'] or not any(r['status'] == 'ready' for r in observed['projects'].values())
+                            or before == observed):
+                        break
             rows = pool.status()['projects']
             if any(row['status'] != 'completed' for row in rows.values()):
                 raise RuntimeError('wave unsettled; observe retained controllers and target handles')

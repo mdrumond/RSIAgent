@@ -25,13 +25,60 @@ class Phase1Recovery:
         self.query_adapter = None
 
     def project_config(self, spec):
-        row = self.cycle.scheduler.state.get('derived_projects', {}).get(spec.project_id)
+        row = (self.cycle.scheduler.state.get('derived_projects', {}).get(spec.project_id)
+            or self.cycle.scheduler.state.get('original_retry_inputs', {}).get(spec.project_id))
         if row:
             config = ProjectConfig.from_dict(self.cycle.store.read_json(row['config_ref']))
             if tuple(config.commands['test']) != spec.command:
                 raise ValueError('derived command differs from its retained config')
             return config
         return self.cycle.services.project_config(self.cycle.config, spec)
+
+    def original_retry(self, spec, row, context):
+        """Snapshot the latest ORIGINAL source; never substitute a child workload."""
+        existing = self.cycle.scheduler.state.get('original_retry_inputs', {}).get(spec.project_id)
+        if existing and existing['operation_id'] == context['operation_id']:
+            return ProjectSpec.from_dict(existing['spec'])
+        parent_spec, wire = self.parent(row)
+        config = wire['config'] if isinstance(wire, dict) and 'config' in wire else wire
+        config = asdict(config) if isinstance(config, ProjectConfig) else config
+        binding = wire.get('binding') if isinstance(wire, dict) else None
+        if binding:
+            from rsi.curriculum_materialization import _argument, _copy_source, _triton_bindings
+            from rsi.triton_worker_binding import case_identity
+            import shutil
+            previous = ProjectConfig.from_dict(config)
+            root = self.cycle.root / 'original-retries' / context['operation_id']
+            root.mkdir(parents=True)  # Partial preparations require observation, never overwrite.
+            inputs = root / 'inputs'
+            inputs.mkdir()
+            oracle, cases = root / 'verify.py', inputs / 'cases.json'
+            with self.cycle.services.setup.measure('original-retry-inputs', context['operation_id']):
+                _copy_source(previous, root / 'project', triton=True)
+                shutil.copyfile(previous.verifier, oracle)
+                shutil.copyfile(_argument(previous, '--cases'), cases)
+                spec, rebuilt, binding = _triton_bindings(parent_spec, previous, binding,
+                    replace(spec, correctness_ref=str(cases)), root / 'project', cases, inputs, oracle, root)
+            if any(getattr(rebuilt, field) != getattr(previous, field) for field in
+                   ('editable_files', 'generated_paths', 'retained_paths', 'performance_seconds')):
+                raise ValueError('original retry changed editable/output or performance policy')
+            if case_identity(rebuilt) != case_identity(previous):
+                raise ValueError('original retry changed the full cases or independent oracle')
+            config = asdict(rebuilt)
+        elif tuple(config['commands']['test']) != spec.command:
+            raise ValueError('original retry must preserve its frozen oracle command')
+        derived = dict(self.cycle.config, project_configs={**self.cycle.config.get('project_configs', {}),
+            spec.project_id: config})
+        spec = replace(spec, starting_folder=config['source'])
+        derived['curriculum_context'] = dict(retry_original=True, project_id=spec.project_id,
+            memory_ref=self.cycle.scheduler.state['memory'])
+        entry = dict(config_ref=self.cycle.store.put_json(config), operation_id=context['operation_id'],
+                     spec=spec.to_dict(), configuration_ref=self.cycle.store.put_json(_snapshot(derived)))
+        if binding:
+            entry['binding'] = binding
+        self.cycle.scheduler.state.setdefault('original_retry_inputs', {})[spec.project_id] = entry
+        self.cycle.scheduler._save()
+        return spec
 
     def observed_proof(self, admitted, facts):
         proof = dict(facts.get('proof_scope', {}))
@@ -93,7 +140,8 @@ class Phase1Recovery:
     def executor_factory(self, spec):
         factory = self.cycle.services.executor_factory
         row = self.cycle.scheduler.state.get('derived_projects', {}).get(spec.project_id)
-        binding = self.cycle.store.read_json(row['provenance_ref']).get('binding') if row else None
+        retry = self.cycle.scheduler.state.get('original_retry_inputs', {}).get(spec.project_id)
+        binding = self.cycle.store.read_json(row['provenance_ref']).get('binding') if row else (retry or {}).get('binding')
         if binding:
             if not callable(getattr(factory, 'with_project_configuration', None)):
                 raise ValueError('derived target requires a scoped registered binder')
@@ -101,7 +149,8 @@ class Phase1Recovery:
         return factory
 
     def configuration_ref(self, spec):
-        entry = self.cycle.scheduler.state.get('derived_projects', {}).get(spec.project_id)
+        entry = (self.cycle.scheduler.state.get('derived_projects', {}).get(spec.project_id)
+            or self.cycle.scheduler.state.get('original_retry_inputs', {}).get(spec.project_id))
         return entry['configuration_ref'] if entry else self.cycle.spec.configuration_ref
 
     def parent(self, row):
@@ -118,7 +167,9 @@ class Phase1Recovery:
         binding = json.loads((root / 'service-binding.json').read_text())
         profile = binding.get('worker_profile') or config.get('executor_identity')
         if profile:
-            registered = c.services.executor_factory.project_binding(profile)['configuration']
+            factory = c.project_executor_factory(spec)
+            registered = (getattr(factory, 'configuration', None)
+                          or c.services.executor_factory.project_binding(profile)['configuration'])
             config = dict(config=config, binding=registered)
         return spec, config
 
@@ -173,9 +224,12 @@ class Phase1Recovery:
         inputs = {}
         failures = {}
         for row in c.scheduler.state['recovery_queue']:
-            spec, config = self.parent(row['result'])
+            if c.scheduler.config.get('deferred_recovery') and (row.get('status') != 'queued'
+                    or row['eligible_wave'] > c.scheduler.state['wave']):
+                continue
+            spec, config = self.parent(row.get('root_result', row['result']))
             inputs[spec.project_id] = (spec, config)
-            failures[spec.project_id] = self.failure(row['result'])
+            failures[spec.project_id] = self.failure(row.get('root_result', row['result']))
             parents.append(dict(project_id=spec.project_id, spec=spec.to_dict(),
                 failure=failures[spec.project_id], templates=capability_catalog(spec, config)))
         exhausted = not any(item['templates'] for item in parents)
@@ -212,6 +266,9 @@ class Phase1Recovery:
                 except ResearchRejected as error:
                     state['history'].append(dict(receipt_ref=error.receipt_ref, actor_seconds=error.actor_seconds))
                     state['rejections'].append(error.receipt_ref)
+                    if c.scheduler.config.get('deferred_recovery'):
+                        state.update(complete=True, deferred=True, reason='investigation_failed')
+                        break
                     atomic_json(path, state)
                     continue
                 finally:
@@ -243,6 +300,9 @@ class Phase1Recovery:
             except MaterializationRejected as error:
                 state['rejections'].append(c.store.put_json(dict(status='rejected', error=str(error))))
                 state.pop('selected')
+                if c.scheduler.config.get('deferred_recovery'):
+                    state.update(complete=True, deferred=True, reason='materialization_failed')
+                    break
                 atomic_json(path, state)
                 continue
             config = asdict(child.config) if isinstance(child.config, ProjectConfig) else child.config

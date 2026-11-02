@@ -19,7 +19,7 @@ def autonomous(instance, cpu):
     observations = instance.store.put_json(dict(applicability=dict(project_id=parent.project_id,
         final_source_hash='c'*64, project_contract_ref='b'*64), artifact_refs=[]))
     facts = instance.store.put_json(dict(project_id=parent.project_id, outcome='budget_exhausted',
-        original_actor_seconds_total=7200., source_hash='c'*64, observations_ref=observations, artifact_refs=[observations],
+        original_actor_seconds_total=50., source_hash='c'*64, observations_ref=observations, artifact_refs=[observations],
         error='scripted historical fixture, not a production failure witness',
         proof_scope=dict(actor_closed=True, provider_settled=True, accounting_unknown=False),
         origin_task_archive=dict(scope='origin-task-archive', service_result=archive)))
@@ -63,12 +63,14 @@ def test_derived_config_executes_canonical_stages_and_feeds_memory_without_root_
     child_configuration = cycle.project_configuration(revised.spec)
     assert child_configuration != cycle.spec.configuration_ref
     result = cycle.step()
+    while result is None:
+        result = cycle.step()
     assert result.outcome == 'accepted'
     row = cycle.scheduler.state['recoveries'][0]
     runner = cycle.open_project(row['operation_id'])
     assert runner.spec.project_id == revised.spec.project_id
     assert {Stage(item['evidence']['stage']) for item in runner.workflow.state['history']} == set(Stage)
-    assert runner.store.read_json(facts)['original_actor_seconds_total'] == 7200
+    assert runner.store.read_json(facts)['original_actor_seconds_total'] == 50
     with pytest.raises(FileNotFoundError):
         runner.store.read_bytes(archive)
     child_result = cycle.load_project(row)
@@ -84,6 +86,14 @@ def test_derived_config_executes_canonical_stages_and_feeds_memory_without_root_
     positive = cycle.memory.records()[-1]['proposal']
     assert positive['kind'] == 'correctness'
     assert positive['observations']['applicability']['project_id'] == revised.spec.project_id
+    assert cycle.scheduler.state['recovery_queue'][0]['status'] == 'queued'
+    retried = cycle.step()
+    while retried is None or not hasattr(retried, 'outcome'):
+        retried = cycle.step()
+    assert retried.outcome == 'accepted'
+    assert cycle.scheduler.state['root_retries'][0]['project']['project_id'] == parent.project_id
+    assert cycle.scheduler.state['originals'] == []
+    assert cycle.scheduler.state['recovery_queue'][0]['status'] == 'accepted'
     assert original == {path: path.read_bytes() for path in original}
 
 
@@ -140,3 +150,78 @@ def test_exhausted_host_catalog_defers_without_research_or_setup(autonomous, mon
     assert receipt['reason'] == 'no-admitted-simpler-template'
     assert cycle.scheduler.state['recovery_queue']
     assert not cycle.scheduler.state.get('derived_projects')
+
+
+def deferred_wave_query(payload):
+    return dict(results=[],negative_records=[],provenance={'fixture':True})
+
+
+class DeferredWaveDecisions:
+    """Explicit CPU test actor: the first root provider closes; retries run normally."""
+    def __init__(self):
+        from test_rsi_services import Decisions
+        self.delegate = Decisions()
+    def prepare(self, *args, **kwargs):
+        return self.delegate.prepare(*args, **kwargs)
+    def next_action(self, context, allowed, **kwargs):
+        from coding.pi.rpc import PiProviderError
+        if (context['task']['project']['project_id'] == '0'
+                and not context['task'].get('curriculum_context', {}).get('retry_original')):
+            raise PiProviderError('explicit closed provider-failure fixture for original 0')
+        return self.delegate.next_action(context, allowed, **kwargs)
+    def close(self):
+        self.delegate.close()
+
+
+def test_actual_cpu_wave_drains_ordinary_siblings_then_retries_original_in_later_wave(instance, cpu):
+    from dataclasses import replace
+    from rsi.services import TestBindings
+    from test_rsi_services import Roles
+    parent, config, _ = cpu
+    settings=show_configuration(instance.root)['payload']
+    specs=[replace(parent, project_id=str(i)) for i in range(3)]
+    settings.update(phase1_projects=[p.to_dict() for p in specs],
+        project_configs={p.project_id:asdict(config) for p in specs},
+        curriculum=dict(enabled=True, project_actor_seconds=15),
+        recovery=dict(enabled=True, max_failed_attempts=2),
+        cycle_limits=dict(wave_size=2, actor_seconds=300, recovery_seconds=100),
+        project_wave=dict(max_parallel=1, wave_size=2, devices=[dict(device='cpu0')]))
+    set_configuration(instance.root,settings)
+    instance.test=TestBindings(deferred_wave_query,
+        DeferredWaveDecisions,Roles,'explicit-test-binding')
+    observed=[]
+    class Research:
+        def research(self, spec, failure, context):
+            snapshot=json.loads((instance.root/'runs/next-wave/cycle.json').read_text())
+            assert [row['outcome'] for row in snapshot['originals']]==['failed','accepted']
+            assert context['wave']==2
+            observed.append(context)
+            receipt=instance.store.put_json(dict(kind='scripted-wave-research'))
+            return ResearchResult(DiagnosticProposal('one frozen case','Study one input','Frozen oracle passes',
+                'cpu.case-subset',dict(case_indices=[0]),spec.project_id),(receipt,),.1,receipt)
+        def actor_context(self, receipt):
+            return dict(rationale='explicit scripted investigation fixture',evidence_refs=[receipt])
+    instance.curriculum_researcher=Research()
+    cycle=instance.create_cycle('next-wave','phase1')
+    try:
+        for _ in range(40):
+            if cycle.scheduler.state['phase']=='complete':break
+            cycle.step()
+        assert cycle.scheduler.state['phase']=='complete'
+        assert len(observed)==1
+        state=cycle.scheduler.state
+        assert [r['outcome'] for r in state['originals']]==['failed','accepted','accepted']
+        assert len(state['recoveries'])==1 and state['recoveries'][0]['outcome']=='accepted'
+        assert len(state['root_retries'])==1 and state['root_retries'][0]['outcome']=='accepted'
+        assert state['recovery_queue'][0]['status']=='accepted'
+        waves=state['wave_history']
+        assert [op['kind'] for op in waves[0]['operations']]==['original','original']
+        mixed=next(w for w in waves if {op['kind'] for op in w['operations']}=={'original','recovery'})
+        assert mixed['memory']!=waves[0]['memory']
+        retry=next(w for w in waves if w['operations'][0]['kind']=='root_retry')
+        assert retry['memory']!=mixed['memory']
+        records=cycle.memory.records()
+        assert any(r['proposal']['kind']=='failure' for r in records)
+        assert sum(r['proposal']['kind']=='correctness' for r in records)==4
+    finally:
+        cycle.close()

@@ -23,6 +23,8 @@ def register(commands):
         for action in ('stop', 'resume', 'revisit', 'adopt', 'reconcile', 'recover'):
             entry = actions.add_parser(action)
             entry.add_argument('--job', required=True)
+            if action == 'resume' and mode == 'phase1':
+                entry.add_argument('--reopen-project', action='append', default=[])
             if action in ('reconcile', 'recover'):
                 entry.add_argument('--operation')
                 entry.add_argument('--observation', type=Path)
@@ -79,6 +81,10 @@ def execute(args):
         if args.action == 'stop':
             return jobs.stop(args.instance, args.job)
         request = dict(previous['request'], action=args.action, previous_job=args.job)
+        if args.action == 'resume':
+            request.pop('reopen_projects', None)
+            if getattr(args, 'reopen_project', []):
+                request['reopen_projects'] = list(args.reopen_project)
         if args.action in ('reconcile', 'recover'):
             request['operation_id'] = args.operation
             request['observation'] = json.loads(args.observation.read_text()) if args.observation else None

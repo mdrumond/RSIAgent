@@ -108,6 +108,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
                 except (ValueError, RuntimeError) as exc:
                     return dict(status='observation_required' if cycle.waves else 'suspended', cycle_id=cycle_id, error=str(exc),
                                 pending=cycle.scheduler.state['pending'], tuning_pending=cycle.tuning.state['pending'])
+            for project_id in request.get('reopen_projects', []):
+                cycle.scheduler.reopen_original(project_id)
             cycle.scheduler.resume()
             if cycle.waves:
                 cycle.waves.resume()

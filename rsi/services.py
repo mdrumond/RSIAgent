@@ -250,8 +250,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
             allowance = policy.get('recovery_seconds')
             if type(allowance) not in (int, float) or not 0 < allowance < float('inf'):
                 raise ValueError('autonomous curriculum requires an explicit finite recovery_seconds pool')
-            policy.setdefault('recovery_limit', None)
+            policy['recovery_limit'] = None
             policy['recovery_feedback'] = True
+            policy['retry_original'] = self.curriculum.original_retry
+            policy['max_failed_recovery_attempts'] = self.config.get('recovery', {}).get('max_failed_attempts', 5)
         if self.config.get('project_wave'):
             policy.setdefault('recovery_limit', None)
         first_clock = not state_path.exists()
@@ -427,7 +429,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def finish_project(self, runner, operation, result, original_id=None):
         pending = self.scheduler.state['pending']
-        if not pending or pending['id'] != operation or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['id'] != operation or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('no matching scheduler admission')
         original_id = original_id or pending['original_id']
         outcome, failure = result['status'], None
@@ -484,7 +486,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 op = admitted['operations'][operation]
                 logical = dict(operation_id=operation, spec=op['spec'], config=op['config'],
                     memory_ref=admitted['memory'], skills_ref=admitted['skills'],
-                    configuration_ref=admitted['configuration'])
+                    configuration_ref=op['binding']['configuration'])
                 if binding.get('logical_admission_hash') != admission_hash(logical):
                     raise ValueError('resolved project differs from admitted logical operation')
                 row = json.loads((self.root / 'waves' / wave_id / 'wave.json').read_text())['projects'][operation]
@@ -559,9 +561,15 @@ class BoundCycle(ProjectComposition, TuningBindings):
         raw = list(result['events'])
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
+        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
+        investigation = row.get('investigation_receipt_ref')
+        if investigation:
+            receipt = self.store.read_json(investigation)
+            evidence[investigation] = dict(kind='failure', summary='Host investigation did not produce a runnable diagnostic')
+            raw.append(investigation)
         return dict(project_id=row['original_id'], outcome=host_outcome,
-            evidence={row['artifact_ref']: dict(kind=kind, summary=summary)},
-            queries=queries, usage=usage, raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
+            evidence=evidence, queries=queries, usage=usage,
+            raw_refs=[*raw, observations_ref, *observations['artifact_refs']],
             observations=observations, observations_ref=observations_ref)
 
     def isolate(self, memory, skills, context):
@@ -656,11 +664,18 @@ class BoundCycle(ProjectComposition, TuningBindings):
     def reconcile(self, *, dispatch_ready=False):
         """Observe existing project completion; no new provider dispatch."""
         pending = self.scheduler.state['pending']
+        if pending and pending['kind'] == 'prepare_retry' and self.curriculum:
+            entry = self.scheduler.state.get('original_retry_inputs', {}).get(pending['original_id'])
+            if not entry or entry['operation_id'] != pending['id']:
+                raise WorkflowError('original input preparation requires host observation')
+            spec = ProjectSpec.from_dict(entry['spec'])
+            self.scheduler.reconcile(pending['id'], spec)
+            return spec
         if pending and pending['kind'] == 'simplify' and self.curriculum:
             result = self.curriculum.retained(pending['id'])
             self.scheduler.reconcile(pending['id'], result)
             return result
-        if self.waves and self.scheduler.state.get('active_wave') and pending and pending['kind'] in ('original', 'recovery'):
+        if self.waves and self.scheduler.state.get('active_wave') and pending and pending['kind'] in ('original', 'recovery', 'root_retry'):
             if dispatch_ready:
                 self.waves.continue_ready()
             state = self.waves.observe()
@@ -704,7 +719,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
         pending = self.scheduler.state['pending']
         if pending and pending['kind'] == 'skill':
             return self.reject_writer()
-        if not pending or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('explicit learning/absence reconciliation required')
         runner = self.open_project(pending['id'])
         path = runner.root / 'service-result.json'
@@ -791,7 +806,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             self.waves.observe()
             raise ValueError('use wave resume after observing retained project handles')
         pending = self.scheduler.state['pending']
-        if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery'):
+        if not pending or pending['id'] != operation_id or pending['kind'] not in ('original', 'recovery', 'root_retry'):
             raise ValueError('explicit continuation requires matching unfinished scheduler admission')
         runner = self.open_project(operation_id)
         # Observation may finish a durable receipt, but must never replay unknown work.

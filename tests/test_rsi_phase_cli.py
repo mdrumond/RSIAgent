@@ -118,3 +118,14 @@ def test_revisit_does_not_turn_later_resume_into_old_manual_tuning(instance, mon
     assert main(['--instance', str(instance), 'phase2', 'revisit', '--job', identity, '--cycle', 'new']) == 0
     assert 'origin_action' not in calls[0] and 'steering' not in calls[0]
     assert calls[0]['from_cycle'] == 'old' and calls[0]['inheritance'] == 'parent'
+
+
+def test_explicit_reopen_is_one_resume_request_and_not_replayed_on_plain_resume(instance,monkeypatch):
+    job_id,_=previous(instance,mode='phase1')
+    calls=[]
+    monkeypatch.setattr(jobs,'start',lambda root,request:calls.append(request) or {})
+    assert main(['--instance',str(instance),'phase1','resume','--job',job_id,
+                 '--reopen-project','failed-original'])==0
+    assert calls[0]['reopen_projects']==['failed-original']
+    assert main(['--instance',str(instance),'phase1','resume','--job',job_id])==0
+    assert 'reopen_projects' not in calls[1]
