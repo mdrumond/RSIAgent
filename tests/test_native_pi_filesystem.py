@@ -116,6 +116,18 @@ def test_mutation_requires_live_admitted_operation(tmp_path, reason):
     assert execution.project_hash() == before
 
 
+def test_unbounded_deadline_allows_native_read_and_pending_write(tmp_path):
+    execution, operation, files = pending(tmp_path)
+    calls = []
+    scope = dict(context(operation), remaining=lambda: calls.append(True))
+    target = execution.project/'helper.py'
+    result = files.read(dict(path=str(target)), scope)['details']
+    assert base64.b64decode(result['data']) == target.read_bytes()
+    files.write(dict(path=str(target), content='value = 9\n'), scope)
+    assert target.read_text() == 'value = 9\n'
+    assert len(calls) == 2
+
+
 @pytest.fixture
 def scripted_provider():
     calls, requests = [], []
