@@ -56,8 +56,9 @@ async function start(config) {
     settingsManager:settings, resourceLoader:loader, noTools:'builtin',
     customTools:[...tools, ...(native.tools || [])]}));
   session.subscribe(event => {
-    if (event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error')
-      failure = event.message.errorMessage || 'Native provider failed';
+    if (event.type === 'message_end' && event.message.role === 'assistant')
+      failure = event.message.stopReason === 'error'
+        ? event.message.errorMessage || 'Native provider failed' : undefined;
     send(event);
   });
   send({type:'ready', session_file:session.sessionManager.getSessionFile()});
