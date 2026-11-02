@@ -62,8 +62,11 @@ def compose_adaptive_controller(
         retain_semantic_failure=True,
         **({"trace_recorder_factory": trace_recorder_factory} if trace_recorder_factory is not None else {}),
     )
+    from benchmarks.ascend.native_curriculum import NativeSubjectRole
+    curriculum_role = NativeSubjectRole(Path(root) / "native-curriculum", profile,
+                                        provider.coding_environment())
     curriculum = CurriculumAgent(
-        lambda messages: provider.complete(profile, messages).text,
+        curriculum_role,
         target_policy=target_policy, profiling_guidance=profiling_guidance,
         unavailable_capabilities=unavailable_capabilities,
         query_knowledge=curriculum_query_knowledge,

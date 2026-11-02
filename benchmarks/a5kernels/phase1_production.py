@@ -440,8 +440,6 @@ def build_phase1_live_dependencies(
         raise ValueError("production Catlass revision does not match the Phase 1 pin")
     values = load_direct_environment(environment, env_file=env_file)
     provider = DirectCompletionProvider(values, transport=transport)
-    if transport is openai_compatible_transport and importlib.util.find_spec("openai") is None:
-        raise RuntimeError("the openai package is required for direct providers")
     if not paths.results_root.parent.is_dir():
         raise ValueError("results root parent does not exist")
     if not paths.kdb.is_file() or not paths.bge_cache.is_dir():
