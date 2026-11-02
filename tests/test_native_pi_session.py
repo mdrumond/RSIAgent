@@ -165,3 +165,32 @@ def test_native_feedback_abort_and_unknown_closure_are_distinct(tmp_path, monkey
             else:
                 assert not result.provider_settled and result.pending_tools == ('native-call-1',)
                 assert not any(e['type']=='agent_settled' for e in events)
+
+
+@pytest.mark.parametrize('during_prepare', [False, True])
+def test_expired_new_prompt_never_dispatches_provider(tmp_path, monkeypatch, provider, during_prepare):
+    from coding.pi.native import DeadlineExceeded
+    import coding.pi.native as native
+    url, requests = provider
+    profile = native.model_profile
+    monkeypatch.setattr(native, 'model_profile', lambda name: dict(profile(name), base_url=url))
+    session = NativeSession(tmp_path, environ={'DEEPSEEK_API_KEY': 'fixture-secret'})
+    left = [1. if during_prepare else 0.]
+    if during_prepare:
+        prepare = session.prepare
+        def becomes_expired(*args, **kwargs):
+            result = prepare(*args, **kwargs)
+            left[0] = 0.
+            return result
+        monkeypatch.setattr(session, 'prepare', becomes_expired)
+    try:
+        with pytest.raises(DeadlineExceeded) as rejected:
+            session.prompt('This must not reach the provider.', operation_id='expired', remaining=lambda: left[0])
+        assert not requests and not session.awaiting_settlement
+        assert rejected.value.settlement.provider_settled
+        assert rejected.value.settlement.status == 'not_dispatched'
+        assert not rejected.value.settlement.pending_tools
+        if not during_prepare:
+            assert session.process is None
+    finally:
+        session.close()

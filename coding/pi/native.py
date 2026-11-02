@@ -229,12 +229,19 @@ class NativeSession:
                 return result
 
     def prompt(self, text, *, operation_id, remaining=None):
-        self.prepare()
         if self.running or self.closed:
             raise NativeError('native session is busy or closed')
         if self.awaiting_settlement:
             raise NativeError('prior native operation requires settlement reconciliation',
                               settlement=self._settlement('unknown'))
+        def admit():
+            left = remaining() if remaining else None
+            if left is not None and left <= 0:
+                raise DeadlineExceeded('native deadline exhausted before provider dispatch',
+                                       settlement=self._settlement('not_dispatched'))
+        admit()
+        self.prepare()  # Setup has its own timeout; it is not an actor allocation.
+        admit()  # A lazy setup may have consumed the enclosing wall allowance.
         self.operation_id, self.running, self.provider_settled = operation_id, True, False
         self.awaiting_settlement = True
         self.cancelled.clear()
