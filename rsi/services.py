@@ -256,9 +256,6 @@ class BoundCycle(ProjectComposition, TuningBindings):
         from rsi.phase1_recovery import Phase1Recovery, configured
         self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
         if self.curriculum:
-            allowance = policy.get('recovery_seconds')
-            if type(allowance) not in (int, float) or not 0 < allowance < float('inf'):
-                raise ValueError('autonomous curriculum requires an explicit finite recovery_seconds pool')
             policy['recovery_limit'] = None
             policy['recovery_feedback'] = True
             policy['retry_original'] = self.curriculum.original_retry

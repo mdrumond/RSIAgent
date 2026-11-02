@@ -298,7 +298,7 @@ def materialize_child(parent_spec, parent_config, proposal, *, root, remaining, 
         child = replace(child, command=tuple(commands['test']))
     allocated = min(allocated, allowance())
     limits = replace(parent_spec.budgets, actor_seconds=allocated,
-                     wall_seconds=min(parent_spec.budgets.wall_seconds, allocated)
+                     wall_seconds=allocated
                      if parent_spec.budgets.wall_seconds is not None else None)
     child = replace(child, budgets=limits)
     if child_binding:

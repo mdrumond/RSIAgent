@@ -31,11 +31,17 @@ class HostTaskResult:
     outcome: str
     artifact_ref: str
     actor_seconds: float
+    classification: str | None = None
+    terminal_failure_ref: str | None = None
+    audit_ref: str | None = None
 
     def __post_init__(self):
         if not self.outcome or not self.artifact_ref:
             raise ValueError('host outcome and retained result reference required')
         _seconds(self.actor_seconds)
+        if self.classification == 'harness_failure' and (
+                self.outcome == 'accepted' or not self.terminal_failure_ref or not self.audit_ref):
+            raise ValueError('harness failure requires terminal proof and scoped host audit')
 
 
 @dataclass(frozen=True)
@@ -142,7 +148,9 @@ class CycleScheduler:
     Inference requires isolate(memory, skills, context) -> IsolationSnapshot
     before any project runs. This hook must publish truly isolated store branches.
     simplify(spec, result, context) -> SimplificationResult is Phase1-only.
-    Its spec and context receive remaining parent/recovery elapsed limits.
+    Legacy hooks receive remaining parent/recovery elapsed limits. Deferred
+    Phase1 projects receive fresh independent allocations; cycle totals remain
+    telemetry and explicit stop still prevents further dispatch.
     Phase2/inference recovery is emitted as deferred work for paired evaluation.
     """
 
@@ -244,7 +252,8 @@ class CycleScheduler:
                 or s['phase'] != 'original' or s['cursor'] or s['completed_operations']
                 or s['pending'] or s['originals'] or s['recoveries'] or s['spent'] or not receipt_ref):
             raise WorkflowError('failed-parent admission requires a fresh configured Phase1 boundary')
-        if not any(self.config[key] is not None for key in ('actor_seconds', 'recovery_seconds')):
+        if not self.config.get('deferred_recovery') and not any(
+                self.config[key] is not None for key in ('actor_seconds', 'recovery_seconds')):
             raise ValueError('diagnostic recovery requires an explicit finite elapsed allocation')
         failed = []
         for row in rows:
@@ -273,18 +282,14 @@ class CycleScheduler:
 
     def _root_remaining(self, item):
         limit = item.get('root_actor_limit', item['root_spec']['budgets']['actor_seconds'])
+        if self.config.get('deferred_recovery'):
+            return limit
         return None if limit is None else max(0., limit - item['root_spent'])
 
     def _eligible(self, *, unprepared=False):
         rows = []
         for item in self.state['recovery_queue']:
             if item.get('status') != 'queued' or item['eligible_wave'] > self.state['wave']:
-                continue
-            if self._root_remaining(item) == 0:
-                item['status'] = 'budget_exhausted'
-                continue
-            if item['action'] == 'diagnostic' and self.remaining()['recovery_seconds'] == 0:
-                item['status'] = 'budget_exhausted'
                 continue
             if not unprepared or item['action'] == 'diagnostic' and not item.get('prepared'):
                 rows.append(item)
@@ -331,12 +336,19 @@ class CycleScheduler:
     def _context(self, operation):
         context = dict(operation_id=operation['id'], namespace=self.state['namespace'],
                     wave=self.state['wave'], original_project_id=operation.get('original_id'),
-                    recovery=operation.get('recovery', False), root_retry=operation['kind'] == 'root_retry', remaining=self.remaining())
+                    recovery=operation.get('recovery', False), root_retry=operation['kind'] == 'root_retry', remaining=self._allocation_remaining())
         if operation['kind'] == 'skill' and self.state['originals']:
             context['previous_skill_rejections'] = [copy.deepcopy(row) for row in
                 self.state.get('rejected_skill_updates', {}).values()
                 if row['project_ref'] == self.state['originals'][-1]['artifact_ref']]
         return context
+
+    def _allocation_remaining(self):
+        # Retained cycle pools remain telemetry. Deferred Phase1 projects each
+        # own their allocation; explicit stop still prevents dispatch.
+        if self.config.get('deferred_recovery'):
+            return dict(actor_seconds=None, recovery_seconds=None, wall_seconds=None)
+        return self.remaining()
 
     def reconcile_rejected_skill(self, result):
         """Charge observed rejection once, retaining the task and pending history.
@@ -430,7 +442,7 @@ class CycleScheduler:
             count = 1
         elif size:
             count = min(count, size - len(s['wave_results']))
-        remaining = self.remaining()
+        remaining = self._allocation_remaining()
         if count < 1 or remaining['wall_seconds'] is not None and remaining['wall_seconds'] <= 0:
             raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
         candidates = []
@@ -485,7 +497,7 @@ class CycleScheduler:
             raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
         wave = dict(id=uuid.uuid4().hex, operations=operations, memory=s['memory'], skills=s['skills'],
                     phase='executing', wall_deadline=(s['created'] + self.config['wall_seconds']
-                    if self.config['wall_seconds'] is not None else None))
+                    if not self.config.get('deferred_recovery') and self.config['wall_seconds'] is not None else None))
         s['pending'] = operations[0]
         s['active_wave'] = wave
         self._save()
@@ -512,7 +524,7 @@ class CycleScheduler:
             self._wave_end()
             self._save()
             return None
-        remaining = self.remaining()
+        remaining = self._allocation_remaining()
         if self.config.get('deferred_recovery') and s['phase'] == 'prepare_wave':
             eligible = self._eligible()
             target = next((r for r in eligible if not r.get('prepared')), None)
@@ -649,6 +661,14 @@ class CycleScheduler:
                 raise TypeError('host task result required')
             row = dict(project=op['spec'], original_id=op['original_id'], operation_id=operation_id,
                        outcome=result.outcome, artifact_ref=result.artifact_ref, actor_seconds=result.actor_seconds)
+            for key in ('classification', 'terminal_failure_ref', 'audit_ref'):
+                if getattr(result, key) is not None:
+                    row[key] = getattr(result, key)
+            harness_failure = result.classification == 'harness_failure'
+            if harness_failure:
+                s['events'].append(dict(kind='project_abandoned', operation_id=operation_id,
+                    original_id=op['original_id'], terminal_failure_ref=result.terminal_failure_ref,
+                    audit_ref=result.audit_ref))
             if self.config.get('deferred_recovery'):
                 row['kind'] = kind
             s['spent'] += result.actor_seconds
@@ -656,7 +676,7 @@ class CycleScheduler:
                 s['originals'].append(row)
                 s['wave_results'].append(row)
                 s['cursor'] += 1
-                if self.config.get('deferred_recovery') and result.outcome != 'accepted':
+                if self.config.get('deferred_recovery') and result.outcome != 'accepted' and not harness_failure:
                     s['recovery_queue'].append(self._root_item(row))
                 if self.spec.mode == Mode.PHASE1:
                     self._after_original()
@@ -669,7 +689,9 @@ class CycleScheduler:
                     item['root_spent'] += result.actor_seconds
                     item['root_result'] = copy.deepcopy(row)
                     item['result'] = copy.deepcopy(row)
-                    if result.outcome == 'accepted':
+                    if harness_failure:
+                        item['status'] = 'abandoned'
+                    elif result.outcome == 'accepted':
                         item['status'] = 'accepted'
                     else:
                         self._failed_attempt(item)
@@ -678,7 +700,10 @@ class CycleScheduler:
                     s['recovery_spent'] += result.actor_seconds
                     s['recoveries'].append(row)
                     item['attempts'] += 1
-                    item['action'] = 'root_retry'
+                    if harness_failure:
+                        item['status'] = 'abandoned'
+                    else:
+                        item['action'] = 'root_retry'
                 item.update(prepared=False, spec=copy.deepcopy(item['root_spec']), eligible_wave=s['wave'] + 1)
                 s['wave_results'].append(row)
                 self._after_original()
@@ -742,7 +767,6 @@ class CycleScheduler:
             original = ProjectSpec.from_dict(op['spec'])
             if isinstance(result, SimplificationDeferred) and self.config.get('deferred_recovery'):
                 item = next(r for r in s['recovery_queue'] if r['original_id'] == op['original_id'])
-                self._failed_attempt(item)
                 item.update(prepared=False, eligible_wave=s['wave'] + 1)
                 s['spent'] += result.actor_seconds
                 s['recovery_spent'] += result.actor_seconds
@@ -782,7 +806,7 @@ class CycleScheduler:
             revised = result.spec
             if self.config.get('recovery_feedback'):
                 allowance = revised.budgets.actor_seconds
-                caps = [value - result.actor_seconds for key, value in self.remaining().items()
+                caps = [value - result.actor_seconds for key, value in self._allocation_remaining().items()
                         if key in ('actor_seconds', 'recovery_seconds') and value is not None]
                 if allowance is None or allowance <= 0 or any(allowance > value for value in caps):
                     raise ValueError('child allocation exceeds the measured remaining semantic pool')
