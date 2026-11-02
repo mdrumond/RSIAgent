@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from test_native_pi_filesystem import scripted_provider
 
 from rsi.contracts import Stage
 import rsi.domain_bindings as bindings
@@ -1031,14 +1032,16 @@ def test_legacy_remote_timeout_without_native_handle_remains_observation_require
     assert len(calls)==1 and 'cancel' not in calls[0] and 'download' not in calls[0]
 
 
-def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_candidate(tmp_path,monkeypatch):
+def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_candidate(tmp_path,monkeypatch,scripted_provider):
     from copy import deepcopy
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import fixture, Backend
     from rsi.actor import PiSessionAdapter
-    from test_rsi_pi_controller import response
+    from test_native_pi_programming_roles import redirect
     from test_pi_runtime import _native_wire_objects
-    store,key=fixture(tmp_path);backend=Backend();wires=[];requested=[];corrected=[]
+    url, calls, wires = scripted_provider
+    redirect(monkeypatch, url)
+    store,key=fixture(tmp_path);backend=Backend();requested=[];corrected=[];queued=[]
     model=CanonicalSession(initial=json.dumps(dict(source='fast',block_count=1)),repaired=json.dumps(dict(source='fast',block_count=1)))
     owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'deepseek-flash','coding_engine':'pi'}),backend,
         knowledge=lambda _:[],canonical=bindings.optimizer_adoption(test_backend=True,
@@ -1055,29 +1058,35 @@ def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_can
             unread_skills=[name for name in runner.bundle.skills_for(stage) if name not in read_names],
             evidence=evidence,read_skills=[dict(receipt_id=runner.service.read_receipt(row['receipt_id'])) for row in reads],
             source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
-    def provider(*_,**kwargs):
-        wire=json.loads(kwargs['data']);wires.append(wire)
-        if not wire.get('tools'):return response([],len(wires))
+    def choose(wire):
         context=payload()
+        prompt=next(value for role,value in reversed(list(_native_wire_objects([wire])))
+                    if role=='user' and 'mapped_skills' in value)
+        if queued:
+            return queued.pop(0)
         if context['stage']=='debug' and not context['unread_skills']:
             if not requested:
                 requested.append(deepcopy(context))
-                return response([('perform',dict(proposal='Try a different candidate after correct TEST',edit=dict(
-                    path=context['source']['path'],sha256=context['source']['sha256'],
-                    source=json.dumps(dict(source='another',block_count=1)))))],len(wires))
-            rejected=[value for role,value in _native_wire_objects([wire]) if role=='tool'
-                and value.get('observation',{}).get('event')=='invalid-action'
-                and value['observation'].get('action')=='perform' and value['observation'].get('executed') is False]
-            assert rejected  # Actual SDK/provider wire, not a fabricated dispatcher payload.
+                return 'write',dict(path=prompt['editable_files'][0],content=json.dumps(dict(source='another',block_count=1)))
+            errors=[json.loads(line) for line in (runner.root/'native/session/native-events.jsonl').read_text().splitlines()
+                    if json.loads(line)['type']=='host_callback_error']
+            assert errors and any(errors[-1]['message'] in message.get('content','')
+                for message in wire['messages'] if message['role']=='tool')
             corrected.append(deepcopy(context))
-            return response([('perform',dict(proposal='Retain the observed candidate'))],len(wires))
+            return 'perform',dict(proposal='Retain the observed candidate')
         names={row['name'] for row in context['evidence']}
         if (context['stage']=='optimisation' and not context['unread_skills']
                 and 'select_strategy' in names and 'optimisation_decision' not in names):
-            action=('optimisation_decision',dict(action='profile',reason='Profile the fixed single candidate'))
-        else:action=model.next_action(context,[],seconds=60,record=lambda *_:None,source=None)
-        return response([action],len(wires))
-    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+            return 'optimisation_decision',dict(action='profile',reason='Profile the fixed single candidate')
+        name,args=model.next_action(context,[],seconds=60,record=lambda *_:None,source=None)
+        if name=='read_skill':
+            return 'read',dict(path=next(row['path'] for row in prompt['mapped_skills'] if row['name']==args['name']))
+        if name=='perform' and 'edit' in args:
+            edit=args.pop('edit')
+            queued.append(('perform',args))
+            return 'write',dict(path=prompt['editable_files'][0],content=edit['source'])
+        return name,args
+    calls.responder=choose
     result=runner.run()
     assert result['status']=='accepted' and requested and corrected
     assert requested[0]['operation_id']==corrected[0]['operation_id']
