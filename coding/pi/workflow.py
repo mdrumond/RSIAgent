@@ -81,7 +81,7 @@ class NativeWorkflowSession:
             self._resume()
 
     def _retain_text(self, value, *, suffix='.json'):
-        data = value.encode() if isinstance(value, str) else json.dumps(value, ensure_ascii=False).encode()
+        data = value.encode() if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2).encode()
         reference = self.runner.store.put_bytes(data)
         path = self.runner.root/'native'/'evidence'/(reference+suffix)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +107,8 @@ class NativeWorkflowSession:
             raise ValueError('no native workflow stage is active')
         payload = self.current[0]
         return dict(stage=payload['stage'], operation_id=payload['operation_id'],
-                    done=bool(self.completed), allowed=[] if self.completed else list(self.current[1]),
+                    done=bool(self.completed), allowed=[] if self.completed else
+                        [name for name in self.current[1] if name not in ('read_skill', 'read_project_file')],
                     skill_receipts=payload['skill_receipts'], evidence_receipts=payload['evidence_receipts'])
 
     def _state_tool(self, args, context):
@@ -120,7 +121,7 @@ class NativeWorkflowSession:
             observation = self._dispatch(name, args)
             text = json.dumps(observation, ensure_ascii=False)
             if len(text.encode()) > 8192:
-                observation = dict(retained_observation=self._retain_text(text),
+                observation = dict(retained_observation=self._retain_text(observation),
                                    stage=self.runner.workflow.stage.value)
             return dict(content=[dict(type='text', text=json.dumps(dict(observation=observation, workflow_state=self._state())))],
                         terminate=bool(self.completed))

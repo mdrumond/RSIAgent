@@ -467,3 +467,7 @@ class PiSessionAdapter:
         adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
         session.closed = True
         return adapter
+
+
+# Historical import name delegates to the sole native implementation.
+SnapshotPiSessionAdapter = PiSessionAdapter
