@@ -73,7 +73,7 @@ class NativeFiles:
     def _mutation(self, context):
         self._scope(context)
         flow = self.backend.workflow if self.backend else None
-        if (flow is None or flow.outcome or not flow.pending
+        if (flow is None or flow.outcome or flow.state['stopped'] or not flow.pending
                 or flow.pending['id'] != context['operation_id']
                 or flow.stage not in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)):
             raise PermissionError('pending mutation stage ownership required')

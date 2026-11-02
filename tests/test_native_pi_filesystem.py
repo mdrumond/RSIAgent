@@ -100,6 +100,22 @@ def test_readonly_resource_scope_and_pending_source_guard(tmp_path):
         files.write(dict(path=str(execution.project/'solution.py'), content='x = 1\n'), context(operation))
 
 
+@pytest.mark.parametrize('reason', ['stopped', 'deadline', 'other_operation'])
+def test_mutation_requires_live_admitted_operation(tmp_path, reason):
+    execution, operation, files = pending(tmp_path)
+    scope = context(operation)
+    if reason == 'stopped':
+        execution.workflow.stop()
+    elif reason == 'deadline':
+        scope['remaining'] = lambda: 0.
+    else:
+        scope['operation_id'] = 'other-operation'
+    before = execution.project_hash()
+    with pytest.raises(PermissionError):
+        files.write(dict(path=str(execution.project/'helper.py'), content='changed\n'), scope)
+    assert execution.project_hash() == before
+
+
 @pytest.fixture
 def scripted_provider():
     calls, requests = [], []
