@@ -33,6 +33,7 @@ def canonical_provider():
         overflow_sent = False
         history_reads = 0
         compactions = 0
+        summary_output = 0
         guidance_nonce = None
         guidance_armed = False
         guidance_queued = False
@@ -53,6 +54,7 @@ def canonical_provider():
                         'The host retained actual tool results and the numeric repair source transition. '
                         'Keep exact receipt IDs in the recent tool state and finish the pending host stage.\n'), finish_reason='stop')],
                     usage=dict(prompt_tokens=10, completion_tokens=40, total_tokens=50))
+                emitted.summary_output += payload['usage']['completion_tokens']
                 self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
                 self.wfile.write(('data: '+json.dumps(payload)+'\n\ndata: [DONE]\n\n').encode())
                 return
@@ -201,7 +203,7 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
                        for line in path.read_text().splitlines()]
             assert any(entry['type'] == 'compaction' for entry in entries)
             assert any(event['type'] == 'session_before_compact' and event['reason'] == 'overflow' for event in native)
-            assert any(event['type'] == 'compaction_end' and event['result']['usage']['output'] == 40 for event in native)
+            assert any(event['type'] == 'compaction_end' and event['result']['usage']['output'] == emitted.summary_output for event in native)
             assert len([entry for entry in emitted if entry['name'] == 'edit']) == 1
 
     finally:
