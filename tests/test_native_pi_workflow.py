@@ -39,6 +39,7 @@ def canonical_provider():
         guidance_queued = False
         post_success = False
         post_success_queued = False
+        post_success_operation = None
     requests, emitted, repaired = [], Observations(), False
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -118,6 +119,7 @@ def canonical_provider():
                 id=f'call-{len(requests)}', type='function', function=dict(name=name, arguments=json.dumps(args)))])
             if name == 'perform' and prompt['stage']=='implementation' and emitted.post_success and not emitted.post_success_queued:
                 emitted.post_success_queued = True
+                emitted.post_success_operation = prompt['operation_id']
                 delta['tool_calls'].append(dict(index=1, id=f'post-success-{len(requests)}', type='function',
                     function=dict(name='write', arguments=json.dumps(dict(path=prompt['editable_files'][0],
                         content='raise RuntimeError("queued mutation after host success")\n')))))
@@ -172,7 +174,8 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         if emitted.post_success:
             assert emitted.post_success_queued
             assert 'queued mutation after host success' not in runner.backend.read('solution.py')['content']
-            commits = [row for row in result['history'] if row['evidence']['stage']=='implementation']
+            commits = [row for row in result['history']
+                       if row['evidence']['operation_id']==emitted.post_success_operation]
             assert len(commits) == 1
             operation = commits[0]['evidence']['operation_id']
             assert len([row for row in emitted if row['operation_id']==operation and row['name']=='perform']) == 1
