@@ -139,7 +139,7 @@ class ProjectWorkerFactory:
         project_binding['worker_profile'] = profile
         project_binding['executor_provenance'] = admitted['identities'].get(profile)
         logical = dict(operation_id=request.project_id, spec=operation['spec'], config=operation['config'],
-            memory_ref=admitted['memory'], skills_ref=admitted['skills'], configuration_ref=admitted['configuration'])
+            memory_ref=admitted['memory'], skills_ref=admitted['skills'], configuration_ref=operation['binding']['configuration'])
         resolution = None
         binding_interval = None
         if request.reopen:

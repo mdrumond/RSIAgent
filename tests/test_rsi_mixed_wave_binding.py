@@ -19,6 +19,7 @@ def exclusive_bind_project(request, logical_admission, *, metadata, configuratio
     manifest = json.loads(Path(configuration['manifest']).read_text())
     project = logical_admission['spec']['project_id']
     admitted = manifest['projects'][project]  # Disjoint manifests must never serve a sibling.
+    assert logical_admission['configuration_ref'] == manifest['configuration_ref']
     assert admitted['source'] == logical_admission['config']['source']
     assert admitted['command'] == logical_admission['spec']['command']
     return cpu_bind_project(request, logical_admission, metadata=metadata,
@@ -67,11 +68,17 @@ def test_mixed_families_bind_and_reopen_their_own_registered_inputs(wave_instanc
                 continue
             config = settings['project_configs'][name]
             configuration_ref = cycle.store.put_json(_snapshot(dict(cycle.config,
+                curriculum_context=dict(project_id=name, diagnostic_family=name),
                 project_configs={**cycle.config['project_configs'], name: config})))
             cycle.scheduler.state.setdefault('derived_projects', {})[name] = dict(
                 config_ref=cycle.store.put_json(config), configuration_ref=configuration_ref,
                 provenance_ref=cycle.store.put_json(dict(binding=bindings[name])))
             expected_configuration[name] = configuration_ref
+        assert len(set(expected_configuration.values())) == len(order)
+        for name in order:
+            manifest_path = Path(bindings[name]['manifest'])
+            manifest = json.loads(manifest_path.read_text())
+            atomic_json(manifest_path, dict(manifest, configuration_ref=expected_configuration[name]))
         cycle.scheduler._save()
         assert cycle.step().outcome == 'accepted'
         wave = cycle.scheduler.state['active_wave']
