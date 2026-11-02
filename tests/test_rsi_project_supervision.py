@@ -55,6 +55,29 @@ def test_elapsed_audit_carries_across_resume_and_retains_only_complete_new_recor
     assert resumed.terminal_audit(json.loads((root / 'workflow.json').read_text())['pending']) is None
 
 
+def test_not_due_poll_skips_host_journal_but_due_and_immediate_fault_authenticate(project, monkeypatch):
+    import rsi.supervision as supervision
+    root, store, journal = project
+    now, reads = [0.], []
+    read = supervision.read_event_refs
+    def observed(path):
+        reads.append(path)
+        return read(path)
+    monkeypatch.setattr(supervision, 'read_event_refs', observed)
+    audit = ProjectSupervision(root, clock=lambda: now[0])
+    assert audit.poll() is None
+    now[0] = 599.
+    assert audit.poll() is None and reads == []
+    now[0] = 600.
+    assert audit.poll() and reads == [root]
+    fault = append(store, journal, dict(type='pi-native-event', event=dict(
+        type='native_fault', fault_id='immediate', origin='protocol', operation_id='operation')))
+    now[0] = 601.
+    report = store.read_json(audit.poll(fault_ref=fault))
+    assert report['fault_ref'] == fault and reads == [root, root]
+    assert report['elapsed_since_audit'] == 1.
+
+
 @pytest.mark.parametrize('origin', ['controller', 'protocol', 'transport'])
 def test_typed_fault_reports_immediately_without_claiming_native_or_external_closure(project, origin):
     root, store, journal = project

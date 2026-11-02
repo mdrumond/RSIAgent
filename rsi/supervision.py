@@ -65,6 +65,8 @@ class ProjectSupervision:
     def poll(self, *, fault_ref=None):
         """Read committed evidence; a fault fact never proves external closure."""
         with self._state() as (state, now):
+            if fault_ref is None and now - state['last_audit'] < 600:
+                return None
             refs = read_event_refs(self.root)
             fault = None
             if fault_ref is not None:
@@ -85,8 +87,6 @@ class ProjectSupervision:
                         raise ValueError('native fault identity changed')
                     return previous['audit_ref']
                 fault = fact
-            if fault is None and now - state['last_audit'] < 600:
-                return None
             if state['host_cursor'] > len(refs):
                 raise ValueError('canonical host journal moved backwards')
             cursor, native_refs = self._native(state['native_cursor'])
