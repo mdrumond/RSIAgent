@@ -54,15 +54,22 @@ def deepseek_librarian(environment, *, root):
     import base64
     from benchmarks.ascend.native_curriculum import NativeSubjectRole
     role = NativeSubjectRole(Path(root), DEEPSEEK, environment)
-    def complete(messages, seconds):
-        response = role(messages, remaining_seconds=seconds)
+    def evidence():
+        if role.last_store is None:
+            return {}
         evidence = {}
         for path in role.last_store.objects.glob('*/*'):
             reference = path.parent.name + path.name
             evidence[reference] = base64.b64encode(role.last_store.read_bytes(reference)).decode('ascii')
+        return evidence
+    def complete(messages, seconds, *, validate=None):
+        role.validator = validate
+        response = role(messages, remaining_seconds=seconds)
         usage = role.last_receipt['usage']
         tokens = sum(row.get('totalTokens', row.get('input', 0)+row.get('output', 0)) for row in usage)
-        return dict(text=response, tokens=tokens, native_evidence=evidence)
+        return dict(text=response, tokens=tokens, native_evidence=evidence())
+    complete.native_validation = True
+    complete.native_evidence = evidence
     return complete
 
 
@@ -108,6 +115,9 @@ class NativeAdaptiveKnowledge:
             audit_root = root / 'librarian-audit'
             audit_root.mkdir(exist_ok=True)
             def retain(audit):
+                retained = getattr(self.complete, 'native_evidence', None)
+                if retained and audit.get('requests') and 'response' not in audit['requests'][-1]:
+                    audit['native_failure_evidence'] = retained()
                 (audit_root / (uuid.uuid4().hex + '.json')).write_bytes(canonical_bytes(audit))
             seconds = min(budget.deadline-time.monotonic(), remaining())
             if seconds <= 0:

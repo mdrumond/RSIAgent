@@ -25,17 +25,21 @@ class OptimizerSession(CanonicalSession):
         self.optimization_edit = None
 
     def next_action(self, context, allowed, **kwargs):
-        # Preserve Pi's argument-validation boundary for scripted decisions.
-        from coding.pi.schema import validate
+        # Script only the invalid legacy read requests in these host fixtures.
+        # Real SDK schema validation is exercised by native tool tests.
         from coding.pi.session import ActionError
         self.owner.agent.canonical_remaining_seconds = kwargs['seconds']
         name, args = self.decide(context, allowed, **kwargs)
         if name not in allowed:
             raise ActionError(f'action unavailable in canonical stage: {name}')
-        try:
-            validate(args, self.schemas[name])
-        except ValueError as error:
-            raise ActionError(str(error)) from error
+        if name == 'read_artifact':
+            reference, offset = args.get('sha256'), args.get('offset', 0)
+            if (not isinstance(reference, str) or len(reference) != 64
+                    or any(char not in '0123456789abcdef' for char in reference)
+                    or type(offset) is not int or offset < 0):
+                raise ActionError('invalid scripted read-artifact request')
+        if name == 'read_memory' and (type(args.get('index')) is not int or args['index'] < 0):
+            raise ActionError('invalid scripted read-memory request')
         return name, args
 
     def decide(self, context, allowed, **kwargs):

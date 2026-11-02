@@ -149,7 +149,14 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                         dict(state=state, observation=observation, correction=correction))}]
                     event = dict(request=[dict(m) for m in messages])
                     log['requests'].append(event)
-                    response = self.complete(messages, check())
+                    if getattr(self.complete, 'native_validation', False):
+                        def validate(value):
+                            _, accepted, _, _ = self._decision(value, inspected)
+                            if len(set(selected) | set(accepted)) > action.limit:
+                                raise ValueError('selected evidence exceeds requested result limit')
+                        response = self.complete(messages, check(), validate=validate)
+                    else:
+                        response = self.complete(messages, check())
                     event['response'] = response
                     check()
                     if (not isinstance(response.get('text'), str) or type(response.get('tokens')) is not int

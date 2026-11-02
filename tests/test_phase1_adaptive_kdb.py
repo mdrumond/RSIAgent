@@ -243,3 +243,39 @@ def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path,
     (root / 'librarian-budget.json').write_bytes(charged)
     knowledge.begin_selection(selection)
     assert (root / 'librarian-budget.json').read_bytes() == charged
+
+
+def test_native_librarian_repairs_uninspected_id_inside_same_session(tmp_path, monkeypatch, scripted_provider):
+    import base64
+    from pathlib import Path
+    from benchmarks.ascend.phase1_knowledge import deepseek_librarian
+    from test_native_pi_programming_roles import redirect
+    url, calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    cfg = config(tmp_path)
+    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
+    steps = []
+    def choose(wire):
+        pointer = json.loads(next(message['content'] for message in reversed(wire['messages'])
+                                 if message['role']=='user' and 'context_path' in message['content']))
+        if not steps:
+            steps.append('read')
+            return 'read', dict(path=pointer['context_path'])
+        context = json.loads(Path(pointer['context_path']).read_text())
+        candidates = json.loads(context[-1]['content'])['observation']['candidates']
+        identity = 'not-inspected' if len(steps)==1 else candidates[0]['id']
+        steps.append(identity)
+        return 'submit_curriculum_proposal', dict(value=dict(action='finish',
+            selected=[dict(id=identity,reason='Use retained actual reference')], rejected=[], gaps=[]))
+    calls.responder = choose
+    adaptive = NativeAdaptiveKnowledge(cfg, Embeddings(), complete)
+    context = actor_context(tmp_path)
+    result = adaptive.actor_query(dict(query='pipeline',limit=1), context)
+    assert result.citations and len(requests)==3
+    assert steps[1]=='not-inspected' and steps[2]!='not-inspected'
+    assert any(message['role']=='tool' and 'decisions require inspected IDs and reasons' in message['content']
+               for message in requests[-1]['messages'])
+    details = context.artifacts.read_json(result.observation['search_details_sha256'])
+    assert len(details['librarian_audit']['requests']) == 1
+    evidence = details['librarian_audit']['requests'][0]['response']['native_evidence']
+    assert any(b'host_callback_error' in base64.b64decode(data) for data in evidence.values())

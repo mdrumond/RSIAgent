@@ -217,6 +217,8 @@ class DirectCompletionProvider:
             raise RuntimeError('production completion requires a native Pi session')
         if profile != direct_profile(profile.identity):
             raise ValueError('provider profile is not canonical')
+        if profile.identity.credential_env not in self._credentials:
+            raise ValueError('provider credential is not configured for this model')
         if max_seconds is not None and max_seconds <= 0:
             raise TimeoutError('fixture completion elapsed allowance exhausted')
         result = self._transport(base_url=profile.base_url,
