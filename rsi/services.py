@@ -31,7 +31,7 @@ from rsi.project_composition import ProjectComposition, verify_kdb
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
-from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
+from rsi.roles import AdmittedEvidence, NativeRoles, _proposal
 from rsi.skills import SkillBundle
 from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
@@ -253,18 +253,18 @@ class BoundCycle(ProjectComposition, TuningBindings):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
         policy = dict(self.config.get('cycle_limits', {}))
+        # Retained cycles keep their admitted policy; new projects own elapsed limits.
+        policy['independent_projects'] = state.get('config', {}).get('independent_projects', False) if state else True
         from rsi.phase1_recovery import Phase1Recovery, configured
         self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
         if self.curriculum:
-            allowance = policy.get('recovery_seconds')
-            if type(allowance) not in (int, float) or not 0 < allowance < float('inf'):
-                raise ValueError('autonomous curriculum requires an explicit finite recovery_seconds pool')
             policy['recovery_limit'] = None
             policy['recovery_feedback'] = True
             policy['retry_original'] = self.curriculum.original_retry
             policy['max_failed_recovery_attempts'] = self.config.get('recovery', {}).get('max_failed_attempts', 5)
         if self.config.get('project_wave'):
             policy.setdefault('recovery_limit', None)
+        policy.setdefault('max_failed_recovery_attempts', self.config.get('recovery', {}).get('max_failed_attempts', 5))
         first_clock = not state_path.exists()
         def cycle_clock():
             nonlocal first_clock
@@ -279,6 +279,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             recover=self.binding.get('recover') if self.binding.get('recover') is not None else
                 True if self.curriculum else self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
+        self.scheduler.adopt_independent_projects()
         try:
             with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
                 self.memory = services._memory(memory_root, self.binding['initial'].encode())
@@ -290,7 +291,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             self.scheduler.close()
             raise
         self.controller = CycleController(root / 'controller.json', self.scheduler,
-            self.learning, artifacts=self.store, pair_factory=self.pair)
+            self.learning, artifacts=self.store, pair_factory=self.pair, pair_feedback=self.paired_feedback)
         self.tuning = TuningController(root / 'tuning.json', self.controller,
                                        evaluation_factory=self.evaluation)
         self.waves = None
@@ -318,11 +319,38 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def observe_role(self, event, payload):
         if event == 'role_started' and self.role_setup_started is not None:
-            self.services.setup.record('roles-worker-dependency-load', self.role_setup_started,
+            self.services.setup.record('native-role-session-setup', self.role_setup_started,
                 success=True, scope=self.role_operation)
             self.role_setup_started = None
         self.role_events.append(dict(operation_id=self.role_operation, event=event, payload=payload))
         atomic_json(self.roles_log, self.role_events)
+        self.supervise_roles(fault_ref=payload.get('artifact_ref') if
+            event == 'role_native_event' and payload.get('type') == 'native_fault' else None)
+
+    def supervise_roles(self, *, fault_ref=None):
+        from rsi.supervision import RoleSupervision
+        seen = set()
+        for started in reversed(self.role_events):
+            if started['event'] != 'role_started' or not started['payload'].get('native_root'):
+                continue
+            payload = started['payload']
+            key = (started['operation_id'], payload['role'])
+            if key in seen:
+                continue
+            seen.add(key)
+            root = Path(payload['native_root']).resolve().parent
+            if not root.is_relative_to((self.root / 'native-roles').resolve()):
+                raise ValueError('role supervision escapes the admitted cycle')
+            retained = json.loads((root / 'role.json').read_text())
+            if retained['status'] != 'pending':
+                continue
+            rows = [row for row in self.role_events if row['operation_id'] == started['operation_id']
+                    and row['payload'].get('role') == payload['role']]
+            if fault_ref and not any(row['payload'].get('artifact_ref') == fault_ref for row in rows):
+                continue
+            scope = dict(cycle_id=self.spec.cycle_id, operation_id=started['operation_id'],
+                         role=payload['role'], request_ref=payload['request_ref'])
+            RoleSupervision(root, store=self.store, scope=scope, host_rows=rows).poll(fault_ref=fault_ref)
 
     def role_elapsed(self, operation):
         rows = [e['payload']['elapsed_seconds'] for e in self.role_events
@@ -343,8 +371,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 profile = direct_profile(identity)
                 if profile.model != provider['model']:
                     raise ValueError('registered role model mismatch')
-                self._roles = IsolatedRoles(str(self.services.executable(self.config['roles_python'])),
-                    profile, observer=self.observe_role, environment=self.services.environment,
+                self._roles = NativeRoles(self.root/'native-roles', profile,
+                    observer=self.observe_role, environment=self.services.environment, store=self.store,
+                    operation_id=lambda: self.role_operation,
+                    node_modules=self.services.root/'machinery/integrations/pi/node_modules',
                     **self.config.get('roles', {}))
         return self._roles
 
@@ -405,7 +435,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def finish_role_setup(self):
         if self.role_setup_started is not None:
-            self.services.setup.record('roles-worker-setup-without-start-receipt',
+            self.services.setup.record('native-role-setup-without-start',
                 self.role_setup_started, success=False, scope=self.role_operation, actor_billable=None)
             self.role_setup_started = None
 
@@ -448,6 +478,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 outcome = 'failed'
             except WorkflowError:
                 pass  # Unknown effects remain suspended; no fabricated closure.
+        if failure:
+            from rsi.supervision import retain_terminal
+            retain_terminal(runner, failure)
         self.retain(runner)
         service_binding = json.loads((runner.root / 'service-binding.json').read_text())
         baseline = service_binding.get('actor_seconds_baseline', 0.0)
@@ -470,7 +503,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
         if outcome not in ('accepted', 'rejected', 'budget_exhausted', 'failed') or (
                 runner.workflow.pending and failure is None):
             raise RuntimeError('project suspended; reconcile same operation before cycle continuation')
-        return HostTaskResult(outcome, ref, delta)
+        return HostTaskResult(outcome, ref, delta,
+            classification=failure['classification'] if failure else None,
+            terminal_failure_ref=proof_ref, audit_ref=failure.get('audit_ref') if failure else None)
 
     def open_project(self, operation):
         relative = self.scheduler.state.get('project_roots', {}).get(operation)
@@ -495,7 +530,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 op = admitted['operations'][operation]
                 logical = dict(operation_id=operation, spec=op['spec'], config=op['config'],
                     memory_ref=admitted['memory'], skills_ref=admitted['skills'],
-                    configuration_ref=admitted['configuration'])
+                    configuration_ref=op['binding']['configuration'])
                 if binding.get('logical_admission_hash') != admission_hash(logical):
                     raise ValueError('resolved project differs from admitted logical operation')
                 row = json.loads((self.root / 'waves' / wave_id / 'wave.json').read_text())['projects'][operation]
@@ -530,7 +565,12 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def load_project(self, row):
         operation = row['operation_id']
-        runner = self.open_project(operation)
+        if row.get('paired_checkpoint'):
+            _, request, runner = self.paired_checkpoint(row['paired_checkpoint'])
+            if request.operation_id != operation:
+                raise ValueError('paired feedback differs from retained trial operation')
+        else:
+            runner = self.open_project(operation)
         self.retain(runner)
         packet = self.store.read_json(row['artifact_ref'])
         if packet['operation_id'] != operation or packet['original_id'] != row['original_id']:
@@ -567,10 +607,19 @@ class BoundCycle(ProjectComposition, TuningBindings):
         observations_ref = self.store.put_json(observations)
         if proof:
             summary = str(proof['classification']) + ': ' + str(proof['error']) + '; ' + summary
+        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
         raw = list(result['events'])
+        if row.get('paired_evidence_ref'):
+            pair, _, _ = self.paired_checkpoint(row['paired_checkpoint'])
+            paired = pair.result()
+            if paired['evidence_ref'] != row['paired_evidence_ref']:
+                raise ValueError('paired Memory evidence differs from retained raw arms')
+            reference = row['paired_evidence_ref']
+            evidence[reference] = dict(kind='recovery', summary='; '.join(
+                name + ': ' + arm['outcome'] for name, arm in paired['arms'].items()))
+            raw.append(reference)
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
-        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
         investigation = row.get('investigation_receipt_ref')
         if investigation:
             receipt = self.store.read_json(investigation)
@@ -627,18 +676,71 @@ class BoundCycle(ProjectComposition, TuningBindings):
         runner.run = run_trial
         return runner
 
+    def paired_checkpoint(self, checkpoint):
+        """Open only an existing canonical pair request; never dispatch a third run."""
+        pair = PairedRecovery(self.root / 'pairs' / (_name(checkpoint['operation_id']) + '.json'),
+                              artifacts=self.store, runner_factory=self.trial)
+        if pair.state['frozen'] != checkpoint['frozen'] or pair.result() is None:
+            raise ValueError('paired checkpoint is not the retained complete pair')
+        request = pair.request(checkpoint['arm'])
+        runner = self.trial(request, reopen=True)
+        pair._check(runner, request)
+        return pair, request, runner
+
+    def paired_feedback(self, event, operation, result):
+        arm = next((name for name, row in result['arms'].items()
+                    if row['outcome'] == 'accepted' and row['workflow'] is True
+                    and row['correctness'] is True), 'candidate')
+        checkpoint = dict(operation_id=operation, arm=arm, frozen=result['frozen'])
+        pair, request, runner = self.paired_checkpoint(checkpoint)
+        if pair.result() != result:
+            raise ValueError('paired result differs from trusted canonical arm receipts')
+        observed = result['arms'][arm]
+        outcome = runner.latest('project-run-outcome')
+        if outcome is None:
+            raise WorkflowError('paired feedback requires the retained canonical run outcome')
+        retained = runner.store.read_json(outcome['reference'])
+        raw = retained['result']
+        if ((observed['outcome'] == 'accepted' and raw['status'] != 'accepted')
+                or raw['contract_ref'] != runner.contract_ref
+                or raw['execution_contract_ref'] != runner.backend.manifest['contract']
+                or raw['source_hash'] != observed['source_hash']
+                or raw['source_hash'] != runner.backend.project_hash()
+                or runner.store.read_json(retained['workflow_state_ref']) != runner.workflow.state):
+            raise ValueError('paired feedback outcome differs from the canonical trial')
+        raw = dict(raw, outcome_ref=outcome['reference'], events=[*raw['events'], outcome['reference']])
+        self.retain(runner)
+        packet = dict(operation_id=request.operation_id, original_id=event['original']['original_id'],
+            root=str(runner.root), result=raw, workflow=runner.workflow.state,
+            host_outcome=observed['outcome'], failure_proof_ref=observed.get('terminal_failure_ref'),
+            actor_seconds_total=observed['actor_seconds'], actor_seconds_baseline=0.,
+            actor_seconds_delta=observed['actor_seconds'], workflow_valid=observed['outcome'] == 'accepted')
+        reference = self.store.put_json(packet)
+        atomic_json(runner.root / 'service-result.json', dict(reference=reference))
+        # Failed originals always carry the actual candidate's latest edits.
+        checkpoint['arm'] = 'candidate'
+        return dict(project=runner.spec.to_dict(), original_id=packet['original_id'],
+            operation_id=request.operation_id, artifact_ref=reference, outcome=observed['outcome'],
+            actor_seconds=observed['actor_seconds'], paired_checkpoint=dict(checkpoint, arm=arm),
+            retry_checkpoint=checkpoint, paired_evidence_ref=result['evidence_ref'])
+
     def pair(self, event, operation, remaining):
         path = self.root / 'pairs' / (_name(operation) + '.json')
         if path.exists():
             return PairedRecovery(path, artifacts=self.store, runner_factory=self.trial)
-        checkpoint = self.open_project(event['original']['operation_id'])
-        packet = self.store.read_json(event['original']['artifact_ref'])
+        if event.get('paired_checkpoint'):
+            previous, request, checkpoint = self.paired_checkpoint(event['paired_checkpoint'])
+            failure_ref = previous.result()['arms'][request.arm].get('terminal_failure_ref')
+        else:
+            checkpoint = self.open_project(event['original']['operation_id'])
+            failure_ref = self.store.read_json(event['original']['artifact_ref']).get('failure_proof_ref')
         return PairedRecovery.create(path, checkpoint, artifacts=self.store, memory_ref=event['memory'],
-            terminal_failure_ref=packet.get('failure_proof_ref'),
+            terminal_failure_ref=failure_ref,
             kdb_ref=self.binding['kdb'], model_config=self.config['provider'], incumbent=event['incumbent'],
             candidate=event['candidate'], joint_limits=BudgetLimits.from_dict(
                 self.config.get('recovery', {}).get('budgets', self.config['budgets'])),
-            remaining_parent=remaining, runner_factory=self.trial)
+            remaining_parent=remaining, runner_factory=self.trial,
+            independent=self.scheduler.independent_projects)
 
     def validate(self, incumbent, candidate, cases, operation):
         suite = self.suite_validation(incumbent, candidate, cases, operation)
@@ -741,8 +843,11 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 if (packet['workflow'] != runner.workflow.state or
                         proof != runner.terminal_failure_proof(closure_ref=proof['closure_ref'])):
                     raise ValueError('failed task admission proof no longer matches')
+                from rsi.supervision import retain_terminal
+                retain_terminal(runner, proof)
                 self.scheduler.reconcile(pending['id'], HostTaskResult('failed', ref,
-                    packet['actor_seconds_delta']))
+                    packet['actor_seconds_delta'], classification=proof['classification'],
+                    terminal_failure_ref=failure, audit_ref=proof.get('audit_ref')))
                 return
         runner.reconcile()
         if runner.workflow.pending:
@@ -761,6 +866,19 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def adopt_revision(self, configuration=None):
         return revisions.adopt(self, configuration or show_configuration(self.services.root))
+
+    def supervise(self):
+        from rsi.supervision import ProjectSupervision
+        self.supervise_roles()
+        if self.active_runner is not None:
+            self.active_runner.supervise()
+        pool = self.waves.active_pool if self.waves else None
+        if pool is not None:
+            for operation, row in pool.status()['projects'].items():
+                root = pool._branch(operation) / 'runner'
+                if row['status'] == 'pending' and all((root / name).exists() for name in
+                        ('runner.json', 'workflow.json')):
+                    ProjectSupervision(root).poll()
 
     def execute(self, runner):
         self.active_runner = runner

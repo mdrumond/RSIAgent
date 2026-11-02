@@ -592,9 +592,12 @@ def test_knowledge_compacts_before_checkpoints_and_sources_are_readable_after_re
             earlier = context['history'][0]
             assert json.loads(earlier['content_preview']) == result
             assert earlier['content_truncated'] is False
-            from coding.pi.context import ContextRecords
-            visible = ContextRecords().snapshot(context)
-            assert isinstance(visible['history'], dict)  # The entire history was paged.
+            from core.artifacts import ContentAddressedArtifacts
+            from test_rsi_memory_projection import native_view, read_all
+            artifacts = ContentAddressedArtifacts(tmp_path/'native-presentation')
+            native = native_view(tmp_path, artifacts)
+            visible = read_all(native.files, native._retain_text(context))
+            assert visible['history'] == context['history']
             assert visible['latest_knowledge'] == result
             return candidate('fast')
 

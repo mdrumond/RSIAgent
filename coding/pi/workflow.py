@@ -1,0 +1,307 @@
+"""Native SDK tools driving the existing host Workflow dispatcher."""
+from dataclasses import asdict
+import json
+from pathlib import Path
+import time
+
+from .filesystem import NativeFiles
+from .native import NativeSession, NativeTool, NativeError, model_profile
+from .session import ActionError
+from rsi.python_execution import digest
+
+
+class NativeWorkflowSession:
+    def __init__(self, *, model='deepseek-flash', environ=None, wall_deadline=None, **options):
+        self.model, self.environ, self.enclosing_deadline = model, environ, wall_deadline
+        self.options = options
+        self.session = self.files = self.runner = None
+        self.current = self.dispatcher = self.actor = self.thinking = None
+        self.completed = []
+        self.skill_paths = {}
+        self.skill_reads = {}
+        self.schemas = {}
+        self.archived = False
+        self.stale = False
+
+    def configure(self, runner):
+        if self.session is not None:
+            raise ValueError('native workflow session is already configured')
+        self.runner = runner
+        root = runner.root / 'native'
+        resources = root / 'skills'
+        for document in runner.bundle.documents:
+            project = getattr(runner.backend, 'project', None)
+            captured = project/'reference-skills'/document.name/'SKILL.md' if project else None
+            path = captured if captured is not None and captured.is_file() else resources/document.name/'SKILL.md'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                if path.read_text() != document.content:
+                    raise ValueError('frozen native skill changed')
+            else:
+                path.write_text(document.content)
+            self.skill_paths[path.resolve()] = document.name
+        if hasattr(runner.backend, 'project'):
+            self.files = NativeFiles(root/'source-transitions', store=runner.store,
+                read_paths=self.skill_paths, backend=runner.backend, record=self._file_event)
+        else:
+            from rsi.native_source import DomainFiles
+            self.files = DomainFiles(root/'source-transitions', runner=runner,
+                                     read_paths=self.skill_paths, record=self._file_event)
+
+    def _file_event(self, kind, payload):
+        self.runner.actor_event(kind, dict(payload, operation_id=self.runner.workflow.pending['id']))
+        receipt = self.runner.store.read_json(payload['reference'])
+        if kind != 'native-file-read' and receipt.get('status') == 'applied':
+            self.runner.append(dict(type='source-edit', operation_id=receipt['operation_id'],
+                before_source=receipt['before'], after_source=receipt['after'],
+                path=receipt['path'], source_ref=receipt['artifact_ref']))
+
+    def _read_observed(self, args, context):
+        """Credit only line ranges actually returned by the SDK read tool."""
+        name = self.skill_paths.get(Path(args['path']).resolve())
+        if name is not None and self.current is not None and name in self.current[0]['skills']:
+            document = self.runner.bundle.document(name)
+            total = len(document.content.splitlines())
+            start = max(0, args.get('offset', 1)-1)
+            truncation = (args.get('details') or {}).get('truncation') or {}
+            count = truncation.get('outputLines', 0) if truncation.get('truncated') else args.get('limit', total)
+            if not truncation.get('firstLineExceedsLimit') and count:
+                key = (context['operation_id'], name)
+                ranges = self.skill_reads.setdefault(key, [])
+                ranges.append((start, min(total, start+count)))
+                end = 0
+                for first, last in sorted(ranges):
+                    if first > end:
+                        break
+                    end = max(end, last)
+                reference = self.runner.store.put_json(dict(name=name, operation_id=context['operation_id'],
+                    tool_call_id=context['tool_call_id'], ranges=ranges, total_lines=total,
+                    truncation=truncation, complete=end >= total))
+                self.runner.append(dict(type='native-skill-read', reference=reference))
+                if end >= total and name not in self.current[0]['read_skill_names']:
+                    self._dispatch('read_skill', dict(name=name))
+        return dict(content=[], details={})
+
+    def _remaining(self):
+        bounds = [value for value in self.runner.workflow.remaining().values() if value is not None]
+        remaining = min(bounds) if bounds else None
+        if self.runner.workflow.state['stopped'] and not self.session.cancelled.is_set():
+            self.session.abort()
+        if self.enclosing_deadline is not None:
+            wall = self.enclosing_deadline-time.monotonic()
+            remaining = wall if remaining is None else min(remaining, wall)
+        return remaining
+
+    def _pause(self):
+        if self.thinking is not None:
+            self.runner.workflow.accounting.end(self.thinking)
+            self.thinking = None
+
+    def _resume(self):
+        if self.actor is not None:
+            self.thinking = self.runner.workflow.accounting.start('thinking')
+
+    def _observe(self, event):
+        self.runner.actor_event('pi-native-event', dict(event=event))
+        if event['type'] == 'message_start' and event.get('message', {}).get('role') == 'assistant':
+            self.stale = False
+        if event['type'] == 'host_callback_start':
+            self._pause()
+        elif event['type'] == 'host_callback_end':
+            self._resume()
+
+    def _retain_text(self, value, *, suffix='.json'):
+        data = value.encode() if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2).encode()
+        reference = self.runner.store.put_bytes(data)
+        path = self.runner.root/'native'/'evidence'/(reference+suffix)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(data)
+        self.files.read_paths[path.resolve()] = reference
+        return dict(path=str(path.resolve()), bytes=len(data), artifact_ref=reference)
+
+    def _dispatch(self, name, args):
+        if self.completed:
+            raise ValueError('this host stage already completed')
+        if name not in self.current[1]:
+            raise ValueError('tool is unavailable in the current host stage')
+        try:
+            self.current = self.dispatcher.send((name, args))
+        except StopIteration as result:
+            self.completed.append(result.value)
+            return dict(host_stage_completed=True, result=asdict(result.value.result))
+        observation = self.current[0]['observation']
+        if isinstance(observation, dict) and observation.get('event') == 'action-superseded':
+            self.stale = True
+        return observation
+
+    def _open_artifact(self, args, context):
+        if self.completed:
+            raise ValueError('this host stage already completed')
+        def grant():
+            reference = args['reference']
+            path = self.runner.store._retention_path(reference)
+            if not path.is_file():
+                reader = getattr(self.runner.backend, 'artifact_bytes', None)
+                if reader is None:
+                    raise FileNotFoundError('artifact is outside retained native evidence')
+                data = reader(reference)
+                from hashlib import sha256
+                if sha256(data).hexdigest() != reference:
+                    raise ValueError('admitted native artifact digest mismatch')
+                self.runner.store.put_bytes(data)
+            path = path.resolve(strict=True)
+            self.files.read_paths[path] = reference
+            self.runner.append(dict(type='native-artifact-grant', reference=reference,
+                operation_id=context['operation_id']))
+            return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
+                path=str(path), bytes=path.stat().st_size, read_with='read')))])
+        return self.actor._timed('retrieval', grant)
+
+    def _observation(self, observation):
+        if len(json.dumps(observation).encode()) <= 8192:
+            return observation
+        result = dict(retained_observation=self._retain_text(observation))
+        if isinstance(observation, dict):
+            for key in ('reference', 'summary', 'status'):
+                if key in observation:
+                    result[key] = observation[key]
+            response = observation.get('evidence', {}).get('payload', {}).get('response', {})
+            index = []
+            for group in ('results', 'negative_records'):
+                for position, row in enumerate(response.get(group, [])):
+                    from rsi.memory_projection import retrieval_facts
+                    facts = retrieval_facts(row)
+                    index.append(dict(group=group, index=position, facts=facts, full_row=self._retain_text(row)))
+            if index:
+                result['retrieval_index'] = self._retain_text(index)
+        return result
+
+    def _fresh_source(self):
+        if self.stale:
+            raise ValueError('Host input changed; regenerate the source action from current native feedback')
+        refresh = self.actor.context_refresh
+        if refresh is not None:
+            fresh = self.actor._timed('retrieval', lambda:refresh(self.current[0]['task']))
+            if fresh is not None:
+                if not isinstance(fresh, dict):
+                    raise TypeError('host context refresh must return a task object')
+                from rsi.actor import HostContextUpdated
+                self.current = self.dispatcher.throw(HostContextUpdated(fresh))
+                self.stale = True
+                raise ValueError('Host input changed; the source action was not executed')
+
+    def _state(self):
+        if self.current is None:
+            raise ValueError('no native workflow stage is active')
+        payload = self.current[0]
+        state = dict(stage=payload['stage'], operation_id=payload['operation_id'], stale=self.stale,
+                    done=bool(self.completed), allowed=[] if self.completed else
+                        [name for name in self.current[1] if name not in ('read_skill', 'read_project_file', 'read_artifact')],
+                    skill_receipts=payload['skill_receipts'], evidence_receipts=payload['evidence_receipts'])
+        if self.stale:
+            state.update(task=self._retain_text(payload['task']), user_guidance=payload['task'].get('user_guidance', {}))
+        return state
+
+    def _state_tool(self, args, context):
+        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))],
+                    terminate=bool(self.completed))
+
+    def _tool(self, name):
+        def invoke(args, context):
+            if self.stale:
+                return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state(), executed=False)))], isError=True)
+            if context['operation_id'] != self.runner.workflow.pending['id']:
+                raise ValueError('native tool differs from pending workflow operation')
+            observation = self._dispatch(name, args)
+            observation = self._observation(observation)
+            return dict(content=[dict(type='text', text=json.dumps(dict(observation=observation, workflow_state=self._state())))],
+                        terminate=bool(self.completed))
+        return invoke
+
+    def prepare(self, timeout, *, schemas):
+        if self.runner is None:
+            raise ValueError('native workflow session needs its trusted runner binding')
+        self.schemas = dict(schemas)
+        self.schemas['perform'] = dict(type='object', properties=dict(proposal=dict(type='string')),
+                                      required=['proposal'], additionalProperties=False)
+        identities = ('deepseek-flash-native-v1', 'openai-gpt-5.6-sol-v1')
+        profile = next((identity for identity in identities
+            if self.model in (identity, model_profile(identity)['model'],
+                model_profile(identity)['provider']+'/'+model_profile(identity)['model'])), None)
+        if profile is None:
+            raise ValueError('registered native programming profile required')
+        tools = [NativeTool(name, 'Execute the host '+name+' operation.', schema, self._tool(name))
+                 for name, schema in self.schemas.items() if name not in ('read_skill', 'read_project_file', 'read_artifact')]
+        tools.append(NativeTool('open_artifact', 'Open an immutable retained artifact for native read.',
+            dict(type='object', properties=dict(reference=dict(type='string', pattern='^[0-9a-f]{64}$')),
+                 required=['reference'], additionalProperties=False), self._open_artifact))
+        options = self.files.session_options()
+        def charged(name, callback):
+            def invoke(args, context):
+                if self.completed:
+                    raise ValueError('this host stage already completed')
+                if name in ('rsi_fs_write', 'rsi_fs_mkdir'):
+                    self._fresh_source()
+                category = 'implementation' if name in ('rsi_fs_write', 'rsi_fs_mkdir') else 'retrieval'
+                return self.actor._timed(category, lambda: callback(args, context))
+            return invoke
+        options['callbacks'] = {name: charged(name, callback)
+                                for name, callback in options['callbacks'].items()}
+        options['callbacks']['rsi_workflow_state'] = self._state_tool
+        options['callbacks']['rsi_workflow_read_observed'] = charged('rsi_workflow_read_observed', self._read_observed)
+        options['tools_factory'] = str(Path(__file__).resolve().parents[2]/'integrations/pi/workflow-tools.mjs')
+        options['tools_options']['skills'] = [dict(name=name, description='Frozen workflow guidance: '+name,
+            filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,
+            sourceInfo=dict(path=str(path), source='rsi-frozen-bundle', scope='project', origin='top-level'))
+            for path, name in self.skill_paths.items()]
+        self.session = NativeSession(self.runner.root/'native'/'session', cwd=self.files.backend.project,
+            profile_id=profile, tools=tools, environ=self.environ, observer=self._observe,
+            system_prompt=self.options.get('system_prompt', '')+'\nUse native read/edit/write and the host workflow tools. Read the retained task file and mapped skill files. '
+                'Design and optimisation require actual KDB and retrospective evidence. '
+                'Only a successful host perform completes a stage; ordinary tool calls continue normally. '
+                'Native edits are retained while the current stage is pending. No arbitrary shell is available.',
+            **options)
+        self.session.prepare(timeout)
+
+    def pending_source(self, operation_id):
+        return self.files.pending_source(operation_id)
+
+    def run_stage(self, dispatcher, turn, actor):
+        self.current, self.dispatcher, self.actor, self.completed = turn, dispatcher, actor, []
+        self.stale = False
+        operation = turn[0]['operation_id']
+        task = self._retain_text(turn[0]['task'])
+        prompt = dict(task=task, stage=turn[0]['stage'], operation_id=operation,
+            user_guidance=turn[0]['task'].get('user_guidance', {}),
+            mapped_skills=[dict(name=name, path=str(path)) for path, name in self.skill_paths.items()
+                           if name in turn[0]['skills']],
+            editable_files=[str(self.files.backend.project/name) for name in self.runner.config.editable_files])
+        self._resume()
+        try:
+            self.session.prompt(json.dumps(prompt), operation_id=operation, remaining=self._remaining)
+            if not self.completed:
+                raise ActionError('Native Pi settled without completing the host stage')
+            return self.completed[0]
+        finally:
+            self._pause()
+            self.current = self.dispatcher = self.actor = None
+
+    @property
+    def completion_tokens(self):
+        return self.session.completion_tokens if self.session else 0
+
+    def close(self):
+        self._pause()
+        if self.session:
+            self.session.close()
+            if not self.archived:
+                paths = [self.session.root/'native-events.jsonl', self.session.root/'native-worker.stderr',
+                         *sorted((self.session.root/'sessions').glob('*.jsonl'))]
+                artifacts = {str(path.relative_to(self.session.root)): self.runner.store.put_bytes(path.read_bytes())
+                             for path in paths if path.is_file()}
+                self.runner.append(dict(type='native-session-artifacts', artifact_refs=list(artifacts.values()),
+                    native_journals=artifacts,
+                    provider_settled=self.session.provider_settled,
+                    pending_tools=sorted(self.session.pending_tools)))
+                self.archived = True

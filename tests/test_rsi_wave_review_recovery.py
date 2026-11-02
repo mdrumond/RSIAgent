@@ -32,8 +32,7 @@ def transient_guard(request, *, phase, metadata, configuration, remaining):
     return dict(admitted=True, physical_device=metadata['physical_device'], observation='CPU admitted')
 
 
-@pytest.mark.parametrize('failure', ['busy', 'probe_pending', 'submission_unknown', 'probe_unknown'])
-def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instance, tmp_path, failure):
+def admission_cycle(wave_instance, tmp_path, failure):
     path = tmp_path / 'profiles.json'
     resolver = profiles(path)
     config = json.loads(path.read_text())
@@ -46,10 +45,20 @@ def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instanc
     settings['project_wave']['devices'] = [dict(device=str(i), worker_profile=f'worker-{i}') for i in (0, 1)]
     set_configuration(wave_instance.root, settings)
     wave_instance.executor_factory = resolver
-    cycle = wave_instance.create_cycle('admission-retry', 'phase1')
+    return wave_instance.create_cycle('admission-retry', 'phase1'), coordination
+
+
+@pytest.mark.parametrize('failure', ['busy', 'probe_pending', 'submission_unknown', 'probe_unknown'])
+def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instance, tmp_path, failure, monkeypatch):
+    cycle, coordination = admission_cycle(wave_instance, tmp_path, failure)
     try:
-        with pytest.raises(RuntimeError):
-            cycle.step()
+        # Exercise explicit observation/resume from a retained admission, rather
+        # than letting the normal drain settle and readmit the known busy case.
+        with monkeypatch.context() as paused:
+            paused.setattr(cycle.waves, 'observe',
+                          lambda: cycle.waves._pool(cycle.scheduler.state['active_wave']).status())
+            with pytest.raises(RuntimeError):
+                cycle.step()
         wave = cycle.scheduler.state['active_wave']
         pool = cycle.waves._pool(wave)
         before = pool.status()['projects']
@@ -86,6 +95,32 @@ def test_pre_runner_admission_can_settle_original_probe_then_resume(wave_instanc
             runner = cycle.open_project(op)
             assert runner.workflow.accounting.seconds() >= closed[op]['actor_seconds']
         assert not cycle.memory.records()
+    finally:
+        cycle.close()
+
+
+
+def test_known_busy_admission_drains_with_fresh_guard_and_carried_elapsed(wave_instance, tmp_path):
+    cycle, coordination = admission_cycle(wave_instance, tmp_path, 'busy')
+    try:
+        assert cycle.step().outcome == 'accepted'
+        wave = cycle.scheduler.state['active_wave']
+        pool = cycle.waves._pool(wave)
+        rows = pool.status()['projects']
+        calls = [json.loads(line) for line in (coordination/'calls.jsonl').read_text().splitlines()]
+        assert len(calls) == len({row['dispatch'] for row in calls}) == 4
+        assert not (coordination/'release').exists()
+        for operation, row in rows.items():
+            assert row['status'] == 'completed' and row['receipt']['result']['status'] == 'accepted'
+            records = [json.loads(p.read_text()) for p in pool._branch(operation).glob('worker-admission-*.json')]
+            denied = [r for r in records if r['receipt'].get('admitted') is False]
+            admitted = [r for r in records if r['receipt'].get('admitted') is True]
+            assert len(denied) == len(admitted) == 1
+            assert denied[0]['receipt']['failure']['type'] == 'busy'
+            assert denied[0]['dispatch_id'] != admitted[0]['dispatch_id'] == row['dispatch_id']
+            elapsed = sum(r['elapsed'] for r in records)
+            assert elapsed > 0 and row['actor_seconds'] >= elapsed
+            assert cycle.open_project(operation).workflow.accounting.seconds() >= elapsed
     finally:
         cycle.close()
 

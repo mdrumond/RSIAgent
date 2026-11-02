@@ -69,7 +69,7 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
-def exercise_optimizer_memory_delivery(tmp_path, monkeypatch):
+def exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider):
     from optimizer.jobs import JobStore,canonical,sha
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import Agent,Backend,candidate
@@ -97,7 +97,7 @@ def exercise_optimizer_memory_delivery(tmp_path, monkeypatch):
     agent = DeliveryAgent([{'action':'cases','signatures':[],'summary':''},
         {'action':'read-memory','index':0},candidate('fast')])
     agent.canonical_fixture = True
-    state = scripted_optimizer_http(monkeypatch, agent)
+    state = scripted_optimizer_http(monkeypatch, agent, native_provider=scripted_provider)
     loop=OptimizationLoop(jobs,key,agent,Backend(),memory_observer=observer)
     result = loop.run(single_evaluation=True)
     assert result['status'] == 'running'
@@ -105,10 +105,9 @@ def exercise_optimizer_memory_delivery(tmp_path, monkeypatch):
     assert state.requests
     assert len(delivered) == 1
     assert all(delivered[0][key] == value for key, value in snapshot['memory_entries'][0].items())
-    requests = [row for row in loop.fixture_runner.events if row['type'] == 'pi-provider-request']
+    requests = [row for row in loop.fixture_runner.events if row['type']=='pi-native-event' and row['event']['type']=='before_provider_request']
     assert len(requests) == len(state.requests)
-    reservations = [row['reservation_id'] for row in requests]
-    assert len(reservations) == len(set(reservations))
+    assert all(row['event']['operation_id'] for row in requests)
     rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
     assert len(rows)==1 and rows[0]['actor_role']=='optimizer'
     assert any(kind == 'presentation' for kind, _ in observed)
@@ -122,8 +121,8 @@ def exercise_optimizer_memory_delivery(tmp_path, monkeypatch):
     assert service.ledger.stats(base['memory_id'])['accesses'] == accesses
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
-    exercise_optimizer_memory_delivery(tmp_path, monkeypatch)
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch, scripted_provider):
+    exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider)
 
 
 @pytest.mark.parametrize('withdraw_first',[False,True])

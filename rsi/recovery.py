@@ -38,8 +38,12 @@ def _files(root, store):
     return result
 
 
-def _half_limits(limits, remaining):
+def _arm_limits(limits, remaining, independent):
     values = limits.to_dict()
+    if independent:
+        for key in ('design_iterations', 'implementation_iterations', 'execution_tries'):
+            values[key] = None
+        return BudgetLimits.from_dict(values)
     for key in ('actor_seconds', 'wall_seconds'):
         bounds = [v for v in (values[key], remaining.get(key),
                   remaining.get('recovery_seconds') if key == 'actor_seconds' else None) if v is not None]
@@ -68,27 +72,30 @@ class TrialRequest:
 class PairedRecovery:
     """One pair per original by default; each trial starts at preflight.
 
-    joint_limits is a NEW allocation bounded by remaining_parent, not a reset
-    of the original workflow. Integer joint caps split evenly (odd remainder
-    unused); None disables a cap. Original consumption is retained as provenance.
+    New pairs give each arm its own complete elapsed allocation. Parent totals
+    remain provenance, not eligibility. independent=False preserves explicitly
+    requested legacy split allocations; retained pairs keep their frozen policy.
     terminal_failure_ref may name an exact public terminal_failure_proof packet
     retained in artifacts. It admits a known-closed failed checkpoint without
     clearing pending or claiming stage completion. Unknown work remains blocked.
-    defer_wall_start freezes inputs now but starts the relative pair window at
-    its first dispatch; an absolute parent bound still applies during staging.
+    For legacy pairs, defer_wall_start begins the shared relative window at
+    first dispatch. Independent arms each persist their own dispatch origin.
     One writer owns path, as for the canonical runner and Learning.
     """
     @classmethod
     def create(cls, path, checkpoint, *, artifacts, memory_ref, kdb_ref,
                model_config, incumbent, candidate, joint_limits,
-               remaining_parent, runner_factory, terminal_failure_ref=None, clock=None, defer_wall_start=False):
+               remaining_parent, runner_factory, terminal_failure_ref=None, clock=None, defer_wall_start=False,
+               independent=True):
         if not isinstance(checkpoint, ProjectRunner):
             raise ValueError('canonical checkpoint required')
         if type(defer_wall_start) is not bool:
             raise ValueError('defer_wall_start must be boolean')
+        if type(independent) is not bool:
+            raise ValueError('independent must be boolean')
         clock = clock or checkpoint.workflow.clock
         created = clock()
-        walls = [v for v in (joint_limits.wall_seconds, remaining_parent.get('wall_seconds')) if v is not None]
+        walls = [] if independent else [v for v in (joint_limits.wall_seconds, remaining_parent.get('wall_seconds')) if v is not None]
         window = min(walls) if walls else None
         deadline = created + window if window is not None and not defer_wall_start else None
         path = Path(path)
@@ -121,7 +128,8 @@ class PairedRecovery:
             verifier=artifacts.put_bytes(checkpoint.backend.verifier.read_bytes()),
             memory=memory_ref, kdb=kdb_ref, model_config=copy.deepcopy(model_config),
             backend=original['backend_identity'], incumbent=incumbent, candidate=candidate,
-            allocation=_half_limits(joint_limits, remaining_parent).to_dict(),
+            allocation=_arm_limits(joint_limits, remaining_parent, independent).to_dict(),
+            independent=independent,
             original_contract=artifacts.put_json(original),
             original_spent=checkpoint.workflow.accounting.seconds(),
             original_source=checkpoint.backend.project_hash(),
@@ -157,6 +165,10 @@ class PairedRecovery:
         now = self.clock()
         if not math.isfinite(now) or now < self.state.get('last_clock', now):
             raise WorkflowError('pair clock moved backwards')
+        if self.frozen.get('independent'):
+            self.state['last_clock'] = now
+            self._save()
+            return now
         deadline = self.state.get('wall_deadline')
         window = self.state.get('wall_window_seconds')
         start_window = window is not None and self.state.get('wall_started') is None
@@ -225,7 +237,9 @@ class PairedRecovery:
         bounds = [v for v in (self.state.get('wall_deadline'),
             started + request.spec.budgets.wall_seconds if request.spec.budgets.wall_seconds is not None else None)
             if v is not None]
-        row['wall_deadline'] = min(bounds) if bounds else None
+        row.setdefault('wall_deadline', min(bounds) if bounds else None)
+        if row['wall_deadline'] is not None and row['wall_deadline'] <= self.clock():
+            raise WorkflowError('arm wall allocation exhausted; observe retained work only')
         row['status'] = 'pending'
         self._save()  # Includes factory/setup failure: absence must be confirmed explicitly.
         runner = self.factory(request, reopen=False)
@@ -259,6 +273,8 @@ class PairedRecovery:
         failure = None
         if flow.outcome not in ('accepted', 'rejected'):
             failure = runner.terminal_failure_proof()
+            from rsi.supervision import retain_terminal
+            retain_terminal(runner, failure)
             terminal = 'failed'
             for obj in runner.store.objects.glob('*/*'):
                 self.store.put_bytes(runner.store.read_bytes(obj.parent.name + obj.name))
@@ -287,6 +303,12 @@ class PairedRecovery:
             (command := self.store.read_json(ref))['current_hash'] == runner.backend.project_hash()
             and command['classification'] in ('numeric_failure', 'compile_failure', 'execution_failure')
             for ref in failure['command_receipts']))
+        audit_ref = None
+        if failure:
+            canonical = runner.store.read_json(failure['result_ref'])['result']
+            audit_ref = failure.get('audit_ref', canonical.get('audit_ref'))
+            if audit_ref:
+                self.store.put_bytes(runner.store.read_bytes(audit_ref))
         receipt = dict(operation_id=request.operation_id, frozen=request.frozen_ref,
             arm=arm, root=str(request.root), skill_bundle_hash=runner.bundle.digest,
             workflow=workflow, correctness=correctness,
@@ -295,7 +317,7 @@ class PairedRecovery:
             wall_deadline=row.get('wall_deadline'),
             wall_limited=row.get('wall_deadline') is not None and self.clock() >= row['wall_deadline'],
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
-            terminal_failure_ref=self.store.put_json(failure) if failure else None,
+            terminal_failure_ref=self.store.put_json(failure) if failure else None, audit_ref=audit_ref,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
             execution_contract=self.store.put_json(runner.backend.contract),
             workflow_receipt=self.store.put_json(flow.state))
@@ -382,11 +404,14 @@ class CycleController:
     PairedRecovery. Learning.validate must consume paired evidence case IDs;
     only beneficial pairs enter its promotion gate. success_cases(event) may
     supply frozen independent validation cases for successful originals.
+    pair_feedback(event, operation, result) admits canonical arm facts for
+    independent original retry queues. It observes retained trials, never runs them.
     Tuning events remain unacknowledged for PR11.
     """
-    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None):
+    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None, pair_feedback=None):
         self.path, self.scheduler, self.learning = Path(path), scheduler, learning
         self.store, self.pair_factory, self.success_cases = artifacts, pair_factory, success_cases
+        self.pair_feedback = pair_feedback
         self.state = json.loads(self.path.read_text()) if self.path.exists() else dict(pending=None, completed={})
 
     def _save(self):
@@ -416,13 +441,14 @@ class CycleController:
         if result is None:
             if event['kind'] == 'paired_recovery_due':
                 if 'wall_deadline' not in pending:
-                    cap = self.scheduler.config['wall_seconds']
+                    cap = None if self.scheduler.independent_projects else self.scheduler.config['wall_seconds']
                     pending['wall_deadline'] = self.scheduler.state['created'] + cap if cap is not None else None
                     self._save()
-                if dispatch and pending['wall_deadline'] is not None and self.scheduler.clock() >= pending['wall_deadline']:
+                if (dispatch and not self.scheduler.independent_projects and pending['wall_deadline'] is not None
+                        and self.scheduler.clock() >= pending['wall_deadline']):
                     raise WorkflowError('parent wall allocation exhausted; observe retained arms only')
-                pair = self.pair_factory(copy.deepcopy(event), operation, self.scheduler.remaining())
-                if pending['wall_deadline'] is not None:
+                pair = self.pair_factory(copy.deepcopy(event), operation, self.scheduler._allocation_remaining())
+                if pending['wall_deadline'] is not None and not self.scheduler.independent_projects:
                     pair.bind_parent_wall_deadline(pending['wall_deadline'])
                 if dispatch:
                     while pair.result() is None:
@@ -437,10 +463,15 @@ class CycleController:
                 result = dict(decision='validation' if cases else 'pending', cases=list(cases), actor_seconds=0.)
             pending['result'] = result
             self._save()
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries and 'feedback' not in pending:
+            if self.pair_feedback is None:
+                raise WorkflowError('paired retry requires canonical host feedback')
+            pending['feedback'] = self.pair_feedback(event, operation, result)
+            self._save()  # Authenticate retained arm facts before any skill promotion.
         if result['decision'] in ('benefit', 'validation') and 'active' not in pending:
             if self.scheduler.state['stopped']:
                 raise WorkflowError('cycle stopped before validation')
-            wall = self.scheduler.remaining()['wall_seconds']
+            wall = self.scheduler._allocation_remaining()['wall_seconds']
             if wall is not None and wall <= 0:
                 raise WorkflowError('parent wall allocation exhausted before validation')
             cases = result.get('cases', [result['evidence_ref']] if 'evidence_ref' in result else [])
@@ -452,6 +483,8 @@ class CycleController:
             self.scheduler.publish_validated_skills(event['incumbent'], self.learning.active)
         receipt = self.store.put_json(dict(event=event['id'], operation_id=operation, result=result,
                                           active=self.learning.active))
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries:
+            self.scheduler.complete_paired_retry(event, result, receipt, pending['feedback'])
         self.scheduler.complete_extension(event['id'], receipt,
             actor_seconds=result['actor_seconds'], recovery=event['kind'] == 'paired_recovery_due')
         self.state['completed'][event['id']] = receipt

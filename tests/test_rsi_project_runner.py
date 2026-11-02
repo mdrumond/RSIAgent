@@ -879,38 +879,6 @@ def test_prepare_failure_retains_closed_session_proof_before_dispatch(tmp_path, 
         database.close()
 
 
-def test_real_rpc_setup_close_and_provider_settlement_are_observed(tmp_path):
-    from pathlib import Path
-    from threading import Event
-    from types import SimpleNamespace
-    from coding.pi.rpc import PiRPC
-    from rsi.actor import PiSessionAdapter
-    class StartingPi(PiSessionAdapter):
-        def __init__(self):
-            rpc = PiRPC([sys.executable, '-c', 'import sys; sys.stdin.readline()'],
-                        cwd=Path(tmp_path), env=None)
-            settled = Event()
-            settled.set()  # No provider request was dispatched during failed setup.
-            self.session = SimpleNamespace(rpc=rpc, gateway=SimpleNamespace(finished=settled), close=rpc.close)
-        def prepare(self, timeout, *, schemas):
-            raise TimeoutError('handshake readiness timeout')
-    sessions = []
-    def factory():
-        session = StartingPi()
-        sessions.append(session)
-        return session
-    runner, _, database = make(tmp_path, session_factory=factory, test_backend=False)
-    try:
-        result = runner.run()
-        assert sessions[0].session.rpc.process.poll() is not None
-        assert result['pending']['handle'] is None
-        closure = runner.store.read_json(result['actor_closure_ref'])['observation']
-        assert closure['actor_closed'] is True and closure['provider_settled'] is True
-        assert runner.terminal_failure_proof()['outcome'] == 'failed'
-    finally:
-        for session in sessions:
-            session.session.rpc.close()
-        database.close()
 
 
 def test_raising_factory_partial_start_needs_scoped_explicit_observation(tmp_path):

@@ -2,27 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from copy import copy, deepcopy
-from contextlib import nullcontext
-import json
-import logging
+from dataclasses import dataclass
+from copy import copy
 import math
-import re
 import time
-from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from benchmarks.ascend.agent_context import (
-    ContextBudget, ContextBudgetError, DEFAULT_CONTEXT_BUDGETS, WorkingContext, request_bytes,
+    ContextBudget, DEFAULT_CONTEXT_BUDGETS,
 )
 
-from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel, A5ModelIdentity
-from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
 from benchmarks.a5kernels.trial import (
-    _ACTION_NUDGE,
     _SYSTEM_PROMPT,
     ActorOutcome,
     ActionOutcome,
@@ -58,7 +48,6 @@ _DIRECT_VALUES = {
 }
 
 _PROVIDER_TIMEOUT_SECONDS = 600
-_LOGGER = logging.getLogger(__name__)
 _MAX_DISTILLATION_ATTEMPTS = 3
 _MAX_DISTILLATION_ARTIFACT_BYTES = 64_000
 _MAX_DISTILLATION_SINGLE_ARTIFACT_BYTES = 32_000
@@ -160,42 +149,13 @@ class ProviderRejectionError(RuntimeError):
                 "status_code": self.status_code, "request_id": self.request_id}
 
 
-def _is_openai_transport_failure(exc: Exception) -> bool:
-    """Recognize optional OpenAI SDK connection failures when it is installed."""
-
-    try:
-        from openai import APIConnectionError, APITimeoutError
-    except ImportError:
-        return False
-    return isinstance(exc, (APIConnectionError, APITimeoutError))
-
-
 def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompletion:
-    from openai import OpenAI
-
-    request = dict(request)
-    timeout = request.pop("timeout", _PROVIDER_TIMEOUT_SECONDS)
-    response = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=timeout,
-        max_retries=0,
-    ).chat.completions.create(
-        **dict(request)
-    )
-    try:
-        return DirectCompletion(
-            response.choices[0].message.content,
-            response.usage.completion_tokens,
-        )
-    except _EmptyTextCompletion:
-        raise
-    except (AttributeError, IndexError, TypeError, ValueError):
-        raise ValueError("provider response is missing content or token usage") from None
+    """Historical transport identity; production calls must use native Pi."""
+    raise RuntimeError('direct HTTP completion was replaced by native Pi sessions')
 
 
 class DirectCompletionProvider:
-    """Hold credentials privately and issue only exact registered direct requests."""
+    """Hold registered credentials/profiles for native Pi composition."""
 
     def __init__(
         self,
@@ -245,196 +205,27 @@ class DirectCompletionProvider:
             self.context_budgets.update(context_budgets)
 
     def coding_environment(self):
-        """Host-only credential copy for the Pi gateway; never passed to Pi."""
+        """Host-only credential copy for native Pi model configuration."""
         return dict(self._credentials)
 
     def context_budget(self, profile):
         return self.context_budgets[profile.identity.backend_model.value]
 
-    def complete(
-        self,
-        profile: DirectModelProfile,
-        messages: Sequence[Mapping[str, str]],
-        *, attempt_observer=None, max_seconds=None,
-    ) -> DirectCompletion:
+    def complete(self, profile, messages, *, attempt_observer=None, max_seconds=None):
+        """Explicitly injected fixture transport only; no production HTTP fallback."""
+        if self._transport is openai_compatible_transport:
+            raise RuntimeError('production completion requires a native Pi session')
         if profile != direct_profile(profile.identity):
-            raise ValueError("provider profile is not canonical")
+            raise ValueError('provider profile is not canonical')
         if profile.identity.credential_env not in self._credentials:
-            raise ValueError("provider credential is not configured for this model")
-        if request_bytes(profile.request(messages)) > self.context_budget(profile).hard:
-            raise ContextBudgetError("direct provider request exceeds context hard byte budget")
-        if max_seconds is not None:
-            if type(max_seconds) not in (int, float) or not math.isfinite(max_seconds):
-                raise ValueError("provider max_seconds must be finite seconds")
-            if max_seconds <= 0:
-                raise TimeoutError("provider request time allowance exhausted")
-        request = profile.request(messages)
-        started = self.clock()
-        request_deadline = started + max_seconds if max_seconds is not None else None
-        retry_seconds = min(self.retry_max_seconds, max_seconds) if max_seconds is not None else self.retry_max_seconds
-        deadline = started + retry_seconds
-        attempt = 0
-        while True:
-            dispatched = dict(request)
-            if request_deadline is not None:
-                remaining = request_deadline - self.clock()
-                if remaining <= 0:
-                    raise TimeoutError("provider request time allowance exhausted")
-                dispatched["timeout"] = min(_PROVIDER_TIMEOUT_SECONDS, remaining)
-            request_sha256 = canonical_digest(dispatched)
-            attempt += 1
-            if attempt_observer is not None:
-                attempt_observer("request", {"attempt": attempt, "request": deepcopy(dispatched),
-                                             "request_sha256": request_sha256})
-            try:
-                return self._complete_once(profile, dispatched)
-            except ProviderRejectionError as exc:
-                retry = self.clock() + self.invalid_prompt_backoff_seconds < deadline
-                delay = self.invalid_prompt_backoff_seconds if retry else 0
-                rejection = {"attempt": attempt, **exc.evidence(),
-                             "request_sha256": request_sha256,
-                             "retry": retry, "backoff_seconds": delay}
-                # Curriculum/KDB callers need diagnostics too, even without an
-                # Actor evidence observer. Never log exception bodies or keys.
-                _LOGGER.warning("provider prompt rejection: %s", json.dumps(rejection, sort_keys=True))
-                if attempt_observer is not None:
-                    attempt_observer("rejection", rejection)
-                if not retry:
-                    raise
-                self._sleep(delay)
-
-    def _complete_once(self, profile, request):
-        try:
-            result = self._transport(
-                base_url=profile.base_url,
-                api_key=self._credentials[profile.identity.credential_env],
-                request=deepcopy(request),
-            )
-        except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            body = getattr(exc, "body", None)
-            code = getattr(exc, "code", None)
-            if isinstance(body, dict):
-                error = body.get("error", body)
-                if isinstance(error, dict):
-                    code = error.get("code", code)
-            if status == 400 and code == "invalid_prompt":
-                request_id = getattr(exc, "request_id", None)
-                # Retain only an ID, never arbitrary exception/body text.
-                if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", request_id):
-                    request_id = None
-                if request_id and any(secret in request_id for secret in self._credentials.values()):
-                    request_id = None
-                raise ProviderRejectionError(code=code, status_code=status,
-                                             request_id=request_id) from None
-            retryable = (
-                isinstance(exc, (ConnectionError, TimeoutError))
-                or _is_openai_transport_failure(exc)
-                or status in {408, 409, 425, 429}
-                or isinstance(status, int) and 500 <= status <= 599
-            )
-            if retryable:
-                raise InfrastructureFailure(
-                    "direct provider transport unavailable"
-                ) from exc
-            raise
+            raise ValueError('provider credential is not configured for this model')
+        if max_seconds is not None and max_seconds <= 0:
+            raise TimeoutError('fixture completion elapsed allowance exhausted')
+        result = self._transport(base_url=profile.base_url,
+            api_key=self._credentials[profile.identity.credential_env], request=profile.request(messages))
         if not isinstance(result, DirectCompletion):
-            raise TypeError("provider transport returned an invalid completion")
+            raise TypeError('injected fixture transport returned an invalid completion')
         return result
-
-
-class _ProviderEvidenceRecorder:
-    """Persist secret-free exact requests and raw provider text for one trial."""
-
-    def __init__(self, workspace) -> None:
-        self.enabled = workspace is not None
-        if not self.enabled:
-            return
-        root = Path(workspace).parent
-        self.artifacts = ContentAddressedArtifacts(root / "artifacts")
-        self.ledger_path = root / "evidence.jsonl"
-
-    def request(self, profile, messages, *, stage: str, turn: int) -> None:
-        if not self.enabled:
-            return
-        digest = self.artifacts.put_json(profile.request(messages))
-        self._append("provider-request", digest, stage=stage, turn=turn)
-
-    def response(self, text: str, *, stage: str, turn: int) -> None:
-        if not self.enabled:
-            return
-        digest = self.artifacts.put_bytes(text.encode("utf-8"))
-        self._append("provider-response", digest, stage=stage, turn=turn)
-
-    def failure(self, exc: Exception, *, stage: str, turn: int) -> None:
-        if not self.enabled:
-            return
-        payload = exc.evidence() if isinstance(exc, ProviderRejectionError) else {"exception_type": type(exc).__name__}
-        digest = self.artifacts.put_json(payload)
-        self._append("provider-response-failure", digest, stage=stage, turn=turn)
-
-    def attempt(self, event, payload, *, stage, turn):
-        if not self.enabled:
-            return
-        digest = self.artifacts.put_json(payload.get("request", payload))
-        role = "provider-request" if event == "request" else "provider-attempt-rejection"
-        self._append(role, digest, stage=stage, turn=turn,
-                     attempt=payload["attempt"], request_sha256=payload["request_sha256"])
-
-    def observation(self, text: str, *, turn: int) -> None:
-        if not self.enabled:
-            return
-        digest = self.artifacts.put_bytes(text.encode("utf-8"))
-        self._append("host-observation", digest, origin="actor", turn=turn)
-
-    def _append(self, role: str, digest: str, **fields: object) -> None:
-        EvidenceLedger(self.ledger_path).append(EvidenceKind.ARTIFACT, {
-            "role": role, "sha256": digest, **fields,
-        })
-
-    def bounded_payloads(self, admitted: Mapping[str, str], *, max_bytes=_MAX_DISTILLATION_ARTIFACT_BYTES) -> dict[str, object]:
-        if not self.enabled:
-            return {}
-        remaining = max_bytes
-        payloads = {}
-        for digest, role in sorted(admitted.items()):
-            if role not in _DISTILLATION_PAYLOAD_ROLES:
-                continue
-            try:
-                content = self.artifacts.read_bytes(digest)
-            except (FileNotFoundError, ValueError):
-                payloads[digest] = {"role": role, "retained": False}
-                continue
-            entry = {"role": role, "size_bytes": len(content), "retained": True}
-            if len(content) > _MAX_DISTILLATION_SINGLE_ARTIFACT_BYTES or len(content) > remaining:
-                entry["payload_omitted"] = "bounded-context-limit"
-            else:
-                try:
-                    entry["payload"] = json.loads(content)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    entry["payload"] = content.decode("utf-8", errors="replace")
-                remaining -= len(content)
-            payloads[digest] = entry
-        return payloads
-
-
-@dataclass(frozen=True)
-class _ActorContinuation:
-    profile: DirectModelProfile
-    messages: tuple[Mapping[str, str], ...]
-    recorder: _ProviderEvidenceRecorder
-    working_context: WorkingContext
-    total_turns: int
-    deadline: float | None = None
-
-
-@dataclass(frozen=True)
-class _ActorSelection:
-    action: TrialAction | None
-    text: str
-    tokens: int
-    invalid_observation: str | None = None
-    exhausted: bool = False
 
 
 from benchmarks.ascend.actor_control import actor_lease
@@ -484,78 +275,6 @@ class DirectActorDriver:
         driver._provider_deadline = min(deadline_after(driver.max_seconds, clock=self.clock),
                                         getattr(self, '_provider_deadline', float('inf')))
         return driver
-
-    def _prepare_context(self, working, profile, recorder, *, turn):
-        tokens = 0
-
-        def summarize(messages):
-            nonlocal tokens
-            self._request(recorder, profile, messages, stage="compaction", turn=turn)
-            try:
-                completion = self._complete(recorder, profile, messages, stage="compaction", turn=turn)
-            except _EmptyTextCompletion as exc:
-                # Only compaction treats empty textual output as correctable.
-                # Ordinary Actor/provider calls still reject this ValueError.
-                completion = exc
-            except Exception as exc:
-                recorder.failure(exc, stage="compaction", turn=turn)
-                if isinstance(exc, ProviderRejectionError):
-                    raise
-                raise ContextBudgetError("work-log summarization failed; original evidence retained") from exc
-            recorder.response(completion.text, stage="compaction", turn=turn)
-            tokens += completion.completion_tokens
-            self._trace("tool", {"name": "context-compaction", "status": "observed",
-                "messages": messages, "work_log": completion.text,
-                "completion_tokens": completion.completion_tokens})
-            return completion.text
-
-        messages = working.prepare(profile, self.provider.context_budget(profile), summarize)
-        return messages, tokens
-
-    def _request(self, recorder, profile, messages, *, stage, turn):
-        self._trace("tool", {"name": "provider-request", "stage": stage, "turn": turn,
-                             "request": profile.request(messages)})
-
-    def _complete(self, recorder, profile, messages, *, stage, turn):
-        def observe(event, payload):
-            recorder.attempt(event, payload, stage=stage, turn=turn)
-            self._trace("tool", {"name": "provider-attempt-" + event,
-                                "stage": stage, "turn": turn, **payload})
-        options = dict(attempt_observer=observe)
-        deadline = getattr(self, '_provider_deadline', None)
-        if deadline is not None:
-            remaining = deadline - self.clock()
-            if remaining <= 0:
-                raise TimeoutError("Actor provider time allowance exhausted")
-            # Production providers support HTTP/retry bounds. Injected providers
-            # retain their existing protocol and own their transport I/O limits.
-            if isinstance(self.provider, DirectCompletionProvider):
-                options['max_seconds'] = remaining
-        return self.provider.complete(profile, messages, **options)
-
-    def _action_session(self, profile, action_executor, deadline):
-        return nullcontext(None)
-
-    def _select_action(self, session, *, working, profile, recorder, turn,
-                       feedback, action_executor, turn_parser, deadline):
-        messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
-        self._request(recorder, profile, messages, stage="action", turn=turn)
-        try:
-            completion = self._complete(recorder, profile, messages, stage="action", turn=turn)
-        except Exception as exc:
-            recorder.failure(exc, stage="action", turn=turn)
-            raise
-        return _ActorSelection(turn_parser(completion.text), completion.text,
-                               summary_tokens + completion.completion_tokens)
-
-    def _observed_action(self, session, action, observation, action_executor):
-        pass
-
-    def _terminal_context(self, working, profile):
-        # Pinned user feedback follows recent exchanges in the model view; it
-        # must never replace the host result consumed by terminal distillation.
-        terminal = working.recent[-1]
-        return [message for message in working.messages() if message is not terminal] + [terminal]
 
     @actor_lease
     def __call__(self, instruction: str, *, profile: DirectModelProfile,

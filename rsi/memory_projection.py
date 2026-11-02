@@ -29,3 +29,26 @@ def project_memory(record, artifacts):
             counts={key: len(value) for key, value in provenance.items()
                     if isinstance(value, (list, dict))},
             packet=provenance.get('packet'), baseline=provenance.get('baseline')))
+
+
+def retrieval_facts(row):
+    """Useful per-record index facts; full original rows remain retained separately."""
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+    def text(value):
+        return value.encode()[:512].decode(errors='ignore') if isinstance(value, str) else None
+    value = mapping(row)
+    metadata = mapping(value.get('memory', value))
+    proposal = mapping(metadata.get('proposal'))
+    observed = mapping(value.get('observations'))
+    scope = mapping(observed.get('applicability'))
+    candidates = dict(memory_id=metadata.get('memory_id'), kind=proposal.get('kind'),
+        project_id=proposal.get('project_id'), summary=proposal.get('summary', value.get('reason', value.get('text', row))),
+        goal=scope.get('goal'), outcome=observed.get('outcome'))
+    facts = {key: found for key, item in candidates.items() if (found := text(item)) is not None}
+    commands = mapping(observed.get('commands')).get('items', [])
+    commands = commands if isinstance(commands, list) else []
+    facts['commands'] = [dict(command=text(item.get('command')), classification=text(item.get('classification')),
+        stderr=text(mapping(item.get('stderr')).get('text')), stdout=text(mapping(item.get('stdout')).get('text')))
+        for item in commands[-3:] if isinstance(item, dict)]
+    return facts

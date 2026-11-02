@@ -10,14 +10,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
-import queue
-import threading
 import time
 import uuid
 
-from coding.pi.context import ContextRecords, encoded
-from coding.pi.schema import STRING, obj, validate
-from coding.pi.session import ActionError, PiCodingSession
+from coding.pi.schema import STRING, obj
+from coding.pi.session import ActionError
 from rsi.contracts import Stage, StepEvidence
 from rsi.runtime import WorkflowError
 from rsi.skills import SkillUsage
@@ -29,18 +26,7 @@ SCHEMAS = {
     'perform': obj({'proposal': STRING, 'edit': obj({
         'path': STRING, 'sha256': STRING, 'source': STRING})}, ['proposal']),
 }
-SYSTEM = (
-    'You select actions for a host-controlled programming workflow. '
-    'Read every mapped skill using read_skill before perform. Only the host '
-    'executes proposals and determines outcomes or stage transitions. '
-    'Use the current stage and observation; never skip stages or claim success '
-    'from a queued action. Source edits require the exact editable path/hash. '
-    'Design and optimisation require real retrospective and KDB evidence. '
-    'Read results appear in the next host snapshot as executed observations. '
-    'Use current_skill_content for already-read skills; use read_context when '
-    'content is paged. Do not repeat a completed read because its native receipt was queued. '
-    'Select exactly one typed host action per turn.'
-)
+
 
 
 @dataclass(frozen=True)
@@ -84,175 +70,10 @@ class EvidenceTool:
             object.__setattr__(self, 'stages', tuple(Stage(stage) for stage in self.stages))
 
 
-class WorkflowContextRecords(ContextRecords):
-    """Canonical projection: current completed reads are usable without paging.
-
-    Histories retain the existing record/page mechanism. Only actual host-returned
-    text is inlined, within fixed per-result and complete-snapshot byte bounds.
-    """
-    def snapshot(self, context, *, target=24576):
-        result = super().snapshot(context, target=target)
-        original, projected = context.get('host', {}), result.get('host', {})
-        observation = original.get('observation')
-        if isinstance(observation, dict) and observation.get('executed') is True:
-            for key, limit in (('content', 4096), ('summary', 2048)):
-                value = observation.get(key)
-                if value is None or len(encoded(value)) > limit:
-                    continue
-                old = projected['observation'].get(key)
-                projected['observation'][key] = value
-                if len(encoded(result)) > target:
-                    projected['observation'][key] = old
-        latest = {}
-        for row in original.get('read_skills', []):
-            if row.get('section') is None:
-                latest[row['skill']] = dict(receipt_id=row['receipt_id'], content=row['content'])
-        visible = {}
-        projected['current_skill_content'] = visible
-        for name, row in reversed(list(latest.items())):
-            if len(encoded(row)) > 4096:
-                continue
-            visible[name] = row
-            if len(encoded(visible)) > 4096 or len(encoded(result)) > target:
-                del visible[name]
-        if len(encoded(result)) > target:
-            projected.pop('current_skill_content', None)
-        return result
-
-
-class SkillDelivery:
-    """Evidence that actual forwarded requests contained complete skill bytes."""
-    def __init__(self):
-        self.operation = None
-        self.expected, self.delivered, self.pages = {}, set(), {}
-
-    def begin(self, operation):
-        if operation != self.operation:
-            self.operation = operation
-            self.expected, self.delivered, self.pages = {}, set(), {}
-
-    def expect(self, reference, content):
-        self.expected[reference] = content
-
-    def observe(self, request, record):
-        strings, pages = [], []
-        def visit(value):
-            if isinstance(value, str):
-                strings.append(value)
-                if value.startswith(('{', '[')):
-                    try:
-                        visit(json.loads(value))
-                    except ValueError:
-                        pass
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item)
-            elif isinstance(value, dict):
-                if {'record', 'offset', 'text'} <= value.keys():
-                    pages.append(value)
-                for item in value.values():
-                    visit(item)
-        visit(request.get('messages', request.get('input', [])))
-        for reference, content in self.expected.items():
-            if reference in self.delivered:
-                continue
-            raw, digest = content.encode(), sha256(content.encode()).hexdigest()
-            spans = self.pages.setdefault(digest, [])
-            for page in pages:
-                offset, text = page['offset'], page['text']
-                if page['record'] != digest or type(offset) is not int or offset < 0 or not isinstance(text, str):
-                    continue
-                fragment = text.encode()
-                if raw[offset:offset+len(fragment)] == fragment:
-                    spans.append((offset, offset+len(fragment)))
-            boundary = 0
-            for start, end in sorted(spans):
-                if start > boundary:
-                    break
-                boundary = max(boundary, end)
-            if any(content in text for text in strings) or boundary >= len(raw):
-                self.delivered.add(reference)
-                record('skill-delivered', dict(receipt_id=reference, content_hash=digest))
-
-    def missing(self, references):
-        return [dict(receipt_id=ref, content=self.expected[ref])
-                for ref in dict.fromkeys(references) if ref not in self.delivered]
-
-
-class SnapshotPiSessionAdapter:
-    """Reuse Pi's schemas, loopback gateway, context paging and exact edits.
-
-    Eager startup + get_state handshake exclude process readiness from charged
-    next_action time. Setup has its own RPC timeout; model deadlines are assigned
-    only afterward from the remaining charged allocation.
-    """
-    def __init__(self, **kwargs):
-        kwargs.setdefault('context_factory', WorkflowContextRecords)
-        self.delivery = SkillDelivery()
-        self.session = PiCodingSession(schemas=SCHEMAS, system_prompt=SYSTEM,
-                                       first_action_only=True, **kwargs)
-        self.session.gateway.request_projector = self._project_tools
-
-    def _project_tools(self, request, **_kwargs):
-        # Keep the provider-visible and host-validated perform schema identical.
-        for tool in request.get('tools', []):
-            function = tool.get('function', tool)
-            if function.get('name') == 'perform':
-                function['parameters'] = self.session.schemas['perform']
-        return request
-
-    def expect_read(self, reference, content):
-        self.delivery.expect(reference, content)
-
-    def missing_reads(self, references):
-        return self.delivery.missing(references)
-
-    def prepare(self, timeout, *, schemas):
-        session = self.session
-        session.schemas.update(schemas)
-        session._start()
-        request = uuid.uuid4().hex
-        session.rpc.send({'type': 'get_state', 'id': request})
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('Pi readiness timeout')
-            try:
-                kind, line = session.rpc.records.get(timeout=remaining)
-            except queue.Empty:
-                raise TimeoutError('Pi readiness timeout') from None
-            if kind == 'eof':
-                raise WorkflowError('Pi exited during setup')
-            event = json.loads(line)
-            session.rpc.events.append(event)
-            if event.get('id') == request and event.get('type') == 'response':
-                if not event.get('success'):
-                    raise WorkflowError('Pi readiness rejected')
-                return
-
-    def next_action(self, context, allowed, *, seconds, record, source):
-        session = self.session
-        self.delivery.begin(context.get('operation_id'))
-        mutable = Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)
-        session.schemas['perform'] = SCHEMAS['perform'] if mutable else obj({'proposal': STRING})
-        def observed(kind, data):
-            if kind == 'pi-provider-request':
-                self.delivery.observe(data['request'], record)
-            record(kind, data)
-        # threading's maximum is a technical RPC bound, not a workflow budget.
-        session.deadline = time.monotonic() + (threading.TIMEOUT_MAX if seconds is None else seconds)
-        session.gateway.deadline = session.deadline
-        write = None
-        if ('perform' in allowed and source is not None
-                and Stage(context['stage']) in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)):
-            write = lambda text: ('perform', {'proposal': 'Apply exact source edit',
-                'edit': {'path': source.path, 'sha256': source.sha256, 'source': text}})
-        return session.next_action(context, allowed, record=observed,
-            source=source.text if source else None, write_action=write)
-
-    def close(self):
-        self.session.close()
+class HostContextUpdated(Exception):
+    """Trusted live-input update, delivered without executing the stale action."""
+    def __init__(self, context):
+        self.context = context
 
 
 class WorkflowActor:
@@ -426,7 +247,9 @@ class WorkflowActor:
                 seconds = self._available()
                 source = self._timed('implementation', self.source_snapshot) if self.source_snapshot else None
                 seconds = self._available()
-                if source and source.project_hash != flow.source_hash:
+                native_changed = bool(source and source.project_hash != flow.source_hash)
+                if native_changed and (not hasattr(self.session, 'pending_source') or
+                        self.session.pending_source(operation)['source_hash'] != source.project_hash):
                     raise WorkflowError('source changed outside current operation')
                 allowed = ['read_skill'] + [name for name, tool in self.evidence_tools.items()
                     if tool.stages is None or stage in tool.stages]
@@ -436,8 +259,6 @@ class WorkflowActor:
                 seconds = self._available()
                 inventory = dict(skill_receipts=list(skill_inventory.values()),
                                  evidence_receipts=list(evidence_inventory.values()))
-                if any(len(json.dumps(rows).encode()) > 3500 for rows in inventory.values()):
-                    raise WorkflowError('receipt inventory exceeds visible context capacity')
                 payload = dict(task=context, stage=stage.value, operation_id=operation,
                     skills=list(names), read_skill_names=[name for name in names if name in read_names],
                     unread_skills=[name for name in names if name not in read_names],
@@ -450,6 +271,11 @@ class WorkflowActor:
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
                     name, args = yield payload, allowed, source, record
+                except HostContextUpdated as update:
+                    context = update.context
+                    observation = dict(event='action-superseded', accepted=False, executed=False)
+                    record('actor-action-superseded', observation)
+                    continue
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -470,11 +296,14 @@ class WorkflowActor:
                                            accepted=False, executed=False)
                         record('actor-action-superseded', observation)
                         continue
+                if name == 'perform' and hasattr(self.session, 'pending_source'):
+                    native_changed = self.session.pending_source(operation)['source_hash'] != flow.source_hash
                 if name == 'perform' and read_names != set(names):
                     raise WorkflowError('read every mapped skill before performing stage')
                 if name not in allowed:
                     raise WorkflowError('actor action unavailable in this stage or readiness state')
-                validate(args, self.schemas[name])
+                if not isinstance(args, dict):
+                    raise ValueError('host tool arguments must be an object')
                 if name == 'read_skill':
                     # Optional empty sections from tool callers mean a full read.
                     # Check model arguments before emitting any usage receipt;
@@ -501,8 +330,6 @@ class WorkflowActor:
                     # A section read is genuine evidence, but does not replace the
                     # required full step contract. Return it without inventing reads.
                     reference = self._read_reference(usage)
-                    if hasattr(self.session, 'expect_read'):
-                        self.session.expect_read(reference, text)
                     refs.append(reference)
                     read_material.append(dict(skill=args['name'], section=args.get('section'),
                         content=text, receipt_id=reference, raw_receipt_id=receipt['receipt_id']))
@@ -561,13 +388,6 @@ class WorkflowActor:
                             evidence_summaries[name] = observation['summary']
                     record('evidence-tool-result', material)
                     continue
-                if hasattr(self.session, 'missing_reads'):
-                    missing = self.session.missing_reads(refs)
-                    if missing:
-                        observation = dict(event='skill-delivery-required', accepted=False,
-                            reads={row['receipt_id']:dict(content=row['content']) for row in missing})
-                        record('skill-delivery-required', observation)
-                        continue
                 if 'edit' in args:
                     edit = args['edit']
                     if (stage not in (Stage.IMPLEMENTATION, Stage.DEBUG, Stage.OPTIMISATION)
@@ -582,7 +402,7 @@ class WorkflowActor:
                 if stage == Stage.OPTIMISATION:
                     decisions = [row['result'].get('evidence', {}) for row in evidence_material
                                  if row['name'] == 'optimisation_decision']
-                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args):
+                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args or native_changed):
                         error = 'optimisation decision does not match edit; noop/profile must omit edit'
                         if not self.recover_invalid_actions:
                             raise WorkflowError(error)
@@ -630,32 +450,37 @@ class WorkflowActor:
             self.session = None
 
 
-class PiSessionAdapter(SnapshotPiSessionAdapter):
-    """Canonical Pi-native controller; Pi owns conversation and compaction."""
-    system_prompt = (
-            'You execute the canonical RSI workflow through completed host tools. '
-            'Read all mapped skills, query real evidence, and follow the authoritative stage. '
-            'Tool results are actual host observations. Read paged resources with read_context. '
-            'Only perform completes a stage; model assertions do not establish success. '
-            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.')
-
+class PiSessionAdapter:
+    """One native SDK session; host Workflow owns stages and evidence."""
     def __init__(self, **kwargs):
-        from coding.pi.controller import ControllerSession
-        self.delivery = SkillDelivery()
-        self.session = ControllerSession(schemas=SCHEMAS,system_prompt=self.system_prompt,**kwargs)
-        self.session.gateway.request_projector = self._project_tools
+        from coding.pi.workflow import NativeWorkflowSession
+        self.session = NativeWorkflowSession(**kwargs)
+
+    def configure(self, runner):
+        self.session.configure(runner)
+
+    def prepare(self, timeout, *, schemas):
+        self.session.prepare(timeout, schemas=schemas)
+
+    def pending_source(self, operation_id):
+        return self.session.pending_source(operation_id)
+
+    def run_stage(self, dispatcher, turn, actor):
+        return self.session.run_stage(dispatcher, turn, actor)
+
+    def close(self):
+        self.session.close()
 
     @classmethod
     def from_existing_session(cls, session, *, wall_deadline=None):
-        from coding.pi.controller import ControllerSession
-        controller = ControllerSession.from_existing_session(session,wall_deadline=wall_deadline)
-        adapter = cls.__new__(cls)
-        adapter.delivery = SkillDelivery()
-        adapter.session = controller
-        controller.schemas.update(SCHEMAS)
-        controller.system_prompt = cls.system_prompt
-        controller.gateway.request_projector = adapter._project_tools
+        if (getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None
+                or getattr(session, 'native_session', None) is not None):
+            raise ValueError('only an unstarted session may transfer ownership')
+        adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
+        session.usage_source = adapter.session  # Observation only; ownership stays with the adapter.
+        session.closed = True
         return adapter
 
-    def run_stage(self, dispatcher, turn, actor):
-        return self.session.run_stage(dispatcher, turn, actor, self.delivery)
+
+# Historical import name delegates to the sole native implementation.
+SnapshotPiSessionAdapter = PiSessionAdapter

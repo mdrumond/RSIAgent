@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from rsi.jobs import _alive
+from rsi.job_inspection import inspect_workflow
 
 
 def inspect_waves(cycle):
@@ -41,18 +42,26 @@ def inspect_waves(cycle):
             path = branch / 'runner' / 'workflow.json'
             workflow = json.loads(path.read_text()) if path.exists() else {}
             pending = workflow.get('pending')
-            uncertain = bool(workflow.get('timing_uncertainties')) or any(
-                interval[2] is None for interval in workflow.get('intervals', {}).values())
-            elapsed = None if uncertain else row.get('actor_seconds')
-            allowance = row.get('allowance', 7200.)
-            projects.append(dict(operation_id=op['id'], project_id=op['original_id'],
+            # Wave allowance is the scheduler ceiling, not the runner's admitted
+            # allocation. Recovery grants and elapsed time belong to Workflow.
+            accounting = inspect_workflow(workflow) if workflow else {}
+            project = dict(operation_id=op['id'], project_id=op['original_id'],
                 status=status, outcome=outcome, device=row.get('device'),
                 assigned_device=row.get('lease_device'), dispatch_id=row.get('dispatch_id'),
-                stage=workflow.get('stage'), pending=pending,
-                admission=admission,
-                actor_seconds=elapsed, actor_allocation=allowance,
-                remaining_actor_seconds=None if elapsed is None else max(0., allowance - elapsed),
-                recovery_authorized=row.get('recovery') is not None))
+                stage=workflow.get('stage'), pending=pending, admission=admission,
+                actor_seconds=accounting.get('actor_union_seconds'),
+                accounting_state=accounting.get('accounting_state', 'not_started'),
+                budget_source='workflow' if workflow else 'unavailable',
+                recovery_authorized=row.get('recovery') is not None)
+            from rsi.supervision import ProjectSupervision
+            project['supervision'] = ProjectSupervision(branch / 'runner').diagnostic()
+            if 'actor_allocation' in accounting:
+                project['actor_allocation'] = accounting['actor_allocation']
+            if 'actor_seconds' in accounting.get('remaining', {}):
+                project['remaining_actor_seconds'] = accounting['remaining']['actor_seconds']
+            if 'allowance' in row:
+                project['wave_actor_ceiling'] = row['allowance']
+            projects.append(project)
         stopped = state.get('stopped') or (root / 'stop.json').exists()
         status = ('observation_required' if any(p['status'] == 'observation_required' for p in projects)
                   else 'draining' if stopped and any(p['status'] == 'running' for p in projects)

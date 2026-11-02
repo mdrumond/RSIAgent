@@ -56,7 +56,7 @@ class Page:
     offset: int
 
 
-def setup(decisions, *, pools=None, seconds=90):
+def setup(decisions, *, pools=None, seconds=90, tokens=10):
     clock = Clock()
     gate = Gate(clock, pools or {'query': [row(i) for i in range(25)]})
     calls, audit = [], []
@@ -66,7 +66,7 @@ def setup(decisions, *, pools=None, seconds=90):
         decision = decisions.pop(0)
         if isinstance(decision, Exception):
             raise decision
-        return {'text': decision if isinstance(decision, str) else json.dumps(decision), 'tokens': 10}
+        return {'text': decision if isinstance(decision, str) else json.dumps(decision), 'tokens': tokens}
     agent = AdaptiveKnowledgeAgent(gate, complete, clock=clock, seconds=seconds, audit=audit.append)
     return agent, gate, clock, calls, audit
 
@@ -86,6 +86,15 @@ def test_multiple_pages_and_wrong_target_rejection_preserve_original_citations()
     assert audit[0]['rejected'] == {identity(0): 'Wrong target'}
     assert gate.entries[0]['citations'] == (row(12).citation,)
     assert len(calls) == 2 and result.audit['tokens'] == 20
+
+
+def test_unknown_usage_does_not_reject_valid_librarian_evidence_or_become_zero():
+    agent, gate, clock, calls, _ = setup([dict(action='next'), pick(12)], tokens=None)
+    result = agent.search(KnowledgeQuery('query'))
+    assert result.status == 'complete' and result.results == (row(12),)
+    assert result.audit['tokens'] is None
+    assert gate.calls == ['query'] and len(calls) == 2
+    assert clock.value >= 8  # Missing token telemetry does not reset actual elapsed.
 
 
 def test_early_finish_never_reads_another_page_and_actor_receives_status():

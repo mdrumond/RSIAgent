@@ -76,13 +76,8 @@ def bounded_completion(provider, profile, messages, remaining_seconds):
         if available <= 0:
             raise TimeoutError('subject role provider elapsed allowance exhausted')
         if transport is openai_compatible_transport:
-            from openai import OpenAI
-            response = OpenAI(api_key=options['api_key'], base_url=options['base_url'],
-                timeout=available, max_retries=0).chat.completions.create(**options['request'])
-            result = DirectCompletion(response.choices[0].message.content, response.usage.completion_tokens)
-        else:
-            # Injected transports own their I/O bounds, just as in the Actor API.
-            result = transport(**options)
+            raise RuntimeError('production role requests require a native session binding')
+        result = transport(**options)
         if provider.clock() >= deadline:
             raise TimeoutError('subject role provider returned after its elapsed allowance')
         return result
@@ -173,6 +168,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         name = settings.get(role + '_model')
         selected = profile if name is None else direct_profile(next(
             item for item in MODEL_IDENTITIES if item.backend_model.value == name))
+        from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
+        if compose is compose_production:
+            from .native_curriculum import NativeSubjectRole
+            return NativeSubjectRole(root / 'native-roles' / role, selected, provider.coding_environment())
+        # Explicit injected test transports retain their existing domain fixture API.
         def complete(messages, *, remaining_seconds):
             return bounded_completion(provider, selected, messages, remaining_seconds)
         complete.model = selected.identity.backend_model.value
@@ -181,14 +181,17 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
     from .pi_project_verifier import session_factory
     verifier_identity_path = root / 'project-verifier-runtime.json'
-    verifier_settings = dict(settings)
+    verifier_settings = dict(settings, native_session_root=str(root / 'native-reviews'),
+                             native_required=compose is compose_production)
     saved_verifier = (json.loads(verifier_identity_path.read_bytes())
                       if verifier_identity_path.exists() else {})
     legacy_default = ('verifier_engine' not in settings and
         (saved_verifier.get('engine_origin') == 'legacy-resume' or
          resumed_runtime and not verifier_identity_path.exists()))
     if legacy_default:
-        # Historical checkpoints retain their completion engine on resume.
+        from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
+        if compose is compose_production:
+            raise ValueError('historical completion verifier requires explicit native runtime rebinding before execution')
         verifier_settings['verifier_engine'] = 'completion'
     verifier_sessions = session_factory(verifier_settings, provider, verifier_complete)
     from coding.pi import ENGINE_IDENTITY
@@ -391,10 +394,29 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 raise ValueError('subject task kind must be target or optimizer')
             return [item]
         def complete_wave(messages):
+            if hasattr(curriculum_complete, 'wave'):
+                from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+                def retrieve(args, remaining):
+                    results = query_wave(KnowledgeQuery(args['query'], args.get('limit', 5)), check_remaining=remaining)
+                    return dict(knowledge_query=dict(available=True, results=[dict(
+                        citation=item.citation.as_dict(), text=item.text, score=item.score) for item in results]))
+                def validate(response):
+                    decision = selector._parse_and_validate(response, value)
+                    if isinstance(decision, WaveDecision):
+                        ids = [project.spec.project_id for project in decision.wave.projects]
+                        if set(ids) & history.keys():
+                            raise ValueError('proposal reuses executed project IDs')
+                        if len(ids) > project_limit:
+                            raise ValueError('wave exceeds the admitted workload size')
+                paths = {store._retention_path(reference):reference
+                         for reference in context.get('selection_artifacts', {}).values()}
+                return curriculum_complete.wave(messages, remaining_seconds=available(), validate=validate,
+                    artifacts=paths, query=retrieve if knowledge.database_path is not None or reference_query is not None else None)
             wire = list(messages)
             while True:
                 working = bounded_review_messages(wire, {'selection_artifacts':context['selection_artifacts']}) if context.get('selection_artifacts') else wire
-                response = curriculum_complete(working, remaining_seconds=available())
+                select = getattr(curriculum_complete, 'wave', curriculum_complete)
+                response = select(working, remaining_seconds=available())
                 if context.get('selection_artifacts'):
                     try:
                         action = json.loads(response)
