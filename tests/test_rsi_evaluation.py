@@ -445,3 +445,16 @@ def test_later_pair_starts_relative_window_at_dispatch_without_resetting_round(c
     assert resumed.pair(1).state['wall_deadline'] <= round_deadline
     assert store.read_json(resumed.pair(1).state['arms']['incumbent']['receipt']) == old
     assert len(calls) == 3 and learner.active == evaluation.plan['incumbent']
+
+
+def test_heldout_repetitions_share_the_explicit_round_cap(comparison):
+    create, _, calls, _, _, _, _ = comparison
+    evaluation = create(repetitions=2, joint_limits=BudgetLimits(actor_seconds=60),
+                        remaining_parent={'actor_seconds': 30})
+    allocations = [evaluation.pair(i).request(arm).spec.budgets.actor_seconds
+                   for i in range(2) for arm in ('incumbent', 'candidate')]
+    assert sum(allocations) == 30
+    result = finish(evaluation)
+    assert len(calls) == 4
+    assert result['decision'] == 'benefit'
+    assert 0 < result['actor_seconds'] <= 30

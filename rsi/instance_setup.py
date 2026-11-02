@@ -13,7 +13,7 @@ import sys
 import time
 import zipfile
 
-from .configuration import _bytes, _locations, _publish, show_configuration, set_configuration
+from .configuration import _bytes, _locations, _publish, show_configuration
 
 
 def machinery(instance):
@@ -159,16 +159,6 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             release = source if (source / 'pyproject.toml').is_file() else _wheel(source, runtime)
             extras = 'legacy,embeddings' if embeddings else 'legacy'
             pip(host, str(release) + '[' + extras + ']')
-            if roles:
-                role_requirements = source / 'requirements-roles.txt'
-                role_python = runtime / 'roles' / 'bin' / 'python'
-                invoke([python, '-m', 'venv', runtime / 'roles'])
-                invoke([role_python, '-c', 'import sys; assert (3,12) <= sys.version_info[:2] < (3,14), "NOOA needs Python 3.12 or 3.13"'])
-                if role_requirements.is_file():
-                    pip(role_python, '-r', role_requirements)
-                else:
-                    pip(role_python, str(release) + '[roles]')
-                invoke([role_python, '-I', '-c', 'import nooa; from pathlib import Path; import sys; assert Path(nooa.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())'])
             invoke([npm, 'ci', '--prefix', source / 'integrations/pi', '--fetch-timeout=30000',
                     '--fetch-retries=1', *(['--offline'] if offline else []),
                     *(['--cache', str(Path(npm_cache).resolve())] if npm_cache else [])])
@@ -180,14 +170,10 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             receipt['versions'] = json.loads(subprocess.check_output(
                 [str(host), '-I', '-c', probe], cwd=runtime, env=env, text=True,
                 timeout=min(30, max(.01, timeout - (time.monotonic() - started)))))
-            if roles:
-                current = show_configuration(root)
-                if not current['payload'].get('roles_python'):
-                    payload = dict(current['payload'], roles_python=str(runtime / 'roles/bin/python'))
-                    revision = set_configuration(root, payload, expect_revision=current['revision'])
-                    receipt['configuration_revision'] = revision['revision']
-            receipt.update(state='ready', python=str(host),
-                           roles_python=str(runtime / 'roles/bin/python') if roles else None)
+            invoke([host, '-I', '-c', 'from coding.pi.native import runtime_preflight; '
+                    'import sys; runtime_preflight(sys.argv[1], sys.argv[2])',
+                    source/'integrations/pi/node_modules', node])
+            receipt.update(state='ready', python=str(host), role_engine='native-pi', roles_python=None)
         except BaseException as exc:
             receipt.update(state='failed', error_type=type(exc).__name__)
             raise
