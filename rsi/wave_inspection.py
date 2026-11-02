@@ -53,6 +53,8 @@ def inspect_waves(cycle):
                 accounting_state=accounting.get('accounting_state', 'not_started'),
                 budget_source='workflow' if workflow else 'unavailable',
                 recovery_authorized=row.get('recovery') is not None)
+            from rsi.supervision import ProjectSupervision
+            project['supervision'] = ProjectSupervision(branch / 'runner').diagnostic()
             if 'actor_allocation' in accounting:
                 project['actor_allocation'] = accounting['actor_allocation']
             if 'actor_seconds' in accounting.get('remaining', {}):

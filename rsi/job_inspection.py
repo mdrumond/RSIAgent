@@ -58,6 +58,8 @@ def inspect_task(path, *, clock=time.time):
     path = Path(path)
     result = inspect_workflow(json.loads((path / 'workflow.json').read_text()), clock=clock)
     result['task_id'] = path.name
+    from .supervision import ProjectSupervision
+    result['supervision'] = ProjectSupervision(path).diagnostic()
     manifest = path / 'runner.json'
     if manifest.exists():
         store = ContentAddressedArtifacts(path / 'artifacts')
@@ -84,6 +86,9 @@ def inspect_cycle(instance, request):
         task['task_id'] = str(Path(folder).relative_to(cycle))
         tasks.append(task)
     result = {'tasks': tasks}
+    from .supervision import ProjectSupervision
+    result['role_supervision'] = [ProjectSupervision(path.parent).diagnostic()
+        for path in sorted((cycle / 'native-roles').glob('*/supervision.json'))]
     from .wave_inspection import inspect_waves
     result['waves'] = inspect_waves(cycle)
     learning_path = cycle / 'learning.json'

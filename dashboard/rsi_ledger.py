@@ -12,7 +12,7 @@ def _union(intervals):
 
 
 def task_inspection(task):
-    result = {key: task[key] for key in ('task_id', 'remaining', 'actor_allocation', 'skills_ref', 'candidate_ref') if key in task}
+    result = {key: task[key] for key in ('task_id', 'remaining', 'actor_allocation', 'skills_ref', 'candidate_ref', 'supervision') if key in task}
     if 'actor_union_seconds' in task or 'intervals' not in task:
         return {**result, **{key: task[key] for key in ('charged_seconds', 'excluded_seconds',
                 'actor_union_seconds', 'accounting_state') if key in task}}
@@ -80,6 +80,7 @@ def inspection(value, *, instance=None):
 
     supplied = value.get('inspection')
     waves = supplied.get('waves', []) if isinstance(supplied, dict) else []
+    roles = supplied.get('role_supervision', []) if isinstance(supplied, dict) else []
     tasks = supplied.get('tasks', []) if isinstance(supplied, dict) else []
     if not tasks:
         latest = {}
@@ -89,8 +90,8 @@ def inspection(value, *, instance=None):
                 latest[event['task_id']] = event
         tasks = list(latest.values())
     if not tasks:
-        if waves:
-            return {'available': True, 'tasks': [], 'waves': waves}
+        if waves or roles:
+            return {'available': True, 'tasks': [], 'waves': waves, 'role_supervision': roles}
         return {'available': False, 'reason': 'No authoritative task time/skill snapshots in CLI evidence.'}
     return {'available': True, 'tasks': [task_inspection(task) for task in tasks if isinstance(task, dict)],
-            'waves': waves}
+            'waves': waves, 'role_supervision': roles}

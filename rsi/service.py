@@ -45,6 +45,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
     last_wave = None
     def wave_progress(state):
         nonlocal last_wave
+        if hasattr(cycle, 'supervise'):
+            cycle.supervise()
         summary = {p: dict(status=row['status'], device=row['device'],
             outcome=row.get('receipt', {}).get('result', {}).get('status'),
             pending=row.get('workflow_pending')) for p, row in state['projects'].items()}
@@ -119,6 +121,8 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
         previous = signal.signal(signal.SIGINT, interrupt)
         def watch():
             while not done.wait(.05):
+                if hasattr(cycle, 'supervise'):
+                    cycle.supervise()
                 wall = cycle.scheduler._allocation_remaining()['wall_seconds']
                 if should_stop() or wall is not None and wall <= 0:
                     if cycle.waves and cycle.waves.active_pool is not None:

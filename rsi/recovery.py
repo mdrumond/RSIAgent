@@ -273,6 +273,8 @@ class PairedRecovery:
         failure = None
         if flow.outcome not in ('accepted', 'rejected'):
             failure = runner.terminal_failure_proof()
+            from rsi.supervision import retain_terminal
+            retain_terminal(runner, failure)
             terminal = 'failed'
             for obj in runner.store.objects.glob('*/*'):
                 self.store.put_bytes(runner.store.read_bytes(obj.parent.name + obj.name))
