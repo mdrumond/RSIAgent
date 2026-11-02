@@ -34,7 +34,7 @@ def test_adaptive_production_retrieves_and_validates_inside_native_role(tmp_path
         ('submit_curriculum_proposal', dict(decision='STALLED', payload=dict(reason='Observed runtime unavailable')))])
     context = CurriculumContext('Investigate observed failure', 1, 'a'*64, (), (),
         feedback=({'error':'runtime unavailable'},), remaining_seconds=30)
-    result = coordinator.curriculum.select(context)
+    result, session = coordinator.curriculum.select(context)
     assert result.status == 'STALLED'
     assert queries == ['actual limitation']
     assert any(message['role']=='tool' and 'Observed API limitation' in message['content']
