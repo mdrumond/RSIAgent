@@ -119,7 +119,7 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
             assert runner.workflow.accounting.seconds(category) > 0
         assert runner.workflow.accounting.seconds() < sum(
             end-start for kind, start, end in runner.workflow.accounting.records.values() if end is not None)
-        closure = runner.store.read_json(result['closure_ref'])['observation']
+        closure = runner.store.read_json(result['actor_closure_ref'])['observation']
         assert closure['provider_settled'] and closure['actor_closed']
         assert any(any(m['role'] == 'tool' for m in request['messages']) for request in requests)
     finally:
