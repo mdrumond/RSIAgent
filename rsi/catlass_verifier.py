@@ -134,11 +134,11 @@ def reference(operation, left, right):
     raise ValueError('unknown frozen operation')
 
 
-def load_kernel(path, allowed_helpers=()):
+def load_kernel(path, allowed_helpers=(), entrypoint='kernel'):
     tree = ast.parse(path.read_text())
     # ABI v1 accepts kernel definitions, documented Catlass imports and numeric
     # constants. It does not execute an Actor-owned host launch/fallback.
-    kernels = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'kernel']
+    kernels = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == entrypoint]
     if len(kernels) != 1:
         raise ValueError('ABI v1 requires exactly one kernel definition')
     arguments = kernels[0].args
@@ -151,7 +151,7 @@ def load_kernel(path, allowed_helpers=()):
         if isinstance(node, ast.Import) and all(a.name == 'catlass.tla' for a in node.names):
             continue
         if isinstance(node, ast.FunctionDef):
-            if node.name == 'kernel':
+            if node.name == entrypoint:
                 continue
             if node.name in allowed_helpers and not node.decorator_list:
                 continue
@@ -166,7 +166,7 @@ def load_kernel(path, allowed_helpers=()):
     spec = importlib.util.spec_from_file_location('rsi_catlass_candidate', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.kernel
+    return getattr(module, entrypoint)
 
 
 def run(contract, mode, case_index=None, capture_root=None, profile_capture=False):
@@ -225,7 +225,7 @@ def run(contract, mode, case_index=None, capture_root=None, profile_capture=Fals
     torch.npu.set_device(application_device)
     candidate = Path('candidate.py')
     candidate_hash = sha(candidate)
-    kernel = load_kernel(candidate, contract['allowed_helpers'])
+    kernel = load_kernel(candidate, contract['allowed_helpers'], contract.get('entrypoint', 'kernel'))
     cache = Path(os.environ['CATLASS_DSL_CACHE_DIR'])
     cache.mkdir(parents=True, exist_ok=True)
     # The marker is an optimisation only: bind it to exact runtime identity.
@@ -252,7 +252,7 @@ def run(contract, mode, case_index=None, capture_root=None, profile_capture=Fals
                 for t in (a, b, out)]
         if mode == 'validation' and contract['exercise']['kind'] == 'compiler-repair' and repair_receipt is None:
             def compile_failed_original(path):
-                original = load_kernel(path, contract['allowed_helpers'])
+                original = load_kernel(path, contract['allowed_helpers'], contract.get('entrypoint', 'kernel'))
                 tla.compile(original, *args, options='--npu-arch 3510')
             repair_receipt = compiler_repair_gate(contract, compile_failed_original, candidate_hash)
         artifact = tla.compile(kernel, *args, options='--npu-arch 3510')
@@ -284,7 +284,7 @@ def run(contract, mode, case_index=None, capture_root=None, profile_capture=Fals
     capability = None
     if mode == 'validation':
         def compile_original(path):
-            original = load_kernel(path, contract['allowed_helpers'])
+            original = load_kernel(path, contract['allowed_helpers'], contract.get('entrypoint', 'kernel'))
             tla.compile(original, *args, options='--npu-arch 3510')
         capability = capability_gate(contract, compile_original=compile_original, candidate_hash=candidate_hash, repair_receipt=repair_receipt)
     if project_hash(contract) != expected_source:

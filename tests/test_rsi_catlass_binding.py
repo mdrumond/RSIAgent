@@ -850,3 +850,26 @@ def test_catlass_admitted_seed_tampering_is_rejected(catlass_parent,tmp_path):
     Path(child.spec.correctness_ref).write_text('{}')
     with pytest.raises(MaterializationRejected):
         read_materialized_child(child.provenance['receipt']['path'],sha256=child.provenance['receipt']['sha256'])
+
+
+def test_frozen_entrypoint_selects_existing_function_without_rewriting_source(tmp_path, monkeypatch):
+    from types import ModuleType
+    from rsi.catlass_project_config import case_identity
+    from rsi.catlass_verifier import load_kernel
+    tla = ModuleType('catlass.tla')
+    tla.kernel = lambda function: function
+    catlass = ModuleType('catlass')
+    catlass.tla = tla
+    monkeypatch.setitem(sys.modules, 'catlass', catlass)
+    monkeypatch.setitem(sys.modules, 'catlass.tla', tla)
+    path = tmp_path/'candidate.py'
+    source = 'import catlass.tla as tla\n@tla.kernel\ndef vector_add(a, b, c):\n    return a, b, c\n'
+    path.write_text(source)
+    chosen = load_kernel(path, entrypoint='vector_add')
+    assert chosen(1, 2, 3) == (1, 2, 3)
+    assert path.read_text() == source
+    with pytest.raises(ValueError):
+        load_kernel(path)  # A different trusted entrypoint cannot silently alias.
+    seed = dict(operation='add', cases=[dict(length=64, block_count=1, seed=17)])
+    assert case_identity(seed) == case_identity(dict(seed, entrypoint='kernel'))
+    assert case_identity(seed) != case_identity(dict(seed, entrypoint='vector_add'))

@@ -21,6 +21,8 @@ def case_identity(seed):
         input_dtype=seed.get('input_dtype','float32'),output_dtype=seed.get('output_dtype','float32'),
         capacity=seed.get('capacity',512),padding_multiple=seed.get('padding_multiple',64),
         atol=seed.get('atol',0.),rtol=seed.get('rtol',0.),oracle=ast.dump(oracle,include_attributes=False))
+    if seed.get('entrypoint', 'kernel') != 'kernel':
+        payload['entrypoint'] = seed['entrypoint']
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
@@ -59,6 +61,9 @@ def freeze_verifier(destination, *, seed, runtime_identity, physical_device, out
         raise ValueError('actual outer BZ-A5 CPL admission handle required')
     if seed['operation'] not in {'add', 'multiply', 'relu', 'convert'}:
         raise ValueError('unsupported Catlass numeric operation')
+    entrypoint = seed.get('entrypoint', 'kernel')
+    if not isinstance(entrypoint, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entrypoint):
+        raise ValueError('frozen Catlass entrypoint must be a Python function name')
     if type(physical_device) is not int or physical_device < 0:
         raise ValueError('main must supply a freshly admitted physical device')
     if not seed['cases']:
@@ -106,7 +111,7 @@ def freeze_verifier(destination, *, seed, runtime_identity, physical_device, out
             helper = Path(source) / helper
         if not helper.is_file() or hashlib.sha256(helper.read_bytes()).hexdigest() != OWNED_CAPTURE_HELPER_SHA256:
             raise ValueError('actual IR helper does not implement the pinned owned no-shim capability')
-    contract = dict(abi_version=ABI_VERSION, operation=seed['operation'], cases=seed['cases'],
+    contract = dict(abi_version=ABI_VERSION, operation=seed['operation'], cases=seed['cases'], entrypoint=entrypoint,
                     physical_device=physical_device, outer_cpl_handle=outer_cpl_handle,
                     execution_runtime='catlass-dsl', direct_physical=False,
                     profile_capture=bool(exercise['kind']=='msprof-basic' and
