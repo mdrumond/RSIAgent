@@ -346,6 +346,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 self._roles = NativeRoles(self.root/'native-roles', profile,
                     observer=self.observe_role, environment=self.services.environment, store=self.store,
                     operation_id=lambda: self.role_operation,
+                    node_modules=self.services.root/'machinery/integrations/pi/node_modules',
                     **self.config.get('roles', {}))
         return self._roles
 

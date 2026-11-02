@@ -170,7 +170,9 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
             receipt['versions'] = json.loads(subprocess.check_output(
                 [str(host), '-I', '-c', probe], cwd=runtime, env=env, text=True,
                 timeout=min(30, max(.01, timeout - (time.monotonic() - started)))))
-            invoke([host, '-I', '-c', 'from coding.pi.native import runtime_preflight; runtime_preflight()'])
+            invoke([host, '-I', '-c', 'from coding.pi.native import runtime_preflight; '
+                    'import sys; runtime_preflight(sys.argv[1], sys.argv[2])',
+                    source/'integrations/pi/node_modules', node])
             receipt.update(state='ready', python=str(host), role_engine='native-pi', roles_python=None)
         except BaseException as exc:
             receipt.update(state='failed', error_type=type(exc).__name__)

@@ -159,7 +159,7 @@ class NativeRoles:
     projects or apply skills. Retained unknown operations cannot be replayed.
     """
     def __init__(self, root, profile, *, observer, environment, store=None,
-                 operation_id=None, session_factory=None, files_factory=None,
+                 operation_id=None, session_factory=None, files_factory=None, node_modules=None,
                  setup_seconds=120., receipt_grace_seconds=None, clock=time.monotonic):
         from coding.pi.native import NativeSession
         self.root, self.profile = Path(root), profile
@@ -167,7 +167,7 @@ class NativeRoles:
         self.store = store or ContentAddressedArtifacts(self.root/'artifacts')
         self.operation_id = operation_id or (lambda: uuid4().hex)
         self.session_factory = session_factory or NativeSession
-        self.files_factory = files_factory
+        self.files_factory, self.node_modules = files_factory, node_modules
         if type(setup_seconds) not in (int, float) or not math.isfinite(setup_seconds) or setup_seconds <= 0:
             raise ValueError('native role setup_seconds must be finite and positive')
         self.setup_seconds = setup_seconds
@@ -224,6 +224,8 @@ class NativeRoles:
                 return _proposal(role, self.store.read_json(saved['proposal_ref']), {e.evidence_id for e in evidence})
             if saved['status'] == 'failed':
                 raise RoleFailure(role, saved['error']['type'], saved['error']['message'])
+            if saved['status'] == 'preparing':
+                raise RoleFailure(role, 'SetupIncomplete', 'Host setup interrupted before native prompt')
             self.observer('accounting_incomplete', dict(role=role, start_receipt_received=True,
                 native_root=str(root), request_ref=request_ref))
             raise NativeError('retained native role requires observation; never replay')
@@ -274,7 +276,7 @@ class NativeRoles:
             reference = self.store.put_json(event)
             self.observer('role_native_event', dict(role=role, type=event['type'], artifact_ref=reference))
         session = self.session_factory(root/'native', cwd=root,
-            profile_id=self.profile.identity.profile_id, environ=self.environment,
+            profile_id=self.profile.identity.profile_id, environ=self.environment, node_modules=self.node_modules,
             tools=[NativeTool('submit_proposal', 'Submit the completed typed role proposal.',
                               proposal_schema(role), submit)], observer=observe,
             system_prompt='Read admitted instructions and evidence using native read. '
