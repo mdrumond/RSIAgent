@@ -1,39 +1,15 @@
-"""Typed, proposal-only NOOA roles over the host's registered direct provider.
-
-Importing this module needs only the standard library. Install ``rsi[roles]``
-with Python 3.12/3.13 to invoke a role. The host supplies admitted evidence,
-absolute monotonic deadlines, and an observer for artifacts/accounting. Calls
-are synchronous, including the bridge's async entry, so cancellation cannot
-leave an unobserved provider thread running. Provider transport enforces timeout.
-No tools, execution, memory storage, or proposal application is delegated here.
-"""
-
-import asyncio
-from contextlib import contextmanager
+"""Typed host proposals over the same native Pi sessions used by coding actors."""
 from dataclasses import asdict, dataclass, fields
-from functools import lru_cache
+import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import selectors
-import shutil
-import tempfile
-import subprocess
-import sys
 import time
-from typing import Annotated, Any, Literal, Mapping
+from typing import Any, Literal, Mapping
+from uuid import uuid4
 
-
-def _wall_remaining(clock, deadline):
-    if deadline is None:
-        return None
-    if type(deadline) not in (int, float) or not math.isfinite(deadline):
-        raise ValueError('wall_deadline must be finite monotonic seconds or None')
-    remaining = deadline - clock()
-    if remaining <= 0:
-        raise TimeoutError('noncoding role wall deadline exhausted')
-    return remaining
+from core.artifacts import ContentAddressedArtifacts, canonical_bytes
+from rsi.python_execution import atomic_json
 
 
 class RoleFailure(RuntimeError):
@@ -100,249 +76,6 @@ class ReviewProposal:
     findings: tuple[ReviewFinding, ...]
 
 
-@lru_cache(maxsize=1)
-def _framework():
-    if not (3, 12) <= sys.version_info[:2] < (3, 14):
-        raise RuntimeError('NOOA roles require Python 3.12 or 3.13; RSI core supports 3.10+')
-    try:
-        from nooa import Agent, strategy
-        from nooa.config.strategy_config import PredictConfig
-        from nooa.strategies.predict import PredictStrategy
-        from nooa.unifiedllm.unifiedllm import UnifiedLLM, LLMResponse
-        from pydantic import BaseModel, ConfigDict, Field
-    except ImportError as exc:
-        raise RuntimeError('Install rsi[roles] to use typed noncoding roles') from exc
-
-    class Proposal(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True, frozen=True)
-        rationale: str = Field(min_length=1)
-        evidence_ids: list[str]
-
-    class Project(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        name: str = Field(min_length=1)
-        goal: str = Field(min_length=1)
-        acceptance: str = Field(min_length=1)
-
-    class ResearchQueryModel(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        query: str = Field(min_length=1)
-        purpose: str = Field(min_length=1)
-
-    class ResearchQueries(Proposal):
-        queries: list[ResearchQueryModel] = Field(min_length=1)
-
-    class DiagnosticProject(Project):
-        template_id: str = Field(min_length=1)
-        parameters: dict[str, Any]
-        parent_project_id: str | None = None
-
-    class NegativeDecisionModel(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        query_ref: str
-        index: int
-        reason: str = Field(min_length=1)
-
-    class UsedNegativeDecisionModel(NegativeDecisionModel):
-        action: Literal['used']
-        redirection: str = Field(min_length=1, pattern=r'\S')
-
-    class RejectedNegativeDecisionModel(NegativeDecisionModel):
-        action: Literal['rejected']
-        redirection: str | None = None
-
-    class Investigation(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        question: str = Field(min_length=1)
-        goal: str = Field(min_length=1)
-        why: str = Field(min_length=1)
-
-    class Diagnostic(Proposal):
-        proposal: DiagnosticProject
-        negative_decisions: list[Annotated[
-            UsedNegativeDecisionModel | RejectedNegativeDecisionModel, Field(discriminator='action')]]
-
-    class Edit(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        skill: str = Field(min_length=1)
-        operation: Literal['replace', 'remove', 'append']
-        content: str
-
-    class Finding(BaseModel):
-        model_config = ConfigDict(extra='forbid', strict=True)
-        severity: Literal['P0', 'P1', 'P2', 'P3']
-        location: str = Field(min_length=1)
-        issue: str = Field(min_length=1)
-
-    class Curriculum(Proposal):
-        projects: list[Project] = Field(min_length=1)
-
-    class Skills(Proposal):
-        edits: list[Edit]
-
-    class Review(Proposal):
-        findings: list[Finding]
-
-    class Roles(Agent):
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def curriculum(self, role_prompt: str, admitted_evidence: str) -> Curriculum:
-            """Propose a curriculum from the role prompt and admitted evidence. Cite evidence IDs."""
-            ...
-
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def research_queries(self, role_prompt: str, admitted_evidence: str) -> ResearchQueries:
-            """Choose documentation/KDB queries before proposing a diagnostic project."""
-            ...
-
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def investigation(self, role_prompt: str, admitted_evidence: str) -> Investigation:
-            """Choose what smaller investigation would explain the failure and why."""
-            ...
-
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def diagnostic(self, role_prompt: str, admitted_evidence: str) -> Diagnostic:
-            """Use actual retrieved facts and address every negative before choosing a host template."""
-            ...
-
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def skillwriter(self, role_prompt: str, admitted_evidence: str) -> Skills:
-            """Propose evidence-supported skill edits. Prioritise error prevention and recovery."""
-            ...
-
-        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
-        async def review(self, role_prompt: str, admitted_evidence: str) -> Review:
-            """Review admitted evidence; report actionable findings, or an empty findings list."""
-            ...
-
-    class RegisteredClient(UnifiedLLM):
-        def __init__(self, owner, deadline):
-            super().__init__(model=owner.profile.model)
-            self.owner, self.deadline = owner, deadline
-
-        @property
-        def context_window(self):
-            # The registered provider enforces its authoritative byte budget.
-            return None
-
-        def call(self, messages, tools=None, output_model=None, **kwargs):
-            if tools:
-                raise ValueError('noncoding roles cannot dispatch tools')
-            normalised = []
-            for message in messages:
-                content = message.get('content')
-                if isinstance(content, list):
-                    if any(block.get('type') != 'text' for block in content):
-                        raise ValueError('noncoding roles accept text evidence only')
-                    content = '\n'.join(block['text'] for block in content)
-                if not isinstance(content, str) or message['role'] not in ('system', 'user', 'assistant'):
-                    raise ValueError('unsupported NOOA message')
-                normalised.append({'role': message['role'], 'content': content})
-            normalised.append({'role': 'user', 'content': 'Return JSON matching this schema:\n' +
-                               json.dumps(output_model.model_json_schema(), sort_keys=True)})
-            result = self.owner.provider.complete(
-                self.owner.profile, normalised, attempt_observer=self.owner.observer,
-                max_seconds=self.owner._remaining(self.deadline))
-            self.owner._remaining(self.deadline)
-            self.owner.observer('role_response', {'text': result.text,
-                                                 'completion_tokens': result.completion_tokens})
-            return LLMResponse(raw_response=None, content=result.text, tool_calls=[],
-                               finish_reason='stop', assistant_message={'role': 'assistant',
-                                                                       'content': result.text},
-                               usage={'completion_tokens': result.completion_tokens})
-
-        async def acall(self, messages, tools=None, output_model=None, **kwargs):
-            return self.call(messages, tools, output_model, **kwargs)
-
-    return Roles, RegisteredClient
-
-
-class NoncodingRoles:
-    """One fresh NOOA agent per proposal; no hidden retries or cross-task history.
-
-    ``observer(event, payload)`` receives role lifecycle, provider attempts, raw
-    response and validated proposal events. Persist these in host-owned artifacts.
-    Setup is outside the measured role interval; role work is charged even on
-    failure. Calls must not overlap on a single host controller.
-    """
-
-    def __init__(self, provider, profile, *, observer, clock=time.monotonic):
-        from benchmarks.a5kernels.phase1_provider import direct_profile
-        if profile != direct_profile(profile.identity):
-            raise ValueError('role profile must use a registered provider identity')
-        self.provider, self.profile = provider, profile
-        self.observer, self.clock = observer, clock
-
-    def _remaining(self, deadline):
-        remaining = deadline - self.clock()
-        if remaining <= 0:
-            raise TimeoutError('noncoding role actor time exhausted')
-        return remaining
-
-    def curriculum(self, role_prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('curriculum', role_prompt, evidence, deadline, wall_deadline)
-
-    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
-
-    def investigation(self, prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('investigation', prompt, evidence, deadline, wall_deadline)
-
-    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
-
-    def skillwriter(self, role_prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('skillwriter', role_prompt, evidence, deadline, wall_deadline)
-
-    def review(self, role_prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('review', role_prompt, evidence, deadline, wall_deadline)
-
-    def _run(self, role, prompt, evidence, deadline, wall_deadline=None):
-        _wall_remaining(self.clock, wall_deadline)
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError('role prompt must be nonempty')
-        if type(deadline) not in (int, float) or not math.isfinite(deadline):
-            raise ValueError('deadline must be finite monotonic seconds')
-        ids, rows = set(), []
-        for item in evidence:
-            if not isinstance(item, AdmittedEvidence) or not item.evidence_id or item.evidence_id in ids:
-                raise ValueError('admitted evidence requires unique nonempty IDs')
-            ids.add(item.evidence_id)
-            rows.append({'evidence_id': item.evidence_id, 'data': dict(item.data)})
-        encoded = json.dumps(rows, allow_nan=False, sort_keys=True)
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError('call synchronous roles outside an active asyncio loop')
-        allowance = self._remaining(deadline)
-        Roles, Client = _framework()
-        client = Client(self, deadline)
-        agent = Roles(llm=client)
-        started = self.clock()
-        _wall_remaining(self.clock, wall_deadline)
-        deadline = client.deadline = min(started + allowance, wall_deadline) if wall_deadline is not None else started + allowance
-        success, error = False, None
-        self.observer('role_started', {'role': role, 'provider_identity': self.profile.identity.as_dict(),
-                                       'prompt': prompt, 'evidence': rows})
-        try:
-            result = asyncio.run(getattr(agent, role)(role_prompt=prompt, admitted_evidence=encoded))
-            self._remaining(deadline)
-            proposal = _proposal(role, result.model_dump(mode='json'), ids)
-            self.observer('role_proposal', {'role': role, 'proposal': result.model_dump(mode='json')})
-            success = True
-            return proposal
-        except Exception as exc:
-            secret = getattr(self.provider, '_credentials', {}).get(self.profile.identity.credential_env)
-            error = _error_details(exc, secret)
-            raise
-        finally:
-            receipt = dict(role=role, success=success, elapsed_seconds=self.clock() - started)
-            if error is not None:
-                receipt['error'] = error
-            self.observer('role_finished', receipt)
-
-
 from rsi.curriculum_research import DiagnosticDecision, DiagnosticProposal, QueryPlan, ResearchQuery
 
 
@@ -354,7 +87,7 @@ _PROPOSALS = {'research_queries': (QueryPlan, 'queries', ResearchQuery),
 
 
 def _proposal(role, data, admitted):
-    """Validate the same typed wire result without loading NOOA in the host."""
+    """Validate domain proposals before the host applies any state change."""
     if role == 'investigation':
         from rsi.curriculum_research import InvestigationIdea
         if (type(data) is not dict or set(data) != {'question', 'goal', 'why'}
@@ -388,105 +121,62 @@ def _proposal(role, data, admitted):
     return outer(data['rationale'], tuple(ids), tuple(entries))
 
 
-_MACHINERY_PACKAGES = ('rsi', 'core', 'coding', 'config', 'env', 'llm', 'optimizer',
-                       'explore', 'benchmarks', 'dashboard', 'integrations', 'tools')
+def proposal_schema(role):
+    """Native tool schemas; host validation remains authoritative."""
+    text = dict(type='string', minLength=1, pattern=r'\S')
+    def obj(properties, optional=()):
+        return dict(type='object', properties=properties,
+                    required=[k for k in properties if k not in optional], additionalProperties=False)
+    def array(items, **limits):
+        return dict(type='array', items=items, **limits)
+    if role == 'investigation':
+        return obj(dict(question=text, goal=text, why=text))
+    if role == 'research_queries':
+        payload = dict(queries=array(obj(dict(query=text, purpose=text)), minItems=1))
+    elif role == 'diagnostic':
+        proposal = obj(dict(name=text, goal=text, acceptance=text, template_id=text,
+            parameters=dict(type='object'), parent_project_id=dict(anyOf=[text, dict(type='null')])),
+            optional=('parent_project_id',))
+        negative = dict(query_ref=text, index=dict(type='integer', minimum=0), reason=text)
+        payload = dict(proposal=proposal, negative_decisions=array(dict(anyOf=[
+            obj(dict(negative, action=dict(const='used'), redirection=text)),
+            obj(dict(negative, action=dict(const='rejected'), redirection=dict(anyOf=[text, dict(type='null')])),
+                optional=('redirection',))])))
+    else:
+        _, name, _ = _PROPOSALS[role]
+        properties = {'curriculum': dict(name=text, goal=text, acceptance=text),
+            'skillwriter': dict(skill=text, operation=dict(enum=['replace', 'remove', 'append']),
+                               content=dict(type='string')),
+            'review': dict(severity=dict(enum=['P0', 'P1', 'P2', 'P3']), location=text, issue=text)}[role]
+        payload = {name: array(obj(properties), **(dict(minItems=1) if role == 'curriculum' else {}))}
+    return obj(dict(rationale=text, evidence_ids=array(text), **payload))
 
 
-@contextmanager
-def _machinery_projection(check=lambda: None):
-    """Copy only this revision's owned machinery, never host site-packages.
+class NativeRoles:
+    """One durable SDK session per host role operation; evidence is read-only.
 
-    A wheel's distribution inventory is authoritative. Source and copied-instance
-    layouts use their explicit package directories, with dependency/cache trees
-    excluded. Cleanup follows worker reaping, including failures during spawn.
+    Pi owns tools, provider calls and continuation. Proposals never execute
+    projects or apply skills. Retained unknown operations cannot be replayed.
     """
-    from importlib.metadata import distribution, PackageNotFoundError
-    machinery = Path(__file__).resolve().parent.parent
-    check()
-    with tempfile.TemporaryDirectory(prefix='rsi-roles-') as temporary:
-        root = Path(temporary)
-        def copy(source, target):
-            check()
-            with open(source, 'rb') as src, open(target, 'wb') as dst:
-                while chunk := src.read(65536):
-                    check()
-                    dst.write(chunk)
-            shutil.copystat(source, target)
-            check()
-            return target
-        if (machinery / 'pyproject.toml').is_file():
-            for name in _MACHINERY_PACKAGES:
-                source = machinery / name
-                if source.is_dir():
-                    shutil.copytree(source, root / name, copy_function=copy, ignore=shutil.ignore_patterns(
-                        '__pycache__', '*.pyc', '.git', 'node_modules', '.venv', 'build', 'dist'))
-        else:
-            try:
-                installed = distribution('rsi')
-            except PackageNotFoundError as exc:
-                raise RuntimeError('cannot identify installed RSI machinery') from exc
-            if Path(installed.locate_file('rsi/roles.py')).resolve() != Path(__file__).resolve():
-                raise RuntimeError('RSI distribution does not match controller machinery')
-            for entry in installed.files or ():
-                if entry.parts[0] not in _MACHINERY_PACKAGES or '..' in entry.parts:
-                    continue
-                source = Path(installed.locate_file(entry))
-                if source.is_file() and source.suffix != '.pyc':
-                    target = root.joinpath(*entry.parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    copy(source, target)
-        if not (root / 'rsi' / 'roles.py').is_file():
-            raise RuntimeError('RSI machinery inventory lacks roles worker')
-        check()
-        yield root
-    check()
-
-
-class IsolatedRoles:
-    """Explicit roles Python executable; host SDK/environment stays untouched.
-
-    The child runs an owned-package projection of this exact machinery via PYTHONPATH, using
-    its own NOOA dependencies. Only the selected registered credential crosses
-    in the controlled environment. JSON contains evidence and receipts, not keys.
-    Observer role_finished receipts are authoritative actor elapsed time; worker
-    loss emits accounting_incomplete and must suspend budgeted host dispatch.
-    """
-
-    def __init__(self, roles_python, profile, *, observer, environment,
-                 setup_seconds=60, receipt_grace_seconds=2, clock=time.monotonic):
-        from benchmarks.a5kernels.phase1_provider import direct_profile
-        if profile != direct_profile(profile.identity):
-            raise ValueError('unregistered role provider')
-        executable = Path(roles_python)
-        if not executable.is_absolute() or not executable.is_file():
-            raise ValueError('roles_python must be an explicit existing absolute executable')
+    def __init__(self, root, profile, *, observer, environment, store=None,
+                 operation_id=None, session_factory=None, files_factory=None,
+                 setup_seconds=120., receipt_grace_seconds=None, clock=time.monotonic):
+        from coding.pi.native import NativeSession
+        self.root, self.profile = Path(root), profile
+        self.observer, self.environment, self.clock = observer, dict(environment), clock
+        self.store = store or ContentAddressedArtifacts(self.root/'artifacts')
+        self.operation_id = operation_id or (lambda: uuid4().hex)
+        self.session_factory = session_factory or NativeSession
+        self.files_factory = files_factory
         if type(setup_seconds) not in (int, float) or not math.isfinite(setup_seconds) or setup_seconds <= 0:
-            raise ValueError('setup_seconds must be positive finite seconds')
-        if (type(receipt_grace_seconds) not in (int, float) or not math.isfinite(receipt_grace_seconds)
-                or receipt_grace_seconds < 0):
-            raise ValueError('receipt_grace_seconds must be finite nonnegative seconds')
-        self.receipt_grace_seconds = receipt_grace_seconds
-        key = profile.identity.credential_env
-        secret = environment.get(key)
-        if not isinstance(secret, str) or not secret.strip():
-            raise ValueError('missing selected provider credential')
-        self.environment = {k: environment[k] for k in ('PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SYSTEMROOT')
-                            if k in environment}
-        self.environment.update({key: secret, 'PYTHONNOUSERSITE': '1', 'PYTHONUNBUFFERED': '1'})
-        self.roles_python, self.profile = str(executable), profile
-        self.observer, self.setup_seconds, self.clock = observer, setup_seconds, clock
+            raise ValueError('native role setup_seconds must be finite and positive')
+        self.setup_seconds = setup_seconds
 
     def curriculum(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('curriculum', prompt, evidence, deadline, wall_deadline)
 
-    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
-
     def investigation(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('investigation', prompt, evidence, deadline, wall_deadline)
-
-    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
-        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
 
     def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('skillwriter', prompt, evidence, deadline, wall_deadline)
@@ -494,176 +184,150 @@ class IsolatedRoles:
     def review(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('review', prompt, evidence, deadline, wall_deadline)
 
-    def _run(self, role, prompt, evidence, deadline, wall_deadline=None):
-        _wall_remaining(self.clock, wall_deadline)
-        if type(deadline) not in (float, int) or not math.isfinite(deadline):
-            raise ValueError('invalid actor deadline')
-        allowance = deadline - self.clock()
+    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
+
+    def _run(self, role, prompt, evidence, deadline, wall_deadline):
+        from coding.pi.native import NativeError, NativeTool
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError('finite native role deadline required')
+        allowance = deadline-self.clock()
         if allowance <= 0:
-            raise TimeoutError('noncoding role actor time exhausted')
+            raise TimeoutError('native role actor allocation exhausted')
+        if wall_deadline is not None and (type(wall_deadline) not in (int, float)
+                or not math.isfinite(wall_deadline) or wall_deadline <= self.clock()):
+            raise TimeoutError('native role wall allocation exhausted')
         evidence = list(evidence)
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError('role prompt must be nonempty')
-        if any(not isinstance(e, AdmittedEvidence) or type(e.evidence_id) is not str or not e.evidence_id
-               for e in evidence) or len({e.evidence_id for e in evidence}) != len(evidence):
+        if any(not isinstance(e, AdmittedEvidence) or not isinstance(e.evidence_id, str)
+               or not e.evidence_id for e in evidence) or len({e.evidence_id for e in evidence}) != len(evidence):
             raise ValueError('admitted evidence requires unique nonempty IDs')
-        request = {'role': role, 'prompt': prompt, 'evidence': [asdict(e) for e in evidence],
-                   'backend_model': self.profile.identity.backend_model.value, 'seconds': allowance,
-                   'wall_deadline': wall_deadline}
-        wire = json.dumps(request, allow_nan=False)
-        secret = self.environment[self.profile.identity.credential_env]
-        if secret in wire:
-            raise ValueError('credential cannot appear in role JSON')
-        with _machinery_projection(lambda: _wall_remaining(self.clock, wall_deadline)) as root:
-            result = self._dispatch(role, wire, allowance, evidence, secret, root, wall_deadline)
-        _wall_remaining(self.clock, wall_deadline)
-        return result
-
-    def _dispatch(self, role, wire, allowance, evidence, secret, root, wall_deadline=None):
-        _wall_remaining(self.clock, wall_deadline)
-        started = self.clock()
-        cutoff, active, finished, proposal = started + self.setup_seconds, False, False, None
-        draining = False
-        process = subprocess.Popen([self.roles_python, '-m', 'rsi.roles'], stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   env={**self.environment, 'PYTHONPATH': str(root)}, cwd=root)
+        raw = canonical_bytes(dict(role=role, prompt=prompt, evidence=[asdict(e) for e in evidence]))
+        secret = self.environment.get(self.profile.identity.credential_env)
+        if secret and secret in raw.decode():
+            raise ValueError('credential cannot appear in role inputs')
+        request_ref = self.store.put_bytes(raw)
+        operation = self.operation_id()
+        if not isinstance(operation, str) or not operation:
+            raise ValueError('native role requires a host operation identity')
+        root = self.root/hashlib.sha256((operation+':'+role).encode()).hexdigest()
+        path = root/'role.json'
+        if path.exists():
+            saved = json.loads(path.read_bytes())
+            if saved['request_ref'] != request_ref:
+                raise ValueError('retained native role inputs differ')
+            if saved['status'] == 'completed':
+                return _proposal(role, self.store.read_json(saved['proposal_ref']), {e.evidence_id for e in evidence})
+            if saved['status'] == 'failed':
+                raise RoleFailure(role, saved['error']['type'], saved['error']['message'])
+            self.observer('accounting_incomplete', dict(role=role, start_receipt_received=True,
+                native_root=str(root), request_ref=request_ref))
+            raise NativeError('retained native role requires observation; never replay')
+        root.mkdir(parents=True)
+        state = dict(operation_id=operation, request_ref=request_ref, status='preparing')
+        atomic_json(path, state)
+        inputs = root/'evidence'
+        inputs.mkdir()
+        prompt_file = inputs/'instructions.txt'
+        prompt_file.write_text(prompt)
+        admitted_files = [prompt_file]
+        manifest = []
+        for item in evidence:
+            content = canonical_bytes(dict(evidence_id=item.evidence_id, data=item.data))
+            reference = self.store.put_bytes(content)
+            target = inputs/(reference+'.json')
+            target.write_bytes(content)
+            admitted_files.append(target)
+            manifest.append(dict(evidence_id=item.evidence_id, path=str(target), bytes=len(content), reference=reference))
+        manifest_file = inputs/'manifest.json'
+        manifest_ref = self.store.put_json(manifest)
+        manifest_file.write_bytes(canonical_bytes(manifest))
+        admitted_files.append(manifest_file)
+        proposal = None
+        def submit(data, context):
+            nonlocal proposal
+            if context['remaining']() <= 0 or context['operation_id'] != operation:
+                raise ValueError('native proposal operation or elapsed allocation differs')
+            if proposal is not None:
+                raise ValueError('role proposal already committed')
+            value = _proposal(role, data, {e.evidence_id for e in evidence})
+            state['proposal_ref'] = self.store.put_json(data)
+            atomic_json(path, state)
+            proposal = value
+            self.observer('role_proposal', dict(role=role, proposal_ref=state['proposal_ref'],
+                tool_call_id=context['tool_call_id']))
+            return dict(content=[dict(type='text', text='Proposal retained for host validation.')], terminate=True)
+        if self.files_factory is None:
+            from coding.pi.filesystem import NativeFiles
+            files_factory = NativeFiles
+        else:
+            files_factory = self.files_factory
+        resources = files_factory(root, store=self.store, read_paths=admitted_files)
+        def observe(event):
+            reference = self.store.put_json(event)
+            self.observer('role_native_event', dict(role=role, type=event['type'], artifact_ref=reference))
+        session = self.session_factory(root/'native', cwd=root,
+            profile_id=self.profile.identity.profile_id, environ=self.environment,
+            tools=[NativeTool('submit_proposal', 'Submit the completed typed role proposal.',
+                              proposal_schema(role), submit)], observer=observe,
+            system_prompt='Read admitted instructions and evidence using native read. '
+                          'Perform the noncoding role and commit with submit_proposal. '
+                          'Only the host applies proposals. Project execution and edits are unavailable.',
+            **resources.session_options())
+        started = failure = settlement = None
         try:
-            outgoing = wire.encode() + b'\n'
-            os.set_blocking(process.stdin.fileno(), False)
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdin, selectors.EVENT_WRITE)
-                selector.register(process.stdout, selectors.EVENT_READ)
-                pending = b''
-                while True:
-                    effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
-                    remaining = effective - self.clock()
-                    ready = selector.select(max(0, remaining))
-                    now = self.clock()
-                    if now >= effective:
-                        if (active and not finished and not draining and self.receipt_grace_seconds
-                                and (wall_deadline is None or now < wall_deadline)):
-                            # The worker's API deadline is unchanged. Collect only
-                            # authoritative completion/accounting; never admit a late proposal.
-                            draining = True
-                            cutoff += self.receipt_grace_seconds
-                        else:
-                            raise TimeoutError('roles worker deadline exhausted')
-                    if not ready:
-                        continue
-                    if any(key.fileobj is process.stdin for key, _ in ready):
-                        sent = os.write(process.stdin.fileno(), outgoing[:65536])
-                        outgoing = outgoing[sent:]
-                        if not outgoing:
-                            selector.unregister(process.stdin)
-                            process.stdin.close()
-                    if not any(key.fileobj is process.stdout for key, _ in ready):
-                        continue
-                    chunk = os.read(process.stdout.fileno(), 65536)
-                    if not chunk:
-                        break
-                    pending += chunk
-                    if len(pending) > 4_000_000:
-                        raise ValueError('oversized roles receipt')
-                    while b'\n' in pending:
-                        line, pending = pending.split(b'\n', 1)
-                        if secret.encode() in line:
-                            raise ValueError('credential in worker output')
-                        message = json.loads(line)
-                        if type(message) is not dict or set(message) != {'event', 'payload'}:
-                            raise ValueError('invalid worker envelope')
-                        event, payload = message['event'], message['payload']
-                        if type(payload) is not dict:
-                            raise ValueError('invalid worker payload')
-                        if event in ('role_started', 'role_finished', 'role_response', 'role_proposal') and payload.get('role', role) != role:
-                            raise ValueError('worker role mismatch')
-                        if event == 'role_started':
-                            if active or finished or payload['provider_identity'] != self.profile.identity.as_dict():
-                                raise ValueError('invalid worker start receipt')
-                            active = True
-                            cutoff = self.clock() + allowance
-                        elif event == 'role_finished':
-                            elapsed = payload['elapsed_seconds']
-                            if not active or finished or type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0 or elapsed > self.clock() - started:
-                                raise ValueError('invalid worker elapsed receipt')
-                            if type(payload.get('success')) is not bool:
-                                raise ValueError('invalid worker outcome')
-                            finished = True
-                            self.observer(event, payload)
-                            if elapsed > allowance or draining:
-                                raise TimeoutError('worker actor cutoff reached; actual elapsed receipt retained')
-                            if not payload['success']:
-                                error = payload.get('error')
-                                if error is not None:
-                                    if (type(error) is not dict or set(error) != {'type', 'message'}
-                                            or any(type(v) is not str for v in error.values())
-                                            or len(error['type'].encode()) > 128
-                                            or len(error['message'].encode()) > 2048):
-                                        raise ValueError('invalid bounded role failure detail')
-                                    raise RoleFailure(role, error['type'], error['message'])
-                                raise RuntimeError('role failed; elapsed receipt retained')
-                            cutoff = self.clock() + self.setup_seconds
-                        elif event == 'result':
-                            if not finished or proposal is not None:
-                                raise ValueError('unordered worker result')
-                            proposal = _proposal(role, payload, {e.evidence_id for e in evidence})
-                        elif event == 'worker_error':
-                            raise RuntimeError('roles worker failed; inspect host receipts')
-                        elif event not in ('request', 'rejection', 'role_response', 'role_proposal') or not active or finished:
-                            raise ValueError('unordered or unknown worker receipt')
-                        if event != 'role_finished':
-                            self.observer(event, payload)
-            _wall_remaining(self.clock, wall_deadline)
-            effective = min(cutoff, wall_deadline) if wall_deadline is not None else cutoff
-            process.wait(timeout=max(0.001, effective - self.clock()))
-            if process.returncode or not finished or proposal is None or pending:
-                raise RuntimeError('roles worker missing completion receipts')
+            timeout = self.setup_seconds
+            if wall_deadline is not None:
+                timeout = min(timeout, max(0., wall_deadline-self.clock()))
+            session.prepare(timeout=timeout)
+            if wall_deadline is not None and self.clock() >= wall_deadline:
+                raise TimeoutError('native role wall allocation exhausted during setup')
+            started = self.clock()
+            cutoff = started+allowance
+            if wall_deadline is not None:
+                cutoff = min(cutoff, wall_deadline)
+            state.update(status='pending')
+            atomic_json(path, state)
+            self.observer('role_started', dict(role=role, request_ref=request_ref,
+                evidence_manifest_ref=manifest_ref, native_root=str(root/'native')))
+            settlement = session.prompt('Read '+str(prompt_file)+' and '+str(manifest_file)+
+                '; use the admitted evidence files, then submit the proposal.',
+                operation_id=operation, remaining=lambda: max(0., cutoff-self.clock()))
+            if self.clock() >= cutoff:
+                raise TimeoutError('native role actor allocation exhausted')
+            if not settlement.provider_settled or settlement.pending_tools:
+                raise NativeError('native role closure unknown', settlement=settlement)
+            if proposal is None:
+                raise RoleFailure(role, 'Blocked', 'Native role settled without a committed proposal')
             return proposal
+        except BaseException as error:
+            failure = error
+            settlement = getattr(error, 'settlement', None) or settlement
+            raise
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            process.stdout.close()
-            if not process.stdin.closed:
-                process.stdin.close()
-            if not finished:
-                self.observer('accounting_incomplete', {'role': role, 'start_receipt_received': active})
-
-
-def _worker():
-    """Private JSON-lines worker, reusing the registered provider and role path."""
-    import contextlib
-    protocol = sys.stdout
-    secret = None
-
-    def emit(event, payload):
-        line = json.dumps({'event': event, 'payload': payload}, allow_nan=False)
-        if secret and secret in line:
-            raise ValueError('credential in role output')
-        protocol.write(line + '\n')
-        protocol.flush()
-
-    try:
-        request = json.loads(sys.stdin.readline())
-        from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-        from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
-        identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == request['backend_model'])
-        secret = os.environ[identity.credential_env]
-        with contextlib.redirect_stdout(sys.stderr):
-            provider = DirectCompletionProvider({identity.credential_env: secret},
-                                                models=[identity.backend_model], invalid_prompt_retries=0)
-            roles = NoncodingRoles(provider, direct_profile(identity), observer=emit)
-            evidence = [AdmittedEvidence(**e) for e in request['evidence']]
-            if request['role'] not in _PROPOSALS and request['role'] != 'investigation':
-                raise ValueError('unknown role')
-            result = getattr(roles, request['role'])(request['prompt'], evidence,
-                                                    deadline=time.monotonic() + request['seconds'],
-                                                    wall_deadline=request.get('wall_deadline'))
-        emit('result', asdict(result))
-        return 0
-    except Exception:
-        emit('worker_error', {'reason': 'role_failed'})
-        return 1
-
-
-if __name__ == '__main__':
-    raise SystemExit(_worker())
+            elapsed = max(0., self.clock()-started) if started is not None else None
+            try:
+                session.close()
+            finally:
+                if settlement is None and isinstance(failure, KeyboardInterrupt) and session.provider_settled:
+                    from coding.pi.native import NativeSettlement
+                    settlement = NativeSettlement('cancelled', True, tuple(session.pending_tools),
+                        session.session_file, tuple(session.usage))
+                known = settlement is not None and settlement.provider_settled and not settlement.pending_tools
+                if started is None:
+                    state.update(status='failed', error=_error_details(failure or RuntimeError('role setup failed'), secret))
+                elif known:
+                    state.update(status='completed' if failure is None else 'failed', actor_seconds=elapsed)
+                    if failure is not None:
+                        state['error'] = _error_details(failure, secret)
+                    self.observer('role_finished', dict(role=role, success=failure is None,
+                        elapsed_seconds=elapsed, **({'error': state['error']} if failure is not None else {})))
+                else:
+                    state.update(status='pending', actor_seconds=None)
+                    self.observer('accounting_incomplete', dict(role=role, start_receipt_received=True,
+                        native_root=str(root/'native'), request_ref=request_ref))
+                atomic_json(path, state)

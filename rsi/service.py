@@ -176,7 +176,7 @@ def run_job(instance, request, configuration=None, *, should_stop, emit):
                         controller_pending=cycle.controller.state['pending'], tuning_pending=cycle.tuning.state['pending'])
         raise
     except KeyboardInterrupt:
-        # ProjectRunner/PythonExecution/IsolatedRoles have unwound and reaped first.
+        # ProjectRunner/host execution/native roles have unwound first; unknown native closure stays pending.
         cycle.scheduler.stop()
         emit(dict(event='cycle_stopped', cycle_id=cycle_id,
                   pending=cycle.scheduler.state['pending'], controller=cycle.controller.state['pending']))
