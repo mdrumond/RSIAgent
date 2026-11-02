@@ -20,7 +20,7 @@ class NativeSubjectRole:
         from benchmarks.a3_model_profiles import load_a3_model_profile
         self.native_profile_id = load_a3_model_profile(BackendModel(self.model)).profile_id
         self.validator, self.artifacts, self.setup_scope = validator, dict(artifacts or {}), setup_scope
-        self.last_receipt = None
+        self.last_receipt = self.last_store = None
 
     def __call__(self, messages, *, remaining_seconds):
         return self._call(messages, remaining_seconds, wave=False)
@@ -36,7 +36,7 @@ class NativeSubjectRole:
         root = self.root/identity
         root.mkdir(parents=True, exist_ok=True)
         state_path = root/'operation.json'
-        store = ContentAddressedArtifacts(root/'artifacts')
+        store = self.last_store = ContentAddressedArtifacts(root/'artifacts')
         if state_path.exists():
             state = json.loads(state_path.read_text())
             if state['status'] == 'completed':

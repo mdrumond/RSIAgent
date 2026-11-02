@@ -480,6 +480,13 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
     finally:
         if thinking is not None:
             clock.end(thinking)
+        if role.last_store is not None:
+            references = []
+            for path in role.last_store.objects.glob('*/*'):
+                reference = path.parent.name+path.name
+                runner.store.retain_from(role.last_store, reference)
+                references.append(reference)
+            runner.append(dict(type='domain-distillation-artifacts', artifact_refs=references))
 
 
 class A3Host(SourceHost):
