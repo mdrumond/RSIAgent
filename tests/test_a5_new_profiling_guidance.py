@@ -63,7 +63,7 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path,
     campaign = build_adaptive_phase1(
         cell=cell, paths=_paths(tmp_path), objective="Learn reusable profiling.",
         initial_memory=b"", guide_bytes=GUIDE_BYTES,
-        profiling_guidance_text=text, environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+        profiling_guidance_text=text, environment={"OPENAI_API_KEY": "fixture-secret", "DEEPSEEK_API_KEY": "fixture-secret"},
         provider_transport=transport, command_executor=FakeCommandExecutor(),
     )
     assert json.loads(campaign.project_actor.immutable_context)["profiling_guidance"] == text
@@ -84,7 +84,15 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path,
     decision,_=campaign.coordinator.curriculum.select(replace(selection_context(),
         feedback=({'error':'fixture runtime unavailable'},),remaining_seconds=30))
     assert decision.status=='STALLED'
-    assert any(text in message.get('content','') for wire in requests for message in wire['messages'] if message['role']=='tool')
+    from test_native_pi_workflow import text_blocks
+    retained_inputs=[]
+    for wire in requests:
+        for message in wire['messages']:
+            if message['role']=='tool':
+                for content in text_blocks(message.get('content') or ''):
+                    if content.startswith('['):
+                        retained_inputs.extend(json.JSONDecoder().raw_decode(content)[0])
+    assert any(text in message['content'] for message in retained_inputs)
     requests.clear()
     spec = _project("context-copy", "gm-ub-movement")
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec

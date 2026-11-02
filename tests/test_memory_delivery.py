@@ -107,7 +107,7 @@ def exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider)
     assert all(delivered[0][key] == value for key, value in snapshot['memory_entries'][0].items())
     requests = [row for row in loop.fixture_runner.events if row['type']=='pi-native-event' and row['event']['type']=='before_provider_request']
     assert len(requests) == len(state.requests)
-    assert all(row['operation_id'] for row in requests)
+    assert all(row['event']['operation_id'] for row in requests)
     rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
     assert len(rows)==1 and rows[0]['actor_role']=='optimizer'
     assert any(kind == 'presentation' for kind, _ in observed)
