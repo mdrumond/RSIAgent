@@ -249,7 +249,7 @@ class NativeWorkflowSession:
         options['callbacks'] = {name: charged(name, callback)
                                 for name, callback in options['callbacks'].items()}
         options['callbacks']['rsi_workflow_state'] = self._state_tool
-        options['callbacks']['rsi_workflow_read_observed'] = self._read_observed
+        options['callbacks']['rsi_workflow_read_observed'] = charged('rsi_workflow_read_observed', self._read_observed)
         options['tools_factory'] = str(Path(__file__).resolve().parents[2]/'integrations/pi/workflow-tools.mjs')
         options['tools_options']['skills'] = [dict(name=name, description='Frozen workflow guidance: '+name,
             filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,
