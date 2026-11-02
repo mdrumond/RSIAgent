@@ -121,8 +121,8 @@ def exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider)
     assert service.ledger.stats(base['memory_id'])['accesses'] == accesses
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
-    exercise_optimizer_memory_delivery(tmp_path, monkeypatch)
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch, scripted_provider):
+    exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider)
 
 
 @pytest.mark.parametrize('withdraw_first',[False,True])
