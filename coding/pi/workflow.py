@@ -28,11 +28,15 @@ class NativeWorkflowSession:
         root = runner.root / 'native'
         resources = root / 'skills'
         for document in runner.bundle.documents:
-            path = resources/document.name/'SKILL.md'
+            project = getattr(runner.backend, 'project', None)
+            captured = project/'reference-skills'/document.name/'SKILL.md' if project else None
+            path = captured if captured is not None and captured.is_file() else resources/document.name/'SKILL.md'
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists() and path.read_text() != document.content:
-                raise ValueError('frozen native skill changed')
-            path.write_text(document.content)
+            if path.exists():
+                if path.read_text() != document.content:
+                    raise ValueError('frozen native skill changed')
+            else:
+                path.write_text(document.content)
             self.skill_paths[path.resolve()] = document.name
         if hasattr(runner.backend, 'project'):
             self.files = NativeFiles(root/'source-transitions', store=runner.store,
