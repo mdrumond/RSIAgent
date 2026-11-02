@@ -264,6 +264,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             policy['max_failed_recovery_attempts'] = self.config.get('recovery', {}).get('max_failed_attempts', 5)
         if self.config.get('project_wave'):
             policy.setdefault('recovery_limit', None)
+        policy.setdefault('max_failed_recovery_attempts', self.config.get('recovery', {}).get('max_failed_attempts', 5))
         first_clock = not state_path.exists()
         def cycle_clock():
             nonlocal first_clock
@@ -289,7 +290,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             self.scheduler.close()
             raise
         self.controller = CycleController(root / 'controller.json', self.scheduler,
-            self.learning, artifacts=self.store, pair_factory=self.pair)
+            self.learning, artifacts=self.store, pair_factory=self.pair, pair_feedback=self.paired_feedback)
         self.tuning = TuningController(root / 'tuning.json', self.controller,
                                        evaluation_factory=self.evaluation)
         self.waves = None
@@ -529,7 +530,12 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def load_project(self, row):
         operation = row['operation_id']
-        runner = self.open_project(operation)
+        if row.get('paired_checkpoint'):
+            _, request, runner = self.paired_checkpoint(row['paired_checkpoint'])
+            if request.operation_id != operation:
+                raise ValueError('paired feedback differs from retained trial operation')
+        else:
+            runner = self.open_project(operation)
         self.retain(runner)
         packet = self.store.read_json(row['artifact_ref'])
         if packet['operation_id'] != operation or packet['original_id'] != row['original_id']:
@@ -566,10 +572,19 @@ class BoundCycle(ProjectComposition, TuningBindings):
         observations_ref = self.store.put_json(observations)
         if proof:
             summary = str(proof['classification']) + ': ' + str(proof['error']) + '; ' + summary
+        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
         raw = list(result['events'])
+        if row.get('paired_evidence_ref'):
+            pair, _, _ = self.paired_checkpoint(row['paired_checkpoint'])
+            paired = pair.result()
+            if paired['evidence_ref'] != row['paired_evidence_ref']:
+                raise ValueError('paired Memory evidence differs from retained raw arms')
+            reference = row['paired_evidence_ref']
+            evidence[reference] = dict(kind='recovery', summary='; '.join(
+                name + ': ' + arm['outcome'] for name, arm in paired['arms'].items()))
+            raw.append(reference)
         if proof:
             raw.extend([packet['failure_proof_ref'], proof['result_ref'], proof['accounting_snapshot']])
-        evidence = {row['artifact_ref']: dict(kind=kind, summary=summary)}
         investigation = row.get('investigation_receipt_ref')
         if investigation:
             receipt = self.store.read_json(investigation)
@@ -626,14 +641,54 @@ class BoundCycle(ProjectComposition, TuningBindings):
         runner.run = run_trial
         return runner
 
+    def paired_checkpoint(self, checkpoint):
+        """Open only an existing canonical pair request; never dispatch a third run."""
+        pair = PairedRecovery(self.root / 'pairs' / (_name(checkpoint['operation_id']) + '.json'),
+                              artifacts=self.store, runner_factory=self.trial)
+        if pair.state['frozen'] != checkpoint['frozen'] or pair.result() is None:
+            raise ValueError('paired checkpoint is not the retained complete pair')
+        request = pair.request(checkpoint['arm'])
+        runner = self.trial(request, reopen=True)
+        pair._check(runner, request)
+        return pair, request, runner
+
+    def paired_feedback(self, event, operation, result):
+        arm = next((name for name, row in result['arms'].items()
+                    if row['outcome'] == 'accepted' and row['workflow'] is True
+                    and row['correctness'] is True), 'candidate')
+        checkpoint = dict(operation_id=operation, arm=arm, frozen=result['frozen'])
+        pair, request, runner = self.paired_checkpoint(checkpoint)
+        if pair.result() != result:
+            raise ValueError('paired result differs from trusted canonical arm receipts')
+        observed = result['arms'][arm]
+        raw = pair.state['arms'][arm]['run_result']
+        self.retain(runner)
+        packet = dict(operation_id=request.operation_id, original_id=event['original']['original_id'],
+            root=str(runner.root), result=raw, workflow=runner.workflow.state,
+            host_outcome=observed['outcome'], failure_proof_ref=observed.get('terminal_failure_ref'),
+            actor_seconds_total=observed['actor_seconds'], actor_seconds_baseline=0.,
+            actor_seconds_delta=observed['actor_seconds'], workflow_valid=observed['outcome'] == 'accepted')
+        reference = self.store.put_json(packet)
+        atomic_json(runner.root / 'service-result.json', dict(reference=reference))
+        # Failed originals always carry the actual candidate's latest edits.
+        checkpoint['arm'] = 'candidate'
+        return dict(project=runner.spec.to_dict(), original_id=packet['original_id'],
+            operation_id=request.operation_id, artifact_ref=reference, outcome=observed['outcome'],
+            actor_seconds=observed['actor_seconds'], paired_checkpoint=dict(checkpoint, arm=arm),
+            retry_checkpoint=checkpoint, paired_evidence_ref=result['evidence_ref'])
+
     def pair(self, event, operation, remaining):
         path = self.root / 'pairs' / (_name(operation) + '.json')
         if path.exists():
             return PairedRecovery(path, artifacts=self.store, runner_factory=self.trial)
-        checkpoint = self.open_project(event['original']['operation_id'])
-        packet = self.store.read_json(event['original']['artifact_ref'])
+        if event.get('paired_checkpoint'):
+            previous, request, checkpoint = self.paired_checkpoint(event['paired_checkpoint'])
+            failure_ref = previous.result()['arms'][request.arm].get('terminal_failure_ref')
+        else:
+            checkpoint = self.open_project(event['original']['operation_id'])
+            failure_ref = self.store.read_json(event['original']['artifact_ref']).get('failure_proof_ref')
         return PairedRecovery.create(path, checkpoint, artifacts=self.store, memory_ref=event['memory'],
-            terminal_failure_ref=packet.get('failure_proof_ref'),
+            terminal_failure_ref=failure_ref,
             kdb_ref=self.binding['kdb'], model_config=self.config['provider'], incumbent=event['incumbent'],
             candidate=event['candidate'], joint_limits=BudgetLimits.from_dict(
                 self.config.get('recovery', {}).get('budgets', self.config['budgets'])),

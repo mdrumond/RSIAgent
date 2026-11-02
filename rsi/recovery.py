@@ -396,11 +396,14 @@ class CycleController:
     PairedRecovery. Learning.validate must consume paired evidence case IDs;
     only beneficial pairs enter its promotion gate. success_cases(event) may
     supply frozen independent validation cases for successful originals.
+    pair_feedback(event, operation, result) admits canonical arm facts for
+    independent original retry queues. It observes retained trials, never runs them.
     Tuning events remain unacknowledged for PR11.
     """
-    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None):
+    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None, pair_feedback=None):
         self.path, self.scheduler, self.learning = Path(path), scheduler, learning
         self.store, self.pair_factory, self.success_cases = artifacts, pair_factory, success_cases
+        self.pair_feedback = pair_feedback
         self.state = json.loads(self.path.read_text()) if self.path.exists() else dict(pending=None, completed={})
 
     def _save(self):
@@ -466,6 +469,13 @@ class CycleController:
             self.scheduler.publish_validated_skills(event['incumbent'], self.learning.active)
         receipt = self.store.put_json(dict(event=event['id'], operation_id=operation, result=result,
                                           active=self.learning.active))
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries:
+            if 'feedback' not in pending:
+                if self.pair_feedback is None:
+                    raise WorkflowError('paired retry requires canonical host feedback')
+                pending['feedback'] = self.pair_feedback(event, operation, result)
+                self._save()
+            self.scheduler.complete_paired_retry(event, result, receipt, pending['feedback'])
         self.scheduler.complete_extension(event['id'], receipt,
             actor_seconds=result['actor_seconds'], recovery=event['kind'] == 'paired_recovery_due')
         self.state['completed'][event['id']] = receipt

@@ -191,6 +191,8 @@ class CycleScheduler:
                       wave_limit=wave_limit, recovery_limit=recovery_limit,
                       actor_seconds=actor_seconds, recovery_seconds=recovery_seconds,
                       wall_seconds=wall_seconds, tuning_every=tuning_every)
+        if independent_projects and spec.mode != Mode.PHASE1:
+            config['max_failed_recovery_attempts'] = max_failed_recovery_attempts
         if recovery_feedback:
             config['recovery_feedback'] = True
         if independent_projects:
@@ -400,9 +402,58 @@ class CycleScheduler:
             self.state['events'].append(dict(kind='tuning_due', id=uuid.uuid4().hex,
                                             original_count=count, reasons=[reason]))
 
+    @property
+    def paired_retries(self):
+        return self.independent_projects and self.spec.mode != Mode.PHASE1 and self.config['recover']
+
+    def _paired_due(self):
+        return next((row for row in self.state.get('paired_retry_queue', {}).values()
+                     if row.get('feedback_pending') and row['eligible_wave'] <= self.state['wave']), None)
+
+    def complete_paired_retry(self, event, result, receipt, feedback):
+        """Observe the existing pair once; the candidate arm is the original retry."""
+        if not self.paired_retries:
+            return
+        state = self.state
+        completed = state.setdefault('paired_retry_receipts', {})
+        if event['id'] in completed:
+            if completed[event['id']] != receipt:
+                raise WorkflowError('paired retry receipt changed')
+            return
+        arms = result['arms']
+        candidate = arms['candidate']
+        accepted = any(row['outcome'] == 'accepted' and row['workflow'] is True
+                       and row['correctness'] is True for row in arms.values())
+        harness = [row for row in arms.values() if row.get('classification') == 'harness_failure']
+        if any(not row.get('terminal_failure_ref') or not row.get('audit_ref') for row in harness):
+            raise ValueError('paired harness failure requires terminal proof and host audit')
+        original = event['original']
+        root = original['original_id']
+        item = state.setdefault('paired_retry_queue', {}).setdefault(root, dict(
+            original=copy.deepcopy(original), failed_attempts=0,
+            original_actor_seconds=original['actor_seconds'], candidate_actor_seconds=0.))
+        item['candidate_actor_seconds'] += candidate['actor_seconds']
+        failed = candidate['outcome'] != 'accepted' and candidate.get('task_failure') is True and not harness
+        if failed:
+            item['failed_attempts'] += 1
+        limit = self.config.get('max_failed_recovery_attempts', 5)
+        status = ('accepted' if accepted else 'abandoned' if harness else
+                  'unrecoverable' if item['failed_attempts'] >= limit else
+                  'queued' if failed else 'observation_required')
+        item.update(status=status, result=copy.deepcopy(feedback), feedback_pending=True,
+                    eligible_wave=state['wave'] + 1, checkpoint=copy.deepcopy(feedback.get('retry_checkpoint', feedback['paired_checkpoint'])))
+        state['events'].append(dict(kind='paired_retry_resolved', original_id=root,
+            event_id=event['id'], receipt_ref=receipt, failed_attempts=item['failed_attempts'], status=status))
+        completed[event['id']] = receipt
+        if state['cursor'] >= len(self.spec.projects) and state['phase'] in ('original', 'complete'):
+            self._wave_end()
+        self._save()
+
     def _wave_end(self):
         self._due('wave_end')
-        if (self.state['cursor'] >= len(self.spec.projects) and not (self.config.get('deferred_recovery')
+        paired_pending = self.paired_retries and any(
+            row.get('feedback_pending') for row in self.state.get('paired_retry_queue', {}).values())
+        if (self.state['cursor'] >= len(self.spec.projects) and not paired_pending and not (self.config.get('deferred_recovery')
                 and any(r.get('status') == 'queued' for r in self.state['recovery_queue']))):
             self.state['phase'] = 'complete'
         elif self.config['wave_limit'] is not None and self.state['wave'] >= self.config['wave_limit']:
@@ -567,6 +618,11 @@ class CycleScheduler:
                 self._save()
                 return None
             raise WorkflowError('parent elapsed allocation exhausted')
+        if self.paired_retries and s['phase'] == 'original' and not s.get('paired_retry_current'):
+            item = self._paired_due()
+            if item:
+                s['paired_retry_current'] = item['original']['original_id']
+                s['phase'] = 'memory'
         phase = s['phase']
         operation = dict(id=uuid.uuid4().hex, kind='memory' if phase == 'recovery_memory' else phase,
                          recovery=phase in ('recovery', 'simplify', 'recovery_memory'))
@@ -631,10 +687,14 @@ class CycleScheduler:
             result = self.runner(spec, s['memory'], s['skills'], ctx)
         elif phase in ('memory', 'recovery_memory'):
             rows = s['recovery_feedback_rows'] if phase == 'recovery_memory' else (
-                s['wave_results'] if self.spec.mode == Mode.PHASE1 else [s['originals'][-1]])
+                s['wave_results'] if self.spec.mode == Mode.PHASE1 else [
+                    s['paired_retry_queue'][s['paired_retry_current']]['result']
+                    if s.get('paired_retry_current') else s['originals'][-1]])
             result = self.memory_update(s['memory'], copy.deepcopy(rows), ctx)
         elif phase == 'skill':
-            result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(s['originals'][-1]), ctx)
+            row = (s['paired_retry_queue'][s['paired_retry_current']]['result']
+                   if s.get('paired_retry_current') else s['originals'][-1])
+            result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(row), ctx)
         elif phase == 'simplify':
             item = next(r for r in s['recovery_queue'] if r['original_id'] == operation['original_id'])
             result = self.simplify(spec, copy.deepcopy(item.get('root_result', item['result'])), ctx)
@@ -733,16 +793,25 @@ class CycleScheduler:
             s['spent'] += result.actor_seconds
             if kind == 'skill':
                 s['candidates'].append(dict(reference=result.reference, operation_id=operation_id))
-                last = s['originals'][-1]
-                if self.config['recover'] and last['outcome'] != 'accepted':
+                current = s.get('paired_retry_current')
+                item = s['paired_retry_queue'][current] if current else None
+                last = item['original'] if item else s['originals'][-1]
+                if self.config['recover'] and last['outcome'] != 'accepted' and last.get('classification') != 'harness_failure':
                     s['events'].append(dict(kind='paired_recovery_due', id=uuid.uuid4().hex,
                                             original=copy.deepcopy(last), memory=s['memory'],
-                                            incumbent=s['skills'], candidate=result.reference))
+                                            incumbent=s['skills'], candidate=result.reference,
+                                            **({'paired_checkpoint': item['checkpoint']} if item else {})))
                 elif last['outcome'] == 'accepted':
                     s['events'].append(dict(kind='candidate_validation_due', id=uuid.uuid4().hex,
                                             original=copy.deepcopy(last), memory=s['memory'],
                                             incumbent=s['skills'], candidate=result.reference))
-                self._after_original()
+                if item:
+                    item['feedback_pending'] = False
+                    item['status'] = 'pair_pending'
+                    s.pop('paired_retry_current')
+                    s['phase'] = 'original'
+                else:
+                    self._after_original()
             else:
                 s['memory'] = result.reference
                 if self.config.get('deferred_recovery'):
@@ -751,6 +820,17 @@ class CycleScheduler:
                     s['recovery_spent'] += result.actor_seconds
                     s['recovery_feedback_rows'] = []
                     s['phase'] = s.pop('after_recovery_memory')
+                elif s.get('paired_retry_current'):
+                    item = s['paired_retry_queue'][s['paired_retry_current']]
+                    if item['status'] == 'queued':
+                        s['phase'] = 'skill'
+                    else:
+                        item['feedback_pending'] = False
+                        s.pop('paired_retry_current')
+                        if s['cursor'] >= len(self.spec.projects) and not self._paired_due():
+                            self._wave_end()
+                        else:
+                            s['phase'] = 'original'
                 elif self.spec.mode != Mode.PHASE1:
                     s['phase'] = 'skill'
                 else:
