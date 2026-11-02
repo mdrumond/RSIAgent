@@ -460,6 +460,11 @@ class CycleController:
                 result = dict(decision='validation' if cases else 'pending', cases=list(cases), actor_seconds=0.)
             pending['result'] = result
             self._save()
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries and 'feedback' not in pending:
+            if self.pair_feedback is None:
+                raise WorkflowError('paired retry requires canonical host feedback')
+            pending['feedback'] = self.pair_feedback(event, operation, result)
+            self._save()  # Authenticate retained arm facts before any skill promotion.
         if result['decision'] in ('benefit', 'validation') and 'active' not in pending:
             if self.scheduler.state['stopped']:
                 raise WorkflowError('cycle stopped before validation')
@@ -476,11 +481,6 @@ class CycleController:
         receipt = self.store.put_json(dict(event=event['id'], operation_id=operation, result=result,
                                           active=self.learning.active))
         if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries:
-            if 'feedback' not in pending:
-                if self.pair_feedback is None:
-                    raise WorkflowError('paired retry requires canonical host feedback')
-                pending['feedback'] = self.pair_feedback(event, operation, result)
-                self._save()
             self.scheduler.complete_paired_retry(event, result, receipt, pending['feedback'])
         self.scheduler.complete_extension(event['id'], receipt,
             actor_seconds=result['actor_seconds'], recovery=event['kind'] == 'paired_recovery_due')

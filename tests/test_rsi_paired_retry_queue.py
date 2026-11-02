@@ -367,3 +367,25 @@ def test_canonical_paired_receipt_preserves_host_audit_for_harness_abandonment(t
         if scheduler:
             scheduler.close()
         database.close()
+
+
+
+def test_unverified_paired_feedback_blocks_promotion_before_consuming_result(tmp_path):
+    scheduler, controller, _, _ = scenario(tmp_path, [('failed', 'accepted')])
+    pair_factory = controller.pair_factory
+    def benefit(*args):
+        pair = pair_factory(*args)
+        pair.result()['decision'] = 'benefit'
+        return pair
+    controller.pair_factory = benefit
+    def unverified(*args):
+        raise ValueError('canonical outcome does not authenticate accepted arm')
+    controller.pair_feedback = unverified
+    try:
+        controller.step(); controller.step(); controller.step()
+        with pytest.raises(ValueError):
+            controller.step()
+        assert controller.learning.calls==[] and scheduler.state['skills']=='incumbent'
+        assert controller.state['pending'] and not scheduler.state.get('paired_retry_queue')
+    finally:
+        scheduler.close()

@@ -666,7 +666,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             raise WorkflowError('paired feedback requires the retained canonical run outcome')
         retained = runner.store.read_json(outcome['reference'])
         raw = retained['result']
-        if (raw['contract_ref'] != runner.contract_ref
+        if ((observed['outcome'] == 'accepted' and raw['status'] != 'accepted')
+                or raw['contract_ref'] != runner.contract_ref
                 or raw['execution_contract_ref'] != runner.backend.manifest['contract']
                 or raw['source_hash'] != observed['source_hash']
                 or raw['source_hash'] != runner.backend.project_hash()
