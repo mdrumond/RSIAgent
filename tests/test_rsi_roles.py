@@ -458,37 +458,6 @@ def test_isolated_error_detail_is_bounded_and_selected_secret_redacted():
     assert secret not in json.dumps(value)
 
 
-@pytest.mark.parametrize('finished', [True, False])
-def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monkeypatch, finished):
-    import time
-    script = worker_script()
-    if finished:
-        script = script.replace('time.sleep(0.02)', 'time.sleep(0.08)').replace(
-            "'elapsed_seconds': 0.02", "'elapsed_seconds': 0.08").replace("'success': True", "'success': False")
-    else:
-        script = script.split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
-    adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
-    with pytest.raises(TimeoutError):
-        adapter.review('review', [], deadline=time.monotonic() + .04)
-    receipts = [payload for event, payload in events if event == 'role_finished']
-    assert [payload['elapsed_seconds'] for payload in receipts] == ([.08] if finished else [])
-    assert any(e == 'accounting_incomplete' and p['start_receipt_received']
-               for e, p in events) is not finished
-    assert len(captured) == 1
-
-
-def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
-    import time
-    script = worker_script().split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
-    adapter, events, _ = isolated(monkeypatch, script, receipt_grace_seconds=2)
-    started = time.monotonic()
-    with pytest.raises(TimeoutError):
-        adapter.review('review', [], deadline=started + .04, wall_deadline=started + .5)
-    assert time.monotonic() - started < 1.5
-    assert not any(e == 'role_finished' for e, _ in events)
-
-
-
 
 def test_actual_typed_validation_emits_specific_finished_failure_detail():
     from nooa.errors import GenerationError
@@ -505,6 +474,57 @@ def test_actual_typed_validation_emits_specific_finished_failure_detail():
     assert finished[0]['error']['type'] == type(error.value).__name__
     assert finished[0]['error']['message'] == str(error.value)
     assert not any(event == 'role_proposal' for event, _ in events)
+
+
+
+@pytest.mark.parametrize('finished', [True, False])
+def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monkeypatch, tmp_path, finished):
+    import time
+    from core.artifacts import ContentAddressedArtifacts
+    from rsi.contracts import ProjectSpec
+    from rsi.curriculum_research import Researcher, ResearchPending
+    script = worker_script().replace("'role': 'review'", "'role': request['role']")
+    if finished:
+        script = script.replace('time.sleep(0.02)', 'time.sleep(0.08)').replace(
+            "'elapsed_seconds': 0.02", "'elapsed_seconds': 0.08").replace("'success': True", "'success': False")
+    else:
+        script = script.split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    def query(*args, **kwargs):
+        return dict(results=[], negative_records=[], provenance={'source': 'retained docs'})
+    researcher = Researcher(adapter, query, store)
+    context = dict(operation_id='cutoff', root=tmp_path, deadline=time.monotonic() + .04, templates=[])
+    parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
+    if finished:
+        result = researcher.research(parent, {}, context)
+        assert result.proposal is None
+        receipt = store.read_json(result.receipt_ref)
+        query_seconds = sum(store.read_json(ref).get('payload', {}).get('elapsed_seconds', 0)
+            for ref in receipt['artifact_refs']
+            if store.read_json(ref).get('event') == 'research_query_finished')
+        assert result.actor_seconds == .08 + query_seconds
+        assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
+        assert not any(e == 'accounting_incomplete' for e, _ in events)
+    else:
+        with pytest.raises(ResearchPending) as error:
+            researcher.research(parent, {}, context)
+        assert error.value.actor_seconds is None
+        assert any(e == 'accounting_incomplete' and p['start_receipt_received'] for e, p in events)
+        assert not any(e == 'role_finished' for e, _ in events)
+    assert len(captured) == 1
+
+
+def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
+    import time
+    script = worker_script().split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
+    adapter, events, _ = isolated(monkeypatch, script, receipt_grace_seconds=2)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        adapter.review('review', [], deadline=started + .04, wall_deadline=started + .5)
+    assert time.monotonic() - started < 1.5
+    assert not any(e == 'role_finished' for e, _ in events)
+
 
 
 @pytest.mark.parametrize('action, fields', [('used', {'redirection': 'Isolate the documented case'}),
@@ -553,3 +573,19 @@ def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
     finished = [p for e, p in events if e == 'role_finished']
     assert len(finished) == 1 and finished[0]['success'] is False
     assert finished[0]['elapsed_seconds'] == 2 and finished[0]['error']
+
+
+def test_semantic_investigation_real_framework_needs_no_identifiers_or_ledger():
+    payload = dict(question='Which small input isolates the discrepancy?',
+                   goal='Distinguish input-dependent behavior', why='Observed mismatch requires isolation')
+    roles, calls, events, _ = make_roles([payload])
+    result = roles.investigation('Choose an investigation',
+        [AdmittedEvidence('host-owned', {'text': 'Retrieved fact', 'negative_records': [{'reason': 'Mismatch'}]})],
+        deadline=110)
+    from rsi.curriculum_research import InvestigationIdea
+    assert result == InvestigationIdea(**payload)
+    assert len(calls) == 1
+    assert next(p for e, p in events if e == 'role_started')['evidence'][0]['data']['text'] == 'Retrieved fact'
+    assert next(p for e, p in events if e == 'role_finished')['elapsed_seconds'] == 2
+    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
+    assert set(schema['properties']) == {'question', 'goal', 'why'}
