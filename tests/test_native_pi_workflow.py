@@ -164,11 +164,13 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         if overflow:
             assert emitted.overflow_sent and emitted.compactions > 0
             native = [event['event'] for event in runner.events if event['type'] == 'pi-native-event']
-            assert any(event['type'] == 'auto_compaction_start' for event in native)
-            assert any(event['type'] == 'auto_compaction_end' for event in native)
+            assert any(event['type'] == 'compaction_start' for event in native)
+            assert any(event['type'] == 'compaction_end' for event in native)
             entries = [json.loads(line) for path in (runner.root/'native/session/sessions').glob('*.jsonl')
                        for line in path.read_text().splitlines()]
             assert any(entry['type'] == 'compaction' for entry in entries)
+            assert any(event['type'] == 'session_before_compact' and event['reason'] == 'overflow' for event in native)
+            assert any(event['type'] == 'compaction_end' and event['result']['usage']['output'] == 40 for event in native)
             assert len([entry for entry in emitted if entry['name'] == 'edit']) == 1
 
     finally:

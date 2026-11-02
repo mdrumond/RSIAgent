@@ -215,6 +215,9 @@ class NativeSession:
             if kind == 'message_end' and event.get('message', {}).get('role') == 'assistant':
                 usage = event['message'].get('usage')
                 self.usage.append(usage if usage is not None else {})
+            if kind == 'compaction_end':
+                usage = (event.get('result') or {}).get('usage')
+                self.usage.append(dict(usage, category='compaction') if usage is not None else {})
             if kind == terminal:
                 if terminal == 'settled':
                     self.awaiting_settlement = False
