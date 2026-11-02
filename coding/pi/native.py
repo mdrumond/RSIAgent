@@ -118,9 +118,17 @@ class NativeSession:
         raw = json.dumps(dict(event, operation_id=self.operation_id), ensure_ascii=False, allow_nan=False)
         if secret:
             raw = raw.replace(secret, '[redacted]')
-        with (self.root/'native-events.jsonl').open('a') as stream:
-            stream.write(raw+'\n'); stream.flush(); os.fsync(stream.fileno())
-        self.observer(json.loads(raw))
+        data = (raw+'\n').encode('utf-8')
+        with (self.root/'native-events.jsonl').open('ab') as stream:
+            offset = stream.tell()
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        observed = json.loads(raw)
+        if observed.get('type') in ('message_update', 'provider_stream_event'):
+            import hashlib
+            observed = dict(type=observed['type'], operation_id=self.operation_id,
+                native_journal=dict(path='native-events.jsonl', offset=offset, length=len(data),
+                                    sha256=hashlib.sha256(data).hexdigest()))
+        self.observer(observed)
 
     def prepare(self, timeout=30.):
         if self.closed:
@@ -215,6 +223,9 @@ class NativeSession:
             if kind == 'message_end' and event.get('message', {}).get('role') == 'assistant':
                 usage = event['message'].get('usage')
                 self.usage.append(usage if usage is not None else {})
+            if kind == 'compaction_end':
+                usage = (event.get('result') or {}).get('usage')
+                self.usage.append(dict(usage, category='compaction') if usage is not None else {})
             if kind == terminal:
                 if terminal == 'settled':
                     self.awaiting_settlement = False
@@ -229,12 +240,19 @@ class NativeSession:
                 return result
 
     def prompt(self, text, *, operation_id, remaining=None):
-        self.prepare()
         if self.running or self.closed:
             raise NativeError('native session is busy or closed')
         if self.awaiting_settlement:
             raise NativeError('prior native operation requires settlement reconciliation',
                               settlement=self._settlement('unknown'))
+        def admit():
+            left = remaining() if remaining else None
+            if left is not None and left <= 0:
+                raise DeadlineExceeded('native deadline exhausted before provider dispatch',
+                                       settlement=self._settlement('not_dispatched'))
+        admit()
+        self.prepare()  # Setup has its own timeout; it is not an actor allocation.
+        admit()  # A lazy setup may have consumed the enclosing wall allowance.
         self.operation_id, self.running, self.provider_settled = operation_id, True, False
         self.awaiting_settlement = True
         self.cancelled.clear()

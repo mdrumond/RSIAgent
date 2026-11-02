@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from copy import copy, deepcopy
-from contextlib import nullcontext
 import json
 import logging
 import math
@@ -418,25 +417,6 @@ class _ProviderEvidenceRecorder:
         return payloads
 
 
-@dataclass(frozen=True)
-class _ActorContinuation:
-    profile: DirectModelProfile
-    messages: tuple[Mapping[str, str], ...]
-    recorder: _ProviderEvidenceRecorder
-    working_context: WorkingContext
-    total_turns: int
-    deadline: float | None = None
-
-
-@dataclass(frozen=True)
-class _ActorSelection:
-    action: TrialAction | None
-    text: str
-    tokens: int
-    invalid_observation: str | None = None
-    exhausted: bool = False
-
-
 from benchmarks.ascend.actor_control import actor_lease
 
 
@@ -484,78 +464,6 @@ class DirectActorDriver:
         driver._provider_deadline = min(deadline_after(driver.max_seconds, clock=self.clock),
                                         getattr(self, '_provider_deadline', float('inf')))
         return driver
-
-    def _prepare_context(self, working, profile, recorder, *, turn):
-        tokens = 0
-
-        def summarize(messages):
-            nonlocal tokens
-            self._request(recorder, profile, messages, stage="compaction", turn=turn)
-            try:
-                completion = self._complete(recorder, profile, messages, stage="compaction", turn=turn)
-            except _EmptyTextCompletion as exc:
-                # Only compaction treats empty textual output as correctable.
-                # Ordinary Actor/provider calls still reject this ValueError.
-                completion = exc
-            except Exception as exc:
-                recorder.failure(exc, stage="compaction", turn=turn)
-                if isinstance(exc, ProviderRejectionError):
-                    raise
-                raise ContextBudgetError("work-log summarization failed; original evidence retained") from exc
-            recorder.response(completion.text, stage="compaction", turn=turn)
-            tokens += completion.completion_tokens
-            self._trace("tool", {"name": "context-compaction", "status": "observed",
-                "messages": messages, "work_log": completion.text,
-                "completion_tokens": completion.completion_tokens})
-            return completion.text
-
-        messages = working.prepare(profile, self.provider.context_budget(profile), summarize)
-        return messages, tokens
-
-    def _request(self, recorder, profile, messages, *, stage, turn):
-        self._trace("tool", {"name": "provider-request", "stage": stage, "turn": turn,
-                             "request": profile.request(messages)})
-
-    def _complete(self, recorder, profile, messages, *, stage, turn):
-        def observe(event, payload):
-            recorder.attempt(event, payload, stage=stage, turn=turn)
-            self._trace("tool", {"name": "provider-attempt-" + event,
-                                "stage": stage, "turn": turn, **payload})
-        options = dict(attempt_observer=observe)
-        deadline = getattr(self, '_provider_deadline', None)
-        if deadline is not None:
-            remaining = deadline - self.clock()
-            if remaining <= 0:
-                raise TimeoutError("Actor provider time allowance exhausted")
-            # Production providers support HTTP/retry bounds. Injected providers
-            # retain their existing protocol and own their transport I/O limits.
-            if isinstance(self.provider, DirectCompletionProvider):
-                options['max_seconds'] = remaining
-        return self.provider.complete(profile, messages, **options)
-
-    def _action_session(self, profile, action_executor, deadline):
-        return nullcontext(None)
-
-    def _select_action(self, session, *, working, profile, recorder, turn,
-                       feedback, action_executor, turn_parser, deadline):
-        messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
-        self._request(recorder, profile, messages, stage="action", turn=turn)
-        try:
-            completion = self._complete(recorder, profile, messages, stage="action", turn=turn)
-        except Exception as exc:
-            recorder.failure(exc, stage="action", turn=turn)
-            raise
-        return _ActorSelection(turn_parser(completion.text), completion.text,
-                               summary_tokens + completion.completion_tokens)
-
-    def _observed_action(self, session, action, observation, action_executor):
-        pass
-
-    def _terminal_context(self, working, profile):
-        # Pinned user feedback follows recent exchanges in the model view; it
-        # must never replace the host result consumed by terminal distillation.
-        terminal = working.recent[-1]
-        return [message for message in working.messages() if message is not terminal] + [terminal]
 
     @actor_lease
     def __call__(self, instruction: str, *, profile: DirectModelProfile,

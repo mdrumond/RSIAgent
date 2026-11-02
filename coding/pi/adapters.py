@@ -1,9 +1,8 @@
 """Mechanical adapters from typed Pi tools to existing host action contracts."""
-import json
 import time
 
 from .schema import STRING, INTEGER, obj
-from .session import PiCodingSession, ENGINE_IDENTITY, ActionError
+from .session import PiCodingSession
 
 ARRAY = {"type": "array", "items": STRING}
 A3_SCHEMAS = {
@@ -40,23 +39,10 @@ class A3Actor:
     def bind_host(self, record, budgets):
         self.record = record
         self.session.deadline = time.monotonic() + budgets.max_seconds
-        self.session.gateway.deadline = self.session.deadline
 
     def __call__(self, profile, context):
-        from benchmarks.a3_model_profiles import A3Completion
-        state = json.loads(context)
-        before = self.session.completion_tokens
-        source = state.get("current_candidate_source")
-        allowed = list(state["allowed_actions"])
-        try:
-            name, args = self.session.next_action(state, allowed, source=source, record=self.record,
-                write_action=(lambda s: ("write_source", {"source": s})) if "write_source" in allowed else None)
-            selected = {"action": name, **args}
-            text = json.dumps(selected)
-        except ActionError:
-            text, selected = "{}", {}  # Existing host records invalid actions.
-        return A3Completion(text, self.session.completion_tokens-before,
-                            {"profile_sha256": profile.fingerprint, **ENGINE_IDENTITY}, selected_action=selected)
+        from rsi.domain_execution import CanonicalConfigurationError
+        raise CanonicalConfigurationError('Programming actors execute through canonical adoption and native host tools')
 
     def close(self):
         self.session.close()

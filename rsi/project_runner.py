@@ -500,9 +500,9 @@ class ProjectRunner:
             editable_files=list(self.config.editable_files), feedback=feedback,
             iterations={k: self.workflow.state[k] for k in ('design', 'implementation')},
             last_validation=self.latest('validation-results'),
-            strategy_protocol='Read mapped skills; query_kdb and retrospect; select_strategy '
+            strategy_protocol='Read mapped skill files with native read; query_kdb and retrospect; select_strategy '
                 'with every result decision; perform matching proposal. Optimisation also '
-                'requires optimisation_decision. Use read_project_file to select editable source. '
+                'requires optimisation_decision. Read/edit/write admitted source with native tools. '
                 'In debug/validation request_redesign(reason) revisits design with fresh evidence.')
 
     def reconcile(self):

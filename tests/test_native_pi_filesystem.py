@@ -181,3 +181,47 @@ def test_real_native_tools_paginate_edit_and_reject_protected_paths(tmp_path, mo
     assert execution.verifier.read_bytes() == verifier
     assert files.pending_source(operation)['source_hash'] == execution.project_hash()
     assert any('outside admitted' in m['content'] for m in feedback)
+
+
+def hard_crash_before_replace(root, workflow_path, files_root, operation):
+    """Importable spawn target: os._exit bypasses every Python finally block."""
+    import os
+    import coding.pi.filesystem as module
+    from rsi.contracts import BudgetLimits
+    from rsi.python_execution import PythonExecution
+    from rsi.runtime import Workflow
+    execution = PythonExecution(Path(root))
+    state = json.loads(Path(workflow_path).read_text())
+    execution.workflow = Workflow(Path(workflow_path), lambda *args: True,
+        source_hash=state['source'], limits=BudgetLimits.from_dict(state['limits']))
+    files = NativeFiles(Path(files_root), store=execution.store, backend=execution)
+    replace = module.os.replace
+    def abrupt(source, destination):
+        if Path(destination) == execution.project/'helper.py':
+            os._exit(37)
+        return replace(source, destination)
+    module.os.replace = abrupt
+    files.write(dict(path=str(execution.project/'helper.py'), content='value = 77\n'), context(operation))
+
+
+def test_hard_process_exit_leaves_staging_outside_source_and_reconciles(tmp_path):
+    import multiprocessing
+    execution, operation, files = pending(tmp_path)
+    before = execution.project_hash()
+    child = multiprocessing.get_context('spawn').Process(target=hard_crash_before_replace,
+        args=(str(execution.root), str(tmp_path/'workflow.json'), str(files.root), operation))
+    child.start()
+    child.join(timeout=15)
+    try:
+        assert not child.is_alive() and child.exitcode == 37
+        assert execution.project_hash() == before
+        assert (execution.project/'helper.py').read_text() == 'value = 1\n'
+        assert len(list((files.root/'staging').iterdir())) == 1
+        reopened = NativeFiles(files.root, store=execution.store, backend=execution)
+        closure = execution.store.read_json(reopened.pending_source(operation)['reference'])
+        receipt = execution.store.read_json(closure['artifact_refs'][0])
+        assert receipt['status'] == 'not_applied' and closure['head'] == before
+    finally:
+        if child.is_alive():
+            child.terminate(); child.join(timeout=5)
+        child.close()

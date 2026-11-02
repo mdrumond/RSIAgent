@@ -26,18 +26,7 @@ SCHEMAS = {
     'perform': obj({'proposal': STRING, 'edit': obj({
         'path': STRING, 'sha256': STRING, 'source': STRING})}, ['proposal']),
 }
-SYSTEM = (
-    'You select actions for a host-controlled programming workflow. '
-    'Read every mapped skill using read_skill before perform. Only the host '
-    'executes proposals and determines outcomes or stage transitions. '
-    'Use the current stage and observation; never skip stages or claim success '
-    'from a queued action. Source edits require the exact editable path/hash. '
-    'Design and optimisation require real retrospective and KDB evidence. '
-    'Read results appear in the next host snapshot as executed observations. '
-    'Use current_skill_content for already-read skills; use read_context when '
-    'content is paged. Do not repeat a completed read because its native receipt was queued. '
-    'Select exactly one typed host action per turn.'
-)
+
 
 
 @dataclass(frozen=True)
@@ -79,6 +68,12 @@ class EvidenceTool:
     def __post_init__(self):
         if self.stages is not None:
             object.__setattr__(self, 'stages', tuple(Stage(stage) for stage in self.stages))
+
+
+class HostContextUpdated(Exception):
+    """Trusted live-input update, delivered without executing the stale action."""
+    def __init__(self, context):
+        self.context = context
 
 
 class WorkflowActor:
@@ -276,6 +271,11 @@ class WorkflowActor:
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
                     name, args = yield payload, allowed, source, record
+                except HostContextUpdated as update:
+                    context = update.context
+                    observation = dict(event='action-superseded', accepted=False, executed=False)
+                    record('actor-action-superseded', observation)
+                    continue
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -473,8 +473,13 @@ class PiSessionAdapter:
 
     @classmethod
     def from_existing_session(cls, session, *, wall_deadline=None):
-        if getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None:
+        if (getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None
+                or getattr(session, 'native_session', None) is not None):
             raise ValueError('only an unstarted session may transfer ownership')
         adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
         session.closed = True
         return adapter
+
+
+# Historical import name delegates to the sole native implementation.
+SnapshotPiSessionAdapter = PiSessionAdapter

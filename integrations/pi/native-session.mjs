@@ -37,6 +37,10 @@ async function start(config) {
   const tools = config.tools.map(tool => ({...tool, label:tool.name, executionMode:'sequential',
     execute:(id, args) => host(tool.name, args, id)}));
   const trace = pi => {
+    // Observe native preparation/results without replacing its compactor or retry policy.
+    for (const type of ['session_before_compact', 'session_compact', 'session_compact_failed']) {
+      pi.on(type, event => { const {signal, ...safe} = event; send(safe); });
+    }
     for (const type of ['before_provider_request', 'after_provider_response', 'provider_stream_event']) {
       pi.on(type, event => {
         const {headers, ...safe} = event; // Native auth headers never enter evidence.

@@ -575,7 +575,23 @@ class CurriculumAgent:
             # historical contexts. Include all corrections within this selection.
             wire = [system, *history[selection_start:]]
             from benchmarks.ascend.context_files import context_wire
-            completion = self._complete(tuple(context_wire(wire)))
+            native_wave = getattr(self._complete, 'wave', None)
+            if native_wave is not None:
+                def validate_native(response):
+                    proposal = self._parse_and_validate(response, context)
+                    if isinstance(proposal, WaveDecision) and remaining_projects is not None and len(proposal.wave.projects) > remaining_projects:
+                        raise ValueError('wave exceeds remaining project budget; select a smaller wave')
+                def native_query(args, seconds):
+                    from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+                    request = KnowledgeQuery(args['query'], args.get('limit', 5))
+                    results = (self.query_knowledge(request, check_remaining=check_remaining)
+                               if self._query_accepts_remaining else self.query_knowledge(request))
+                    return dict(knowledge_query=dict(available=True, results=[dict(
+                        citation=item.citation.as_dict(), text=item.text, score=item.score) for item in results]))
+                completion = native_wave(tuple(context_wire(wire)), remaining_seconds=check_remaining(),
+                    validate=validate_native, query=native_query if self.query_knowledge is not None else None)
+            else:
+                completion = self._complete(tuple(context_wire(wire)))
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
