@@ -290,3 +290,70 @@ def test_reconciled_completed_arm_without_outer_return_reaches_canonical_memory(
         assert created == ['incumbent', 'candidate']
     finally:
         cycle.close()
+
+
+
+@pytest.mark.parametrize('limit', [2, 5])
+def test_existing_independent_cycle_adopts_counter_metadata_without_changing_config(tmp_path, limit):
+    scheduler, _, _, _ = scenario(tmp_path, [('failed', 'failed')], limit=limit)
+    try:
+        retained = copy.deepcopy(scheduler.state)
+    finally:
+        scheduler.close()
+    # Exact shape of an N4b retained cycle, before the queue policy existed.
+    retained['config'].pop('max_failed_recovery_attempts', None)
+    retained.pop('paired_retry_policy', None)
+    retained['events'] = [e for e in retained['events'] if e['kind']!='paired_retry_policy_adopted']
+    path = tmp_path/'cycle.json'
+    path.write_text(json.dumps(retained))
+    for _ in range(2):
+        reopened, _, _, _ = scenario(tmp_path, [('failed', 'failed')], limit=limit)
+        try:
+            assert reopened.state['config']==retained['config']
+            assert reopened.state['paired_retry_policy']=={'max_failed_attempts': limit}
+            assert sum(e['kind']=='paired_retry_policy_adopted' for e in reopened.state['events'])==1
+        finally:
+            reopened.close()
+
+
+def test_canonical_paired_receipt_preserves_host_audit_for_harness_abandonment(tmp_path):
+    from rsi.contracts import BudgetLimits
+    from rsi.project_runner import ProjectRunner
+    from test_rsi_recovery import setup_pair, run_pair
+    def audited(request, reopen, injections):
+        runner = ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
+            request.root, request.spec, request.bundle, request.config, **injections)
+        if not reopen and request.arm=='candidate':
+            outcome = runner._outcome
+            def host_audited_outcome(result, closure):
+                # Explicit host-fault fixture producer, not a model-authored classification.
+                audit = runner.store.put_json(dict(kind='test-host-harness-audit',
+                    operation_id=request.operation_id, contract_ref=runner.contract_ref,
+                    source_hash=runner.backend.project_hash()))
+                result.update(classification='harness_failure', audit_ref=audit)
+                return outcome(result, closure)
+            runner._outcome = host_audited_outcome
+        return runner
+    pair, original, store, _, database = setup_pair(tmp_path, repairs=(False, False),
+        limits=BudgetLimits(actor_seconds=1.5, wall_seconds=30), independent=True, wrap=audited)
+    scheduler = None
+    try:
+        result = run_pair(pair)
+        candidate = result['arms']['candidate']
+        assert candidate['classification']=='harness_failure'
+        audit = store.read_json(candidate['audit_ref'])
+        assert audit['operation_id']==candidate['operation_id']
+        proof = store.read_json(candidate['terminal_failure_ref'])
+        assert proof['project_contract_ref']==audit['contract_ref']
+        scheduler, controller, _, _ = scenario(tmp_path/'policy', [('failed', 'failed')])
+        event = dict(id='actual-audited-pair', original=dict(project=original.spec.to_dict(),
+            original_id='root', actor_seconds=0.))
+        checkpoint = dict(operation_id='pair', arm='candidate', frozen=result['frozen'])
+        feedback = dict(paired_checkpoint=checkpoint)
+        scheduler.complete_paired_retry(event, result, candidate['audit_ref'], feedback)
+        item = scheduler.state['paired_retry_queue']['root']
+        assert item['status']=='abandoned' and item['failed_attempts']==0
+    finally:
+        if scheduler:
+            scheduler.close()
+        database.close()

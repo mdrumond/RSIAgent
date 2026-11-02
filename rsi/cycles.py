@@ -191,8 +191,6 @@ class CycleScheduler:
                       wave_limit=wave_limit, recovery_limit=recovery_limit,
                       actor_seconds=actor_seconds, recovery_seconds=recovery_seconds,
                       wall_seconds=wall_seconds, tuning_every=tuning_every)
-        if independent_projects and spec.mode != Mode.PHASE1:
-            config['max_failed_recovery_attempts'] = max_failed_recovery_attempts
         if recovery_feedback:
             config['recovery_feedback'] = True
         if independent_projects:
@@ -219,6 +217,19 @@ class CycleScheduler:
             raise
         self.spec, self.config = spec, config
         self.needs_reconciliation = self.state['pending'] is not None
+        try:
+            if self.paired_retries:
+                policy = dict(max_failed_attempts=max_failed_recovery_attempts)
+                prior = self.state.get('paired_retry_policy')
+                if prior is not None and prior != policy:
+                    raise ValueError('retained paired retry counter policy differs')
+                if prior is None:
+                    self.state['paired_retry_policy'] = policy
+                    self.state['events'].append(dict(kind='paired_retry_policy_adopted', **policy))
+                    self._save()  # Preserve the original immutable config, including legacy flags.
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
         if not self.lock.closed:
@@ -436,7 +447,7 @@ class CycleScheduler:
         failed = candidate['outcome'] != 'accepted' and candidate.get('task_failure') is True and not harness
         if failed:
             item['failed_attempts'] += 1
-        limit = self.config.get('max_failed_recovery_attempts', 5)
+        limit = self.state['paired_retry_policy']['max_failed_attempts']
         status = ('accepted' if accepted else 'abandoned' if harness else
                   'unrecoverable' if item['failed_attempts'] >= limit else
                   'queued' if failed else 'observation_required')

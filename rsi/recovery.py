@@ -301,6 +301,12 @@ class PairedRecovery:
             (command := self.store.read_json(ref))['current_hash'] == runner.backend.project_hash()
             and command['classification'] in ('numeric_failure', 'compile_failure', 'execution_failure')
             for ref in failure['command_receipts']))
+        audit_ref = None
+        if failure:
+            canonical = runner.store.read_json(failure['result_ref'])['result']
+            audit_ref = canonical.get('audit_ref')
+            if audit_ref:
+                self.store.put_bytes(runner.store.read_bytes(audit_ref))
         receipt = dict(operation_id=request.operation_id, frozen=request.frozen_ref,
             arm=arm, root=str(request.root), skill_bundle_hash=runner.bundle.digest,
             workflow=workflow, correctness=correctness,
@@ -309,7 +315,7 @@ class PairedRecovery:
             wall_deadline=row.get('wall_deadline'),
             wall_limited=row.get('wall_deadline') is not None and self.clock() >= row['wall_deadline'],
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
-            terminal_failure_ref=self.store.put_json(failure) if failure else None,
+            terminal_failure_ref=self.store.put_json(failure) if failure else None, audit_ref=audit_ref,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
             execution_contract=self.store.put_json(runner.backend.contract),
             workflow_receipt=self.store.put_json(flow.state))
