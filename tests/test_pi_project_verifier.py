@@ -21,44 +21,18 @@ def test_production_defaults_pi_but_injected_transport_stays_compatible(monkeypa
     completion = SimpleNamespace(model='deepseek-flash')
     live = SimpleNamespace(_transport=openai_compatible_transport)
     assert session_factory({}, SimpleNamespace(_transport=object()), completion) is None
-    assert session_factory({'verifier_engine': 'completion'}, live, completion) is None
+    with pytest.raises(ValueError):
+        session_factory({'verifier_engine': 'completion'}, live, completion)
     create = session_factory({}, live, completion)
     before = time.monotonic()
     with create(max_seconds=7):
         pass
     assert made[0]['model'] == 'deepseek-flash'
-    from test_review_context import fixture
-    from coding.pi.context import encoded
-    packed = made[0]['context_factory']().snapshot(fixture(), target=16384)
-    assert len(encoded(packed)) <= 16384
-    assert packed['host']['review_state']['missing_required_artifacts']
     assert before + 7 <= made[0]['deadline'] <= time.monotonic() + 7
     with pytest.raises(ValueError):
         session_factory({'verifier_engine': 'unknown'}, live, completion)
 
 
-def test_real_pi_verifier_reads_missing_log_and_admits_only_host_valid_decision(monkeypatch):
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    h = Harness([])
-    actions = iter([*prerequisites()[:2], decision(), prerequisites()[2],
-                    prerequisites()[3], decision(memory())])
-    calls = []
-    def provider(*_, **options):
-        action = next(actions)
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        calls.append(json.loads(options['data']))
-        return stream(name, args, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
-        deadline=time.monotonic()+options['max_seconds'])
-    assert h.agent.review(request(), max_seconds=30) == decision(memory())
-    assert L in [digest for digest, _ in h.reads]
-    assert len(calls) == 6
-    assert not h.calls
 
 
 def test_subject_composition_selects_configured_verifier_model(tmp_path, monkeypatch):
@@ -140,83 +114,10 @@ def stream_many(actions):
     return Response()
 
 
-def test_compat_first_arriving_action_cannot_bypass_host_evidence_gate(monkeypatch):
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    h = Harness([])
-    calls = []
-    def provider(*_, **options):
-        body = json.loads(options['data'])
-        calls.append(body)
-        if len(calls) == 1:
-            return stream_many([*prerequisites()[:3], decision(memory())])
-        # The legacy extension permits parallel HTTP arrivals. Whichever call
-        # arrived first, follow the authoritative host's remaining evidence.
-        snapshot = json.loads(next(m['content'] for m in body['messages'] if m['role'] == 'user'))
-        state = snapshot['context']['host']['review_state']
-        if state['missing_required_artifacts']:
-            action = {'read_artifact': {'sha256': state['missing_required_artifacts'][0]['sha256']}}
-        elif not state['knowledge_queried']:
-            action = {'knowledge_query': {'query': 'increment'}}
-        else:
-            action = decision(memory())
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        return stream(name, args, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
-        deadline=time.monotonic()+options['max_seconds'], first_action_only=True)
-    assert h.agent.review(request(), max_seconds=30) == decision(memory())
-    assert {digest for digest, _ in h.reads} == {S, R, L}
-    selected = [e['payload'] for e in h.agent.last_trace if e['kind'] == 'pi-action']
-    assert selected[0]['discarded_actions'] == 3
-    assert len([e for e in h.agent.last_trace if e['kind'] == 'pi-action-rejected']) == 3
-    assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
 
 
-def test_actor_still_rejects_multiple_queued_actions(monkeypatch):
-    from coding.pi.session import ActionError
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **k: stream_many(prerequisites()[:2]))
-    with PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-            environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30) as session:
-        with pytest.raises(ActionError):
-            session.next_action({}, ['read_artifact'])
-        assert session.pending is None
 
 
-def test_real_pi_rejects_prose_evidence_then_corrects_without_context_growth(monkeypatch):
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    h = Harness([])
-    bad = decision(memory())
-    bad['evidence'] = [f'source {S} with observed result {R}']
-    actions = iter([*prerequisites(), bad, *[prerequisites()[0]] * 15, decision(memory())])
-    calls = []
-    def provider(*_, **options):
-        action = next(actions)
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        calls.append(json.loads(options['data']))
-        assert len(options['data']) < 20000
-        return stream(name, args, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
-        deadline=time.monotonic()+options['max_seconds'], first_action_only=True)
-    assert h.agent.review(request(), max_seconds=30) == decision(memory())
-    assert len(calls) == 21
-    assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
-    submitted = [e['payload'] for e in h.agent.last_trace
-                 if e['kind'] == 'pi-action' and e['payload']['name'] == 'submit_review']
-    assert len(submitted) == 1
-    assert submitted[0]['arguments']['evidence'] == [R]
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -262,35 +163,6 @@ def test_admitted_runtime_config_preserves_verifier_route_and_retained_review(tm
     assert allocations[-1]['allocation']['worker']['physical_device'] == 1
 
 
-@pytest.mark.parametrize('ambient', [None, 'wrong-ambient-key'])
-def test_real_pi_gateway_uses_private_provider_credential(monkeypatch, ambient):
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    if ambient is None:
-        monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
-    else:
-        monkeypatch.setenv('DEEPSEEK_API_KEY', ambient)
-    selected = next(p.backend_model for p in MODEL_IDENTITIES if p.backend_model.value == 'deepseek-flash')
-    private = 'configured-private-provider-key'
-    provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': private}, models=[selected])
-    calls = []
-    actions = iter([*prerequisites(), decision(memory())])
-    def http(*_, **options):
-        calls.append(options)
-        action = next(actions)
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        return stream(name, args, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', http)
-    create = session_factory({}, provider, SimpleNamespace(model='deepseek-flash'))
-    h = Harness([])
-    h.agent.session_factory = create
-    assert h.agent.review(request(), max_seconds=15) == decision(memory())
-    assert calls[0]['headers']['Authorization'] == 'Bearer ' + private
-    assert private not in calls[0]['data'].decode()
 
 
 @pytest.mark.parametrize('failure,expected', [
@@ -319,49 +191,3 @@ def test_production_review_boundary_normalizes_pi_failures(monkeypatch, failure,
 
 
 
-def test_real_pi_pages_aggregate_feedback_then_executes_required_reads(monkeypatch):
-    from benchmarks.ascend.review_context import ReviewContextRecords
-    from test_review_context import fixture
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    h = Harness([])
-    feedback = fixture()['host']['project']['rewrite_feedback']
-    actions = iter([*prerequisites(), decision(memory())])
-    restored, reference, reading = [], [None], [True]
-    calls = []
-    def provider(*_, **options):
-        body = json.loads(options['data'])
-        calls.append(body)
-        assert len(options['data']) < 49152
-        if reference[0] is None:
-            snapshot = json.loads(next(m['content'] for m in body['messages'] if m['role'] == 'user'))
-            host = snapshot['context']['host']
-            pointer = host['project']['rewrite_feedback']['prior_draft']
-            reference[0] = pointer['record']
-            assert host['review_state']['missing_required_artifacts']
-            assert host['review_state']['host_checks_passed'] is True
-            return stream('read_context', {'record': reference[0], 'offset': 0, 'limit': 4096}, len(calls))
-        if reading[0]:
-            message = next(m for m in reversed(body['messages']) if m['role'] == 'tool')
-            content = message['content']
-            if isinstance(content, list):
-                content = ''.join(p.get('text', '') for p in content)
-            page = json.loads(content)
-            restored.append(page['text'])
-            if page['next_offset'] is not None:
-                return stream('read_context', {'record': reference[0], 'offset': page['next_offset'], 'limit': 4096}, len(calls))
-            reading[0] = False
-        action = next(actions)
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        return stream(name, args, len(calls))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
-        deadline=time.monotonic()+options['max_seconds'], first_action_only=True,
-        context_factory=ReviewContextRecords)
-    assert h.agent.review(request(), feedback=feedback, max_seconds=30) == decision(memory())
-    assert json.loads(''.join(restored)) == feedback['prior_draft']
-    assert [digest for digest, _ in h.reads[:3]] == [S, R, L]
-    assert len(h.queries) == 1

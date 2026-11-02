@@ -69,6 +69,7 @@ def test_native_review_reads_actual_artifacts_queries_and_admits_memory(tmp_path
     harness = Harness([])
     session = PiReviewSession(model='deepseek-flash', schemas=SCHEMAS,
         environ={'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path)
+    calls.append(('submit_review', decision(memory())))  # Actual missing-read admission failure.
     calls.extend([('read', dict(path=str(session.root/'evidence'/(reference+'.txt'))))
                   for reference in (S, R, L)])
     calls.extend([('knowledge_query', dict(query='increment overflow lessons')),
@@ -79,6 +80,6 @@ def test_native_review_reads_actual_artifacts_queries_and_admits_memory(tmp_path
     assert harness.queries and not harness.calls  # No legacy text completion path.
     observed = [row for row in harness.agent.last_trace if row['kind']=='native-review-read']
     assert {row['payload']['sha256'] for row in observed} == {S, R, L}
-    assert len(requests) == 5
+    assert len(requests) == 6
     retained = next(row['payload'] for row in harness.agent.last_trace if row['kind']=='native-review-session')
     assert retained['artifact_refs']

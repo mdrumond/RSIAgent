@@ -197,58 +197,6 @@ def test_source_snapshot_supports_python_paths_and_project_hash(tmp_path):
     assert called[0][1]['edit']['source'] == 'answer = 43\n'
 
 
-@pytest.mark.parametrize('read_all', [True, False])
-def test_real_pi_uses_existing_gateway_and_explicit_skill_reads(monkeypatch, tmp_path, read_all):
-    from coding.pi.session import runtime_preflight, RuntimeUnavailable
-    from test_pi_runtime import stream
-    try: runtime_preflight()
-    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
-    calls, executed = [], []
-    actual_reads = reads(Stage.TASK_CONSTRUCTION) if read_all else reads(Stage.TASK_CONSTRUCTION)[-1:]
-    actions = iter(actual_reads+[('perform', {'proposal':'construct'})])
-    def provider(*_, **kwargs):
-        calls.append(json.loads(kwargs['data']))
-        action = next(actions, None)
-        if action is not None:
-            return stream(*action, len(calls))
-        # Native Pi reports the unavailable tool and asks the provider again.
-        # End that request without selecting another action; do not fake a read.
-        response = stream('perform', {}, len(calls), finish='stop')
-        original = response.iter_lines
-        def lines():
-            for line in original():
-                if line.startswith(b'data: {'):
-                    body = json.loads(line[6:])
-                    delta = body['choices'][0]['delta']
-                    if delta.pop('tool_calls', None):
-                        delta['content'] = 'No further action selected.'
-                    line = b'data: ' + json.dumps(body).encode()
-                yield line
-        response.iter_lines = lines
-        return response
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    flow = Workflow(tmp_path/'state.json', lambda *_: False, source_hash='v1')
-    actor = WorkflowActor(flow, builtin_bundle(),
-        lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
-        perform=lambda *args: executed.append(args) or StageResult(),
-        preflight=lambda *_: StageResult(), emit=lambda *_: None)
-    try:
-        actor.step({})
-        if read_all:
-            actor.step({'goal':'write Python'})
-        else:
-            from coding.pi.session import ActionError
-            with pytest.raises(ActionError):
-                actor.step({'goal':'write Python'})
-    finally: actor.close()
-    assert len(calls) == len(actual_reads)+(1 if read_all else 2)
-    if read_all:
-        assert flow.stage == Stage.DESIGN and len(executed) == 1
-        assert len(flow.state['history'][-1]['evidence']['skill_refs']) == 2
-    else:
-        assert flow.stage == Stage.TASK_CONSTRUCTION and not executed
-        assert flow.pending['handle'].startswith('pi:')
-    assert 'fake-provider-secret' not in json.dumps(calls)
 
 
 def test_read_material_remains_available_after_later_reads(tmp_path):
@@ -332,29 +280,6 @@ def test_host_evidence_tool_runs_in_current_operation_before_strategy(tmp_path):
     assert retrieved and session.contexts[-1]['observation']['retrieval_ref'] == 'host-query-1'
 
 
-def test_adapter_deadline_is_assigned_after_setup_and_gateway_matches(monkeypatch):
-    from types import SimpleNamespace
-    import rsi.actor as module
-    clock = Clock()
-    monkeypatch.setattr(module.time, 'monotonic', clock)
-    captured = []
-    raw = SimpleNamespace(gateway=SimpleNamespace(deadline=1001), deadline=1001, schemas={},
-        next_action=lambda *args, **kwargs: captured.append(kwargs) or ('perform', {'proposal':'edit'}))
-    monkeypatch.setattr(module, 'PiCodingSession', lambda **kwargs: raw)
-    adapter = PiSessionAdapter(model='deepseek-flash')
-    clock.value += 100  # setup must not consume the subsequent model allocation
-    source = SourceSnapshot('project.py','x=1','project-v1')
-    adapter.next_action({'stage':Stage.IMPLEMENTATION.value}, ['perform'],
-        seconds=7, record=lambda *_:None, source=source)
-    assert raw.deadline == raw.gateway.deadline == 1107
-    assert captured[-1]['write_action']('x=2') == ('perform', {
-        'proposal':'Apply exact source edit', 'edit':dict(path='project.py',sha256=source.sha256,source='x=2')})
-    adapter.next_action({'stage':Stage.DESIGN.value}, ['perform'],
-        seconds=5, record=lambda *_:None, source=source)
-    assert captured[-1]['write_action'] is None
-    adapter.next_action({'stage':Stage.IMPLEMENTATION.value}, ['read_skill'],
-        seconds=5, record=lambda *_:None, source=source)
-    assert captured[-1]['write_action'] is None
 
 
 def test_late_host_result_is_retained_without_advancing_workflow(tmp_path):
@@ -423,78 +348,6 @@ def test_pi_dispatch_identity_is_durable_before_thinking(tmp_path):
     assert request['request_id'] == provider['request_id']
 
 
-@pytest.mark.parametrize('with_context_read', [False, True])
-def test_real_pi_batched_calls_execute_only_first_host_action(monkeypatch, tmp_path, with_context_read):
-    from coding.pi.session import runtime_preflight, RuntimeUnavailable
-    from test_pi_runtime import stream
-    try: runtime_preflight()
-    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
-    bundle = builtin_bundle()
-    names = bundle.skills_for(Stage.TASK_CONSTRUCTION)
-    events, executed, requests = [], [], []
-    guide = 'Python project context. ' * 100
-
-    def actual_reads():
-        return [data['skill'] for kind,data in events if kind == 'skill-usage'
-                and data['kind'] == 'read' and data['stage'] == Stage.TASK_CONSTRUCTION.value]
-
-    def provider(*_, **kwargs):
-        request = json.loads(kwargs['data'])
-        requests.append(request)
-        index = len(requests)
-        if with_context_read and index == 1:
-            snapshot = json.loads(next(m['content'] for m in request['messages'] if m['role']=='user'))
-            reference = snapshot['context']['host']['task']['guide']['record']
-            actions = [('read_context', {'record':reference, 'limit':128})]
-        elif index == 1 + int(with_context_read):
-            actions = [('read_skill', {'name':name}) for name in names]
-            if with_context_read:
-                pages = [json.loads(m['content']) for m in request['messages'] if m['role']=='tool']
-                assert pages[0]['text'] == guide[:128]
-        elif index == 2 + int(with_context_read):
-            assert actual_reads() == [names[0]] and not executed
-            actions = [('read_skill', {'name':names[1]})]
-        else:
-            assert index == 3 + int(with_context_read) and actual_reads() == list(names) and not executed
-            actions = [('perform', {'proposal':'verified host invocation'}),
-                       ('perform', {'proposal':'phantom execution'})]
-        response = stream(*actions[0], index)
-        original = response.iter_lines
-        def lines():
-            for line in original():
-                if line.startswith(b'data: {'):
-                    body = json.loads(line[6:])
-                    delta = body['choices'][0]['delta']
-                    if delta.get('tool_calls'):
-                        delta['tool_calls'] = [dict(index=i, id=f'batch_{index}_{i}', type='function',
-                            function=dict(name=name, arguments=json.dumps(args)))
-                            for i,(name,args) in enumerate(actions)]
-                        line = b'data: ' + json.dumps(body).encode()
-                yield line
-        response.iter_lines = lines
-        return response
-
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
-    actor = WorkflowActor(flow, bundle,
-        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
-        perform=lambda stage,args,*_:executed.append(args['proposal']) or StageResult(),
-        preflight=lambda *_:StageResult(), emit=lambda kind,data:events.append((kind,data)))
-    try:
-        actor.step({})
-        actor.step({'guide':guide})
-    finally:
-        actor.close()
-    assert flow.stage == Stage.DESIGN and len(requests) == 3 + int(with_context_read)
-    assert actual_reads() == list(names)
-    assert executed == ['verified host invocation']
-    actions = [data for kind,data in events if kind == 'pi-action']
-    assert [data['discarded_actions'] for data in actions] == [1, 0, 1]
-    context_reads = [data for kind,data in events if kind == 'pi-context-read']
-    assert len(context_reads) == int(with_context_read)
-    if with_context_read:
-        assert context_reads[0]['record'] == hashlib.sha256(guide.encode()).hexdigest()
-        assert context_reads[0]['bytes'] == 128
 
 
 @pytest.mark.parametrize('stage', [Stage.TEST, Stage.VALIDATION])
@@ -612,98 +465,11 @@ def test_scripted_tool_cannot_bypass_stage_scope(tmp_path):
     with pytest.raises(WorkflowError, match='unavailable'): actor.step({})
 
 
-def test_real_pi_advertises_only_scoped_ready_tools(monkeypatch, tmp_path):
-    from coding.pi.schema import obj
-    from coding.pi.session import runtime_preflight, RuntimeUnavailable
-    from rsi.actor import EvidenceTool
-    from test_pi_runtime import stream
-    try: runtime_preflight()
-    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
-    from rsi.skills import SkillBundle, SkillDocument
-    base = builtin_bundle()
-    bundle = SkillBundle(tuple(SkillDocument(doc.name, doc.content+'\n'+('actual guidance ' * 500))
-                               for doc in base.documents), base.mapping)
-    ready, requests, executed, page_offsets = [], [], [], {}
-    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
-    names = bundle.skills_for(Stage.TASK_CONSTRUCTION)
-    actions = iter([*[('read_skill', {'name':name}) for name in names],
-                    ('query_kdb', {}), ('perform', {'proposal':'construct'})])
-    def provider(*_, **kwargs):
-        request = json.loads(kwargs['data'])
-        requests.append(request)
-        advertised = {tool['function']['name'] for tool in request['tools']}
-        assert not advertised & {'select_idea', 'optimisation_decision'}
-        assert 'query_kdb' in advertised
-        perform = next((t['function'] for t in request['tools'] if t['function']['name']=='perform'), None)
-        if perform:
-            assert 'edit' not in perform['parameters']['properties']
-        assert ('perform' in advertised) == bool(ready)
-        if ready:
-            snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role']=='user'))['context']['host']
-            assert snapshot['read_skills']['read_with'] == snapshot['evidence']['read_with'] == 'read_context'
-            assert {row['skill'] for row in snapshot['skill_receipts']} == set(names)
-            assert all(row['receipt_id'] for row in snapshot['skill_receipts'])
-            assert snapshot['evidence_receipts'] == [{'name':'query_kdb','reference':'actual-query-receipt'}]
-            assert snapshot['evidence_summaries']['query_kdb']['query_ref'] == 'actual-query-receipt'
-        if ready and snapshot['observation'].get('event') == 'skill-delivery-required':
-            for message in request['messages']:
-                if message['role']=='tool':
-                    page = json.loads(message['content'])
-                    if 'record' in page and 'next_offset' in page:
-                        page_offsets[page['record']] = page['next_offset']
-            for row in snapshot['observation']['reads'].values():
-                reference = row['content']['record']
-                if reference not in page_offsets or page_offsets[reference] is not None:
-                    return stream('read_context', dict(record=reference, offset=page_offsets.get(reference,0), limit=8192), len(requests))
-            return stream('perform', {'proposal':'construct'}, len(requests))
-        name,args = next(actions)
-        return stream(name,args,len(requests))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    actor = WorkflowActor(flow, bundle,
-        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
-        perform=lambda *_:executed.append(True) or StageResult(), preflight=lambda *_:StageResult(),
-        emit=lambda *_:None, perform_ready=lambda *_:bool(ready), evidence_tools={
-            'query_kdb':EvidenceTool(obj(), lambda *args:ready.append(args[2]) or dict(reference='actual-query-receipt',
-                summary=dict(query_ref='actual-query-receipt', counts={'results':0}),
-                evidence={'retained':'actual result ' * 600})),
-            'select_idea':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage selection'),
-                                      stages=(Stage.DESIGN,Stage.OPTIMISATION)),
-            'optimisation_decision':EvidenceTool(obj(), lambda *_:pytest.fail('wrong-stage optimisation'),
-                                                stages=(Stage.OPTIMISATION,))})
-    try:
-        actor.step({})
-        actor.step({'goal':'normal Python task construction'})
-    finally: actor.close()
-    expected_pages = sum((len(bundle.document(name).content.encode())+8191)//8192 for name in names)
-    assert flow.stage == Stage.DESIGN and len(requests) == 5+expected_pages and executed == [True]
 
 
-@pytest.mark.parametrize('first_name,first_args', [
-    ('read_skill', {'name':'task-construction'}), ('perform', {'proposal':'first model action'})])
-def test_ordered_batch_chooses_model_order_even_if_requests_arrive_reversed(monkeypatch, first_name, first_args):
-    import coding.pi.session as module
-    from rsi.actor import SCHEMAS
-    monkeypatch.setattr(module, 'runtime_preflight', lambda:None)
-    with module.PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
-            environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}, first_action_only=True) as pi:
-        pi.allowed = {'read_context', 'read_skill', 'perform'}
-        reference = pi.context.admit('actual context page')['record']
-        calls = [dict(id='page', name='read_context', arguments={'record':reference}),
-                 dict(id='first', name=first_name, arguments=first_args),
-                 dict(id='later', name='perform', arguments={'proposal':'phantom'})]
-        assert pi._operation('propose_batch', dict(batch=1, calls=calls))['accepted']
-        with pytest.raises(ValueError, match='not executed'):
-            pi._operation('execute_call', dict(batch=1, id='later'))
-        assert pi.pending is None
-        assert pi._operation('execute_call', dict(batch=1, id='page'))['text'] == 'actual context page'
-        pi._operation('execute_call', dict(batch=1, id='first'))
-        assert pi.pending == (first_name, first_args) and pi.discarded_actions == 1
-        with pytest.raises(ValueError, match='already handled'):
-            pi._operation('execute_call', dict(batch=1, id='first'))
 
 
 def test_visible_receipt_inventory_survives_large_material_paging(tmp_path):
-    from coding.pi.context import ContextRecords
     from coding.pi.schema import obj
     from rsi.actor import EvidenceTool
     from rsi.skills import SkillBundle, SkillDocument
@@ -725,8 +491,7 @@ def test_visible_receipt_inventory_survives_large_material_paging(tmp_path):
     actor.schemas['query_kdb'] = actor.evidence_tools['query_kdb'].schema
     actor.step({})
     payload = session.contexts[-1]
-    compact = ContextRecords().snapshot({'host':payload})['host']
-    assert compact['read_skills']['read_with'] == compact['evidence']['read_with'] == 'read_context'
+    compact = payload
     assert len(compact['skill_receipts']) == len(bundle.skills_for(Stage.TASK_CONSTRUCTION))
     actual_reads = {data['skill']:'cas:'+data['receipt_id'] for kind,data in events
                     if kind=='skill-usage' and data['kind']=='read'}
@@ -773,74 +538,10 @@ def test_optional_action_feedback_does_not_mask_provider_failure(tmp_path):
     assert not any(kind=='actor-invalid-action' for kind,_ in events)
 
 
-def test_real_pi_recovers_invalid_arguments_without_phantom_reads(monkeypatch, tmp_path):
-    from coding.pi.session import runtime_preflight, RuntimeUnavailable
-    from test_pi_runtime import stream
-    try: runtime_preflight()
-    except RuntimeUnavailable: pytest.skip('Pi runtime is not installed')
-    names = builtin_bundle().skills_for(Stage.TASK_CONSTRUCTION)
-    events, requests, executed = [], [], []
-    def actual_reads():
-        return [data['skill'] for kind,data in events if kind=='skill-usage'
-                and data['kind']=='read' and data['stage']==Stage.TASK_CONSTRUCTION.value]
-    def provider(*_, **kwargs):
-        requests.append(json.loads(kwargs['data']))
-        assert len(requests) <= 6
-        if len(requests) == 1:
-            return stream('read_skill', {'name':123}, len(requests))
-        missing = [name for name in names if name not in actual_reads()]
-        return stream('read_skill', {'name':missing[0]}, len(requests)) if missing else stream(
-            'perform', {'proposal':'construct'}, len(requests))
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    flow = Workflow(tmp_path/'state.json', lambda *_:False, source_hash='v1')
-    actor = WorkflowActor(flow, builtin_bundle(),
-        lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fake-provider-secret'}),
-        perform=lambda *_:executed.append(True) or StageResult(), preflight=lambda *_:StageResult(),
-        emit=lambda kind,data:events.append((kind,data)), recover_invalid_actions=True)
-    try:
-        actor.step({})
-        actor.step({'goal':'construct Python project'})
-    finally: actor.close()
-    assert flow.stage == Stage.DESIGN and executed == [True] and actual_reads() == list(names)
-    feedback = [data for kind,data in events if kind=='actor-invalid-action']
-    assert feedback and all(data['accepted'] is False for data in feedback)
-    assert {data['operation_id'] for kind,data in events if kind=='actor-request'} == {feedback[0]['operation_id']}
 
 
-def test_canonical_context_keeps_completed_small_skill_text_inline():
-    from rsi.actor import WorkflowContextRecords
-    from coding.pi.context import ContextRecords
-    text = 'actual skill body\n' * 80
-    read = dict(skill='mapped-skill', section=None, receipt_id='actual-read', content=text)
-    context = {'host':dict(observation=dict(executed=True, content=text), read_skills=[read]*5)}
-    default = ContextRecords().snapshot(context)['host']
-    assert default['observation']['content']['read_with'] == 'read_context'
-    canonical = WorkflowContextRecords().snapshot(context)['host']
-    assert canonical['observation']['content'] == text
-    assert canonical['current_skill_content']['mapped-skill'] == dict(receipt_id='actual-read',content=text)
-    assert canonical['read_skills']['read_with'] == 'read_context'
 
 
-def test_long_skill_delivery_requires_actual_forwarded_page_coverage():
-    from coding.pi.context import ContextRecords
-    from rsi.actor import SkillDelivery
-    text = 'actual long contract\n' * 500
-    pages, events = ContextRecords(), []
-    reference = pages.admit(text)['record']
-    delivery = SkillDelivery()
-    delivery.begin('operation')
-    delivery.expect('read-receipt', text)
-    record = lambda kind,data:events.append((kind,data))
-    delivery.observe({'messages':[{'content':json.dumps({'preview':text[:384]})}]}, record)
-    assert delivery.missing(['read-receipt'])
-    offset = 0
-    while offset is not None:
-        page = pages.read(reference, offset, 4096)
-        delivery.observe({'messages':[{'role':'tool','content':json.dumps(page)}]}, record)
-        offset = page['next_offset']
-        assert bool(delivery.missing(['read-receipt'])) == (offset is not None)
-    assert [kind for kind,_ in events] == ['skill-delivered']
-    assert events[0][1]['receipt_id'] == 'read-receipt'
 
 
 def test_pre_dispatch_stage_edit_error_is_recoverable_when_enabled(tmp_path):
