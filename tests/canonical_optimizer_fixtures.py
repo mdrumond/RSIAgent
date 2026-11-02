@@ -162,50 +162,58 @@ def retained_native(execution):
         events=[store.read_json(reference) for reference in read_event_refs(root)])
 
 
-def scripted_optimizer_http(monkeypatch, agent, *, compile_if_offered=False):
-    """Run the real Pi controller; script only provider HTTP tool decisions."""
+def scripted_optimizer_http(monkeypatch, agent, *, native_provider, compile_if_offered=False):
+    """Real SDK HTTP fixture; the host still owns all optimizer effects."""
     from types import SimpleNamespace
     from rsi.actor import PiSessionAdapter
-    from test_rsi_pi_controller import response
-    state = SimpleNamespace(session=None, requests=[])
-
+    from test_native_pi_programming_roles import redirect
+    from test_pi_runtime import _native_wire_objects
+    url, calls, requests = native_provider
+    redirect(monkeypatch,url)
+    state = SimpleNamespace(session=None,requests=requests,compiled=False)
     class Session(PiSessionAdapter):
         def __init__(self, owner):
-            super().__init__(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'},
-                             context_window=16384, request_bytes=49152)
-            self.owner, self.decisions = owner, OptimizerSession(owner)
-            state.session = self
-        def run_stage(self, dispatcher, turn, actor):
-            self.payload = turn[0]
-            return super().run_stage(dispatcher, turn, actor)
-
-    def provider(*_, **kwargs):
-        wire = json.loads(kwargs['data'])
-        state.requests.append(wire)
-        if not wire.get('tools'):
-            return response([], len(state.requests))
-        if compile_if_offered and any(tool["function"]["name"] == "compile" for tool in wire["tools"]):
-            return response([("compile", dict(source="pass", block_count=1,
-                                             summary="Probe advertised compiler"))], len(state.requests))
-        session = state.session
-        runner = session.owner.fixture_runner
-        operation = runner.workflow.pending['id']
-        events = [row for row in runner.events if row.get('operation_id') == operation]
-        reads = [row for row in events if row['type'] == 'skill-usage' and row.get('kind') == 'read']
-        names = runner.bundle.skills_for(runner.workflow.stage)
-        source = runner.snapshot()
-        payload = dict(session.payload,
+            super().__init__(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fixture-secret'})
+            self.owner,self.decisions=owner,OptimizerSession(owner)
+            state.session=self
+        def run_stage(self,dispatcher,turn,actor):
+            self.payload=turn[0]
+            return super().run_stage(dispatcher,turn,actor)
+    queued=[]
+    def choose(wire):
+        prompt=next(value for role,value in reversed(list(_native_wire_objects([wire])))
+                    if role=='user' and 'mapped_skills' in value)
+        if queued:
+            return queued.pop(0)
+        session=state.session
+        runner=session.owner.fixture_runner
+        operation=runner.workflow.pending['id']
+        events=[row for row in runner.events if row.get('operation_id')==operation]
+        reads=[row for row in events if row['type']=='skill-usage' and row.get('kind')=='read']
+        names=runner.bundle.skills_for(runner.workflow.stage)
+        source=runner.snapshot()
+        payload=dict(session.payload,
             unread_skills=[name for name in names if name not in {row['skill'] for row in reads}],
             read_skills=[dict(receipt_id=runner.service.read_receipt(row['receipt_id'])) for row in reads],
-            evidence=[dict(name=row['name'], result=row['result']) for row in events
-                      if row['type'] == 'evidence-tool-result'],
-            source=dict(path=source.path, text=source.text, sha256=source.sha256,
-                        project_hash=source.project_hash))
-        name, args = session.decisions.decide(payload, list(session.session.allowed))
-        return response([(name, args)], len(state.requests))
-
-    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    agent.canonical_session_factory = Session
+            evidence=[dict(name=row['name'],result=row['result']) for row in events if row['type']=='evidence-tool-result'],
+            source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
+        if compile_if_offered and not state.compiled and not payload['unread_skills'] and 'compile' in session.session.current[1]:
+            state.compiled=True
+            return 'compile',dict(source='pass',block_count=1,summary='Probe advertised compiler')
+        name,args=session.decisions.decide(payload,list(session.session.current[1]))
+        if name=='read_skill':
+            return 'read',dict(path=next(row['path'] for row in prompt['mapped_skills'] if row['name']==args['name']))
+        if name=='read_artifact':
+            reference=args['sha256']
+            queued.append(('read',dict(path=str(runner.store._retention_path(reference).resolve()))))
+            return 'open_artifact',dict(reference=reference)
+        if name=='perform' and 'edit' in args:
+            edit=args.pop('edit')
+            queued.append(('perform',args))
+            return 'write',dict(path=prompt['editable_files'][0],content=edit['source'])
+        return name,args
+    calls.responder=choose
+    agent.canonical_session_factory=Session
     return state
 
 
