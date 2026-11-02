@@ -5,6 +5,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from test_native_pi_filesystem import scripted_provider
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionContext
@@ -148,32 +149,27 @@ def test_configuration_rejects_unusable_adaptive_bindings(tmp_path, fields):
         NativeProductionConfig(tmp_path, 'A3', 'arch', 'local', 'a'*64, 'b'*40, **fields)
 
 
-def test_librarian_provider_is_deepseek_and_cancels_at_total_elapsed_deadline(monkeypatch):
-    import asyncio
-    import openai
+def test_librarian_native_role_retains_full_evidence_and_obeys_zero_remaining(tmp_path, monkeypatch, scripted_provider):
+    import base64
+    import hashlib
     from benchmarks.ascend.phase1_knowledge import deepseek_librarian
-    observed = []
-    class Client:
-        def __init__(self, **options):
-            observed.append(options)
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            observed.append('closed')
-        async def create(self, **request):
-            observed.append(request)
-            try:
-                await asyncio.sleep(10)
-            finally:
-                observed.append('cancelled')
-    monkeypatch.setattr(openai, 'AsyncOpenAI', Client)
-    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture'})
+    from test_native_pi_programming_roles import redirect
+    url, calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
     with pytest.raises(TimeoutError):
-        complete([{'role':'user', 'content':'JSON please'}], .01)
-    assert observed[0]['max_retries'] == 0 and observed[0]['timeout'] == .01
-    assert observed[1]['model'] == 'deepseek-flash'
-    assert observed[-2:] == ['cancelled', 'closed']
+        complete([{'role':'user','content':'JSON please'}], 0)
+    assert requests == []
+    value = dict(status='insufficient', gaps=['Need retained documentation'])
+    calls.append(('submit_curriculum_proposal', dict(value=value)))
+    result = complete([{'role':'user','content':'Assess admitted documentation'}], 30)
+    assert json.loads(result['text']) == value
+    assert result['tokens'] > 0 and len(requests) == 1
+    assert result['native_evidence']
+    objects = {reference:base64.b64decode(data) for reference,data in result['native_evidence'].items()}
+    assert all(hashlib.sha256(data).hexdigest()==reference for reference,data in objects.items())
+    assert any(b'before_provider_request' in data for data in objects.values())
+    assert all(b'fixture-secret' not in data for data in objects.values())
 
 
 def test_gz_binding_records_selected_transport_runtime_without_substitution(tmp_path):

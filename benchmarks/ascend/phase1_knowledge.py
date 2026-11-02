@@ -1,6 +1,5 @@
 """Optional production A3 librarian over pinned references and an immutable memory export."""
 from contextlib import ExitStack
-import asyncio
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -50,30 +49,20 @@ def adaptive_knowledge_identity(config):
                 manifests={name: manifest.fingerprint for name, manifest in manifests.items()}, snapshot=memory)
 
 
-def deepseek_librarian(environment):
-    """A separate canonical DeepSeek client; no unbounded Actor provider reuse."""
-    from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, APIStatusError
-    key = environment.get(DEEPSEEK.identity.credential_env)
-    if not isinstance(key, str) or not key.strip():
-        raise ValueError('adaptive librarian requires DeepSeek credentials')
+def deepseek_librarian(environment, *, root):
+    """A typed native role; host librarian evidence admission remains unchanged."""
+    import base64
+    from benchmarks.ascend.native_curriculum import NativeSubjectRole
+    role = NativeSubjectRole(Path(root), DEEPSEEK, environment)
     def complete(messages, seconds):
-        if seconds <= 0:
-            raise TimeoutError('librarian provider elapsed allowance exhausted')
-        request = DEEPSEEK.request(messages)
-        request['response_format'] = {'type': 'json_object'}
-        async def invoke():
-            async with AsyncOpenAI(api_key=key, base_url=DEEPSEEK.base_url,
-                                   max_retries=0, timeout=seconds) as client:
-                return await client.chat.completions.create(**request)
-        try:
-            async def bounded():
-                return await asyncio.wait_for(invoke(), timeout=seconds)
-            response = asyncio.run(bounded())
-        except (APITimeoutError, TimeoutError):
-            raise TimeoutError('librarian provider elapsed allowance exhausted') from None
-        except (APIConnectionError, APIStatusError):
-            raise OSError('librarian provider transport failed') from None
-        return dict(text=response.choices[0].message.content, tokens=response.usage.total_tokens)
+        response = role(messages, remaining_seconds=seconds)
+        evidence = {}
+        for path in role.last_store.objects.glob('*/*'):
+            reference = path.parent.name + path.name
+            evidence[reference] = base64.b64encode(role.last_store.read_bytes(reference)).decode('ascii')
+        usage = role.last_receipt['usage']
+        tokens = sum(row.get('totalTokens', row.get('input', 0)+row.get('output', 0)) for row in usage)
+        return dict(text=response, tokens=tokens, native_evidence=evidence)
     return complete
 
 
@@ -132,6 +121,7 @@ class NativeAdaptiveKnowledge:
                 agent.close()
             remaining()
             return outcome.results, dict(status=outcome.status, gaps=list(outcome.gaps),
+                librarian_audit=outcome.audit,
                 selection_reasons=[dict(citation=outcome.audit['selected_citations'][key], reason=reason)
                     for key, reason in outcome.audit['selected'].items()])
         finally:

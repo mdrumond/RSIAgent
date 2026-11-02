@@ -278,7 +278,7 @@ def build_native_adaptive_phase1(
         if config.adaptive_kdb:
             from benchmarks.ascend.phase1_knowledge import NativeAdaptiveKnowledge, deepseek_librarian
             adaptive = NativeAdaptiveKnowledge(config, embeddings,
-                librarian_complete or deepseek_librarian(environment))
+                librarian_complete or deepseek_librarian(environment, root=root / "native-librarian"))
             identity["adaptive_kdb"] = adaptive.identity
         query = adaptive.actor_query if adaptive is not None else _knowledge_action(config, embeddings)
         # The pinned local embedding model is shared; its tokenizer/model need
