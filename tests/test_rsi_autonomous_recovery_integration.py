@@ -13,7 +13,7 @@ from test_rsi_curriculum_materialization import cpu
 
 
 @pytest.fixture
-def autonomous(instance, cpu):
+def autonomous(instance, cpu, request):
     parent, config, _ = cpu
     archive = 'a' * 64  # Deliberately absent: historical SFT is not a child dependency.
     observations = instance.store.put_json(dict(applicability=dict(project_id=parent.project_id,
@@ -29,6 +29,7 @@ def autonomous(instance, cpu):
     settings.update(phase1_projects=[parent.to_dict()], project_configs={parent.project_id: asdict(config)},
         curriculum=dict(enabled=True, only_derived=True, project_actor_seconds=7, failed_parent_refs=[admission]),
         cycle_limits=dict(actor_seconds=90, recovery_seconds=90, recovery_limit=None))
+    settings['cycle_limits'].update(getattr(request, 'param', {}))
     set_configuration(instance.root, settings)
     calls = []
     class ScriptedResearch:
@@ -50,6 +51,7 @@ def autonomous(instance, cpu):
         cycle.close()
 
 
+@pytest.mark.parametrize('autonomous', [{}, dict(actor_seconds=0, recovery_seconds=0, wall_seconds=0)], indirect=True)
 def test_derived_config_executes_canonical_stages_and_feeds_memory_without_root_retry(autonomous):
     cycle, parent, parent_config, calls, archive, facts = autonomous
     source = Path(parent_config.source)
@@ -114,11 +116,10 @@ def test_invalid_child_caps_cannot_admit_configuration(cap):
         validate_configuration(dict(curriculum=dict(project_actor_seconds=cap)))
 
 
-@pytest.mark.parametrize('pool', [None, 0, float('inf')])
-def test_autonomy_requires_explicit_finite_semantic_pool(pool):
-    with pytest.raises(ValueError):
-        validate_configuration(dict(curriculum=dict(enabled=True),
-            cycle_limits=dict(actor_seconds=7200, recovery_seconds=pool)))
+@pytest.mark.parametrize('pool', [None, 0])
+def test_autonomy_does_not_require_shared_semantic_pool(pool):
+    validate_configuration(dict(curriculum=dict(enabled=True, project_actor_seconds=7),
+        cycle_limits=dict(actor_seconds=7200, recovery_seconds=pool)))
 
 
 @pytest.mark.parametrize('prior_seconds', [0., .5])

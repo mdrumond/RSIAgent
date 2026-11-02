@@ -1,6 +1,7 @@
 """Phase1 curriculum bindings for the existing scheduler, roles and project runner."""
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 import time
 
@@ -203,6 +204,9 @@ class Phase1Recovery:
         return dict(facts, host_failure_ref=reference)
 
     def remaining(self, context, spent):
+        if self.cycle.scheduler.config.get('deferred_recovery'):
+            return dict(actor_seconds=max(0., context['project_actor_seconds'] - spent),
+                        recovery_seconds=None, wall_seconds=None)
         remaining = self.cycle.scheduler.remaining()
         for key in ('actor_seconds', 'recovery_seconds'):
             limit = context['remaining'][key]
@@ -214,6 +218,11 @@ class Phase1Recovery:
         from rsi.curriculum_materialization import capability_catalog, materialize_child, MaterializationRejected
         from rsi.curriculum_research import Researcher, ResearchRejected, DiagnosticProposal
         c = self.cycle
+        context = dict(context, project_actor_seconds=c.config['curriculum'].get(
+            'project_actor_seconds', parent.budgets.actor_seconds))
+        cap = context['project_actor_seconds']
+        if type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0:
+            raise ValueError('curriculum requires a finite positive project actor allocation')
         root = c.root / 'curriculum' / context['operation_id']
         root.mkdir(parents=True, exist_ok=True)
         path = root / 'integration.json'
@@ -287,6 +296,8 @@ class Phase1Recovery:
                 raise ValueError('curriculum selected a parent outside the admitted catalog')
             spec, config = inputs[chosen]
             def remaining():
+                if c.scheduler.config.get('deferred_recovery'):
+                    return context['project_actor_seconds']
                 limits = self.remaining(context, sum(item['actor_seconds'] for item in state['history']))
                 cap = c.config['curriculum'].get('project_actor_seconds')
                 if cap is not None:
