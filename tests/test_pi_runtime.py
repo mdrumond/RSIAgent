@@ -122,7 +122,11 @@ def _native_wire_objects(wires):
             texts=[content] if isinstance(content,str) else [part.get('text','') for part in content]
             for text in texts:
                 if text.startswith('{'):
-                    yield message['role'],json.loads(text)
+                    try:
+                        value, _ = json.JSONDecoder().raw_decode(text)
+                    except ValueError:
+                        continue
+                    yield message['role'], value
 
 
 def _canonical_kernel_case(tmp_path, monkeypatch, *, real=False, shape=None,
