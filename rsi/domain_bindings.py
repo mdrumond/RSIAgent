@@ -694,6 +694,31 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
+def _retained_programming_tokens(runner, session):
+    native = [row['event'] for row in runner.events if row['type']=='pi-native-event']
+    requests = [index for index,event in enumerate(native) if event['type']=='before_provider_request']
+    settled = [index for index,event in enumerate(native) if event['type']=='settled']
+    faults = [index for index,event in enumerate(native)
+              if event['type']=='native_fault' and event.get('operation_id') is not None]
+    if max([*requests, *faults], default=-1) > max(settled, default=-1):
+        return None
+    usage = []
+    for event in native:
+        if event['type']=='message_end' and event.get('message', {}).get('role')=='assistant':
+            usage.append({} if event.get('usage_observed') is False else event['message'].get('usage') or {})
+        elif event['type']=='compaction_end':
+            usage.append({} if event.get('usage_observed') is False else (event.get('result') or {}).get('usage') or {})
+    if usage:
+        return None if any('output' not in row for row in usage) else sum(row['output'] for row in usage)
+    if requests:
+        return None
+    legacy = [row.get('usage') or {} for row in runner.events if row['type']=='pi-provider']
+    if legacy:
+        return (None if any(row.get('completion_tokens') is None for row in legacy)
+                else sum(row['completion_tokens'] for row in legacy))
+    return getattr(session, 'completion_tokens', 0)
+
+
 def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
@@ -744,8 +769,8 @@ def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False
         from benchmarks.a3kernels.phase1_protocol import VerifiedResult
         return TrialResult('passed' if result['status'] == 'accepted' else
             host.failure_classification or result['status'], len(result['history']),
-            getattr(getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None),
-                'completion_tokens', sum((e.get('usage') or {}).get('completion_tokens', 0) or 0 for e in runner.events)),
+            _retained_programming_tokens(runner,
+                getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None)),
             host.verified if isinstance(host.verified, VerifiedResult) else None,
             host.profile, host.queries, tuple(host.failures), entry_ref)
     return CanonicalAdoption(build, finish)

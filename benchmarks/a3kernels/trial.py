@@ -197,7 +197,7 @@ def trial_protocol_sha256() -> str:
 class TrialResult:
     status: str
     turns: int
-    tokens: int
+    tokens: int | None
     verified: VerifiedResult | None
     profile_result: CompactProfileResult | None
     knowledge_queries: int

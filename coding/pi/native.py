@@ -93,6 +93,7 @@ class NativeSession:
         self.environment = os.environ if environ is None else environ
         self.observer = observer or (lambda event: None)
         self.events, self.usage = queue.Queue(), []
+        self._unreported_usage = []
         self.process = self.reader = None
         self.session_file, self.operation_id = None, None
         self.pending_tools = set()
@@ -103,6 +104,8 @@ class NativeSession:
 
     @property
     def completion_tokens(self):
+        if self.awaiting_settlement or not self.provider_settled or self._unreported_usage:
+            return None
         return None if any('output' not in usage for usage in self.usage) else sum(u['output'] for u in self.usage)
 
     def _send(self, value):
@@ -217,15 +220,27 @@ class NativeSession:
                 self.pending_tools.discard(identity)
                 self._record(dict(type='host_callback_end', tool_call_id=identity, name=name))
                 continue
+            if kind == 'before_provider_request':
+                self._unreported_usage.append(False)
+            elif kind == 'provider_stream_event' and self._unreported_usage:
+                data = event.get('data') or {}
+                response = data.get('response') or {}
+                usage = data.get('usage') or (response.get('usage') if isinstance(response, dict) else None)
+                if isinstance(usage, dict) and any(usage.get(key) is not None for key in ('completion_tokens', 'output_tokens', 'output')):
+                    self._unreported_usage[-1] = True
+            reported = (kind == 'compaction_end' or kind == 'message_end' and event.get('message', {}).get('role') == 'assistant')
+            if reported and self._unreported_usage:
+                event = dict(event, usage_observed=all(self._unreported_usage))
+                self._unreported_usage.clear()
             self._record(event)
             if kind == 'agent_settled':
                 self.provider_settled = True
             if kind == 'message_end' and event.get('message', {}).get('role') == 'assistant':
                 usage = event['message'].get('usage')
-                self.usage.append(usage if usage is not None else {})
+                self.usage.append(usage if usage is not None and event.get('usage_observed') is not False else {})
             if kind == 'compaction_end':
                 usage = (event.get('result') or {}).get('usage')
-                self.usage.append(dict(usage, category='compaction') if usage is not None else {})
+                self.usage.append(dict(usage, category='compaction') if usage is not None and event.get('usage_observed') is not False else {})
             if kind == terminal:
                 if terminal == 'settled':
                     self.awaiting_settlement = False

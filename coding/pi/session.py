@@ -28,6 +28,7 @@ class PiCodingSession:
         self.environ = os.environ if environ is None else environ
         self.schemas, self.options, self.deadline = dict(schemas or {}), options, deadline
         self.closed, self.rpc, self.native_session = False, None, None
+        self.usage_source = None
 
     def open_native(self, root, **options):
         if self.closed or self.native_session is not None:
@@ -38,7 +39,8 @@ class PiCodingSession:
 
     @property
     def completion_tokens(self):
-        return self.native_session.completion_tokens if self.native_session else 0
+        source = self.native_session or self.usage_source
+        return source.completion_tokens if source is not None else 0
 
     def close(self):
         if not self.closed and self.native_session:

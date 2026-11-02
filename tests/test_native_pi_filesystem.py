@@ -132,6 +132,7 @@ def test_unbounded_deadline_allows_native_read_and_pending_write(tmp_path):
 def scripted_provider():
     class Calls(list):
         responder = None
+        include_usage = True
     calls, requests = Calls(), []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -147,6 +148,8 @@ def scripted_provider():
             payload = dict(id='fixture', object='chat.completion.chunk', model='deepseek-flash',
                 choices=[dict(index=0, delta=delta, finish_reason='tool_calls' if 'tool_calls' in delta else 'stop')],
                 usage=dict(prompt_tokens=10, completion_tokens=2, total_tokens=12))
+            if not calls.include_usage:
+                payload.pop('usage')
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             self.wfile.write(('data: '+json.dumps(payload)+'\n\ndata: [DONE]\n\n').encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
