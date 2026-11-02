@@ -11,9 +11,12 @@ No dashboard is started by bootstrap.
 from __future__ import annotations
 
 import ctypes
+import base64
+import csv
 import errno
 import hashlib
 from importlib import metadata
+import io
 import json
 import os
 from pathlib import Path
@@ -108,14 +111,62 @@ def _copy_machinery(destination: Path):
     files = distribution.files
     if not files:
         raise ValueError('installed RSI distribution has no release file inventory')
+    # Newer importlib.metadata filters absent members out of Distribution.files.
+    # Authenticate completeness against the original wheel RECORD as well.
+    read_text = getattr(distribution, 'read_text', lambda _: None)
+    recorded = read_text('RECORD')
+    present = {str(item) for item in files}
+    for row in csv.reader(io.StringIO(recorded or '')):
+        relative = Path(row[0])
+        if relative.is_absolute() or '..' in relative.parts or not _allowed(relative):
+            continue
+        if relative.parts[0].endswith('.dist-info') and relative.name in (
+                'INSTALLER', 'REQUESTED', 'direct_url.json'):
+            continue
+        if row[0] not in present:
+            raise ValueError(f'installed release file is missing from its inventory: {relative}')
+    if Path(distribution.locate_file('rsi/instances.py')).resolve() != Path(__file__).resolve():
+        raise ValueError('installed RSI inventory belongs to a different module location')
+    hashes = {}
+    record = None
     for item in files:
         relative = Path(str(item))
         if relative.is_absolute() or '..' in relative.parts or not _allowed(relative):
             continue
+        if relative.parts[0].endswith('.dist-info'):
+            if relative.name == 'RECORD':
+                record = relative
+            # Installer-local paths and console-script records are not source identity.
+            if relative.name in ('INSTALLER', 'REQUESTED', 'direct_url.json', 'RECORD'):
+                continue
         source = Path(distribution.locate_file(item))
-        if source.is_file():
-            _copy_file(source, destination / relative)
-    return {'kind': 'distribution', 'revision': distribution.version}
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f'installed release file is missing or linked: {relative}')
+        data = source.read_bytes()
+        expected = getattr(item, 'hash', None)
+        if expected is not None:
+            observed = base64.urlsafe_b64encode(hashlib.new(expected.mode, data).digest()).rstrip(b'=').decode()
+            if observed != expected.value:
+                raise ValueError(f'installed release file differs from its inventory: {relative}')
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(source.stat().st_mode & 0o777)
+        hashes[relative.as_posix()] = hashlib.sha256(data).hexdigest()
+    if record is not None:
+        # Rebuild a relocatable RECORD containing only files actually retained.
+        target = destination / record
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('w', newline='') as stream:
+            writer = csv.writer(stream, lineterminator='\n')
+            for name, digest in sorted(hashes.items()):
+                encoded = base64.urlsafe_b64encode(bytes.fromhex(digest)).rstrip(b'=').decode()
+                writer.writerow([name, 'sha256='+encoded, (destination/name).stat().st_size])
+            writer.writerow([record.as_posix(), '', ''])
+        hashes[record.as_posix()] = hashlib.sha256(target.read_bytes()).hexdigest()
+    content = json.dumps(hashes, sort_keys=True, separators=(',', ':')).encode()
+    return {'kind': 'distribution', 'revision': distribution.version,
+            'sha256': hashlib.sha256(content).hexdigest()}
 
 
 def _publish(staging: Path, destination: Path):
