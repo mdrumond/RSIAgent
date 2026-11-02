@@ -296,6 +296,10 @@ class KernelActionsHost(SourceHost):
     def on_actor_event(self, kind, data):
         self.owner._trace(kind, data)
 
+    def artifact_bytes(self, reference):
+        reader = getattr(self.actions, 'read_artifacts', None) or self.actions.artifacts
+        return reader.read_bytes(reference)
+
     def evidence_tools(self):
         from rsi.actor import EvidenceTool
         from coding.pi.schema import STRING, INTEGER, obj
@@ -962,6 +966,15 @@ class OptimizerHost(SourceHost):
                     read_memory=EvidenceTool(OPTIMIZER_SCHEMAS['read-memory'], read_memory),
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
         return tools
+
+    def artifact_bytes(self, reference):
+        import base64
+        job, memory = self.artifact_scope()
+        if reference in job:
+            return self.owner.store.read_artifact(self.owner.key, reference)
+        if reference in memory:
+            return base64.b64decode(memory[reference]['base64'], validate=True)
+        raise FileNotFoundError('artifact is outside admitted job and memory evidence')
 
     def artifact_scope(self):
         job = {row['sha256'] for row in self.owner.store.artifacts(self.owner.key)}

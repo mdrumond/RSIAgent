@@ -1,3 +1,4 @@
+from test_native_pi_filesystem import scripted_provider
 import pytest
 
 

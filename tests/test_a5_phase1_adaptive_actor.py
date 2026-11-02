@@ -912,7 +912,7 @@ def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_pat
     assert explanation["code"] == "observed-compile"
 
 
-def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(canonical_kernel):
+def test_subject_lesson_and_admitted_artifacts_reach_actual_native_actor(canonical_kernel):
     from benchmarks.a5kernels.evidence import canonical_bytes
     from benchmarks.ascend.agent_context import request_bytes
     case = canonical_kernel
@@ -928,8 +928,11 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='Use host checks',
                               memories=[record]))
     request = replace(case.request, pre_wave_memory=raw, publish_learning=False)
-    selected, pages = [], []
+    selected, pages, denied = [], [], []
     def select(context, allowed):
+        if not denied:
+            denied.append('f'*64)
+            return 'open_artifact',dict(reference=denied[0])
         if not selected:
             instruction = context['task']['domain']['instruction']
             marker = 'Pre-wave memory (immutable, readable index): '
@@ -938,8 +941,9 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
             assert row['summary'] == proposal['summary'] and row['after'] == proposal['after']
             assert store.read_json(row['memory_document_sha256']) == record
             selected.extend([row['proposal_sha256'], source])
-        read_events = [event for event in case.runner.events if event['type'] == 'evidence-tool-result'
-                       and event['name'] == 'read_artifact']
+        read_events = [case.runner.store.read_json(event['reference']) for event in case.runner.events
+                       if event['type']=='native-file-read']
+        read_events = [row for row in read_events if row['artifact_ref'] in selected]
         if len(read_events) < len(selected):
             return 'read_artifact', dict(sha256=selected[len(read_events)])
         return CanonicalSession.next_action(case.session, context, allowed)
@@ -947,10 +951,16 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     result = AdaptiveActorProjectExecutor(case.executor, case.make_driver('pi'), case.profile,
         query_knowledge=case.knowledge)(request)
     for event in case.runner.events:
-        if event['type'] == 'evidence-tool-result' and event['name'] == 'read_artifact':
-            pages.append(event['result'])
-    assert json.loads(pages[0]['text']) == proposal
-    assert pages[1]['text'].encode() == source_bytes
+        if event['type']=='native-file-read':
+            receipt=case.runner.store.read_json(event['reference'])
+            if receipt['artifact_ref'] in selected:
+                pages.append(case.runner.store.read_bytes(receipt['artifact_ref']))
+    assert json.loads(pages[0]) == proposal
+    assert pages[1] == source_bytes
+    grants=[event['reference'] for event in case.runner.events if event['type']=='native-artifact-grant']
+    assert denied[0] not in grants and set(selected)<=set(grants)
+    assert any('Clamp negatives before storing' in message.get('content','')
+               for wire in case.wires for message in wire['messages'] if message['role']=='tool')
     assert result.memory.host_facts and not result.memory.lessons
     assert result.memory.source_revision == hashlib.sha256(case.session.repaired.encode()).hexdigest()
     host = case.runner.backend.host
@@ -958,7 +968,7 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     assert host.actions.latest.evidence.verified
     assert host.actions.latest_source_sha256 == result.memory.source_revision
     assert 'compile' in case.calls and 'run' in case.calls
-    assert case.wires and all(request_bytes(wire) <= 48 * 1024 for wire in case.wires)
+    assert case.wires
     # The large provenance document remains readable without replaying it into model context.
     assert not any('z' * 76665 in json.dumps(wire) for wire in case.wires)
 

@@ -113,11 +113,27 @@ class NativeWorkflowSession:
         return observation
 
     def _open_artifact(self, args, context):
-        reference = args['reference']
-        path = self.runner.store._retention_path(reference).resolve(strict=True)
-        self.files.read_paths[path] = reference
-        return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
-            path=str(path), bytes=path.stat().st_size, read_with='read')))])
+        if self.completed:
+            raise ValueError('this host stage already completed')
+        def grant():
+            reference = args['reference']
+            path = self.runner.store._retention_path(reference)
+            if not path.is_file():
+                reader = getattr(self.runner.backend, 'artifact_bytes', None)
+                if reader is None:
+                    raise FileNotFoundError('artifact is outside retained native evidence')
+                data = reader(reference)
+                from hashlib import sha256
+                if sha256(data).hexdigest() != reference:
+                    raise ValueError('admitted native artifact digest mismatch')
+                self.runner.store.put_bytes(data)
+            path = path.resolve(strict=True)
+            self.files.read_paths[path] = reference
+            self.runner.append(dict(type='native-artifact-grant', reference=reference,
+                operation_id=context['operation_id']))
+            return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
+                path=str(path), bytes=path.stat().st_size, read_with='read')))])
+        return self.actor._timed('retrieval', grant)
 
     def _observation(self, observation):
         if len(json.dumps(observation).encode()) <= 8192:
