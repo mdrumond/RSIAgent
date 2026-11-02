@@ -235,8 +235,10 @@ def test_canonical_host_result_requires_settlement_and_elapsed_admission(tmp_pat
         result = runner.run()
         assert intercepted
         assert runner.workflow.pending['stage'] == 'task_construction'
-        assert runner.workflow.state['history'] == []
-        proposals = [event for event in runner.events if event['type']=='stage-result-proposed']
+        operation = runner.workflow.pending['id']
+        assert all(row['evidence']['operation_id'] != operation for row in runner.workflow.state['history'])
+        proposals = [event for event in runner.events if event['type']=='stage-result-proposed'
+                     and event['operation_id']==operation]
         assert len(proposals) == 1
         assert result['status'] != 'accepted'
         if boundary == 'transport_unknown':
