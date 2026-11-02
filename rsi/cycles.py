@@ -217,16 +217,9 @@ class CycleScheduler:
             raise
         self.spec, self.config = spec, config
         self.needs_reconciliation = self.state['pending'] is not None
+        self.max_failed_recovery_attempts = max_failed_recovery_attempts
         try:
-            if self.paired_retries:
-                policy = dict(max_failed_attempts=max_failed_recovery_attempts)
-                prior = self.state.get('paired_retry_policy')
-                if prior is not None and prior != policy:
-                    raise ValueError('retained paired retry counter policy differs')
-                if prior is None:
-                    self.state['paired_retry_policy'] = policy
-                    self.state['events'].append(dict(kind='paired_retry_policy_adopted', **policy))
-                    self._save()  # Preserve the original immutable config, including legacy flags.
+            self.adopt_paired_retry_policy()
         except BaseException:
             self.close()
             raise
@@ -417,6 +410,18 @@ class CycleScheduler:
     def paired_retries(self):
         return self.independent_projects and self.spec.mode != Mode.PHASE1 and self.config['recover']
 
+    def adopt_paired_retry_policy(self):
+        if not self.paired_retries:
+            return
+        policy = dict(max_failed_attempts=self.max_failed_recovery_attempts)
+        prior = self.state.get('paired_retry_policy')
+        if prior is not None and prior != policy:
+            raise ValueError('retained paired retry counter policy differs')
+        if prior is None:
+            self.state['paired_retry_policy'] = policy
+            self.state['events'].append(dict(kind='paired_retry_policy_adopted', **policy))
+            self._save()  # Frozen config/pending work survive pre-queue budget policy adoption.
+
     def _paired_due(self):
         return next((row for row in self.state.get('paired_retry_queue', {}).values()
                      if row.get('feedback_pending') and row['eligible_wave'] <= self.state['wave']), None)
@@ -425,6 +430,7 @@ class CycleScheduler:
         """Observe the existing pair once; the candidate arm is the original retry."""
         if not self.paired_retries:
             return
+        self.adopt_paired_retry_policy()
         state = self.state
         completed = state.setdefault('paired_retry_receipts', {})
         if event['id'] in completed:

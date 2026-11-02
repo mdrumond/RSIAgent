@@ -316,14 +316,15 @@ def test_existing_independent_cycle_adopts_counter_metadata_without_changing_con
             reopened.close()
 
 
-def test_canonical_paired_receipt_preserves_host_audit_for_harness_abandonment(tmp_path):
+@pytest.mark.parametrize('audit_location', ['canonical_result', 'terminal_proof'])
+def test_canonical_paired_receipt_preserves_host_audit_for_harness_abandonment(tmp_path, audit_location):
     from rsi.contracts import BudgetLimits
     from rsi.project_runner import ProjectRunner
     from test_rsi_recovery import setup_pair, run_pair
     def audited(request, reopen, injections):
         runner = ProjectRunner(request.root, **injections) if reopen else ProjectRunner.create(
             request.root, request.spec, request.bundle, request.config, **injections)
-        if not reopen and request.arm=='candidate':
+        if not reopen and request.arm=='candidate' and audit_location=='canonical_result':
             outcome = runner._outcome
             def host_audited_outcome(result, closure):
                 # Explicit host-fault fixture producer, not a model-authored classification.
@@ -333,6 +334,15 @@ def test_canonical_paired_receipt_preserves_host_audit_for_harness_abandonment(t
                 result.update(classification='harness_failure', audit_ref=audit)
                 return outcome(result, closure)
             runner._outcome = host_audited_outcome
+        if request.arm=='candidate' and audit_location=='terminal_proof':
+            terminal_proof = runner.terminal_failure_proof
+            def audited_closed_proof(**kwargs):
+                proof = terminal_proof(**kwargs)  # Real closure/contracts/accounting verification first.
+                audit = runner.store.put_json(dict(kind='test-host-harness-audit',
+                    operation_id=request.operation_id, contract_ref=runner.contract_ref,
+                    source_hash=runner.backend.project_hash()))
+                return dict(proof, classification='harness_failure', audit_ref=audit)
+            runner.terminal_failure_proof = audited_closed_proof
         return runner
     pair, original, store, _, database = setup_pair(tmp_path, repairs=(False, False),
         limits=BudgetLimits(actor_seconds=1.5, wall_seconds=30), independent=True, wrap=audited)

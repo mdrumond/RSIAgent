@@ -304,7 +304,7 @@ class PairedRecovery:
         audit_ref = None
         if failure:
             canonical = runner.store.read_json(failure['result_ref'])['result']
-            audit_ref = canonical.get('audit_ref')
+            audit_ref = failure.get('audit_ref', canonical.get('audit_ref'))
             if audit_ref:
                 self.store.put_bytes(runner.store.read_bytes(audit_ref))
         receipt = dict(operation_id=request.operation_id, frozen=request.frozen_ref,
