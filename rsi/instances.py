@@ -16,6 +16,7 @@ import csv
 import errno
 import hashlib
 from importlib import metadata
+import io
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,20 @@ def _copy_machinery(destination: Path):
     files = distribution.files
     if not files:
         raise ValueError('installed RSI distribution has no release file inventory')
+    # Newer importlib.metadata filters absent members out of Distribution.files.
+    # Authenticate completeness against the original wheel RECORD as well.
+    read_text = getattr(distribution, 'read_text', lambda _: None)
+    recorded = read_text('RECORD')
+    present = {str(item) for item in files}
+    for row in csv.reader(io.StringIO(recorded or '')):
+        relative = Path(row[0])
+        if relative.is_absolute() or '..' in relative.parts or not _allowed(relative):
+            continue
+        if relative.parts[0].endswith('.dist-info') and relative.name in (
+                'INSTALLER', 'REQUESTED', 'direct_url.json'):
+            continue
+        if row[0] not in present:
+            raise ValueError(f'installed release file is missing from its inventory: {relative}')
     if Path(distribution.locate_file('rsi/instances.py')).resolve() != Path(__file__).resolve():
         raise ValueError('installed RSI inventory belongs to a different module location')
     hashes = {}
