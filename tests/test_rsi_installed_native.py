@@ -47,7 +47,7 @@ def installed_native(tmp_path_factory):
     dependencies = [path for path in sys.path if path.endswith(('site-packages', 'dist-packages'))]
     (purelib/'test-dependencies.pth').write_text('\n'.join(dependencies)+'\n')
     clean = {key: value for key, value in os.environ.items() if not key.startswith('PYTHON')}
-    run([python, '-I', '-m', 'pip', 'install', '--no-index', '--no-deps', '--no-compile',
+    run([python, '-I', '-m', 'pip', 'install', '--no-index', '--no-deps', '--no-compile', '--ignore-installed',
          next(wheels.glob('rsi-*.whl'))], cwd=work, env=clean)
     (purelib/'unrelated-installed-package.txt').write_text('must not enter instance machinery')
     def invoke(script, *args, env=None):
