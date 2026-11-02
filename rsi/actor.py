@@ -264,8 +264,6 @@ class WorkflowActor:
                 seconds = self._available()
                 inventory = dict(skill_receipts=list(skill_inventory.values()),
                                  evidence_receipts=list(evidence_inventory.values()))
-                if any(len(json.dumps(rows).encode()) > 3500 for rows in inventory.values()):
-                    raise WorkflowError('receipt inventory exceeds visible context capacity')
                 payload = dict(task=context, stage=stage.value, operation_id=operation,
                     skills=list(names), read_skill_names=[name for name in names if name in read_names],
                     unread_skills=[name for name in names if name not in read_names],

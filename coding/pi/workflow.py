@@ -98,6 +98,17 @@ class NativeWorkflowSession:
             return dict(host_stage_completed=True, result=asdict(result.value.result))
         return self.current[0]['observation']
 
+    def _state(self):
+        if self.current is None:
+            raise ValueError('no native workflow stage is active')
+        payload = self.current[0]
+        return dict(stage=payload['stage'], operation_id=payload['operation_id'],
+                    done=bool(self.completed), allowed=[] if self.completed else list(self.current[1]),
+                    skill_receipts=payload['skill_receipts'], evidence_receipts=payload['evidence_receipts'])
+
+    def _state_tool(self, args, context):
+        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))])
+
     def _tool(self, name):
         def invoke(args, context):
             if context['operation_id'] != self.runner.workflow.pending['id']:
@@ -107,7 +118,7 @@ class NativeWorkflowSession:
             if len(text.encode()) > 8192:
                 observation = dict(retained_observation=self._retain_text(text),
                                    stage=self.runner.workflow.stage.value)
-            return dict(content=[dict(type='text', text=json.dumps(observation))],
+            return dict(content=[dict(type='text', text=json.dumps(dict(observation=observation, workflow_state=self._state())))],
                         terminate=bool(self.completed))
         return invoke
 
@@ -133,6 +144,7 @@ class NativeWorkflowSession:
             return invoke
         options['callbacks'] = {name: charged(name, callback)
                                 for name, callback in options['callbacks'].items()}
+        options['callbacks']['rsi_workflow_state'] = self._state_tool
         options['tools_factory'] = str(Path(__file__).resolve().parents[2]/'integrations/pi/workflow-tools.mjs')
         options['tools_options']['skills'] = [dict(name=name, description='Frozen workflow guidance: '+name,
             filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,
