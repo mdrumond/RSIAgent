@@ -36,10 +36,36 @@ class Phase1Recovery:
 
     def original_retry(self, spec, row, context):
         """Snapshot the latest ORIGINAL source; never substitute a child workload."""
-        _, wire = self.parent(row)
+        existing = self.cycle.scheduler.state.get('original_retry_inputs', {}).get(spec.project_id)
+        if existing and existing['operation_id'] == context['operation_id']:
+            return ProjectSpec.from_dict(existing['spec'])
+        parent_spec, wire = self.parent(row)
         config = wire['config'] if isinstance(wire, dict) and 'config' in wire else wire
         config = asdict(config) if isinstance(config, ProjectConfig) else config
-        if tuple(config['commands']['test']) != spec.command:
+        binding = wire.get('binding') if isinstance(wire, dict) else None
+        if binding:
+            from rsi.curriculum_materialization import _argument, _copy_source, _triton_bindings
+            from rsi.triton_worker_binding import case_identity
+            import shutil
+            previous = ProjectConfig.from_dict(config)
+            root = self.cycle.root / 'original-retries' / context['operation_id']
+            root.mkdir(parents=True)  # Partial preparations require observation, never overwrite.
+            inputs = root / 'inputs'
+            inputs.mkdir()
+            oracle, cases = root / 'verify.py', inputs / 'cases.json'
+            with self.cycle.services.setup.measure('original-retry-inputs', context['operation_id']):
+                _copy_source(previous, root / 'project', triton=True)
+                shutil.copyfile(previous.verifier, oracle)
+                shutil.copyfile(_argument(previous, '--cases'), cases)
+                spec, rebuilt, binding = _triton_bindings(parent_spec, previous, binding,
+                    replace(spec, correctness_ref=str(cases)), root / 'project', cases, inputs, oracle, root)
+            if any(getattr(rebuilt, field) != getattr(previous, field) for field in
+                   ('editable_files', 'generated_paths', 'retained_paths', 'performance_seconds')):
+                raise ValueError('original retry changed editable/output or performance policy')
+            if case_identity(rebuilt) != case_identity(previous):
+                raise ValueError('original retry changed the full cases or independent oracle')
+            config = asdict(rebuilt)
+        elif tuple(config['commands']['test']) != spec.command:
             raise ValueError('original retry must preserve its frozen oracle command')
         derived = dict(self.cycle.config, project_configs={**self.cycle.config.get('project_configs', {}),
             spec.project_id: config})
@@ -48,8 +74,8 @@ class Phase1Recovery:
             memory_ref=self.cycle.scheduler.state['memory'])
         entry = dict(config_ref=self.cycle.store.put_json(config), operation_id=context['operation_id'],
                      spec=spec.to_dict(), configuration_ref=self.cycle.store.put_json(_snapshot(derived)))
-        if isinstance(wire, dict) and wire.get('binding'):
-            entry['binding'] = wire['binding']
+        if binding:
+            entry['binding'] = binding
         self.cycle.scheduler.state.setdefault('original_retry_inputs', {})[spec.project_id] = entry
         self.cycle.scheduler._save()
         return spec
@@ -141,7 +167,9 @@ class Phase1Recovery:
         binding = json.loads((root / 'service-binding.json').read_text())
         profile = binding.get('worker_profile') or config.get('executor_identity')
         if profile:
-            registered = c.services.executor_factory.project_binding(profile)['configuration']
+            factory = c.project_executor_factory(spec)
+            registered = (getattr(factory, 'configuration', None)
+                          or c.services.executor_factory.project_binding(profile)['configuration'])
             config = dict(config=config, binding=registered)
         return spec, config
 
