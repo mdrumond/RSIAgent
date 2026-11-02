@@ -275,3 +275,54 @@ def test_canonical_host_result_requires_settlement_and_elapsed_admission(tmp_pat
     finally:
         runner.actor.close()
         database.close()
+
+
+@pytest.mark.parametrize('partial', ['limit', 'offset', 'truncation'])
+def test_native_skill_requires_actual_full_read_before_one_stage_commit(tmp_path, monkeypatch, scripted_provider, partial):
+    from rsi.skills import SkillDocument, SkillBundle
+    from test_native_pi_programming_roles import redirect
+    from test_pi_runtime import _native_wire_objects
+    import test_rsi_project_runner as fixture
+    content='# Retained skill\n'+''.join(f'Instruction line {i}\n' for i in range(2500 if partial=='truncation' else 20))
+    document=SkillDocument('retained-guide',content)
+    bundle=SkillBundle((document,),tuple((stage,(document.name,)) for stage in Stage))
+    monkeypatch.setattr(fixture,'builtin_bundle',lambda:bundle)
+    url,calls,requests=scripted_provider
+    redirect(monkeypatch,url)
+    selections=[]
+    runner,_,database=make(tmp_path, budgets=BudgetLimits(actor_seconds=30,wall_seconds=60),
+        session_factory=lambda:PiSessionAdapter(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fixture-secret'}))
+    original_complete=runner.workflow.complete
+    def complete(evidence,**kwargs):
+        result=original_complete(evidence,**kwargs)
+        if evidence.stage==Stage.TASK_CONSTRUCTION:runner.workflow.stop()
+        return result
+    monkeypatch.setattr(runner.workflow,'complete',complete)
+    def choose(wire):
+        prompt=next(value for role,value in reversed(list(_native_wire_objects([wire])))
+                    if role=='user' and 'mapped_skills' in value)
+        path=prompt['mapped_skills'][0]['path']
+        turn=len(selections)
+        selections.append(turn)
+        if turn in (1,2):
+            assert not any(row['evidence']['stage']=='task_construction' for row in runner.workflow.state['history'])
+            assert not any(event['type']=='host-dispatch' and event['operation_id']==prompt['operation_id'] for event in runner.events)
+        if turn==0:
+            return 'read',dict(path=path,**({'limit':1} if partial=='limit' else {'offset':2} if partial=='offset' else {}))
+        if turn==2:
+            return 'read',dict(path=path,**({'offset':2} if partial=='limit' else {'limit':1} if partial=='offset' else {'offset':2001}))
+        return 'perform',dict(proposal='Apply the completely observed frozen guide')
+    calls.responder=choose
+    try:
+        runner.run()
+        commits=[row for row in runner.workflow.state['history'] if row['evidence']['stage']=='task_construction']
+        assert len(commits)==1 and len(requests)==4
+        operation=commits[0]['evidence']['operation_id']
+        assert len([event for event in runner.events if event['type']=='host-dispatch' and event['operation_id']==operation])==1
+        reads=[runner.store.read_json(event['reference']) for event in runner.events if event['type']=='native-skill-read']
+        assert [row['complete'] for row in reads]==[False,True]
+        if partial=='truncation':assert reads[0]['truncation']['truncated'] is True
+        assert runner.workflow.pending is None
+    finally:
+        runner.actor.close()
+        database.close()

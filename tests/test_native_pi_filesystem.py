@@ -142,9 +142,11 @@ def scripted_provider():
             delta = dict(role='assistant', content='Finished.')
             action = calls.responder(requests[-1]) if calls.responder is not None else (calls.pop(0) if calls else None)
             if action is not None:
-                name, arguments = action
-                delta.update(content=None, tool_calls=[dict(index=0, id=f'call-{len(requests)}', type='function',
-                    function=dict(name=name, arguments=json.dumps(arguments)))])
+                actions = action if isinstance(action, list) else [action]
+                delta.update(content=None, tool_calls=[dict(index=index,
+                    id=f'call-{len(requests)}'+(f'-{index}' if index else ''), type='function',
+                    function=dict(name=name, arguments=json.dumps(arguments)))
+                    for index,(name,arguments) in enumerate(actions)])
             payload = dict(id='fixture', object='chat.completion.chunk', model='deepseek-flash',
                 choices=[dict(index=0, delta=delta, finish_reason='tool_calls' if 'tool_calls' in delta else 'stop')],
                 usage=dict(prompt_tokens=10, completion_tokens=2, total_tokens=12))

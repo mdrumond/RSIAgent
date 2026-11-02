@@ -61,10 +61,11 @@ def test_late_selection_never_executes_host_action(canonical_kernel, backend):
 
 
 def test_native_terminal_distillation_retains_host_result_and_current_feedback(canonical_kernel, monkeypatch, scripted_provider):
-    from test_native_pi_programming_roles import redirect
+    from test_native_pi_programming_roles import redirect, registered_profile
     from test_pi_runtime import _native_wire_objects
     from test_native_pi_workflow import text_blocks
     case = canonical_kernel
+    case.profile = registered_profile()
     url, calls, requests = scripted_provider
     redirect(monkeypatch, url)
     feedback = 'Inspect the padded tail before completing the task.'
