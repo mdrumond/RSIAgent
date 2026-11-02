@@ -255,8 +255,10 @@ class NativeWorkflowSession:
             if not self.archived:
                 paths = [self.session.root/'native-events.jsonl', self.session.root/'native-worker.stderr',
                          *sorted((self.session.root/'sessions').glob('*.jsonl'))]
-                references = [self.runner.store.put_bytes(path.read_bytes()) for path in paths if path.is_file()]
-                self.runner.append(dict(type='native-session-artifacts', artifact_refs=references,
+                artifacts = {str(path.relative_to(self.session.root)): self.runner.store.put_bytes(path.read_bytes())
+                             for path in paths if path.is_file()}
+                self.runner.append(dict(type='native-session-artifacts', artifact_refs=list(artifacts.values()),
+                    native_journals=artifacts,
                     provider_settled=self.session.provider_settled,
                     pending_tools=sorted(self.session.pending_tools)))
                 self.archived = True

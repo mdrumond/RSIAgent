@@ -194,3 +194,33 @@ def test_expired_new_prompt_never_dispatches_provider(tmp_path, monkeypatch, pro
             assert session.process is None
     finally:
         session.close()
+
+
+def test_partial_observations_resolve_exact_redacted_journal_bytes(tmp_path):
+    import hashlib
+    session = object.__new__(NativeSession)
+    session.root, session.operation_id = tmp_path, 'operation'
+    session.environment = {'TEST_SECRET': 'private-value'}
+    session.profile = {'credential_env': 'TEST_SECRET'}
+    events = []
+    session.observer = events.append
+    partials = [dict(type='message_update', message={'text': 'private-value' * 1000}),
+                dict(type='provider_stream_event', delta='token')]
+    for event in partials:
+        session._record(event)
+    session._record(dict(type='agent_settled', aborted=False))
+    raw = (tmp_path/'native-events.jsonl').read_bytes()
+    assert b'private-value' not in raw
+    for observation, original in zip(events, partials):
+        pointer = observation['native_journal']
+        data = raw[pointer['offset']:pointer['offset']+pointer['length']]
+        assert hashlib.sha256(data).hexdigest() == pointer['sha256']
+        recovered = json.loads(data)
+        assert recovered['type'] == original['type']
+        assert recovered['operation_id'] == 'operation'
+        if recovered['type'] == 'message_update':
+            assert recovered['message']['text'] == '[redacted]' * 1000
+        else:
+            assert recovered['delta'] == 'token'
+        assert len(json.dumps(observation)) < 400
+    assert events[-1] == dict(type='agent_settled', aborted=False, operation_id='operation')

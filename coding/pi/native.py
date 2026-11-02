@@ -118,9 +118,17 @@ class NativeSession:
         raw = json.dumps(dict(event, operation_id=self.operation_id), ensure_ascii=False, allow_nan=False)
         if secret:
             raw = raw.replace(secret, '[redacted]')
-        with (self.root/'native-events.jsonl').open('a') as stream:
-            stream.write(raw+'\n'); stream.flush(); os.fsync(stream.fileno())
-        self.observer(json.loads(raw))
+        data = (raw+'\n').encode('utf-8')
+        with (self.root/'native-events.jsonl').open('ab') as stream:
+            offset = stream.tell()
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        observed = json.loads(raw)
+        if observed.get('type') in ('message_update', 'provider_stream_event'):
+            import hashlib
+            observed = dict(type=observed['type'], operation_id=self.operation_id,
+                native_journal=dict(path='native-events.jsonl', offset=offset, length=len(data),
+                                    sha256=hashlib.sha256(data).hexdigest()))
+        self.observer(observed)
 
     def prepare(self, timeout=30.):
         if self.closed:
