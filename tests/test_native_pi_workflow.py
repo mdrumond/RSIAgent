@@ -150,7 +150,7 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         emitted.guidance_nonce = uuid4().hex
     profile = native.model_profile
     monkeypatch.setattr(native, 'model_profile', lambda identity: dict(profile(identity), base_url=url))
-    runner, _, database = make(tmp_path, budgets=BudgetLimits(actor_seconds=120, wall_seconds=180),
+    runner, _, database = make(tmp_path, budgets=BudgetLimits(actor_seconds=20 if emitted.post_success else 120, wall_seconds=180),
         session_factory=lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fixture-secret'}),
         extra_files={'history-reference.md': ('Python math.fsum preserves stable accumulation. Keep the frozen oracle and host evidence.\n' * 4000).encode()} if overflow else None)
     if emitted.guidance_nonce:

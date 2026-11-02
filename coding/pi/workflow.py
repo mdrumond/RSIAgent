@@ -165,7 +165,8 @@ class NativeWorkflowSession:
         return state
 
     def _state_tool(self, args, context):
-        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))])
+        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))],
+                    terminate=bool(self.completed))
 
     def _tool(self, name):
         def invoke(args, context):
@@ -199,6 +200,8 @@ class NativeWorkflowSession:
         options = self.files.session_options()
         def charged(name, callback):
             def invoke(args, context):
+                if self.completed:
+                    raise ValueError('this host stage already completed')
                 if name in ('rsi_fs_write', 'rsi_fs_mkdir'):
                     self._fresh_source()
                 category = 'implementation' if name in ('rsi_fs_write', 'rsi_fs_mkdir') else 'retrieval'

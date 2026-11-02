@@ -7,7 +7,7 @@ export function createNativeResources(context) {
       try { result = await tool.execute(id, ...args); }
       catch (error) { result = {isError:true, content:[{type:'text', text:error.message}]}; }
       const state = await context.host('rsi_workflow_state', {}, id);
-      return {...result, content:[...result.content, ...state.content]};
+      return {...result, terminate:state.terminate || result.terminate, content:[...result.content, ...state.content]};
     }}));
   return {...resources, tools, resourceOptions:{noSkills:true,
     skillsOverride:() => ({skills:context.options.skills, diagnostics:[]})}};
