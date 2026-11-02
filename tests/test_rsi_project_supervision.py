@@ -7,6 +7,7 @@ from core.artifacts import ContentAddressedArtifacts
 from rsi.event_journal import EventJournal
 from rsi.python_execution import atomic_json
 from rsi.supervision import ProjectSupervision, RoleSupervision
+from test_native_pi_session import provider
 
 
 @pytest.fixture
@@ -30,8 +31,8 @@ def test_elapsed_audit_carries_across_resume_and_retains_only_complete_new_recor
     now = [0.]
     audit = ProjectSupervision(root, clock=lambda: now[0])
     assert audit.poll() is None
-    path = root / 'native' / 'native-events.jsonl'
-    path.parent.mkdir()
+    path = root / 'native' / 'session' / 'native-events.jsonl'
+    path.parent.mkdir(parents=True)
     path.write_bytes(b'{"type":"first"}\n{"type":')
     first = append(store, journal, dict(type='host-command', classification='compile_failure'))
     now[0] = 599
@@ -256,4 +257,58 @@ def test_unscoped_native_startup_fault_retains_evidence_without_masking_transpor
         assert retained['event']['operation_id'] is None
         assert runner.workflow.pending is None and runner.workflow.outcome is None
     finally:
+        database.close()
+
+
+@pytest.mark.parametrize('known', [False, True])
+def test_real_sdk_protocol_fault_retains_native_logs_and_requires_observed_settlement(tmp_path, monkeypatch, provider, known):
+    import coding.pi.native as native
+    from coding.pi.workflow import NativeWorkflowSession
+    from rsi.actor import PiSessionAdapter
+    from rsi.contracts import BudgetLimits
+    from rsi.runtime import WorkflowError
+    from rsi.supervision import retain_terminal
+    from test_rsi_project_runner import make
+    url, requests = provider
+    profile = native.model_profile
+    monkeypatch.setattr(native, 'model_profile', lambda name: dict(profile(name), base_url=url))
+    observe = NativeWorkflowSession._observe
+    injected = []
+    def protocol_fault(session, event):
+        observe(session, event)
+        if not injected and event['type'] == ('agent_settled' if known else 'message_start'):
+            injected.append(event['type'])
+            # Inject a controller-channel parse fault at the actual SDK boundary,
+            # after either real settlement or the first real in-flight response.
+            with session.session.events.mutex:
+                session.session.events.queue.appendleft(dict(type='protocol_error', message='injected parse fault'))
+                session.session.events.not_empty.notify()
+    monkeypatch.setattr(NativeWorkflowSession, '_observe', protocol_fault)
+    runner, _, database = make(tmp_path, budgets=BudgetLimits(actor_seconds=30, wall_seconds=45),
+        session_factory=lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fixture-secret'}))
+    try:
+        result = runner.run()
+        assert injected and requests and result['status'] == 'suspended'
+        pending = dict(runner.workflow.pending)
+        diagnostic = ProjectSupervision(runner.root).diagnostic()
+        audit = runner.store.read_json(diagnostic['audit_ref'])
+        assert audit['fault']['origin'] == 'protocol' and audit['native_refs']
+        assert audit['fault']['settlement']['provider_settled'] is known
+        assert all(b'fixture-secret' not in runner.store.read_bytes(ref) for ref in audit['native_refs'])
+        if known:
+            proof = runner.terminal_failure_proof()
+            assert proof['classification'] == 'harness_failure' and proof['audit_ref'] == diagnostic['audit_ref']
+            retain_terminal(runner, proof)
+            from rsi.job_inspection import inspect_task
+            task = inspect_task(runner.root)
+            assert task['supervision']['closure'] == 'known'
+        else:
+            with pytest.raises(WorkflowError):
+                runner.terminal_failure_proof()
+            assert diagnostic['closure'] == 'unknown'
+        before = len(requests)
+        runner.run()  # Observation of the original pending operation never dispatches again.
+        assert len(requests) == before and runner.workflow.pending == pending
+    finally:
+        runner.actor.close()
         database.close()

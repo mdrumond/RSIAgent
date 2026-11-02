@@ -40,7 +40,7 @@ class ProjectSupervision:
                 atomic_json(self.path, state)
 
     def _native(self, cursor):
-        path = self.root / 'native' / 'native-events.jsonl'
+        path = self._native_path()
         if not path.exists():
             return cursor, []
         stat = path.stat()
@@ -58,6 +58,9 @@ class ProjectSupervision:
                 refs.append(self.store.put_bytes(line))
                 offset = stream.tell()
         return dict(identity=identity, offset=offset), refs
+
+    def _native_path(self):
+        return self.root / 'native' / 'session' / 'native-events.jsonl'
 
     def poll(self, *, fault_ref=None):
         """Read committed evidence; a fault fact never proves external closure."""
@@ -172,6 +175,9 @@ class RoleSupervision(ProjectSupervision):
         if any(retained[key] != self.scope[key] for key in ('operation_id', 'request_ref')):
             raise ValueError('role audit differs from retained role admission')
         return self.scope
+
+    def _native_path(self):
+        return self.root / 'native' / 'native-events.jsonl'
 
     def poll(self, *, fault_ref=None):
         with self._state() as (state, now):
