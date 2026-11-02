@@ -37,6 +37,8 @@ def canonical_provider():
         guidance_nonce = None
         guidance_armed = False
         guidance_queued = False
+        post_success = False
+        post_success_queued = False
     requests, emitted, repaired = [], Observations(), False
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -114,6 +116,11 @@ def canonical_provider():
             emitted.append(dict(operation_id=prompt['operation_id'], stage=prompt['stage'], name=name))
             delta = dict(role='assistant', content=None, tool_calls=[dict(index=0,
                 id=f'call-{len(requests)}', type='function', function=dict(name=name, arguments=json.dumps(args)))])
+            if name == 'perform' and prompt['stage']=='implementation' and emitted.post_success and not emitted.post_success_queued:
+                emitted.post_success_queued = True
+                delta['tool_calls'].append(dict(index=1, id=f'post-success-{len(requests)}', type='function',
+                    function=dict(name='write', arguments=json.dumps(dict(path=prompt['editable_files'][0],
+                        content='raise RuntimeError("queued mutation after host success")\n')))))
             if name == 'edit' and emitted.guidance_nonce and not emitted.guidance_queued:
                 emitted.guidance_queued = True
                 delta['tool_calls'].append(dict(index=1, id=f'stale-perform-{len(requests)}', type='function',
@@ -132,11 +139,12 @@ def canonical_provider():
         server.shutdown(); server.server_close(); thread.join()
 
 
-@pytest.mark.parametrize('scenario', ['normal', 'overflow', 'guidance'])
+@pytest.mark.parametrize('scenario', ['normal', 'overflow', 'guidance', 'post_success'])
 def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path, monkeypatch, canonical_provider, scenario):
     import coding.pi.native as native
     url, requests, emitted = canonical_provider
     overflow = emitted.overflow = scenario == 'overflow'
+    emitted.post_success = scenario == 'post_success'
     if scenario == 'guidance':
         from uuid import uuid4
         emitted.guidance_nonce = uuid4().hex
@@ -161,6 +169,9 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         assert {row['evidence']['stage'] for row in result['history']} == {stage.value for stage in Stage}
         assert any(row['evidence']['stage'] == 'test' and not row['passed'] for row in result['history'])
         assert runner.backend.verifier.read_bytes() == verifier
+        if emitted.post_success:
+            assert emitted.post_success_queued
+            assert 'queued mutation after host success' not in runner.backend.read('solution.py')['content']
         assert runner.backend.read('solution.py')['content'].startswith('from math import fsum')
         assert {'read', 'edit', 'query_kdb', 'retrospect', 'select_strategy', 'perform'} <= {r['name'] for r in emitted}
         transitions = [runner.store.read_json(e['reference']) for e in runner.events if e['type'] == 'native-source-transition']
