@@ -12,7 +12,7 @@ def _union(intervals):
 
 
 def task_inspection(task):
-    result = {key: task[key] for key in ('task_id', 'remaining', 'skills_ref', 'candidate_ref') if key in task}
+    result = {key: task[key] for key in ('task_id', 'remaining', 'actor_allocation', 'skills_ref', 'candidate_ref') if key in task}
     if 'actor_union_seconds' in task or 'intervals' not in task:
         return {**result, **{key: task[key] for key in ('charged_seconds', 'excluded_seconds',
                 'actor_union_seconds', 'accounting_state') if key in task}}
@@ -40,7 +40,44 @@ def task_inspection(task):
             [pair for k, v in groups.items() if k in ActorClock.BILLABLE for pair in v]))
 
 
-def inspection(value):
+def inspection(value, *, instance=None):
+    supplied = value.get('inspection')
+    tasks = supplied.get('tasks', []) if isinstance(supplied, dict) else []
+    projects = [project for wave in supplied.get('waves', []) for project in wave['projects']] if isinstance(supplied, dict) else []
+    legacy = (not supplied or any('actor_allocation' not in task for task in tasks)
+              or any('budget_source' not in project for project in projects))
+    if legacy and instance is not None:
+        from pathlib import Path
+        from rsi.job_inspection import inspect_cycle
+        cycle_id = value.get('job', {}).get('request', {}).get('cycle_id')
+        if cycle_id:
+            root = (Path(instance).resolve() / 'runs').resolve()
+            cycle = (root / cycle_id).resolve()
+            if cycle.parent != root:
+                raise ValueError('cycle identity escapes instance runs')
+            if (cycle / 'cycle.json').is_file():
+                # Old pinned CLI remains the command authority. Only retained
+                # read-only accounting is projected with the current inspector.
+                supplied = inspect_cycle(instance, {'cycle_id': cycle_id})
+                value = dict(value, inspection=supplied)
+    # Old evidence without local workflow access cannot prove an allocation.
+    # Keep its scheduler ceiling distinct instead of presenting it as effective.
+    if isinstance(supplied, dict):
+        waves = []
+        for wave in supplied.get('waves', []):
+            rows = []
+            for project in wave['projects']:
+                row = dict(project)
+                if 'budget_source' not in row and (
+                        'actor_allocation' in row or 'remaining_actor_seconds' in row):
+                    if 'actor_allocation' in row:
+                        row['wave_actor_ceiling'] = row.pop('actor_allocation')
+                    row.pop('remaining_actor_seconds', None)
+                    row['budget_source'] = 'unavailable'
+                rows.append(row)
+            waves.append(dict(wave, projects=rows))
+        value = dict(value, inspection=dict(supplied, waves=waves))
+
     supplied = value.get('inspection')
     waves = supplied.get('waves', []) if isinstance(supplied, dict) else []
     tasks = supplied.get('tasks', []) if isinstance(supplied, dict) else []

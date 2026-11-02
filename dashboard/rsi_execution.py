@@ -45,11 +45,12 @@ def _public_job(row):
     return {**{key: row.get(key) for key in ('job_id', 'state')},
             'mode': request_data.get('mode'), 'cycle_id': request_data.get('cycle_id'),
             'action': request_data.get('action'),
+            'previous_job': request_data.get('previous_job') if isinstance(request_data.get('previous_job'), str) else None,
             'configuration_revision': row.get('configuration', {}).get('revision'),
             'service_status': service_status, 'result_state': service_status}
 
 
-def register_rsi_execution(app, controls, csrf_token, cli):
+def register_rsi_execution(app, controls, csrf_token, cli, *, instance=None):
     def capabilities():
         try:
             value = cli('capabilities')
@@ -255,7 +256,7 @@ def register_rsi_execution(app, controls, csrf_token, cli):
             abort(403)
         try:
             evidence = cli('job', 'evidence', job_id)
-            return jsonify(job=_public_job(evidence['job']), inspection=_inspection(evidence),
+            return jsonify(job=_public_job(evidence['job']), inspection=_inspection(evidence, instance=instance),
                            event_count=len(evidence.get('events', [])))
         except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
             return jsonify(error='Retained job evidence is unavailable.'), 409
