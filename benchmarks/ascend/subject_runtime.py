@@ -173,6 +173,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         name = settings.get(role + '_model')
         selected = profile if name is None else direct_profile(next(
             item for item in MODEL_IDENTITIES if item.backend_model.value == name))
+        from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
+        if provider._transport is openai_compatible_transport:
+            from .native_curriculum import NativeSubjectRole
+            return NativeSubjectRole(root / 'native-roles' / role, selected, provider.coding_environment())
+        # Explicit injected test transports retain their existing domain fixture API.
         def complete(messages, *, remaining_seconds):
             return bounded_completion(provider, selected, messages, remaining_seconds)
         complete.model = selected.identity.backend_model.value
@@ -188,7 +193,9 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         (saved_verifier.get('engine_origin') == 'legacy-resume' or
          resumed_runtime and not verifier_identity_path.exists()))
     if legacy_default:
-        # Historical checkpoints retain their completion engine on resume.
+        from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
+        if provider._transport is openai_compatible_transport:
+            raise ValueError('historical completion verifier requires explicit native runtime rebinding before execution')
         verifier_settings['verifier_engine'] = 'completion'
     verifier_sessions = session_factory(verifier_settings, provider, verifier_complete)
     from coding.pi import ENGINE_IDENTITY
@@ -394,7 +401,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             wire = list(messages)
             while True:
                 working = bounded_review_messages(wire, {'selection_artifacts':context['selection_artifacts']}) if context.get('selection_artifacts') else wire
-                response = curriculum_complete(working, remaining_seconds=available())
+                select = getattr(curriculum_complete, 'wave', curriculum_complete)
+                response = select(working, remaining_seconds=available())
                 if context.get('selection_artifacts'):
                     try:
                         action = json.loads(response)
