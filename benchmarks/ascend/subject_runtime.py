@@ -181,7 +181,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
     from .pi_project_verifier import session_factory
     verifier_identity_path = root / 'project-verifier-runtime.json'
-    verifier_settings = dict(settings)
+    verifier_settings = dict(settings, native_session_root=str(root / 'native-reviews'))
     saved_verifier = (json.loads(verifier_identity_path.read_bytes())
                       if verifier_identity_path.exists() else {})
     legacy_default = ('verifier_engine' not in settings and

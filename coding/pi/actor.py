@@ -8,16 +8,6 @@ from .session import runtime_preflight
 
 
 
-def observation_context(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except ValueError:
-            pass
-    return value
-
-
-
 def task_contract(executor):
     """Expose layout and ABI metadata without oracle values or tensor storage."""
     prepared = getattr(executor, "prepared", None)
