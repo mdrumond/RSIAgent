@@ -96,6 +96,7 @@ class NativeSession:
         self.session_file, self.operation_id = None, None
         self.pending_tools = set()
         self.provider_settled, self.running, self.closed = True, False, False
+        self.awaiting_settlement = False
         self.cancelled = threading.Event()
         self.write_lock = threading.Lock()
 
@@ -206,6 +207,8 @@ class NativeSession:
                 usage = event['message'].get('usage')
                 self.usage.append(usage if usage is not None else {})
             if kind == terminal:
+                if terminal == 'settled':
+                    self.awaiting_settlement = False
                 self.session_file = event.get('session_file', self.session_file)
                 result = self._settlement(event.get('status', 'settled'))
                 if expired:
@@ -220,7 +223,11 @@ class NativeSession:
         self.prepare()
         if self.running or self.closed:
             raise NativeError('native session is busy or closed')
+        if self.awaiting_settlement:
+            raise NativeError('prior native operation requires settlement reconciliation',
+                              settlement=self._settlement('unknown'))
         self.operation_id, self.running, self.provider_settled = operation_id, True, False
+        self.awaiting_settlement = True
         self.cancelled.clear()
         self._send(dict(type='prompt', text=text))
         try:

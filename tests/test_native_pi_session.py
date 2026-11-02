@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -11,19 +12,28 @@ from coding.pi.native import NativeSession, NativeTool, NativeError, Cancelled
 
 @pytest.fixture
 def provider():
-    requests = []
+    class Requests(list):
+        failures = 0
+    requests = Requests()
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             requests.append(body)
+            if len(requests) <= requests.failures:
+                self.send_response(503)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"temporary provider outage"}}')
+                return
+            first = len(requests) == requests.failures + 1
             message = dict(role='assistant', content='Native work completed.')
-            if len(requests) == 1:
+            if first:
                 message.update(content=None, tool_calls=[dict(id='native-call-1', type='function',
                     function=dict(name='observe', arguments='{"value":7}'))])
             payload = dict(id='fixture', object='chat.completion', model='deepseek-flash',
-                choices=[dict(index=0, message=message, finish_reason='tool_calls' if len(requests)==1 else 'stop')],
+                choices=[dict(index=0, message=message, finish_reason='tool_calls' if first else 'stop')],
                 usage=dict(prompt_tokens=10, completion_tokens=2, total_tokens=12))
             # The real SDK's streaming parser consumes the provider fixture.
             delta = dict(message)
@@ -69,6 +79,58 @@ def test_real_sdk_tool_result_continues_and_retains_native_session(tmp_path, mon
         resumed = reopened.prompt('Recall the observed value.', operation_id='next', remaining=lambda: 30.)
         assert resumed.provider_settled and resumed.session_file == result.session_file
         assert any(m.get('tool_call_id')=='native-call-1' for m in requests[-1]['messages'])
+
+
+def test_native_provider_retry_recovers_without_replaying_tool(tmp_path, monkeypatch, provider):
+    import coding.pi.native as native
+    url, requests = provider
+    requests.failures = 1
+    original = native.model_profile
+    monkeypatch.setattr(native, 'model_profile', lambda name: dict(original(name), base_url=url))
+    calls, events = [], []
+    def observe(args, context):
+        calls.append(context['tool_call_id'])
+        return dict(content=[dict(type='text', text='Observed seven.')])
+    tool = NativeTool('observe', 'Observe a value.', dict(type='object', properties={}), observe)
+    with NativeSession(tmp_path, tools=[tool], environ={'DEEPSEEK_API_KEY': 'fixture-secret'},
+                       observer=events.append) as session:
+        deadline = time.monotonic() + 30
+        result = session.prompt('Use observe.', operation_id='recovered',
+                                remaining=lambda: deadline-time.monotonic())
+        assert result.status == 'settled' and result.provider_settled
+        assert calls == ['native-call-1'] and len(requests) == 3
+        assert any(e['type']=='auto_retry_end' and e.get('success') for e in events)
+        assert any(e['type']=='message_end' and e.get('message', {}).get('stopReason')=='error'
+                   for e in events)
+
+
+def test_unknown_handoff_cannot_consume_old_settlement_as_new_prompt(tmp_path, monkeypatch, provider):
+    import coding.pi.native as native
+    url, requests = provider
+    original = native.model_profile
+    monkeypatch.setattr(native, 'model_profile', lambda name: dict(original(name), base_url=url))
+    tool = NativeTool('observe', 'Observe a value.', dict(type='object', properties={}),
+        lambda args, context: dict(content=[dict(type='text', text='Observed seven.')]))
+    with NativeSession(tmp_path, tools=[tool], environ={'DEEPSEEK_API_KEY': 'fixture-secret'}) as session:
+        send = session._send
+        def lose_ack(value):
+            send(value)
+            if value['type'] == 'tool_result':
+                raise NativeError('handoff acknowledgment lost', settlement=session._settlement('unknown'))
+        monkeypatch.setattr(session, '_send', lose_ack)
+        with pytest.raises(NativeError):
+            session.prompt('Use observe.', operation_id='original', remaining=lambda: 30.)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with session.events.mutex:
+                arrived = any(e.get('type')=='settled' for e in session.events.queue)
+            if arrived:
+                break
+            time.sleep(.01)
+        assert arrived and len(requests) == 2
+        with pytest.raises(NativeError):
+            session.prompt('Start another operation.', operation_id='new', remaining=lambda: 30.)
+        assert session.operation_id == 'original'
 
 
 @pytest.mark.parametrize('action', ['denied', 'abort', 'transport_loss'])
