@@ -285,10 +285,13 @@ class PythonExecution:
             shutil.rmtree(root)
             raise
 
-    def project_hash(self):
+    def project_hash(self, *, replacements=None):
+        """Hash source, optionally projecting a trusted pending file mutation."""
+        replacements = replacements or {}
         entries = []
         names = set(self.contract.get('execution_inputs', self.contract['editable_files']))
         names.update(self.contract['editable_files'])
+        names.update(replacements)
         # New code/data counts too. Only explicitly generated outputs and narrow
         # interpreter/test caches may be ignored; edit rights are independent.
         for path in self.project.rglob('*'):
@@ -302,7 +305,8 @@ class PythonExecution:
                 names.add(name)
         for name in sorted(names):
             path = self._file(name)
-            entries.append([name, digest(path.read_bytes()) if path.is_file() else None])
+            data = replacements[name] if name in replacements else path.read_bytes() if path.is_file() else None
+            entries.append([name, digest(data) if data is not None else None])
         return digest(json.dumps(entries, separators=(',', ':')).encode())
 
     def sync_source(self):
