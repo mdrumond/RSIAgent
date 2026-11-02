@@ -279,6 +279,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             recover=self.binding.get('recover') if self.binding.get('recover') is not None else
                 True if self.curriculum else self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
+        self.scheduler.adopt_independent_projects()
         try:
             with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
                 self.memory = services._memory(memory_root, self.binding['initial'].encode())

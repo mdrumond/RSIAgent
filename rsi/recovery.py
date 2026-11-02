@@ -442,10 +442,11 @@ class CycleController:
                     cap = None if self.scheduler.independent_projects else self.scheduler.config['wall_seconds']
                     pending['wall_deadline'] = self.scheduler.state['created'] + cap if cap is not None else None
                     self._save()
-                if dispatch and pending['wall_deadline'] is not None and self.scheduler.clock() >= pending['wall_deadline']:
+                if (dispatch and not self.scheduler.independent_projects and pending['wall_deadline'] is not None
+                        and self.scheduler.clock() >= pending['wall_deadline']):
                     raise WorkflowError('parent wall allocation exhausted; observe retained arms only')
                 pair = self.pair_factory(copy.deepcopy(event), operation, self.scheduler._allocation_remaining())
-                if pending['wall_deadline'] is not None:
+                if pending['wall_deadline'] is not None and not self.scheduler.independent_projects:
                     pair.bind_parent_wall_deadline(pending['wall_deadline'])
                 if dispatch:
                     while pair.result() is None:

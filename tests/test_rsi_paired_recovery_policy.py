@@ -1,5 +1,6 @@
 """Independent elapsed allocations preserve canonical paired trials and jobs."""
 from dataclasses import asdict
+import copy
 import time
 
 import pytest
@@ -10,6 +11,7 @@ from rsi.contracts import BudgetLimits, CycleSpec, Mode, ProjectSpec
 from rsi.cycles import CycleScheduler, HostTaskResult, SnapshotUpdate
 from rsi.project_runner import ProjectRunner
 from rsi.recovery import CycleController, PairedRecovery
+from rsi.runtime import WorkflowError
 from test_rsi_project_runner import Session
 from test_rsi_recovery import LearningStub, run_pair, setup_pair
 from test_rsi_services import instance
@@ -156,3 +158,64 @@ def test_owned_job_ignores_shared_wall_but_keeps_real_project_limits(instance, m
         assert not cycle.scheduler.state.get('root_retries')
     finally:
         cycle.close()
+
+
+@pytest.mark.parametrize('unknown', [False, True])
+def test_legacy_service_cycle_adopts_future_policy_without_resetting_history(instance, monkeypatch, unknown):
+    import rsi.service
+    settings = show_configuration(instance.root)['payload']
+    settings['phase1_projects'].append(dict(settings['phase1_projects'][0], project_id='next'))
+    settings['project_configs']['next'] = settings['project_configs']['answer']
+    settings['cycle_limits'] = dict(actor_seconds=100, recovery_seconds=100, wall_seconds=100)
+    settings['tuning'] = dict(at_wave_end=False)
+    set_configuration(instance.root, settings)
+    cycle = instance.create_cycle('legacy-adoption', 'phase1', recover=False)
+    assert cycle.step().outcome == 'accepted'
+    first = cycle.open_project(cycle.scheduler.state['originals'][0]['operation_id'])
+    history = (first.root / 'workflow.json').read_bytes()
+    original_limits = first.workflow.limits.to_dict()
+    if unknown:
+        def lost(*args):
+            raise ConnectionError('original dispatch closure unknown')
+        cycle.scheduler.runner = lost
+        with pytest.raises(ConnectionError):
+            cycle.scheduler.step()
+    # Retained legacy-format fixture: exhausted historical cycle banks, immutable
+    # original checkpoint, and (when present) the original unknown dispatch intent.
+    state = cycle.scheduler.state
+    state['config'].pop('independent_projects')
+    state.pop('allocation_policy', None)
+    state['spent'] = state['recovery_spent'] = 100
+    state['created'] -= 1000
+    old_config, pending = copy.deepcopy(state['config']), copy.deepcopy(state['pending'])
+    cycle.scheduler._save()
+    cycle.close()
+    monkeypatch.setattr(rsi.service, 'InstanceServices', lambda root: instance)
+    if unknown:
+        resumed = instance.open_cycle('legacy-adoption')
+        try:
+            assert resumed.scheduler.independent_projects
+            assert resumed.scheduler.state['pending'] == pending
+            with pytest.raises(WorkflowError, match='pending operation'):
+                resumed.scheduler.step()
+            assert resumed.scheduler.state['pending'] == pending
+        finally:
+            resumed.close()
+    else:
+        result = rsi.service.run_job(instance.root,
+            dict(action='resume', cycle_id='legacy-adoption'),
+            should_stop=lambda: False, emit=lambda event: None)
+        assert result['status'] == 'complete'
+    resumed = instance.open_cycle('legacy-adoption')
+    try:
+        assert resumed.scheduler.state['config'] == old_config
+        assert resumed.scheduler.state['allocation_policy']['prior_config'] == old_config
+        assert resumed.scheduler.remaining() == dict(actor_seconds=0, recovery_seconds=0, wall_seconds=0)
+        assert (first.root / 'workflow.json').read_bytes() == history
+        assert resumed.open_project(resumed.scheduler.state['originals'][0]['operation_id']).workflow.limits.to_dict() == original_limits
+        if not unknown:
+            row = resumed.scheduler.state['originals'][-1]
+            assert row['project']['project_id'] == 'next' and row['outcome'] == 'accepted'
+            assert row['project']['budgets']['actor_seconds'] == 30
+    finally:
+        resumed.close()

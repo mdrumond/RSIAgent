@@ -355,7 +355,15 @@ class CycleScheduler:
 
     @property
     def independent_projects(self):
-        return bool(self.config.get('independent_projects') or self.config.get('deferred_recovery'))
+        return bool(self.config.get('independent_projects') or self.config.get('deferred_recovery')
+                    or self.state.get('allocation_policy', {}).get('kind') == 'independent-projects-v1')
+
+    def adopt_independent_projects(self):
+        """Change future admission policy, retaining every prior allocation and intent."""
+        if not self.independent_projects:
+            self.state['allocation_policy'] = dict(kind='independent-projects-v1',
+                prior_config=copy.deepcopy(self.config), adopted=self.clock())
+            self._save()
 
     def _allocation_remaining(self):
         # Independent projects own their allocation; cycle pools are telemetry.
