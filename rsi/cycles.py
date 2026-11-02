@@ -343,14 +343,21 @@ class CycleScheduler:
                                     ('recovery_seconds', self.state['recovery_spent'] + retained_recovery),
                                     ('wall_seconds', elapsed)]}
 
+    def _skill_project(self):
+        """The observed project currently feeding Memory and the skill writer."""
+        current = self.state.get('paired_retry_current')
+        if current:
+            return self.state['paired_retry_queue'][current]['result']
+        return self.state['originals'][-1] if self.state['originals'] else None
+
     def _context(self, operation):
         context = dict(operation_id=operation['id'], namespace=self.state['namespace'],
                     wave=self.state['wave'], original_project_id=operation.get('original_id'),
                     recovery=operation.get('recovery', False), root_retry=operation['kind'] == 'root_retry', remaining=self._allocation_remaining())
-        if operation['kind'] == 'skill' and self.state['originals']:
+        if operation['kind'] == 'skill' and self._skill_project() is not None:
             context['previous_skill_rejections'] = [copy.deepcopy(row) for row in
                 self.state.get('rejected_skill_updates', {}).values()
-                if row['project_ref'] == self.state['originals'][-1]['artifact_ref']]
+                if row['project_ref'] == self._skill_project()['artifact_ref']]
         return context
 
     @property
@@ -389,7 +396,7 @@ class CycleScheduler:
         if (not pending or pending['kind'] != 'skill' or pending['id'] != result.operation_id
                 or state['phase'] != 'skill' or state['namespace'] != result.namespace
                 or state['skills'] != result.incumbent or state['memory'] != result.memory_ref
-                or not state['originals'] or state['originals'][-1]['artifact_ref'] != result.project_ref
+                or self._skill_project() is None or self._skill_project()['artifact_ref'] != result.project_ref
                 or result.operation_id in state['completed_operations']):
             raise WorkflowError('rejected proposal scope differs from pending skill operation')
         state.setdefault('rejected_skill_updates', {})[result.operation_id] = row
@@ -712,13 +719,10 @@ class CycleScheduler:
             result = self.runner(spec, s['memory'], s['skills'], ctx)
         elif phase in ('memory', 'recovery_memory'):
             rows = s['recovery_feedback_rows'] if phase == 'recovery_memory' else (
-                s['wave_results'] if self.spec.mode == Mode.PHASE1 else [
-                    s['paired_retry_queue'][s['paired_retry_current']]['result']
-                    if s.get('paired_retry_current') else s['originals'][-1]])
+                s['wave_results'] if self.spec.mode == Mode.PHASE1 else [self._skill_project()])
             result = self.memory_update(s['memory'], copy.deepcopy(rows), ctx)
         elif phase == 'skill':
-            row = (s['paired_retry_queue'][s['paired_retry_current']]['result']
-                   if s.get('paired_retry_current') else s['originals'][-1])
+            row = self._skill_project()
             result = self.skill_update(s['skills'], s['memory'], copy.deepcopy(row), ctx)
         elif phase == 'simplify':
             item = next(r for r in s['recovery_queue'] if r['original_id'] == operation['original_id'])

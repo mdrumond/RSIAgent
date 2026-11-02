@@ -409,3 +409,66 @@ def test_late_legacy_budget_adoption_initializes_counter_before_first_pair(tmp_p
         assert len(results) == limit and sum(e[0]=='original' for e in trace)==1
     finally:
         scheduler.close()
+
+
+def test_paired_feedback_writer_rejection_charges_once_and_next_writer_continues(instance):
+    from rsi.cycles import RejectedSkillUpdate
+    from rsi.roles import SkillEdit, SkillProposal
+    class RejectSecondWriter(Roles):
+        calls = 0
+        def skillwriter(self, prompt, evidence, **kwargs):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return super().skillwriter(prompt, evidence, **kwargs)
+            self.observer('role_finished', dict(role='skillwriter', success=True, elapsed_seconds=.25))
+            return SkillProposal('Retain verified guidance', (evidence[0].evidence_id,), (
+                SkillEdit('test', 'replace' if type(self).calls == 2 else 'append',
+                          'Verify the frozen full oracle after changes.'),))
+    (instance.root/'source/solution.py').write_text('answer = 41\n')
+    settings = show_configuration(instance.root)['payload']
+    settings['phase2_projects'][0]['budgets'].update(actor_seconds=1.5,
+        design_iterations=None, implementation_iterations=None, execution_tries=None)
+    settings['recovery'] = dict(enabled=True, max_failed_attempts=2, budgets=dict(
+        actor_seconds=1.5, wall_seconds=60, design_iterations=None,
+        implementation_iterations=None, execution_tries=None))
+    settings['tuning'] = dict(at_wave_end=False)
+    set_configuration(instance.root, settings)
+    sessions = []
+    def actor():
+        sessions.append(len(sessions))
+        return AnswerDecision(repair=len(sessions)==5)
+    instance.test = Bindings(wave_query, actor, RejectSecondWriter, 'scripted-rejection-continuation')
+    cycle = instance.create_cycle('paired-writer-rejection', 'phase2')
+    try:
+        rejection = None
+        for _ in range(12):
+            spent = cycle.scheduler.state['spent']
+            value = cycle.step()
+            if isinstance(value, RejectedSkillUpdate):
+                rejection = value
+                break
+        assert rejection is not None and RejectSecondWriter.calls == 2
+        state = cycle.scheduler.state
+        original = copy.deepcopy(state['originals'])
+        current = state['paired_retry_queue'][state['paired_retry_current']]['result']
+        assert rejection.project_ref == current['artifact_ref'] != original[0]['artifact_ref']
+        assert state['spent'] == spent + .25
+        cycle.scheduler.reconcile_rejected_skill(rejection)
+        assert state['spent'] == spent + .25  # Receipt replay never bills twice.
+        actor_count = len(sessions)
+        update = cycle.step()
+        assert RejectSecondWriter.calls == 3 and len(sessions) == actor_count
+        operation = cycle.learning.state['operations'][state['candidates'][-1]['operation_id']]
+        context = cycle.store.read_json(operation['writer_context'])
+        assert context['previous_skill_rejections'][0]['rejection_ref'] == rejection.rejection_ref
+        assert operation['request']['row']['artifact_ref'] == current['artifact_ref']
+        assert state['spent'] == spent + .5 and state['originals'] == original
+        assert state['candidates'][-1]['reference'] == update.reference
+        for _ in range(12):
+            cycle.step()
+            if state['phase']=='complete':
+                break
+        assert state['paired_retry_queue']['answer']['status']=='accepted'
+        assert state['originals']==original and len(sessions)==5
+    finally:
+        cycle.close()
