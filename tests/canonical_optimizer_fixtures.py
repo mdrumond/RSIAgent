@@ -180,11 +180,15 @@ def scripted_optimizer_http(monkeypatch, agent, *, native_provider, compile_if_o
             self.payload=turn[0]
             return super().run_stage(dispatcher,turn,actor)
     queued=[]
+    task_reads=set()
     def choose(wire):
         prompt=next(value for role,value in reversed(list(_native_wire_objects([wire])))
                     if role=='user' and 'mapped_skills' in value)
         if queued:
             return queued.pop(0)
+        if prompt['operation_id'] not in task_reads:
+            task_reads.add(prompt['operation_id'])
+            return 'read',dict(path=prompt['task']['path'])
         session=state.session
         runner=session.owner.fixture_runner
         operation=runner.workflow.pending['id']

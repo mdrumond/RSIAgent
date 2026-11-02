@@ -790,15 +790,19 @@ class OptimizerHost(SourceHost):
 
     def on_actor_event(self, kind, data):
         observer = self.owner.memory_observer
-        if kind != 'pi-provider-request' or observer is None:
+        event = data.get('event', {})
+        if kind != 'pi-native-event' or event.get('type') != 'before_provider_request' or observer is None:
             return
-        # Only exact summary rows observed in the actual gateway request count;
+        request = event['payload']
+        from core.artifacts import canonical_bytes
+        identity = sha256(canonical_bytes(dict(operation=event['operation_id'], request=request))).hexdigest()
+        # Only exact summary rows observed in the actual native provider request count;
         # building/filtering a context or admitting a CAS reference is not exposure.
         shown = []
         def visit(value):
             if isinstance(value, str):
                 try:
-                    decoded = json.loads(value)
+                    decoded, _ = json.JSONDecoder().raw_decode(value)
                 except (ValueError, TypeError):
                     return
                 if not isinstance(decoded, str):
@@ -812,10 +816,10 @@ class OptimizerHost(SourceHost):
                         shown.append(row)
                 for item in value.values():
                     visit(item)
-        visit(data['request'])
+        visit(request)
         if shown:
             delivered = observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown),
-                                 data['reservation_id'])
+                                 identity)
             if delivered.get('memory_summary') != shown:
                 raise WorkflowError('memory availability changed before provider dispatch; refresh context')
 
