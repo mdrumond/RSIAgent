@@ -426,7 +426,9 @@ class WorkflowActor:
                 seconds = self._available()
                 source = self._timed('implementation', self.source_snapshot) if self.source_snapshot else None
                 seconds = self._available()
-                if source and source.project_hash != flow.source_hash:
+                native_changed = bool(source and source.project_hash != flow.source_hash)
+                if native_changed and (not hasattr(self.session, 'pending_source') or
+                        self.session.pending_source(operation)['source_hash'] != source.project_hash):
                     raise WorkflowError('source changed outside current operation')
                 allowed = ['read_skill'] + [name for name, tool in self.evidence_tools.items()
                     if tool.stages is None or stage in tool.stages]
@@ -470,6 +472,8 @@ class WorkflowActor:
                                            accepted=False, executed=False)
                         record('actor-action-superseded', observation)
                         continue
+                if name == 'perform' and hasattr(self.session, 'pending_source'):
+                    native_changed = self.session.pending_source(operation)['source_hash'] != flow.source_hash
                 if name == 'perform' and read_names != set(names):
                     raise WorkflowError('read every mapped skill before performing stage')
                 if name not in allowed:
@@ -582,7 +586,7 @@ class WorkflowActor:
                 if stage == Stage.OPTIMISATION:
                     decisions = [row['result'].get('evidence', {}) for row in evidence_material
                                  if row['name'] == 'optimisation_decision']
-                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args):
+                    if decisions and (decisions[-1].get('action') == 'edit') != ('edit' in args or native_changed):
                         error = 'optimisation decision does not match edit; noop/profile must omit edit'
                         if not self.recover_invalid_actions:
                             raise WorkflowError(error)
@@ -630,32 +634,31 @@ class WorkflowActor:
             self.session = None
 
 
-class PiSessionAdapter(SnapshotPiSessionAdapter):
-    """Canonical Pi-native controller; Pi owns conversation and compaction."""
-    system_prompt = (
-            'You execute the canonical RSI workflow through completed host tools. '
-            'Read all mapped skills, query real evidence, and follow the authoritative stage. '
-            'Tool results are actual host observations. Read paged resources with read_context. '
-            'Only perform completes a stage; model assertions do not establish success. '
-            'Pi manages conversation and compaction. Preserve receipt IDs and pending work.')
-
+class PiSessionAdapter:
+    """One native SDK session; host Workflow owns stages and evidence."""
     def __init__(self, **kwargs):
-        from coding.pi.controller import ControllerSession
-        self.delivery = SkillDelivery()
-        self.session = ControllerSession(schemas=SCHEMAS,system_prompt=self.system_prompt,**kwargs)
-        self.session.gateway.request_projector = self._project_tools
+        from coding.pi.workflow import NativeWorkflowSession
+        self.session = NativeWorkflowSession(**kwargs)
+
+    def configure(self, runner):
+        self.session.configure(runner)
+
+    def prepare(self, timeout, *, schemas):
+        self.session.prepare(timeout, schemas=schemas)
+
+    def pending_source(self, operation_id):
+        return self.session.pending_source(operation_id)
+
+    def run_stage(self, dispatcher, turn, actor):
+        return self.session.run_stage(dispatcher, turn, actor)
+
+    def close(self):
+        self.session.close()
 
     @classmethod
     def from_existing_session(cls, session, *, wall_deadline=None):
-        from coding.pi.controller import ControllerSession
-        controller = ControllerSession.from_existing_session(session,wall_deadline=wall_deadline)
-        adapter = cls.__new__(cls)
-        adapter.delivery = SkillDelivery()
-        adapter.session = controller
-        controller.schemas.update(SCHEMAS)
-        controller.system_prompt = cls.system_prompt
-        controller.gateway.request_projector = adapter._project_tools
+        if getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None:
+            raise ValueError('only an unstarted session may transfer ownership')
+        adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
+        session.closed = True
         return adapter
-
-    def run_stage(self, dispatcher, turn, actor):
-        return self.session.run_stage(dispatcher, turn, actor, self.delivery)

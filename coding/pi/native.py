@@ -12,9 +12,10 @@ from uuid import uuid4
 
 
 class NativeError(RuntimeError):
-    def __init__(self, message, *, settlement=None):
+    def __init__(self, message, *, settlement=None, native_fault=None):
         super().__init__(message)
         self.settlement = settlement
+        self.native_fault = native_fault
 
 
 class ProviderFailure(NativeError):
@@ -181,7 +182,15 @@ class NativeSession:
                 continue
             kind = event['type']
             if kind in ('eof', 'protocol_error', 'fatal'):
-                raise NativeError(event.get('message', 'native worker exited'), settlement=self._settlement('unknown'))
+                settlement = self._settlement('unknown')
+                fault = dict(type='native_fault', fault_id=uuid4().hex,
+                    origin={'eof':'transport', 'protocol_error':'protocol', 'fatal':'controller'}[kind],
+                    kind=kind, operation_id=self.operation_id, session_file=self.session_file,
+                    settlement=dict(provider_settled=settlement.provider_settled,
+                                    pending_tools=list(settlement.pending_tools)))
+                self._record(fault)
+                raise NativeError(event.get('message', 'native worker exited'),
+                                  settlement=settlement, native_fault=fault)
             if kind == 'tool':
                 identity, name = event['tool_call_id'], event['name']
                 self.pending_tools.add(identity)

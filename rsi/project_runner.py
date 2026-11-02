@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from coding.pi.rpc import PiError, PiProviderError, PiDeadlineError, PiCancelled
 from coding.pi.session import ActionError
+from coding.pi.native import NativeError, ProviderFailure, DeadlineExceeded, Cancelled
 from coding.pi.schema import INTEGER, STRING, obj
 from rsi.actor import EvidenceTool, PiSessionAdapter, SourceSnapshot, StageResult, WorkflowActor
 from rsi.contracts import ProjectSpec, Stage, StepEvidence
@@ -122,6 +123,8 @@ class ProjectRunner:
             self._factory_attempted = True
             self._session_closure_ref = None
             session = session_factory()  # A raising factory may have unknown partial effects.
+            if hasattr(session, 'configure'):
+                session.configure(self)
             original_close = getattr(session.close, '_rsi_original_close', session.close)
             def observed_close():
                 original_close()
@@ -375,6 +378,16 @@ class ProjectRunner:
     def perform(self, stage, args, operation, seconds):
         with self.charged_host():
             refs, selection, changed = [], None, None
+            actual = self.backend.project_hash()
+            if actual != self.workflow.source_hash:
+                session = self.actor.session
+                if not hasattr(session, 'pending_source'):
+                    raise WorkflowError('source changed without native transition evidence')
+                pending = session.pending_source(operation)
+                if pending['source_hash'] != actual:
+                    raise WorkflowError('native pending source differs from current candidate')
+                changed = actual
+                refs.append(pending['reference'])
             if stage in (Stage.DESIGN, Stage.OPTIMISATION):
                 selection = self.selection(operation)
             decision = None
@@ -384,7 +397,7 @@ class ProjectRunner:
                 if not decisions:
                     raise WorkflowError('explicit optimisation decision required')
                 decision = self.store.read_json(decisions[-1]['reference'])['action']
-                if (decision == 'edit') != ('edit' in args):
+                if (decision == 'edit') != ('edit' in args or changed is not None):
                     raise WorkflowError('optimisation decision does not match edit')
             if 'edit' in args:
                 edit = args['edit']
@@ -492,10 +505,10 @@ class ProjectRunner:
         A factory which raises before returning any session produces no proof.
         """
         known_pi = isinstance(session, PiSessionAdapter)
-        rpc = session.session.rpc if known_pi else None
-        absent = known_pi and rpc is None
-        closed = (rpc is not None and rpc.process.poll() is not None) if known_pi else self.service.test_backend
-        settled = session.session.gateway.finished.is_set() if known_pi else self.service.test_backend
+        native = session.session.session if known_pi else None
+        absent = known_pi and (native is None or native.process is None)
+        closed = (absent or native.process.poll() is not None) if known_pi else self.service.test_backend
+        settled = (absent or native.provider_settled and not native.pending_tools) if known_pi else self.service.test_backend
         pending = self.workflow.pending
         return self._closure(dict(method='observed-session-close', actor_closed=closed,
             actor_absent=absent, provider_settled=settled,
@@ -684,12 +697,12 @@ class ProjectRunner:
             while not self.workflow.outcome:
                 self.actor.step(self.context())
             status = self.workflow.outcome
-        except PiError as exc:
+        except (PiError, NativeError) as exc:
             status, error = 'suspended', str(exc)
             classification = ('malformed_action' if isinstance(exc, ActionError) else
-                'provider_timeout' if isinstance(exc, PiDeadlineError) else
-                'provider_failure' if isinstance(exc, PiProviderError) else
-                'actor_cancelled' if isinstance(exc, PiCancelled) else 'actor_failure')
+                'provider_timeout' if isinstance(exc, (PiDeadlineError, DeadlineExceeded)) else
+                'provider_failure' if isinstance(exc, (PiProviderError, ProviderFailure)) else
+                'actor_cancelled' if isinstance(exc, (PiCancelled, Cancelled)) else 'actor_failure')
             self.append(dict(type='project-failure', classification=classification,
                 error_type=type(exc).__name__, pending=self.workflow.pending))
         except QueryUnavailable as exc:
@@ -716,7 +729,7 @@ class ProjectRunner:
                     closure_ref = self._closure(dict(method='host-no-actor-dispatch',
                         actor_absent=True, actor_closed=False, provider_settled=True,
                         observation='This live controller reached failure without calling the actor factory or dispatching backend work'))
-            except PiError as exc:
+            except (PiError, NativeError) as exc:
                 self.append(dict(type='project-failure', classification='actor_cleanup_failure',
                     error_type=type(exc).__name__, pending=self.workflow.pending))
                 if error is None:
