@@ -13,7 +13,7 @@ from test_rsi_cycles import isolation
 from test_rsi_recovery import LearningStub
 
 
-def scenario(tmp_path, outcomes, *, limit=5, mode=Mode.PHASE2, recover=True):
+def scenario(tmp_path, outcomes, *, limit=5, mode=Mode.PHASE2, recover=True, independent=True):
     trace, results = [], []
     store = ContentAddressedArtifacts(tmp_path/'artifacts')
     project = ProjectSpec('root', 'Keep the full original oracle', ('python', 'verify.py'))
@@ -28,7 +28,7 @@ def scenario(tmp_path, outcomes, *, limit=5, mode=Mode.PHASE2, recover=True):
         return SnapshotUpdate('candidate-'+str(len(trace)), .1)
     scheduler = CycleScheduler(tmp_path/'cycle.json',
         CycleSpec('paired', mode, (project,), 'memory', 'incumbent'), original, memory,
-        skill_update=writer, independent_projects=True, recover=recover,
+        skill_update=writer, independent_projects=independent, recover=recover,
         max_failed_recovery_attempts=limit, tuning_every=None,
         isolate=(lambda m, s, c: isolation(tmp_path/'fork', m, s, c['namespace'])) if mode == Mode.INFERENCE else None)
     def pair(event, operation, remaining):
@@ -387,5 +387,25 @@ def test_unverified_paired_feedback_blocks_promotion_before_consuming_result(tmp
             controller.step()
         assert controller.learning.calls==[] and scheduler.state['skills']=='incumbent'
         assert controller.state['pending'] and not scheduler.state.get('paired_retry_queue')
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize('limit', [2, 5])
+def test_late_legacy_budget_adoption_initializes_counter_before_first_pair(tmp_path, limit):
+    scheduler, controller, trace, results = scenario(tmp_path, [('failed', 'failed')],
+        limit=limit, independent=False)
+    try:
+        frozen = copy.deepcopy(scheduler.state['config'])
+        assert not scheduler.independent_projects
+        assert 'paired_retry_policy' not in scheduler.state
+        scheduler.adopt_independent_projects()  # Actual BoundCycle post-constructor API.
+        drain(scheduler, controller)
+        assert scheduler.state['config'] == frozen
+        assert scheduler.state['allocation_policy']['prior_config'] == frozen
+        assert scheduler.state['paired_retry_policy'] == {'max_failed_attempts': limit}
+        row = scheduler.state['paired_retry_queue']['root']
+        assert row['failed_attempts'] == limit and row['status'] == 'unrecoverable'
+        assert len(results) == limit and sum(e[0]=='original' for e in trace)==1
     finally:
         scheduler.close()
