@@ -102,13 +102,42 @@ class NativeWorkflowSession:
             return dict(host_stage_completed=True, result=asdict(result.value.result))
         return self.current[0]['observation']
 
+    def _open_artifact(self, args, context):
+        reference = args['reference']
+        path = self.runner.store._retention_path(reference).resolve(strict=True)
+        self.files.read_paths[path] = reference
+        return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
+            path=str(path), bytes=path.stat().st_size, read_with='read')))])
+
+    def _observation(self, observation):
+        if len(json.dumps(observation).encode()) <= 8192:
+            return observation
+        result = dict(retained_observation=self._retain_text(observation))
+        if isinstance(observation, dict):
+            for key in ('reference', 'summary', 'status'):
+                if key in observation:
+                    result[key] = observation[key]
+            response = observation.get('evidence', {}).get('payload', {}).get('response', {})
+            index = []
+            for group in ('results', 'negative_records'):
+                for position, row in enumerate(response.get(group, [])):
+                    metadata = row.get('memory', row) if isinstance(row, dict) else {}
+                    proposal = metadata.get('proposal', {})
+                    facts = {key: proposal[key] for key in ('kind', 'project_id', 'summary') if key in proposal}
+                    if isinstance(row, dict) and isinstance(row.get('text'), str):
+                        facts['excerpt'] = row['text'][:512]
+                    index.append(dict(group=group, index=position, facts=facts, full_row=self._retain_text(row)))
+            if index:
+                result['retrieval_index'] = self._retain_text(index)
+        return result
+
     def _state(self):
         if self.current is None:
             raise ValueError('no native workflow stage is active')
         payload = self.current[0]
         return dict(stage=payload['stage'], operation_id=payload['operation_id'],
                     done=bool(self.completed), allowed=[] if self.completed else
-                        [name for name in self.current[1] if name not in ('read_skill', 'read_project_file')],
+                        [name for name in self.current[1] if name not in ('read_skill', 'read_project_file', 'read_artifact')],
                     skill_receipts=payload['skill_receipts'], evidence_receipts=payload['evidence_receipts'])
 
     def _state_tool(self, args, context):
@@ -119,10 +148,7 @@ class NativeWorkflowSession:
             if context['operation_id'] != self.runner.workflow.pending['id']:
                 raise ValueError('native tool differs from pending workflow operation')
             observation = self._dispatch(name, args)
-            text = json.dumps(observation, ensure_ascii=False)
-            if len(text.encode()) > 8192:
-                observation = dict(retained_observation=self._retain_text(observation),
-                                   stage=self.runner.workflow.stage.value)
+            observation = self._observation(observation)
             return dict(content=[dict(type='text', text=json.dumps(dict(observation=observation, workflow_state=self._state())))],
                         terminate=bool(self.completed))
         return invoke
@@ -140,7 +166,10 @@ class NativeWorkflowSession:
         if profile is None:
             raise ValueError('registered native programming profile required')
         tools = [NativeTool(name, 'Execute the host '+name+' operation.', schema, self._tool(name))
-                 for name, schema in self.schemas.items() if name not in ('read_skill', 'read_project_file')]
+                 for name, schema in self.schemas.items() if name not in ('read_skill', 'read_project_file', 'read_artifact')]
+        tools.append(NativeTool('open_artifact', 'Open an immutable retained artifact for native read.',
+            dict(type='object', properties=dict(reference=dict(type='string', pattern='^[0-9a-f]{64}$')),
+                 required=['reference'], additionalProperties=False), self._open_artifact))
         options = self.files.session_options()
         def charged(name, callback):
             def invoke(args, context):
