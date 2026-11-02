@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from test_native_pi_filesystem import scripted_provider
 
 from rsi.contracts import Stage
 import rsi.domain_bindings as bindings
@@ -376,50 +377,23 @@ def test_local_native_source_rejection_has_observed_failure_receipt_and_export(t
     assert export_task(runner.root,tmp_path/'local-native-failure')['task_contract']==runner.contract_ref
 
 
-def test_existing_pi_session_adoption_transfers_controller_route_and_cleanup(monkeypatch):
+def test_existing_pi_session_adoption_transfers_model_environment_without_budget_reset():
     import time
-    import coding.pi.session as native
-    from coding.pi.controller import ControllerSession
+    from coding.pi.session import PiCodingSession
+    from coding.pi.workflow import NativeWorkflowSession
     from rsi.actor import PiSessionAdapter
-    from pathlib import Path
-    monkeypatch.setattr(native, 'runtime_preflight', lambda: Path('/unused-cpu-fixture'))
-    session = native.PiCodingSession(model='deepseek-flash', schemas={},
-        environ={'DEEPSEEK_API_KEY': 'CPU-fixture-secret'}, own_process_group=False)
-    # A3's actor request deadline may expire during excluded setup/transfer. It
-    # must survive as provenance, not become an inferred enclosing wall limit.
-    session.deadline = session.gateway.deadline = time.monotonic() - 1
-    provenance = dict(session=session.deadline, gateway=session.gateway.deadline)
-    profile, gateway, original_stack = session.profile, session.gateway, session.stack
-    cleaned = []
-    original_stack.callback(lambda: cleaned.append('original transport cleanup'))
-    adapter = PiSessionAdapter.from_existing_session(session)
-    controller = adapter.session
-    try:
-        assert isinstance(controller, ControllerSession) and controller is not session
-        assert controller.model == session.model and controller.profile is profile
-        assert controller.gateway is gateway and controller.stack is original_stack
-        assert controller._provider_secret == 'CPU-fixture-secret'
-        assert controller.own_process_group is False and controller.rpc is None
-        assert controller.request_deadline_provenance == provenance
-        assert controller.enclosing_deadline is None
-        assert session.closed and not controller.closed
-        session.close()
-        assert not controller.closed and cleaned == []
-        delivered = []
-        adapter.delivery.begin('operation')
-        adapter.expect_read('receipt', 'observed skill bytes')
-        adapter.delivery.observe(dict(messages=[dict(content='observed skill bytes')]),
-            lambda kind, data: delivered.append((kind, data)))
-        assert adapter.missing_reads(['receipt']) == []
-        assert any(kind == 'skill-delivered' for kind, _ in delivered)
-        controller.schemas['perform'] = dict(type='object', properties=dict(proposal=dict(type='string')))
-        request = dict(tools=[dict(function=dict(name='perform', parameters={}))])
-        assert gateway.request_projector(request)['tools'][0]['function']['parameters'] == controller.schemas['perform']
-    finally:
-        adapter.close()
-    assert controller.closed and cleaned == ['original transport cleanup']
+    environment = {'DEEPSEEK_API_KEY': 'CPU-fixture-secret'}
+    original = PiCodingSession(model='deepseek-flash', environ=environment, deadline=time.monotonic()-1)
+    adapter = PiSessionAdapter.from_existing_session(original)
+    assert original.closed
+    assert isinstance(adapter.session, NativeWorkflowSession)
+    assert adapter.session.model == original.model
+    assert adapter.session.environ is environment
+    assert adapter.session.enclosing_deadline is None
+    assert adapter.session.session is None
+    with pytest.raises(ValueError):
+        PiSessionAdapter.from_existing_session(original)
     adapter.close()
-    assert cleaned == ['original transport cleanup']
 
 
 @pytest.mark.parametrize('changed', ['memory', 'collection', 'negative_snapshot'])
@@ -1058,14 +1032,16 @@ def test_legacy_remote_timeout_without_native_handle_remains_observation_require
     assert len(calls)==1 and 'cancel' not in calls[0] and 'download' not in calls[0]
 
 
-def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_candidate(tmp_path,monkeypatch):
+def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_candidate(tmp_path,monkeypatch,scripted_provider):
     from copy import deepcopy
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import fixture, Backend
     from rsi.actor import PiSessionAdapter
-    from test_rsi_pi_controller import response
+    from test_native_pi_programming_roles import redirect
     from test_pi_runtime import _native_wire_objects
-    store,key=fixture(tmp_path);backend=Backend();wires=[];requested=[];corrected=[]
+    url, calls, wires = scripted_provider
+    redirect(monkeypatch, url)
+    store,key=fixture(tmp_path);backend=Backend();requested=[];corrected=[];queued=[]
     model=CanonicalSession(initial=json.dumps(dict(source='fast',block_count=1)),repaired=json.dumps(dict(source='fast',block_count=1)))
     owner=OptimizationLoop(store,key,SimpleNamespace(identity={'model':'deepseek-flash','coding_engine':'pi'}),backend,
         knowledge=lambda _:[],canonical=bindings.optimizer_adoption(test_backend=True,
@@ -1082,29 +1058,35 @@ def test_actual_pi_pure_perform_denial_reaches_wire_and_profiles_same_single_can
             unread_skills=[name for name in runner.bundle.skills_for(stage) if name not in read_names],
             evidence=evidence,read_skills=[dict(receipt_id=runner.service.read_receipt(row['receipt_id'])) for row in reads],
             source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
-    def provider(*_,**kwargs):
-        wire=json.loads(kwargs['data']);wires.append(wire)
-        if not wire.get('tools'):return response([],len(wires))
+    def choose(wire):
         context=payload()
+        prompt=next(value for role,value in reversed(list(_native_wire_objects([wire])))
+                    if role=='user' and 'mapped_skills' in value)
+        if queued:
+            return queued.pop(0)
         if context['stage']=='debug' and not context['unread_skills']:
             if not requested:
                 requested.append(deepcopy(context))
-                return response([('perform',dict(proposal='Try a different candidate after correct TEST',edit=dict(
-                    path=context['source']['path'],sha256=context['source']['sha256'],
-                    source=json.dumps(dict(source='another',block_count=1)))))],len(wires))
-            rejected=[value for role,value in _native_wire_objects([wire]) if role=='tool'
-                and value.get('observation',{}).get('event')=='invalid-action'
-                and value['observation'].get('action')=='perform' and value['observation'].get('executed') is False]
-            assert rejected  # Actual SDK/provider wire, not a fabricated dispatcher payload.
+                return 'write',dict(path=prompt['editable_files'][0],content=json.dumps(dict(source='another',block_count=1)))
+            errors=[json.loads(line) for line in (runner.root/'native/session/native-events.jsonl').read_text().splitlines()
+                    if json.loads(line)['type']=='host_callback_error']
+            assert errors and any(errors[-1]['message'] in message.get('content','')
+                for message in wire['messages'] if message['role']=='tool')
             corrected.append(deepcopy(context))
-            return response([('perform',dict(proposal='Retain the observed candidate'))],len(wires))
+            return 'perform',dict(proposal='Retain the observed candidate')
         names={row['name'] for row in context['evidence']}
         if (context['stage']=='optimisation' and not context['unread_skills']
                 and 'select_strategy' in names and 'optimisation_decision' not in names):
-            action=('optimisation_decision',dict(action='profile',reason='Profile the fixed single candidate'))
-        else:action=model.next_action(context,[],seconds=60,record=lambda *_:None,source=None)
-        return response([action],len(wires))
-    monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+            return 'optimisation_decision',dict(action='profile',reason='Profile the fixed single candidate')
+        name,args=model.next_action(context,[],seconds=60,record=lambda *_:None,source=None)
+        if name=='read_skill':
+            return 'read',dict(path=next(row['path'] for row in prompt['mapped_skills'] if row['name']==args['name']))
+        if name=='perform' and 'edit' in args:
+            edit=args.pop('edit')
+            queued.append(('perform',args))
+            return 'write',dict(path=prompt['editable_files'][0],content=edit['source'])
+        return name,args
+    calls.responder=choose
     result=runner.run()
     assert result['status']=='accepted' and requested and corrected
     assert requested[0]['operation_id']==corrected[0]['operation_id']

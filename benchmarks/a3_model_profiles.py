@@ -302,23 +302,6 @@ def _validated_transport_result(text: Any, completion_tokens: Any) -> A3Transpor
 Transport = Callable[..., A3TransportResult]
 
 
-def _openai_transport(
-    *, base_url: str, api_key: str, request: Mapping[str, Any]
-) -> A3TransportResult:
-    from openai import OpenAI
-
-    response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
-        **dict(request)
-    )
-    try:
-        return _validated_transport_result(
-            response.choices[0].message.content or "",
-            response.usage.completion_tokens,
-        )
-    except (AttributeError, IndexError, TypeError):
-        raise A3ProviderResponseError("missing-response-fields") from None
-
-
 def complete_a3(
     system: str,
     user: str,
@@ -327,13 +310,15 @@ def complete_a3(
     environ: Mapping[str, str] | None = None,
     transport: Transport | None = None,
 ) -> A3Completion:
+    if transport is None:
+        raise ValueError('programming completion requires a native Pi session; transport injection is fixture-only')
     profile = load_a3_model_profile(model)
     environment = os.environ if environ is None else environ
     api_key = environment.get(profile.credential_env, "")
     if not api_key:
         raise ValueError(f"missing required credential {profile.credential_env}")
     request = profile.request(system, user)
-    result = (transport or _openai_transport)(
+    result = transport(
         base_url=profile.base_url, api_key=api_key, request=request
     )
     if not isinstance(result, A3TransportResult):

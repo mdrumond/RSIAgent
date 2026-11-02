@@ -32,18 +32,6 @@ def host(actions, name, **payload):
     return json.loads(actions(TrialAction(name,payload)).observation)['host']
 
 
-def editable_session(source, write_action=None):
-    pi=PiCodingSession.__new__(PiCodingSession)
-    pi.lock=threading.Lock()
-    pi.allowed={'edit_source','write'}
-    pi.schemas=A5_SCHEMAS | {'edit_source': {'type':'object','properties':{
-        name:{'type':'string'} for name in ['sha256','old_text','new_text']},
-        'required':['sha256','old_text','new_text'],'additionalProperties':False}}
-    pi.mutations=0;pi.first_action_only=False;pi.pending=None
-    pi.source=source;pi.write_action=write_action or (lambda s:('write',{'slot':'kernel','content':s}))
-    return pi
-
-
 def test_compiler_log_read_then_audited_edit_repair_and_submit(tmp_path):
     diagnostic=('compiler warning: template diagnostic\n'*700 +
                 'candidate.cpp:91: error: use fixed source instead\n' +
@@ -70,12 +58,7 @@ def test_compiler_log_read_then_audited_edit_repair_and_submit(tmp_path):
     compiled=current.artifacts.read_json(failed['artifact']['sha256'])
     assert compiled['compiler_output']==details
     assert host(current,'compile')['repeated_source'] is True
-    pi=editable_session('compile failure')
-    receipt=pi._operation('edit_source',{'sha256':hashlib.sha256(b'compile failure').hexdigest(),
-        'old_text':'compile failure','new_text':'fixed source'})
-    assert receipt=={'status':'queued','executed':False,'action':'write'}
-    name,payload=pi.pending
-    host(current,name,**payload)
+    host(current,'write',slot='kernel',content='fixed source')
     assert current.source=='fixed source' and current.latest is None
     assert host(current,'compile')['repeated_source'] is False
     assert host(current,'run')['classification']=='host-verified'
@@ -92,14 +75,6 @@ def test_backend_compile_evidence_must_match_digest(tmp_path):
     host(current,'write',slot='kernel',content='compile failure')
     with pytest.raises(ValueError,match='compiler details differ'):
         host(current,'compile')
-
-
-def test_native_edit_cannot_queue_an_unavailable_host_route():
-    pi=editable_session('broken',lambda s:('compile',{}))
-    with pytest.raises(ValueError,match='unavailable host write'):
-        pi._operation('edit_source',{'sha256':hashlib.sha256(b'broken').hexdigest(),
-            'old_text':'broken','new_text':'fixed'})
-    assert pi.pending is None
 
 
 def test_large_unicode_diagnostic_preview_is_bounded_and_unchanged_when_small():

@@ -195,7 +195,10 @@ def a3_test_adoption(session, baseline):
         return dict(results=[asdict(row) for row in rows], negative_records=[],
                     provenance=dict(manifest=json.loads(baseline.manifest.to_json())))
     query.canonical_identity = lambda: dict(manifest=json.loads(baseline.manifest.to_json()))
-    options = dict(baseline_query=query, session_factory=lambda: session, test_backend=True)
+    from coding.pi.session import PiCodingSession
+    options = dict(baseline_query=query, test_backend=True)
+    if not isinstance(session, PiCodingSession):
+        options['session_factory'] = lambda: session
     adoption = a3_adoption(**options)
     def build(owner, **inputs):
         return a3_adoption(**options, clock=owner.clock).build(owner, **inputs)

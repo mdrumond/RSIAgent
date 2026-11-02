@@ -18,6 +18,7 @@ class NativeWorkflowSession:
         self.current = self.dispatcher = self.actor = self.thinking = None
         self.completed = []
         self.skill_paths = {}
+        self.skill_reads = {}
         self.schemas = {}
         self.archived = False
         self.stale = False
@@ -50,14 +51,36 @@ class NativeWorkflowSession:
     def _file_event(self, kind, payload):
         self.runner.actor_event(kind, dict(payload, operation_id=self.runner.workflow.pending['id']))
         receipt = self.runner.store.read_json(payload['reference'])
-        if kind == 'native-file-read':
-            name = self.skill_paths.get(Path(receipt['path']))
-            if name and self.current is not None and name in self.current[0]['skills']:
-                self._dispatch('read_skill', dict(name=name))
-        elif receipt.get('status') == 'applied':
+        if kind != 'native-file-read' and receipt.get('status') == 'applied':
             self.runner.append(dict(type='source-edit', operation_id=receipt['operation_id'],
                 before_source=receipt['before'], after_source=receipt['after'],
                 path=receipt['path'], source_ref=receipt['artifact_ref']))
+
+    def _read_observed(self, args, context):
+        """Credit only line ranges actually returned by the SDK read tool."""
+        name = self.skill_paths.get(Path(args['path']).resolve())
+        if name is not None and self.current is not None and name in self.current[0]['skills']:
+            document = self.runner.bundle.document(name)
+            total = len(document.content.splitlines())
+            start = max(0, args.get('offset', 1)-1)
+            truncation = (args.get('details') or {}).get('truncation') or {}
+            count = truncation.get('outputLines', 0) if truncation.get('truncated') else args.get('limit', total)
+            if not truncation.get('firstLineExceedsLimit') and count:
+                key = (context['operation_id'], name)
+                ranges = self.skill_reads.setdefault(key, [])
+                ranges.append((start, min(total, start+count)))
+                end = 0
+                for first, last in sorted(ranges):
+                    if first > end:
+                        break
+                    end = max(end, last)
+                reference = self.runner.store.put_json(dict(name=name, operation_id=context['operation_id'],
+                    tool_call_id=context['tool_call_id'], ranges=ranges, total_lines=total,
+                    truncation=truncation, complete=end >= total))
+                self.runner.append(dict(type='native-skill-read', reference=reference))
+                if end >= total and name not in self.current[0]['read_skill_names']:
+                    self._dispatch('read_skill', dict(name=name))
+        return dict(content=[], details={})
 
     def _remaining(self):
         bounds = [value for value in self.runner.workflow.remaining().values() if value is not None]
@@ -113,11 +136,27 @@ class NativeWorkflowSession:
         return observation
 
     def _open_artifact(self, args, context):
-        reference = args['reference']
-        path = self.runner.store._retention_path(reference).resolve(strict=True)
-        self.files.read_paths[path] = reference
-        return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
-            path=str(path), bytes=path.stat().st_size, read_with='read')))])
+        if self.completed:
+            raise ValueError('this host stage already completed')
+        def grant():
+            reference = args['reference']
+            path = self.runner.store._retention_path(reference)
+            if not path.is_file():
+                reader = getattr(self.runner.backend, 'artifact_bytes', None)
+                if reader is None:
+                    raise FileNotFoundError('artifact is outside retained native evidence')
+                data = reader(reference)
+                from hashlib import sha256
+                if sha256(data).hexdigest() != reference:
+                    raise ValueError('admitted native artifact digest mismatch')
+                self.runner.store.put_bytes(data)
+            path = path.resolve(strict=True)
+            self.files.read_paths[path] = reference
+            self.runner.append(dict(type='native-artifact-grant', reference=reference,
+                operation_id=context['operation_id']))
+            return dict(content=[dict(type='text', text=json.dumps(dict(reference=reference,
+                path=str(path), bytes=path.stat().st_size, read_with='read')))])
+        return self.actor._timed('retrieval', grant)
 
     def _observation(self, observation):
         if len(json.dumps(observation).encode()) <= 8192:
@@ -165,7 +204,8 @@ class NativeWorkflowSession:
         return state
 
     def _state_tool(self, args, context):
-        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))])
+        return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))],
+                    terminate=bool(self.completed))
 
     def _tool(self, name):
         def invoke(args, context):
@@ -199,6 +239,8 @@ class NativeWorkflowSession:
         options = self.files.session_options()
         def charged(name, callback):
             def invoke(args, context):
+                if self.completed:
+                    raise ValueError('this host stage already completed')
                 if name in ('rsi_fs_write', 'rsi_fs_mkdir'):
                     self._fresh_source()
                 category = 'implementation' if name in ('rsi_fs_write', 'rsi_fs_mkdir') else 'retrieval'
@@ -207,6 +249,7 @@ class NativeWorkflowSession:
         options['callbacks'] = {name: charged(name, callback)
                                 for name, callback in options['callbacks'].items()}
         options['callbacks']['rsi_workflow_state'] = self._state_tool
+        options['callbacks']['rsi_workflow_read_observed'] = charged('rsi_workflow_read_observed', self._read_observed)
         options['tools_factory'] = str(Path(__file__).resolve().parents[2]/'integrations/pi/workflow-tools.mjs')
         options['tools_options']['skills'] = [dict(name=name, description='Frozen workflow guidance: '+name,
             filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,

@@ -131,7 +131,8 @@ def test_installed_release_inventory(tmp_path, monkeypatch):
     monkeypatch.setattr(instances.metadata, 'distribution', lambda name: distribution)
     target = tmp_path / 'release'
     result = instances._copy_machinery(target)
-    assert result == {'kind': 'distribution', 'revision': '0.1.0'}
+    assert result['kind'] == 'distribution' and result['revision'] == '0.1.0'
+    assert len(result['sha256']) == 64
     assert (target / 'rsi/instances.py').read_text() == 'release'
     assert not (target / 'rsi/.env').exists()
     assert not (target / 'unlisted.txt').exists()

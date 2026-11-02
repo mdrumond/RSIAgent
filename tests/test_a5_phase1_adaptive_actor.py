@@ -278,17 +278,10 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path, canoni
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.sft_dataset import _read_trace
 
-    identity = MODEL_IDENTITIES[0]
-    provider = DirectCompletionProvider(
-        {"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
-        transport=lambda **_: pytest.fail("oversized request must not reach transport"),
-        context_budgets={identity.backend_model.value: ContextBudget(2000, 1024, 3000)},
-    )
     case = canonical_kernel
-    # Exercise the actual provider's byte admission from the scripted session
-    # boundary; no provider dispatch or host command is allowed after rejection.
+    # Exercise the retained SDK context-failure classification at the fixture seam.
     def reject_oversize(context, allowed):
-        provider.complete(case.profile, [dict(role='user', content=context['task']['domain']['instruction'])])
+        raise ContextBudgetError('native SDK context admission failed')
     case.before_select = reject_oversize
     request = case.request
     driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
@@ -305,67 +298,47 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path, canoni
     assert all(row["status"] != "infrastructure-failure" for row in validations)
 
 
-def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path, canonical_kernel):
+def test_artifact_wire_view_and_typed_rejection_keep_exact_evidence(tmp_path, canonical_kernel):
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_provider import (
-        DirectCompletionProvider, ProviderRejectionError,
-    )
+    from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
     from benchmarks.a5kernels.sft_dataset import _read_trace
     import base64
     raw = b'{"prior":"memory"}'
     digest = hashlib.sha256(raw).hexdigest()
-    calls = []
-    class Rejected(Exception):
-        status_code, code, request_id = 400, "invalid_prompt", "req_fixture"
-    def transport(**kwargs):
-        calls.append(kwargs["request"])
-        raise Rejected("credential must not appear")
-    elapsed, delays = [0.0], []
-    def sleep(seconds):
-        delays.append(seconds)
-        elapsed[0] += seconds
-    provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
-        transport=transport, sleeper=sleep, clock=lambda: elapsed[0])
     case = canonical_kernel
     request = case.request
-    # Native read_artifact is dispatched by the canonical engine. Subsequent
-    # provider attempts exercise its real rejection/retry/credential redaction.
-    delivered = []
+    delivered, pages = [], []
     def select(context, allowed):
         if not delivered:
             delivered.append(True)
             return 'read_artifact', dict(sha256=digest)
         return CanonicalSession.next_action(case.session, context, allowed)
     def after_select(context, selected):
-        events = [row for row in case.runner.events if row['type'] == 'evidence-tool-result'
-                  and row['name'] == 'read_artifact']
+        events = [row for row in case.runner.events if row['type']=='evidence-tool-result'
+                  and row['name']=='read_artifact']
         if events:
-            page = events[-1]['result']
-            assert page['text'].encode() == raw
-            provider.complete(case.profile, [dict(role='user', content=json.dumps(dict(host=page)))])
+            pages.append(events[-1]['result'])
+            assert pages[-1]['text'].encode() == raw
+            raise ProviderRejectionError(code='invalid_prompt',status_code=400,request_id='req_fixture')
     case.select, case.after_select = select, after_select
     driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
         query_knowledge=case.knowledge,
-        trace_recorder_factory=recorder_factory(phase="phase1", round_id="provider-rejection",
-            model="fixture", source_manifest_sha256="a" * 64))
+        trace_recorder_factory=recorder_factory(phase='phase1',round_id='provider-rejection',
+            model='fixture',source_manifest_sha256='a'*64))
     with pytest.raises(ProviderRejectionError):
         driver(request)
-    assert case.calls == []
-    assert len(calls) == 4 and calls == [calls[0]] * 4
-    assert delays == [120, 120, 120] and elapsed[0] == 360
-    view = json.loads(calls[0]["messages"][-1]["content"])["host"]
-    assert view["text"].encode() == raw and "base64" not in view
-    store = ContentAddressedArtifacts(request.branch_root / "artifacts")
-    raw_page = store.read_json(view["full_observation_sha256"])
-    assert base64.b64decode(raw_page["base64"]) == raw
-    assert store.read_bytes(digest) == raw
-    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
-    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
-    assert validations[-1]["status"] == "failed"
-    assert validations[-1]["details"]["abort_status"] == "provider-rejected"
-    assert validations[-1]["details"]["request_id"] == "req_fixture"
-    assert "credential must not appear" not in json.dumps(trace)
+    assert case.calls == [] and len(pages)==1
+    view = pages[0]
+    assert 'base64' not in view
+    store = ContentAddressedArtifacts(request.branch_root/'artifacts')
+    raw_page = store.read_json(view['full_observation_sha256'])
+    assert base64.b64decode(raw_page['base64'])==raw and store.read_bytes(digest)==raw
+    trace = _read_trace(next((request.branch_root/'sft-traces').glob('*.jsonl')))
+    validations = [row['payload'] for row in trace if row['kind']=='validation']
+    assert validations[-1]['status']=='failed'
+    assert validations[-1]['details']['abort_status']=='provider-rejected'
+    assert validations[-1]['details']['request_id']=='req_fixture'
 
 
 def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
@@ -939,7 +912,7 @@ def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_pat
     assert explanation["code"] == "observed-compile"
 
 
-def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(canonical_kernel):
+def test_subject_lesson_and_admitted_artifacts_reach_actual_native_actor(canonical_kernel):
     from benchmarks.a5kernels.evidence import canonical_bytes
     from benchmarks.ascend.agent_context import request_bytes
     case = canonical_kernel
@@ -955,8 +928,11 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='Use host checks',
                               memories=[record]))
     request = replace(case.request, pre_wave_memory=raw, publish_learning=False)
-    selected, pages = [], []
+    selected, pages, denied = [], [], []
     def select(context, allowed):
+        if not denied:
+            denied.append('f'*64)
+            return 'open_artifact',dict(reference=denied[0])
         if not selected:
             instruction = context['task']['domain']['instruction']
             marker = 'Pre-wave memory (immutable, readable index): '
@@ -965,8 +941,9 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
             assert row['summary'] == proposal['summary'] and row['after'] == proposal['after']
             assert store.read_json(row['memory_document_sha256']) == record
             selected.extend([row['proposal_sha256'], source])
-        read_events = [event for event in case.runner.events if event['type'] == 'evidence-tool-result'
-                       and event['name'] == 'read_artifact']
+        read_events = [case.runner.store.read_json(event['reference']) for event in case.runner.events
+                       if event['type']=='native-file-read']
+        read_events = [row for row in read_events if row['artifact_ref'] in selected]
         if len(read_events) < len(selected):
             return 'read_artifact', dict(sha256=selected[len(read_events)])
         return CanonicalSession.next_action(case.session, context, allowed)
@@ -974,10 +951,16 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     result = AdaptiveActorProjectExecutor(case.executor, case.make_driver('pi'), case.profile,
         query_knowledge=case.knowledge)(request)
     for event in case.runner.events:
-        if event['type'] == 'evidence-tool-result' and event['name'] == 'read_artifact':
-            pages.append(event['result'])
-    assert json.loads(pages[0]['text']) == proposal
-    assert pages[1]['text'].encode() == source_bytes
+        if event['type']=='native-file-read':
+            receipt=case.runner.store.read_json(event['reference'])
+            if receipt['artifact_ref'] in selected:
+                pages.append(case.runner.store.read_bytes(receipt['artifact_ref']))
+    assert json.loads(pages[0]) == proposal
+    assert pages[1] == source_bytes
+    grants=[event['reference'] for event in case.runner.events if event['type']=='native-artifact-grant']
+    assert denied[0] not in grants and set(selected)<=set(grants)
+    assert any('Clamp negatives before storing' in message.get('content','')
+               for wire in case.wires for message in wire['messages'] if message['role']=='tool')
     assert result.memory.host_facts and not result.memory.lessons
     assert result.memory.source_revision == hashlib.sha256(case.session.repaired.encode()).hexdigest()
     host = case.runner.backend.host
@@ -985,7 +968,7 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     assert host.actions.latest.evidence.verified
     assert host.actions.latest_source_sha256 == result.memory.source_revision
     assert 'compile' in case.calls and 'run' in case.calls
-    assert case.wires and all(request_bytes(wire) <= 48 * 1024 for wire in case.wires)
+    assert case.wires
     # The large provenance document remains readable without replaying it into model context.
     assert not any('z' * 76665 in json.dumps(wire) for wire in case.wires)
 

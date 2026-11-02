@@ -5,6 +5,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from test_native_pi_filesystem import scripted_provider
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionContext
@@ -68,22 +69,25 @@ def test_production_actor_uses_compact_admitted_evidence_and_persistent_shared_b
     assert len(calls) == 1
 
 
-def test_curriculum_selection_handshake_and_actor_composition(tmp_path):
+def test_curriculum_selection_handshake_and_actor_composition(tmp_path, monkeypatch, scripted_provider):
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.a5kernels.phase1_provider import direct_profile, DirectCompletion
     from test_a5_phase1_curriculum_selector import context, project, wave
-    calls, decisions = [], []
+    from test_native_pi_programming_roles import redirect
+    url, native_calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    calls = []
+    native_calls.extend([('knowledge_query', dict(query='pipeline',limit=1)),
+        ('submit_curriculum_proposal', dict(decision='WAVE',payload=json.loads(wave([project('selected')]).split('\n',1)[1])))])
     def transport(**request):
-        decisions.append(request)
-        text = '{"knowledge_query":{"query":"pipeline","limit":1}}' if len(decisions) == 1 else wave([project('selected')])
-        return DirectCompletion(text, 1)
+        raise AssertionError('native curriculum cannot call the old provider transport')
     controller = build_native_adaptive_phase1(config=config(tmp_path), native_transport=NativeTransport(),
-        profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=b'Native guide', objective='Learn native copy',
+        profile=direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value=='deepseek-flash')), guide_bytes=b'Native guide', objective='Learn native copy',
         initial_memory=b'', environment={'OPENAI_API_KEY':'fixture', 'DEEPSEEK_API_KEY':'fixture'},
         provider_transport=transport, embeddings=Embeddings(), librarian_complete=completion(calls))
     decision, session = controller.curriculum.select(context())
     assert decision.wave.projects[0].spec.project_id == 'selected'
-    assert len(calls) == 1 and session.turns == 2
+    assert len(calls) == 1 and session.turns == 1 and len(requests) == 2
     packet = json.loads(calls[0][0][1]['content'])
     assert packet['role'] == 'curriculum' and packet['context']['target'] == 'Ascend910B4'
     assert list((tmp_path/'campaign'/'curriculum-librarian').glob('*/librarian-budget.json'))
@@ -148,32 +152,33 @@ def test_configuration_rejects_unusable_adaptive_bindings(tmp_path, fields):
         NativeProductionConfig(tmp_path, 'A3', 'arch', 'local', 'a'*64, 'b'*40, **fields)
 
 
-def test_librarian_provider_is_deepseek_and_cancels_at_total_elapsed_deadline(monkeypatch):
-    import asyncio
-    import openai
+@pytest.mark.parametrize('include_usage', [True, False])
+def test_librarian_native_role_retains_full_evidence_and_obeys_zero_remaining(tmp_path, monkeypatch, scripted_provider, include_usage):
+    import base64
+    import hashlib
     from benchmarks.ascend.phase1_knowledge import deepseek_librarian
-    observed = []
-    class Client:
-        def __init__(self, **options):
-            observed.append(options)
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            observed.append('closed')
-        async def create(self, **request):
-            observed.append(request)
-            try:
-                await asyncio.sleep(10)
-            finally:
-                observed.append('cancelled')
-    monkeypatch.setattr(openai, 'AsyncOpenAI', Client)
-    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture'})
+    from test_native_pi_programming_roles import redirect
+    url, calls, requests = scripted_provider
+    calls.include_usage = include_usage
+    redirect(monkeypatch, url)
+    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
     with pytest.raises(TimeoutError):
-        complete([{'role':'user', 'content':'JSON please'}], .01)
-    assert observed[0]['max_retries'] == 0 and observed[0]['timeout'] == .01
-    assert observed[1]['model'] == 'deepseek-flash'
-    assert observed[-2:] == ['cancelled', 'closed']
+        complete([{'role':'user','content':'JSON please'}], 0)
+    assert requests == []
+    value = dict(status='insufficient', gaps=['Need retained documentation'])
+    calls.append(('submit_curriculum_proposal', dict(value=value)))
+    result = complete([{'role':'user','content':'Assess admitted documentation'}], 30)
+    assert json.loads(result['text']) == value
+    assert len(requests) == 1
+    if include_usage:
+        assert result['tokens'] > 0
+    else:
+        assert result['tokens'] is None
+    assert result['native_evidence']
+    objects = {reference:base64.b64decode(data) for reference,data in result['native_evidence'].items()}
+    assert all(hashlib.sha256(data).hexdigest()==reference for reference,data in objects.items())
+    assert any(b'before_provider_request' in data for data in objects.values())
+    assert all(b'fixture-secret' not in data for data in objects.values())
 
 
 def test_gz_binding_records_selected_transport_runtime_without_substitution(tmp_path):
@@ -244,3 +249,40 @@ def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path,
     (root / 'librarian-budget.json').write_bytes(charged)
     knowledge.begin_selection(selection)
     assert (root / 'librarian-budget.json').read_bytes() == charged
+
+
+def test_native_librarian_repairs_uninspected_id_inside_same_session(tmp_path, monkeypatch, scripted_provider):
+    import base64
+    from pathlib import Path
+    from benchmarks.ascend.phase1_knowledge import deepseek_librarian
+    from test_native_pi_programming_roles import redirect
+    url, calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    cfg = config(tmp_path)
+    complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
+    steps = []
+    def choose(wire):
+        from test_pi_runtime import _native_wire_objects
+        pointer = next(value for role,value in _native_wire_objects([wire])
+                       if role=='user' and 'context_path' in value)
+        if not steps:
+            steps.append('read')
+            return 'read', dict(path=pointer['context_path'])
+        context = json.loads(Path(pointer['context_path']).read_text())
+        candidates = json.loads(context[-1]['content'])['observation']['candidates']
+        identity = 'not-inspected' if len(steps)==1 else candidates[0]['id']
+        steps.append(identity)
+        return 'submit_curriculum_proposal', dict(value=dict(action='finish',
+            selected=[dict(id=identity,reason='Use retained actual reference')], rejected=[], gaps=[]))
+    calls.responder = choose
+    adaptive = NativeAdaptiveKnowledge(cfg, Embeddings(), complete)
+    context = actor_context(tmp_path)
+    result = adaptive.actor_query(dict(query='pipeline',limit=1), context)
+    assert result.citations and len(requests)==3
+    assert steps[1]=='not-inspected' and steps[2]!='not-inspected'
+    assert any(message['role']=='tool' and 'decisions require inspected IDs and reasons' in message['content']
+               for message in requests[-1]['messages'])
+    details = context.artifacts.read_json(result.observation['search_details_sha256'])
+    assert len(details['librarian_audit']['requests']) == 1
+    evidence = details['librarian_audit']['requests'][0]['response']['native_evidence']
+    assert any(b'host_callback_error' in base64.b64decode(data) for data in evidence.values())

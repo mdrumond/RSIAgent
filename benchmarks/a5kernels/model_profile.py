@@ -215,15 +215,13 @@ def complete_a5(
     metadata. Truncated output is returned without changing generation controls.
 
     ``client`` is injectable so profile validation and request construction are
-    testable without credentials or a network.  The production default is the
-    repository's existing OpenRouter client.
+    testable without credentials or a network. Production programming uses native
+    Pi sessions and requires no direct completion fallback.
     """
     selected = load_a5_model_profile() if profile is None else profile
     selected.validate()
     if client is None:
-        from llm.client import chat
-
-        client = chat
+        raise ValueError('programming completion requires a native Pi session; client injection is fixture-only')
     text = client(
         selected.model,
         system,

@@ -130,20 +130,28 @@ def test_unbounded_deadline_allows_native_read_and_pending_write(tmp_path):
 
 @pytest.fixture
 def scripted_provider():
-    calls, requests = [], []
+    class Calls(list):
+        responder = None
+        include_usage = True
+    calls, requests = Calls(), []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
         def do_POST(self):
             requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             delta = dict(role='assistant', content='Finished.')
-            if calls:
-                name, arguments = calls.pop(0)
-                delta.update(content=None, tool_calls=[dict(index=0, id=f'call-{len(requests)}', type='function',
-                    function=dict(name=name, arguments=json.dumps(arguments)))])
+            action = calls.responder(requests[-1]) if calls.responder is not None else (calls.pop(0) if calls else None)
+            if action is not None:
+                actions = action if isinstance(action, list) else [action]
+                delta.update(content=None, tool_calls=[dict(index=index,
+                    id=f'call-{len(requests)}'+(f'-{index}' if index else ''), type='function',
+                    function=dict(name=name, arguments=json.dumps(arguments)))
+                    for index,(name,arguments) in enumerate(actions)])
             payload = dict(id='fixture', object='chat.completion.chunk', model='deepseek-flash',
                 choices=[dict(index=0, delta=delta, finish_reason='tool_calls' if 'tool_calls' in delta else 'stop')],
                 usage=dict(prompt_tokens=10, completion_tokens=2, total_tokens=12))
+            if not calls.include_usage:
+                payload.pop('usage')
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             self.wfile.write(('data: '+json.dumps(payload)+'\n\ndata: [DONE]\n\n').encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)

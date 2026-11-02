@@ -20,8 +20,9 @@ from test_rsi_production_domain_bindings import CanonicalSession
 
 
 @pytest.fixture
-def canonical_kernel(tmp_path, monkeypatch):
+def canonical_kernel(tmp_path, monkeypatch, request):
     """Keep the real domain host alive across stop/reconstruction in one test."""
+    fixture_request = request
     from test_a5_phase1_adaptive_actor import _request
     import rsi.domain_bindings as bindings
     native_adapter = bindings.PiSessionAdapter
@@ -118,48 +119,50 @@ def canonical_kernel(tmp_path, monkeypatch):
             turn_parser=parse_trial_action, action_executor=actions)
         return state.outcome
     def enable_native():
-        """Drive the installed Pi SDK; replace upstream HTTP decisions only."""
-        from test_rsi_pi_controller import response
+        """Use actual SDK tools; script only the model's domain decisions."""
+        from test_pi_runtime import _native_wire_objects
+        from test_native_pi_programming_roles import redirect
+        url, calls, requests = fixture_request.getfixturevalue('scripted_provider')
+        redirect(monkeypatch, url)
         state.profile = direct_profile(next(model for model in MODEL_IDENTITIES
-            if model.backend_model.value == 'deepseek-flash'))
-        class Adapter(native_adapter):
-            def __init__(self, **kwargs):
-                super().__init__(context_window=16384, request_bytes=49152, **kwargs)
-            def prepare(self, timeout, *, schemas):
-                state.session.prepare(timeout, schemas=schemas)
-                return super().prepare(timeout, schemas=schemas)
-        def provider(*args, **kwargs):
-            wire = json.loads(kwargs['data'])
-            state.wires.append(wire)
-            if state.wire:
-                result = state.wire(wire)
-                if result is not None:
-                    return result
-            if not wire.get('tools'):
-                return response([], len(state.wires), tokens=len(kwargs['data']) // 4)
+            if model.backend_model.value=='deepseek-flash'))
+        state.wires = requests
+        queued = []
+        def choose(wire):
+            prompt = next(value for role,value in reversed(list(_native_wire_objects([wire])))
+                          if role=='user' and 'mapped_skills' in value)
+            if queued:
+                return queued.pop(0)
             runner = state.runner
             operation = runner.workflow.pending['id']
-            reads = [row for row in runner.events if row['type'] == 'skill-usage'
-                     and row.get('kind') == 'read' and row['operation_id'] == operation]
+            reads = [row for row in runner.events if row['type']=='skill-usage'
+                     and row.get('kind')=='read' and row['operation_id']==operation]
             names = runner.bundle.skills_for(runner.workflow.stage)
             read_names = {row['skill'] for row in reads}
             source = runner.snapshot()
-            evidence = [dict(name=row['name'], result=dict(reference=row['reference'],
+            evidence = [dict(name=row['name'],result=dict(reference=row['reference'],
                             evidence=runner.store.read_json(row['reference'])))
-                        for row in runner.events if row['type'] == 'project-tool'
-                        and row['operation_id'] == operation]
+                        for row in runner.events if row['type']=='project-tool' and row['operation_id']==operation]
             host = runner.backend.host
-            context = dict(stage=runner.workflow.stage.value, evidence=evidence,
+            context = dict(stage=runner.workflow.stage.value,evidence=evidence,
                 unread_skills=[name for name in names if name not in read_names],
                 read_skills=[dict(receipt_id=runner.service.read_receipt(row['receipt_id'])) for row in reads],
-                task=dict(domain=dict(instruction=host.instruction, feedback=host.feedback)),
-                source=dict(path=source.path, text=source.text, sha256=source.sha256,
-                            project_hash=source.project_hash))
-            action = state.session.next_action(context, [],
-                seconds=120, record=lambda *_: None, source=None)
-            return response([action], len(state.wires), tokens=len(kwargs['data']) // 4)
-        monkeypatch.setattr(bindings, 'PiSessionAdapter', Adapter)
-        monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+                task=dict(domain=dict(instruction=host.instruction,feedback=host.feedback)),
+                source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
+            name,args = state.session.next_action(context,[],seconds=120,record=lambda *_:None,source=None)
+            if name=='read_skill':
+                return 'read',dict(path=next(row['path'] for row in prompt['mapped_skills'] if row['name']==args['name']))
+            if name=='read_artifact':
+                reference = args['sha256']
+                queued.append(('read',dict(path=str(runner.store._retention_path(reference).resolve()))))
+                return 'open_artifact',dict(reference=reference)
+            if name=='perform' and 'edit' in args:
+                edit=args.pop('edit')
+                queued.append(('perform',args))
+                return 'write',dict(path=prompt['editable_files'][0],content=edit['source'])
+            return name,args
+        calls.responder = choose
+        monkeypatch.setattr(bindings,'PiSessionAdapter',native_adapter)
     state.enable_native = enable_native
     state.make_driver, state.run = driver, run
     state.driver = driver()

@@ -111,54 +111,6 @@ class ActorControl:
             raise ActorStopped('user requested a stop at the next safe boundary')
 
 
-class ActorConversation:
-    """Checkpoint model context without restoring host verification authority."""
-    def __init__(self, workspace, instruction, working, action_executor=None):
-        self.control = ActorControl(workspace)
-        self.identity = hashlib.sha256(instruction.encode()).hexdigest()
-        self.working, self.actions = working, action_executor
-        self.turn = 0
-        self.feedback = []
-        checkpoint = self.control.status()['checkpoint']
-        if checkpoint is not None:
-            if checkpoint['instruction_sha256'] != self.identity:
-                raise ValueError('actor instruction changed; start a fresh linked attempt')
-            self.turn = checkpoint['turn']
-            self.feedback = checkpoint.get('feedback', [])
-            for field in ('fixed', 'recent', 'work_log', 'host_state', 'tail'):
-                setattr(working, field, checkpoint['working'][field])
-            source = checkpoint.get('source')
-            restore = getattr(action_executor, 'restore_source', None)
-            if source is not None and restore is not None:
-                restore(source)
-                working.host_state = {}
-                working.append(dict(role='user', content=(
-                    'The actor resumed from retained source and conversation. '
-                    'Host verification and measurements must be repeated before submission.')))
-        self._pin()
-
-    def _pin(self):
-        # WorkingContext never compacts pinned messages. IDs are metadata only.
-        self.working.pinned = [{key: row[key] for key in ('role', 'content')}
-                               for row in self.feedback]
-
-    def snapshot(self):
-        return dict(instruction_sha256=self.identity, turn=self.turn,
-            feedback=self.feedback, source=getattr(self.actions, 'source', None),
-            working={field: getattr(self.working, field) for field in
-                     ('fixed', 'recent', 'work_log', 'host_state', 'tail')})
-
-    def boundary(self):
-        checkpoint = self.snapshot()
-        self.control.boundary(checkpoint, self.feedback)
-        self._pin()
-        return self.feedback
-
-    def save(self, turn):
-        self.turn = turn
-        self.control.save(self.snapshot())
-
-
 def actor_lease(function):
     @wraps(function)
     def execute(self, instruction, **options):

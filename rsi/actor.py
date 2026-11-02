@@ -477,6 +477,7 @@ class PiSessionAdapter:
                 or getattr(session, 'native_session', None) is not None):
             raise ValueError('only an unstarted session may transfer ownership')
         adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
+        session.usage_source = adapter.session  # Observation only; ownership stays with the adapter.
         session.closed = True
         return adapter
 

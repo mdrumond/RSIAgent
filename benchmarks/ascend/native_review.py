@@ -21,6 +21,7 @@ class PiReviewSession:
         self.store = ContentAddressedArtifacts(self.root/'artifacts')
         self.session = None
         self.paths = {}
+        self.fatal_error = None
 
     def _retain(self, value):
         data = json.dumps(value, ensure_ascii=False, indent=2).encode()
@@ -71,12 +72,23 @@ class PiReviewSession:
 
     def _tool(self, name):
         def invoke(args, context):
+            if self.fatal_error is not None:
+                raise self.fatal_error
             if name not in self.state.allowed():
                 raise ValueError('review tool is not currently admitted')
             value = args if name == 'submit_review' else {name:args}
-            observation = self.state.execute(value)
-            retained = self._retain(observation)
+            try:
+                observation = self.state.execute(value)
+            except Exception as error:
+                # Host failures are not model-correctable validation feedback.
+                self.fatal_error = error
+                self.state.host_ok = False
+                self.session.abort()
+                raise
+            full = self.state.raw_observation
+            retained = self._retain(observation if full is None else full)
             summary = dict(observation=observation if len(json.dumps(observation)) <= 8192 else retained,
+                           full_observation=retained,
                            review_state=self.state.summary(), artifact_files=self._paths())
             self.state.agent._record('native-review-tool', dict(name=name,
                 tool_call_id=context['tool_call_id'], reference=retained['artifact_ref']))
@@ -106,9 +118,13 @@ class PiReviewSession:
             resource_options=dict(noSkills=True, noPromptTemplates=True),
             observer=lambda event:state.agent._record('pi-native-event', event), **options)
         self.session.prepare()
-        self.session.prompt(json.dumps(dict(context=context,
-            instruction='Read the retained context and admitted artifact files with native read, then use submit_review.')),
-            operation_id='review-'+self.root.name, remaining=state.remaining)
+        try:
+            self.session.prompt(json.dumps(dict(context=context,
+                instruction='Read the retained context and admitted artifact files with native read, then use submit_review.')),
+                operation_id='review-'+self.root.name, remaining=state.remaining)
+        finally:
+            if self.fatal_error is not None:
+                raise self.fatal_error
         if state.decision is None:
             raise ActionError('Native review settled without a host-admitted decision')
         return state.decision
@@ -116,7 +132,9 @@ class PiReviewSession:
     def close(self):
         if self.session:
             self.session.close()
-            refs = [self.store.put_bytes(path.read_bytes()) for path in self.session.root.rglob('*.jsonl')]
+            for path in self.session.root.rglob('*.jsonl'):
+                self.store.put_bytes(path.read_bytes())
+            refs = sorted(path.parent.name+path.name for path in self.store.objects.glob('*/*'))
             self.state.agent._record('native-review-session', dict(artifact_refs=refs, store=str(self.store.root)))
 
     def __enter__(self):

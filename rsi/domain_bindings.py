@@ -296,6 +296,10 @@ class KernelActionsHost(SourceHost):
     def on_actor_event(self, kind, data):
         self.owner._trace(kind, data)
 
+    def artifact_bytes(self, reference):
+        reader = getattr(self.actions, 'read_artifacts', None) or self.actions.artifacts
+        return reader.read_bytes(reference)
+
     def evidence_tools(self):
         from rsi.actor import EvidenceTool
         from coding.pi.schema import STRING, INTEGER, obj
@@ -453,7 +457,7 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
         owner.provider.coding_environment(),
         validator=lambda value:parse_agent_distillation(json.dumps(value), admitted),
         artifacts=artifacts, setup_scope=setup)
-    context = dict(instruction=continuation.instruction, host_outcome=outcome.status,
+    context = dict(instruction=continuation.instruction, feedback=host.context()['feedback'], host_outcome=outcome.status,
         source_hash=host.project_hash(), host_summaries=list(host_summaries),
         admitted_artifacts=[dict(reference=reference, role=admitted[reference], path=str(path))
                             for path, reference in artifacts.items()],
@@ -474,7 +478,8 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
             wall_time_s=clock.seconds(), distillation=distilled, admitted_artifacts=admitted, continuation=None)
     except Exception as error:
         reference = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-            exception_type=type(error).__name__, source_hash=host.project_hash(), contract_ref=runner.contract_ref))
+            exception_type=type(error).__name__, host_outcome=outcome.status,
+            source_hash=host.project_hash(), contract_ref=runner.contract_ref))
         runner.append(dict(type='domain-distillation-failure', reference=reference))
         return replace(outcome, distillation_failure=reference, wall_time_s=clock.seconds())
     finally:
@@ -689,6 +694,31 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
+def _retained_programming_tokens(runner, session):
+    native = [row['event'] for row in runner.events if row['type']=='pi-native-event']
+    requests = [index for index,event in enumerate(native) if event['type']=='before_provider_request']
+    settled = [index for index,event in enumerate(native) if event['type']=='settled']
+    faults = [index for index,event in enumerate(native)
+              if event['type']=='native_fault' and event.get('operation_id') is not None]
+    if max([*requests, *faults], default=-1) > max(settled, default=-1):
+        return None
+    usage = []
+    for event in native:
+        if event['type']=='message_end' and event.get('message', {}).get('role')=='assistant':
+            usage.append({} if event.get('usage_observed') is False else event['message'].get('usage') or {})
+        elif event['type']=='compaction_end':
+            usage.append({} if event.get('usage_observed') is False else (event.get('result') or {}).get('usage') or {})
+    if usage:
+        return None if any('output' not in row for row in usage) else sum(row['output'] for row in usage)
+    if requests:
+        return None
+    legacy = [row.get('usage') or {} for row in runner.events if row['type']=='pi-provider']
+    if legacy:
+        return (None if any(row.get('completion_tokens') is None for row in legacy)
+                else sum(row['completion_tokens'] for row in legacy))
+    return getattr(session, 'completion_tokens', 0)
+
+
 def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
@@ -739,8 +769,8 @@ def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False
         from benchmarks.a3kernels.phase1_protocol import VerifiedResult
         return TrialResult('passed' if result['status'] == 'accepted' else
             host.failure_classification or result['status'], len(result['history']),
-            getattr(getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None),
-                'completion_tokens', sum((e.get('usage') or {}).get('completion_tokens', 0) or 0 for e in runner.events)),
+            _retained_programming_tokens(runner,
+                getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None)),
             host.verified if isinstance(host.verified, VerifiedResult) else None,
             host.profile, host.queries, tuple(host.failures), entry_ref)
     return CanonicalAdoption(build, finish)
@@ -785,15 +815,19 @@ class OptimizerHost(SourceHost):
 
     def on_actor_event(self, kind, data):
         observer = self.owner.memory_observer
-        if kind != 'pi-provider-request' or observer is None:
+        event = data.get('event', {})
+        if kind != 'pi-native-event' or event.get('type') != 'before_provider_request' or observer is None:
             return
-        # Only exact summary rows observed in the actual gateway request count;
+        request = event['payload']
+        from core.artifacts import canonical_bytes
+        identity = sha256(canonical_bytes(dict(operation=event['operation_id'], request=request))).hexdigest()
+        # Only exact summary rows observed in the actual native provider request count;
         # building/filtering a context or admitting a CAS reference is not exposure.
         shown = []
         def visit(value):
             if isinstance(value, str):
                 try:
-                    decoded = json.loads(value)
+                    decoded, _ = json.JSONDecoder().raw_decode(value)
                 except (ValueError, TypeError):
                     return
                 if not isinstance(decoded, str):
@@ -807,12 +841,9 @@ class OptimizerHost(SourceHost):
                         shown.append(row)
                 for item in value.values():
                     visit(item)
-        visit(data['request'])
+        visit(request)
         if shown:
-            delivered = observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown),
-                                 data['reservation_id'])
-            if delivered.get('memory_summary') != shown:
-                raise WorkflowError('memory availability changed before provider dispatch; refresh context')
+            observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown), identity)
 
 
     def __init__(self, owner, inputs):
@@ -961,6 +992,15 @@ class OptimizerHost(SourceHost):
                     read_memory=EvidenceTool(OPTIMIZER_SCHEMAS['read-memory'], read_memory),
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
         return tools
+
+    def artifact_bytes(self, reference):
+        import base64
+        job, memory = self.artifact_scope()
+        if reference in job:
+            return self.owner.store.read_artifact(self.owner.key, reference)
+        if reference in memory:
+            return base64.b64decode(memory[reference]['base64'], validate=True)
+        raise FileNotFoundError('artifact is outside admitted job and memory evidence')
 
     def artifact_scope(self):
         job = {row['sha256'] for row in self.owner.store.artifacts(self.owner.key)}

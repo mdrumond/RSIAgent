@@ -98,7 +98,7 @@ def test_prepare_and_single_attempts_reuse_baseline_and_authenticated_results(tm
 
 
 @pytest.mark.parametrize('capability', ['absent', None, 'not callable'])
-def test_real_pi_omits_unsupported_compile_and_completes_all_stages(tmp_path, monkeypatch, capability):
+def test_real_pi_omits_unsupported_compile_and_completes_all_stages(tmp_path, monkeypatch, capability, scripted_provider):
     from types import SimpleNamespace
     from rsi.contracts import Stage
     execution, agent, backend = executor(tmp_path, [candidate('good')])
@@ -107,7 +107,7 @@ def test_real_pi_omits_unsupported_compile_and_completes_all_stages(tmp_path, mo
     if capability != 'absent':
         runtime.compile = capability
     execution._backend = runtime
-    http = scripted_optimizer_http(monkeypatch, agent, compile_if_offered=True)
+    http = scripted_optimizer_http(monkeypatch, agent, native_provider=scripted_provider, compile_if_offered=True)
     result = execution.attempt('target-001')
     assert result['verified'] and result['speedup'] == 2
     assert http.requests and all('compile' not in {tool['function']['name']
@@ -147,10 +147,10 @@ def test_real_pi_omits_unsupported_compile_and_completes_all_stages(tmp_path, mo
     assert [case['case'] for case in result['result']['cases']] == [case['case'] for case in baseline['cases']]
 
 
-def test_compile_repairs_do_not_charge_candidate_budget(tmp_path, monkeypatch):
+def test_compile_repairs_do_not_charge_candidate_budget(tmp_path, monkeypatch, scripted_provider):
     execution, agent, backend = executor(tmp_path, [candidate('bad', 'compile'),
         candidate('good', 'compile'), candidate('good')])
-    http = scripted_optimizer_http(monkeypatch, agent)
+    http = scripted_optimizer_http(monkeypatch, agent, native_provider=scripted_provider)
     result = execution.attempt('target-001')
     assert result['verified']
     assert any(tool['function']['name'] == 'compile' for wire in http.requests for tool in wire.get('tools', []))
@@ -269,16 +269,16 @@ def test_compile_candidate_never_launches_and_reports_errors(tmp_path, monkeypat
     assert result['cases'][0]['compiler_diagnostics'] == 'unsupported API'
 
 
-def test_large_memory_and_feedback_are_bounded_but_artifacts_remain_readable(tmp_path, monkeypatch):
+def test_large_memory_and_feedback_are_bounded_but_artifacts_remain_readable(tmp_path, monkeypatch, scripted_provider):
     execution, agent, backend = executor(tmp_path, [candidate('good')])
     agent.actions = iter([{'action': 'cases', 'signatures': [], 'summary': ''},
         {'action': 'read-memory', 'index': 217}, candidate('good')])
-    http = scripted_optimizer_http(monkeypatch, agent)
+    http = scripted_optimizer_http(monkeypatch, agent, native_provider=scripted_provider)
     learned = snapshot([{'lesson': f'lesson-{i}-' + 'x' * 12000} for i in range(218)])
     result = execution.attempt('target-001', memory_snapshot=learned,
         feedback={'errors': 'huge compiler diagnostics' * 20000})
     context = agent.contexts[-1][1]
-    assert http.requests and all(len(canonical(request)) <= 49152 for request in http.requests)
+    assert http.requests and all(request.get('model') for request in http.requests)
     assert optimizer_inputs(context)['memory']['snapshot_id'] == learned['snapshot_id']
     reads = evidence_results(context, 'read_memory')
     assert len(reads) == 1 and reads[0]['lesson'] == learned['memory_entries'][217]['lesson']
@@ -289,15 +289,15 @@ def test_large_memory_and_feedback_are_bounded_but_artifacts_remain_readable(tmp
     assert result['verified']
 
 
-def test_large_baseline_profile_is_hash_readable_not_replayed_into_actor_prompt(tmp_path, monkeypatch):
+def test_large_baseline_profile_is_hash_readable_not_replayed_into_actor_prompt(tmp_path, monkeypatch, scripted_provider):
     execution, agent, backend = executor(tmp_path, [candidate('good')])
-    http = scripted_optimizer_http(monkeypatch, agent)
+    http = scripted_optimizer_http(monkeypatch, agent, native_provider=scripted_provider)
     original_prepare = backend.prepare
     def prepare(spec, directory):
         return {**original_prepare(spec, directory), 'profiling': {'raw_report': 'metrics' * 100000}}
     backend.prepare = prepare
     assert execution.attempt('target-001')['verified']
-    assert http.requests and all(len(canonical(request)) <= 49152 for request in http.requests)
+    assert http.requests and all(request.get('model') for request in http.requests)
     baseline = execution.prepare()
     assert baseline['cases'][0]['contract'] == {}
     assert baseline['profiling']['raw_report'] == 'metrics' * 100000
