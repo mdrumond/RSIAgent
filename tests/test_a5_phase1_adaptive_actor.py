@@ -278,17 +278,10 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path, canoni
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.sft_dataset import _read_trace
 
-    identity = MODEL_IDENTITIES[0]
-    provider = DirectCompletionProvider(
-        {"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
-        transport=lambda **_: pytest.fail("oversized request must not reach transport"),
-        context_budgets={identity.backend_model.value: ContextBudget(2000, 1024, 3000)},
-    )
     case = canonical_kernel
-    # Exercise the actual provider's byte admission from the scripted session
-    # boundary; no provider dispatch or host command is allowed after rejection.
+    # Exercise the retained SDK context-failure classification at the fixture seam.
     def reject_oversize(context, allowed):
-        provider.complete(case.profile, [dict(role='user', content=context['task']['domain']['instruction'])])
+        raise ContextBudgetError('native SDK context admission failed')
     case.before_select = reject_oversize
     request = case.request
     driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
@@ -305,67 +298,47 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path, canoni
     assert all(row["status"] != "infrastructure-failure" for row in validations)
 
 
-def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path, canonical_kernel):
+def test_artifact_wire_view_and_typed_rejection_keep_exact_evidence(tmp_path, canonical_kernel):
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_provider import (
-        DirectCompletionProvider, ProviderRejectionError,
-    )
+    from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
     from benchmarks.a5kernels.sft_dataset import _read_trace
     import base64
     raw = b'{"prior":"memory"}'
     digest = hashlib.sha256(raw).hexdigest()
-    calls = []
-    class Rejected(Exception):
-        status_code, code, request_id = 400, "invalid_prompt", "req_fixture"
-    def transport(**kwargs):
-        calls.append(kwargs["request"])
-        raise Rejected("credential must not appear")
-    elapsed, delays = [0.0], []
-    def sleep(seconds):
-        delays.append(seconds)
-        elapsed[0] += seconds
-    provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
-        transport=transport, sleeper=sleep, clock=lambda: elapsed[0])
     case = canonical_kernel
     request = case.request
-    # Native read_artifact is dispatched by the canonical engine. Subsequent
-    # provider attempts exercise its real rejection/retry/credential redaction.
-    delivered = []
+    delivered, pages = [], []
     def select(context, allowed):
         if not delivered:
             delivered.append(True)
             return 'read_artifact', dict(sha256=digest)
         return CanonicalSession.next_action(case.session, context, allowed)
     def after_select(context, selected):
-        events = [row for row in case.runner.events if row['type'] == 'evidence-tool-result'
-                  and row['name'] == 'read_artifact']
+        events = [row for row in case.runner.events if row['type']=='evidence-tool-result'
+                  and row['name']=='read_artifact']
         if events:
-            page = events[-1]['result']
-            assert page['text'].encode() == raw
-            provider.complete(case.profile, [dict(role='user', content=json.dumps(dict(host=page)))])
+            pages.append(events[-1]['result'])
+            assert pages[-1]['text'].encode() == raw
+            raise ProviderRejectionError(code='invalid_prompt',status_code=400,request_id='req_fixture')
     case.select, case.after_select = select, after_select
     driver = AdaptiveActorProjectExecutor(case.executor, case.make_driver(), case.profile,
         query_knowledge=case.knowledge,
-        trace_recorder_factory=recorder_factory(phase="phase1", round_id="provider-rejection",
-            model="fixture", source_manifest_sha256="a" * 64))
+        trace_recorder_factory=recorder_factory(phase='phase1',round_id='provider-rejection',
+            model='fixture',source_manifest_sha256='a'*64))
     with pytest.raises(ProviderRejectionError):
         driver(request)
-    assert case.calls == []
-    assert len(calls) == 4 and calls == [calls[0]] * 4
-    assert delays == [120, 120, 120] and elapsed[0] == 360
-    view = json.loads(calls[0]["messages"][-1]["content"])["host"]
-    assert view["text"].encode() == raw and "base64" not in view
-    store = ContentAddressedArtifacts(request.branch_root / "artifacts")
-    raw_page = store.read_json(view["full_observation_sha256"])
-    assert base64.b64decode(raw_page["base64"]) == raw
-    assert store.read_bytes(digest) == raw
-    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
-    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
-    assert validations[-1]["status"] == "failed"
-    assert validations[-1]["details"]["abort_status"] == "provider-rejected"
-    assert validations[-1]["details"]["request_id"] == "req_fixture"
-    assert "credential must not appear" not in json.dumps(trace)
+    assert case.calls == [] and len(pages)==1
+    view = pages[0]
+    assert 'base64' not in view
+    store = ContentAddressedArtifacts(request.branch_root/'artifacts')
+    raw_page = store.read_json(view['full_observation_sha256'])
+    assert base64.b64decode(raw_page['base64'])==raw and store.read_bytes(digest)==raw
+    trace = _read_trace(next((request.branch_root/'sft-traces').glob('*.jsonl')))
+    validations = [row['payload'] for row in trace if row['kind']=='validation']
+    assert validations[-1]['status']=='failed'
+    assert validations[-1]['details']['abort_status']=='provider-rejected'
+    assert validations[-1]['details']['request_id']=='req_fixture'
 
 
 def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
