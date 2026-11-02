@@ -199,14 +199,14 @@ def worker_environment(*, inherited, outer_cpl_handle, physical_device, cache_di
     return result
 
 
-def project_spec(*, project_id, goal, config):
+def project_spec(*, project_id, goal, config, budgets=None):
     """Finalize launch argv from the canonical config, never staging placeholders."""
     from rsi.contracts import ProjectSpec
 
     if config.executor_identity is not None:
         raise ValueError('A5 on-host binding uses default local execution')
     return ProjectSpec(project_id=project_id, goal=goal,
-                       command=tuple(config.commands['test']), budgets=elapsed_budget(),
+                       command=tuple(config.commands['test']), budgets=elapsed_budget() if budgets is None else budgets,
                        starting_folder=config.source, correctness_ref=config.verifier)
 
 

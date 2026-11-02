@@ -538,8 +538,8 @@ def test_numeric_child_is_reaped_before_profile_without_parent_npu_context(tmp_p
 
 
 @pytest.mark.parametrize('actor_seconds,wall_seconds',
-    [(7200.,None),(900.,5400.),(731.25,5170.5),(300.,420.)],
-    ids=['legacy','root','carried-remaining','diagnostic-child'])
+    [(7200.,None),(900.,5400.),(731.25,5170.5),(300.,420.),(28800.,None),(9600.,None)],
+    ids=['legacy','root','carried-remaining','diagnostic-child','a5-campaign','a5-diagnostic'])
 def test_lease_binder_matches_actual_assignment_and_never_rebuilds_on_resume(
         tmp_path,monkeypatch,actor_seconds,wall_seconds):
     from rsi.catlass_project_config import bind_project,case_identity
@@ -780,6 +780,9 @@ def test_catlass_semantic_subset_uses_scoped_factory_and_actual_lease(catlass_pa
         scheduler=SimpleNamespace(state={'derived_projects':{child.spec.project_id:{
             'provenance_ref':store.put_json(child.provenance)}}}))
     recovery = Phase1Recovery(cycle)
+    from rsi.services import BoundCycle
+    cycle.curriculum = recovery
+    cycle.project_executor_factory = BoundCycle.project_executor_factory.__get__(cycle)
     failed_spec,failed_config = recovery.parent(dict(artifact_ref=store.put_json(dict(root=str(archived)))))
     assert failed_config['binding']==parent_binding
     assert capability_catalog(failed_spec,failed_config)==catalog
@@ -873,3 +876,13 @@ def test_frozen_entrypoint_selects_existing_function_without_rewriting_source(tm
     seed = dict(operation='add', cases=[dict(length=64, block_count=1, seed=17)])
     assert case_identity(seed) == case_identity(dict(seed, entrypoint='kernel'))
     assert case_identity(seed) != case_identity(dict(seed, entrypoint='vector_add'))
+
+
+def test_project_spec_accepts_explicit_campaign_budget_without_resetting_it(tmp_path):
+    from rsi.contracts import BudgetLimits
+    config = project_config(source=tmp_path/'source', verifier=tmp_path/'verify.py', target_python='/registered/python')
+    limits = BudgetLimits(actor_seconds=28800, wall_seconds=None)
+    spec = project_spec(project_id='fresh-a5', goal='Preserve admitted independent allocation', config=config, budgets=limits)
+    assert spec.budgets is limits
+    assert spec.to_dict()['budgets']['actor_seconds'] == 28800
+    assert spec.command == tuple(config.commands['test'])
