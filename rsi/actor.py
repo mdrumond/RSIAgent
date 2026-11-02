@@ -26,18 +26,7 @@ SCHEMAS = {
     'perform': obj({'proposal': STRING, 'edit': obj({
         'path': STRING, 'sha256': STRING, 'source': STRING})}, ['proposal']),
 }
-SYSTEM = (
-    'You select actions for a host-controlled programming workflow. '
-    'Read every mapped skill using read_skill before perform. Only the host '
-    'executes proposals and determines outcomes or stage transitions. '
-    'Use the current stage and observation; never skip stages or claim success '
-    'from a queued action. Source edits require the exact editable path/hash. '
-    'Design and optimisation require real retrospective and KDB evidence. '
-    'Read results appear in the next host snapshot as executed observations. '
-    'Use current_skill_content for already-read skills; use read_context when '
-    'content is paged. Do not repeat a completed read because its native receipt was queued. '
-    'Select exactly one typed host action per turn.'
-)
+
 
 
 @dataclass(frozen=True)

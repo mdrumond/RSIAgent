@@ -156,7 +156,7 @@ class NativeWorkflowSession:
             for path, name in self.skill_paths.items()]
         self.session = NativeSession(self.runner.root/'native'/'session', cwd=self.files.backend.project,
             profile_id=profile, tools=tools, environ=self.environ, observer=self._observe,
-            system_prompt='Use native read/edit/write and the host workflow tools. Read mapped skill files. '
+            system_prompt='Use native read/edit/write and the host workflow tools. Read the retained task file and mapped skill files. '
                 'Design and optimisation require actual KDB and retrospective evidence. '
                 'Only a successful host perform completes a stage; ordinary tool calls continue normally. '
                 'Native edits are retained while the current stage is pending. No arbitrary shell is available.',
