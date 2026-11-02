@@ -1,6 +1,7 @@
 """Independent elapsed allocations preserve canonical paired trials and jobs."""
 from dataclasses import asdict
 import copy
+import json
 import time
 
 import pytest
@@ -208,3 +209,43 @@ def test_legacy_service_cycle_adopts_future_policy_without_resetting_history(ins
             assert row['project']['budgets']['actor_seconds'] == 30
     finally:
         resumed.close()
+
+
+def test_manual_tuning_has_own_round_budget_and_retains_it_across_resume(instance):
+    from rsi.evaluation import SkillEvaluation
+    from test_rsi_services import configure_heldout
+    configure_heldout(instance)
+    settings = show_configuration(instance.root)['payload']
+    settings['cycle_limits'] = dict(actor_seconds=0, recovery_seconds=0, wall_seconds=0)
+    settings['tuning'].update(every_projects=None, at_wave_end=False,
+                              budgets=BudgetLimits(actor_seconds=30, wall_seconds=60).to_dict())
+    set_configuration(instance.root, settings)
+    cycle = instance.create_cycle('tuning-independent', 'phase2')
+    try:
+        for _ in range(5):
+            cycle.step()
+        cycle.request_tuning(dict(project_ref='answer', user_guidance='Use the frozen heldout oracle'),
+                             request_id='bounded-round')
+        cycle.step()  # Real writer and incumbent heldout arm, despite zero shared banks.
+        pending = copy.deepcopy(cycle.tuning.state['pending'])
+        path = next((cycle.root / 'evaluations').glob('*/evaluation.json'))
+        allocation = (path.parent / 'allocation.json').read_bytes()
+        evaluation = SkillEvaluation(path, artifacts=cycle.store, runner_factory=cycle.trial)
+        assert json.loads(allocation)['writer_seconds'] == .25
+        cap = evaluation.plan['parent']['actor_seconds']
+        assert cap == 29.75
+        pair = evaluation.pair(0)
+        assert sum(pair.request(arm).spec.budgets.actor_seconds for arm in ('incumbent', 'candidate')) == cap
+        incumbent = copy.deepcopy(pair.state['arms']['incumbent'])
+        cycle.close()
+        cycle = instance.open_cycle('tuning-independent')
+        assert cycle.tuning.state['pending'] == pending
+        cycle.step()  # Dispatch only the retained candidate arm; do not reset the round.
+        evaluation = SkillEvaluation(path, artifacts=cycle.store, runner_factory=cycle.trial)
+        assert evaluation.pair(0).state['arms']['incumbent'] == incumbent
+        assert (path.parent / 'allocation.json').read_bytes() == allocation
+        assert evaluation.result()['actor_seconds'] <= cap
+        assert not cycle.tuning.state['pending']
+        assert cycle.scheduler.remaining() == dict(actor_seconds=0, recovery_seconds=0, wall_seconds=0)
+    finally:
+        cycle.close()

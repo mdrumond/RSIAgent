@@ -84,7 +84,7 @@ class SkillEvaluation:
                     memory_ref=memory_ref, kdb_ref=kdb_ref, model_config=model_config,
                     incumbent=incumbent, candidate=candidate, joint_limits=limits,
                     remaining_parent={k: remaining_parent.get(k) for k in ('actor_seconds', 'wall_seconds')},
-                    runner_factory=runner_factory, clock=clock, defer_wall_start=True)
+                    runner_factory=runner_factory, clock=clock, defer_wall_start=True, independent=False)
                 plan['pairs'].append(dict(path=str(pair_path.resolve()), frozen=pair.state['frozen'],
                                           case=i, repetition=repetition))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +244,7 @@ class TuningController:
                 return self.controller.step()
             pending = self.state['pending'] = dict(event=event, operation_id=uuid.uuid4().hex)
             self._save()  # Lost factory returns require reopen, never create anew.
-            evaluation = self.factory(copy.deepcopy(event), pending['operation_id'], scheduler.remaining())
+            evaluation = self.factory(copy.deepcopy(event), pending['operation_id'], scheduler._allocation_remaining())
             if not isinstance(evaluation, SkillEvaluation):
                 raise ValueError('canonical evaluation required')
             pending.update(path=str(evaluation.path.resolve()), plan=evaluation.state['plan'])
@@ -252,7 +252,7 @@ class TuningController:
         else:
             if 'path' not in pending:
                 raise WorkflowError('tuning setup pending; explicitly bind retained evaluation')
-            evaluation = self.factory(copy.deepcopy(pending['event']), pending['operation_id'], scheduler.remaining())
+            evaluation = self.factory(copy.deepcopy(pending['event']), pending['operation_id'], scheduler._allocation_remaining())
             if (str(evaluation.path.resolve()) != pending['path']
                     or evaluation.state['plan'] != pending['plan']):
                 raise WorkflowError('tuning factory changed retained round')
