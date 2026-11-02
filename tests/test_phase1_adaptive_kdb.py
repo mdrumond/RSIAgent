@@ -152,12 +152,14 @@ def test_configuration_rejects_unusable_adaptive_bindings(tmp_path, fields):
         NativeProductionConfig(tmp_path, 'A3', 'arch', 'local', 'a'*64, 'b'*40, **fields)
 
 
-def test_librarian_native_role_retains_full_evidence_and_obeys_zero_remaining(tmp_path, monkeypatch, scripted_provider):
+@pytest.mark.parametrize('include_usage', [True, False])
+def test_librarian_native_role_retains_full_evidence_and_obeys_zero_remaining(tmp_path, monkeypatch, scripted_provider, include_usage):
     import base64
     import hashlib
     from benchmarks.ascend.phase1_knowledge import deepseek_librarian
     from test_native_pi_programming_roles import redirect
     url, calls, requests = scripted_provider
+    calls.include_usage = include_usage
     redirect(monkeypatch, url)
     complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
     with pytest.raises(TimeoutError):
@@ -167,7 +169,11 @@ def test_librarian_native_role_retains_full_evidence_and_obeys_zero_remaining(tm
     calls.append(('submit_curriculum_proposal', dict(value=value)))
     result = complete([{'role':'user','content':'Assess admitted documentation'}], 30)
     assert json.loads(result['text']) == value
-    assert result['tokens'] > 0 and len(requests) == 1
+    assert len(requests) == 1
+    if include_usage:
+        assert result['tokens'] > 0
+    else:
+        assert result['tokens'] is None
     assert result['native_evidence']
     objects = {reference:base64.b64decode(data) for reference,data in result['native_evidence'].items()}
     assert all(hashlib.sha256(data).hexdigest()==reference for reference,data in objects.items())
