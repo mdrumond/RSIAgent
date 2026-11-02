@@ -1256,23 +1256,19 @@ def test_completion_provenance_and_no_secret_in_terminal_output(tmp_path):
     assert record["evidence_sha256"] == canonical_digest(composition.cell_digests[record["cell_id"]])
 
 
-def test_deepseek_actor_uses_pi_without_exposing_secret():
-    seen = {}
-    class Session:
-        completion_tokens = 0
-        def __init__(self, **kwargs): seen.update(kwargs)
-        def next_action(self, context, allowed, **kwargs):
-            assert allowed == ["compile"]
-            self.completion_tokens += 3
-            return "compile", {}
-        def close(self): pass
-    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, session_factory=Session)
+def test_deepseek_actor_binds_private_profile_for_canonical_adoption():
+    from coding.pi.session import PiCodingSession
+    from rsi.domain_execution import CanonicalConfigurationError
+    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, session_factory=PiCodingSession)
     cell = next(cell for cell in foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
-    completion = factory(cell, DEFAULT_PROPOSALS[0])(
-        load_a3_model_profile(cell.backend_model), '{"allowed_actions":{"compile":[]}}')
-    assert seen["model"] == BackendModel.DEEPSEEK_FLASH
-    assert completion.provenance["coding_engine"] == "pi"
-    assert "private-value" not in json.dumps(completion.as_dict())
+    actor = factory(cell, DEFAULT_PROPOSALS[0])
+    assert actor.session.model == cell.backend_model.value
+    assert actor.session.profile == load_a3_model_profile(cell.backend_model)
+    assert actor.session.environ['DEEPSEEK_API_KEY'] == 'private-value'
+    assert actor.session.completion_tokens == 0 and actor.session.native_session is None
+    with pytest.raises(CanonicalConfigurationError):
+        actor(load_a3_model_profile(cell.backend_model), '{"allowed_actions":{"compile":[]}}')
+    assert actor.session.native_session is None
 
 
 def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):

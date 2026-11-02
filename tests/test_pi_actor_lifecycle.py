@@ -1,9 +1,9 @@
 """Default Direct/Pi drivers share canonical host admission and recovery."""
 import json
+from pathlib import Path
 
 import pytest
 
-from benchmarks.a5kernels.phase1_provider import DirectCompletion, DISTILLATION_PROMPT
 from benchmarks.ascend.actor_control import ActorControl
 from canonical_kernel_fixtures import canonical_kernel
 
@@ -60,28 +60,40 @@ def test_late_selection_never_executes_host_action(canonical_kernel, backend):
     assert not case.actions.admitted
 
 
-def test_direct_terminal_distillation_separates_host_result_from_user_feedback(canonical_kernel):
+def test_native_terminal_distillation_retains_host_result_and_current_feedback(canonical_kernel, monkeypatch, scripted_provider):
+    from test_native_pi_programming_roles import redirect
+    from test_pi_runtime import _native_wire_objects
+    from test_native_pi_workflow import text_blocks
     case = canonical_kernel
+    url, calls, requests = scripted_provider
+    redirect(monkeypatch, url)
     feedback = 'Inspect the padded tail before completing the task.'
     ActorControl(case.workspace).send('tail-feedback', feedback)
-    requests = []
-    def transport(**options):
-        requests.append(options['request'])
-        return DirectCompletion('{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
-    case.provider._transport = transport
     outcome = case.run()
     assert outcome.status == 'host-verified'
     terminal_history = outcome.continuation.runner.workflow.state['history']
     assert terminal_history[-1]['passed'] is True
+    # Also deliver an instruction arriving after the final programming stage.
+    late = ActorControl(case.workspace).send('terminal-feedback', 'Keep the new lesson specific to this host receipt.')
+    read = []
+    def choose(wire):
+        pointer = next(value for role,value in _native_wire_objects([wire]) if role=='user' and 'context_path' in value)
+        if not read:
+            read.append(pointer['context_path'])
+            return 'read', dict(path=read[0])
+        return 'submit_curriculum_proposal', dict(value=dict(distillation=dict(no_new_knowledge=True, lessons=[])))
+    calls.responder = choose
+    effects = list(case.calls)
     distilled = case.driver.distill(outcome)
-    assert distilled.distillation is not None
-    terminal_message = next(message for message in requests[-1]['messages']
-                            if message['content'].startswith(DISTILLATION_PROMPT))
-    context = json.loads(terminal_message['content'].split('\n')[-1])
+    assert distilled.distillation is not None and distilled.distillation_failure is None
     runner = outcome.continuation.runner
-    assert runner.store.read_json(context['history_ref']) == terminal_history
-    final = context['workflow_history'][-1]
-    assert final['passed'] is True
-    assert final['evidence']['operation_id'] == terminal_history[-1]['evidence']['operation_id']
-    assert final['evidence']['source_hash'] == terminal_history[-1]['evidence']['source_hash']
-    assert feedback in json.dumps(requests[-1]['messages'])
+    context = json.loads(json.loads(Path(read[0]).read_text())[-1]['content'])
+    archive = context['historical_workflow']
+    assert archive['scope'] == 'origin-task-archive'
+    assert runner.store.read_json(archive['reference']) == terminal_history
+    assert context['host_outcome'] == 'host-verified'
+    assert [row['content'] for row in context['feedback']] == [feedback, late['text']]
+    assert case.calls == effects
+    tool_observations = [text for wire in requests for message in wire['messages']
+                         if message['role']=='tool' for text in text_blocks(message['content'])]
+    assert any(feedback in text and late['text'] in text for text in tool_observations)

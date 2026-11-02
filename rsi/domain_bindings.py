@@ -457,7 +457,7 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
         owner.provider.coding_environment(),
         validator=lambda value:parse_agent_distillation(json.dumps(value), admitted),
         artifacts=artifacts, setup_scope=setup)
-    context = dict(instruction=continuation.instruction, host_outcome=outcome.status,
+    context = dict(instruction=continuation.instruction, feedback=host.context()['feedback'], host_outcome=outcome.status,
         source_hash=host.project_hash(), host_summaries=list(host_summaries),
         admitted_artifacts=[dict(reference=reference, role=admitted[reference], path=str(path))
                             for path, reference in artifacts.items()],
