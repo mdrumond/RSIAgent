@@ -250,3 +250,43 @@ def test_real_cpu_pair_findings_feed_memory_and_next_pair_uses_latest_candidate(
         assert cycle.load_project(item['result'])['outcome']=='accepted'
     finally:
         cycle.close()
+
+
+
+def test_reconciled_completed_arm_without_outer_return_reaches_canonical_memory(instance):
+    cycle = instance.create_cycle('lost-return-feedback', 'phase2')
+    try:
+        assert cycle.controller.step().outcome == 'accepted'
+        original = cycle.scheduler.state['originals'][0]
+        event = dict(original=original, memory=cycle.scheduler.state['memory'],
+            incumbent=cycle.scheduler.state['skills'], candidate=cycle.scheduler.state['skills'])
+        pair = cycle.pair(event, 'lost-return-pair', cycle.scheduler._allocation_remaining())
+        factory, created = pair.factory, []
+        def disconnected(request, *, reopen):
+            runner = factory(request, reopen=reopen)
+            if not reopen:
+                created.append(request.arm)
+                if request.arm == 'incumbent':
+                    execute = runner.run
+                    def lost_return():
+                        execute()
+                        raise ConnectionError('canonical arm completed before outer return')
+                    runner.run = lost_return
+            return runner
+        pair.factory = disconnected
+        with pytest.raises(ConnectionError):
+            pair.step()
+        observed = pair.reconcile('incumbent')  # Observe only, never execute again.
+        assert observed['outcome'] == 'accepted'
+        assert 'run_result' not in pair.state['arms']['incumbent']
+        pair.step()
+        feedback = cycle.paired_feedback(event, 'lost-return-pair', pair.result())
+        assert feedback['paired_checkpoint']['arm'] == 'incumbent'
+        assert created == ['incumbent', 'candidate']
+        assert cycle.load_project(feedback)['outcome'] == 'accepted'
+        update = cycle.learning.memory_update(cycle.scheduler.state['memory'], [feedback],
+            cycle.scheduler._context(dict(id='lost-return-memory', kind='memory')))
+        assert update.reference and cycle.memory.records()
+        assert created == ['incumbent', 'candidate']
+    finally:
+        cycle.close()

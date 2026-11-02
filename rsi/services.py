@@ -661,7 +661,18 @@ class BoundCycle(ProjectComposition, TuningBindings):
         if pair.result() != result:
             raise ValueError('paired result differs from trusted canonical arm receipts')
         observed = result['arms'][arm]
-        raw = pair.state['arms'][arm]['run_result']
+        outcome = runner.latest('project-run-outcome')
+        if outcome is None:
+            raise WorkflowError('paired feedback requires the retained canonical run outcome')
+        retained = runner.store.read_json(outcome['reference'])
+        raw = retained['result']
+        if (raw['contract_ref'] != runner.contract_ref
+                or raw['execution_contract_ref'] != runner.backend.manifest['contract']
+                or raw['source_hash'] != observed['source_hash']
+                or raw['source_hash'] != runner.backend.project_hash()
+                or runner.store.read_json(retained['workflow_state_ref']) != runner.workflow.state):
+            raise ValueError('paired feedback outcome differs from the canonical trial')
+        raw = dict(raw, outcome_ref=outcome['reference'], events=[*raw['events'], outcome['reference']])
         self.retain(runner)
         packet = dict(operation_id=request.operation_id, original_id=event['original']['original_id'],
             root=str(runner.root), result=raw, workflow=runner.workflow.state,
