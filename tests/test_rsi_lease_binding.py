@@ -137,7 +137,9 @@ def test_unfinished_resume_uses_saved_binding_without_baseline_or_builder(wave_i
     cycle = wave_instance.create_cycle('resume-binding', 'phase1')
     try:
         observe = cycle.waves.observe
-        monkeypatch.setattr(cycle.waves, 'observe', lambda: None)  # Retain the closed unfinished attempt.
+        # Retain the closed unfinished attempt while honoring observe's pool-state return contract.
+        monkeypatch.setattr(cycle.waves, 'observe',
+                            lambda: cycle.waves._pool(cycle.scheduler.state['active_wave']).status())
         with pytest.raises(RuntimeError):
             cycle.step()
         wave = cycle.scheduler.state['active_wave']
