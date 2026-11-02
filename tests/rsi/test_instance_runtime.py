@@ -20,7 +20,6 @@ def instance(tmp_path):
     for directory in ('config', 'runtime', 'dashboard'):
         (root / directory).mkdir()
     (source / 'pyproject.toml').write_text('[project]\nname="rsi"\nversion="0.1"\n')
-    (source / 'requirements-roles.txt').write_text('nooa==0.0.10\n')
     manifest = {'files': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                          for p in source.rglob('*') if p.is_file()}}
     (root / 'instance.json').write_text(json.dumps(manifest))

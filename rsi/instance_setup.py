@@ -74,15 +74,16 @@ def install(interpreter, *arguments, cwd, env, timeout, offline=False, pip_cache
             *options, *map(str, arguments)], cwd=cwd, env=env, timeout=remaining)
 
 
-def _wheel(source, target):
+def _wheel(source, target, *, inventory=None):
     """Reconstitute the bootstrap's installed-wheel inventory without rebuilding."""
     metadata = list(source.glob('rsi-*.dist-info'))
     if len(metadata) != 1:
         raise ValueError('snapshot lacks source packaging or RSI wheel metadata')
     stem = metadata[0].name.removesuffix('.dist-info')
     wheel = target / f'{stem}-py3-none-any.whl'
+    paths = (source / name for name in inventory) if inventory is not None else source.rglob('*')
     with zipfile.ZipFile(wheel, 'w', zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(source.rglob('*')):
+        for path in sorted(paths):
             if path.is_file():
                 archive.write(path, path.relative_to(source))
     return wheel
@@ -156,23 +157,35 @@ def setup(instance, *, python=None, node=None, roles=True, embeddings=False,
         try:
             host = runtime / 'python' / 'bin' / 'python'
             invoke([python, '-m', 'venv', runtime / 'python'])
-            release = source if (source / 'pyproject.toml').is_file() else _wheel(source, runtime)
-            extras = 'legacy,embeddings' if embeddings else 'legacy'
-            pip(host, str(release) + '[' + extras + ']')
+            inventory = json.loads((root/'instance.json').read_text())['files']
+            owned = [str(Path(name).relative_to('machinery')) for name in inventory
+                     if name.startswith('machinery/')]
+            release = source if (source / 'pyproject.toml').is_file() else _wheel(source, runtime, inventory=owned)
+            pip(host, str(release) + ('[embeddings]' if embeddings else ''))
             invoke([npm, 'ci', '--prefix', source / 'integrations/pi', '--fetch-timeout=30000',
                     '--fetch-retries=1', *(['--offline'] if offline else []),
                     *(['--cache', str(Path(npm_cache).resolve())] if npm_cache else [])])
             invoke([host, '-I', '-c', 'import rsi, flask; import dashboard.app; from pathlib import Path; import sys; assert all(Path(m.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()) for m in (rsi, flask)); from importlib.metadata import version; print(version("rsi"))'])
-            invoke([source / 'integrations/pi/node_modules/.bin/pi', '--version'])
             if embeddings:
                 invoke([host, '-I', '-c', 'import torch, transformers; from pathlib import Path; import sys; assert all(Path(m.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()) for m in (torch, transformers))'])
-            probe = 'import importlib.metadata as m, json, sys; print(json.dumps({"python": sys.version, "packages": {k:m.version(k) for k in ("rsi", "Flask", "Pygments", "openai")}}))'
+            probe = 'import importlib.metadata as m, json, sys; print(json.dumps({"python": sys.version, "packages": {k:m.version(k) for k in ("rsi", "Flask", "Pygments", "PyYAML", "requests")}}))'
             receipt['versions'] = json.loads(subprocess.check_output(
                 [str(host), '-I', '-c', probe], cwd=runtime, env=env, text=True,
                 timeout=min(30, max(.01, timeout - (time.monotonic() - started)))))
             invoke([host, '-I', '-c', 'from coding.pi.native import runtime_preflight; '
-                    'import sys; runtime_preflight(sys.argv[1], sys.argv[2])',
+                    'import coding.pi.native as native; from pathlib import Path; import sys; '
+                    'runtime_preflight(sys.argv[1], sys.argv[2]); '
+                    'assets=Path(native.__file__).resolve().parents[2]/"integrations/pi"; '
+                    'assert all((assets/name).is_file() for name in ("native-session.mjs", "native-files.mjs"))',
                     source/'integrations/pi/node_modules', node])
+            invoke([node, '--input-type=module', '-e',
+                    'import {readFileSync} from "node:fs"; import {join} from "node:path"; '
+                    'import {pathToFileURL} from "node:url"; const root=process.argv[1]; '
+                    'const manifest=JSON.parse(readFileSync(join(root,"package.json"),"utf8")); '
+                    'const sdk=await import(pathToFileURL(join(root,manifest.exports?.["."]?.import||manifest.main))); '
+                    'for(const name of ["createAgentSession","SessionManager","ModelRuntime"]) '
+                    'if(!sdk[name]) throw new Error("Missing Pi SDK export: "+name);',
+                    source/'integrations/pi/node_modules/@earendil-works/pi-coding-agent'])
             receipt.update(state='ready', python=str(host), role_engine='native-pi', roles_python=None)
         except BaseException as exc:
             receipt.update(state='failed', error_type=type(exc).__name__)
