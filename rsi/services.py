@@ -486,7 +486,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 op = admitted['operations'][operation]
                 logical = dict(operation_id=operation, spec=op['spec'], config=op['config'],
                     memory_ref=admitted['memory'], skills_ref=admitted['skills'],
-                    configuration_ref=admitted['configuration'])
+                    configuration_ref=op['binding']['configuration'])
                 if binding.get('logical_admission_hash') != admission_hash(logical):
                     raise ValueError('resolved project differs from admitted logical operation')
                 row = json.loads((self.root / 'waves' / wave_id / 'wave.json').read_text())['projects'][operation]
