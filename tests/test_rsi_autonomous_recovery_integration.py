@@ -1,5 +1,5 @@
 """Real materialization/runner bindings with an explicitly scripted research fixture."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -25,11 +25,30 @@ def autonomous(instance, cpu, request):
         origin_task_archive=dict(scope='origin-task-archive', service_result=archive)))
     admission = instance.store.put_json(dict(project=parent.to_dict(), host_failure_ref=facts,
         parent_config=asdict(config), original_id=parent.project_id, operation_id='historical-operation'))
+    options = dict(getattr(request, 'param', {}))
+    other_cap = options.pop('other_parent_cap', None)
+    admissions, parents = [admission], [parent]
+    if other_cap is not None:
+        other = replace(parent, project_id='other-parent', budgets=replace(parent.budgets, actor_seconds=other_cap))
+        other_observations = instance.store.read_json(observations)
+        other_observations['applicability']['project_id'] = other.project_id
+        other_facts = dict(instance.store.read_json(facts), project_id=other.project_id,
+            observations_ref=instance.store.put_json(other_observations))
+        admissions.append(instance.store.put_json(dict(project=other.to_dict(),
+            host_failure_ref=instance.store.put_json(other_facts), parent_config=asdict(config),
+            original_id=other.project_id, operation_id='other-historical-operation')))
+        parents.append(other)
     settings = show_configuration(instance.root)['payload']
     settings.update(phase1_projects=[parent.to_dict()], project_configs={parent.project_id: asdict(config)},
-        curriculum=dict(enabled=True, only_derived=True, project_actor_seconds=7, failed_parent_refs=[admission]),
+        curriculum=dict(enabled=True, only_derived=True, project_actor_seconds=7, failed_parent_refs=admissions),
         cycle_limits=dict(actor_seconds=90, recovery_seconds=90, recovery_limit=None))
-    settings['cycle_limits'].update(getattr(request, 'param', {}))
+    if other_cap is not None:
+        override = options.pop('project_actor_seconds')
+        if override is None:
+            settings['curriculum'].pop('project_actor_seconds')
+        else:
+            settings['curriculum']['project_actor_seconds'] = override
+    settings['cycle_limits'].update(options)
     set_configuration(instance.root, settings)
     calls = []
     class ScriptedResearch:
@@ -41,7 +60,7 @@ def autonomous(instance, cpu, request):
             assert context['failed_parents'][0]['failure']['origin_task_archive']['service_result'] == archive
             receipt = instance.store.put_json(dict(kind='explicit-scripted-research-fixture', artifact_refs=[facts]))
             return ResearchResult(DiagnosticProposal('one case', 'Investigate one frozen case',
-                'Independent oracle passes', 'cpu.case-subset', dict(case_indices=[1]), parent.project_id),
+                'Independent oracle passes', 'cpu.case-subset', dict(case_indices=[1]), parents[-1].project_id),
                 (facts,), .5, receipt)
     instance.curriculum_researcher = ScriptedResearch()
     cycle = instance.create_cycle('autonomous', 'phase1')
@@ -108,6 +127,28 @@ def test_completed_simplification_receipt_reopens_without_new_research(autonomou
     state = cycle.scheduler.state.copy()
     assert cycle.curriculum.project_config(result.spec) == cycle.project_config(result.spec)
     assert cycle.scheduler.state == state
+
+
+@pytest.mark.parametrize('autonomous', [
+    dict(other_parent_cap=30, project_actor_seconds=None),
+    dict(other_parent_cap=120, project_actor_seconds=None),
+    dict(other_parent_cap=30, project_actor_seconds=7),
+], indirect=True)
+def test_selected_parent_owns_child_default_cap_while_research_keeps_its_allocation(autonomous):
+    cycle, parent, _, calls, _, _ = autonomous
+    selected = cycle.scheduler.state['recovery_queue'][1]
+    expected = cycle.config['curriculum'].get('project_actor_seconds',
+        selected['root_spec']['budgets']['actor_seconds'])
+    result = cycle.step()
+    assert result.parent_project_id == 'other-parent'
+    assert result.spec.budgets.actor_seconds == expected
+    assert calls[0]['remaining']['actor_seconds'] == cycle.config['curriculum'].get(
+        'project_actor_seconds', parent.budgets.actor_seconds)
+    entry = cycle.scheduler.state['derived_projects'][result.spec.project_id]
+    allocation = cycle.store.read_json(entry['allocation_ref'])
+    assert allocation['parent_project_id'] == 'other-parent'
+    assert allocation['actor_seconds'] == expected
+    assert cycle.scheduler.state['recovery_queue'][0]['original_id'] == 'other-parent'
 
 
 @pytest.mark.parametrize('cap', [0, -1, True, float('inf')])

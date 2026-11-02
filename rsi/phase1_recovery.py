@@ -297,7 +297,7 @@ class Phase1Recovery:
             spec, config = inputs[chosen]
             def remaining():
                 if c.scheduler.config.get('deferred_recovery'):
-                    return context['project_actor_seconds']
+                    return c.config['curriculum'].get('project_actor_seconds', spec.budgets.actor_seconds)
                 limits = self.remaining(context, sum(item['actor_seconds'] for item in state['history']))
                 cap = c.config['curriculum'].get('project_actor_seconds')
                 if cap is not None:
