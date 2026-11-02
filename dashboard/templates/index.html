@@ -2,6 +2,16 @@
 <div class="eyebrow">A3 RESEARCH LOOP</div><h1>Campaign control room</h1>
 <p class="lede">A cached view of curriculum progress, evidence and evolving kernel source.</p>
 {% if view.stale %}<aside class="warning">Artifact refresh failed. Showing the last cached snapshot.</aside>{% endif %}
+{% if config.RSI_INPUTS_ENABLED %}
+<section id="instance-campaigns" data-execution-url="{{ url_for('rsi_execution_page') }}">
+<div class="row"><h2>Instance campaigns</h2><button id="instance-campaigns-refresh" type="button">Refresh</button></div>
+<p>Latest CLI job per cycle and retained project evidence. Refreshes every 10 seconds.</p>
+<p id="instance-campaigns-status" role="status" aria-live="polite">Loading instance jobs…</p>
+<div id="instance-campaigns-list"></div>
+<p><a href="{{ url_for('rsi_execution_page') }}">Open RSI execution controls and evidence</a></p>
+</section>
+<script src="{{ url_for('static', filename='instance_campaigns.js') }}" defer></script>
+{% endif %}
 {% if controls.enabled %}<section class="control-panel"><h2>Campaign controls</h2>
 <p>Actions run asynchronously. Confirm each operation before it is queued.</p>
 <div class="control-actions">{% for preset in controls.presets.values() %}

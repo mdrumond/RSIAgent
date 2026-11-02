@@ -37,7 +37,7 @@ def register_rsi_inputs(app, config_path, csrf_token, runner=None):
 
     app.extensions['rsi_cli'] = cli
     from .rsi_execution import register_rsi_execution
-    register_rsi_execution(app, controls, csrf_token, cli)
+    register_rsi_execution(app, controls, csrf_token, cli, instance=instance)
 
     def local_request():
         try:

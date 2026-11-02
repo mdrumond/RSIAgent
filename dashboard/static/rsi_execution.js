@@ -102,18 +102,23 @@
     const add = (tag, text, parent = ledger) => {
       const node = document.createElement(tag); node.textContent = text; parent.append(node); return node;
     };
+    const seconds = (value, key) => !Object.hasOwn(value, key) ? 'unknown'
+      : value[key] === null ? 'unlimited' : value[key] + ' seconds';
     if (!inspection.available) { add('p', inspection.reason); return; }
     for (const wave of inspection.waves || []) {
       add('h3', `Wave ${wave.wave_id}: ${wave.status}`);
       const table = document.createElement('table'); ledger.append(table);
       const header = document.createElement('tr'); table.append(header);
-      for (const label of ['Project / operation', 'Lifecycle / outcome', 'Device lease', 'Actor elapsed / allocation', 'Recovery']) add('th', label, header);
+      for (const label of ['Project / operation', 'Lifecycle / outcome', 'Device lease', 'Actor elapsed', 'Effective actor allocation', 'Actor remaining', 'Wave actor ceiling', 'Recovery']) add('th', label, header);
       for (const project of wave.projects) {
         const row = document.createElement('tr'); table.append(row);
         add('td', `${project.project_id} / ${project.operation_id}`, row);
         add('td', `${project.status} / ${project.outcome || 'not settled'} / ${project.stage || 'not started'}`, row);
         add('td', project.device || (project.assigned_device ? `released ${project.assigned_device}` : 'unassigned'), row);
-        add('td', `${project.actor_seconds == null ? 'unknown' : project.actor_seconds} / ${project.actor_allocation} seconds`, row);
+        add('td', project.actor_seconds == null ? 'unknown' : project.actor_seconds + ' seconds', row);
+        add('td', seconds(project, 'actor_allocation'), row);
+        add('td', seconds(project, 'remaining_actor_seconds'), row);
+        add('td', seconds(project, 'wave_actor_ceiling'), row);
         add('td', project.recovery_authorized ? 'one harness grant retained' : 'no harness grant', row);
         if (project.pending) add('p', `Original pending handle: ${project.pending.handle || project.pending.id}`);
       }
@@ -131,6 +136,7 @@
         add('td', Object.hasOwn(charged, category) ? String(charged[category]) : '—', row);
         add('td', Object.hasOwn(excluded, category) ? String(excluded[category]) : '—', row);
       }
+      add('p', `Effective actor allocation: ${seconds(task, 'actor_allocation')}`);
       add('p', `Actor interval union: ${task.actor_union_seconds == null ? 'unknown / unresolved' : task.actor_union_seconds + ' seconds'}`);
       for (const [key, label] of [['actor_seconds', 'Actor remaining'], ['wall_seconds', 'Wall remaining']]) {
         const remaining = task.remaining || {};

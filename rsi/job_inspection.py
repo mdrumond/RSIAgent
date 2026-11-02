@@ -10,9 +10,8 @@ from .runtime import ActorClock, WorkflowError
 from .skills import SkillBundle
 
 
-def inspect_task(path, *, clock=time.time):
-    path = Path(path)
-    state = json.loads((path / 'workflow.json').read_text())
+def inspect_workflow(state, *, clock=time.time):
+    """Project retained workflow accounting without opening or changing a runner."""
     now = clock()
     intervals = state['intervals']
     accounting = ActorClock(intervals, lambda: None, lambda: now,
@@ -46,12 +45,19 @@ def inspect_task(path, *, clock=time.time):
             return ActorClock(records, lambda: None, lambda: now).seconds(kind)
         except WorkflowError:
             return None
-    result = dict(task_id=path.name, charged_seconds={k: category(k) for k in sorted(ActorClock.BILLABLE)},
+    result = dict(actor_allocation=cap, charged_seconds={k: category(k) for k in sorted(ActorClock.BILLABLE)},
         excluded_seconds={k: category(k) for k in sorted(ActorClock.EXCLUDED)},
         actor_union_seconds=union, remaining=remaining, accounting_state=condition,
         intervals=intervals, clock_domain='controller', timing_uncertainties=state.get('timing_uncertainties', {}),
         timing_receipts=state.get('timing_receipts', {}),
         source_hash=state['source'], stage=state['stage'])
+    return result
+
+
+def inspect_task(path, *, clock=time.time):
+    path = Path(path)
+    result = inspect_workflow(json.loads((path / 'workflow.json').read_text()), clock=clock)
+    result['task_id'] = path.name
     manifest = path / 'runner.json'
     if manifest.exists():
         store = ContentAddressedArtifacts(path / 'artifacts')
