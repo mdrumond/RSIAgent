@@ -18,7 +18,7 @@ class Clock:
 
 
 class Files:
-    def __init__(self, root, *, store, read_paths):
+    def __init__(self, root, *, store, read_paths, record):
         self.paths = read_paths
     def session_options(self):
         return {}
@@ -185,3 +185,27 @@ def test_legacy_diagnostic_reader_preserves_conditional_redirection_contract():
         _proposal('diagnostic', data, {'query'})
     data['negative_decisions'][0]['redirection'] = 'Use a smaller admitted input'
     assert _proposal('diagnostic', data, {'query'}).proposal.parameters == {'case_indices': [0]}
+
+
+def test_native_role_preserves_research_query_accounting_and_host_binding(tmp_path):
+    from rsi.contracts import ProjectSpec
+    from rsi.curriculum_research import Researcher
+    roles, clock, _, _, store = fixture_roles(tmp_path, responses=[IDEA])
+    queries = []
+    def query(payload, *, deadline):
+        queries.append(payload)
+        clock.now += 3
+        return dict(results=[dict(text='Actual document fact')], negative_records=[],
+                    provenance={'collection': 'documents'})
+    researcher = Researcher(roles, query, store, clock=clock)
+    template = dict(template_id='cpu.case-subset', parameters={'case_indices': dict(
+        type='array', items={'type': 'integer', 'enum': [0, 1]}, minItems=1, maxItems=1, uniqueItems=True)})
+    result = researcher.research(ProjectSpec('parent', 'Original immutable goal', ('python', 'verify.py')),
+        {'error': 'Retained numerical mismatch'}, dict(operation_id='research', root=tmp_path,
+            deadline=110., templates=[template]))
+    assert result.actor_seconds == 5 and len(queries) == 1
+    assert result.proposal.parent_project_id == 'parent'
+    assert result.proposal.parameters == {'case_indices': [0]}
+    receipt = store.read_json(result.receipt_ref)
+    assert receipt['status'] == 'accepted'
+    assert researcher.actor_context(result.receipt_ref)['rationale'] == IDEA['why']

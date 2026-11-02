@@ -237,7 +237,8 @@ class NativeRoles:
         admitted_files = [prompt_file]
         manifest = []
         for item in evidence:
-            content = canonical_bytes(dict(evidence_id=item.evidence_id, data=item.data))
+            content = json.dumps(dict(evidence_id=item.evidence_id, data=item.data),
+                                 indent=2, ensure_ascii=False, allow_nan=False).encode()
             reference = self.store.put_bytes(content)
             target = inputs/(reference+'.json')
             target.write_bytes(content)
@@ -266,7 +267,9 @@ class NativeRoles:
             files_factory = NativeFiles
         else:
             files_factory = self.files_factory
-        resources = files_factory(root, store=self.store, read_paths=admitted_files)
+        resources = files_factory(root, store=self.store, read_paths=admitted_files,
+            record=lambda kind, payload: self.observer('role_native_file',
+                dict(role=role, kind=kind, **payload)))
         def observe(event):
             reference = self.store.put_json(event)
             self.observer('role_native_event', dict(role=role, type=event['type'], artifact_ref=reference))
