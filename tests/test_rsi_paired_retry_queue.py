@@ -52,7 +52,8 @@ def scenario(tmp_path, outcomes, *, limit=5, mode=Mode.PHASE2, recover=True):
             paired_checkpoint=dict(operation_id=operation, frozen=result['frozen'], arm=accepted),
             retry_checkpoint=dict(operation_id=operation, frozen=result['frozen'], arm='candidate'))
     controller = CycleController(tmp_path/'controller.json', scheduler, LearningStub('incumbent'),
-        artifacts=store, pair_factory=pair, pair_feedback=feedback)
+        artifacts=store, pair_factory=pair)
+    controller.pair_feedback = feedback
     return scheduler, controller, trace, results
 
 
@@ -191,14 +192,18 @@ from test_rsi_service_wave import wave_query
 
 
 class AnswerDecision(Decisions):
-    def __init__(self, repair):
-        self.repair = repair
+    def __init__(self, repair, broken=False):
+        self.repair, self.broken, self.edited = repair, broken, False
     def next_action(self, context, allowed, **kwargs):
-        if self.repair and context['stage']=='debug' and any(
+        if any(name not in {row['skill'] for row in context['read_skills']} for name in context['skills']):
+            return super().next_action(context, allowed, **kwargs)
+        if (self.repair or self.broken and not self.edited) and context['stage']=='debug' and any(
                 row['classification']=='numeric_failure' for row in context['task']['feedback']):
             source = context['source']
+            self.edited = True
             return 'perform', dict(proposal='Correct the observed frozen-oracle mismatch', edit=dict(
-                path=source['path'], sha256=source['sha256'], source='answer = 42\n'))
+                path=source['path'], sha256=source['sha256'],
+                source='answer = 42\n' if self.repair else 'answer = 40\n'))
         return super().next_action(context, allowed, **kwargs)
 
 
@@ -217,7 +222,7 @@ def test_real_cpu_pair_findings_feed_memory_and_next_pair_uses_latest_candidate(
     def sessions():
         created.append(len(created))
         # Original + first pair fail; only the second pair's candidate repairs.
-        return AnswerDecision(repair=len(created)==5)
+        return AnswerDecision(repair=len(created)==5, broken=len(created)==3)
     instance.test = Bindings(wave_query, sessions, Roles, 'explicit-scripted-CPU-fixture')
     cycle = instance.create_cycle('real-paired-queue', 'phase2')
     try:
@@ -237,6 +242,9 @@ def test_real_cpu_pair_findings_feed_memory_and_next_pair_uses_latest_candidate(
         assert len(cycle.memory.records())>=3
         pairs = [json.loads(p.read_text()) for p in (cycle.root/'pairs').glob('*.json')]
         assert all(all(row['status']=='complete' for row in pair['arms'].values()) for pair in pairs)
+        latest_pair, _, latest = cycle.paired_checkpoint(item['checkpoint'])
+        assert cycle.store.read_bytes(latest_pair.frozen['files']['solution.py'])==b'answer = 40\n'
+        assert (latest.backend.project/'solution.py').read_bytes()==b'answer = 42\n'
         packet = cycle.store.read_json(item['result']['artifact_ref'])
         assert packet['host_outcome']=='accepted'
         assert cycle.load_project(item['result'])['outcome']=='accepted'

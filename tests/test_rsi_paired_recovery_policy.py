@@ -99,14 +99,21 @@ def test_controller_preserves_memory_writer_and_validated_promotion_at_zero_pool
     learning = LearningStub('incumbent')
     class Pair:
         def result(self):
-            return dict(decision='benefit', actor_seconds=45,
-                        evidence_ref=store.put_json({'actual': 'paired evidence'}))
+            return dict(decision='benefit', actor_seconds=45, frozen='scripted-pair',
+                arms=dict(incumbent=dict(outcome='failed', workflow=False, correctness=False,
+                    task_failure=True, actor_seconds=25), candidate=dict(outcome='accepted',
+                    workflow=True, correctness=True, task_failure=False, actor_seconds=20)),
+                evidence_ref=store.put_json({'actual': 'paired evidence'}))
     def pair(event, operation, remaining):
         assert remaining == dict(actor_seconds=None, recovery_seconds=None, wall_seconds=None)
         calls.append(('pair', event['memory']))
         return Pair()
+    def feedback(event, operation, result):
+        return dict(project=project.to_dict(), original_id='root', operation_id=operation+'-candidate',
+            outcome='accepted', actor_seconds=20, artifact_ref=result['evidence_ref'],
+            paired_checkpoint=dict(operation_id=operation, arm='candidate', frozen=result['frozen']))
     controller = CycleController(tmp_path / 'controller.json', scheduler, learning,
-                                 artifacts=store, pair_factory=pair)
+                                 artifacts=store, pair_factory=pair, pair_feedback=feedback)
     try:
         for _ in range(4):
             controller.step()
@@ -117,6 +124,10 @@ def test_controller_preserves_memory_writer_and_validated_promotion_at_zero_pool
         assert scheduler.remaining() == dict(actor_seconds=0, recovery_seconds=0, wall_seconds=0)
         assert scheduler.state['spent'] == 81
         assert len(scheduler.state['extension_receipts']) == 1
+        item = scheduler.state['paired_retry_queue']['root']
+        assert item['status'] == 'accepted' and item['failed_attempts'] == 0
+        controller.step()  # The actual paired feedback enters the next Memory update.
+        assert calls[-1] == ('memory', item['result']['artifact_ref'])
     finally:
         scheduler.close()
 
