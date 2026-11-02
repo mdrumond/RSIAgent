@@ -799,7 +799,7 @@ def test_phase2_pairs_known_closed_failed_checkpoint_and_keeps_its_original_trac
         assert comparison['arms']['incumbent']['outcome'] == 'failed'
         assert comparison['arms']['incumbent']['workflow'] is False
         assert comparison['arms']['candidate']['outcome'] == 'accepted'
-        assert pair.frozen['allocation']['actor_seconds'] == 600
+        assert pair.frozen['allocation']['actor_seconds'] == config['recovery']['budgets']['actor_seconds']
         assert comparison['arms']['incumbent']['actor_seconds'] > 600
         assert comparison['arms']['candidate']['actor_seconds'] < 600
         assert pair.frozen['terminal_failure_ref']
