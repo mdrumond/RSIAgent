@@ -818,10 +818,7 @@ class OptimizerHost(SourceHost):
                     visit(item)
         visit(request)
         if shown:
-            delivered = observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown),
-                                 identity)
-            if delivered.get('memory_summary') != shown:
-                raise WorkflowError('memory availability changed before provider dispatch; refresh context')
+            observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown), identity)
 
 
     def __init__(self, owner, inputs):
