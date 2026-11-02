@@ -276,7 +276,9 @@ def test_real_sdk_protocol_fault_retains_native_logs_and_requires_observed_settl
     injected = []
     def protocol_fault(session, event):
         observe(session, event)
-        if not injected and event['type'] == ('agent_settled' if known else 'message_start'):
+        trigger = (event['type'] == 'agent_settled' if known else
+                   event['type'] == 'message_start' and event.get('message', {}).get('role') == 'assistant')
+        if not injected and trigger:
             injected.append(event['type'])
             # Inject a controller-channel parse fault at the actual SDK boundary,
             # after either real settlement or the first real in-flight response.
