@@ -28,7 +28,12 @@ def object_lines(message):
 
 @pytest.fixture
 def canonical_provider():
-    requests, emitted, repaired = [], [], False
+    class Observations(list):
+        overflow = False
+        overflow_sent = False
+        history_reads = 0
+        compactions = 0
+    requests, emitted, repaired = [], Observations(), False
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -37,6 +42,23 @@ def canonical_provider():
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             requests.append(body)
             messages = body['messages']
+            if not body.get('tools'):
+                emitted.compactions += 1
+                payload = dict(id='summary', object='chat.completion.chunk', model='deepseek-flash',
+                    choices=[dict(index=0, delta=dict(role='assistant', content=
+                        '## Goal\nComplete the retained canonical Python task.\n## Progress\n'
+                        'The host retained actual tool results and the numeric repair source transition. '
+                        'Keep exact receipt IDs in the recent tool state and finish the pending host stage.\n'), finish_reason='stop')],
+                    usage=dict(prompt_tokens=10, completion_tokens=40, total_tokens=50))
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
+                self.wfile.write(('data: '+json.dumps(payload)+'\n\ndata: [DONE]\n\n').encode())
+                return
+            if emitted.overflow and repaired and not emitted.overflow_sent:
+                emitted.overflow_sent = True
+                self.send_response(400); self.send_header('Content-Type', 'application/json'); self.end_headers()
+                self.wfile.write(json.dumps(dict(error=dict(type='invalid_request_error',
+                    code='context_length_exceeded', message='Maximum context length exceeded; compact the conversation.'))).encode())
+                return
             prompts = [(i, value) for i, message in enumerate(messages) if message['role'] == 'user'
                        for value in object_lines(message) if 'mapped_skills' in value]
             assert prompts, 'native provider must receive actual canonical stage context'
@@ -52,6 +74,11 @@ def canonical_provider():
             name, args = 'perform', dict(proposal='Use stable accumulation')
             if missing:
                 name, args = 'read', dict(path=missing['path'])
+            elif emitted.overflow and prompt['stage'] == 'design' and emitted.history_reads < 3:
+                from pathlib import Path
+                name, args = 'read', dict(path=str(Path(prompt['editable_files'][0]).parent/'history-reference.md'),
+                                          offset=1+emitted.history_reads*1000, limit=1000)
+                emitted.history_reads += 1
             elif prompt['stage'] in ('design', 'optimisation'):
                 if 'query_kdb' not in evidence:
                     name, args = 'query_kdb', dict(query='stable sum')
@@ -91,13 +118,16 @@ def canonical_provider():
         server.shutdown(); server.server_close(); thread.join()
 
 
-def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path, monkeypatch, canonical_provider):
+@pytest.mark.parametrize('overflow', [False, True])
+def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path, monkeypatch, canonical_provider, overflow):
     import coding.pi.native as native
     url, requests, emitted = canonical_provider
+    emitted.overflow = overflow
     profile = native.model_profile
     monkeypatch.setattr(native, 'model_profile', lambda identity: dict(profile(identity), base_url=url))
     runner, _, database = make(tmp_path, budgets=BudgetLimits(actor_seconds=120, wall_seconds=180),
-        session_factory=lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fixture-secret'}))
+        session_factory=lambda: PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY': 'fixture-secret'}),
+        extra_files={'history-reference.md': ('Python math.fsum preserves stable accumulation. Keep the frozen oracle and host evidence.\n' * 4000).encode()} if overflow else None)
     verifier = runner.backend.verifier.read_bytes()
     try:
         result = runner.run()
@@ -131,6 +161,16 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         assert session_refs and all(b'fixture-secret' not in runner.store.read_bytes(reference) for reference in session_refs)
         assert set(session_refs) <= {row['id'] for row in rows if row['kind'] == 'artifact'}
         assert any(row['kind'] == 'event' and row['data'].get('type') == 'native-session-artifacts' for row in rows)
+        if overflow:
+            assert emitted.overflow_sent and emitted.compactions > 0
+            native = [event['event'] for event in runner.events if event['type'] == 'pi-native-event']
+            assert any(event['type'] == 'auto_compaction_start' for event in native)
+            assert any(event['type'] == 'auto_compaction_end' for event in native)
+            entries = [json.loads(line) for path in (runner.root/'native/session/sessions').glob('*.jsonl')
+                       for line in path.read_text().splitlines()]
+            assert any(entry['type'] == 'compaction' for entry in entries)
+            assert len([entry for entry in emitted if entry['name'] == 'edit']) == 1
+
     finally:
         runner.actor.close()
         database.close()
