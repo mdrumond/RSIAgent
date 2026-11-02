@@ -55,7 +55,10 @@ class NativeWorkflowSession:
                 path=receipt['path'], source_ref=receipt['artifact_ref']))
 
     def _remaining(self):
-        remaining = self.actor._available()
+        bounds = [value for value in self.runner.workflow.remaining().values() if value is not None]
+        remaining = min(bounds) if bounds else None
+        if self.runner.workflow.state['stopped'] and not self.session.cancelled.is_set():
+            self.session.abort()
         if self.enclosing_deadline is not None:
             wall = self.enclosing_deadline-time.monotonic()
             remaining = wall if remaining is None else min(remaining, wall)
