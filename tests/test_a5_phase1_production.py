@@ -310,7 +310,9 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     trace_messages = [row["payload"] for row in trace_rows if row["kind"] == "message"]
     assert trace_messages[-2]["role"] == "user"
     assert trace_messages[-1] == {"role": "assistant", "content": SOURCE}
-    assert any(row["kind"] == "tool" for row in trace_rows)
+    dispatches = [case.runner.store.read_json(event['reference']) for event in case.runner.events
+                  if event['type'] == 'domain-dispatch']
+    assert {'compile', 'run'} <= {row['name'] for row in dispatches}
     assert trace_rows[-2]["kind"] == "validation"
     assert trace_rows[-2]["payload"]["status"] == "passed"
     assert trace_rows[-2]["payload"]["evidence_sha256"] == memory.host_facts[0].evidence_sha256
