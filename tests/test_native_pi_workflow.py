@@ -209,3 +209,41 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
     finally:
         runner.actor.close()
         database.close()
+
+
+@pytest.mark.parametrize('boundary', ['transport_unknown', 'elapsed_after_host'])
+def test_canonical_host_result_requires_settlement_and_elapsed_admission(tmp_path, monkeypatch, canonical_provider, boundary):
+    import coding.pi.native as native
+    url, requests, emitted = canonical_provider
+    profile = native.model_profile
+    monkeypatch.setattr(native, 'model_profile', lambda identity:dict(profile(identity), base_url=url))
+    original = native.NativeSession._record
+    intercepted = []
+    def record(session, event):
+        original(session, event)
+        if event['type']=='host_callback_end' and event.get('name')=='perform' and not intercepted:
+            intercepted.append(event['tool_call_id'])
+            if boundary == 'transport_unknown':
+                with session.events.mutex:
+                    session.events.queue.appendleft(dict(type='protocol_error', message='Injected lost settlement after host result'))
+            else:
+                time.sleep(2.1)  # Measured post-host thinking/settlement time, not a fake charge.
+    monkeypatch.setattr(native.NativeSession, '_record', record)
+    runner, _, database = make(tmp_path, budgets=BudgetLimits(actor_seconds=2, wall_seconds=20),
+        session_factory=lambda:PiSessionAdapter(model='deepseek-flash', environ={'DEEPSEEK_API_KEY':'fixture-secret'}))
+    try:
+        result = runner.run()
+        assert intercepted
+        assert runner.workflow.pending['stage'] == 'task_construction'
+        assert runner.workflow.state['history'] == []
+        proposals = [event for event in runner.events if event['type']=='stage-result-proposed']
+        assert len(proposals) == 1
+        assert result['status'] != 'accepted'
+        if boundary == 'transport_unknown':
+            assert any(event['type']=='pi-native-event' and event['event']['type']=='native_fault'
+                       for event in runner.events)
+        else:
+            assert runner.workflow.accounting.seconds() >= 2.1
+    finally:
+        runner.actor.close()
+        database.close()
