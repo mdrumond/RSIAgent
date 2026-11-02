@@ -130,15 +130,18 @@ def test_unbounded_deadline_allows_native_read_and_pending_write(tmp_path):
 
 @pytest.fixture
 def scripted_provider():
-    calls, requests = [], []
+    class Calls(list):
+        responder = None
+    calls, requests = Calls(), []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
         def do_POST(self):
             requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             delta = dict(role='assistant', content='Finished.')
-            if calls:
-                name, arguments = calls.pop(0)
+            action = calls.responder(requests[-1]) if calls.responder is not None else (calls.pop(0) if calls else None)
+            if action is not None:
+                name, arguments = action
                 delta.update(content=None, tool_calls=[dict(index=0, id=f'call-{len(requests)}', type='function',
                     function=dict(name=name, arguments=json.dumps(arguments)))])
             payload = dict(id='fixture', object='chat.completion.chunk', model='deepseek-flash',

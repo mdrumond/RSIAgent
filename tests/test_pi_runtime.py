@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 import pytest
+from test_native_pi_filesystem import scripted_provider
 
 def stream(tool, args, index=0, finish='tool_calls'):
     class Response:
@@ -125,7 +126,7 @@ def _native_wire_objects(wires):
 
 
 def _canonical_kernel_case(tmp_path, monkeypatch, *, real=False, shape=None,
-                           reject=False, expire=False, parent_expired=False):
+                           reject=False, expire=False, parent_expired=False, native_provider=None):
     """Real canonical host/SQL evidence; scripted CPU decisions, never a device."""
     from dataclasses import replace
     from types import SimpleNamespace
@@ -217,17 +218,32 @@ def _canonical_kernel_case(tmp_path, monkeypatch, *, real=False, shape=None,
             return dict(stage=stage.value,unread_skills=[n for n in names if n not in read_names],evidence=evidence,
                 read_skills=[dict(receipt_id=runner.service.read_receipt(e['receipt_id'])) for e in reads],
                 source=dict(path=source.path,text=source.text,sha256=source.sha256,project_hash=source.project_hash))
-        def provider(*_,**kwargs):
-            wire=json.loads(kwargs['data']); state.wires.append(wire)
-            if not wire.get('tools'):
-                return response([],len(state.wires))
-            # One genuine SDK-level rejection before reads. No host completion.
-            if reject and len(state.wires)==1:
-                model.rejected=True
-                return response([('read_context',{'record':'0'*64})],len(state.wires))
-            name,args=model.next_action(payload(),[],seconds=60,record=lambda *_:None,source=None)
-            return response([(name,args)],len(state.wires))
-        monkeypatch.setattr('coding.pi.gateway.requests.post',provider)
+        from pathlib import Path
+        from test_native_pi_programming_roles import redirect
+        if native_provider is None:
+            raise AssertionError('real native domain fixture requires loopback provider')
+        url, calls, wires = native_provider
+        redirect(monkeypatch, url)
+        state.wires = wires
+        queued, read_tasks = [], set()
+        def choose(wire):
+            prompts = [value for role,value in _native_wire_objects([wire]) if role=='user' and 'mapped_skills' in value]
+            prompt = prompts[-1]
+            if prompt['operation_id'] not in read_tasks:
+                read_tasks.add(prompt['operation_id'])
+                return 'read', dict(path=prompt['task']['path'])
+            if queued:
+                return queued.pop(0)
+            context = payload()
+            name, args = model.next_action(context, [], seconds=60, record=lambda *_:None, source=None)
+            if name == 'read_skill':
+                return 'read', dict(path=next(row['path'] for row in prompt['mapped_skills'] if row['name']==args['name']))
+            if name == 'perform' and 'edit' in args:
+                edit = args.pop('edit')
+                queued.append(('perform', args))
+                return 'write', dict(path=prompt['editable_files'][0], content=edit['source'])
+            return name, args
+        calls.responder = choose
     else:
         monkeypatch.setattr(binding,'PiSessionAdapter',lambda **_:model)
         monkeypatch.setattr('coding.pi.actor.runtime_preflight',lambda:None)
@@ -247,12 +263,15 @@ def _canonical_kernel_case(tmp_path, monkeypatch, *, real=False, shape=None,
 
 
 
-def test_actor_provider_receives_layout_contract_without_context_reads(monkeypatch, tmp_path):
-    state = _canonical_kernel_case(tmp_path, monkeypatch, real=True, shape=(2,23)).run()
+def test_native_actor_reads_actual_layout_contract(monkeypatch, tmp_path, scripted_provider):
+    state = _canonical_kernel_case(tmp_path, monkeypatch, real=True, shape=(2,23), native_provider=scripted_provider).run()
     assert state.outcome.status == 'host-verified'
     first = next(value for role,value in _native_wire_objects(state.wires[:1])
                  if role=='user' and 'task' in value)
-    contract = first['task']['domain']['kernel_contract']
+    from pathlib import Path
+    contract = json.loads(Path(first['task']['path']).read_text())['domain']['kernel_contract']
+    assert any('kernel_contract' in message.get('content', '') for wire in state.wires
+               for message in wire['messages'] if message['role']=='tool')
     assert contract['shape']==[2,23] and contract['dtype']=='float32'
     assert contract['block_count']==1 and contract['padding_multiple']==32
     assert contract['abi']['input_arguments']==['gm_input0']
