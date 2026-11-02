@@ -256,8 +256,9 @@ def test_native_librarian_repairs_uninspected_id_inside_same_session(tmp_path, m
     complete = deepseek_librarian({'DEEPSEEK_API_KEY':'fixture-secret'}, root=tmp_path/'native-librarian')
     steps = []
     def choose(wire):
-        pointer = json.loads(next(message['content'] for message in reversed(wire['messages'])
-                                 if message['role']=='user' and 'context_path' in message['content']))
+        from test_pi_runtime import _native_wire_objects
+        pointer = next(value for role,value in _native_wire_objects([wire])
+                       if role=='user' and 'context_path' in value)
         if not steps:
             steps.append('read')
             return 'read', dict(path=pointer['context_path'])
