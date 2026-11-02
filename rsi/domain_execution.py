@@ -242,6 +242,8 @@ class DomainRunner(ProjectRunner):
             self._factory_attempted = True
             self._session_closure_ref = None
             session = session_factory()
+            if hasattr(session, 'configure'):
+                session.configure(self)
             original_close = getattr(session.close, '_rsi_original_close', session.close)
             def observed_close():
                 original_close()
@@ -340,12 +342,21 @@ class DomainRunner(ProjectRunner):
             decision = self.store.read_json(next(e['reference'] for e in reversed(self.events)
                 if e['type'] == 'project-tool' and e['operation_id'] == operation
                 and e['name'] == 'optimisation_decision'))
-            if (decision['action'] == 'edit') != ('edit' in args):
+            changed = self.backend.project_hash() != self.workflow.source_hash
+            if (decision['action'] == 'edit') != ('edit' in args or changed):
                 raise WorkflowError('optimisation decision does not match edit')
             args = dict(args, optimisation_decision=decision)
-        old_hash = self.backend.project_hash()
-        if old_hash != self.workflow.source_hash:
-            raise WorkflowError('domain source changed outside current stage')
+        old_hash = self.workflow.source_hash
+        current_hash = self.backend.project_hash()
+        native_refs = []
+        if current_hash != old_hash:
+            session = self.actor.session
+            if not hasattr(session, 'pending_source'):
+                raise WorkflowError('domain source changed outside current stage')
+            retained = session.pending_source(operation)
+            if retained['source_hash'] != current_hash:
+                raise WorkflowError('domain source differs from retained native edit')
+            native_refs.append(retained['reference'])
         if 'edit' in args:
             edit = args['edit']
             before_edit = getattr(self.backend, 'before_edit', None)
@@ -405,7 +416,7 @@ class DomainRunner(ProjectRunner):
             (self.spec.performance_goal is None or observation.performance == 'met'))
         checkpoint = self.capture_checkpoint(operation, scope='stage')
         return self.result(operation, StageResult(passed=passed,
-            artifact_refs=(*observation.artifact_refs, *extra_refs, ref, checkpoint),
+            artifact_refs=(*observation.artifact_refs, *native_refs, *extra_refs, ref, checkpoint),
             retrieval_refs=(selection['query_ref'],) if selection else (),
             retrospective_ref=selection['retrospective_ref'] if selection else None,
             new_source_hash=actual if actual != old_hash else None, redesign=redesign))

@@ -33,8 +33,13 @@ class NativeWorkflowSession:
                 raise ValueError('frozen native skill changed')
             path.write_text(document.content)
             self.skill_paths[path.resolve()] = document.name
-        self.files = NativeFiles(root/'source-transitions', store=runner.store,
-            read_paths=self.skill_paths, backend=runner.backend, record=self._file_event)
+        if hasattr(runner.backend, 'project'):
+            self.files = NativeFiles(root/'source-transitions', store=runner.store,
+                read_paths=self.skill_paths, backend=runner.backend, record=self._file_event)
+        else:
+            from rsi.native_source import DomainFiles
+            self.files = DomainFiles(root/'source-transitions', runner=runner,
+                                     read_paths=self.skill_paths, record=self._file_event)
 
     def _file_event(self, kind, payload):
         self.runner.actor_event(kind, dict(payload, operation_id=self.runner.workflow.pending['id']))
@@ -133,7 +138,7 @@ class NativeWorkflowSession:
             filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,
             sourceInfo=dict(path=str(path), source='rsi-frozen-bundle', scope='project', origin='top-level'))
             for path, name in self.skill_paths.items()]
-        self.session = NativeSession(self.runner.root/'native'/'session', cwd=self.runner.backend.project,
+        self.session = NativeSession(self.runner.root/'native'/'session', cwd=self.files.backend.project,
             profile_id=profile, tools=tools, environ=self.environ, observer=self._observe,
             system_prompt='Use native read/edit/write and the host workflow tools. Read mapped skill files. '
                 'Design and optimisation require actual KDB and retrospective evidence. '
@@ -153,7 +158,7 @@ class NativeWorkflowSession:
             user_guidance=turn[0]['task'].get('user_guidance', {}),
             mapped_skills=[dict(name=name, path=str(path)) for path, name in self.skill_paths.items()
                            if name in turn[0]['skills']],
-            editable_files=[str(self.runner.backend.project/name) for name in self.runner.config.editable_files])
+            editable_files=[str(self.files.backend.project/name) for name in self.runner.config.editable_files])
         self._resume()
         try:
             self.session.prompt(json.dumps(prompt), operation_id=operation, remaining=self._remaining)
