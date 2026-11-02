@@ -33,6 +33,37 @@ class GuardPending(GuardDenied):
 
 
 @dataclass(frozen=True)
+class ProjectConfigurationProfiles:
+    """A child admission's immutable binder configuration over the same transport."""
+    factory: object
+    configuration: dict
+
+    def __call__(self, identity):
+        return self.factory(identity)
+
+    def metadata(self, identity):
+        return self.factory.metadata(identity)
+
+    def worker_environment(self, identity, request, **kwargs):
+        return self.factory.worker_environment(identity, request, **kwargs)
+
+    def guard(self, identity, request, **kwargs):
+        return self.factory.guard(identity, request, **kwargs)
+
+    def binding_contract(self, identity):
+        from rsi.project_binding import admission_hash
+        return admission_hash(dict(binder=self.factory.project_binding(identity)['callback'],
+                                   configuration=self.configuration))
+
+    def bind_project(self, identity, request, logical_admission, *, remaining):
+        callback = self.factory.project_binding(identity)['callback']
+        if not callback:
+            raise ValueError('derived project requires the registered parent binder')
+        return _callable(callback)(request, logical_admission, metadata=self.metadata(identity),
+                                   configuration=self.configuration, remaining=remaining)
+
+
+@dataclass(frozen=True)
 class ExecutorProfiles:
     path: str
 
@@ -69,6 +100,15 @@ class ExecutorProfiles:
         from rsi.project_binding import admission_hash
         return admission_hash(dict(binder=value['project_binder'],
                                    configuration=value.get('project_configuration', {})))
+
+    def project_binding(self, identity):
+        """Trusted host binding inputs; never part of public runtime metadata."""
+        value = self._record(identity)
+        return dict(callback=value.get('project_binder'),
+                    configuration=value.get('project_configuration', {}))
+
+    def with_project_configuration(self, configuration):
+        return ProjectConfigurationProfiles(self, configuration)
 
     def bind_project(self, identity, request, logical_admission, *, remaining):
         value = self._record(identity)

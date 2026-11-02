@@ -55,11 +55,14 @@ class TestBindings:
 
 
 class InstanceServices:
-    def __init__(self, instance, *, environment=None, test_bindings=None, executor_factory=None):
+    def __init__(self, instance, *, environment=None, test_bindings=None, executor_factory=None,
+                 curriculum_researcher=None, curriculum_materializer=None):
         self.root = Path(instance).resolve(strict=True)
         self.environment = dict(os.environ if environment is None else environment)
         self.test = test_bindings
         self.executor_factory = executor_factory
+        self.curriculum_researcher = curriculum_researcher
+        self.curriculum_materializer = curriculum_materializer
         if test_bindings is not None and not isinstance(test_bindings, TestBindings):
             raise TypeError('explicit TestBindings required')
         self.store = ContentAddressedArtifacts(self.root / 'artifacts')
@@ -78,7 +81,7 @@ class InstanceServices:
         return path.absolute()
 
     def create_cycle(self, cycle_id, mode, *, projects=None, configuration=None, recover=None,
-                     from_cycle=None, inheritance='auto', input_overrides=()):
+                     from_cycle=None, inheritance='auto', input_overrides=(), failed_parent_refs=(), curriculum_only=False):
         created = time.time()
         mode = Mode(mode)
         input_overrides = tuple(input_overrides)
@@ -89,12 +92,20 @@ class InstanceServices:
             raise FileExistsError(root)
         snapshot = revisions.checked(configuration) if configuration is not None else show_configuration(self.root)
         config = snapshot['payload']
+        curriculum_only = curriculum_only or config.get('curriculum', {}).get('only_derived', False)
+        failed_parent_refs = tuple(failed_parent_refs or config.get('curriculum', {}).get('failed_parent_refs', ()))
+        if (curriculum_only or failed_parent_refs) and (
+                mode != Mode.PHASE1 or config.get('curriculum', {}).get('enabled') is not True):
+            raise ValueError('failed-parent admission requires configured autonomous Phase1')
         projects = revisions.projects(config, mode, projects)
+        if not projects and curriculum_only:
+            projects = tuple(ProjectSpec.from_dict(self.store.read_json(ref)['project']) for ref in failed_parent_refs)
         if not projects:
             raise ValueError('cycle requires explicit curriculum projects')
         # Validate every configured host command before publishing the cycle.
-        for spec in projects:
-            self.project_config(config, spec)
+        if not curriculum_only:
+            for spec in projects:
+                self.project_config(config, spec)
         with self.setup.measure('accepted-input-capture', cycle_id):
             parent = capture_parent(self.root, mode, from_cycle, inheritance=inheritance,
                                     overrides=input_overrides, configuration=snapshot)
@@ -141,6 +152,7 @@ class InstanceServices:
             kdb=parent.kdb_ref, initial=initial.decode(), recover=recover, created=created,
             requested_configuration_ref=requested_config, input_handoff=asdict(parent),
             input_policy=dict(inheritance=inheritance, overrides=list(input_overrides), from_cycle=from_cycle),
+            failed_parent_refs=list(failed_parent_refs), curriculum_only=curriculum_only,
             test_identity=self.test.identity if self.test else None))
         return self.open_cycle(cycle_id)
 
@@ -232,6 +244,14 @@ class BoundCycle(ProjectComposition, TuningBindings):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
         policy = dict(self.config.get('cycle_limits', {}))
+        from rsi.phase1_recovery import Phase1Recovery, configured
+        self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
+        if self.curriculum:
+            allowance = policy.get('recovery_seconds')
+            if type(allowance) not in (int, float) or not 0 < allowance < float('inf'):
+                raise ValueError('autonomous curriculum requires an explicit finite recovery_seconds pool')
+            policy.setdefault('recovery_limit', None)
+            policy['recovery_feedback'] = True
         if self.config.get('project_wave'):
             policy.setdefault('recovery_limit', None)
         first_clock = not state_path.exists()
@@ -244,8 +264,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
         self.scheduler = CycleScheduler(state_path, self.spec, self.run,
             lambda *args: self.learning.memory_update(*args),
             skill_update=self.write_skills, isolate=self.isolate,
+            simplify=self.curriculum.simplify if self.curriculum else None,
             recover=self.binding.get('recover') if self.binding.get('recover') is not None else
-                self.config.get('recovery', {}).get('enabled', True),
+                True if self.curriculum else self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
         try:
             with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
@@ -265,12 +286,24 @@ class BoundCycle(ProjectComposition, TuningBindings):
         if self.config.get('project_wave'):
             from rsi.service_wave import WaveBindings
             self.waves = WaveBindings(self)
+        if self.curriculum:
+            self.curriculum.seed(self.binding.get('failed_parent_refs') or self.config['curriculum'].get('failed_parent_refs', ()),
+                only_derived=self.binding.get('curriculum_only', False) or self.config['curriculum'].get('only_derived', False))
 
     def make_learning(self, path):
         return Learning(path, self.store, self.memory, self, load_project=self.load_project,
             validate=self.validate, mode=self.spec.mode.value,
             role_elapsed=self.role_elapsed,
             unused_window=self.config.get('learning', {}).get('unused_window', 10))
+
+    def project_config(self, spec):
+        return self.curriculum.project_config(spec) if self.curriculum else self.services.project_config(self.config, spec)
+
+    def project_executor_factory(self, spec):
+        return self.curriculum.executor_factory(spec) if self.curriculum else self.services.executor_factory
+
+    def project_configuration(self, spec):
+        return self.curriculum.configuration_ref(spec) if self.curriculum else self.spec.configuration_ref
 
     def observe_role(self, event, payload):
         if event == 'role_started' and self.role_setup_started is not None:
@@ -379,12 +412,14 @@ class BoundCycle(ProjectComposition, TuningBindings):
         root = self.root / 'projects' / operation
         if root.exists():
             raise ValueError('existing admitted operation requires reconciliation')
-        binding = dict(memory=memory_ref, skills=skills_ref, configuration=self.spec.configuration_ref,
+        binding = dict(memory=memory_ref, skills=skills_ref, configuration=self.project_configuration(spec),
                        kdb=self.binding['kdb'], provider=self.config['provider'],
                        test_identity=self.binding['test_identity'], actor_seconds_baseline=0.0)
         backend = self.store.put_json(binding)
+        overrides = dict(configuration_ref=binding['configuration'],
+                         executor_factory=self.project_executor_factory(spec)) if self.curriculum else {}
         runner = self.runner(root, spec=spec, bundle=SkillBundle.from_dict(self.store.read_json(skills_ref)),
-            config=self.services.project_config(self.config, spec), memory_ref=memory_ref, backend_identity=backend)
+            config=self.project_config(spec), memory_ref=memory_ref, backend_identity=backend, **overrides)
         atomic_json(root / 'training-identity.json', case_identity(runner))
         atomic_json(root / 'service-binding.json', binding)
         result = self.execute(runner)
@@ -621,6 +656,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
     def reconcile(self, *, dispatch_ready=False):
         """Observe existing project completion; no new provider dispatch."""
         pending = self.scheduler.state['pending']
+        if pending and pending['kind'] == 'simplify' and self.curriculum:
+            result = self.curriculum.retained(pending['id'])
+            self.scheduler.reconcile(pending['id'], result)
+            return result
         if self.waves and self.scheduler.state.get('active_wave') and pending and pending['kind'] in ('original', 'recovery'):
             if dispatch_ready:
                 self.waves.continue_ready()
@@ -636,7 +675,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             if pending['id'] in self.learning.state['operations']:
                 result = self.learning.reconcile_memory(pending['id'])
             else:
-                rows = self.scheduler.state['wave_results'] if self.spec.mode == Mode.PHASE1 else [self.scheduler.state['originals'][-1]]
+                rows = self.scheduler.state['recovery_feedback_rows'] if pending.get('feedback') == 'recovery' else (
+                    self.scheduler.state['wave_results'] if self.spec.mode == Mode.PHASE1 else [self.scheduler.state['originals'][-1]])
                 result = self.learning.memory_update(self.scheduler.state['memory'], rows,
                                                      self.scheduler._context(pending))
             self.scheduler.reconcile(pending['id'], result)

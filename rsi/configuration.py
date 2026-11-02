@@ -97,9 +97,21 @@ def validate_configuration(payload):
         parsed = [ProjectSpec.from_dict(project) for project in projects]
         if len({project.project_id for project in parsed}) != len(parsed):
             raise ValueError(f'{name}: project IDs must be unique')
-    for name in ('prompts', 'provider', 'roles', 'recovery', 'tuning', 'dashboard'):
+    for name in ('prompts', 'provider', 'roles', 'recovery', 'tuning', 'dashboard', 'curriculum'):
         if name in payload:
             _object(payload[name], name)
+    curriculum = payload.get('curriculum', {})
+    if 'enabled' in curriculum and type(curriculum['enabled']) is not bool:
+        raise ValueError('curriculum.enabled must be boolean')
+    if curriculum.get('enabled'):
+        for name in ('actor_seconds', 'recovery_seconds'):
+            value = payload.get('cycle_limits', {}).get(name)
+            if type(value) not in (int, float) or not 0 < value < float('inf'):
+                raise ValueError('autonomous curriculum requires finite positive cycle_limits.' + name)
+    if 'project_actor_seconds' in curriculum:
+        value = curriculum['project_actor_seconds']
+        if type(value) not in (int, float) or not 0 < value < float('inf'):
+            raise ValueError('curriculum.project_actor_seconds must be finite and positive')
     for name in ('curriculum', 'actor', 'waves', 'skillwriter'):
         prompts = payload.get('prompts', {})
         if name in prompts and not isinstance(prompts[name], str):

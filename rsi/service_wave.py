@@ -279,7 +279,7 @@ class WaveBindings:
                     continue
                 if cycle.services.executor_factory is None:
                     raise ValueError('ignored host executor profile resolver required')
-                resolver = cycle.services.executor_factory
+                resolver = cycle.project_executor_factory(ProjectSpec.from_dict(wave['operations'][0]['spec']))
                 if not all(callable(getattr(resolver, name, None)) for name in
                            ('metadata', 'worker_environment', 'guard')):
                     raise ValueError('NPU profiles must provide trusted worker context and health/policy guards')
@@ -298,10 +298,10 @@ class WaveBindings:
             for op in wave['operations']:
                 spec = ProjectSpec.from_dict(op['spec'])
                 binding = dict(memory=wave['memory'], skills=wave['skills'],
-                    configuration=cycle.spec.configuration_ref, kdb=cycle.binding['kdb'],
+                    configuration=cycle.project_configuration(spec), kdb=cycle.binding['kdb'],
                     provider=cycle.config['provider'], test_identity=cycle.binding['test_identity'],
                     actor_seconds_baseline=0.)
-                config = asdict(cycle.services.project_config(cycle.config, spec))
+                config = asdict(cycle.project_config(spec))
                 started, monotonic_start = time.time(), time.monotonic()
                 source_hash = source_identity(config['source'], verifier=config['verifier'],
                                               generated_paths=config.get('generated_paths', ()))
@@ -312,7 +312,8 @@ class WaveBindings:
                 relative = Path('waves') / wave['id'] / 'projects' / op['id'] / 'runner'
                 state.setdefault('project_roots', {})[op['id']] = relative.as_posix()
             admitted = dict(binding=cycle.binding, operations=admissions,
-                configuration=cycle.spec.configuration_ref, memory=wave['memory'], skills=wave['skills'],
+                configuration=admissions[wave['operations'][0]['id']]['binding']['configuration'],
+                memory=wave['memory'], skills=wave['skills'],
                 memory_bytes=cycle.store.read_bytes(wave['memory']).hex(),
                 skills_bytes=cycle.store.read_bytes(wave['skills']).hex(), devices=self.policy['devices'],
                 identities=identities, binding_contracts=binding_contracts, kdb_stat=kdb_stat, wall_deadline=wave['wall_deadline'])
@@ -324,7 +325,7 @@ class WaveBindings:
     def _factory(self, wave):
         cycle = self.cycle
         admitted = cycle.store.read_json(wave['admission_ref'])
-        resolver = cycle.services.executor_factory
+        resolver = cycle.project_executor_factory(ProjectSpec.from_dict(wave['operations'][0]['spec']))
         if admitted['identities']:
             resolver = FrozenExecutorFactory(resolver, json.dumps(admitted['identities'], sort_keys=True),
                 json.dumps(admitted.get('binding_contracts', {}), sort_keys=True))

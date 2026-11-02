@@ -14,6 +14,9 @@ def register(commands):
         start = actions.add_parser('start')
         start.add_argument('--cycle', default=None)
         _inheritance_flags(start)
+        if mode == 'phase1':
+            start.add_argument('--failed-parent-ref', action='append', default=[])
+            start.add_argument('--curriculum-only', action='store_true')
         if mode == 'inference':
             start.add_argument('--project', type=Path, required=True)
             start.add_argument('--no-recovery', action='store_true')
@@ -62,6 +65,9 @@ def execute(args):
     if args.action == 'start':
         request = {'action': 'start', 'mode': args.command,
                    'cycle_id': args.cycle or str(uuid.uuid4())}
+        if args.command == 'phase1':
+            request.update(failed_parent_refs=getattr(args, 'failed_parent_ref', []),
+                           curriculum_only=getattr(args, 'curriculum_only', False))
         if args.command == 'inference':
             request['projects'] = [ProjectSpec.from_dict(
                 json.loads(args.project.read_text())).to_dict()]
