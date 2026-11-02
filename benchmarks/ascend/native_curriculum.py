@@ -13,9 +13,11 @@ from rsi.python_execution import atomic_json
 
 
 class NativeSubjectRole:
-    def __init__(self, root, profile, environ):
+    def __init__(self, root, profile, environ, *, validator=None, artifacts=None, setup_scope=None):
         self.root, self.profile, self.environ = Path(root), profile, environ
         self.model = profile.identity.backend_model.value
+        self.validator, self.artifacts, self.setup_scope = validator, dict(artifacts or {}), setup_scope
+        self.last_receipt = None
 
     def __call__(self, messages, *, remaining_seconds):
         return self._call(messages, remaining_seconds, wave=False)
@@ -35,13 +37,15 @@ class NativeSubjectRole:
         if state_path.exists():
             state = json.loads(state_path.read_text())
             if state['status'] == 'completed':
-                return store.read_json(state['result_ref'])['response']
+                self.last_receipt = store.read_json(state['result_ref'])
+                return self.last_receipt['response']
             raise NativeError('retained native curriculum operation requires observation; never replay')
         state = dict(status='pending', operation_id=identity, input_ref=store.put_json(messages))
         atomic_json(state_path, state)
         context = root/'context.json'
         context.write_text(json.dumps(messages, ensure_ascii=False, indent=2))
         files = NativeFiles(root/'files', store=store, read_paths=[context])
+        files.read_paths.update({Path(path).resolve():reference for path, reference in self.artifacts.items()})
         chosen = []
         def submit(args, scope):
             if chosen:
@@ -54,6 +58,8 @@ class NativeSubjectRole:
                     response = 'DECISION: '+decision+'\n'+json.dumps(payload)
             else:
                 response = json.dumps(args['value'])
+            if self.validator:
+                self.validator(json.loads(response))
             chosen.append(response)
             return dict(content=[dict(type='text', text='Typed proposal retained; domain admission remains host-owned.')], terminate=True)
         shape = (dict(type='object', properties=dict(
@@ -69,7 +75,7 @@ class NativeSubjectRole:
                 'The model does not supply prose wire headers. Domain constraints and actual retained evidence remain authoritative.')
         actor_start = None
         try:
-            with excluded_phase('setup'):
+            with self.setup_scope() if self.setup_scope else excluded_phase('setup'):
                 session.prepare()
             actor_start = time.monotonic()
             deadline = actor_start+seconds
@@ -78,8 +84,8 @@ class NativeSubjectRole:
                 operation_id=identity, remaining=lambda: deadline-time.monotonic())
             if not chosen or not result.provider_settled or result.pending_tools:
                 raise ActionError('native curriculum settled without a known typed proposal')
-            state.update(status='completed', result_ref=store.put_json(dict(response=chosen[0],
-                actor_seconds=time.monotonic()-actor_start, usage=result.usage)))
+            self.last_receipt = dict(response=chosen[0], actor_seconds=time.monotonic()-actor_start, usage=result.usage)
+            state.update(status='completed', result_ref=store.put_json(self.last_receipt))
             atomic_json(state_path, state)
             return chosen[0]
         finally:
