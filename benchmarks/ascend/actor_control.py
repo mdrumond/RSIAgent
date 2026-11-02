@@ -138,7 +138,7 @@ class ActorConversation:
         self._pin()
 
     def _pin(self):
-        # WorkingContext never compacts pinned messages. IDs are metadata only.
+        # Operator steering IDs are metadata; the canonical native session owns compaction.
         self.working.pinned = [{key: row[key] for key in ('role', 'content')}
                                for row in self.feedback]
 
