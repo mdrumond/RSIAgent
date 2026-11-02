@@ -22,7 +22,7 @@ import tempfile
 import subprocess
 import sys
 import time
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 
 def _wall_remaining(clock, deadline):
@@ -124,6 +124,38 @@ def _framework():
         goal: str = Field(min_length=1)
         acceptance: str = Field(min_length=1)
 
+    class ResearchQueryModel(BaseModel):
+        model_config = ConfigDict(extra='forbid', strict=True)
+        query: str = Field(min_length=1)
+        purpose: str = Field(min_length=1)
+
+    class ResearchQueries(Proposal):
+        queries: list[ResearchQueryModel] = Field(min_length=1)
+
+    class DiagnosticProject(Project):
+        template_id: str = Field(min_length=1)
+        parameters: dict[str, Any]
+        parent_project_id: str | None = None
+
+    class NegativeDecisionModel(BaseModel):
+        model_config = ConfigDict(extra='forbid', strict=True)
+        query_ref: str
+        index: int
+        reason: str = Field(min_length=1)
+
+    class UsedNegativeDecisionModel(NegativeDecisionModel):
+        action: Literal['used']
+        redirection: str = Field(min_length=1, pattern=r'\S')
+
+    class RejectedNegativeDecisionModel(NegativeDecisionModel):
+        action: Literal['rejected']
+        redirection: str | None = None
+
+    class Diagnostic(Proposal):
+        proposal: DiagnosticProject
+        negative_decisions: list[Annotated[
+            UsedNegativeDecisionModel | RejectedNegativeDecisionModel, Field(discriminator='action')]]
+
     class Edit(BaseModel):
         model_config = ConfigDict(extra='forbid', strict=True)
         skill: str = Field(min_length=1)
@@ -149,6 +181,16 @@ def _framework():
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
         async def curriculum(self, role_prompt: str, admitted_evidence: str) -> Curriculum:
             """Propose a curriculum from the role prompt and admitted evidence. Cite evidence IDs."""
+            ...
+
+        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
+        async def research_queries(self, role_prompt: str, admitted_evidence: str) -> ResearchQueries:
+            """Choose documentation/KDB queries before proposing a diagnostic project."""
+            ...
+
+        @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
+        async def diagnostic(self, role_prompt: str, admitted_evidence: str) -> Diagnostic:
+            """Use actual retrieved facts and address every negative before choosing a host template."""
             ...
 
         @strategy(PredictStrategy(config=PredictConfig(max_retries=1)))
@@ -228,6 +270,12 @@ class NoncodingRoles:
     def curriculum(self, role_prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('curriculum', role_prompt, evidence, deadline, wall_deadline)
 
+    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
+
     def skillwriter(self, role_prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('skillwriter', role_prompt, evidence, deadline, wall_deadline)
 
@@ -281,13 +329,21 @@ class NoncodingRoles:
             self.observer('role_finished', receipt)
 
 
-_PROPOSALS = {'curriculum': (CurriculumProposal, 'projects', ProjectIdea),
+from rsi.curriculum_research import DiagnosticDecision, DiagnosticProposal, QueryPlan, ResearchQuery
+
+
+_PROPOSALS = {'research_queries': (QueryPlan, 'queries', ResearchQuery),
+              'diagnostic': (DiagnosticDecision, 'proposal', DiagnosticProposal),
+              'curriculum': (CurriculumProposal, 'projects', ProjectIdea),
               'skillwriter': (SkillProposal, 'edits', SkillEdit),
               'review': (ReviewProposal, 'findings', ReviewFinding)}
 
 
 def _proposal(role, data, admitted):
     """Validate the same typed wire result without loading NOOA in the host."""
+    if role in ('research_queries', 'diagnostic'):
+        from rsi.curriculum_research import parse_proposal
+        return parse_proposal(role, data, admitted)
     outer, name, inner = _PROPOSALS[role]
     if type(data) is not dict or set(data) != {'rationale', 'evidence_ids', name}:
         raise ValueError('invalid proposal fields')
@@ -402,6 +458,12 @@ class IsolatedRoles:
 
     def curriculum(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('curriculum', prompt, evidence, deadline, wall_deadline)
+
+    def research_queries(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('research_queries', prompt, evidence, deadline, wall_deadline)
+
+    def diagnostic(self, prompt, evidence, *, deadline, wall_deadline=None):
+        return self._run('diagnostic', prompt, evidence, deadline, wall_deadline)
 
     def skillwriter(self, prompt, evidence, *, deadline, wall_deadline=None):
         return self._run('skillwriter', prompt, evidence, deadline, wall_deadline)
