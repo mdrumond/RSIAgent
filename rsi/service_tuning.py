@@ -1,13 +1,40 @@
 """Production heldout factory bindings for the existing tuning controller."""
 import json
+import time
 
 from rsi.contracts import BudgetLimits, ProjectSpec
 from rsi.evaluation import SkillEvaluation, case_identity
 from rsi.project_runner import ProjectConfig
 from rsi.skills import SkillBundle
+from rsi.python_execution import atomic_json
+from rsi.runtime import WorkflowError
 
 
 class TuningBindings:
+    def tuning_remaining(self, root, limits, *, writer_seconds=None):
+        """One durable round allocation, independent of cycle telemetry banks."""
+        if not self.scheduler.independent_projects:
+            return self.scheduler.remaining()
+        path = root / 'allocation.json'
+        if path.exists():
+            state = json.loads(path.read_text())
+            if state['limits'] != limits.to_dict():
+                raise ValueError('retained tuning round limits differ')
+        else:
+            state = dict(created=time.time(), limits=limits.to_dict(), writer_seconds=0.)
+        if writer_seconds is not None:
+            state['writer_seconds'] = writer_seconds
+        root.mkdir(parents=True, exist_ok=True)
+        atomic_json(path, state)
+        elapsed = time.time() - state['created']
+        remaining = dict(actor_seconds=None if limits.actor_seconds is None else
+                         limits.actor_seconds - state['writer_seconds'],
+                         wall_seconds=None if limits.wall_seconds is None else limits.wall_seconds - elapsed,
+                         recovery_seconds=None)
+        if elapsed < 0 or any(value is not None and value <= 0 for value in remaining.values()):
+            raise WorkflowError('tuning round elapsed allocation exhausted; retain pending work')
+        return remaining
+
     def tuning_settings(self):
         settings = self.config.get('tuning', {})
         for name, default in (('heldout_projects', 5), ('runs_per_arm', 2)):
@@ -61,6 +88,8 @@ class TuningBindings:
         if path.exists():
             return SkillEvaluation(path, artifacts=self.store, runner_factory=self.trial)
         settings, cases = self.tuning_settings()
+        limits = BudgetLimits.from_dict(settings.get('budgets', self.config['budgets']))
+        round_remaining = self.tuning_remaining(root, limits)
         memory, incumbent = self.scheduler.state['memory'], self.scheduler.state['skills']
         matching = [ref for ref, record in self.learning.state['candidates'].items()
                     if record['incumbent'] == incumbent and not record['quarantined']]
@@ -71,13 +100,14 @@ class TuningBindings:
             self.tuning_guidance = event.get('steering', {})
             try:
                 update = self.write_skills(incumbent, memory, row,
-                    dict(operation_id=writer_id, remaining=self.scheduler.remaining()))
+                    dict(operation_id=writer_id, remaining=round_remaining))
             finally:
                 self.tuning_guidance = {}
             if not any(e.get('id') == writer_id for e in self.scheduler.state['events']):
                 self.scheduler.state['events'].append(dict(kind='manual_writer', id=writer_id))
                 self.scheduler._save()
             self.scheduler.complete_extension(writer_id, update.reference, actor_seconds=update.actor_seconds)
+            self.tuning_remaining(root, limits, writer_seconds=update.actor_seconds)
             candidate = update.reference
         else:
             candidate = matching[-1]
@@ -103,8 +133,8 @@ class TuningBindings:
         return SkillEvaluation.create(path, checkpoints=heldouts, training=training,
             artifacts=self.store, memory_ref=memory, kdb_ref=self.binding['kdb'],
             model_config=self.config['provider'], incumbent=incumbent, candidate=candidate,
-            joint_limits=BudgetLimits.from_dict(settings.get('budgets', self.config['budgets'])),
-            remaining_parent=self.scheduler.remaining(), runner_factory=self.trial,
+            joint_limits=limits,
+            remaining_parent=self.tuning_remaining(root, limits), runner_factory=self.trial,
             case_count=settings.get('heldout_projects', 5), repetitions=settings.get('runs_per_arm', 2),
             steering=event.get('steering', {}))
 
