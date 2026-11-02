@@ -924,7 +924,7 @@ class OptimizerHost(SourceHost):
             if type(index) is not int or not 0 <= index < len(snapshot['memory_entries']):
                 raise StrategyRejected(
                     f'memory index is outside admitted entries [0, {len(snapshot["memory_entries"])}); '
-                    'use read_memory with an admitted index or read_context for a paged tool result')
+                    'use read_memory with an admitted index or native read on the returned observation path')
             row = snapshot['memory_entries'][index]
             if self.owner.memory_observer is not None:
                 row = self.owner.memory_observer('read-memory', snapshot, dict(action=dict(index=index), result=row), operation)
@@ -938,7 +938,7 @@ class OptimizerHost(SourceHost):
             if reference not in job and reference not in memory:
                 raise StrategyRejected(json.dumps(dict(
                     reason='reference is outside admitted job and memory artifacts',
-                    guidance='Use read_context for paged query results or read_memory for snapshot entries. '
+                    guidance='Use native read on returned observation paths for query results or read_memory for snapshot entries. '
                              'Query receipts are not artifacts; use exact admitted IDs from artifact_scope.',
                     job_ids=sorted(job), memory_ids=sorted(memory))))
             if reference in job:
@@ -975,7 +975,7 @@ class OptimizerHost(SourceHost):
         job, memory = self.artifact_scope()
         value['artifact_scope'] = dict(job_ids=sorted(job), memory_ids=sorted(memory),
             memory_entries=len(self.submission['memory_snapshot']['memory_entries']),
-            query_results='Use returned content/read_context pages; query receipt IDs are not artifact IDs.')
+            query_results='Use returned content or native read on returned observation paths; query receipt IDs are not artifact IDs.')
         summaries = dict(memory_summary=[dict(index=index, summary=str(entry)[:1200])
             for index,entry in enumerate(self.submission['memory_snapshot']['memory_entries'])])
         observer = self.owner.memory_observer
