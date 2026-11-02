@@ -54,13 +54,20 @@ def test_a3_public_usage_survives_adoption_and_reopen(tmp_path, monkeypatch, scr
     assert requests and binding.closed
     expected=2*len(requests) if mode=='known' else None
     assert result.tokens == binding.completion_tokens == expected
-    assert result.status == 'passed' if mode!='unknown' else result.status!='passed'
+    if mode!='unknown':
+        assert result.status=='passed'
+    else:
+        assert result.status!='passed'
     if mode=='unknown':assert interrupted and owner.candidate.calls==[]
     before=len(requests)
     fresh=PiCodingSession(model='deepseek-flash',environ={'DEEPSEEK_API_KEY':'fixture-secret'})
     assert fresh.completion_tokens == 0
     resumed,_=make_trial(tmp_path,session=fresh,cell=_cell(model=BackendModel.DEEPSEEK_FLASH),candidate=recording_candidate())
+    # The CPU fixture resolver is in-memory; retain its actual prior authority.
+    resumed.memory, resumed.candidate, resumed.profiler = owner.memory, owner.candidate, owner.profiler
+    effects=list(owner.candidate.calls)
     assert resumed.run().tokens == expected
+    assert owner.candidate.calls==effects
     assert len(requests)==before  # Accepted/unknown retained operations never replay.
 
 

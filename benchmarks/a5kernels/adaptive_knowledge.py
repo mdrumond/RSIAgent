@@ -159,10 +159,11 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                         response = self.complete(messages, check())
                     event['response'] = response
                     check()
-                    if (not isinstance(response.get('text'), str) or type(response.get('tokens')) is not int
-                            or response['tokens'] < 0):
+                    tokens = response.get('tokens')
+                    if (not isinstance(response.get('text'), str) or 'tokens' not in response
+                            or tokens is not None and (type(tokens) is not int or tokens < 0)):
                         raise ValueError('invalid librarian completion')
-                    log['tokens'] += response['tokens']
+                    log['tokens'] = None if log['tokens'] is None or tokens is None else log['tokens'] + tokens
                     try:
                         decision = json.loads(response['text'])
                         kind, accept, reject, new_gaps = self._decision(decision, inspected)

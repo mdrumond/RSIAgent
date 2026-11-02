@@ -66,7 +66,8 @@ def deepseek_librarian(environment, *, root):
         role.validator = validate
         response = role(messages, remaining_seconds=seconds)
         usage = role.last_receipt['usage']
-        tokens = sum(row.get('totalTokens', row.get('input', 0)+row.get('output', 0)) for row in usage)
+        tokens = (None if any('output' not in row for row in usage) else
+                  sum(row.get('totalTokens', row.get('input', 0)+row['output']) for row in usage))
         return dict(text=response, tokens=tokens, native_evidence=evidence())
     complete.native_validation = True
     complete.native_evidence = evidence
