@@ -172,6 +172,18 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         if emitted.post_success:
             assert emitted.post_success_queued
             assert 'queued mutation after host success' not in runner.backend.read('solution.py')['content']
+            commits = [row for row in result['history'] if row['evidence']['stage']=='implementation']
+            assert len(commits) == 1
+            operation = commits[0]['evidence']['operation_id']
+            assert len([row for row in emitted if row['operation_id']==operation and row['name']=='perform']) == 1
+            assert not any(row['type']=='source-edit' and row.get('operation_id')==operation for row in runner.events)
+            native_events = [json.loads(line) for line in
+                (runner.root/'native/session/native-events.jsonl').read_text().splitlines()]
+            scoped = [event for event in native_events if event.get('operation_id')==operation]
+            completed = next(index for index,event in enumerate(scoped)
+                             if event['type']=='host_callback_end' and event.get('name')=='perform')
+            assert not any(event['type']=='before_provider_request' for event in scoped[completed+1:])
+            assert any(event['type']=='agent_settled' for event in scoped[completed+1:])
         assert runner.backend.read('solution.py')['content'].startswith('from math import fsum')
         assert {'read', 'edit', 'query_kdb', 'retrospect', 'select_strategy', 'perform'} <= {r['name'] for r in emitted}
         transitions = [runner.store.read_json(e['reference']) for e in runner.events if e['type'] == 'native-source-transition']
