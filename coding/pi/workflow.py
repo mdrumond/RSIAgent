@@ -114,12 +114,20 @@ class NativeWorkflowSession:
                                       required=['proposal'], additionalProperties=False)
         identities = ('deepseek-flash-native-v1', 'openai-gpt-5.6-sol-v1')
         profile = next((identity for identity in identities
-            if self.model in (identity, model_profile(identity)['model'])), None)
+            if self.model in (identity, model_profile(identity)['model'],
+                model_profile(identity)['provider']+'/'+model_profile(identity)['model'])), None)
         if profile is None:
             raise ValueError('registered native programming profile required')
         tools = [NativeTool(name, 'Execute the host '+name+' operation.', schema, self._tool(name))
                  for name, schema in self.schemas.items() if name not in ('read_skill', 'read_project_file')]
         options = self.files.session_options()
+        def charged(name, callback):
+            def invoke(args, context):
+                category = 'implementation' if name in ('rsi_fs_write', 'rsi_fs_mkdir') else 'retrieval'
+                return self.actor._timed(category, lambda: callback(args, context))
+            return invoke
+        options['callbacks'] = {name: charged(name, callback)
+                                for name, callback in options['callbacks'].items()}
         options['tools_factory'] = str(Path(__file__).resolve().parents[2]/'integrations/pi/workflow-tools.mjs')
         options['tools_options']['skills'] = [dict(name=name, description='Frozen workflow guidance: '+name,
             filePath=str(path), baseDir=str(path.parent), disableModelInvocation=False,
