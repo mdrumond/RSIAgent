@@ -22,7 +22,8 @@ from rsi.learning import Validation
 
 
 def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, wrap=None,
-               original_session=None, clock=None, checkpoint_hook=None, config_overrides=None):
+               original_session=None, clock=None, checkpoint_hook=None, config_overrides=None,
+               independent=False):
     original, injected, database = make(tmp_path, original_session, config_overrides=config_overrides,
                                         **({'clock': clock} if clock else {}))
     store = ContentAddressedArtifacts(tmp_path / 'shared')
@@ -49,7 +50,8 @@ def setup_pair(tmp_path, *, repairs=(False, True), limits=None, remaining=None, 
         model_config={'model': 'TEST', 'temperature': 0}, incumbent=incumbent, candidate=candidate,
         joint_limits=limits or BudgetLimits(design_iterations=6, implementation_iterations=4,
                                             execution_tries=40, actor_seconds=1200),
-        remaining_parent=remaining or {'actor_seconds': 1200, 'recovery_seconds': 1200}, runner_factory=factory)
+        remaining_parent=remaining or {'actor_seconds': 1200, 'recovery_seconds': 1200}, runner_factory=factory,
+        **({'independent': independent} if independent is not None else {}))
     return pair, original, store, calls, database
 
 

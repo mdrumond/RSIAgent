@@ -148,9 +148,9 @@ class CycleScheduler:
     Inference requires isolate(memory, skills, context) -> IsolationSnapshot
     before any project runs. This hook must publish truly isolated store branches.
     simplify(spec, result, context) -> SimplificationResult is Phase1-only.
-    Legacy hooks receive remaining parent/recovery elapsed limits. Deferred
-    Phase1 projects receive fresh independent allocations; cycle totals remain
-    telemetry and explicit stop still prevents further dispatch.
+    Legacy hooks receive remaining parent/recovery elapsed limits. Independent
+    projects receive fresh allocations; cycle totals remain telemetry and an
+    explicit stop still prevents further dispatch.
     Phase2/inference recovery is emitted as deferred work for paired evaluation.
     """
 
@@ -159,9 +159,11 @@ class CycleScheduler:
                  wave_limit=None, recovery_limit=1, actor_seconds=None,
                  recovery_seconds=None, wall_seconds=None, tuning_every=5,
                  recovery_feedback=False, retry_original=None, max_failed_recovery_attempts=5,
-                 clock=time.time):
+                 clock=time.time, independent_projects=False):
         if not isinstance(spec, CycleSpec):
             raise TypeError('CycleSpec required')
+        if type(independent_projects) is not bool:
+            raise ValueError('independent_projects must be boolean')
         if spec.mode != Mode.PHASE1 and skill_update is None:
             raise ValueError('Phase2/inference requires injected skill_update')
         if spec.mode == Mode.INFERENCE and isolate is None:
@@ -191,6 +193,8 @@ class CycleScheduler:
                       wall_seconds=wall_seconds, tuning_every=tuning_every)
         if recovery_feedback:
             config['recovery_feedback'] = True
+        if independent_projects:
+            config['independent_projects'] = True
         if retry_original is not None:
             config.update(deferred_recovery=True, max_failed_recovery_attempts=max_failed_recovery_attempts, recovery_limit=None)
         try:
@@ -343,10 +347,13 @@ class CycleScheduler:
                 if row['project_ref'] == self.state['originals'][-1]['artifact_ref']]
         return context
 
+    @property
+    def independent_projects(self):
+        return bool(self.config.get('independent_projects') or self.config.get('deferred_recovery'))
+
     def _allocation_remaining(self):
-        # Retained cycle pools remain telemetry. Deferred Phase1 projects each
-        # own their allocation; explicit stop still prevents dispatch.
-        if self.config.get('deferred_recovery'):
+        # Independent projects own their allocation; cycle pools are telemetry.
+        if self.independent_projects:
             return dict(actor_seconds=None, recovery_seconds=None, wall_seconds=None)
         return self.remaining()
 
@@ -497,7 +504,7 @@ class CycleScheduler:
             raise WorkflowError('parent elapsed allocation cannot reserve a project wave')
         wave = dict(id=uuid.uuid4().hex, operations=operations, memory=s['memory'], skills=s['skills'],
                     phase='executing', wall_deadline=(s['created'] + self.config['wall_seconds']
-                    if not self.config.get('deferred_recovery') and self.config['wall_seconds'] is not None else None))
+                    if not self.independent_projects and self.config['wall_seconds'] is not None else None))
         s['pending'] = operations[0]
         s['active_wave'] = wave
         self._save()

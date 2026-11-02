@@ -253,6 +253,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
         policy = dict(self.config.get('cycle_limits', {}))
+        # Retained cycles keep their admitted policy; new projects own elapsed limits.
+        policy['independent_projects'] = state.get('config', {}).get('independent_projects', False) if state else True
         from rsi.phase1_recovery import Phase1Recovery, configured
         self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
         if self.curriculum:
@@ -635,7 +637,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             kdb_ref=self.binding['kdb'], model_config=self.config['provider'], incumbent=event['incumbent'],
             candidate=event['candidate'], joint_limits=BudgetLimits.from_dict(
                 self.config.get('recovery', {}).get('budgets', self.config['budgets'])),
-            remaining_parent=remaining, runner_factory=self.trial)
+            remaining_parent=remaining, runner_factory=self.trial,
+            independent=self.scheduler.independent_projects)
 
     def validate(self, incumbent, candidate, cases, operation):
         suite = self.suite_validation(incumbent, candidate, cases, operation)
