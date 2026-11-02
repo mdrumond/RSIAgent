@@ -9,6 +9,7 @@ import pytest
 from coding.pi.native import NativeError, NativeSettlement
 from core.artifacts import ContentAddressedArtifacts
 from rsi.roles import AdmittedEvidence, NativeRoles, RoleFailure, _proposal
+from test_rsi_services import instance
 
 
 class Clock:
@@ -209,3 +210,27 @@ def test_native_role_preserves_research_query_accounting_and_host_binding(tmp_pa
     receipt = store.read_json(result.receipt_ref)
     assert receipt['status'] == 'accepted'
     assert researcher.actor_context(result.receipt_ref)['rationale'] == IDEA['why']
+
+
+@pytest.mark.parametrize('legacy_python', [None, '/retired/missing/nooa/python'])
+def test_production_services_select_native_roles_without_legacy_interpreter(instance, monkeypatch, legacy_python):
+    from rsi import services
+    cycle = instance.create_cycle('native-role-binding', 'phase1')
+    captured = {}
+    sentinel = object()
+    def native(root, profile, **options):
+        captured.update(root=root, profile=profile, **options)
+        return sentinel
+    monkeypatch.setattr(services, 'NativeRoles', native)
+    instance.test = None
+    cycle.config['roles_python'] = legacy_python
+    cycle.role_operation = 'native-operation'
+    try:
+        assert cycle.roles() is sentinel and cycle.roles() is sentinel
+        assert captured['root'] == cycle.root/'native-roles'
+        assert captured['operation_id']() == 'native-operation'
+        assert captured['node_modules'] == instance.root/'machinery/integrations/pi/node_modules'
+        assert captured['store'] is cycle.store
+        assert captured['profile'].identity.profile_id == cycle.config['provider']['profile_id']
+    finally:
+        cycle.close()
