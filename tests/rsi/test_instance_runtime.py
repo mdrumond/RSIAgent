@@ -47,16 +47,21 @@ def setup_spy(monkeypatch, root, fail=None):
     return node, commands, runner
 
 
-def test_isolated_install_targets_and_offline_caches(tmp_path, monkeypatch):
+@pytest.mark.parametrize('roles', [True, False])
+def test_isolated_install_targets_and_offline_caches(tmp_path, monkeypatch, roles):
     root = instance(tmp_path)
     node, commands, runner = setup_spy(monkeypatch, root)
     monkeypatch.setenv('PIP_TARGET', '/wrong/location')
     monkeypatch.setenv('PYTHONPATH', '/ambient/source')
     receipt = instance_setup.setup(root, node=node, offline=True, pip_cache=tmp_path,
-                                   npm_cache=tmp_path, runner=runner)
+                                   npm_cache=tmp_path, roles=roles, runner=runner)
     assert receipt['state'] == 'ready' and receipt['actor_seconds'] == 0
     pip = [cmd for cmd, _ in commands if 'pip' in cmd]
-    assert len(pip) == 2
+    assert len(pip) == 1
+    environments = [Path(cmd[-1]) for cmd, _ in commands if cmd[1:3] == ['-m', 'venv']]
+    assert environments == [root/'runtime/python']
+    assert receipt['role_engine'] == 'native-pi' and receipt['roles_python'] is None
+    assert json.loads((root/'config/instance.json').read_text()) == {}
     for cmd in pip:
         assert '--isolated' in cmd and '--ignore-installed' in cmd and '--no-index' in cmd
         target = Path(cmd[cmd.index('--target') + 1])
