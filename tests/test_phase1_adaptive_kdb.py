@@ -69,22 +69,25 @@ def test_production_actor_uses_compact_admitted_evidence_and_persistent_shared_b
     assert len(calls) == 1
 
 
-def test_curriculum_selection_handshake_and_actor_composition(tmp_path):
+def test_curriculum_selection_handshake_and_actor_composition(tmp_path, monkeypatch, scripted_provider):
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.a5kernels.phase1_provider import direct_profile, DirectCompletion
     from test_a5_phase1_curriculum_selector import context, project, wave
-    calls, decisions = [], []
+    from test_native_pi_programming_roles import redirect
+    url, native_calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    calls = []
+    native_calls.extend([('knowledge_query', dict(query='pipeline',limit=1)),
+        ('submit_curriculum_proposal', dict(decision='WAVE',payload=json.loads(wave([project('selected')]).split('\n',1)[1])))])
     def transport(**request):
-        decisions.append(request)
-        text = '{"knowledge_query":{"query":"pipeline","limit":1}}' if len(decisions) == 1 else wave([project('selected')])
-        return DirectCompletion(text, 1)
+        raise AssertionError('native curriculum cannot call the old provider transport')
     controller = build_native_adaptive_phase1(config=config(tmp_path), native_transport=NativeTransport(),
-        profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=b'Native guide', objective='Learn native copy',
+        profile=direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value=='deepseek-flash')), guide_bytes=b'Native guide', objective='Learn native copy',
         initial_memory=b'', environment={'OPENAI_API_KEY':'fixture', 'DEEPSEEK_API_KEY':'fixture'},
         provider_transport=transport, embeddings=Embeddings(), librarian_complete=completion(calls))
     decision, session = controller.curriculum.select(context())
     assert decision.wave.projects[0].spec.project_id == 'selected'
-    assert len(calls) == 1 and session.turns == 2
+    assert len(calls) == 1 and session.turns == 1 and len(requests) == 2
     packet = json.loads(calls[0][0][1]['content'])
     assert packet['role'] == 'curriculum' and packet['context']['target'] == 'Ascend910B4'
     assert list((tmp_path/'campaign'/'curriculum-librarian').glob('*/librarian-budget.json'))
