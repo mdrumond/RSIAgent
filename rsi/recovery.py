@@ -301,6 +301,12 @@ class PairedRecovery:
             (command := self.store.read_json(ref))['current_hash'] == runner.backend.project_hash()
             and command['classification'] in ('numeric_failure', 'compile_failure', 'execution_failure')
             for ref in failure['command_receipts']))
+        audit_ref = None
+        if failure:
+            canonical = runner.store.read_json(failure['result_ref'])['result']
+            audit_ref = failure.get('audit_ref', canonical.get('audit_ref'))
+            if audit_ref:
+                self.store.put_bytes(runner.store.read_bytes(audit_ref))
         receipt = dict(operation_id=request.operation_id, frozen=request.frozen_ref,
             arm=arm, root=str(request.root), skill_bundle_hash=runner.bundle.digest,
             workflow=workflow, correctness=correctness,
@@ -309,7 +315,7 @@ class PairedRecovery:
             wall_deadline=row.get('wall_deadline'),
             wall_limited=row.get('wall_deadline') is not None and self.clock() >= row['wall_deadline'],
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
-            terminal_failure_ref=self.store.put_json(failure) if failure else None,
+            terminal_failure_ref=self.store.put_json(failure) if failure else None, audit_ref=audit_ref,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
             execution_contract=self.store.put_json(runner.backend.contract),
             workflow_receipt=self.store.put_json(flow.state))
@@ -396,11 +402,14 @@ class CycleController:
     PairedRecovery. Learning.validate must consume paired evidence case IDs;
     only beneficial pairs enter its promotion gate. success_cases(event) may
     supply frozen independent validation cases for successful originals.
+    pair_feedback(event, operation, result) admits canonical arm facts for
+    independent original retry queues. It observes retained trials, never runs them.
     Tuning events remain unacknowledged for PR11.
     """
-    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None):
+    def __init__(self, path, scheduler, learning, *, artifacts, pair_factory, success_cases=None, pair_feedback=None):
         self.path, self.scheduler, self.learning = Path(path), scheduler, learning
         self.store, self.pair_factory, self.success_cases = artifacts, pair_factory, success_cases
+        self.pair_feedback = pair_feedback
         self.state = json.loads(self.path.read_text()) if self.path.exists() else dict(pending=None, completed={})
 
     def _save(self):
@@ -452,6 +461,11 @@ class CycleController:
                 result = dict(decision='validation' if cases else 'pending', cases=list(cases), actor_seconds=0.)
             pending['result'] = result
             self._save()
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries and 'feedback' not in pending:
+            if self.pair_feedback is None:
+                raise WorkflowError('paired retry requires canonical host feedback')
+            pending['feedback'] = self.pair_feedback(event, operation, result)
+            self._save()  # Authenticate retained arm facts before any skill promotion.
         if result['decision'] in ('benefit', 'validation') and 'active' not in pending:
             if self.scheduler.state['stopped']:
                 raise WorkflowError('cycle stopped before validation')
@@ -467,6 +481,8 @@ class CycleController:
             self.scheduler.publish_validated_skills(event['incumbent'], self.learning.active)
         receipt = self.store.put_json(dict(event=event['id'], operation_id=operation, result=result,
                                           active=self.learning.active))
+        if event['kind'] == 'paired_recovery_due' and self.scheduler.paired_retries:
+            self.scheduler.complete_paired_retry(event, result, receipt, pending['feedback'])
         self.scheduler.complete_extension(event['id'], receipt,
             actor_seconds=result['actor_seconds'], recovery=event['kind'] == 'paired_recovery_due')
         self.state['completed'][event['id']] = receipt
