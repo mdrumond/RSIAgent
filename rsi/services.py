@@ -320,6 +320,33 @@ class BoundCycle(ProjectComposition, TuningBindings):
             self.role_setup_started = None
         self.role_events.append(dict(operation_id=self.role_operation, event=event, payload=payload))
         atomic_json(self.roles_log, self.role_events)
+        self.supervise_roles(fault_ref=payload.get('artifact_ref') if
+            event == 'role_native_event' and payload.get('type') == 'native_fault' else None)
+
+    def supervise_roles(self, *, fault_ref=None):
+        from rsi.supervision import RoleSupervision
+        seen = set()
+        for started in reversed(self.role_events):
+            if started['event'] != 'role_started' or not started['payload'].get('native_root'):
+                continue
+            payload = started['payload']
+            key = (started['operation_id'], payload['role'])
+            if key in seen:
+                continue
+            seen.add(key)
+            root = Path(payload['native_root']).resolve().parent
+            if not root.is_relative_to((self.root / 'native-roles').resolve()):
+                raise ValueError('role supervision escapes the admitted cycle')
+            retained = json.loads((root / 'role.json').read_text())
+            if retained['status'] != 'pending':
+                continue
+            rows = [row for row in self.role_events if row['operation_id'] == started['operation_id']
+                    and row['payload'].get('role') == payload['role']]
+            if fault_ref and not any(row['payload'].get('artifact_ref') == fault_ref for row in rows):
+                continue
+            scope = dict(cycle_id=self.spec.cycle_id, operation_id=started['operation_id'],
+                         role=payload['role'], request_ref=payload['request_ref'])
+            RoleSupervision(root, store=self.store, scope=scope, host_rows=rows).poll(fault_ref=fault_ref)
 
     def role_elapsed(self, operation):
         rows = [e['payload']['elapsed_seconds'] for e in self.role_events
@@ -467,7 +494,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
         if outcome not in ('accepted', 'rejected', 'budget_exhausted', 'failed') or (
                 runner.workflow.pending and failure is None):
             raise RuntimeError('project suspended; reconcile same operation before cycle continuation')
-        return HostTaskResult(outcome, ref, delta)
+        return HostTaskResult(outcome, ref, delta,
+            classification=failure['classification'] if failure else None,
+            terminal_failure_ref=proof_ref, audit_ref=failure.get('audit_ref') if failure else None)
 
     def open_project(self, operation):
         relative = self.scheduler.state.get('project_roots', {}).get(operation)
@@ -739,7 +768,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
                         proof != runner.terminal_failure_proof(closure_ref=proof['closure_ref'])):
                     raise ValueError('failed task admission proof no longer matches')
                 self.scheduler.reconcile(pending['id'], HostTaskResult('failed', ref,
-                    packet['actor_seconds_delta']))
+                    packet['actor_seconds_delta'], classification=proof['classification'],
+                    terminal_failure_ref=failure, audit_ref=proof.get('audit_ref')))
                 return
         runner.reconcile()
         if runner.workflow.pending:
@@ -758,6 +788,19 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def adopt_revision(self, configuration=None):
         return revisions.adopt(self, configuration or show_configuration(self.services.root))
+
+    def supervise(self):
+        from rsi.supervision import ProjectSupervision
+        self.supervise_roles()
+        if self.active_runner is not None:
+            self.active_runner.supervise()
+        pool = self.waves.active_pool if self.waves else None
+        if pool is not None:
+            for operation, row in pool.status()['projects'].items():
+                root = pool._branch(operation) / 'runner'
+                if row['status'] == 'pending' and all((root / name).exists() for name in
+                        ('runner.json', 'workflow.json')):
+                    ProjectSupervision(root).poll()
 
     def execute(self, runner):
         self.active_runner = runner

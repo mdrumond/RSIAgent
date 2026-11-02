@@ -296,6 +296,7 @@ class PairedRecovery:
             wall_limited=row.get('wall_deadline') is not None and self.clock() >= row['wall_deadline'],
             source_hash=runner.backend.project_hash(), source_files=_files(runner.backend.project, self.store),
             terminal_failure_ref=self.store.put_json(failure) if failure else None,
+            audit_ref=failure.get('audit_ref') if failure else None,
             contract=self.store.put_json(runner.store.read_json(runner.contract_ref)),
             execution_contract=self.store.put_json(runner.backend.contract),
             workflow_receipt=self.store.put_json(flow.state))

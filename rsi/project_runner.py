@@ -149,7 +149,22 @@ class ProjectRunner:
     def actor_event(self, kind, data):
         if kind == 'skill-usage':
             self.service.record_skill_event(data)
-        self.append(dict(type=kind, **data))
+        event = dict(type=kind, **data)
+        self.append(event)
+        if kind == 'pi-native-event' and data.get('event', {}).get('type') == 'native_fault':
+            self.supervise(fault_ref=self.store.put_json(event))
+
+    def supervise(self, *, fault_ref=None):
+        from rsi.supervision import ProjectSupervision
+        reference = ProjectSupervision(self.root, clock=self.workflow.clock).poll(fault_ref=fault_ref)
+        if fault_ref is not None:
+            native = getattr(getattr(self.actor.session, 'session', None), 'session', None)
+            if native is not None:
+                try:
+                    native.abort()
+                except NativeError:
+                    pass  # Abort transport failure does not establish closure.
+        return reference
 
     def resolve(self, kind, reference, stage, operation):
         if kind == 'failed-operation':
@@ -686,6 +701,10 @@ class ProjectRunner:
                 frozen_skill_hash=self.bundle.digest, result_ref=event['reference'], closure_ref=ref,
                 accounting_snapshot=outcome['workflow_state_ref'], created=self.workflow.state['created'],
                 limits=self.workflow.state['limits'], stage_completion_claim=False, replay_allowed=False)
+            from rsi.supervision import ProjectSupervision
+            audit = ProjectSupervision(self.root).terminal_audit(self.workflow.pending, result_ref=event['reference'])
+            if audit:
+                packet.update(classification='harness_failure', audit_ref=audit)
             return json.loads(json.dumps(packet, allow_nan=False))  # No mutable state aliases.
 
     def run(self):
