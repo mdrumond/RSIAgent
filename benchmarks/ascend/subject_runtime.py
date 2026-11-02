@@ -76,13 +76,8 @@ def bounded_completion(provider, profile, messages, remaining_seconds):
         if available <= 0:
             raise TimeoutError('subject role provider elapsed allowance exhausted')
         if transport is openai_compatible_transport:
-            from openai import OpenAI
-            response = OpenAI(api_key=options['api_key'], base_url=options['base_url'],
-                timeout=available, max_retries=0).chat.completions.create(**options['request'])
-            result = DirectCompletion(response.choices[0].message.content, response.usage.completion_tokens)
-        else:
-            # Injected transports own their I/O bounds, just as in the Actor API.
-            result = transport(**options)
+            raise RuntimeError('production role requests require a native session binding')
+        result = transport(**options)
         if provider.clock() >= deadline:
             raise TimeoutError('subject role provider returned after its elapsed allowance')
         return result

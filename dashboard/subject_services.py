@@ -58,10 +58,24 @@ def bind_subject(config_path, campaign_id, *, max_seconds, compose=None):
         knowledge = SubjectKnowledge(root, store, lambda: memory, paths=bound.get('paths'),
             embeddings=bound.get('embeddings'),
             reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
+        roles = {}
         def complete(role, messages, *, remaining_seconds):
             name = settings.get(role + '_model', settings.get('curriculum_model') if role == 'librarian' else None)
             selected = profile if name is None else direct_profile(next(
                 row for row in MODEL_IDENTITIES if row.backend_model.value == name))
-            return bounded_completion(provider, selected, messages, min(max_seconds, remaining_seconds))
+            allowance = min(max_seconds, remaining_seconds)
+            if compose is not None:
+                return bounded_completion(provider, selected, messages, allowance)
+            from benchmarks.ascend.native_curriculum import NativeSubjectRole
+            if role not in roles:
+                roles[role] = NativeSubjectRole(root / 'dashboard-native-roles' / role, selected,
+                                                provider.coding_environment())
+            try:
+                return roles[role](messages, remaining_seconds=allowance)
+            finally:
+                native_store = roles[role].last_store
+                if native_store is not None:
+                    for path in native_store.objects.glob('*/*'):
+                        store.retain_from(native_store, path.parent.name + path.name)
         yield SimpleNamespace(root=root, entry=entry, settings=settings, bound=bound,
             provider=provider, profile=profile, policy=policy, knowledge=knowledge, complete=complete)
