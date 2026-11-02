@@ -134,36 +134,8 @@ def test_direct_construction_cannot_bypass_profile_controls():
         load_a5_model_profile().generation.max_tokens = 1000
 
 
-@pytest.mark.parametrize("truncated", [False, True])
-def test_default_client_wire_route_and_controls_stay_fixed(monkeypatch, truncated):
-    from llm import client
 
-    requests = []
 
-    def create(**kwargs):
-        requests.append(kwargs)
-        return SimpleNamespace(
-            provider="OpenAI", choices=[SimpleNamespace(
-                finish_reason="length" if truncated else "stop",
-                message=SimpleNamespace(content="" if truncated else "candidate"),
-            )],
-        )
-
-    monkeypatch.setattr(client, "_client", SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-    ))
-    result = complete_a5("system", "user")
-    assert result.text == ("" if truncated else "candidate")
-    assert requests == [{
-        "model": CANONICAL_MODEL,
-        "messages": [{"role": "system", "content": "system"},
-                     {"role": "user", "content": "user"}],
-        "max_tokens": 32768, "temperature": 0.0, "top_p": 1.0,
-        "extra_body": {
-            "reasoning": {"effort": "high"},
-            "provider": {"order": ["OpenAI"], "allow_fallbacks": False,
-                         "require_parameters": True},
-        },
-    }]
-    assert result.provenance.generation["allow_truncation_retry"] is False
-    assert result.provenance.profile_sha256 == load_a5_model_profile().fingerprint
+def test_default_programming_completion_requires_native_session():
+    with pytest.raises(ValueError):
+        complete_a5('system', 'user')

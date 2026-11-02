@@ -44,3 +44,21 @@ def test_kernel_terminal_native_repair_retains_host_evidence_without_openai(tmp_
     assert artifacts[-1]['artifact_refs']
     for reference in artifacts[-1]['artifact_refs']:
         case.runner.store.read_bytes(reference)
+
+
+def test_native_terminal_failure_keeps_verified_host_result_and_full_role_evidence(tmp_path, monkeypatch, scripted_provider):
+    url, calls, requests = scripted_provider
+    redirect(monkeypatch, url)
+    case = _canonical_kernel_case(tmp_path, monkeypatch).run()
+    before = list(case.calls)
+    calls.append(('submit_curriculum_proposal', dict(value=dict(distillation=dict(no_new_knowledge=False, lessons=[])))))
+    result = case.driver.distill(case.outcome)
+    assert result.status == 'host-verified' and result.distillation is None
+    assert result.distillation_failure
+    assert case.runner.store.read_json(result.distillation_failure)['host_outcome'] == 'host-verified'
+    assert case.calls == before and len(requests) == 2
+    artifacts = next(event for event in reversed(case.runner.events) if event['type']=='domain-distillation-artifacts')
+    assert artifacts['artifact_refs']
+    assert any(b'Native provider' in case.runner.store.read_bytes(reference)
+               or b'before_provider_request' in case.runner.store.read_bytes(reference)
+               for reference in artifacts['artifact_refs'])

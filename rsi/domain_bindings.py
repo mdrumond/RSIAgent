@@ -474,7 +474,8 @@ def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()
             wall_time_s=clock.seconds(), distillation=distilled, admitted_artifacts=admitted, continuation=None)
     except Exception as error:
         reference = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-            exception_type=type(error).__name__, source_hash=host.project_hash(), contract_ref=runner.contract_ref))
+            exception_type=type(error).__name__, host_outcome=outcome.status,
+            source_hash=host.project_hash(), contract_ref=runner.contract_ref))
         runner.append(dict(type='domain-distillation-failure', reference=reference))
         return replace(outcome, distillation_failure=reference, wall_time_s=clock.seconds())
     finally:
