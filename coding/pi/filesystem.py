@@ -49,8 +49,7 @@ class NativeFiles:
         return checked
 
     def _scope(self, context):
-        left = context['remaining']() if context.get('remaining') else None
-        if left is not None and left <= 0:
+        if context.get('remaining') and context['remaining']() <= 0:
             raise PermissionError('native filesystem deadline exhausted')
         if not context.get('operation_id') or not context.get('tool_call_id'):
             raise ValueError('native operation and tool call identities required')
