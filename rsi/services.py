@@ -31,7 +31,7 @@ from rsi.project_composition import ProjectComposition, verify_kdb
 from rsi.python_execution import atomic_json
 from rsi.recovery import CycleController, PairedRecovery, fork_inference
 from rsi.runtime import WorkflowError
-from rsi.roles import AdmittedEvidence, IsolatedRoles, _proposal
+from rsi.roles import AdmittedEvidence, NativeRoles, _proposal
 from rsi.skills import SkillBundle
 from rsi import revisions
 from rsi.setup_telemetry import SetupTelemetry
@@ -253,6 +253,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             branch = Path(state['isolation']['branch_root'])
             memory_root, learning_path = branch / 'memory', branch / 'learning.json'
         policy = dict(self.config.get('cycle_limits', {}))
+        # Retained cycles keep their admitted policy; new projects own elapsed limits.
+        policy['independent_projects'] = state.get('config', {}).get('independent_projects', False) if state else True
         from rsi.phase1_recovery import Phase1Recovery, configured
         self.curriculum = Phase1Recovery(self) if self.spec.mode == Mode.PHASE1 and configured(self.config) else None
         if self.curriculum:
@@ -276,6 +278,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
             recover=self.binding.get('recover') if self.binding.get('recover') is not None else
                 True if self.curriculum else self.config.get('recovery', {}).get('enabled', True),
             tuning_every=self.config.get('tuning', {}).get('every_projects', 5), clock=cycle_clock, **policy)
+        self.scheduler.adopt_independent_projects()
         try:
             with self.services.setup.measure('cycle-memory-learning-open', self.spec.cycle_id):
                 self.memory = services._memory(memory_root, self.binding['initial'].encode())
@@ -315,7 +318,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def observe_role(self, event, payload):
         if event == 'role_started' and self.role_setup_started is not None:
-            self.services.setup.record('roles-worker-dependency-load', self.role_setup_started,
+            self.services.setup.record('native-role-session-setup', self.role_setup_started,
                 success=True, scope=self.role_operation)
             self.role_setup_started = None
         self.role_events.append(dict(operation_id=self.role_operation, event=event, payload=payload))
@@ -367,8 +370,10 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 profile = direct_profile(identity)
                 if profile.model != provider['model']:
                     raise ValueError('registered role model mismatch')
-                self._roles = IsolatedRoles(str(self.services.executable(self.config['roles_python'])),
-                    profile, observer=self.observe_role, environment=self.services.environment,
+                self._roles = NativeRoles(self.root/'native-roles', profile,
+                    observer=self.observe_role, environment=self.services.environment, store=self.store,
+                    operation_id=lambda: self.role_operation,
+                    node_modules=self.services.root/'machinery/integrations/pi/node_modules',
                     **self.config.get('roles', {}))
         return self._roles
 
@@ -429,7 +434,7 @@ class BoundCycle(ProjectComposition, TuningBindings):
 
     def finish_role_setup(self):
         if self.role_setup_started is not None:
-            self.services.setup.record('roles-worker-setup-without-start-receipt',
+            self.services.setup.record('native-role-setup-without-start',
                 self.role_setup_started, success=False, scope=self.role_operation, actor_billable=None)
             self.role_setup_started = None
 
@@ -664,7 +669,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
             kdb_ref=self.binding['kdb'], model_config=self.config['provider'], incumbent=event['incumbent'],
             candidate=event['candidate'], joint_limits=BudgetLimits.from_dict(
                 self.config.get('recovery', {}).get('budgets', self.config['budgets'])),
-            remaining_parent=remaining, runner_factory=self.trial)
+            remaining_parent=remaining, runner_factory=self.trial,
+            independent=self.scheduler.independent_projects)
 
     def validate(self, incumbent, candidate, cases, operation):
         suite = self.suite_validation(incumbent, candidate, cases, operation)

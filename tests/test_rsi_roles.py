@@ -1,591 +1,236 @@
-"""Real NOOA PredictStrategy over the registered direct-provider boundary."""
-import importlib.util
+"""Native role proposals, bounded evidence and authoritative settlement behavior."""
+from dataclasses import asdict
 import json
-import subprocess
-import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from rsi.roles import AdmittedEvidence, NoncodingRoles
-
-@pytest.fixture(autouse=True)
-def optional_framework(request):
-    if (not request.node.name.startswith('test_isolated')
-            and not request.node.name.startswith('test_wall')
-            and request.node.name != 'test_core_module_import_does_not_load_optional_framework'
-            and importlib.util.find_spec('nooa') is None):
-        pytest.skip('install rsi[roles] on Python 3.12/3.13')
+from coding.pi.native import NativeError, NativeSettlement
+from core.artifacts import ContentAddressedArtifacts
+from rsi.roles import AdmittedEvidence, NativeRoles, RoleFailure, _proposal
+from test_rsi_services import instance
 
 
 class Clock:
-    now = 100.0
-
+    now = 100.
     def __call__(self):
         return self.now
 
 
-def make_roles(responses, clock=None):
-    from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider, direct_profile
-    from benchmarks.a5kernels.phase1_experiments import A5BackendModel, MODEL_IDENTITIES
-
-    calls = []
-    events = []
-    clock = clock or Clock()
-
-    def transport(**kwargs):
-        calls.append(kwargs)
-        value = responses.pop(0)
-        if isinstance(value, Exception):
-            raise value
-        clock.now += 2
-        return DirectCompletion(json.dumps(value), 20)
-
-    model = A5BackendModel.DEEPSEEK_FLASH
-    provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': 'test-only-secret'},
-                                        transport=transport, models=[model], clock=clock)
-    profile = direct_profile(next(x for x in MODEL_IDENTITIES if x.backend_model == model))
-    roles = NoncodingRoles(provider, profile, clock=clock,
-                          observer=lambda event, payload: events.append((event, payload)))
-    return roles, calls, events, clock
+class Files:
+    def __init__(self, root, *, store, read_paths, record):
+        self.paths = read_paths
+    def session_options(self):
+        return {}
 
 
-def test_curriculum_runs_real_predict_and_preserves_registered_route():
-    roles, calls, events, _ = make_roles([{
-        'rationale': 'exercise numeric repair', 'evidence_ids': ['failure'],
-        'projects': [{'name': 'stable_sum', 'goal': 'accurate cancellation',
-                      'acceptance': 'match decimal reference'}]}])
-    result = roles.curriculum('Construct a CPU curriculum',
-                              [AdmittedEvidence('failure', {'error': 1.0})], deadline=110)
-    assert result.projects[0].name == 'stable_sum'
-    assert result.evidence_ids == ('failure',)
-    assert len(calls) == 1
-    assert calls[0]['base_url'] == 'https://api.deepseek.com'
-    assert calls[0]['request']['model'] == 'deepseek-flash'
-    assert 0 < calls[0]['request']['timeout'] <= 10
-    wire = json.dumps(calls[0]['request']['messages'])
-    assert 'test-only-secret' not in wire
-    assert [e for e, _ in events].count('role_finished') == 1
-    assert events[-1][1]['elapsed_seconds'] == 2
-    assert events[0][1]['evidence'] == [{'evidence_id': 'failure', 'data': {'error': 1.0}}]
-
-
-def test_skillwriter_returns_proposal_without_applying_it():
-    roles, _, _, _ = make_roles([{
-        'rationale': 'detect regression', 'evidence_ids': ['run'],
-        'edits': [{'skill': 'debug', 'operation': 'replace', 'content': 'Check reference.'}]}])
-    proposal = roles.skillwriter('Improve detection', [AdmittedEvidence('run', {})], deadline=110)
-    assert proposal.edits[0].operation == 'replace'
-    assert proposal.edits[0].skill == 'debug'
-
-
-def test_review_allows_no_actionable_findings():
-    roles, _, _, _ = make_roles([{'rationale': 'no regression', 'evidence_ids': [], 'findings': []}])
-    assert roles.review('Review', [], deadline=110).findings == ()
-
-
-@pytest.mark.parametrize('bad', [
-    {'rationale': 'x', 'evidence_ids': [], 'findings': [], 'approved': True},
-    {'rationale': 'x', 'evidence_ids': [], 'findings': [{'severity': 'urgent', 'location': 'a:1', 'issue': 'bug'}]},
-    {'rationale': 'x', 'evidence_ids': ['invented'], 'findings': []},
-])
-def test_invalid_proposal_does_not_retry_or_escape_host_gate(bad):
-    roles, calls, events, _ = make_roles([bad])
-    with pytest.raises(Exception):
-        roles.review('Review', [AdmittedEvidence('real', {})], deadline=110)
-    assert len(calls) == 1
-    assert events[-1][1]['success'] is False
-
-
-def test_deadline_exhausted_before_dispatch():
-    roles, calls, _, _ = make_roles([])
-    with pytest.raises(TimeoutError):
-        roles.review('Review', [], deadline=100)
-    assert calls == []
-
-
-def test_late_provider_result_cannot_be_accepted():
-    roles, calls, events, _ = make_roles([{'rationale': 'ok', 'evidence_ids': [], 'findings': []}])
-    with pytest.raises(TimeoutError):
-        roles.review('Review', [], deadline=101)
-    assert len(calls) == 1
-    assert events[-1][1]['success'] is False
-
-
-def test_duplicate_evidence_rejected_before_dispatch():
-    roles, calls, _, _ = make_roles([])
-    with pytest.raises(ValueError):
-        roles.review('Review', [AdmittedEvidence('a', {}), AdmittedEvidence('a', {})], deadline=110)
-    assert calls == []
-
-
-def test_core_module_import_does_not_load_optional_framework():
-    subprocess.run([sys.executable, '-c',
-                    "import sys; import rsi.roles; assert 'nooa' not in sys.modules; assert 'pydantic' not in sys.modules"],
-                   check=True)
-
-
-def test_framework_setup_does_not_consume_actor_allowance(monkeypatch):
-    import rsi.roles as module
-    roles, calls, events, clock = make_roles([{'rationale': 'ok', 'evidence_ids': [], 'findings': []}])
-    original = module._framework
-
-    def setup():
-        framework = original()
-        clock.now += 7
-        return framework
-
-    monkeypatch.setattr(module, '_framework', setup)
-    roles.review('Review', [], deadline=110)
-    assert calls[0]['request']['timeout'] == 10
-    assert events[-1][1]['elapsed_seconds'] == 2
-
-
-def test_provider_failure_is_observed_and_never_falls_back():
-    roles, calls, events, _ = make_roles([RuntimeError('transport failed')])
-    with pytest.raises(Exception):
-        roles.review('Review', [], deadline=110)
-    assert len(calls) == 1
-    assert events[-1][1]['success'] is False
-
-
-def test_active_async_loop_rejected_before_dispatch():
-    import asyncio
-    roles, calls, _, _ = make_roles([])
-
-    async def nested():
-        with pytest.raises(RuntimeError):
-            roles.review('Review', [], deadline=110)
-
-    asyncio.run(nested())
-    assert calls == []
-
-
-def isolated(monkeypatch, script, *, allowance=5, setup_seconds=5, receipt_grace_seconds=2):
-    """Use a real subprocess with scripted receipts, never the network."""
-    import os
-    import rsi.roles as module
-    roles, _, _, _ = make_roles([])
-    original = subprocess.Popen
-    captured = []
-    events = []
-
-    def launch(command, **kwargs):
-        captured.append((command, kwargs['env']))
-        return original([sys.executable, '-c', script], **kwargs)
-
-    monkeypatch.setattr(module.subprocess, 'Popen', launch)
-    adapter = module.IsolatedRoles(sys.executable, roles.profile,
-        observer=lambda e, p: events.append((e, p)),
-        environment={**os.environ, 'DEEPSEEK_API_KEY': 'test-only-secret',
-                     'OPENAI_API_KEY': 'must-not-inherit'}, setup_seconds=setup_seconds,
-        receipt_grace_seconds=receipt_grace_seconds)
-    return adapter, events, captured
-
-
-WORKER = '''
-import json, sys, time
-request = json.loads(sys.stdin.readline())
-def emit(event, payload):
-    print(json.dumps(dict(event=event, payload=payload)), flush=True)
-time.sleep(0.05)
-emit('role_started', {'role': 'review', 'provider_identity': IDENTITY})
-time.sleep(0.02)
-emit('role_finished', {'role': 'review', 'success': True, 'elapsed_seconds': 0.02})
-emit('result', {'rationale': 'checked', 'evidence_ids': ['run'], 'findings': []})
-'''
-
-
-def worker_script():
-    roles, _, _, _ = make_roles([])
-    return WORKER.replace('IDENTITY', repr(roles.profile.identity.as_dict()))
-
-
-def test_isolated_validates_real_process_receipts_and_controls_environment(monkeypatch):
-    import time
-    adapter, events, captured = isolated(monkeypatch, worker_script())
-    result = adapter.review('review', [AdmittedEvidence('run', {})], deadline=time.monotonic() + 5)
-    assert result.findings == ()
-    env = captured[0][1]
-    assert env['DEEPSEEK_API_KEY'] == 'test-only-secret'
-    assert env['PYTHONNOUSERSITE'] == '1'
-    from pathlib import Path
-    assert not Path(env['PYTHONPATH']).exists()
-    assert 'OPENAI_API_KEY' not in env
-    assert captured[0][0][-2:] == ['-m', 'rsi.roles']
-    assert [p['elapsed_seconds'] for e, p in events if e == 'role_finished'] == [0.02]
-
-
-@pytest.mark.parametrize('replacement', [
-    ("'evidence_ids': ['run']", "'evidence_ids': ['invented']"),
-    ("'elapsed_seconds': 0.02", "'elapsed_seconds': -1"),
-    ("'elapsed_seconds': 0.02", "'elapsed_seconds': float('nan')"),
-    ("'success': True", "'success': False"),
-])
-def test_isolated_rejects_invalid_proposals_and_receipts(monkeypatch, replacement):
-    import time
-    script = worker_script().replace(*replacement)
-    adapter, _, _ = isolated(monkeypatch, script)
-    with pytest.raises((ValueError, RuntimeError)):
-        adapter.review('review', [AdmittedEvidence('run', {})], deadline=time.monotonic() + 5)
-
-
-def test_isolated_enforces_timeout_without_retry_and_marks_missing_accounting(monkeypatch):
-    import time
-    adapter, events, captured = isolated(monkeypatch,
-        'import time; time.sleep(5)', setup_seconds=0.05)
-    with pytest.raises(TimeoutError):
-        adapter.review('review', [], deadline=time.monotonic() + 5)
-    assert len(captured) == 1
-    assert events[-1][0] == 'accounting_incomplete'
-    from pathlib import Path
-    assert not Path(captured[0][1]['PYTHONPATH']).exists()
-
-
-def test_isolated_never_publishes_secret_output(monkeypatch):
-    import time
-    script = "import sys; sys.stdin.readline(); print('test-only-secret', flush=True)"
-    adapter, events, _ = isolated(monkeypatch, script)
-    with pytest.raises(ValueError):
-        adapter.review('review', [], deadline=time.monotonic() + 5)
-    assert 'test-only-secret' not in json.dumps(events)
-
-
-def test_isolated_installed_wheel_excludes_host_dependencies(tmp_path):
-    """Install a real wheel outside checkout; child keeps its own OpenAI SDK."""
-    import os
-    import venv
-    from pathlib import Path
-    worker_version = '2.0.0-worker-fixture'
-    worker = tmp_path / 'worker'
-    venv.EnvBuilder(with_pip=False).create(worker)
-    worker_python = worker / 'bin' / 'python'
-    site = Path(subprocess.check_output([str(worker_python), '-c',
-        'import sysconfig; print(sysconfig.get_paths()["purelib"])'], text=True).strip())
-    (site / 'openai').mkdir()
-    (site / 'openai' / '__init__.py').write_text('__version__ = ' + repr(worker_version) + '\n')
-    source = Path(__file__).resolve().parents[1]
-    wheels, host = tmp_path / 'wheels', tmp_path / 'host-site'
-    wheels.mkdir()
-    subprocess.run([sys.executable, '-m', 'pip', 'wheel', '--no-deps',
-                    '--no-build-isolation', '--wheel-dir', str(wheels), str(source)],
-                   check=True, capture_output=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps',
-                    '--target', str(host), str(next(wheels.glob('rsi-*.whl')))],
-                   check=True, capture_output=True)
-    sentinel = host / 'openai'
-    sentinel.mkdir()
-    (sentinel / '__init__.py').write_text("raise RuntimeError('host SDK leaked into worker')\n")
-    probe = '''
-import hashlib, json, pathlib, sys, time
-import openai, rsi.roles
-req = json.loads(sys.stdin.readline())
-assert pathlib.Path.cwd() != pathlib.Path(HOST)
-assert pathlib.Path(rsi.roles.__file__).read_bytes() == pathlib.Path(ORIGINAL).read_bytes()
-assert openai.__version__ == EXPECTED_VERSION
-def emit(event, payload):
-    print(json.dumps(dict(event=event, payload=payload)), flush=True)
-emit('role_started', {'role': 'review', 'provider_identity': IDENTITY})
-emit('role_finished', {'role': 'review', 'success': True, 'elapsed_seconds': 0.0})
-emit('result', {'rationale': openai.__version__, 'evidence_ids': [], 'findings': []})
-'''
-    parent = '''
-import json, os, pathlib, subprocess, sys, time
-import rsi.roles as module
-from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-from benchmarks.a5kernels.phase1_provider import direct_profile
-identity = next(x for x in MODEL_IDENTITIES if x.backend_model.value == 'deepseek-flash')
-original = subprocess.Popen
-projection = []
-probe = %r
-probe = probe.replace('HOST', repr(%r)).replace('ORIGINAL', repr(module.__file__)).replace('IDENTITY', repr(identity.as_dict())).replace('EXPECTED_VERSION', repr(%r))
-def launch(command, **kwargs):
-    projection.append(pathlib.Path(kwargs['cwd']))
-    assert kwargs['env']['PYTHONNOUSERSITE'] == '1'
-    assert kwargs['env']['PYTHONPATH'] != %r
-    return original([%r, '-c', probe], **kwargs)
-module.subprocess.Popen = launch
-adapter = module.IsolatedRoles(sys.executable, direct_profile(identity), observer=lambda *args: None,
-                               environment={'DEEPSEEK_API_KEY': 'test-only-secret'})
-result = adapter.review('review', [], deadline=time.monotonic() + 10)
-assert result.rationale == %r
-assert not projection[0].exists()
-print(json.dumps({'worker_openai': result.rationale, 'projection_removed': True}))
-''' % (probe, str(host), worker_version, str(host), str(worker_python), worker_version)
-    completed = subprocess.run([sys.executable, '-c', parent], cwd=tmp_path,
-                               env={**os.environ, 'PYTHONPATH': str(host), 'PYTHONNOUSERSITE': '1'},
-                               check=True, capture_output=True, text=True)
-    assert json.loads(completed.stdout)['projection_removed'] is True
-
-
-def test_wall_framework_setup_exhaustion_never_starts_provider(monkeypatch):
-    import rsi.roles as module
-    roles, calls, events, clock = make_roles([])
-    class Client:
-        def __init__(self, owner, deadline):
-            self.deadline = deadline
-    class Agent:
-        def __init__(self, llm):
-            pass
-    def framework():
-        clock.now += 100
-        return Agent, Client
-    monkeypatch.setattr(module, '_framework', framework)
-    with pytest.raises(TimeoutError, match='wall'):
-        roles.skillwriter('write', [], deadline=110, wall_deadline=105)
-    assert calls == []
-    assert not events  # No fabricated role_finished for setup-only work.
-
-
-def test_wall_remaining_after_setup_bounds_provider_and_actor_receipt(monkeypatch):
-    from types import SimpleNamespace
-    import rsi.roles as module
-    roles, calls, events, clock = make_roles([])
-    observed = []
-    class Client:
-        def __init__(self, owner, deadline):
-            self.owner, self.deadline = owner, deadline
-    class Agent:
-        def __init__(self, llm):
-            self.llm = llm
-        async def skillwriter(self, **kwargs):
-            observed.append(self.llm.owner._remaining(self.llm.deadline))
+def fixture_roles(tmp_path, *, responses=None, fault=None, settled=True, setup=40.):
+    clock, events, sessions = Clock(), [], []
+    store = ContentAddressedArtifacts(tmp_path/'artifacts')
+    profile = SimpleNamespace(identity=SimpleNamespace(profile_id='deepseek-flash-native-v1',
+                                                       credential_env='DEEPSEEK_API_KEY'))
+    class Session:
+        provider_settled = settled
+        pending_tools = set() if settled else {'pending-native-call'}
+        session_file = 'native-session.jsonl'
+        usage = []
+        def __init__(self, root, **kwargs):
+            self.root, self.options = root, kwargs
+            self.closed = False
+            sessions.append(self)
+        def prepare(self, timeout):
+            clock.now += setup
+        def prompt(self, text, *, operation_id, remaining):
+            self.prompt_text = text
+            self.options['observer'](dict(type='agent_start'))
             clock.now += 2
-            return SimpleNamespace(model_dump=lambda **kwargs: dict(
-                rationale='no changes', evidence_ids=[], edits=[]))
-    def framework():
-        clock.now += 3
-        return Agent, Client
-    monkeypatch.setattr(module, '_framework', framework)
-    with pytest.raises(TimeoutError):
-        roles.skillwriter('write', [], deadline=110, wall_deadline=105)
-    assert observed == [2]
-    receipts = [payload for event, payload in events if event == 'role_finished']
-    assert len(receipts) == 1
-    assert receipts[0]['elapsed_seconds'] == 2
-    assert receipts[0]['success'] is False
+            if fault:
+                if fault is KeyboardInterrupt:
+                    raise KeyboardInterrupt()
+                raise fault('actual failure', settlement=NativeSettlement('failed', settled,
+                    tuple(self.pending_tools), self.session_file, ()))
+            for data in responses or []:
+                try:
+                    self.result = self.options['tools'][0].callback(data,
+                        dict(operation_id=operation_id, tool_call_id='native-proposal', remaining=remaining))
+                except ValueError as exc:
+                    self.options['observer'](dict(type='host_callback_error', message=str(exc)))
+                    continue
+                assert self.result['terminate'] is True
+                break
+            return NativeSettlement('settled', True, (), self.session_file, ())
+        def close(self):
+            self.closed = True
+    roles = NativeRoles(tmp_path/'roles', profile, observer=lambda *event: events.append(event),
+        environment={'DEEPSEEK_API_KEY': 'fixture-secret'}, store=store, operation_id=lambda: 'operation',
+        session_factory=Session, files_factory=Files, clock=clock)
+    return roles, clock, events, sessions, store
 
 
-@pytest.mark.parametrize('finished_before_timeout', [False, True])
-def test_isolated_wall_kills_slow_worker_without_fabricated_finished(monkeypatch, tmp_path, finished_before_timeout):
-    from contextlib import contextmanager
-    import time
-    import rsi.roles as module
-    @contextmanager
-    def projection(check=lambda: None):
-        check()
-        yield tmp_path
-        check()
-    monkeypatch.setattr(module, '_machinery_projection', projection)
-    script = worker_script().split("time.sleep(0.02)")[0]
-    if finished_before_timeout:
-        script += "emit('role_finished', {'role': 'review', 'success': True, 'elapsed_seconds': 0.0})\n"
-    script += 'time.sleep(5)\n'
-    adapter, events, captured = isolated(monkeypatch, script)
-    started = time.monotonic()
-    with pytest.raises(TimeoutError):
-        adapter.review('review', [], deadline=started + 10, wall_deadline=started + 0.3)
-    assert time.monotonic() - started < 2
-    assert len(captured) == 1
-    receipts = [payload for event, payload in events if event == 'role_finished']
-    assert len(receipts) == int(finished_before_timeout)
-    assert any(event == 'accounting_incomplete' for event, _ in events) is not finished_before_timeout
+IDEA = dict(question='Which input isolates the mismatch?', goal='Investigate a smaller input',
+            why='Distinguish compilation from numerical behavior')
 
 
-def test_isolated_wall_projection_exhaustion_never_spawns(monkeypatch, tmp_path):
-    from contextlib import contextmanager
-    import rsi.roles as module
-    now = [100.0]
-    @contextmanager
-    def projection(check=lambda: None):
-        now[0] += 6
-        check()
-        yield tmp_path
-    monkeypatch.setattr(module, '_machinery_projection', projection)
-    adapter, events, captured = isolated(monkeypatch, 'raise AssertionError("must not run")')
-    adapter.clock = lambda: now[0]
-    with pytest.raises(TimeoutError, match='wall'):
-        adapter.review('review', [], deadline=110, wall_deadline=105)
-    assert captured == []
-    assert events == []
+def test_semantic_proposal_uses_native_tool_and_setup_is_not_actor_time(tmp_path):
+    roles, clock, events, sessions, store = fixture_roles(tmp_path, responses=[IDEA])
+    idea = roles.investigation('Read documentation before proposing.',
+        [AdmittedEvidence('failure', {'error': 'actual mismatch'})], deadline=110)
+    assert asdict(idea) == IDEA and clock.now == 142
+    finished = [data for event, data in events if event == 'role_finished']
+    assert finished == [dict(role='investigation', success=True, elapsed_seconds=2)]
+    started = next(data for event, data in events if event == 'role_started')
+    assert store.read_json(started['request_ref'])['evidence'][0]['data']['error'] == 'actual mismatch'
+    assert all(session.closed for session in sessions)
+    assert sessions[0].options['tools'][0].name == 'submit_proposal'
+    assert 'fixture-secret' not in json.dumps(events)
 
 
-def test_skillwriter_real_predict_accepts_typed_append_without_normalisation():
-    roles, calls, events, _ = make_roles([{
-        'rationale': 'prevent recurrence', 'evidence_ids': ['numeric-failure'],
-        'edits': [{'skill': 'debug', 'operation': 'append', 'content': 'Retest cancellation.'}]}])
-    proposal = roles.skillwriter('Improve detection', [AdmittedEvidence('numeric-failure', {})], deadline=110)
-    assert proposal.edits[0].operation == 'append'
-    assert proposal.edits[0].content == 'Retest cancellation.'
-    assert len(calls) == 1
-    emitted = [payload for event, payload in events if event == 'role_proposal']
-    assert emitted[0]['proposal']['edits'] == [dict(skill='debug', operation='append', content='Retest cancellation.')]
+@pytest.mark.parametrize('role,data,field', [
+    ('curriculum', dict(rationale='Useful next project', evidence_ids=['fact'],
+        projects=[dict(name='tiny', goal='Diagnose', acceptance='Independent oracle passes')]), 'projects'),
+    ('skillwriter', dict(rationale='Retained failure', evidence_ids=['fact'],
+        edits=[dict(skill='debug', operation='append', content='Investigate before changing code')]), 'edits'),
+    ('review', dict(rationale='No regression', evidence_ids=['fact'], findings=[]), 'findings'),
+])
+def test_typed_callers_keep_domain_values_without_applying_them(tmp_path, role, data, field):
+    roles, _, _, _, _ = fixture_roles(tmp_path, responses=[data])
+    result = getattr(roles, role)('Perform the role', [AdmittedEvidence('fact', {})], deadline=110)
+    assert asdict(result)[field] == tuple(data[field])
+    assert not list(tmp_path.glob('*.py'))
 
 
-def test_isolated_finished_failure_retains_detail_scope_and_known_elapsed(monkeypatch):
-    import time
-    from rsi.roles import RoleFailure
-    detail = {'type': 'ValueError', 'message': 'negative_decisions[0].redirection is required'}
-    script = worker_script().replace("'success': True", "'success': False")
-    script = script.replace("'elapsed_seconds': 0.02}", "'elapsed_seconds': 0.02, 'error': " + repr(detail) + "}")
-    adapter, events, _ = isolated(monkeypatch, script)
-    with pytest.raises(RoleFailure) as error:
-        adapter.review('review', [AdmittedEvidence('run', {})], deadline=time.monotonic() + 5)
-    assert error.value.role == 'review'
-    assert error.value.error_type == detail['type']
-    assert error.value.message == detail['message']
-    finished = [payload for event, payload in events if event == 'role_finished']
-    assert len(finished) == 1 and finished[0]['elapsed_seconds'] == 0.02
-    assert finished[0]['error'] == detail
-    assert not any(event == 'accounting_incomplete' for event, _ in events)
+def test_native_validation_feedback_can_precede_one_committed_proposal(tmp_path):
+    roles, _, events, sessions, _ = fixture_roles(tmp_path,
+        responses=[dict(IDEA, evidence_ids=['invented']), IDEA])
+    assert asdict(roles.investigation('Investigate', [], deadline=110)) == IDEA
+    assert len([e for e, _ in events if e == 'role_proposal']) == 1
+    assert sessions[0].result['terminate']
+    assert len([e for e, _ in events if e == 'role_native_event']) == 2
 
 
-def test_isolated_legacy_failure_still_retains_elapsed(monkeypatch):
-    import time
-    adapter, events, _ = isolated(monkeypatch, worker_script().replace("'success': True", "'success': False"))
-    with pytest.raises(RuntimeError):
-        adapter.review('review', [], deadline=time.monotonic() + 5)
-    assert [payload['elapsed_seconds'] for event, payload in events if event == 'role_finished'] == [0.02]
-    assert not any(event == 'accounting_incomplete' for event, _ in events)
+def test_large_evidence_retained_as_files_without_full_lifecycle_echo(tmp_path):
+    evidence = {'text': 'document line\n'*400000, 'tail': 'important final diagnostic'}
+    roles, _, events, sessions, store = fixture_roles(tmp_path, responses=[IDEA])
+    roles.investigation('Read the full admitted document.', [AdmittedEvidence('document', evidence)], deadline=110)
+    started = next(data for event, data in events if event == 'role_started')
+    manifest = store.read_json(started['evidence_manifest_ref'])
+    assert len(manifest) == 1 and manifest[0]['bytes'] > 4_000_000
+    full = Path(manifest[0]['path']).read_bytes()
+    assert full == store.read_bytes(manifest[0]['reference'])
+    assert json.loads(full)['data'] == evidence
+    assert len(json.dumps(events)) < 4096 and len(sessions[0].prompt_text) < 1024
 
 
-def test_isolated_error_detail_is_bounded_and_selected_secret_redacted():
-    from rsi.roles import _error_details
-    from uuid import uuid4
-    secret = uuid4().hex
-    value = _error_details(ValueError('field: ' + secret + '🙂' * 3000), secret)
-    assert value['type'] == 'ValueError'
-    assert len(value['message'].encode()) <= 2048
-    assert secret not in json.dumps(value)
+@pytest.mark.parametrize('settled', [True, False])
+def test_known_failure_bills_once_and_unknown_never_replays(tmp_path, settled):
+    roles, _, events, sessions, _ = fixture_roles(tmp_path, fault=NativeError, settled=settled)
+    with pytest.raises(NativeError):
+        roles.investigation('Investigate', [], deadline=110)
+    before = len(events)
+    with pytest.raises(RoleFailure if settled else NativeError):
+        roles.investigation('Investigate', [], deadline=200)
+    assert len(sessions) == 1 and sessions[0].closed
+    finished = [row for event, row in events if event == 'role_finished']
+    assert [row['elapsed_seconds'] for row in finished] == ([2.] if settled else [])
+    if settled:
+        assert len(events) == before
+    else:
+        assert events[-1][0] == 'accounting_incomplete'
+        assert events[-1][1]['start_receipt_received']
 
 
-
-def test_actual_typed_validation_emits_specific_finished_failure_detail():
-    from nooa.errors import GenerationError
-    payload = dict(rationale='Use retained guidance', evidence_ids=['query'],
-        proposal=dict(name='small', goal='goal', acceptance='oracle', template_id='cpu.case-subset',
-                      parameters={'case_indices': [0]}),
-        negative_decisions=[dict(query_ref='query', index=0, action='used', reason='Reuse')])
-    roles, calls, events, _ = make_roles([payload])
-    with pytest.raises(GenerationError) as error:
-        roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
-    finished = [value for event, value in events if event == 'role_finished']
-    assert len(calls) == 1 and len(finished) == 1
-    assert finished[0]['success'] is False and finished[0]['elapsed_seconds'] == 2
-    assert finished[0]['error']['type'] == type(error.value).__name__
-    assert finished[0]['error']['message'] == str(error.value)
-    assert not any(event == 'role_proposal' for event, _ in events)
+def test_completed_operation_returns_retained_domain_value_without_dispatch(tmp_path):
+    roles, _, events, sessions, _ = fixture_roles(tmp_path, responses=[IDEA])
+    first = roles.investigation('Investigate', [], deadline=110)
+    before = len(events)
+    assert roles.investigation('Investigate', [], deadline=200) == first
+    assert len(sessions) == 1 and len(events) == before
+    with pytest.raises(ValueError):
+        roles.investigation('Different instructions', [], deadline=200)
 
 
+@pytest.mark.parametrize('settled', [True, False])
+def test_interrupt_reports_only_observed_native_settlement(tmp_path, settled):
+    roles, _, events, _, _ = fixture_roles(tmp_path, fault=KeyboardInterrupt, settled=settled)
+    with pytest.raises(KeyboardInterrupt):
+        roles.investigation('Investigate', [], deadline=110)
+    assert any(event == 'role_finished' for event, _ in events) is settled
+    assert any(event == 'accounting_incomplete' for event, _ in events) is not settled
 
-@pytest.mark.parametrize('finished', [True, False])
-def test_isolated_receipt_grace_distinguishes_actual_overshoot_from_unknown(monkeypatch, tmp_path, finished):
-    import time
-    from core.artifacts import ContentAddressedArtifacts
+
+def test_settled_without_proposal_is_closed_failure(tmp_path):
+    roles, _, events, _, _ = fixture_roles(tmp_path)
+    with pytest.raises(RoleFailure):
+        roles.investigation('Investigate', [], deadline=110)
+    assert events[-1][0] == 'role_finished' and events[-1][1]['success'] is False
+
+
+def test_deadline_duplicate_evidence_and_secret_are_rejected_before_session(tmp_path):
+    roles, _, _, sessions, _ = fixture_roles(tmp_path)
+    for evidence, deadline, prompt, error in [
+        ([], 100, 'Investigate', TimeoutError),
+        ([AdmittedEvidence('x', {}), AdmittedEvidence('x', {})], 110, 'Investigate', ValueError),
+        ([], 110, 'fixture-secret', ValueError),
+    ]:
+        with pytest.raises(error):
+            roles.investigation(prompt, evidence, deadline=deadline)
+    assert not sessions
+
+
+def test_legacy_diagnostic_reader_preserves_conditional_redirection_contract():
+    data = dict(rationale='Read docs', evidence_ids=['query'], proposal=dict(name='child', goal='goal',
+        acceptance='oracle', template_id='cpu.case-subset', parameters={'case_indices': [0]}),
+        negative_decisions=[dict(query_ref='query', index=0, action='used', reason='Changed applicability')])
+    with pytest.raises(ValueError):
+        _proposal('diagnostic', data, {'query'})
+    data['negative_decisions'][0]['redirection'] = 'Use a smaller admitted input'
+    assert _proposal('diagnostic', data, {'query'}).proposal.parameters == {'case_indices': [0]}
+
+
+def test_native_role_preserves_research_query_accounting_and_host_binding(tmp_path):
     from rsi.contracts import ProjectSpec
-    from rsi.curriculum_research import Researcher, ResearchPending
-    script = worker_script().replace("'role': 'review'", "'role': request['role']")
-    if finished:
-        script = script.replace('time.sleep(0.02)', 'time.sleep(0.08)').replace(
-            "'elapsed_seconds': 0.02", "'elapsed_seconds': 0.08").replace("'success': True", "'success': False")
-    else:
-        script = script.split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
-    adapter, events, captured = isolated(monkeypatch, script, receipt_grace_seconds=.2)
-    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
-    def query(*args, **kwargs):
-        return dict(results=[], negative_records=[], provenance={'source': 'retained docs'})
-    researcher = Researcher(adapter, query, store)
-    context = dict(operation_id='cutoff', root=tmp_path, deadline=time.monotonic() + .04, templates=[])
-    parent = ProjectSpec('parent', 'Preserved original', ('python', 'verify.py'))
-    if finished:
-        result = researcher.research(parent, {}, context)
-        assert result.proposal is None
-        receipt = store.read_json(result.receipt_ref)
-        query_seconds = sum(store.read_json(ref).get('payload', {}).get('elapsed_seconds', 0)
-            for ref in receipt['artifact_refs']
-            if store.read_json(ref).get('event') == 'research_query_finished')
-        assert result.actor_seconds == .08 + query_seconds
-        assert store.read_json(result.receipt_ref)['status'] == 'budget_exhausted'
-        assert not any(e == 'accounting_incomplete' for e, _ in events)
-    else:
-        with pytest.raises(ResearchPending) as error:
-            researcher.research(parent, {}, context)
-        assert error.value.actor_seconds is None
-        assert any(e == 'accounting_incomplete' and p['start_receipt_received'] for e, p in events)
-        assert not any(e == 'role_finished' for e, _ in events)
-    assert len(captured) == 1
+    from rsi.curriculum_research import Researcher
+    roles, clock, _, _, store = fixture_roles(tmp_path, responses=[IDEA])
+    queries = []
+    def query(payload, *, deadline):
+        queries.append(payload)
+        clock.now += 3
+        return dict(results=[dict(text='Actual document fact')], negative_records=[],
+                    provenance={'collection': 'documents'})
+    researcher = Researcher(roles, query, store, clock=clock)
+    template = dict(template_id='cpu.case-subset', parameters={'case_indices': dict(
+        type='array', items={'type': 'integer', 'enum': [0, 1]}, minItems=1, maxItems=1, uniqueItems=True)})
+    result = researcher.research(ProjectSpec('parent', 'Original immutable goal', ('python', 'verify.py')),
+        {'error': 'Retained numerical mismatch'}, dict(operation_id='research', root=tmp_path,
+            deadline=110., templates=[template]))
+    assert result.actor_seconds == 5 and len(queries) == 1
+    assert result.proposal.parent_project_id == 'parent'
+    assert result.proposal.parameters == {'case_indices': [0]}
+    receipt = store.read_json(result.receipt_ref)
+    assert receipt['status'] == 'accepted'
+    assert researcher.actor_context(result.receipt_ref)['rationale'] == IDEA['why']
 
 
-def test_isolated_receipt_grace_does_not_extend_absolute_wall(monkeypatch):
-    import time
-    script = worker_script().split('time.sleep(0.02)')[0] + 'time.sleep(5)\n'
-    adapter, events, _ = isolated(monkeypatch, script, receipt_grace_seconds=2)
-    started = time.monotonic()
-    with pytest.raises(TimeoutError):
-        adapter.review('review', [], deadline=started + .04, wall_deadline=started + .5)
-    assert time.monotonic() - started < 1.5
-    assert not any(e == 'role_finished' for e, _ in events)
-
-
-
-@pytest.mark.parametrize('action, fields', [('used', {'redirection': 'Isolate the documented case'}),
-    ('rejected', {}), ('rejected', {'redirection': None}), ('rejected', {'redirection': ''})])
-def test_diagnostic_provider_schema_and_typed_result_preserve_conditional_contract(action, fields):
-    import re
-    decision = dict(query_ref='query', index=0, action=action, reason='Observed applicability')
-    decision.update(fields)
-    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
-        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
-        negative_decisions=[decision])
-    roles, calls, events, _ = make_roles([payload])
-    result = roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
-    assert result.negative_decisions[0].action == action
-    assert result.negative_decisions[0].redirection == fields.get('redirection')
-    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
-    items = schema['properties']['negative_decisions']['items']
-    branches = {key: schema['$defs'][ref.rsplit('/', 1)[1]]
-                for key, ref in items['discriminator']['mapping'].items()}
-    used, rejected = branches['used'], branches['rejected']
-    assert 'redirection' in used['required']
-    field = used['properties']['redirection']
-    assert field['type'] == 'string' and field['minLength'] >= 1
-    assert re.search(field['pattern'], 'Use an isolated case')
-    assert re.search(field['pattern'], ' \t\n') is None
-    assert 'redirection' not in rejected['required']
-    assert {row.get('type') for row in rejected['properties']['redirection']['anyOf']} == {'string', 'null'}
-    assert len(calls) == 1
-    assert [p['success'] for e, p in events if e == 'role_finished'] == [True]
-
-
-@pytest.mark.parametrize('fields', [{}, {'redirection': None}, {'redirection': ''},
-                                    {'redirection': ' \t\n'}, {'redirection': 7}])
-def test_used_negative_invalid_redirection_never_emits_a_typed_proposal(fields):
-    from nooa.errors import GenerationError
-    decision = dict(query_ref='query', index=0, action='used', reason='Observed applicability')
-    decision.update(fields)
-    payload = dict(rationale='Use retained evidence', evidence_ids=['query'],
-        proposal=dict(name='child', goal='goal', acceptance='oracle', template_id='host.template', parameters={}),
-        negative_decisions=[decision])
-    roles, calls, events, _ = make_roles([payload])
-    with pytest.raises(GenerationError):
-        roles.diagnostic('Choose a diagnostic', [AdmittedEvidence('query', {})], deadline=110)
-    assert len(calls) == 1
-    assert not any(event == 'role_proposal' for event, _ in events)
-    finished = [p for e, p in events if e == 'role_finished']
-    assert len(finished) == 1 and finished[0]['success'] is False
-    assert finished[0]['elapsed_seconds'] == 2 and finished[0]['error']
-
-
-def test_semantic_investigation_real_framework_needs_no_identifiers_or_ledger():
-    payload = dict(question='Which small input isolates the discrepancy?',
-                   goal='Distinguish input-dependent behavior', why='Observed mismatch requires isolation')
-    roles, calls, events, _ = make_roles([payload])
-    result = roles.investigation('Choose an investigation',
-        [AdmittedEvidence('host-owned', {'text': 'Retrieved fact', 'negative_records': [{'reason': 'Mismatch'}]})],
-        deadline=110)
-    from rsi.curriculum_research import InvestigationIdea
-    assert result == InvestigationIdea(**payload)
-    assert len(calls) == 1
-    assert next(p for e, p in events if e == 'role_started')['evidence'][0]['data']['text'] == 'Retrieved fact'
-    assert next(p for e, p in events if e == 'role_finished')['elapsed_seconds'] == 2
-    schema = json.loads(calls[0]['request']['messages'][-1]['content'].split('\n', 1)[1])
-    assert set(schema['properties']) == {'question', 'goal', 'why'}
+@pytest.mark.parametrize('legacy_python', [None, '/retired/missing/nooa/python'])
+def test_production_services_select_native_roles_without_legacy_interpreter(instance, monkeypatch, legacy_python):
+    from rsi import services
+    cycle = instance.create_cycle('native-role-binding', 'phase1')
+    captured = {}
+    sentinel = object()
+    def native(root, profile, **options):
+        captured.update(root=root, profile=profile, **options)
+        return sentinel
+    monkeypatch.setattr(services, 'NativeRoles', native)
+    instance.test = None
+    cycle.config['roles_python'] = legacy_python
+    cycle.role_operation = 'native-operation'
+    try:
+        assert cycle.roles() is sentinel and cycle.roles() is sentinel
+        assert captured['root'] == cycle.root/'native-roles'
+        assert captured['operation_id']() == 'native-operation'
+        assert captured['node_modules'] == instance.root/'machinery/integrations/pi/node_modules'
+        assert captured['store'] is cycle.store
+        assert captured['profile'].identity.profile_id == cycle.config['provider']['profile_id']
+    finally:
+        cycle.close()
