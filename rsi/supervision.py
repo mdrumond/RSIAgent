@@ -107,9 +107,25 @@ class ProjectSupervision:
         if not self.path.exists():
             return None
         state = json.loads(self.path.read_text())
+        current = dict(closure='unknown')
+        if 'contract_ref' in state['scope']:
+            workflow = json.loads((self.root / 'workflow.json').read_text())
+            for ref in reversed(read_event_refs(self.root)):
+                event = self.store.read_json(ref)
+                if event.get('type') != 'supervision-terminal-proof':
+                    continue
+                proof = self.store.read_json(event['reference'])
+                if (proof['project_contract_ref'] == state['scope']['contract_ref']
+                        and self.store.read_json(proof['accounting_snapshot']) == workflow):
+                    current = dict(closure='known', classification=proof['classification'],
+                                   terminal_failure_ref=event['reference'])
+                    break
+        else:
+            role = json.loads((self.root / 'role.json').read_text())
+            current = dict(closure='role_lifecycle_authority', role_status=role['status'])
         return dict(scope=state['scope'], audit_ref=state['reports'][-1] if state['reports'] else None,
                     fault_audits=[row['audit_ref'] for row in state['faults'].values()],
-                    last_audit=state['last_audit'], closure='unknown')
+                    last_audit=state['last_audit'], audit_closure='unknown', **current)
 
     def terminal_audit(self, pending, *, result_ref=None):
         """Called only after the runner authenticates all terminal closure proofs."""
@@ -133,6 +149,16 @@ class ProjectSupervision:
                     and fact.get('origin') in ('controller', 'protocol')):
                 return entry['audit_ref']
         return None
+
+
+def retain_terminal(runner, proof):
+    """Publish the already-authenticated terminal proof for read-only UI consumers."""
+    if proof['classification'] != 'harness_failure':
+        return
+    reference = runner.store.put_json(proof)
+    if not any(event['type'] == 'supervision-terminal-proof' and event['reference'] == reference
+               for event in runner.events):
+        runner.append(dict(type='supervision-terminal-proof', reference=reference))
 
 
 class RoleSupervision(ProjectSupervision):

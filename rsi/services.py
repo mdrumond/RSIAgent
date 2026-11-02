@@ -477,6 +477,9 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 outcome = 'failed'
             except WorkflowError:
                 pass  # Unknown effects remain suspended; no fabricated closure.
+        if failure:
+            from rsi.supervision import retain_terminal
+            retain_terminal(runner, failure)
         self.retain(runner)
         service_binding = json.loads((runner.root / 'service-binding.json').read_text())
         baseline = service_binding.get('actor_seconds_baseline', 0.0)
@@ -773,6 +776,8 @@ class BoundCycle(ProjectComposition, TuningBindings):
                 if (packet['workflow'] != runner.workflow.state or
                         proof != runner.terminal_failure_proof(closure_ref=proof['closure_ref'])):
                     raise ValueError('failed task admission proof no longer matches')
+                from rsi.supervision import retain_terminal
+                retain_terminal(runner, proof)
                 self.scheduler.reconcile(pending['id'], HostTaskResult('failed', ref,
                     packet['actor_seconds_delta'], classification=proof['classification'],
                     terminal_failure_ref=failure, audit_ref=proof.get('audit_ref')))

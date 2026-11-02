@@ -158,9 +158,75 @@ def test_canonical_failed_runner_authenticates_audit_only_after_known_closure(tm
         assert proof['replay_allowed'] is False and proof['stage_completion_claim'] is False
         assert proof['retrieval_receipts']
         from rsi.job_inspection import inspect_task
-        assert inspect_task(runner.root)['supervision']['audit_ref'] == proof['audit_ref']
+        unknown_task = inspect_task(runner.root)
+        assert unknown_task['supervision']['closure'] == 'unknown'
+        from rsi.supervision import retain_terminal
+        retain_terminal(runner, proof)
+        task = inspect_task(runner.root)
+        assert task['supervision']['audit_ref'] == proof['audit_ref']
+        assert task['supervision']['closure'] == 'known'
+        assert task['supervision']['audit_closure'] == 'unknown'
+        role_root = runner.root / 'role-wait'
+        role_root.mkdir()
+        scope = dict(cycle_id='actual-cycle', operation_id='writer-wait', role='skillwriter',
+                     request_ref=runner.store.put_json({'actual': 'role-input'}))
+        atomic_json(role_root / 'role.json', dict(scope, status='pending'))
+        now = [0.]
+        role = RoleSupervision(role_root, store=runner.store, scope=scope, host_rows=[], clock=lambda: now[0])
+        role.poll()
+        now[0] = 600
+        role.poll()
+        assert_dashboard_detail(tmp_path, unknown_task, role.diagnostic())
+        assert_dashboard_detail(tmp_path, task, role.diagnostic())
     finally:
         database.close()
+
+
+def assert_dashboard_detail(tmp_path, task, role):
+    """Real HTTP projection plus the existing browser detail-view handler."""
+    from flask import Flask
+    from types import SimpleNamespace
+    from dashboard.rsi_execution import register_rsi_execution
+    import shutil
+    import subprocess
+    from pathlib import Path
+    job = dict(job_id=role['scope']['request_ref'], state='running',
+        request=dict(cycle_id=role['scope']['cycle_id'], mode='phase1'))
+    evidence = dict(job=job, inspection=dict(tasks=[task], waves=[], role_supervision=[role]))
+    app = Flask(__name__)
+    register_rsi_execution(app, SimpleNamespace(handlers={}, enabled=False), 'test', lambda *args: evidence)
+    response = app.test_client().get('/api/rsi/jobs/' + job['job_id'])
+    assert response.status_code == 200
+    detail = response.get_json()
+    projected = detail['inspection']['tasks'][0]['supervision']
+    assert projected.get('terminal_failure_ref') == task['supervision'].get('terminal_failure_ref')
+    assert projected['audit_ref'] == task['supervision']['audit_ref']
+    assert projected['closure'] == task['supervision']['closure']
+    assert projected['audit_closure'] == 'unknown'
+    assert detail['inspection']['role_supervision'][0] == role
+    node = shutil.which('node')
+    assert node, 'Browser behavior validation requires the installed Node runtime'
+    path = tmp_path / 'http-detail.json'
+    path.write_text(json.dumps(detail))
+    script = r"""
+const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
+const detail=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+class E {constructor(){this.children=[];this.listeners={};this.dataset={};this.value='';}
+addEventListener(k,f){this.listeners[k]=f;} append(...n){this.children.push(...n);}
+replaceChildren(...n){this.children=n;}}
+const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,new E());return nodes.get(id);};
+get('phase-form').elements={operation:new E()};get('rsi-execution').dataset.enabled='true';
+const context={document:{getElementById:get,createElement:()=>new E(),body:{dataset:{}}},
+Option:class extends E{constructor(t,v){super();this.textContent=t;this.value=v;}},
+fetch:async url=>({ok:true,json:async()=>url==='/api/rsi/capabilities'?{}:
+url==='/api/rsi/jobs'?{jobs:[detail.job]}:detail}),setTimeout,console};
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),context);
+setImmediate(async()=>{try{await get('jobs-list').children[0].listeners.click();
+assert.deepEqual(JSON.parse(get('job-inspection').textContent),detail);
+}catch(e){console.error(e);process.exitCode=1;}});
+"""
+    subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'dashboard/static/rsi_execution.js'), str(path)],
+                   check=True, capture_output=True, text=True, timeout=20)
 
 
 def test_late_fault_cannot_reclassify_an_earlier_closed_semantic_failure(tmp_path):
