@@ -398,6 +398,24 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 raise ValueError('subject task kind must be target or optimizer')
             return [item]
         def complete_wave(messages):
+            if hasattr(curriculum_complete, 'wave'):
+                from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+                def retrieve(args, remaining):
+                    results = query_wave(KnowledgeQuery(args['query'], args.get('limit', 5)), check_remaining=remaining)
+                    return dict(knowledge_query=dict(available=True, results=[dict(
+                        citation=item.citation.as_dict(), text=item.text, score=item.score) for item in results]))
+                def validate(response):
+                    decision = selector._parse_and_validate(response, value)
+                    if isinstance(decision, WaveDecision):
+                        ids = [project.spec.project_id for project in decision.wave.projects]
+                        if set(ids) & history.keys():
+                            raise ValueError('proposal reuses executed project IDs')
+                        if len(ids) > project_limit:
+                            raise ValueError('wave exceeds the admitted workload size')
+                paths = {store._retention_path(reference):reference
+                         for reference in context.get('selection_artifacts', {}).values()}
+                return curriculum_complete.wave(messages, remaining_seconds=available(), validate=validate,
+                    artifacts=paths, query=retrieve if knowledge.database_path is not None or reference_query is not None else None)
             wire = list(messages)
             while True:
                 working = bounded_review_messages(wire, {'selection_artifacts':context['selection_artifacts']}) if context.get('selection_artifacts') else wire

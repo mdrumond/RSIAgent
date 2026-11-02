@@ -22,10 +22,10 @@ class NativeSubjectRole:
     def __call__(self, messages, *, remaining_seconds):
         return self._call(messages, remaining_seconds, wave=False)
 
-    def wave(self, messages, *, remaining_seconds):
-        return self._call(messages, remaining_seconds, wave=True)
+    def wave(self, messages, *, remaining_seconds, query=None, artifacts=None, validate=None):
+        return self._call(messages, remaining_seconds, wave=True, query=query, artifacts=artifacts, validate=validate)
 
-    def _call(self, messages, seconds, *, wave):
+    def _call(self, messages, seconds, *, wave, query=None, artifacts=None, validate=None):
         if seconds <= 0:
             raise TimeoutError('native curriculum allocation exhausted before dispatch')
         identity = hashlib.sha256(canonical_bytes(dict(messages=messages, wave=wave,
@@ -45,7 +45,8 @@ class NativeSubjectRole:
         context = root/'context.json'
         context.write_text(json.dumps(messages, ensure_ascii=False, indent=2))
         files = NativeFiles(root/'files', store=store, read_paths=[context])
-        files.read_paths.update({Path(path).resolve():reference for path, reference in self.artifacts.items()})
+        readable = {**self.artifacts, **(artifacts or {})}
+        files.read_paths.update({Path(path).resolve():reference for path, reference in readable.items()})
         chosen = []
         def submit(args, scope):
             if chosen:
@@ -58,18 +59,35 @@ class NativeSubjectRole:
                     response = 'DECISION: '+decision+'\n'+json.dumps(payload)
             else:
                 response = json.dumps(args['value'])
+            if validate:
+                validate(response)
             if self.validator:
                 self.validator(json.loads(response))
             chosen.append(response)
             return dict(content=[dict(type='text', text='Typed proposal retained; domain admission remains host-owned.')], terminate=True)
         shape = (dict(type='object', properties=dict(
-                    decision=dict(type='string', enum=['WAVE', 'SATURATED', 'STALLED', 'knowledge_query', 'read_artifact']),
+                    decision=dict(type='string', enum=['WAVE', 'SATURATED', 'STALLED']),
                     payload=dict(type='object', additionalProperties=True)), required=['decision', 'payload'], additionalProperties=False)
                  if wave else dict(type='object', properties=dict(value=dict(anyOf=[
                      dict(type='object', additionalProperties=True), dict(type='array', items={})])),
                      required=['value'], additionalProperties=False))
         tool = NativeTool('submit_curriculum_proposal', 'Submit the typed domain proposal; host admission is authoritative.', shape, submit)
-        session = NativeSession(root/'session', tools=[tool], environ=self.environ,
+        tools = [tool]
+        if query:
+            def retrieve(args, scope):
+                intent = store.put_json(dict(operation_id=identity, tool_call_id=scope['tool_call_id'], request=args))
+                value = query(args, scope['remaining'])
+                reference = store.put_json(dict(intent_ref=intent, result=value))
+                data = json.dumps(value, ensure_ascii=False, indent=2).encode()
+                path = root/(reference+'.json')
+                path.write_bytes(data)
+                files.read_paths[path.resolve()] = store.put_bytes(data)
+                text = json.dumps(value) if len(data) <= 8192 else json.dumps(dict(reference=reference, path=str(path.resolve())))
+                return dict(content=[dict(type='text', text=text)], details=dict(reference=reference))
+            tools.append(NativeTool('knowledge_query', 'Retrieve actual admitted curriculum documentation and evidence.',
+                dict(type='object', properties=dict(query=dict(type='string'), limit=dict(type='integer', minimum=1)),
+                     required=['query'], additionalProperties=False), retrieve))
+        session = NativeSession(root/'session', tools=tools, environ=self.environ,
             profile_id=self.profile.profile_id, **files.session_options(),
             system_prompt='Read the retained role context with native read. Use the typed proposal tool. '
                 'The model does not supply prose wire headers. Domain constraints and actual retained evidence remain authoritative.')
@@ -80,7 +98,7 @@ class NativeSubjectRole:
             actor_start = time.monotonic()
             deadline = actor_start+seconds
             result = session.prompt(json.dumps(dict(context_path=str(context.resolve()),
-                proposal_kind='wave or read-only retrieval request' if wave else 'domain JSON proposal')),
+                proposal_kind='wave, saturated or stalled decision after admitted research' if wave else 'domain JSON proposal')),
                 operation_id=identity, remaining=lambda: deadline-time.monotonic())
             if not chosen or not result.provider_settled or result.pending_tools:
                 raise ActionError('native curriculum settled without a known typed proposal')
