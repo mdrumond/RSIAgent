@@ -70,6 +70,12 @@ class EvidenceTool:
             object.__setattr__(self, 'stages', tuple(Stage(stage) for stage in self.stages))
 
 
+class HostContextUpdated(Exception):
+    """Trusted live-input update, delivered without executing the stale action."""
+    def __init__(self, context):
+        self.context = context
+
+
 class WorkflowActor:
     """Single-controller stage driver; call step() once per workflow stage.
 
@@ -265,6 +271,11 @@ class WorkflowActor:
                 record('actor-request', {'timestamp': flow.clock()})
                 try:
                     name, args = yield payload, allowed, source, record
+                except HostContextUpdated as update:
+                    context = update.context
+                    observation = dict(event='action-superseded', accepted=False, executed=False)
+                    record('actor-action-superseded', observation)
+                    continue
                 except ActionError as error:
                     if not self.recover_invalid_actions:
                         raise
@@ -462,7 +473,8 @@ class PiSessionAdapter:
 
     @classmethod
     def from_existing_session(cls, session, *, wall_deadline=None):
-        if getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None:
+        if (getattr(session, 'closed', False) or getattr(session, 'rpc', None) is not None
+                or getattr(session, 'native_session', None) is not None):
             raise ValueError('only an unstarted session may transfer ownership')
         adapter = cls(model=session.model, environ=session.environ, wall_deadline=wall_deadline)
         session.closed = True

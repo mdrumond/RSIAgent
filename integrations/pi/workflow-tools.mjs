@@ -3,7 +3,9 @@ export function createNativeResources(context) {
   const resources = filesystem(context);
   const tools = resources.tools.map(tool => ({...tool,
     execute:async (id, ...args) => {
-      const result = await tool.execute(id, ...args);
+      let result;
+      try { result = await tool.execute(id, ...args); }
+      catch (error) { result = {isError:true, content:[{type:'text', text:error.message}]}; }
       const state = await context.host('rsi_workflow_state', {}, id);
       return {...result, content:[...result.content, ...state.content]};
     }}));

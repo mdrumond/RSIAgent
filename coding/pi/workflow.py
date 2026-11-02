@@ -20,6 +20,7 @@ class NativeWorkflowSession:
         self.skill_paths = {}
         self.schemas = {}
         self.archived = False
+        self.stale = False
 
     def configure(self, runner):
         if self.session is not None:
@@ -79,6 +80,8 @@ class NativeWorkflowSession:
 
     def _observe(self, event):
         self.runner.actor_event('pi-native-event', dict(event=event))
+        if event['type'] == 'message_start' and event.get('message', {}).get('role') == 'assistant':
+            self.stale = False
         if event['type'] == 'host_callback_start':
             self._pause()
         elif event['type'] == 'host_callback_end':
@@ -104,7 +107,10 @@ class NativeWorkflowSession:
         except StopIteration as result:
             self.completed.append(result.value)
             return dict(host_stage_completed=True, result=asdict(result.value.result))
-        return self.current[0]['observation']
+        observation = self.current[0]['observation']
+        if isinstance(observation, dict) and observation.get('event') == 'action-superseded':
+            self.stale = True
+        return observation
 
     def _open_artifact(self, args, context):
         reference = args['reference']
@@ -132,20 +138,39 @@ class NativeWorkflowSession:
                 result['retrieval_index'] = self._retain_text(index)
         return result
 
+    def _fresh_source(self):
+        if self.stale:
+            raise ValueError('Host input changed; regenerate the source action from current native feedback')
+        refresh = self.actor.context_refresh
+        if refresh is not None:
+            fresh = self.actor._timed('retrieval', lambda:refresh(self.current[0]['task']))
+            if fresh is not None:
+                if not isinstance(fresh, dict):
+                    raise TypeError('host context refresh must return a task object')
+                from rsi.actor import HostContextUpdated
+                self.current = self.dispatcher.throw(HostContextUpdated(fresh))
+                self.stale = True
+                raise ValueError('Host input changed; the source action was not executed')
+
     def _state(self):
         if self.current is None:
             raise ValueError('no native workflow stage is active')
         payload = self.current[0]
-        return dict(stage=payload['stage'], operation_id=payload['operation_id'],
+        state = dict(stage=payload['stage'], operation_id=payload['operation_id'], stale=self.stale,
                     done=bool(self.completed), allowed=[] if self.completed else
                         [name for name in self.current[1] if name not in ('read_skill', 'read_project_file', 'read_artifact')],
                     skill_receipts=payload['skill_receipts'], evidence_receipts=payload['evidence_receipts'])
+        if self.stale:
+            state.update(task=self._retain_text(payload['task']), user_guidance=payload['task'].get('user_guidance', {}))
+        return state
 
     def _state_tool(self, args, context):
         return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state())))])
 
     def _tool(self, name):
         def invoke(args, context):
+            if self.stale:
+                return dict(content=[dict(type='text', text=json.dumps(dict(workflow_state=self._state(), executed=False)))], isError=True)
             if context['operation_id'] != self.runner.workflow.pending['id']:
                 raise ValueError('native tool differs from pending workflow operation')
             observation = self._dispatch(name, args)
@@ -174,6 +199,8 @@ class NativeWorkflowSession:
         options = self.files.session_options()
         def charged(name, callback):
             def invoke(args, context):
+                if name in ('rsi_fs_write', 'rsi_fs_mkdir'):
+                    self._fresh_source()
                 category = 'implementation' if name in ('rsi_fs_write', 'rsi_fs_mkdir') else 'retrieval'
                 return self.actor._timed(category, lambda: callback(args, context))
             return invoke
@@ -187,7 +214,7 @@ class NativeWorkflowSession:
             for path, name in self.skill_paths.items()]
         self.session = NativeSession(self.runner.root/'native'/'session', cwd=self.files.backend.project,
             profile_id=profile, tools=tools, environ=self.environ, observer=self._observe,
-            system_prompt='Use native read/edit/write and the host workflow tools. Read the retained task file and mapped skill files. '
+            system_prompt=self.options.get('system_prompt', '')+'\nUse native read/edit/write and the host workflow tools. Read the retained task file and mapped skill files. '
                 'Design and optimisation require actual KDB and retrospective evidence. '
                 'Only a successful host perform completes a stage; ordinary tool calls continue normally. '
                 'Native edits are retained while the current stage is pending. No arbitrary shell is available.',
@@ -199,6 +226,7 @@ class NativeWorkflowSession:
 
     def run_stage(self, dispatcher, turn, actor):
         self.current, self.dispatcher, self.actor, self.completed = turn, dispatcher, actor, []
+        self.stale = False
         operation = turn[0]['operation_id']
         task = self._retain_text(turn[0]['task'])
         prompt = dict(task=task, stage=turn[0]['stage'], operation_id=operation,
