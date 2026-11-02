@@ -923,7 +923,7 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
             text = "DECISION: WAVE\n" + json.dumps(dict(wave_id=context["next_wave_id"],
                 pre_wave_memory_sha256=context["pre_wave_memory_sha256"], pre_wave_coverage=context["pre_wave_coverage"],
                 projects=[dict(spec=spec, requires=[])]))
-        elif "Distill only" in messages[0]["content"] or "Distill only" in messages[-1]["content"]:
+        elif "host_outcome" in json.loads(messages[-1]["content"]):
             text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
         else:
             pytest.fail("kernel decisions escaped the canonical session factory")

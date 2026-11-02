@@ -29,7 +29,7 @@ from benchmarks.a5kernels.phase1_production import (
     load_direct_environment,
 )
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider, DISTILLATION_PROMPT
+from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.production import ProductionPaths
@@ -242,7 +242,7 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         provider_calls.append(kwargs)
         prompt = kwargs["request"]["messages"][-1]["content"]
         context = json.loads(prompt.rsplit("\n", 1)[-1])
-        admitted = context["admitted_artifacts"]
+        admitted = {row["reference"]:row["role"] for row in context["admitted_artifacts"]}
         performance = [digest for digest, role in admitted.items()
                        if role == "performance-study"]
         category = "performance" if performance else "correctness"
@@ -319,13 +319,12 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
-    presented = [context['task']['domain']['instruction'] for context in case.contexts]
-    assert any(message['role'] == 'user' and message['content'] in presented
-               for message in distillation_messages)
-    terminal = next(message for message in distillation_messages
-                    if message['content'].startswith(DISTILLATION_PROMPT))
-    context = json.loads(terminal['content'].rsplit('\n', 1)[-1])
-    assert context['workflow_history'][-1]['passed'] is True
+    context = json.loads(distillation_messages[-1]['content'])
+    assert context['host_outcome'] == 'host-verified'
+    assert context['instruction'] in [row['task']['domain']['instruction'] for row in case.contexts]
+    history = case.runner.store.read_json(context['historical_workflow']['reference'])
+    assert context['historical_workflow']['scope'] == 'origin-task-archive'
+    assert history[-1]['passed'] is True
     assert case.runner.workflow.outcome == 'accepted'
     assert case.runner.backend.host.actions.final_run.verified.passed
     submitted = case.runner.backend.host.actions.final_run.verified
@@ -333,35 +332,18 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert len(bytes.fromhex(submitted.attestation_sha256)) == 32
     attempt = next(memory_path.glob("provider-attempts/attempt-*"))
     artifacts = ContentAddressedArtifacts(attempt / "artifacts")
-    retained_requests = [artifacts.read_json(entry.payload["sha256"])
-                         for entry in EvidenceLedger(attempt / "evidence.jsonl").entries
-                         if entry.payload.get("role") == "provider-request"]
-    assert retained_requests == [provider_calls[-1]["request"]]
+    receipts = [case.runner.store.read_json(event['reference']) for event in case.runner.events
+                if event['type'] == 'domain-distillation-result']
+    assert len(receipts) == 1
+    assert case.runner.store.read_json(receipts[0]['input_ref']) == distillation_messages
     if expected_category == "performance":
-        study = next(
-            digest for digest in memory.admitted_artifact_sha256
-            if digest in terminal["content"]
-            and memory.lessons[0].evidence_artifact_sha256 == (digest,)
-        )
-        retained = ContentAddressedArtifacts(
-            next(memory_path.glob("provider-attempts/attempt-*/artifacts"))
-        )
-        study_payload = retained.read_json(study)
-        assert study_payload["timing"]
-        context = json.loads(terminal["content"].rsplit("\n", 1)[-1])
-        payload = context["artifact_payloads"][study]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        assert payload == study_payload
-        summaries = []
-        for message in distillation_messages:
-            try:
-                value = json.loads(message['content'])
-            except (ValueError, TypeError):
-                continue
-            if isinstance(value, dict) and 'host_summary' in value:
-                summaries.append(value['host_summary'])
-        assert any(row['category'] == 'host-verification' for row in summaries)
+        study = memory.lessons[0].evidence_artifact_sha256[0]
+        study_payload = artifacts.read_json(study)
+        assert study_payload['timing']
+        from pathlib import Path
+        path = next(row['path'] for row in context['admitted_artifacts'] if row['reference']==study)
+        assert json.loads(Path(path).read_text()) == study_payload
+    assert any(row['category']=='host-verification' for row in context['host_summaries'])
 
 
 def test_project_executes_registered_logical_and_padded_dimensions(tmp_path):

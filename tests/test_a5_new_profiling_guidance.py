@@ -173,4 +173,3 @@ def test_slow_selection_cannot_admit_execution_after_deadline(tmp_path):
     assert executed == []
 
 
-pytestmark = pytest.mark.usefixtures("scripted_pi")
