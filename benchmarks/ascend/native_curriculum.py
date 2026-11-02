@@ -16,6 +16,9 @@ class NativeSubjectRole:
     def __init__(self, root, profile, environ, *, validator=None, artifacts=None, setup_scope=None):
         self.root, self.profile, self.environ = Path(root), profile, environ
         self.model = profile.identity.backend_model.value
+        from benchmarks.a3_experiments import BackendModel
+        from benchmarks.a3_model_profiles import load_a3_model_profile
+        self.native_profile_id = load_a3_model_profile(BackendModel(self.model)).profile_id
         self.validator, self.artifacts, self.setup_scope = validator, dict(artifacts or {}), setup_scope
         self.last_receipt = None
 
@@ -88,7 +91,7 @@ class NativeSubjectRole:
                 dict(type='object', properties=dict(query=dict(type='string'), limit=dict(type='integer', minimum=1)),
                      required=['query'], additionalProperties=False), retrieve))
         session = NativeSession(root/'session', tools=tools, environ=self.environ,
-            profile_id=self.profile.profile_id, **files.session_options(),
+            profile_id=self.native_profile_id, **files.session_options(),
             system_prompt='Read the retained role context with native read. Use the typed proposal tool. '
                 'The model does not supply prose wire headers. Domain constraints and actual retained evidence remain authoritative.')
         actor_start = None

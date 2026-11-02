@@ -66,12 +66,12 @@ def session_factory(settings, provider, complete):
     from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
     engine = settings.get('verifier_engine')
     if engine is None:
-        engine = ('pi' if getattr(provider, '_transport', None) is openai_compatible_transport
+        engine = ('pi' if settings.get('native_required') or getattr(provider, '_transport', None) is openai_compatible_transport
                   else 'completion')
     if engine not in {'pi', 'completion'}:
         raise ValueError('verifier_engine must be pi or completion')
     if engine == 'completion':
-        if getattr(provider, '_transport', None) is openai_compatible_transport:
+        if settings.get('native_required') or getattr(provider, '_transport', None) is openai_compatible_transport:
             raise ValueError('production programming reviews require the native Pi SDK')
         return None
 

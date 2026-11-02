@@ -174,7 +174,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         selected = profile if name is None else direct_profile(next(
             item for item in MODEL_IDENTITIES if item.backend_model.value == name))
         from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
-        if provider._transport is openai_compatible_transport:
+        if compose is compose_production:
             from .native_curriculum import NativeSubjectRole
             return NativeSubjectRole(root / 'native-roles' / role, selected, provider.coding_environment())
         # Explicit injected test transports retain their existing domain fixture API.
@@ -186,7 +186,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
     from .pi_project_verifier import session_factory
     verifier_identity_path = root / 'project-verifier-runtime.json'
-    verifier_settings = dict(settings, native_session_root=str(root / 'native-reviews'))
+    verifier_settings = dict(settings, native_session_root=str(root / 'native-reviews'),
+                             native_required=compose is compose_production)
     saved_verifier = (json.loads(verifier_identity_path.read_bytes())
                       if verifier_identity_path.exists() else {})
     legacy_default = ('verifier_engine' not in settings and
@@ -194,7 +195,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
          resumed_runtime and not verifier_identity_path.exists()))
     if legacy_default:
         from benchmarks.a5kernels.phase1_provider import openai_compatible_transport
-        if provider._transport is openai_compatible_transport:
+        if compose is compose_production:
             raise ValueError('historical completion verifier requires explicit native runtime rebinding before execution')
         verifier_settings['verifier_engine'] = 'completion'
     verifier_sessions = session_factory(verifier_settings, provider, verifier_complete)
