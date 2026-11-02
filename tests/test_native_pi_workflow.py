@@ -122,6 +122,13 @@ def test_native_sdk_canonical_nine_stages_repair_and_retained_evidence(tmp_path,
         closure = runner.store.read_json(result['actor_closure_ref'])['observation']
         assert closure['provider_settled'] and closure['actor_closed']
         assert any(any(m['role'] == 'tool' for m in request['messages']) for request in requests)
+        from rsi.evidence_io import export_task
+        exported = tmp_path/'evidence.jsonl'
+        export_task(runner.root, exported)
+        rows = [json.loads(line) for line in exported.read_text().splitlines()]
+        session_refs = next(e['artifact_refs'] for e in runner.events if e['type'] == 'native-session-artifacts')
+        assert session_refs and all(runner.store.read_bytes(reference) is not None for reference in session_refs)
+        assert any(row['kind'] == 'event' and row['data'].get('type') == 'native-session-artifacts' for row in rows)
     finally:
         runner.actor.close()
         database.close()

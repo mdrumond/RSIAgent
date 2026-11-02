@@ -19,6 +19,7 @@ class NativeWorkflowSession:
         self.completed = []
         self.skill_paths = {}
         self.schemas = {}
+        self.archived = False
 
     def configure(self, runner):
         if self.session is not None:
@@ -189,3 +190,11 @@ class NativeWorkflowSession:
         self._pause()
         if self.session:
             self.session.close()
+            if not self.archived:
+                paths = [self.session.root/'native-events.jsonl', self.session.root/'native-worker.stderr',
+                         *sorted((self.session.root/'sessions').glob('*.jsonl'))]
+                references = [self.runner.store.put_bytes(path.read_bytes()) for path in paths if path.is_file()]
+                self.runner.append(dict(type='native-session-artifacts', artifact_refs=references,
+                    provider_settled=self.session.provider_settled,
+                    pending_tools=sorted(self.session.pending_tools)))
+                self.archived = True
