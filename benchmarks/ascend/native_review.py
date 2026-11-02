@@ -103,6 +103,7 @@ class PiReviewSession:
                                     artifact_files=self._paths(), feedback=state.feedback))
         self.session = NativeSession(self.root/'session', tools=tools, profile_id=self.profile,
             system_prompt=self.system_prompt, environ=self.environ,
+            resource_options=dict(noSkills=True, noPromptTemplates=True),
             observer=lambda event:state.agent._record('pi-native-event', event), **options)
         self.session.prepare()
         self.session.prompt(json.dumps(dict(context=context,

@@ -8,7 +8,7 @@ from .project_verifier import REVIEW_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS
 
 SYSTEM = REVIEW_INSTRUCTIONS + '''Use the declared typed native tools; never print JSON action envelopes.
 Native read and host list/query tools return real observations. Use submit_review or request_check only after reading their required evidence. Only a host-validated terminal decision ends the review.
-Use review_context.host.review_state.missing_required_artifacts for exact roles
+Use the retained context review_state.missing_required_artifacts for exact roles
 and hashes still required; ready_for_decision is guidance, not automatic acceptance.
 Evidence arrays contain only bare hashes from allowed_evidence. Citations must
 be exact KDB objects from review_state.citations (or [] when none). Snippet lines

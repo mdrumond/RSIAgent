@@ -91,7 +91,8 @@ class NativeSubjectRole:
                 dict(type='object', properties=dict(query=dict(type='string'), limit=dict(type='integer', minimum=1)),
                      required=['query'], additionalProperties=False), retrieve))
         session = NativeSession(root/'session', tools=tools, environ=self.environ,
-            profile_id=self.native_profile_id, **files.session_options(),
+            profile_id=self.native_profile_id, resource_options=dict(noSkills=True, noPromptTemplates=True),
+            **files.session_options(),
             system_prompt='Read the retained role context with native read. Use the typed proposal tool. '
                 'The model does not supply prose wire headers. Domain constraints and actual retained evidence remain authoritative.')
         actor_start = None
