@@ -152,7 +152,14 @@ class ProjectRunner:
         event = dict(type=kind, **data)
         self.append(event)
         if kind == 'pi-native-event' and data.get('event', {}).get('type') == 'native_fault':
-            self.supervise(fault_ref=self.store.put_json(event))
+            reference = self.store.put_json(event)
+            try:
+                self.supervise(fault_ref=reference)
+            except (ValueError, OSError) as error:
+                # Keep an unscoped startup/transport fact without replacing the
+                # original native exception or inventing a terminal operation.
+                self.append(dict(type='supervision-audit-incomplete', fault_ref=reference,
+                                 error_type=type(error).__name__))
 
     def supervise(self, *, fault_ref=None):
         from rsi.supervision import ProjectSupervision

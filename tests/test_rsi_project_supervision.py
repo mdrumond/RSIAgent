@@ -175,3 +175,19 @@ def test_late_fault_cannot_reclassify_an_earlier_closed_semantic_failure(tmp_pat
         assert after == before and after['classification'] == 'provider_timeout'
     finally:
         database.close()
+
+
+def test_unscoped_native_startup_fault_retains_evidence_without_masking_transport_failure(tmp_path):
+    from test_rsi_project_runner import make
+    runner, _, database = make(tmp_path)
+    try:
+        assert runner.workflow.pending is None
+        runner.actor_event('pi-native-event', dict(event=dict(type='native_fault',
+            fault_id='startup-fault', origin='transport', kind='eof', operation_id=None)))
+        incomplete = runner.latest('supervision-audit-incomplete')
+        retained = runner.store.read_json(incomplete['fault_ref'])
+        assert retained['event']['fault_id'] == 'startup-fault'
+        assert retained['event']['operation_id'] is None
+        assert runner.workflow.pending is None and runner.workflow.outcome is None
+    finally:
+        database.close()
