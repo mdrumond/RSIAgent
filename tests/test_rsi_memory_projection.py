@@ -3,24 +3,30 @@ import json
 from types import SimpleNamespace
 
 from core.artifacts import ContentAddressedArtifacts, canonical_bytes
-from coding.pi.context import ContextRecords, encoded
+from coding.pi.context import encoded
+from coding.pi.filesystem import NativeFiles
+from coding.pi.workflow import NativeWorkflowSession
 from rsi.evidence_io import _references
 from rsi.memory_projection import project_memory
 from rsi.project_composition import ProjectComposition
 
 
-def read_all(context, pointer):
-    pieces, offset = [], 0
-    while True:
-        page = context.read(pointer['record'], offset, 8192)
-        pieces.append(page['text'])
-        offset = page['next_offset']
-        if offset is None:
-            raw = ''.join(pieces)
-            try:
-                return json.loads(raw)
-            except ValueError:
-                return raw
+def read_all(files, pointer):
+    import base64
+    result = files.read(dict(path=pointer['path']), dict(operation_id='retrieval-test',
+                        tool_call_id='read-'+pointer['artifact_ref'], remaining=lambda:None))
+    raw = base64.b64decode(result['details']['data']).decode()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def native_view(root, store):
+    session = NativeWorkflowSession()
+    session.runner = SimpleNamespace(root=root, store=store)
+    session.files = NativeFiles(root/'native-files', store=store)
+    return session
 
 
 def dense_records(store):
@@ -87,22 +93,20 @@ def test_dense_query_projects_metadata_without_changing_original_or_evidence_clo
 def test_all_eight_negative_facts_and_complete_rows_addressable_in_bounded_context(tmp_path):
     composed, reference, records, _, _ = composition(tmp_path)
     response = composed.query(reference)({})
-    context = ContextRecords()
-    observed = context.resource(dict(reference=reference, evidence=dict(payload=dict(response=response)),
+    context = native_view(tmp_path, composed.store)
+    observed = context._observation(dict(reference=reference, evidence=dict(payload=dict(response=response)),
         summary={'negative_records': 8}))
     assert len(encoded(observed)) <= 6144
-    groups = observed.get('retrieval', observed.get('evidence', {}).get('payload', {}).get('response'))
-    negatives = groups['negative_records']
-    assert negatives['count'] == 8
-    index = read_all(context, negatives['index'])
+    index = read_all(context.files, observed['retrieval_index'])
     assert [entry['index'] for entry in index] == list(range(8))
     for i, entry in enumerate(index):
+        assert entry['group'] == 'negative_records'
         assert entry['facts']['memory_id'] == f'failure-{i}'
         assert entry['facts']['goal'] == f'Compute shape {i}'
         assert entry['facts']['commands'][0]['stderr'] == f'expected {i}, got -1'
-        full = read_all(context, entry['full'])
+        full = read_all(context.files, entry['full_row'])
         assert full['observations'] == records[i]['proposal']['observations']
-    assert read_all(context, negatives['all_records']) == response['negative_records']
+    assert read_all(context.files, observed['retained_observation'])['evidence']['payload']['response'] == response
 
 
 def test_projection_retains_evidence_beyond_inline_preview(tmp_path):
@@ -118,13 +122,14 @@ def test_projection_retains_evidence_beyond_inline_preview(tmp_path):
     assert store.read_json(row['artifact_ref']) == original
 
 
-def test_mixed_legacy_negatives_remain_recoverable():
+def test_mixed_legacy_negatives_remain_recoverable(tmp_path):
     rows = ['old failure', {'reason': 'overflow', 'observations': None}, {'proposal': None}]
-    context = ContextRecords()
-    result = context.retrieval_rows(rows, budget=1)
-    assert result['omitted'] == 3
-    index = read_all(context, result['index'])
-    assert [read_all(context, item['full']) for item in index] == rows
+    context = native_view(tmp_path, ContentAddressedArtifacts(tmp_path/'artifacts'))
+    # Make the real response require a retained index, without changing row identities.
+    result = context._observation(dict(evidence=dict(payload=dict(response=dict(results=[], negative_records=rows))),
+                                       retained_detail='x' * 9000))
+    index = read_all(context.files, result['retrieval_index'])
+    assert [read_all(context.files, item['full_row']) for item in index] == rows
 
 
 def test_export_preserves_projected_original_and_complete_raw_instrumentation(tmp_path):

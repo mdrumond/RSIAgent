@@ -121,11 +121,8 @@ class NativeWorkflowSession:
             index = []
             for group in ('results', 'negative_records'):
                 for position, row in enumerate(response.get(group, [])):
-                    metadata = row.get('memory', row) if isinstance(row, dict) else {}
-                    proposal = metadata.get('proposal', {})
-                    facts = {key: proposal[key] for key in ('kind', 'project_id', 'summary') if key in proposal}
-                    if isinstance(row, dict) and isinstance(row.get('text'), str):
-                        facts['excerpt'] = row['text'][:512]
+                    from rsi.memory_projection import retrieval_facts
+                    facts = retrieval_facts(row)
                     index.append(dict(group=group, index=position, facts=facts, full_row=self._retain_text(row)))
             if index:
                 result['retrieval_index'] = self._retain_text(index)
