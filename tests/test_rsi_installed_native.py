@@ -132,6 +132,8 @@ def test_installed_cli_optional_repository_is_independent(installed_native):
 
 def test_actual_sdk_custom_tool_runs_from_installed_worker(installed_native):
     work, _, environment, invoke = installed_native
+    from coding.pi.native import runtime_preflight
+    node, modules = runtime_preflight()
     requests=[]
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args):pass
@@ -166,7 +168,7 @@ with native.NativeSession(Path(sys.argv[1])/'installed-session',tools=[tool],env
     assert settled.provider_settled and not settled.pending_tools
 assert session.process.poll()==0
 print(json.dumps({'worker':str(worker),'calls':calls,'settled':settled.provider_settled}))
-''',work,f'http://127.0.0.1:{server.server_port}/v1')
+''',work,f'http://127.0.0.1:{server.server_port}/v1', env={'RSI_PI_NODE':str(node), 'RSI_PI_NODE_MODULES':str(modules)})
     finally:
         server.shutdown();server.server_close();thread.join()
     assert len(requests)==1

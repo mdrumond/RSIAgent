@@ -130,20 +130,28 @@ def test_unbounded_deadline_allows_native_read_and_pending_write(tmp_path):
 
 @pytest.fixture
 def scripted_provider():
-    calls, requests = [], []
+    class Calls(list):
+        responder = None
+        include_usage = True
+    calls, requests = Calls(), []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
         def do_POST(self):
             requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             delta = dict(role='assistant', content='Finished.')
-            if calls:
-                name, arguments = calls.pop(0)
-                delta.update(content=None, tool_calls=[dict(index=0, id=f'call-{len(requests)}', type='function',
-                    function=dict(name=name, arguments=json.dumps(arguments)))])
+            action = calls.responder(requests[-1]) if calls.responder is not None else (calls.pop(0) if calls else None)
+            if action is not None:
+                actions = action if isinstance(action, list) else [action]
+                delta.update(content=None, tool_calls=[dict(index=index,
+                    id=f'call-{len(requests)}'+(f'-{index}' if index else ''), type='function',
+                    function=dict(name=name, arguments=json.dumps(arguments)))
+                    for index,(name,arguments) in enumerate(actions)])
             payload = dict(id='fixture', object='chat.completion.chunk', model='deepseek-flash',
                 choices=[dict(index=0, delta=delta, finish_reason='tool_calls' if 'tool_calls' in delta else 'stop')],
                 usage=dict(prompt_tokens=10, completion_tokens=2, total_tokens=12))
+            if not calls.include_usage:
+                payload.pop('usage')
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             self.wfile.write(('data: '+json.dumps(payload)+'\n\ndata: [DONE]\n\n').encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -181,3 +189,47 @@ def test_real_native_tools_paginate_edit_and_reject_protected_paths(tmp_path, mo
     assert execution.verifier.read_bytes() == verifier
     assert files.pending_source(operation)['source_hash'] == execution.project_hash()
     assert any('outside admitted' in m['content'] for m in feedback)
+
+
+def hard_crash_before_replace(root, workflow_path, files_root, operation):
+    """Importable spawn target: os._exit bypasses every Python finally block."""
+    import os
+    import coding.pi.filesystem as module
+    from rsi.contracts import BudgetLimits
+    from rsi.python_execution import PythonExecution
+    from rsi.runtime import Workflow
+    execution = PythonExecution(Path(root))
+    state = json.loads(Path(workflow_path).read_text())
+    execution.workflow = Workflow(Path(workflow_path), lambda *args: True,
+        source_hash=state['source'], limits=BudgetLimits.from_dict(state['limits']))
+    files = NativeFiles(Path(files_root), store=execution.store, backend=execution)
+    replace = module.os.replace
+    def abrupt(source, destination):
+        if Path(destination) == execution.project/'helper.py':
+            os._exit(37)
+        return replace(source, destination)
+    module.os.replace = abrupt
+    files.write(dict(path=str(execution.project/'helper.py'), content='value = 77\n'), context(operation))
+
+
+def test_hard_process_exit_leaves_staging_outside_source_and_reconciles(tmp_path):
+    import multiprocessing
+    execution, operation, files = pending(tmp_path)
+    before = execution.project_hash()
+    child = multiprocessing.get_context('spawn').Process(target=hard_crash_before_replace,
+        args=(str(execution.root), str(tmp_path/'workflow.json'), str(files.root), operation))
+    child.start()
+    child.join(timeout=15)
+    try:
+        assert not child.is_alive() and child.exitcode == 37
+        assert execution.project_hash() == before
+        assert (execution.project/'helper.py').read_text() == 'value = 1\n'
+        assert len(list((files.root/'staging').iterdir())) == 1
+        reopened = NativeFiles(files.root, store=execution.store, backend=execution)
+        closure = execution.store.read_json(reopened.pending_source(operation)['reference'])
+        receipt = execution.store.read_json(closure['artifact_refs'][0])
+        assert receipt['status'] == 'not_applied' and closure['head'] == before
+    finally:
+        if child.is_alive():
+            child.terminate(); child.join(timeout=5)
+        child.close()

@@ -122,12 +122,18 @@ class NativeFiles:
         data = args['content'].encode('utf-8')
         name = target.relative_to(self.backend.project).as_posix()
         after = self.backend.project_hash(replacements={name: data})
+        staging = self.root/'staging'
+        if staging.resolve().is_relative_to(self.backend.project.resolve()):
+            raise PermissionError('native edit staging must be outside hashed project source')
+        staging.mkdir(mode=0o700, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if staging.stat().st_dev != target.parent.stat().st_dev:
+            raise PermissionError('atomic native edit requires same-filesystem staging')
         state['intent'] = dict(schema='rsi-native-source-transition-v1', operation_id=context['operation_id'],
             tool_call_id=context['tool_call_id'], base=state['base'], before=state['head'], after=after,
             path=name, artifact_ref=self.store.put_bytes(data))
         atomic_json(path, state)  # Intent and content precede source mutation.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(dir=target.parent, prefix='.native-edit-')
+        descriptor, temporary = tempfile.mkstemp(dir=staging, prefix='native-edit-')
         try:
             with os.fdopen(descriptor, 'wb') as stream:
                 stream.write(data); stream.flush(); os.fsync(stream.fileno())

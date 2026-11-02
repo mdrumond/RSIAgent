@@ -91,7 +91,7 @@ def test_accepted_memory_index_selects_only_active_versions(tmp_path):
     assert 'reference' in collections
 
 
-def test_real_direct_provider_role_callback_uses_private_elapsed_and_http_bounds(tmp_path, monkeypatch):
+def test_injected_role_transport_keeps_elapsed_bounds_and_default_requires_native(tmp_path, monkeypatch):
     import sys
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
     from benchmarks.ascend.subject_runtime import bounded_completion
@@ -127,8 +127,9 @@ def test_real_direct_provider_role_callback_uses_private_elapsed_and_http_bounds
     monkeypatch.setitem(sys.modules, 'openai', SimpleNamespace(OpenAI=client))
     default_provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
         models=[profile.identity.backend_model], clock=lambda: 0)
-    assert bounded_completion(default_provider, profile, (), 7) == '{}'
-    assert timeouts == [(7, 0)]
+    with pytest.raises(RuntimeError):
+        bounded_completion(default_provider, profile, (), 7)
+    assert timeouts == []  # The retired default cannot start a Python provider.
 
 
 def test_project_plan_ordinal_survives_other_projects_and_rejects_plan_change(tmp_path, monkeypatch):

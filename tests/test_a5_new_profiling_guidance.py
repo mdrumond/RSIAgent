@@ -47,7 +47,7 @@ def test_admission_hashes_all_references_and_preserves_legacy_cells(tmp_path):
             assert before.as_dict() == after.as_dict()
 
 
-def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path, canonical_kernel):
+def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path, canonical_kernel, monkeypatch, scripted_provider):
     identity, text = _guidance(tmp_path / "skill")
     cell = next(c for c in build_cells(_guide(), profiling_guide=identity)
                 if c.profiling is ProfilingGuidance.NEW and c.model.provider == "DeepSeek"
@@ -63,15 +63,37 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path,
     campaign = build_adaptive_phase1(
         cell=cell, paths=_paths(tmp_path), objective="Learn reusable profiling.",
         initial_memory=b"", guide_bytes=GUIDE_BYTES,
-        profiling_guidance_text=text, environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+        profiling_guidance_text=text, environment={"OPENAI_API_KEY": "fixture-secret", "DEEPSEEK_API_KEY": "fixture-secret"},
         provider_transport=transport, command_executor=FakeCommandExecutor(),
     )
     assert json.loads(campaign.project_actor.immutable_context)["profiling_guidance"] == text
-    ticks = iter(range(0, 1000000, 2000))
-    campaign.coordinator.curriculum.clock = lambda: next(ticks)
-    with pytest.raises(ValueError, match="time budget exhausted"):
-        campaign.run()
-    assert text in calls[0]["messages"][1]["content"]
+    from dataclasses import replace
+    from test_a5_phase1_curriculum_selector import context as selection_context
+    from test_pi_runtime import _native_wire_objects
+    from test_native_pi_programming_roles import redirect
+    url, native_calls, requests = scripted_provider
+    redirect(monkeypatch,url)
+    seen=[]
+    def choose(wire):
+        pointer=next(value for role,value in _native_wire_objects([wire]) if role=='user' and 'context_path' in value)
+        if not seen:
+            seen.append(True)
+            return 'read',dict(path=pointer['context_path'])
+        return 'submit_curriculum_proposal',dict(decision='STALLED',payload=dict(reason='Observed fixture runtime unavailable'))
+    native_calls.responder=choose
+    decision,_=campaign.coordinator.curriculum.select(replace(selection_context(),
+        feedback=({'error':'fixture runtime unavailable'},),remaining_seconds=30))
+    assert decision.status=='STALLED'
+    from test_native_pi_workflow import text_blocks
+    retained_inputs=[]
+    for wire in requests:
+        for message in wire['messages']:
+            if message['role']=='tool':
+                for content in text_blocks(message.get('content') or ''):
+                    if content.startswith('['):
+                        retained_inputs.extend(json.JSONDecoder().raw_decode(content)[0])
+    assert any(text in message['content'] for message in retained_inputs)
+    requests.clear()
     spec = _project("context-copy", "gm-ub-movement")
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
     prepared = campaign.project_actor.executor.prepare(ProjectSpec.from_mapping(spec))
@@ -81,17 +103,13 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path,
     campaign.actor.canonical = kernel_adoption(baseline_query=case.baseline_query)
     campaign.actor.canonical_budgets = BudgetLimits(actor_seconds=120, wall_seconds=120)
     case.enable_native()
-    offsets, instruction_refs = [], []
-    def select(context, allowed):
-        instruction = context['task']['domain']['instruction']
-        ref = hashlib.sha256(instruction.encode()).hexdigest()
-        if not instruction_refs:
-            instruction_refs.append(ref)
-        offset = len(offsets) * 3072
-        if offset < len(instruction.encode()):
-            offsets.append(offset)
-            return 'read_context', dict(record=ref, offset=offset, limit=3072)
-        return CanonicalSession.next_action(case.session, context, allowed)
+    reads=[]
+    def select(context,allowed):
+        if not reads:
+            reads.append(True)
+            prompt=next(value for role,value in _native_wire_objects([case.wires[-1]]) if role=='user' and 'mapped_skills' in value)
+            return 'read',dict(path=prompt['task']['path'])
+        return CanonicalSession.next_action(case.session,context,allowed)
     case.select = select
     case.after_select = lambda context, selected: setattr(case, 'now', case.now + 121) if selected[0] == 'perform' else None
     # Keep production composition and treatment binding; only model decisions
@@ -100,30 +118,13 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path,
         campaign.project_actor(AdaptiveProjectRequest(
             prepared.spec, 1, b"", tmp_path / "actor-proof", prepared.inputs, prepared.expected,
         ))
-    pages = {}
-    def visit(value):
-        if isinstance(value, dict):
-            if value.get('record') == instruction_refs[0] and 'text' in value:
-                pages[value['offset']] = value['text']
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-        elif isinstance(value, str):
-            try:
-                decoded = json.loads(value)
-            except (ValueError, TypeError):
-                return
-            if not isinstance(decoded, str):
-                visit(decoded)
-    visit(case.wires)
-    delivered = ''.join(pages[offset] for offset in sorted(pages))
-    actor_context = json.loads(delivered.split(
-        "Production context (immutable, identical for every project): ", 1)[1])
-    assert actor_context['profiling_guidance'] == text
-    retained = [row['request'] for row in case.runner.events if row['type'] == 'pi-provider-request']
-    assert retained == case.wires and retained
+    delivered=next(value['domain']['instruction'] for wire in case.wires
+        for role,value in _native_wire_objects([wire]) if role=='tool' and 'domain' in value)
+    actor_context=json.loads(delivered.split('Production context (immutable, identical for every project): ',1)[1])
+    assert actor_context['profiling_guidance']==text
+    retained=[row for row in case.runner.events if row['type']=='pi-native-event'
+              and row['event']['type']=='before_provider_request']
+    assert len(retained)==len(case.wires) and retained
     dispatches = [case.runner.store.read_json(row['reference'])
                   for row in case.runner.events if row['type'] == 'domain-dispatch']
     assert not any(row['category'] in ('compilation', 'execution', 'profiling') for row in dispatches)
@@ -172,4 +173,3 @@ def test_slow_selection_cannot_admit_execution_after_deadline(tmp_path):
     assert executed == []
 
 
-pytestmark = pytest.mark.usefixtures("scripted_pi")

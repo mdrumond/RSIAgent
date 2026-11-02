@@ -260,39 +260,11 @@ def test_invalid_provider_usage_is_not_reported_as_consumed_tokens(usage):
     assert raised.value.completion_tokens is None
 
 
-def test_openai_compatible_response_rejects_missing_content(monkeypatch):
-    response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
-        usage=SimpleNamespace(completion_tokens=23),
-    )
-    completions = SimpleNamespace(create=lambda **_request: response)
-    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-    monkeypatch.setitem(
-        __import__("sys").modules, "openai",
-        SimpleNamespace(OpenAI=lambda **_route: client),
-    )
-
-    with pytest.raises(A3ProviderResponseError) as raised:
-        model_module._openai_transport(
-            base_url=DEEPSEEK_BASE_URL,
-            api_key="secret",
-            request={"model": "deepseek-flash"},
-        )
-    assert raised.value.code == "invalid-content-or-usage"
 
 
-def test_openai_compatible_response_parses_provider_completion_usage(monkeypatch):
-    response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="candidate"))],
-        usage=SimpleNamespace(completion_tokens=23),
-    )
-    completions = SimpleNamespace(create=lambda **_request: response)
-    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-    monkeypatch.setitem(
-        __import__("sys").modules, "openai",
-        SimpleNamespace(OpenAI=lambda **_route: client),
-    )
 
-    assert model_module._openai_transport(
-        base_url=DEEPSEEK_BASE_URL, api_key="secret", request={"model": "deepseek-flash"}
-    ) == A3TransportResult("candidate", 23)
+
+def test_default_programming_completion_requires_native_session():
+    with pytest.raises(ValueError):
+        complete_a3('system', 'user', model=BackendModel.DEEPSEEK_FLASH,
+                    environ={'DEEPSEEK_API_KEY':'fixture-secret'})

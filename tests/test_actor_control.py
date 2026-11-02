@@ -3,8 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.ascend.actor_control import ActorControl, ActorConversation, ActorStopped, grant_elapsed
-from benchmarks.ascend.agent_context import WorkingContext
+from benchmarks.ascend.actor_control import ActorControl, ActorStopped, grant_elapsed
 from benchmarks.ascend.time_budget import AttemptTimeBudget
 from canonical_kernel_fixtures import canonical_kernel
 
@@ -38,28 +37,6 @@ def test_stop_preserves_checkpoint_without_consuming_feedback(tmp_path):
     feedback = []
     inbox.boundary({'feedback': feedback}, feedback)
     assert feedback[0]['content'] == 'redirect'
-
-
-def test_checkpoint_restores_source_work_log_and_feedback_without_host_authority(tmp_path):
-    fixed = [{'role': 'system', 'content': 'contract'}, {'role': 'user', 'content': 'task'}]
-    working = WorkingContext(fixed)
-    actions = SimpleNamespace(source='saved source')
-    conversation = ActorConversation(tmp_path, 'task', working, actions)
-    ActorControl(tmp_path).send('redirect', 'inspect masks')
-    conversation.boundary()
-    working.work_log = 'Earlier compile failed; inspect retained log.'
-    working.host_state = {'host-verified': {'passed': True}}
-    conversation.save(4)
-    restored = WorkingContext(fixed)
-    sources = []
-    resumed = ActorConversation(tmp_path, 'task', restored,
-                                SimpleNamespace(restore_source=sources.append, source=None))
-    assert resumed.turn == 4 and sources == ['saved source']
-    assert restored.work_log == working.work_log
-    assert restored.host_state == {}
-    assert restored.pinned == [{'role': 'user', 'content': 'inspect masks'}]
-    with pytest.raises(ValueError):
-        ActorConversation(tmp_path, 'changed task', WorkingContext(fixed))
 
 
 def test_explicit_grant_preserves_elapsed_across_original_identity_resume(tmp_path):

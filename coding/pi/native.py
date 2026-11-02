@@ -12,9 +12,10 @@ from uuid import uuid4
 
 
 class NativeError(RuntimeError):
-    def __init__(self, message, *, settlement=None):
+    def __init__(self, message, *, settlement=None, native_fault=None):
         super().__init__(message)
         self.settlement = settlement
+        self.native_fault = native_fault
 
 
 class ProviderFailure(NativeError):
@@ -92,6 +93,7 @@ class NativeSession:
         self.environment = os.environ if environ is None else environ
         self.observer = observer or (lambda event: None)
         self.events, self.usage = queue.Queue(), []
+        self._unreported_usage = []
         self.process = self.reader = None
         self.session_file, self.operation_id = None, None
         self.pending_tools = set()
@@ -102,6 +104,8 @@ class NativeSession:
 
     @property
     def completion_tokens(self):
+        if self.awaiting_settlement or not self.provider_settled or self._unreported_usage:
+            return None
         return None if any('output' not in usage for usage in self.usage) else sum(u['output'] for u in self.usage)
 
     def _send(self, value):
@@ -117,9 +121,17 @@ class NativeSession:
         raw = json.dumps(dict(event, operation_id=self.operation_id), ensure_ascii=False, allow_nan=False)
         if secret:
             raw = raw.replace(secret, '[redacted]')
-        with (self.root/'native-events.jsonl').open('a') as stream:
-            stream.write(raw+'\n'); stream.flush(); os.fsync(stream.fileno())
-        self.observer(json.loads(raw))
+        data = (raw+'\n').encode('utf-8')
+        with (self.root/'native-events.jsonl').open('ab') as stream:
+            offset = stream.tell()
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        observed = json.loads(raw)
+        if observed.get('type') in ('message_update', 'provider_stream_event'):
+            import hashlib
+            observed = dict(type=observed['type'], operation_id=self.operation_id,
+                native_journal=dict(path='native-events.jsonl', offset=offset, length=len(data),
+                                    sha256=hashlib.sha256(data).hexdigest()))
+        self.observer(observed)
 
     def prepare(self, timeout=30.):
         if self.closed:
@@ -181,7 +193,15 @@ class NativeSession:
                 continue
             kind = event['type']
             if kind in ('eof', 'protocol_error', 'fatal'):
-                raise NativeError(event.get('message', 'native worker exited'), settlement=self._settlement('unknown'))
+                settlement = self._settlement('unknown')
+                fault = dict(type='native_fault', fault_id=uuid4().hex,
+                    origin={'eof':'transport', 'protocol_error':'protocol', 'fatal':'controller'}[kind],
+                    kind=kind, operation_id=self.operation_id, session_file=self.session_file,
+                    settlement=dict(provider_settled=settlement.provider_settled,
+                                    pending_tools=list(settlement.pending_tools)))
+                self._record(fault)
+                raise NativeError(event.get('message', 'native worker exited'),
+                                  settlement=settlement, native_fault=fault)
             if kind == 'tool':
                 identity, name = event['tool_call_id'], event['name']
                 self.pending_tools.add(identity)
@@ -200,12 +220,27 @@ class NativeSession:
                 self.pending_tools.discard(identity)
                 self._record(dict(type='host_callback_end', tool_call_id=identity, name=name))
                 continue
+            if kind == 'before_provider_request':
+                self._unreported_usage.append(False)
+            elif kind == 'provider_stream_event' and self._unreported_usage:
+                data = event.get('data') or {}
+                response = data.get('response') or {}
+                usage = data.get('usage') or (response.get('usage') if isinstance(response, dict) else None)
+                if isinstance(usage, dict) and any(usage.get(key) is not None for key in ('completion_tokens', 'output_tokens', 'output')):
+                    self._unreported_usage[-1] = True
+            reported = (kind == 'compaction_end' or kind == 'message_end' and event.get('message', {}).get('role') == 'assistant')
+            if reported and self._unreported_usage:
+                event = dict(event, usage_observed=all(self._unreported_usage))
+                self._unreported_usage.clear()
             self._record(event)
             if kind == 'agent_settled':
                 self.provider_settled = True
             if kind == 'message_end' and event.get('message', {}).get('role') == 'assistant':
                 usage = event['message'].get('usage')
-                self.usage.append(usage if usage is not None else {})
+                self.usage.append(usage if usage is not None and event.get('usage_observed') is not False else {})
+            if kind == 'compaction_end':
+                usage = (event.get('result') or {}).get('usage')
+                self.usage.append(dict(usage, category='compaction') if usage is not None and event.get('usage_observed') is not False else {})
             if kind == terminal:
                 if terminal == 'settled':
                     self.awaiting_settlement = False
@@ -220,12 +255,19 @@ class NativeSession:
                 return result
 
     def prompt(self, text, *, operation_id, remaining=None):
-        self.prepare()
         if self.running or self.closed:
             raise NativeError('native session is busy or closed')
         if self.awaiting_settlement:
             raise NativeError('prior native operation requires settlement reconciliation',
                               settlement=self._settlement('unknown'))
+        def admit():
+            left = remaining() if remaining else None
+            if left is not None and left <= 0:
+                raise DeadlineExceeded('native deadline exhausted before provider dispatch',
+                                       settlement=self._settlement('not_dispatched'))
+        admit()
+        self.prepare()  # Setup has its own timeout; it is not an actor allocation.
+        admit()  # A lazy setup may have consumed the enclosing wall allowance.
         self.operation_id, self.running, self.provider_settled = operation_id, True, False
         self.awaiting_settlement = True
         self.cancelled.clear()

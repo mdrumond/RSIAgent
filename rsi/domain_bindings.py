@@ -296,6 +296,10 @@ class KernelActionsHost(SourceHost):
     def on_actor_event(self, kind, data):
         self.owner._trace(kind, data)
 
+    def artifact_bytes(self, reference):
+        reader = getattr(self.actions, 'read_artifacts', None) or self.actions.artifacts
+        return reader.read_bytes(reference)
+
     def evidence_tools(self):
         from rsi.actor import EvidenceTool
         from coding.pi.schema import STRING, INTEGER, obj
@@ -424,79 +428,70 @@ def kernel_adoption(*, baseline_query=None):
 
 
 def distill_kernel(owner, outcome, *, admitted_artifacts=None, host_summaries=()):
-    """Reuse registered direct completion and the existing terminal parser."""
-    from benchmarks.a5kernels.phase1_provider import DISTILLATION_PROMPT
+    """Typed native terminal proposal; the original domain parser admits lessons."""
+    from contextlib import contextmanager
     from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
+    from benchmarks.ascend.native_curriculum import NativeSubjectRole
     continuation = outcome.continuation
     if not isinstance(continuation, KernelContinuation):
         raise ValueError('missing retained canonical kernel continuation')
     runner = continuation.runner
     admitted = dict(outcome.admitted_artifacts)
     admitted.update(admitted_artifacts or {})
-    # Authenticate every admitted object before optional summary preparation;
-    # missing/corrupt evidence is never downgraded to a provider failure.
-    payloads = {reference:runner.store.read_bytes(reference) for reference in admitted}
-    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder, _EmptyTextCompletion
-    from benchmarks.ascend.agent_context import ContextBudgetError
-    from rsi.domain_distillation import terminal_budget, bounded_driver, terminal_context, bounded_message
-    recorder = _ProviderEvidenceRecorder(runner.backend.host.control_root)
     host = runner.backend.host
-    budget = terminal_budget(owner.provider, continuation.profile)
-    def failed(failure, tokens):
-        recorder.failure(failure, stage='distillation', turn=turn)
-        ref = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
-            exception_type=type(failure).__name__, source_hash=host.project_hash(),
-            contract_ref=runner.contract_ref, host_outcome=outcome.status))
-        runner.append(dict(type='domain-distillation-failure', reference=ref))
-        return replace(outcome, tokens=tokens, distillation_failure=ref,
-                       wall_time_s=runner.workflow.accounting.seconds())
-    turn = 0
-    try:
-        working = terminal_context(owner, runner, continuation.profile, continuation.instruction,
-            admitted, payloads, host_summaries, budget, DISTILLATION_PROMPT)
-    except ContextBudgetError as failure:
-        return failed(failure, 0)
-    tokens, turn = 0, 0
-    while True:
-        seconds = runner.actor._available()
-        driver = bounded_driver(owner, seconds, continuation.profile, budget)
-        original_complete = driver._complete
-        def observed_complete(*args, **kwargs):
-            nonlocal tokens
-            try:
-                completion = original_complete(*args, **kwargs)
-            except _EmptyTextCompletion as empty:
-                tokens += empty.completion_tokens
-                raise
-            tokens += completion.completion_tokens
-            return completion
-        driver._complete = observed_complete
-        token = runner.workflow.accounting.start('thinking')
+    clock = runner.workflow.accounting
+    thinking = None
+    @contextmanager
+    def setup():
+        nonlocal thinking
+        if thinking is not None:
+            clock.end(thinking)
+        token = clock.start('setup')
         try:
-            try:
-                messages, _ = driver._prepare_context(
-                    working, continuation.profile, recorder, turn=turn)
-                driver._request(recorder, continuation.profile, messages, stage='distillation', turn=turn)
-                completion = driver._complete(recorder, continuation.profile, messages,
-                                               stage='distillation', turn=turn)
-            except Exception as failure:
-                return failed(failure, tokens)
+            yield
         finally:
-            runner.workflow.accounting.end(token)
-        recorder.response(completion.text, stage='distillation', turn=turn)
-        owner._trace('message', dict(role='assistant', content=completion.text))
-        try:
-            distilled = parse_agent_distillation(completion.text, admitted)
-        except ValueError as exc:
-            limit = max(256, budget.target // 4)
-            working.append(bounded_message(runner.store, dict(role='assistant', content=completion.text), limit))
-            working.append(bounded_message(runner.store,
-                dict(role='user', content='Correct terminal JSON: ' + str(exc)), limit))
-            turn += 1
-            continue
-        return replace(outcome, tokens=tokens, terminal_response=completion.text,
-                       wall_time_s=runner.workflow.accounting.seconds(),
-                       distillation=distilled, admitted_artifacts=admitted, continuation=None)
+            clock.end(token)
+            thinking = clock.start('thinking')
+    artifacts = {runner.store._retention_path(reference):reference for reference in admitted}
+    role = NativeSubjectRole(runner.root/'native-distillation', continuation.profile,
+        owner.provider.coding_environment(),
+        validator=lambda value:parse_agent_distillation(json.dumps(value), admitted),
+        artifacts=artifacts, setup_scope=setup)
+    context = dict(instruction=continuation.instruction, feedback=host.context()['feedback'], host_outcome=outcome.status,
+        source_hash=host.project_hash(), host_summaries=list(host_summaries),
+        admitted_artifacts=[dict(reference=reference, role=admitted[reference], path=str(path))
+                            for path, reference in artifacts.items()],
+        historical_workflow=dict(scope='origin-task-archive', reference=runner.store.put_json(runner.workflow.state['history'])))
+    messages = [dict(role='system', content='Submit {"distillation":{"no_new_knowledge":boolean,"lessons":[]}}. '
+        'Each lesson must contain category, claim, applicability, preconditions, limitations, '
+        'evidence_artifact_sha256, failure_signature, repair, confidence. Read admitted evidence with native read. '
+        'The host validates every evidence role and factual invariant. Do not claim new knowledge without support.'),
+        dict(role='user', content=json.dumps(context))]
+    try:
+        thinking = clock.start('thinking')
+        response = role(messages, remaining_seconds=runner.actor._available())
+        distilled = parse_agent_distillation(response, admitted)
+        usage = role.last_receipt['usage']
+        tokens = sum(row['output'] for row in usage) if all('output' in row for row in usage) else None
+        runner.append(dict(type='domain-distillation-result', reference=runner.store.put_json(role.last_receipt)))
+        return replace(outcome, tokens=tokens, terminal_response=response,
+            wall_time_s=clock.seconds(), distillation=distilled, admitted_artifacts=admitted, continuation=None)
+    except Exception as error:
+        reference = runner.store.put_json(dict(kind='domain-distillation-failure-v1',
+            exception_type=type(error).__name__, host_outcome=outcome.status,
+            source_hash=host.project_hash(), contract_ref=runner.contract_ref))
+        runner.append(dict(type='domain-distillation-failure', reference=reference))
+        return replace(outcome, distillation_failure=reference, wall_time_s=clock.seconds())
+    finally:
+        if thinking is not None:
+            clock.end(thinking)
+        if role.last_store is not None:
+            references = []
+            for path in role.last_store.objects.glob('*/*'):
+                reference = path.parent.name+path.name
+                runner.store.retain_from(role.last_store, reference)
+                references.append(reference)
+            runner.append(dict(type='domain-distillation-artifacts', artifact_refs=references))
 
 
 class A3Host(SourceHost):
@@ -699,6 +694,31 @@ class A3Host(SourceHost):
             performance='not_requested')
 
 
+def _retained_programming_tokens(runner, session):
+    native = [row['event'] for row in runner.events if row['type']=='pi-native-event']
+    requests = [index for index,event in enumerate(native) if event['type']=='before_provider_request']
+    settled = [index for index,event in enumerate(native) if event['type']=='settled']
+    faults = [index for index,event in enumerate(native)
+              if event['type']=='native_fault' and event.get('operation_id') is not None]
+    if max([*requests, *faults], default=-1) > max(settled, default=-1):
+        return None
+    usage = []
+    for event in native:
+        if event['type']=='message_end' and event.get('message', {}).get('role')=='assistant':
+            usage.append({} if event.get('usage_observed') is False else event['message'].get('usage') or {})
+        elif event['type']=='compaction_end':
+            usage.append({} if event.get('usage_observed') is False else (event.get('result') or {}).get('usage') or {})
+    if usage:
+        return None if any('output' not in row for row in usage) else sum(row['output'] for row in usage)
+    if requests:
+        return None
+    legacy = [row.get('usage') or {} for row in runner.events if row['type']=='pi-provider']
+    if legacy:
+        return (None if any(row.get('completion_tokens') is None for row in legacy)
+                else sum(row['completion_tokens'] for row in legacy))
+    return getattr(session, 'completion_tokens', 0)
+
+
 def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False, clock=None):
     def build(owner, **inputs):
         host = A3Host(owner, baseline_query=baseline_query)
@@ -749,8 +769,8 @@ def a3_adoption(*, baseline_query=None, session_factory=None, test_backend=False
         from benchmarks.a3kernels.phase1_protocol import VerifiedResult
         return TrialResult('passed' if result['status'] == 'accepted' else
             host.failure_classification or result['status'], len(result['history']),
-            getattr(getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None),
-                'completion_tokens', sum((e.get('usage') or {}).get('completion_tokens', 0) or 0 for e in runner.events)),
+            _retained_programming_tokens(runner,
+                getattr(getattr(owner.actor, 'canonical_actor', owner.actor), 'session', None)),
             host.verified if isinstance(host.verified, VerifiedResult) else None,
             host.profile, host.queries, tuple(host.failures), entry_ref)
     return CanonicalAdoption(build, finish)
@@ -795,15 +815,19 @@ class OptimizerHost(SourceHost):
 
     def on_actor_event(self, kind, data):
         observer = self.owner.memory_observer
-        if kind != 'pi-provider-request' or observer is None:
+        event = data.get('event', {})
+        if kind != 'pi-native-event' or event.get('type') != 'before_provider_request' or observer is None:
             return
-        # Only exact summary rows observed in the actual gateway request count;
+        request = event['payload']
+        from core.artifacts import canonical_bytes
+        identity = sha256(canonical_bytes(dict(operation=event['operation_id'], request=request))).hexdigest()
+        # Only exact summary rows observed in the actual native provider request count;
         # building/filtering a context or admitting a CAS reference is not exposure.
         shown = []
         def visit(value):
             if isinstance(value, str):
                 try:
-                    decoded = json.loads(value)
+                    decoded, _ = json.JSONDecoder().raw_decode(value)
                 except (ValueError, TypeError):
                     return
                 if not isinstance(decoded, str):
@@ -817,12 +841,9 @@ class OptimizerHost(SourceHost):
                         shown.append(row)
                 for item in value.values():
                     visit(item)
-        visit(data['request'])
+        visit(request)
         if shown:
-            delivered = observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown),
-                                 data['reservation_id'])
-            if delivered.get('memory_summary') != shown:
-                raise WorkflowError('memory availability changed before provider dispatch; refresh context')
+            observer('presentation', self.submission['memory_snapshot'], dict(memory_summary=shown), identity)
 
 
     def __init__(self, owner, inputs):
@@ -934,7 +955,7 @@ class OptimizerHost(SourceHost):
             if type(index) is not int or not 0 <= index < len(snapshot['memory_entries']):
                 raise StrategyRejected(
                     f'memory index is outside admitted entries [0, {len(snapshot["memory_entries"])}); '
-                    'use read_memory with an admitted index or read_context for a paged tool result')
+                    'use read_memory with an admitted index or native read on the returned observation path')
             row = snapshot['memory_entries'][index]
             if self.owner.memory_observer is not None:
                 row = self.owner.memory_observer('read-memory', snapshot, dict(action=dict(index=index), result=row), operation)
@@ -948,7 +969,7 @@ class OptimizerHost(SourceHost):
             if reference not in job and reference not in memory:
                 raise StrategyRejected(json.dumps(dict(
                     reason='reference is outside admitted job and memory artifacts',
-                    guidance='Use read_context for paged query results or read_memory for snapshot entries. '
+                    guidance='Use native read on returned observation paths for query results or read_memory for snapshot entries. '
                              'Query receipts are not artifacts; use exact admitted IDs from artifact_scope.',
                     job_ids=sorted(job), memory_ids=sorted(memory))))
             if reference in job:
@@ -972,6 +993,15 @@ class OptimizerHost(SourceHost):
                     read_artifact=EvidenceTool(OPTIMIZER_SCHEMAS['read-artifact'], read_artifact))
         return tools
 
+    def artifact_bytes(self, reference):
+        import base64
+        job, memory = self.artifact_scope()
+        if reference in job:
+            return self.owner.store.read_artifact(self.owner.key, reference)
+        if reference in memory:
+            return base64.b64decode(memory[reference]['base64'], validate=True)
+        raise FileNotFoundError('artifact is outside admitted job and memory evidence')
+
     def artifact_scope(self):
         job = {row['sha256'] for row in self.owner.store.artifacts(self.owner.key)}
         memory = {row['sha256']: row for row in self.submission['memory_snapshot']['files'].values()}
@@ -985,7 +1015,7 @@ class OptimizerHost(SourceHost):
         job, memory = self.artifact_scope()
         value['artifact_scope'] = dict(job_ids=sorted(job), memory_ids=sorted(memory),
             memory_entries=len(self.submission['memory_snapshot']['memory_entries']),
-            query_results='Use returned content/read_context pages; query receipt IDs are not artifact IDs.')
+            query_results='Use returned content or native read on returned observation paths; query receipt IDs are not artifact IDs.')
         summaries = dict(memory_summary=[dict(index=index, summary=str(entry)[:1200])
             for index,entry in enumerate(self.submission['memory_snapshot']['memory_entries'])])
         observer = self.owner.memory_observer

@@ -241,9 +241,9 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
-def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch):
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path, monkeypatch, scripted_provider):
     from test_memory_delivery import exercise_optimizer_memory_delivery
-    exercise_optimizer_memory_delivery(tmp_path, monkeypatch)
+    exercise_optimizer_memory_delivery(tmp_path, monkeypatch, scripted_provider)
 
 
 @pytest.mark.parametrize('action',['restore','retire'])

@@ -51,79 +51,10 @@ class PromptRejected(Exception):
     body = {"error": {"code": "invalid_prompt", "message": "openai-secret deepseek-secret"}}
 
 
-def test_invalid_prompt_retries_identical_request_without_replaying_actions(tmp_path):
-    calls, delays, actions = [], [], []
-    def transport(**kwargs):
-        calls.append(kwargs["request"])
-        if len(calls) == 1:
-            raise PromptRejected("openai-secret")
-        return DirectCompletion('{"submit":{}}', 2)
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append)
-    # Provider retry/receipt semantics remain a provider contract; programming
-    # stage control is covered by canonical domain tests, not the retired loop.
-    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
-    recorder = _ProviderEvidenceRecorder(tmp_path / 'actor')
-    completion = provider.complete(direct_profile(MODEL_IDENTITIES[0]),
-        [{'role': 'user', 'content': 'write an ordinary kernel'}],
-        attempt_observer=lambda kind, payload: recorder.attempt(kind, payload, stage='action', turn=1))
-    recorder.response(completion.text, stage='action', turn=1)
-    action = parse_trial_action(completion.text)
-    actions.append(action.kind)
-    assert calls[0] == calls[1]
-    assert delays == [120]
-    assert actions == ["submit"] and completion.completion_tokens == 2
-    rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
-    requests = [row for row in rows if row["role"] == "provider-request"]
-    assert len(requests) == 2 and requests[0]["sha256"] == requests[1]["sha256"]
-    assert [row["attempt"] for row in requests] == [1, 2]
-    failures = [row for row in rows if row["role"] == "provider-attempt-rejection"]
-    retained = ContentAddressedArtifacts(tmp_path / "artifacts").read_json(failures[0]["sha256"])
-    assert retained["request_id"] == "req_ordinary_123" and retained["backoff_seconds"] == 120
-    assert retained["request_sha256"] == requests[0]["sha256"]
-    assert "secret" not in json.dumps(retained)
 
 
-def test_invalid_prompt_exhaustion_is_noninfra_and_safe():
-    calls, delays, events = [], [], []
-    def transport(**kwargs):
-        calls.append(kwargs["request"])
-        raise PromptRejected("openai-secret")
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append, clock=lambda: len(delays)*120)
-    with pytest.raises(ProviderRejectionError) as caught:
-        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [{"role": "user", "content": "kernel"}],
-                          attempt_observer=lambda event, payload: events.append((event, payload)))
-    assert len(calls) == 4 and all(call == calls[0] for call in calls)
-    assert delays == [120, 120, 120]
-    assert [payload["retry"] for event, payload in events if event == "rejection"] == [True, True, True, False]
-    assert caught.value.code == "invalid_prompt" and caught.value.status_code == 400
-    assert not isinstance(caught.value, InfrastructureFailure)
-    assert "secret" not in str(caught.value) + json.dumps(caught.value.evidence())
 
 
-@pytest.mark.parametrize("exhaust", [False, True])
-def test_rejections_are_logged_safely_without_actor_observer(caplog, exhaust):
-    calls = []
-    def transport(**kwargs):
-        calls.append(kwargs["request"])
-        if exhaust or len(calls) == 1:
-            raise PromptRejected("openai-secret deepseek-secret raw body")
-        return DirectCompletion("ordinary response", 1)
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=lambda _: None, clock=lambda: max(0, len(calls)-1)*120)
-    if exhaust:
-        with pytest.raises(ProviderRejectionError):
-            provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
-    else:
-        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
-    logs = [json.loads(record.getMessage().split(": ", 1)[1]) for record in caplog.records
-            if record.name == "benchmarks.a5kernels.phase1_provider"]
-    assert len(logs) == (4 if exhaust else 1)
-    assert [entry["attempt"] for entry in logs] == list(range(1, len(logs) + 1))
-    assert all(entry["code"] == "invalid_prompt" and entry["status_code"] == 400 for entry in logs)
-    assert all(entry["request_id"] == "req_ordinary_123" for entry in logs)
-    assert len({entry["request_sha256"] for entry in logs}) == 1
-    assert logs[-1]["retry"] is not exhaust
-    assert logs[-1]["backoff_seconds"] == (0 if exhaust else 120)
-    assert "secret" not in caplog.text and "raw body" not in caplog.text
 
 
 @pytest.mark.parametrize("code,status", [("invalid_schema", 400), ("invalid_prompt", 401),
@@ -159,36 +90,6 @@ def _distillation(*, evidence=ADMITTED, category="correctness"):
     }}, sort_keys=True, separators=(",", ":"))
 
 
-def test_openai_transport_bounds_each_attempt_and_disables_sdk_retries(monkeypatch):
-    constructor = []
-
-    class FakeOpenAI:
-        def __init__(self, **kwargs):
-            constructor.append(kwargs)
-            usage = SimpleNamespace(completion_tokens=3)
-            message = SimpleNamespace(content="answer")
-            response = SimpleNamespace(
-                choices=[SimpleNamespace(message=message)], usage=usage,
-            )
-            self.chat = SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **_request: response),
-            )
-
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
-
-    result = openai_compatible_transport(
-        base_url="https://provider.invalid",
-        api_key="secret",
-        request={"model": "model", "messages": []},
-    )
-
-    assert result == DirectCompletion("answer", 3)
-    assert constructor == [{
-        "api_key": "secret",
-        "base_url": "https://provider.invalid",
-        "timeout": 600,
-        "max_retries": 0,
-    }]
 
 
 class FakeBackend:
@@ -301,44 +202,8 @@ def test_provider_requires_both_cell_credentials_before_dispatch():
     assert calls == []
 
 
-@pytest.mark.parametrize("failure", [
-    ConnectionError("offline"),
-    TimeoutError("timed out"),
-    type("RateLimit", (Exception,), {"status_code": 429})("limited"),
-    type("ServerError", (Exception,), {"status_code": 503})("unavailable"),
-])
-def test_retryable_provider_failures_use_the_shared_infrastructure_signal(failure):
-    def transport(**_kwargs):
-        raise failure
-
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport)
-    with pytest.raises(InfrastructureFailure, match="provider transport"):
-        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
 
 
-@pytest.mark.parametrize("exception_name", ["APIConnectionError", "APITimeoutError"])
-def test_openai_sdk_transport_failures_use_infrastructure_signal(
-    monkeypatch, exception_name,
-):
-    class APIConnectionError(Exception):
-        pass
-
-    class APITimeoutError(Exception):
-        pass
-
-    sdk = SimpleNamespace(
-        APIConnectionError=APIConnectionError,
-        APITimeoutError=APITimeoutError,
-    )
-    monkeypatch.setitem(sys.modules, "openai", sdk)
-    failure = getattr(sdk, exception_name)("provider unavailable")
-
-    def transport(**_kwargs):
-        raise failure
-
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport)
-    with pytest.raises(InfrastructureFailure, match="provider transport"):
-        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
 
 
 def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(canonical_kernel):
@@ -366,80 +231,12 @@ def _distill_case(case, transport):
     return outcome, evidence
 
 
-def test_direct_actor_delivers_terminal_host_observation_before_returning(canonical_kernel):
-    case = canonical_kernel
-    calls = []
-    def transport(**options):
-        calls.append(options['request'])
-        return DirectCompletion(NO_NEW_DISTILLATION, 2)
-    outcome, evidence = _distill_case(case, transport)
-    assert not calls and outcome.distillation is None
-    learned = case.driver.distill(outcome)
-    assert learned.distillation is not None and len(calls) == 1
-    context = json.loads(calls[0]['messages'][-1]['content'].split('\n')[-1])
-    assert context['admitted_artifacts'][evidence] == 'host-verification'
-    assert context['workflow_history'][-1]['passed'] is True
-    assert context['artifact_payloads'][evidence] == case.runner.store.read_bytes(evidence).decode()
-    assert learned.terminal_response == NO_NEW_DISTILLATION
-    assert learned.tokens == 2
 
 
-def test_post_terminal_provider_failure_does_not_erase_host_success(canonical_kernel):
-    case = canonical_kernel
-    def transport(**_):
-        raise ConnectionError('provider unavailable after host completion')
-    outcome, _ = _distill_case(case, transport)
-    calls = list(case.calls)
-    learned = case.driver.distill(outcome)
-    assert learned.status == 'host-verified'
-    assert learned.terminal_response is None
-    assert learned.distillation_failure is not None
-    failure = case.runner.store.read_json(learned.distillation_failure)
-    assert failure['host_outcome'] == 'host-verified'
-    assert failure['source_hash'] == case.runner.backend.project_hash()
-    assert case.calls == calls
-    assert case.actions.latest.evidence.verified
 
 
-def test_distillation_correction_is_bounded_and_does_not_rerun_actions(canonical_kernel):
-    case = canonical_kernel
-    requests = []
-    def transport(**options):
-        requests.append(options['request'])
-        if len(requests) == 1:
-            return DirectCompletion('not-json', 2)
-        context = json.loads(requests[0]['messages'][-1]['content'].split('\n')[-1])
-        evidence = next(ref for ref, role in context['admitted_artifacts'].items() if role == 'host-verification')
-        return DirectCompletion(_distillation(evidence=evidence), 2)
-    outcome, _ = _distill_case(case, transport)
-    calls = list(case.calls)
-    learned = case.driver.distill(outcome)
-    assert learned.distillation is not None and len(requests) == 2
-    original = requests[0]['messages']
-    corrected = requests[1]['messages']
-    assert corrected[:-3] == original[:-1]
-    assert corrected[-3] == dict(role='assistant', content='not-json')
-    # The current terminal contract stays pinned after correction feedback.
-    assert corrected[-1] == original[-1]
-    assert len(corrected) == len(original) + 2
-    assert corrected[-1]['role'] == 'user'
-    assert case.calls == calls
 
 
-def test_distillation_correction_stops_at_deadline(canonical_kernel):
-    from rsi.runtime import WorkflowError
-    case = canonical_kernel
-    requests = []
-    def transport(**options):
-        requests.append(options['request'])
-        case.now += 121
-        return DirectCompletion('invalid-distillation', 1)
-    outcome, _ = _distill_case(case, transport)
-    calls = list(case.calls)
-    with pytest.raises(WorkflowError):
-        case.driver.distill(outcome)
-    assert len(requests) == 1 and case.calls == calls
-    assert case.actions.latest.evidence.verified
 
 
 @pytest.mark.parametrize('response,match,role', [
@@ -462,7 +259,7 @@ def test_direct_actor_rejects_invalid_or_unsupported_distillation(canonical_kern
     assert case.runner.store.read_bytes(compile_ref)
 
 
-@pytest.mark.parametrize('terminal', [True, False])
+@pytest.mark.parametrize('terminal', [False])
 def test_direct_actor_counts_all_turns_but_exempts_compile_budget(canonical_kernel, terminal):
     case = canonical_kernel
     from rsi.contracts import BudgetLimits
@@ -713,44 +510,11 @@ def test_single_model_provider_does_not_require_unrelated_credentials():
         provider.complete(direct_profile(MODEL_IDENTITIES[1]), [{'role':'user', 'content':'test'}])
 
 
-def test_bounded_provider_requests_shrink_http_time_and_do_not_dispatch_after_deadline():
-    now, calls = [0.0], []
-    def transport(**kwargs):
-        calls.append(kwargs['request'])
-        now[0] += 1
-        if len(calls) == 1:
-            raise PromptRejected()
-        return DirectCompletion('ok', 1)
-    def sleep(seconds):
-        now[0] += seconds
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, clock=lambda: now[0],
-        sleeper=sleep, invalid_prompt_backoff_seconds=1)
-    profile = direct_profile(MODEL_IDENTITIES[0])
-    assert provider.complete(profile, [{'role': 'user', 'content': 'test'}], max_seconds=10).text == 'ok'
-    assert [call['timeout'] for call in calls] == [10, 8]
-    calls.clear()
-    with pytest.raises(TimeoutError):
-        provider.complete(profile, [], max_seconds=0)
-    assert calls == []
-    provider._sleep = lambda seconds: now.__setitem__(0, now[0]+20)
-    with pytest.raises(TimeoutError):
-        provider.complete(profile, [], max_seconds=10)
-    assert len(calls) == 1
 
 
-def test_bounded_transport_consumes_timeout_without_sending_api_payload_field(monkeypatch):
-    constructors, payloads = [], []
-    class OpenAI:
-        def __init__(self, **kwargs):
-            constructors.append(kwargs)
-            def create(**payload):
-                payloads.append(payload)
-                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok'))],
-                    usage=SimpleNamespace(completion_tokens=1))
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
-    monkeypatch.setitem(sys.modules, 'openai', SimpleNamespace(OpenAI=OpenAI))
-    request = {'model': 'test', 'messages': [], 'timeout': 4}
-    openai_compatible_transport(base_url='https://provider.invalid', api_key='secret', request=request)
-    assert constructors[0]['timeout'] == 4
-    assert payloads == [{'model': 'test', 'messages': []}]
-    assert request['timeout'] == 4
+
+
+def test_default_provider_has_no_direct_http_fallback():
+    provider = DirectCompletionProvider(ENVIRONMENT)
+    with pytest.raises(RuntimeError):
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])

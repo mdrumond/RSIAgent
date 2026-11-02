@@ -5,8 +5,8 @@ bundle and mapping, run artifacts, dependency environments, and dashboard state.
 The global CLI routes instance operations to that verified machinery snapshot.
 Changes to a global checkout do not silently upgrade an existing instance.
 
-Use Python 3.12 or 3.13 when enabling NVIDIA NOOA roles, and Node 22 or newer for
-Pi. Install the packaged CLI, export starter skills, then bootstrap:
+Use a supported Python interpreter and Node 22 or newer for the native Pi SDK.
+Install the packaged CLI, export starter skills, then bootstrap:
 
 ```sh
 python -m pip install .
@@ -20,9 +20,9 @@ rsi --instance ./my-rsi dashboard start --port 0
 `baseline.sqlite3` is an existing KnowledgeDB database. Supply your existing
 skills directory and mapping instead of starter templates when available. Add
 `--repository REPO --repository-revision REV` to snapshot an optional repository.
-Keep provider credentials in the launching process environment. Setup installs
-legacy/embedding packages and the NOOA role worker into separate owned Python
-environments; incompatible OpenAI SDK requirements do not share an environment.
+Keep provider credentials in the launching process environment. Setup installs the owned Python/embedding dependencies and pinned native Pi SDK.
+Programming and typed research roles use native Pi sessions; no separate NOOA
+Python worker or Python OpenAI SDK is required.
 Setup time is recorded separately from actor time.
 
 Before starting jobs, set `kdb_collections` in the configuration payload to the
@@ -34,7 +34,7 @@ only by default. To permit downloading the pinned weights, explicitly set
 add a collection to the configured baseline after embeddings are available.
 
 For CPU-only offline setup, provide a complete compatible wheelhouse including a
-CPU PyTorch wheel and both separate role/legacy dependency sets, plus the pinned
+CPU PyTorch wheel and the configured embedding dependencies, plus the pinned
 npm cache:
 
 ```sh
