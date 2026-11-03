@@ -54,19 +54,22 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     }}).restore(state.events(attempt.id));
   const extension=pi=>{
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
-      parameters:Type.Object({}),execute:async()=>result(await workflow.skill())});
+      parameters:Type.Object({}),execute:async()=>result({stage:workflow.stage,skill:await workflow.skill(),history:workflow.history})});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier.',
       parameters:Type.Object({}),execute:async()=>result(await workflow.validate())});
-    pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete current step after using its skill and required evidence.',
-      parameters:Type.Object({reflection:Type.Optional(Type.String()),next:Type.Optional(Type.String())}),
+    pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance automatically to the next canonical step. Do not specify a step name. Design and optimisation require reflection.',
+      parameters:Type.Object({reflection:Type.Optional(Type.String())}),
       execute:async(_id,args)=>{
-        const response=await workflow.advance(args);
+        const response=await workflow.advance({reflection:args.reflection});
         accepted=Boolean(response.accepted);
         return result(response);
       }});
+    pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'After debugging or validation, return to design or implementation with the observed reason.',
+      parameters:Type.Object({to:Type.Union([Type.Literal('design'),Type.Literal('implementation')]),reflection:Type.String({minLength:1})}),
+      execute:async(_id,args)=>result(await workflow.advance({next:args.to,reflection:args.reflection}))});
     pi.registerTool(sdk.createBashTool(project.source,{operations:{exec:async(command,cwd,options)=>{
       clock.check();
       const response=await execute(command,cwd,{...options,

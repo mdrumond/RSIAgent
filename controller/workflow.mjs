@@ -63,7 +63,7 @@ export class Workflow {
     const destination = next ?? stages[this.index+1];
     const allowed = [stages[this.index+1]];
     if (['debug','optimisation','validation'].includes(this.stage)) allowed.push('design','implementation');
-    if (!allowed.includes(destination)) throw new Error('Invalid workflow transition');
+    if (!allowed.includes(destination)) throw new Error(`Current stage ${this.stage}; permitted destinations: ${allowed.join(', ')}. Use rsi_advance for the next step.`);
     if (this.stage === 'validation' && destination === 'acceptance' && !this.validation?.passed)
       throw new Error('Validation did not pass');
     this.history.push({stage:this.stage,reflection,next:destination});
