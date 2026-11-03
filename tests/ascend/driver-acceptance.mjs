@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile} from 'node:fs/promises';
+import {readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
+import {ownerStopped} from '../../controller/lifecycle.mjs';
 import {setup,rows,until} from './driver_setup.mjs';
 
 test('CLI original failure -> smaller canonical investigation -> memory -> original retry; unrelated work proceeds',
@@ -96,5 +97,34 @@ test('CLI stop/resume preserves the interrupted attempt, native session and rema
   assert.equal(status.attempts[0].outcome,'passed');assert.ok(status.attempts[0].elapsed>=stopped.elapsed);
   assert.equal(rows(f.root,'SELECT session FROM attempts')[0].session,session);
   assert.equal(rows(f.root,"SELECT * FROM events WHERE type='job-admitted'").length,1);
+  f.pass();
+});
+
+
+test('resource discovery failure waits for an already launched worker before releasing ownership',{timeout:120000},async t=>{
+  const f=await setup(t,'recover',['first','second']);
+  const module=join(f.root,'machinery','failing-resources.mjs');
+  await writeFile(module,`import {createEnvironment as base} from './integrations/environments/index.mjs';
+import {writeFile,readFile} from 'node:fs/promises';
+import {setTimeout as delay} from 'node:timers/promises';
+export async function createEnvironment(options,context){
+ const env=await base({mode:'local'},context);let calls=0;
+ return {...env,prepare:async value=>{await env.prepare(value);await writeFile(options.gate,'ready');},resources:async()=>{
+  if(++calls===1)return [{id:'one',available:true}];
+  const end=performance.now()+10000;
+  while(performance.now()<end){try{await readFile(options.gate);throw new Error('Temporary probe failure');}catch(error){if(error.code!=='ENOENT')throw error;}await delay(20);}
+  throw new Error('Worker startup deadline');
+ }};
+}`);
+  const action=join(f.root,'scheduler-input.json');
+  await writeFile(action,JSON.stringify({concurrency:2,environment:{module:'machinery/failing-resources.mjs',options:{gate:join(f.root,'worker-ready')}}}));
+  await f.run('config','--config',action);
+  await assert.rejects(f.run('wave'));
+  const attempts=rows(f.root,'SELECT * FROM attempts');assert.equal(attempts.length,1);
+  assert.equal(await ownerStopped(attempts[0].owner),true);
+  assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='owner'")[0].value),null);
+  assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='stop'")[0].value),true);
+  assert.equal(attempts[0].outcome,null);
+  assert.equal(rows(f.root,'SELECT count(*) AS n FROM resource_leases')[0].n,1);
   f.pass();
 });
