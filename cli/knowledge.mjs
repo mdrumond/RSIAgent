@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, open, readFile, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -16,7 +16,7 @@ async function healthy(url) {
   catch{return false;}
 }
 export async function ensureKnowledgeService(config,{signal}={}) {
-  const receipt=join(config.root,'knowledge-service.json'),legacyLock=receipt+'.lock';
+  const receipt=join(config.root,'knowledge-service.json');
   const deadline=performance.now()+60000,key='knowledge-startup';
   const state=new State(join(config.root,'state.sqlite')),me=JSON.stringify(await processIdentity());
   state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
@@ -54,15 +54,6 @@ export async function ensureKnowledgeService(config,{signal}={}) {
         const latest=await inspect();
         if(latest.url)return latest.url;
         if(latest.pending){await wait();continue;}
-        try {
-          let owner;
-          try{owner=await load(legacyLock);}catch(error){
-            if(error instanceof SyntaxError){await wait();continue;}
-            throw error;
-          }
-          if(!await ownerStopped(owner)){await wait();continue;}
-          await unlink(legacyLock);
-        }catch(error){if(error.code!=='ENOENT')throw error;}
         signal?.throwIfAborted();
         const port=await freePort(),url=`http://127.0.0.1:${port}/mcp`;
         await mkdir(join(config.root,'logs'),{recursive:true});
