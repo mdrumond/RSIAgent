@@ -200,3 +200,57 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   assert.equal((await verify()).exitCode, 125); // existing corruption prevents verifier launch
   assert.equal((await verified.execute('test ! -e verified.marker', project)).exitCode, 0);
 });
+
+test('missing submission receipts persist unresolved events before errors and survive observer restart without dispatch', async t => {
+  for (const phase of ['work', 'setup', 'prepare']) {
+    const f = await fixture(t), trace = [];
+    let submissions = 0;
+    const context = { ...f.context, event: async (type, data) => {
+      await f.context.event(type, data);
+      await writeFile(join(f.instancePath, 'events.json'), JSON.stringify(f.events));
+      if (type === 'execution-unresolved') trace.push('persisted');
+    }, client: async args => {
+      const file = args[args.indexOf('--file') + 1];
+      if ((phase === 'prepare' && args[0] === 'upload') ||
+          (args[0] === 'run' && file.endsWith(phase === 'setup' ? 'sync.sh' : 'command.sh'))) {
+        submissions++;
+        if (phase === 'setup') return { state: 'queued' };
+        throw new Error('HTTP400 text without structured admission evidence');
+      }
+      return f.context.client(args);
+    } };
+    const verifier = join(f.instancePath, 'verify.py');
+    await writeFile(verifier, 'assert True');
+    const spec = { project: { id: 'p', source: f.project, ...(phase === 'prepare' ? { verifier: { files: [verifier] } } : {}) }, attempt: { id: phase } };
+    const environment = await createEnvironment(f.options, context);
+    await assert.rejects(async () => {
+      try { await environment.prepare(spec); if (phase !== 'prepare') await environment.execute('true', f.project); }
+      catch (error) { trace.push('exception'); throw error; }
+    });
+    assert.deepEqual(trace, ['persisted', 'exception']);
+    const marker = JSON.parse(await readFile(join(f.instancePath, 'events.json'), 'utf8')).at(-1);
+    assert.equal(marker.type, 'execution-unresolved'); assert.equal(marker.handle, null);
+    assert.match(marker.operation, /^[0-9a-f-]{36}$/);
+    await createEnvironment(f.options, context);
+    assert.equal(submissions, 1);
+    assert.deepEqual(JSON.parse(await readFile(join(f.instancePath, 'events.json'), 'utf8')).at(-1), marker);
+  }
+  const rejected = await fixture(t, async args => args[0] === 'run' ? { admitted: false, state: 'rejected' } : undefined);
+  await assert.rejects(rejected.environment.execute('true', rejected.project));
+  assert.equal(rejected.events.some(event => event.type === 'execution-unresolved'), false);
+});
+
+test('native SDK session PATH and local session-file metadata do not override remote runtime', async t => {
+  const sdk = await import(process.env.PI_SDK_MODULE ?? '@earendil-works/pi-coding-agent');
+  const f = await fixture(t);
+  const tool = sdk.createBashTool(f.project, { operations: { exec: (command, cwd, options) => f.environment.execute(command, cwd, options) } });
+  await tool.execute('native-env', { command: 'true' }, undefined, undefined, {
+    cwd: f.project, sessionManager: { getSessionId: () => 'native-session', getSessionFile: () => '/local/attempt/session.jsonl' },
+  });
+  const run = f.calls.find(args => args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith('command.sh'));
+  const script = await readFile(run[run.indexOf('--file') + 1], 'utf8');
+  const config = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -2));
+  assert.equal(Object.hasOwn(config.env, 'PATH'), false);
+  assert.equal(Object.hasOwn(config.env, 'PI_SESSION_FILE'), false);
+  assert.equal(config.env.PI_SESSION_ID, 'native-session');
+});

@@ -1,5 +1,5 @@
 import { readFile, readdir, mkdtemp, writeFile, mkdir, rename } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
@@ -149,16 +149,27 @@ export async function createEnvironment(options, context) {
     }
     return { state: 'unknown' };
   }
+  async function submit(args, receipt, allowCompleted = false) {
+    const operation = randomUUID();
+    let result, cause;
+    try { result = await client(args); }
+    catch (error) {
+      cause = error;
+      if (receipt) try { result = await json(receipt); } catch { /* absence is not closure */ }
+    }
+    if (result?.handle || (allowCompleted && result?.state === 'completed')) return result;
+    if (result?.admitted === false || result?.submitted === false) {
+      throw new Error(`CPL ${args[0]} was not admitted`);
+    }
+    const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
+    await event('execution-unresolved', { operation, handle: null, message });
+    throw new Error(message, { cause });
+  }
   async function transfer(args, dir) {
     const upload = args[0] === 'upload';
     if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
     else args.push('--timeout', '0');
-    let result;
-    try { result = await client(args); }
-    catch (error) {
-      if (!upload) throw error;
-      try { result = await json(join(dir, 'transfer.json')); } catch { throw error; }
-    }
+    let result = await submit(args, upload ? join(dir, 'transfer.json') : undefined, true);
     const handle = result.handle;
     if (handle) {
       await event('execution-handle', { handle, purpose: 'transfer' });
@@ -216,10 +227,7 @@ export async function createEnvironment(options, context) {
       await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
       const args = ['run', options.target, '--file', script, '--receipt-file', join(dir, 'sync-submission.json')];
       if (options.runtime) args.push('--runtime', options.runtime);
-      let submitted;
-      try { submitted = await client(args); }
-      catch (error) { try { submitted = await json(join(dir, 'sync-submission.json')); } catch { throw error; } }
-      if (!submitted.handle) throw new Error('Copy submission identity unknown; do not resubmit');
+      const submitted = await submit(args, join(dir, 'sync-submission.json'));
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
       do {
@@ -231,21 +239,16 @@ export async function createEnvironment(options, context) {
     if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
     const spool = posix.join(runRoot, 'output');
     const configuration = { command, verifiers: opts.purpose === 'verification' ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
-      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) => process.env[key] !== value)) }, timeout: remaining() ?? null };
+      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) =>
+        key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (opts.env ?? {}))) && process.env[key] !== value)) }, timeout: remaining() ?? null };
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
     await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(supervisor)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
     const args = ['run', options.target, '--file', script, '--receipt-file', receipt];
     if (options.runtime) args.push('--runtime', options.runtime);
     if (opts.resourceId !== undefined) args.push('--npu', String(opts.resourceId));
-    let submitted;
-    try { submitted = await client(args); }
-    catch (error) {
-      try { submitted = await json(receipt); }
-      catch { throw new Error('Submission identity unknown; do not resubmit', { cause: error }); }
-    }
+    const submitted = await submit(args, receipt);
     handle = submitted.handle;
-    if (!handle) throw new Error('CPL returned no handle; do not resubmit');
     check(handle);
     await save(join(dir, 'execution.json'), { handle, spool, cwd: configuration.cwd });
     await event('execution-handle', { handle });
@@ -317,9 +320,7 @@ export async function createEnvironment(options, context) {
 export async function createEnvironmentTools(environment, cwd, sdk) {
   sdk ??= await import('@earendil-works/pi-coding-agent');
   return [sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
-    // Pi supplies its whole LOCAL shell environment; forward only tool overrides.
-    const env = Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) => process.env[key] !== value));
-    const result = await environment.execute(command, cwd, { ...opts, env });
+    const result = await environment.execute(command, cwd, opts);
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
   } } })];
