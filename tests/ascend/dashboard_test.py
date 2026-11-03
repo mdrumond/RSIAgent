@@ -14,7 +14,10 @@ def harness(monkeypatch, tmp_path):
     calls = []
     config = {"format": 1, "environment": {"options": {"runtime": "named"}},
               "projects": [], "unknown": {"keep": True}}
-    state = {"projects": [{"id": "p", "status": "queued"}], "attempts": []}
+    state = {"projects": [{"id": "p", "status": "queued"}], "attempts": [], "requests": [
+        {"id": "tune-1", "kind": "tune", "status": "queued", "result": None, "error": None},
+        {"id": "kdb-1", "kind": "kdb", "status": "passed", "result": {"indexed": 3}, "error": None},
+        {"id": "kdb-2", "kind": "kdb", "status": "failed", "result": None, "error": "Input unavailable"}]}
     replies = {}
 
     def run(argv, **kwargs):
@@ -105,12 +108,13 @@ def test_failed_config_prevents_tuning(harness):
 
 
 @pytest.mark.parametrize("route,payload", [("browse", {"path": "/a b/$(literal)"}),
-                                           ("kdb", {"action": "search", "query": "q"})])
+                                           ("kdb", {"action": "add-repo", "path": "/source/a b", "collection": "new"})])
 def test_actions_use_json_files(harness, route, payload):
     client, calls, *_ = harness
     assert client.post(f"/api/{route}", json=payload).status_code == 200
     assert calls[-1][1] == payload
     assert "--config" in calls[-1][0]
+    assert ("--detach" in calls[-1][0]) == (route == "kdb")
 
 
 @pytest.mark.parametrize("response", [
@@ -135,7 +139,7 @@ def test_bad_requests_do_not_execute_cli(harness):
 
 def test_executed_frontend_forwards_canonical_config_and_browse_contract(harness):
     """Run the shipped JS and replay its fetches through Flask into the CLI driver."""
-    client, calls, config, replies, _ = harness
+    client, calls, config, replies, state = harness
     original = {**config, "actor": {"model": "kernel"},
                 "curriculum_actor": {"model": "curriculum"},
                 "skill_writer_actor": {"model": "writer"},
@@ -158,7 +162,7 @@ function element() {
 }
 const document = {
   getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
-  createElement: element, querySelectorAll: () => []
+  createElement: tag => ({...element(), tagName: tag}), querySelectorAll: () => []
 };
 const requests = [];
 const fetch = async (url, options) => {
@@ -166,7 +170,7 @@ const fetch = async (url, options) => {
   requests.push({url, method: options.method, body});
   let value = {};
   if (url === '/api/config') value = body ?? input.config;
-  if (url === '/api/status') value = {projects: [], attempts: []};
+  if (url === '/api/status') value = input.state;
   if (url === '/api/browse') value = {path: body.path, entries: [
     {name: 'child', path: '/workspace/child', isDirectory: true}]};
   return {ok: true, json: async () => value};
@@ -187,6 +191,8 @@ const fetch = async (url, options) => {
   await elements.get('folders').children[0].onclick();
   process.stdout.write(JSON.stringify({initialActors, requests,
     scopes: elements.get('skill-scope').children.map(option => option.value),
+    statusRows: elements.get('status').children.filter(child => child.tagName === 'pre')
+      .map(child => JSON.parse(child.textContent)),
     error: elements.get('message').textContent}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
@@ -196,7 +202,7 @@ const fetch = async (url, options) => {
         try:
             stdout, stderr = process.communicate(json.dumps({
                 "source": (Path(__file__).resolve().parents[2] / "web/app.js").read_text(),
-                "config": original, "actors": edited, "skillsmap": skillsmap}), timeout=10)
+                "config": original, "actors": edited, "skillsmap": skillsmap, "state": state}), timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate()
@@ -207,6 +213,7 @@ const fetch = async (url, options) => {
         "curriculum": original["curriculum_actor"], "writer": original["skill_writer_actor"]}
     assert result["error"] == "Done"
     assert result["scopes"] == ["design"]
+    assert result["statusRows"] == [state["projects"], state["attempts"], state["requests"]]
     for req in result["requests"]:
         if req["method"] == "GET":
             continue

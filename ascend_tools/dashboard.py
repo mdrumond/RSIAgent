@@ -130,7 +130,7 @@ def create_app(instance, machinery=None, node="node"):
     def kdb():
         value = body()
         with lock:
-            return jsonify(driver.call("kdb", value))
+            return jsonify(driver.call("kdb", value, detach=True))
 
     @app.post("/api/tune")
     def tune():

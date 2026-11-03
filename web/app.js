@@ -60,6 +60,7 @@ async function refresh() {
   el('status').replaceChildren();
   table('Projects', state.projects);
   table('Attempts', state.attempts);
+  table('Background operations', state.requests);
 }
 
 el('settings').addEventListener('input', () => { dirty = true; });
