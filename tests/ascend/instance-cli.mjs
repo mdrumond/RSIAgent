@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { bootstrap, readConfig, updateConfig } from '../../cli/instance.mjs';
+import { bootstrap, readConfig, updateConfig, upgrade } from '../../cli/instance.mjs';
 import { main } from '../../cli/main.mjs';
 
 test('bootstrap snapshots own memory, skills and machinery; CLI changes persist independently',async()=>{
@@ -33,6 +33,10 @@ test('bootstrap snapshots own memory, skills and machinery; CLI changes persist 
     await writeFile(spec,JSON.stringify({id:'python',goal:'edited numeric goal',actor_seconds:240}));
     await main(['project','--instance',instance,'--project',spec]);
     assert.equal((await readConfig(instance)).projects.length,1);
+    await writeFile(join(machinery,'controller','marker.mjs'),'export const marker=2');
+    await upgrade(instance,machinery);
+    assert.equal(await readFile(join(instance,'machinery','controller','marker.mjs'),'utf8'),'export const marker=2');
+    assert.equal((await main(['status','--instance',instance])).projects[0].id,'python');
     assert.ok((await main(['browse','--instance',instance])).entries.some(e=>e.name==='machinery' && e.isDirectory));
     await assert.rejects(bootstrap(join(machinery,'nested'),{baseline,skills,machinery,environment:{}}));
   }finally{await rm(root,{recursive:true,force:true});}

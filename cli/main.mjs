@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { bootstrap, readConfig, updateConfig } from './instance.mjs';
+import { bootstrap, readConfig, updateConfig, upgrade } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 
 export async function main(argv=process.argv.slice(2)) {
@@ -14,7 +14,7 @@ export async function main(argv=process.argv.slice(2)) {
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
-  if (values.help || !command) return {commands:['bootstrap','status','config','project','wave','resume','stop','dashboard','kdb','tune']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','project','wave','resume','stop','dashboard','kdb','tune']};
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
@@ -22,6 +22,10 @@ export async function main(argv=process.argv.slice(2)) {
   }
   const root=resolve(values.instance??arg??'.');
   const config=await readConfig(root);
+  if(command==='upgrade') {
+    const input=JSON.parse(await readFile(values.config,'utf8'));
+    return upgrade(root,input.machinery);
+  }
   if (command==='config') {
     const skillRoot=join(root,'skills','versions',config.skills.activeVersion);
     const map=JSON.parse(await readFile(join(skillRoot,'skill-map.json'),'utf8'));
@@ -81,7 +85,7 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==='status') {
     const state=new State(join(root,'state.sqlite'));
     try {
-      return {mode:config.mode,projects:state.db.prepare('SELECT id,status,frozen FROM projects').all(),
+      return {mode:config.mode,projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
