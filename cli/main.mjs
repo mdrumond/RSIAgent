@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 
-export async function main(argv=process.argv.slice(2)) {
+export async function main(argv=process.argv.slice(2),{signal}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
@@ -103,7 +103,7 @@ export async function main(argv=process.argv.slice(2)) {
   }
   if (['wave','resume','stop'].includes(command)) {
     const {operate}=await import('./runtime.mjs');
-    return operate(command,config,{...values,mode:values.mode??config.mode});
+    return operate(command,config,{...values,signal,mode:values.mode??config.mode});
   }
   if(command==='dashboard') {
     const {spawn}=await import('node:child_process');
@@ -114,7 +114,7 @@ export async function main(argv=process.argv.slice(2)) {
   }
   if(command==='kdb' || command==='tune') {
     const module=command==='kdb'?'./knowledge.mjs':'./skills.mjs';
-    return (await import(module)).run(config,values);
+    return (await import(module)).run(config,{...values,signal});
   }
   throw new Error(`Unknown command ${command}`);
   };
@@ -122,7 +122,9 @@ export async function main(argv=process.argv.slice(2)) {
   return operation();
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
-  main().then(value=>console.log(JSON.stringify(value))).catch(error=>{
+  const abort=new AbortController();
+  const stop=()=>abort.abort();process.on('SIGTERM',stop);process.on('SIGINT',stop);
+  main(undefined,{signal:abort.signal}).then(value=>console.log(JSON.stringify(value))).catch(error=>{
     console.error(JSON.stringify({error:error.message}));process.exitCode=1;
-  });
+  }).finally(()=>{process.off('SIGTERM',stop);process.off('SIGINT',stop);});
 }
