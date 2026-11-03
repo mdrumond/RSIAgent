@@ -105,7 +105,8 @@ c=json.loads(manifest_bytes)
 if not os.path.isdir(c['incoming']): raise FileNotFoundError('Retained incoming source snapshot is missing')
 if c.get('snapshot') is not None:
  expected={entry[0]:entry[1:] for entry in c['snapshot']}
- actual={}
+ root_info=os.lstat(c['incoming'])
+ actual={'':['directory' if stat.S_ISDIR(root_info.st_mode) else 'other',root_info.st_mode & 0o777]}
  for directory, directories, files in os.walk(c['incoming'],followlinks=False):
   for name in directories+files:
    path=os.path.join(directory,name); relative=os.path.relpath(path,c['incoming']); info=os.lstat(path)
@@ -340,7 +341,7 @@ export async function createEnvironment(options, context) {
         await transfer(['upload', options.target, projectRoot, stage.incoming], dir);
         const configuration = { incoming: posix.join(options.workspacePath, stage.incoming),
           project: posix.join(options.workspacePath, destination), files: snapshot.files,
-          snapshot: snapshot.cacheable ? snapshot.entries.filter(entry => entry[0] !== '') : null };
+          snapshot: snapshot.cacheable ? snapshot.entries : null };
         const manifestDir = await mkdtemp(join(root, 'manifest-'));
         const manifest = join(manifestDir, 'sync.json');
         const bytes = JSON.stringify(configuration);

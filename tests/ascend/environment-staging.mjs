@@ -201,3 +201,24 @@ test('partial snapshot deletion, content/type/mode changes, extra files and mani
     assert.equal(f.sourceUploads().length, 2);
   }
 });
+
+
+test('retained root mode and directory-to-symlink changes fail before restore; explicit fresh retry restores project root permissions', async t => {
+  for (const corruption of ['chmod 555 "$incoming"', 'mv "$incoming" "$incoming.saved"; ln -s "$incoming.saved" "$incoming"']) {
+    const f = await fixture(t);
+    await chmod(f.source, 0o755);
+    await f.run("incoming=$(printf '%s' ../exec-*/incoming); " + corruption + '; printf poisoned > value.txt');
+    const workloads = f.runs(false).length;
+    await assert.rejects(f.environment.execute('printf workload > should-not-exist', f.source), /Copy failed/, corruption);
+    assert.equal(f.runs(false).length, workloads);
+    const project = join(f.workspace, 'owned/a/project');
+    assert.equal((await stat(project)).mode & 0o777, 0o755);
+    assert.equal(await readFile(join(project, 'value.txt'), 'utf8'), 'poisoned');
+    assert.equal(await f.run('./run.sh; printf built > build.output'), 'one');
+    assert.equal(f.sourceUploads().length, 2);
+    assert.equal((await stat(project)).mode & 0o777, 0o755);
+    assert.equal(await readFile(join(project, 'build.output'), 'utf8'), 'built');
+    // Restore the retired test snapshot's permissions solely for fixture cleanup.
+    await chmod(join(f.workspace, f.sourceUploads()[0][3]), 0o755);
+  }
+});
