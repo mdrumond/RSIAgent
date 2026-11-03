@@ -165,3 +165,17 @@ test('source fingerprints distinguish file boundaries from arbitrary binary cont
     assert.notEqual(await fingerprint(root),first);
   }finally{await rm(root,{recursive:true,force:true});}
 });
+
+test('parallel workers retain all evidence in the shared WAL ledger',async()=>{
+  const {mkdtemp,rm}=await import('node:fs/promises');const {spawn}=await import('node:child_process');
+  const {once}=await import('node:events');const {join}=await import('node:path');const {tmpdir}=await import('node:os');
+  const root=await mkdtemp(join(tmpdir(),'ascend-ledger-')),path=join(root,'state.sqlite');
+  const state=new State(path);
+  try {
+    const module=new URL('../../controller/state.mjs',import.meta.url).href;
+    const code="const {State}=await import(process.argv[2]);const s=new State(process.argv[1]);for(let i=0;i<100;i++)s.event(null,'parallel',{pid:process.pid,i});s.close();";
+    const children=Array.from({length:2},()=>spawn(process.execPath,['--input-type=module','-e',code,path,module],{stdio:'ignore'}));
+    for(const result of await Promise.all(children.map(child=>once(child,'exit'))))assert.equal(result[0],0);
+    assert.equal(state.db.prepare("SELECT count(*) AS n FROM events WHERE type='parallel'").get().n,200);
+  }finally{state.close();await rm(root,{recursive:true,force:true});}
+});

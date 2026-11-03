@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 export class State {
   constructor(file) {
     this.db = new DatabaseSync(file);
-    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
     if (version === 0 && this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().length)
       throw new Error('Existing unversioned state is unsupported; bootstrap a fresh instance');
