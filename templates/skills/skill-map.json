@@ -1,0 +1,12 @@
+{
+  "global-kdb": "global-kdb.md",
+  "preflight": "preflight.md",
+  "task-construction": "task-construction.md",
+  "design": "design.md",
+  "implementation": "implementation.md",
+  "test": "test.md",
+  "debug": "debug.md",
+  "optimisation": "optimisation.md",
+  "validation": "validation.md",
+  "acceptance": "acceptance.md"
+}

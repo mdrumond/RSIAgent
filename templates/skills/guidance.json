@@ -1,0 +1,72 @@
+[
+  {
+    "id": "global-kdb-baseline",
+    "scope": "global-kdb",
+    "text": "Retrieve applicable positive and negative evidence. Keep failed approaches, applicability limits and direct evidence references. Distinguish observed results from hypotheses. Prefer error avoidance, detection and recovery before speed.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "preflight-baseline",
+    "scope": "preflight",
+    "text": "Confirm the Ascend target, runtime, source revisions and healthy available resources. Stop on mismatches before execution; retain the fault and recovery evidence.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "task-construction-baseline",
+    "scope": "task-construction",
+    "text": "Freeze the original goal, inputs, correctness cases and independent verifier. Separate original projects from diagnostics and retries.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "design-baseline",
+    "scope": "design",
+    "text": "Read positive and negative KDB evidence. Reflect on previous attempts before selecting a design; explain known failure avoidance and recovery before performance choices.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "implementation-baseline",
+    "scope": "implementation",
+    "text": "Implement the verified design in the task source. Preserve frozen verifiers and negative lessons. Keep changes small enough to diagnose.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "test-baseline",
+    "scope": "test",
+    "text": "Run the frozen correctness cases. Record failures and source identity before changing code. Passing a partial case set does not establish correctness.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "debug-baseline",
+    "scope": "debug",
+    "text": "Identify the observed failing behavior and evidence. Recover with a bounded source change, then rerun the failed cases and regression verifier.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "optimisation-baseline",
+    "scope": "optimisation",
+    "text": "Retrieve positive and negative evidence and reflect on previous iterations. Preserve correctness while measuring performance on the required target; retain unsuccessful optimisations.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "validation-baseline",
+    "scope": "validation",
+    "text": "Run the independent frozen verifier against the current source. Keep raw results and source identity. A failure returns to design or implementation.",
+    "critical": true,
+    "negative": false
+  },
+  {
+    "id": "acceptance-baseline",
+    "scope": "acceptance",
+    "text": "Accept only with a passing frozen verifier on unchanged current source. Retain raw provider, SFT, KDB retrieval and skill-read evidence, including failures.",
+    "critical": true,
+    "negative": false
+  }
+]
