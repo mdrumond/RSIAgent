@@ -45,6 +45,21 @@ test('paired decision rejects correctness loss, missing samples, ties and regres
   assert.equal(evaluateDecision(results.slice(1), config.skills.tuningProjectIds).promote, false);
 });
 
+test('candidate repairs active failures before performance, but reverse never promotes', () => {
+  const results = ['reg-a', 'reg-b'].flatMap(projectId => [0, 1].flatMap(run =>
+    ['active', 'candidate'].map(arm => ({ projectId, run, arm, correct: true,
+      score: arm === 'active' ? 2 : 1 }))));
+  results[0].correct = false;
+  delete results[0].score;
+  assert.deepEqual(evaluateDecision(results, config.skills.tuningProjectIds),
+    { promote: true, reason: 'reliability-improvement' });
+  const reverse = results.map(r => ({ ...r, arm: r.arm === 'active' ? 'candidate' : 'active' }));
+  assert.deepEqual(evaluateDecision(reverse, config.skills.tuningProjectIds),
+    { promote: false, reason: 'correctness-regression' });
+  results[3].correct = false;
+  assert.equal(evaluateDecision(results, config.skills.tuningProjectIds).promote, false);
+});
+
 test('negative retention and evidence-gated critical pruning are enforced', () => {
   const remove = [{ action: 'remove', id: 'failure' }];
   const options = { allowPruning: true, history: history(24) };

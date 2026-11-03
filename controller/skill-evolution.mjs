@@ -22,7 +22,7 @@ export function cadenceDecision(history, task, lastEvaluated = 0) {
     allowPruning: new Set([...history, task].map(x => x.id)).size >= 24 };
 }
 
-// A paired improvement must be repeated, and every candidate correctness result must pass.
+// Correctness improvements precede timing; every candidate correctness result must pass.
 export function evaluateDecision(results, projectIds, runs = 2) {
   if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 2)
     throw new Error('Require two distinct regression projects and at least two runs');
@@ -36,10 +36,14 @@ export function evaluateDecision(results, projectIds, runs = 2) {
     const result = matches[0];
     if (result.correct === false && key.arm === 'candidate')
       return { promote: false, reason: 'correctness-regression' };
-    if (result.correct !== true || !Number.isFinite(result.score))
+    if (result.correct !== true && !(key.arm === 'active' && result.correct === false))
       return { promote: false, reason: 'inconclusive' };
     paired.push(result);
   }
+  if (paired.some(r => r.arm === 'active' && r.correct === false))
+    return { promote: true, reason: 'reliability-improvement' };
+  if (paired.some(r => !Number.isFinite(r.score)))
+    return { promote: false, reason: 'inconclusive' };
   const improvements = paired.filter(r => r.arm === 'candidate').map(r => r.score -
     paired.find(a => a.arm === 'active' && a.projectId === r.projectId && a.run === r.run).score);
   return improvements.every(x => x > 0) ? { promote: true, reason: 'repeated-improvement' }
