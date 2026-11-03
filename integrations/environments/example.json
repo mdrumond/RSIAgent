@@ -5,8 +5,7 @@
     "mode": "cpl",
     "target": "registered-target",
     "runtime": "registered-runtime",
-    "cwd": "configured-workspace",
-    "uploads": [],
-    "downloadDirectory": "./private/downloads"
+    "workspacePath": "/configured/registry/workspace",
+    "remoteDirectory": "task-owned-attempts"
   }
 }

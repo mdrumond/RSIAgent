@@ -1,89 +1,188 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, mkdir, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
 
-async function fixture(t, client, mode = 'cpl', extra = {}) {
+async function fixture(t, override) {
   const instancePath = await mkdtemp(join(tmpdir(), 'environment-test-'));
   t.after(() => rm(instancePath, { recursive: true, force: true }));
-  const events = [], excluded = [];
-  const sdk = { createLocalBashOperations: () => ({ exec: async () => ({ exitCode: 0 }) }),
-    createBashTool: (cwd, options) => ({ cwd, ...options }) };
-  const context = { instancePath, client, sdk, event: async (type, data) => { events.push({ type, ...data }); },
-    exclude: async (label, fn) => { excluded.push(label); return fn(); } };
-  return { environment: await createEnvironment({ mode, target: 'fake', pollMs: 0, ...extra }, context), events, excluded, sdk, instancePath };
+  const project = join(instancePath, 'project');
+  await mkdir(project);
+  await writeFile(join(project, 'program.py'), 'version=1');
+  const events = [], excluded = [], calls = [], versions = [];
+  let output = 'answer\n';
+  const sdk = { createLocalBashOperations: () => ({}), createBashTool: (cwd, options) => ({ cwd, ...options }) };
+  const context = { instancePath, sdk, event: async (type, data) => { events.push({ type, ...data }); },
+    exclude: async (label, fn) => { assert.ok(['setup','transfer'].includes(label)); excluded.push(label); return fn(); },
+    client: async args => {
+      calls.push(args);
+      if (args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith('sync.sh')) return { handle: 'remote:fake:job:sync' };
+      if (args[0] === 'observe' && args[1] === 'remote:fake:job:sync') return { state: 'completed', exit: 0 };
+      const overridden = override && await override(args, { events, versions });
+      if (overridden !== undefined) return overridden;
+      if (args[0] === 'capabilities') return { state: 'available' };
+      if (args[0] === 'upload') { versions.push(await readFile(join(args[2], 'program.py'), 'utf8')); return { state: 'completed', handle: 'remote:fake:transfer:copy' }; }
+      if (args[0] === 'download') { await writeFile(args[3], args[2].endsWith('stdout') ? output : ''); return { state: 'completed' }; }
+      if (args[0] === 'run') return { handle: 'remote:fake:job:one' };
+      return { state: 'completed', exit: 0 };
+    } };
+  const options = { mode: 'cpl', target: 'fake', pollMs: 0, workspacePath: '/registered', remoteDirectory: 'task-scope' };
+  const environment = await createEnvironment(options, context);
+  await environment.prepare({ project: { id: 'p', sourceDirectory: project }, attempt: { id: 'attempt' } });
+  return { environment, events, excluded, sdk, instancePath, project, calls, versions, setOutput: value => { output = value; }, context, options };
 }
 
-test('handle precedes observation; native tool receives output and exit', async t => {
-  let f;
-  const calls = [];
-  f = await fixture(t, async args => {
-    calls.push(args);
-    if (args[0] === 'run') return { handle: 'remote:fake:job:one' };
-    if (args[0] === 'logs') return { content: args.includes('stdout') ? 'answer\n' : '' };
-    assert.equal(f.events[0].type, 'execution-handle');
-    return { state: 'completed', exit: 7 };
-  });
-  const [tool] = await createEnvironmentTools(f.environment, '/work', f.sdk);
+test('stable attempt directories map local cwd and sync edits; full output reaches native tool', async t => {
+  const f = await fixture(t);
+  const [tool] = await createEnvironmentTools(f.environment, f.project, f.sdk);
+  const full = 'large output\n'.repeat(10000);
+  f.setOutput(full);
   let output = '';
-  const result = await tool.operations.exec('echo answer', '/work', { timeout: 4, onData: data => { output += data; } });
-  assert.equal(result.exitCode, 7);
-  assert.equal(output, 'answer\n');
-  assert.equal(calls.filter(args => args[0] === 'run').length, 1);
-  assert.equal(f.excluded.length, 0);
-  assert.ok(Number(calls[0][calls[0].indexOf('--timeout') + 1]) <= 4);
+  const result = await tool.operations.exec('python3 program.py', f.project, { timeout: 4, env: { ...process.env, ENVIRONMENT_TEST_VALUE: 'tool-override' }, onData: data => { output += data; } });
+  assert.equal(result.exitCode, 0);
+  assert.equal(output, full);
+  await writeFile(join(f.project, 'program.py'), 'version=2');
+  await tool.operations.exec('python3 program.py', f.project, { timeout: 4 });
+  assert.deepEqual(f.versions, ['version=1', 'version=2']);
+  const runs = f.calls.filter(args => args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith('command.sh'));
+  assert.equal(runs.length, 2);
+  assert.ok(runs.every(args => !args.includes('--cwd') && !args.includes('--timeout')));
+  assert.notEqual(f.calls.filter(args => args[0] === 'upload')[0][3], f.calls.filter(args => args[0] === 'upload')[1][3]);
+  assert.equal(f.events.filter(e => e.type === 'execution-output').every(e => e.partial === false), true);
+  assert.ok(f.excluded.includes('setup') && f.excluded.includes('transfer'));
+  const receipt = JSON.parse(await readFile(join(f.instancePath, '.executions', (await readdir(join(f.instancePath, '.executions')))[0], 'execution.json'), 'utf8'));
+  assert.ok(receipt.cwd.startsWith('/registered/task-scope/attempt/'));
+  const script = await readFile(runs[0][runs[0].indexOf('--file') + 1], 'utf8');
+  const config = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -2));
+  assert.deepEqual(config.env, { ENVIRONMENT_TEST_VALUE: 'tool-override' });
 });
 
-test('disconnect preserves handle; observe and stop never resubmit', async t => {
-  let connected = false, cancelled = false, runs = 0;
-  const f = await fixture(t, async args => {
-    if (args[0] === 'run') { runs++; return { handle: 'remote:fake:job:two' }; }
+test('disconnect preserves handle; new observer can stop without resubmission', async t => {
+  let connected = false, cancelled = false;
+  const f = await fixture(t, async (args, { events }) => {
+    if (args[0] === 'observe') {
+      assert.ok(events.some(e => e.type === 'execution-handle' && e.handle === args[1]));
+      if (!connected) throw new Error('offline');
+      return { state: cancelled ? 'cancelled' : 'running' };
+    }
     if (args[0] === 'cancel') { cancelled = true; return {}; }
-    if (!connected) throw new Error('offline');
-    return { state: cancelled ? 'cancelled' : 'running' };
   });
-  const result = await f.environment.execute('work', '/work');
+  const result = await f.environment.execute('work', f.project);
   assert.equal(result.settled, false);
-  assert.equal((await f.environment.observe(result.handle)).state, 'unknown');
+  const resumed = await createEnvironment(f.options, f.context);
+  assert.equal((await resumed.observe(result.handle)).state, 'unknown');
   connected = true;
-  assert.equal((await f.environment.observe(result.handle)).state, 'running');
-  assert.equal((await f.environment.stop(result.handle)).state, 'stopped');
-  assert.equal(runs, 1);
+  assert.equal((await resumed.observe(result.handle)).state, 'running');
+  assert.equal((await resumed.stop(result.handle)).state, 'stopped');
+  assert.equal(f.calls.filter(args => args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith('command.sh')).length, 1);
 });
 
-test('native receipt recovers identity after submission disconnect', async t => {
+test('native submission receipt recovers identity; missing output is explicitly partial', async t => {
   const f = await fixture(t, async args => {
     if (args[0] === 'run') {
       await writeFile(args[args.indexOf('--receipt-file') + 1], JSON.stringify({ handle: 'remote:fake:job:receipt' }));
       throw new Error('disconnected after receipt');
     }
-    return { state: 'completed', exit: 0 };
+    if (args[0] === 'download') throw new Error('copy unavailable');
   });
-  assert.equal((await f.environment.execute('true', '/work')).handle, 'remote:fake:job:receipt');
+  const result = await f.environment.execute('true', f.project);
+  assert.equal(result.handle, 'remote:fake:job:receipt');
+  assert.equal(result.settled, true);
+  const output = f.events.find(e => e.type === 'execution-output');
+  assert.equal(output.partial, true);
+  assert.ok(output.archive.path.startsWith('task-scope/attempt/'));
 });
 
-test('setup and copies are excluded; workload is charged', async t => {
-  let tick = 0, excludedMs = 0;
-  const instancePath = await mkdtemp(join(tmpdir(), 'environment-clock-'));
+test('copy latency is excluded from forwarded elapsed timeout', async t => {
+  const f = await fixture(t, async args => {
+    if (args[0] === 'upload') { await delay(80); return { state: 'completed' }; }
+    if (args[0] === 'run') {
+      const script = await readFile(args[args.indexOf('--file') + 1], 'utf8');
+      // Parse the public Python JSON argument, rather than asserting source wording.
+      const config = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -2));
+      assert.ok(config.timeout > 0.05 && config.timeout <= 0.1);
+      assert.ok(!config.cwd.includes(f.project));
+      return { handle: 'remote:fake:job:clock' };
+    }
+  });
+  assert.equal((await f.environment.execute('true', f.project, { timeout: 0.1 })).exitCode, 0);
+});
+
+test('local native operations persist identity across observer restart and confirm child group stop', async t => {
+  const sdk = await import(process.env.PI_SDK_MODULE ?? '@earendil-works/pi-coding-agent');
+  const instancePath = await mkdtemp(join(tmpdir(), 'environment-local-'));
   t.after(() => rm(instancePath, { recursive: true, force: true }));
-  const env = await createEnvironment({ mode: 'cpl', target: 'fake', uploads: [{ local: 'input', remote: 'input' }] }, {
-    instancePath, sdk: { createLocalBashOperations: () => ({}) }, event: async () => {},
-    exclude: async (label, fn) => { const before = tick; const result = await fn(); excludedMs += tick - before; return result; },
-    client: async args => { tick += 10; return args[0] === 'run' ? { handle: 'remote:fake:job:clock' } : { state: args[0] === 'capabilities' ? 'available' : 'completed', exit: 0 }; },
-  });
-  await env.prepare({ project: { id: 'p' }, attempt: { id: 'a' } });
-  assert.equal(excludedMs, 30);
-  await env.execute('compile', '/work');
-  assert.equal(tick - excludedMs, 20);
+  let handle;
+  const context = { instancePath, sdk, exclude: async (_, fn) => fn(), event: async (type, data) => { if (type === 'execution-handle') handle = data.handle; } };
+  const original = await createEnvironment({ mode: 'local' }, context);
+  const completion = original.execute('sleep 60 & wait', instancePath);
+  const resumed = await createEnvironment({ mode: 'local' }, context);
+  let state;
+  for (let n = 0; n < 100; n++) {
+    if (handle) state = await resumed.observe(handle);
+    if (state?.state === 'running') break;
+    await delay(10);
+  }
+  assert.equal(state?.state, 'running');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const childCode = `import {createEnvironment} from ${JSON.stringify(new URL('../../integrations/environments/index.mjs', import.meta.url).href)};
+    const env=await createEnvironment({mode:'local'},{instancePath:process.argv[2],sdk:{createLocalBashOperations:()=>({})},event:async()=>{},exclude:async(_,fn)=>fn()});
+    console.log(JSON.stringify([await env.observe(process.argv[1]),await env.stop(process.argv[1])]));`;
+  const child = await promisify(execFile)(process.execPath, ['--input-type=module','-e',childCode,handle,instancePath]);
+  const states = JSON.parse(child.stdout);
+  assert.equal(states[0].state, 'running');
+  assert.equal(states[1].state, 'stopped');
+  assert.equal((await completion).settled, true);
+  const short = await original.execute('exit 7', instancePath);
+  assert.equal(short.exitCode, 7);
+  assert.equal((await resumed.observe(short.handle)).exitCode, 7);
 });
 
-test('local path reuses native operations and exposes resource', async t => {
-  const f = await fixture(t, undefined, 'local');
-  assert.equal((await f.environment.execute('true', f.instancePath)).exitCode, 0);
-  assert.equal(f.events[0].type, 'execution-handle');
-  assert.equal((await f.environment.observe(f.events[0].handle)).state, 'stopped');
-  assert.equal((await f.environment.resources({}))[0].available, true);
-  assert.ok(Array.isArray(await f.environment.browse(f.instancePath)));
+test('Python supervisor enforces elapsed timeout and preserves build outputs while syncing source deletions', async t => {
+  const sdk = await import(process.env.PI_SDK_MODULE ?? '@earendil-works/pi-coding-agent');
+  const { cp } = await import('node:fs/promises');
+  const instancePath = await mkdtemp(join(tmpdir(), 'environment-supervisor-'));
+  t.after(() => rm(instancePath, { recursive: true, force: true }));
+  const project = join(instancePath, 'source'), workspace = join(instancePath, 'remote');
+  await mkdir(project); await mkdir(workspace);
+  await writeFile(join(project, 'old.py'), 'old');
+  const jobs = new Map(); let sequence = 0, loseObserver = false;
+  const context = { instancePath, sdk, event: async () => {}, exclude: async (label, fn) => {
+    assert.ok(['setup','transfer'].includes(label)); return fn();
+  }, client: async args => {
+    if (args[0] === 'capabilities') return { state: 'available' };
+    if (args[0] === 'upload') { await cp(args[2], join(workspace, args[3]), { recursive: true }); return { state: 'completed' }; }
+    if (args[0] === 'download') { await cp(join(workspace, args[2]), args[3]); return { state: 'completed' }; }
+    if (args[0] === 'run') {
+      const handle = `remote:fake:job:${++sequence}`;
+      const job = { state: 'running', setup: args[args.indexOf('--file') + 1].endsWith('sync.sh') }; jobs.set(handle, job);
+      const script = await readFile(args[args.indexOf('--file') + 1], 'utf8');
+      job.completion = sdk.createLocalBashOperations().exec(script, workspace, { onData: () => {} }).then(result => {
+        job.state = 'completed'; job.exit = result.exitCode;
+      });
+      return { handle };
+    }
+    if (args[0] === 'observe') {
+      if (loseObserver && !jobs.get(args[1]).setup) { loseObserver = false; throw new Error('observer disconnected'); }
+      const { state, exit } = jobs.get(args[1]); return { state, exit };
+    }
+    return { state: 'completed' };
+  } };
+  const environment = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'attempts', pollMs: 1 }, context);
+  await environment.prepare({ project: { id: 'p', sourceDirectory: project }, attempt: { id: 'a' } });
+  assert.equal((await environment.execute('printf built > build.marker', project)).exitCode, 0);
+  await rm(join(project, 'old.py'));
+  await writeFile(join(project, 'new.py'), "from pathlib import Path\nassert not Path('old.py').exists()\nprint(Path('build.marker').read_text())\n");
+  let output = '';
+  assert.equal((await environment.execute('python3 new.py', project, { onData: data => { output += data; } })).exitCode, 0);
+  assert.equal(output, 'built\n');
+  // The caller disappears after dispatch; workload timeout still closes the child.
+  loseObserver = true;
+  const timeoutJob = await environment.execute("python3 -c 'import time; time.sleep(30)'", project, { timeout: 0.1 });
+  for (const job of jobs.values()) await job.completion;
+  assert.equal(jobs.get(timeoutJob.handle).exit, 124);
 });
