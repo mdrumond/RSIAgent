@@ -20,6 +20,12 @@ test('isolated evaluation runs its requested canonical project outside the produ
     assert.equal(result.correct,true);assert.equal(result.attempts.length,1);
     assert.equal(rows(instanceRoot,"SELECT count(*) AS n FROM events WHERE type='stage-completed'")[0].n,8);
     assert.ok(f.server.requests.some(r=>r.messages.some(m=>m.role==='tool')));
+    const unavailable=join(round,'unavailable'),before=f.server.requests.length;
+    await bootstrap({sourceInstanceRoot:f.root,instanceRoot:unavailable,projectId:'unrelated',projectIds:['unrelated'],skillVersion:'baseline',
+      config:{...requested,resource_ids:['unavailable-fixture-resource']}});
+    const skipped=await wave({instanceRoot:unavailable,config:requested});
+    assert.equal(skipped.correct,null);assert.deepEqual(skipped.attempts,[]);
+    assert.equal(f.server.requests.length,before);
   } finally {
     try{
       const receipt=JSON.parse(await readFile(join(instanceRoot,'knowledge-service.json'),'utf8'));
