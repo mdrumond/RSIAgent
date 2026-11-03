@@ -42,3 +42,6 @@ dist/
 .codex/local/
 node_modules/
 .pi/
+
+# Development may link a shared Pi installation.
+/node_modules
