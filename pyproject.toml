@@ -3,30 +3,26 @@ requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rsi"
+name = "ascend-tools"
 version = "0.1.0"
-description = "RSI programming workflows and shared contracts"
-requires-python = ">=3.10"
-dependencies = ["PyYAML==6.0.3", "Flask==3.0.3", "Pygments==2.18.0", "requests==2.31.0"]
-dynamic = ["optional-dependencies"]
+description = "Ascend knowledge, verification and dashboard helpers for the native Pi controller"
+requires-python = ">=3.12"
+dependencies = ["mcp==1.27.2", "Flask==3.0.3"]
 
-
-[project.scripts]
-rsi = "rsi.cli:main"
-
-[tool.setuptools]
-py-modules = ["run_a3kernels", "run_a3_phase1", "run_a5_baseline_archive", "run_a5_fireworks_sft", "run_a5kernels", "run_a5_phase1_adaptive", "run_a5_phase1", "run_a5_sft_experiment", "run_ale", "run_ascend_campaign", "run_ascend_subjects", "run_catlass_dsl_harness", "run_osworld"]
+[project.optional-dependencies]
+embeddings = ["torch==2.10.0", "transformers==5.0.0"]
+dev = ["pytest==9.1.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rsi*", "core*", "coding*", "config*", "env*", "llm*", "optimizer*", "explore*", "benchmarks*", "dashboard*", "integrations*", "tools*"]
+include = ["ascend_tools", "ascend_tools.*"]
 namespaces = true
-exclude = ["*.node_modules", "*.node_modules.*", "tests", "tests.*", "*.tests", "*.tests.*", "build", "build.*", "*.build", "*.build.*", "*.dist", "*.dist.*", "*.__pycache__", "*.__pycache__.*"]
+exclude = ["*.tests", "*.tests.*", "*.__pycache__", "*.__pycache__.*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.yaml", "*.yml", "*.md", "*.txt", "*.js", "*.mjs", "*.html", "*.css", "*.ts", "*.cpp", "*.inc", "*.sh", "*.lock", "Dockerfile", "*.example"]
-dashboard = ["templates/*.html", "static/*"]
+ascend_tools = ["templates/kdb/*.md"]
 
-[tool.setuptools.dynamic.optional-dependencies]
-legacy = {file = ["requirements.txt"]}
-embeddings = {file = ["requirements-embeddings.txt"]}
+[tool.pytest.ini_options]
+testpaths = ["tests/ascend"]
+python_files = ["test_*.py", "*_test.py", "target_*.py"]
+pythonpath = [".", "tests/ascend"]
