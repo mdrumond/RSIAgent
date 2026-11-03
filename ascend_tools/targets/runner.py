@@ -147,7 +147,10 @@ def verify(args):
                         compare(actual, expected, atol=case.get('atol', 0), rtol=case.get('rtol', 0))
                     report['correctness'] = 'passed'
                 else:
-                    from .triton import execute
+                    if args.target == 'a5-catlass':
+                        from .catlass import execute
+                    else:
+                        from .triton import execute
                     execute(args, cases, identity, directory, report, save)
                 if sha(args.candidate) != args.source_sha256:
                     raise ValueError('candidate changed during verification')

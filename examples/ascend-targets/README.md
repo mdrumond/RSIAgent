@@ -27,10 +27,39 @@ it makes no correctness claim. Performance is unmeasured and that mode fails
 explicitly; elapsed wall time is not a device timing measurement. Failed studies
 retain raw diagnostics without claiming hardware or language unsupported.
 
-A5 Catlass extraction is a separate dependent slice from the preserved 2d23
-branch. This CLI does not yet claim A5 support. It must retain its independent
-three-tensor ABI, oracle, CANN 9.3/compiler/gitlink identity checks and real
-compile/launch evidence, without the old outer-CPL admission handshake.
+A5 Catlass uses `--target a5-catlass` with ABI version 1: the candidate exports
+`kernel(a, b, out)` (or the frozen `entrypoint`), and the host owns allocation,
+compilation and launch. The case JSON has `abi_version: 1`, `operation`, and
+`cases` containing unchanged `length`, `seed`, `block_count` controls. Numerical
+operations add/multiply/relu/convert retain the original independent oracle.
+Physical padding to 64 elements is distinct from the logical length (1..512).
+
+The runtime identity includes all common exact compiler/CANN file fingerprints,
+Python3.11 and device_health with product a5 and chip null.
+Additional required fields: catlass_source, source_revision, dependency_gitlink,
+dependency_revision, cann_version (9.3.x), cann_version_file,
+cann_version_contents, pipeline_manifest, pipeline_manifest_sha256,
+compiler_paths (compiler_bridge/hivmc-a5), module_sha256 (catlass/torch/torch_npu), and
+expected_versions (torch/torch_npu). Selected compiler files must be in
+compiler_consumer_files with exact hashes. Paths are resolved exclusively from
+ignored environment settings; the leaf never discovers or rebuilds dependencies.
+A fresh per-run cache is prepared with `python -m catlass.bc_compile` before
+compiling. Catlass supplies its own MLIR bindings, which must construct `ir.Context()`.
+Compiler identity uses the actual in-process bridge and backend selected by
+Catlass execution resolvers; no standalone TlaCompile PATH binding is required.
+
+A5 compile mode stops after `tla.compile`; test mode separately launches,
+synchronizes, retains tensors, checks unmodified inputs and compares numerical
+outputs. A5 timing/profiling is not implemented and performance requests fail
+explicitly as unmeasured. CPU contract tests cannot establish device behavior.
+No old outer-CPL receipts or controller capabilities are consumed.
+
+Explicit `device_health.allow_alarm: true` preserves user-authorized ordinary
+Alarm-device tolerance and records degraded status; busy sharing separately
+requires allow_busy and memory below 50%. Timing requires healthy idle regardless
+of either opt-in. Unresponsive queries always exclude the device. Runtime import,
+compile or launch failures remain retained observations, even after health
+admission; they never establish a hardware or language unsupported claim.
 
 Device targets require `--physical-device "$ASCEND_PHYSICAL_DEVICE"` in the
 host-frozen trusted verifier command. The domain wrapper supplies that value
@@ -41,3 +70,4 @@ Identical cases/runtime/verifier bytes therefore serve physical0 and1 leases.
 Explicit project device affinity belongs in a resource selection filter, never
 in a rewritten verifier or runtime profile. Conflicting assignment/masks reject;
 no logical-to-physical fallback or old-profile device alias is supported.
+

@@ -6,7 +6,7 @@ from .runner import verify
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--target', choices=('cpu', 'a3-triton'), required=True)
+    parser.add_argument('--target', choices=('cpu', 'a3-triton', 'a5-catlass'), required=True)
     parser.add_argument('--physical-device', type=int)
     parser.add_argument('--mode', choices=('compile', 'test', 'performance'), required=True)
     for name in ('candidate', 'cases', 'cases-sha256', 'runtime', 'runtime-sha256', 'source-sha256', 'artifacts'):
