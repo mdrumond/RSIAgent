@@ -12,7 +12,7 @@ import {State} from '../../controller/state.mjs';
 import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 import {ensureKnowledgeService} from '../../cli/knowledge.mjs';
 import {deliverLessons} from '../../cli/memory.mjs';
-import {investigate} from '../../cli/curriculum.mjs';
+import {investigate,summarize} from '../../cli/curriculum.mjs';
 
 const read=async path=>JSON.parse(await readFile(path,'utf8'));
 function setClaim(config,value) {
@@ -122,8 +122,59 @@ test('native curriculum returns executable source-relative verifier after reloca
   config.actor={provider:'service-fixture',model:'scripted',base_url:`http://127.0.0.1:${server.address().port}/v1`,credential_env:'SERVICE_FIXTURE_KEY',
     metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
   const path=join(config.root,'attempt');await mkdir(path);
-  const spec=await investigate({config,path,job:{origin_attempt:'failed',actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state:{events:()=>[]},bridge:{extension:()=>{}}});
+  const spec=await investigate({config,path,job:{origin_attempt:'failed',actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state:{events:()=>[],attempt:()=>({})},bridge:{extension:()=>{}}});
   assert.equal(spec.performance_goal,undefined);
   const relocated=join(config.root,'relocated');await cp(join(path,'investigation'),relocated,{recursive:true});await rm(path,{recursive:true});
   const result=await promisify(execFile)('bash',['-c',spec.verifier.command],{cwd:join(relocated,'source')});assert.equal(Number(result.stdout.trim()),42);
+});
+
+test('native summary and investigation retrieve authoritative diagnostics despite Pi telemetry tail',{timeout:15000},async t=>{
+  const config=await fixture(t),path=join(config.root,'attempt'),source=join(config.root,'source');
+  await mkdir(path);await mkdir(source);
+  const evidence=join(path,'verify.log'),session=join(path,'actor.jsonl');
+  await writeFile(evidence,'numeric-check-observed-42');await writeFile(session,'native-actor-diagnostic-17');
+  const state=new State(join(config.root,'diagnostics.sqlite'));t.after(()=>state.close());
+  state.add({id:'project',goal:'numeric',source,actor_seconds:120,verifier:{files:[],command:'true'}});
+  const attempt=state.admit('project',await processIdentity());state.checkpoint(attempt.id,1,session);
+  state.event(attempt.id,'verification',{passed:true,evidence});
+  state.event(attempt.id,'rejected',{diagnostics:['workflow acceptance incomplete']});
+  for(let i=0;i<80;i++)state.event(attempt.id,'pi-event',{type:'message_update',i});
+  const retrieved=[];
+  const server=createServer(async(req,res)=>{
+    let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
+    const prompt=body.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:m.content.map(part=>part.text??'').join('\n')).join('\n');
+    const context=JSON.parse(prompt.split('Attempt diagnostics: ')[1].split('\n')[0]);
+    const logs=context.diagnostics.find(event=>event.type==='verification')?.data.evidence;
+    const tools=body.messages.filter(m=>m.role==='tool');
+    const investigation=body.tools.some(tool=>tool.function.name==='submit_investigation');
+    let name,args;
+    if(tools.length===0){name='read';args={path:context.session};}
+    else if(tools.length===1){name='read';args={path:logs};}
+    else {
+      const results=tools.slice(0,2).map(m=>typeof m.content==='string'?m.content:JSON.stringify(m.content));
+      assert.ok(results[0].includes('native-actor-diagnostic-17'));assert.ok(results[1].includes('numeric-check-observed-42'));
+      if(investigation&&tools.length===2){name='write';args={path:'verify.py',content:'print(42)\n'};}
+      else if(tools.length===(investigation?3:2)) {
+        retrieved.push({session:context.session,evidence:logs});
+        name=investigation?'submit_investigation':'record_findings';
+        args=investigation?{goal:'inspect numeric',question:'why acceptance incomplete?',verifier:'verify.py'}:
+          {findings:'Numeric check observed 42; acceptance incomplete.',useful:true,paths:[logs]};
+      }
+    }
+    res.writeHead(200,{'Content-Type':'text/event-stream'});
+    const frame=(delta,finish_reason)=>res.write('data: '+JSON.stringify({id:'diagnostics',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
+    if(name){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+tools.length,type:'function',function:{name,arguments:JSON.stringify(args)}}]},null);frame({},'tool_calls');}
+    else{frame({role:'assistant',content:'Recorded.'},null);frame({},'stop');}
+    res.end('data: [DONE]\n\n');
+  });server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
+  const old=process.env.SERVICE_DIAGNOSTIC_KEY;process.env.SERVICE_DIAGNOSTIC_KEY='fixture-only';
+  t.after(()=>{if(old===undefined)delete process.env.SERVICE_DIAGNOSTIC_KEY;else process.env.SERVICE_DIAGNOSTIC_KEY=old;});
+  config.actor={provider:'service-diagnostics',model:'scripted',base_url:`http://127.0.0.1:${server.address().port}/v1`,credential_env:'SERVICE_DIAGNOSTIC_KEY',
+    metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
+  const findings=await summarize({config,path,state,job:{attempt},bridge:{extension:()=>{}},passed:true});
+  assert.equal(findings.evidence[0].path,evidence);
+  await investigate({config,path,state,job:{origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric'},bridge:{extension:()=>{}}});
+  assert.deepEqual(retrieved,[{session,evidence},{session,evidence}]);
+  assert.equal(state.events(attempt.id).filter(event=>event.type==='pi-event').length,80);
 });
