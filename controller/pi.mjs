@@ -103,6 +103,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   };
   try {
     if(signal?.aborted)throw new Error('Attempt interrupted');
+    clock.check();
     await environment.prepare({project,attempt});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
@@ -142,6 +143,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   } catch(error) {
     event('attempt-error',{message:error.message,stage:workflow.stage});
     state.checkpoint(attempt.id,clock.elapsed);
+    if(error.code==='ACTOR_ELAPSED_EXHAUSTED' && !uncertain && !signal?.aborted) {
+      event('rejected',{stage:workflow.stage,reason:error.code});
+      state.finish(attempt.id,'failed',{settleProject});
+      return {accepted:false,elapsed:clock.elapsed};
+    }
     // Keep the attempt open until the caller confirms all recorded external handles stopped.
     throw error;
   } finally {
