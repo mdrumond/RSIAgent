@@ -11,7 +11,7 @@ const task = (n, extra = {}) => ({ id: `original-${n}`, projectId: `project-${n}
   events: [{ type: 'knowledge-retrieved', data: { kind: 'negative', evidence: 'failure.json' } }], ...extra });
 const history = n => Array.from({ length: n }, (_, i) => task(i));
 const guidance = { id: 'failure', scope: 'debug', text: 'Check the failing case.', critical: false, negative: true };
-const config = { phase: 'phase2', skills: { activeVersion: 'baseline', tuningProjectIds: ['reg-a', 'reg-b'] } };
+const config = { root: tmpdir(), mode: 'phase2', skills: { activeVersion: 'baseline', tuningProjectIds: ['reg-a', 'reg-b'] } };
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'skills-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -124,9 +124,9 @@ test('inconclusive result keeps instance active; phase1 never invokes proposal o
 });
 
 test('CLI requires runtime contract and regression project configuration', async () => {
-  await assert.rejects(run({ skills: {} }), /tuningProjectIds/);
-  await assert.rejects(run(config), /runtimeModule/);
-  assert.equal((await run({ phase: 'phase1' })).analyse, false);
+  await assert.rejects(run({ root: tmpdir(), skills: {} }), /tuningProjectIds/);
+  await assert.rejects(run(config, { runtime: {} }), /runtimeModule/);
+  assert.equal((await run({ mode: 'phase1' })).analyse, false);
 });
 
 test('actual Pi SDK completes proposal through loopback provider with scoped agent/session evidence', async t => {
@@ -185,10 +185,11 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
       calls.push(['wave', request.instanceRoot]);
       assert.deepEqual(request.projectIds.length, 1);
       assert.equal(request.evaluation, true);
+      assert.equal(request.config.root, request.instanceRoot);
       return { correct: true, score: 1 };
     }
   };
-  const result = await run(config, { instanceRoot: root, runtime });
+  const result = await run({ ...config, root }, { runtime });
   assert.equal(result.promote, false);
   assert.equal(calls.length, 16);
   for (let i = 0; i < calls.length; i += 2) {
@@ -196,4 +197,16 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
     assert.equal(calls[i + 1][0], 'wave');
     assert.equal(calls[i][1], calls[i + 1][1]);
   }
+});
+
+test('CLI consumes action file task and requires an explicit writer profile', async t => {
+  const root = await fixture(t);
+  const action = join(root, 'action.json');
+  await writeFile(action, JSON.stringify({ task: task(0), userinfo: 'Prefer recovery guidance.' }));
+  await assert.rejects(run({ ...config, root }, { config: action,
+    runtime: { async bootstrap() {}, async wave() {} } }), /skill_writer_actor or actor/);
+  const proposals = await readdir(join(root, 'skills', 'proposals'));
+  const evidence = await load(join(root, 'skills', 'proposals', proposals[0], 'evidence.json'));
+  assert.equal(evidence.id, task(0).id);
+  assert.equal((await run({ mode: 'phase1', root }, { config: '/missing-action.json' })).analyse, false);
 });

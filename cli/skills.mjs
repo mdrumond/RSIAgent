@@ -10,17 +10,32 @@ import { tune } from '../controller/skill-evolution.mjs';
 // Both functions retain native provider/session/SFT and verifier evidence inside that instance.
 // Programmatic callers may supply values.runtime with these exact functions instead.
 export async function run(config, values = {}) {
-  const instanceRoot = resolve(values.instanceRoot ?? config.instanceRoot ?? '.');
-  if (config.skills?.tuningDisabled || config.phase === 'phase1')
+  if (config.skills?.tuningDisabled || config.mode === 'phase1')
     return { analyse: false, evaluate: false };
+  const instanceRoot = resolve(config.root);
+  const action = values.config ? JSON.parse(await readFile(resolve(values.config), 'utf8')) : {};
   const ids = config.skills?.tuningProjectIds;
   if (!Array.isArray(ids) || ids.length !== 2 || new Set(ids).size !== 2)
     throw new Error('skills.tuningProjectIds requires two distinct canonical regression project IDs');
   const runtimePath = config.skills?.runtimeModule;
-  const runtime = values.runtime ?? (runtimePath && await import(pathToFileURL(resolve(instanceRoot, runtimePath)).href));
+  const runtime = values.runtime ?? await import(runtimePath
+    ? pathToFileURL(resolve(instanceRoot, runtimePath)).href : new URL('./evaluation.mjs', import.meta.url).href);
   if (typeof runtime?.bootstrap !== 'function' || typeof runtime?.wave !== 'function')
     throw new Error('Provide skills.runtimeModule exporting bootstrap and wave, or values.runtime');
-  const task = values.task ?? (values.taskFile && JSON.parse(await readFile(resolve(values.taskFile), 'utf8')));
+  const task = values.task ?? action.task;
+  const userinfo = action.userinfo ?? config.userinfo;
+  const generate = async options => {
+    let { modelRuntime, model } = values;
+    if (!modelRuntime || !model) {
+      if (modelRuntime || model) throw new Error('Inject both modelRuntime and model');
+      const profile = config.skill_writer_actor ?? config.actor;
+      if (!profile) throw new Error('Configure skill_writer_actor or actor for native skill generation');
+      const { modelFromProfile } = await import('../controller/model.mjs');
+      ({ modelRuntime, model } = await modelFromProfile(profile));
+    }
+    const { generateCandidate } = await import('../controller/skill-evolution.mjs');
+    return generateCandidate({ ...options, modelRuntime, model });
+  };
   const evaluate = async request => {
     try {
       await access(request.instanceRoot);
@@ -31,5 +46,5 @@ export async function run(config, values = {}) {
       projectIds: [request.projectId], evaluation: true });
   };
   return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
-    task, evaluate, native: values.native, modelRuntime: values.modelRuntime, model: values.model });
+    task, userinfo, evaluate, generate, native: values.native });
 }

@@ -141,9 +141,9 @@ async function writeVersion(root, entries) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
+  task, userinfo, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
   const current = await json(configPath);
-  if (current.skills?.tuningDisabled || current.phase === 'phase1') return { analyse: false, evaluate: false };
+  if (current.skills?.tuningDisabled || current.mode === 'phase1') return { analyse: false, evaluate: false };
   if (config?.skills?.activeVersion !== current.skills?.activeVersion)
     throw new Error('Stale instance configuration');
   const root = resolve(instanceRoot);
@@ -174,7 +174,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const proposalRoot = join(directory, 'proposals', randomUUID());
     await mkdir(proposalRoot, { recursive: true });
     await save(join(proposalRoot, 'evidence.json'), entry);
-    const changes = await generate({ directory: proposalRoot, input: { entries, history,
+    const changes = await generate({ directory: proposalRoot, input: { entries, history, userinfo,
       actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
       native, modelRuntime, model });
     if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
@@ -200,6 +200,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       const isolatedRoot = join(evaluationRoot, randomUUID());
       const skillVersion = pending[arm];
       const isolatedConfig = structuredClone(current);
+      isolatedConfig.root = isolatedRoot;
       isolatedConfig.skills = { ...isolatedConfig.skills, activeVersion: skillVersion, tuningDisabled: true };
       const result = await evaluate({ instanceRoot: isolatedRoot, config: isolatedConfig,
         sourceInstanceRoot: root, projectId, run, arm, skillVersion });
