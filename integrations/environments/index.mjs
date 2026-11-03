@@ -80,9 +80,8 @@ os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
 sys.exit(code if code>=0 else 128-code)
 `;
 
-const synchronize = `import json, os, shutil, sys
+const synchronize = `import errno, json, os, shutil, sys
 c=json.loads(sys.argv[1]); os.makedirs(c['project'],exist_ok=True)
-shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True)
 manifest=c['project']+'/.environment-source-files.json'
 try:
  with open(manifest) as f: previous=json.load(f)
@@ -90,6 +89,17 @@ except FileNotFoundError: previous=[]
 for name in set(previous)-set(c['files']):
  try: os.unlink(c['project']+'/'+name)
  except FileNotFoundError: pass
+parents=set()
+for name in previous:
+ parent=os.path.dirname(name)
+ while parent: parents.add(parent); parent=os.path.dirname(parent)
+for name in sorted(parents,key=lambda p:p.count('/'),reverse=True):
+ try: os.rmdir(c['project']+'/'+name)
+ except OSError as error:
+  if error.errno==errno.ENOENT: continue
+  if error.errno in (errno.ENOTEMPTY,errno.EEXIST) and name not in c['files']: continue
+  raise
+shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True)
 with open(manifest,'w') as f: json.dump(c['files'],f)
 `;
 
@@ -402,10 +412,3 @@ export async function createEnvironmentTools(environment, cwd, sdk) {
   } } })];
 }
 
-export function createExtension(options, context) {
-  return async pi => {
-    const environment = await createEnvironment(options, context);
-    for (const tool of await createEnvironmentTools(environment, options.cwd)) pi.registerTool(tool);
-    pi.on('before_agent_start', async event => ({ systemPrompt: `${event.systemPrompt}\n${environment.instructions}` }));
-  };
-}

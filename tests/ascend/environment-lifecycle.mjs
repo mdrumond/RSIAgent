@@ -150,6 +150,7 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const project = join(instancePath, 'source'), workspace = join(instancePath, 'remote');
   await mkdir(project); await mkdir(workspace);
   await writeFile(join(project, 'old.py'), 'old');
+  await writeFile(join(project, 'layout-node'), 'old file');
   const jobs = new Map(); let sequence = 0, loseObserver = false;
   const context = { instancePath, sdk, event: async () => {}, exclude: async (label, fn) => {
     assert.ok(['setup','transfer'].includes(label)); return fn();
@@ -176,10 +177,16 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   await environment.prepare({ project: { id: 'p', sourceDirectory: project }, attempt: { id: 'a' } });
   assert.equal((await environment.execute('printf built > build.marker', project)).exitCode, 0);
   await rm(join(project, 'old.py'));
+  await rm(join(project, 'layout-node')); await mkdir(join(project, 'layout-node'));
+  await writeFile(join(project, 'layout-node', 'nested.py'), 'new directory');
   await writeFile(join(project, 'new.py'), "from pathlib import Path\nassert not Path('old.py').exists()\nprint(Path('build.marker').read_text())\n");
   let output = '';
   assert.equal((await environment.execute('python3 new.py', project, { onData: data => { output += data; } })).exitCode, 0);
   assert.equal(output, 'built\n');
+  assert.equal((await environment.execute("python3 -c \"from pathlib import Path; assert Path('layout-node/nested.py').read_text() == 'new directory'; assert Path('build.marker').read_text() == 'built'\"", project)).exitCode, 0);
+  await rm(join(project, 'layout-node', 'nested.py')); await rm(join(project, 'layout-node'), { recursive: true });
+  await writeFile(join(project, 'layout-node'), 'new file');
+  assert.equal((await environment.execute("python3 -c \"from pathlib import Path; assert Path('layout-node').read_text() == 'new file'; assert Path('build.marker').read_text() == 'built'\"", project)).exitCode, 0);
   // The caller disappears after dispatch; workload timeout still closes the child.
   loseObserver = true;
   const timeoutJob = await environment.execute("python3 -c 'import time; time.sleep(30)'", project, { timeout: 0.1 });
