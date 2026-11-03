@@ -50,12 +50,18 @@ test('actual Pi readonly KDB lookup and validated publisher repair a rejected pr
   const port = socket.address().port;
   await new Promise(resolve => socket.close(resolve));
   const service = spawn(python, ['-m', 'ascend_tools.kdb_service', '--db', join(root, 'knowledge.sqlite'),
-    '--port', String(port), '--embedding-factory', 'kdb_fixture:Embeddings'], { env, stdio: 'ignore' });
-  t.after(async () => { if (service.exitCode === null) {
+    '--port', String(port), '--embedding-factory', 'kdb_fixture:Embeddings'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '', startupError;
+  service.stderr.on('data', data => { stderr = (stderr + data).slice(-3000); });
+  service.once('error', error => { startupError = error; });
+  t.after(async () => { if (service.pid && service.exitCode === null && service.signalCode === null) {
     const { once } = await import('node:events'); const closed = once(service, 'exit'); service.kill(); await closed;
   } });
   const deadline = Date.now() + 5000;
   while (true) {
+    if (startupError) throw startupError;
+    if (service.exitCode !== null || service.signalCode !== null)
+      throw new Error(`KDB service exited (${service.exitCode ?? service.signalCode}): ${stderr}`);
     try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {}
     if (Date.now() > deadline) throw new Error('KDB readiness deadline');
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -133,4 +139,18 @@ test('external stop aborts native session, rejects submission and preserves part
   assert.equal((await load(join(root, 'stopped', 'responses.json'))).length, 1);
   await assert.rejects(generateCandidate({ directory: join(root, 'never-started'), input: {}, native,
     signal: controller.signal }), { name: 'AbortError' });
+});
+
+test('elapsed expiry during extension binding cannot start a later prompt', async t => {
+  const root = await fixture(t), { native, flags } = nativeWriter();
+  const create = native.createAgentSession; let prompts = 0;
+  native.createAgentSession = async options => {
+    const result = await create(options);
+    result.session.bindExtensions = async () => new Promise(resolve => setTimeout(resolve, 150));
+    result.session.prompt = async () => { prompts++; };
+    return result;
+  };
+  await assert.rejects(generateCandidate({ directory: join(root, 'binding'), input: {}, native,
+    seconds: 0.1 }), /elapsed allocation/);
+  assert.equal(prompts, 0); assert.ok(flags.aborted && flags.disposed);
 });
