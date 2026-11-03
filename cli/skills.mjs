@@ -64,6 +64,7 @@ export async function run(config, values = {}) {
       return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension] });
     };
     const evaluate = async request => {
+      request.resource = values.resource;
       const runtime = values.runtime ?? await import(config.skills?.runtimeModule
         ? pathToFileURL(resolve(instanceRoot, config.skills.runtimeModule)).href
         : new URL('./evaluation.mjs', import.meta.url).href);

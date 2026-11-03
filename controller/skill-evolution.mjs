@@ -22,12 +22,14 @@ const compactTask = task => ({ id: task.id, projectId: task.projectId, kind: tas
   phase: task.phase, completed: task.completed, outcome: task.outcome,
   events: (task.events ?? []).filter(event => usageTypes.has(event.type)) });
 
-export function cadenceDecision(history, task, lastEvaluated = 0) {
+export function cadenceDecision(history, task, lastEvaluated = 0, every = 8, pruneAfterTasks = 24) {
+  if (![every, pruneAfterTasks].every(value => Number.isInteger(value) && value > 0))
+    throw new Error('Skill cadence and pruning thresholds must be positive integers');
   if (!completed(task) || history.some(x => x.id === task.id)) return { analyse: false, evaluate: false };
   const counted = originals([...history, task]);
   const projects = new Set(counted.map(x => x.projectId)).size;
-  return { analyse: true, evaluate: task.kind === 'original' && projects - lastEvaluated >= 8, projects,
-    allowPruning: new Set(counted.map(x => x.id)).size >= 24 };
+  return { analyse: true, evaluate: task.kind === 'original' && projects - lastEvaluated >= every, projects,
+    allowPruning: new Set(counted.map(x => x.id)).size >= pruneAfterTasks };
 }
 
 // Recovery must never override an active user edit with an older candidate.
@@ -75,7 +77,7 @@ export function applyProposal(current, changes, { allowPruning, history }) {
       if (old.negative || (old.critical && !contradicted)) throw new Error('Protected guidance');
       const used = history.some(task => task.events.some(event => event.type === 'skill-read' &&
         event.data?.stage === old.scope));
-      if (!contradicted && (!allowPruning || used)) throw new Error('Pruning requires 24 originals and unused guidance');
+      if (!contradicted && (!allowPruning || used)) throw new Error('Pruning requires enough distinct originals and unused guidance');
     }
     if (change.action === 'remove') entries.delete(change.id);
     else {
@@ -154,7 +156,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     state.candidate = null; state.pending = null; state.candidateBase = current.skills.activeVersion;
     await save(statePath, state, signal);
   }
-  const decision = cadenceDecision(state.history, task, state.lastEvaluated);
+  const every = current.tune_every ?? 8, pruneAfterTasks = current.skills?.pruneAfterTasks ?? 24;
+  const decision = cadenceDecision(state.history, task, state.lastEvaluated, every, pruneAfterTasks);
   if (!decision.analyse && !manual && !state.pending) return decision;
   if (task?.phase === 'phase1') return { analyse: false, evaluate: false };
   if (!state.pending) {
@@ -164,8 +167,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const history = (manual ? state.history : [...state.history, entry]).map(compactTask);
     const counted = originals(history);
     const projectIds = current.skills?.tuningProjectIds ?? [...new Set(counted.map(x => x.projectId))].sort().slice(0, 2);
-    const shouldEvaluate = Boolean(decision.evaluate || (manual &&
-      (current.skills?.tuningProjectIds !== undefined || projectIds.length >= 2)));
+    const shouldEvaluate = Boolean((decision.evaluate || manual) &&
+      (current.skills?.tuningProjectIds !== undefined || projectIds.length >= 2));
     const active = current.skills?.activeVersion;
     if (!/^[a-zA-Z0-9-]+$/.test(active ?? '')) throw new Error('Instance requires an active skill version');
     const source = join(directory, 'versions', state.candidate ?? active);
@@ -174,10 +177,10 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     await mkdir(proposalRoot, { recursive: true });
     await save(join(proposalRoot, 'evidence.json'), rawEntry);
     const validate = changes => applyProposal(entries, changes, {
-      allowPruning: new Set(counted.map(x => x.id)).size >= 24,
+      allowPruning: new Set(counted.map(x => x.id)).size >= pruneAfterTasks,
       history: manual ? [...history, entry] : history });
     signal?.throwIfAborted();
-    const changes = await generate({ directory: proposalRoot, input: { entries, history, originalCount: new Set(counted.map(x => x.id)).size, userinfo, context: { ...entry, userinfo },
+    const changes = await generate({ directory: proposalRoot, input: { entries, history, pruneAfterTasks, originalCount: new Set(counted.map(x => x.id)).size, userinfo, context: { ...entry, userinfo },
       actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
       validate, native, modelRuntime, model, signal, seconds: current.skill_writer_seconds ?? 240 });
     signal?.throwIfAborted();
@@ -215,7 +218,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       isolatedConfig.mode = mode;
       isolatedConfig.skills = { ...isolatedConfig.skills, activeVersion: skillVersion, tuningDisabled: true };
       const result = await evaluate({ instanceRoot: isolatedRoot, config: isolatedConfig,
-        sourceInstanceRoot: root, projectId, run, arm, skillVersion, signal });
+        sourceInstanceRoot: root, projectId, projectIds: ids, run, arm, skillVersion, signal });
       results.push({ ...result, projectId, run, arm, instanceRoot: isolatedRoot });
       await save(join(evaluationRoot, 'results.json'), results);
     }

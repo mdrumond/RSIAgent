@@ -138,9 +138,10 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
   const pending = await load(join(root, 'skills', 'evolution.json'));
   pending.pending.candidate = 'candidate';
   await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify(pending));
-  const calls = [], controller = new AbortController();
+  const calls = [], controller = new AbortController(), resource = { id: 'opaque-lease' };
   const runtime = {
-    async bootstrap(request) { assert.equal(request.signal, controller.signal); calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
+    async bootstrap(request) { assert.equal(request.signal, controller.signal); assert.equal(request.resource, resource);
+      assert.deepEqual(request.projectIds, config.skills.tuningProjectIds); calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
     async wave(request) {
       calls.push(['wave', request.instanceRoot]);
       assert.deepEqual(request.projectIds.length, 1);
@@ -150,7 +151,7 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
       return { correct: true, score: 1 };
     }
   };
-  const result = await lockedRun({ ...config, root }, { runtime, signal: controller.signal });
+  const result = await lockedRun({ ...config, root }, { runtime, signal: controller.signal, resource });
   assert.equal(result.promote, false);
   assert.equal(calls.length, 16);
   for (let i = 0; i < calls.length; i += 2) {
@@ -352,4 +353,22 @@ test('authoritative user edit supersedes pending candidate without deleting evid
   const after = await load(join(root, 'skills', 'evolution.json'));
   assert.equal(after.candidateBase, 'user-edit');
   assert.equal(candidateVersion(after, 'user-edit'), updated.candidate);
+});
+
+test('configured two-original cadence evaluates earlier than default eight with validated thresholds', async t => {
+  assert.equal(cadenceDecision(history(1), task(1)).evaluate, false);
+  assert.equal(cadenceDecision(history(1), task(1), 0, 2).evaluate, true);
+  assert.equal(cadenceDecision(history(1), task(1), 0, 2, 2).allowPruning, true);
+  for (const invalid of [0, -1, 1.5, '2']) assert.throws(() => cadenceDecision([], task(0), 0, invalid));
+  const root = await fixture(t), current = { ...config, tune_every: 2,
+    skills: { activeVersion: 'baseline', pruneAfterTasks: 4 } };
+  await writeFile(join(root, 'instance.json'), JSON.stringify(current));
+  let arms = 0;
+  for (let i = 0; i < 2; i++) {
+    await tune({ instanceRoot: root, config: current, task: task(i),
+      generate: async ({ input }) => { assert.equal(input.pruneAfterTasks, 4); return []; },
+      evaluate: async () => { arms++; return { correct: true, score: 1 }; } });
+    assert.equal(arms, i ? 8 : 0);
+  }
+  assert.equal((await load(join(root, 'skills', 'evolution.json'))).lastEvaluated, 2);
 });
