@@ -81,7 +81,8 @@ sys.exit(code if code>=0 else 128-code)
 `;
 
 const synchronize = `import errno, json, os, shutil, sys
-c=json.loads(sys.argv[1]); os.makedirs(c['project'],exist_ok=True)
+with open(sys.argv[1]) as manifest_input: c=json.load(manifest_input)
+os.makedirs(c['project'],exist_ok=True)
 manifest=c['project']+'/.environment-source-files.json'
 try:
  with open(manifest) as f: previous=json.load(f)
@@ -284,8 +285,12 @@ export async function createEnvironment(options, context) {
     await copy('transfer', async () => {
       await transfer(['upload', options.target, projectRoot, incoming], dir);
       const configuration = { incoming: posix.join(options.workspacePath, incoming), project: posix.join(options.workspacePath, destination), files };
+      const manifestDir = await mkdtemp(join(root, 'manifest-'));
+      const manifest = join(manifestDir, 'sync.json'), remoteManifest = posix.join(runRoot, 'sync.json');
+      await writeFile(manifest, JSON.stringify(configuration), { mode: 0o600 });
+      await transfer(['upload', options.target, manifest, remoteManifest], manifestDir);
       const script = join(dir, 'sync.sh');
-      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
+      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, remoteManifest))}\n`, { mode: 0o600 });
       const args = ['run', options.target, '--file', script, '--receipt-file', join(dir, 'sync-submission.json')];
       if (options.runtime) args.push('--runtime', options.runtime);
       const submitted = await submit(args, join(dir, 'sync-submission.json'), false, true);
