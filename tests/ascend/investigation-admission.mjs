@@ -9,6 +9,7 @@ import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {investigate,summarize} from '../../cli/curriculum.mjs';
+import {findingsFor} from '../../cli/findings.mjs';
 
 async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'investigation-admission-'));
@@ -75,4 +76,20 @@ test('native summary rejects directory evidence then accepts a real file without
   assert.equal(result.useful,false);
   assert.deepEqual(result.evidence,[{path:join(f.path,'evidence.log'),sha256:createHash('sha256').update(text).digest('hex')}]);
   assert.equal(await readFile(join(f.path,'evidence.log'),'utf8'),text);
+});
+
+
+test('pre-actor failure has readable diagnostics before native summary repairs directory evidence',{timeout:15000},async t=>{
+  const record={findings:'Missing verifier prevented actor startup; no experiment ran.',useful:false,paths:['.']};
+  const f=await fixture(t,[['record_findings',record],['read',{path:'diagnostics.json'}],['record_findings',{...record,paths:['diagnostics.json']}]]);
+  const failure={type:'attempt-error',data:{message:'ENOENT missing verifier',stage:'worker'}};
+  f.options.state={events:()=>[failure],attempt:()=>({session:null})};
+  const result=await findingsFor({...f.options,passed:false});
+  assert.match(f.results()[0].content,/regular file/);
+  assert.deepEqual(JSON.parse(f.results()[1].content),[failure]);
+  assert.equal(f.results()[2].content,'Recorded');
+  assert.equal(result.useful,false);
+  assert.equal(result.evidence[0].path,join(f.path,'diagnostics.json'));
+  assert.equal(result.evidence[0].sha256,createHash('sha256').update(await readFile(result.evidence[0].path)).digest('hex'));
+  assert.deepEqual(JSON.parse(await readFile(join(f.path,'findings.json'),'utf8')),result);
 });

@@ -70,7 +70,7 @@ export async function summarize({config,job,path,state,bridge,passed,signal}) {
     `Frozen verifier passed: ${passed}. Summarize actual findings and failures as compact reusable memory. `+
     `For an investigation, useful=true ONLY when new observed evidence addresses the original gap, even if the investigation failed. `+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.attempt.id,30))}\n`+
-    `Read the recorded native session and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
+    `Controller diagnostic snapshot: ${join(path,'diagnostics.json')}. Read the recorded native session when present and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
     tool:{name:'record_findings',label:'Record findings',description:'Record evidence-based findings and usefulness.',
       parameters:Type.Object({findings:Type.String({minLength:1,maxLength:4000}),useful:Type.Boolean(),
         paths:Type.Array(Type.String(),{minItems:1,maxItems:16})}),
