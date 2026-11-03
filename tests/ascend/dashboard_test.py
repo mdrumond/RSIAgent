@@ -179,7 +179,7 @@ const fetch = async (url, options) => {
   elements.get('baseline').value = '/baseline/new database.sqlite';
   elements.get('settings').onsubmit({preventDefault() {}});
   await tick();
-  elements.get('path').value = '/workspace';
+  document.getElementById('path').value = '/workspace';
   elements.get('browse').onsubmit({preventDefault() {}});
   await tick();
   await elements.get('folders').children[0].onclick();
