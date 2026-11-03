@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,mkdir,writeFile,rm,stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdtemp,mkdir,writeFile,rm,stat,cp } from 'node:fs/promises';
+import { join,relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -27,8 +27,11 @@ for(const mode of ['absolute','relative'])test(`performance project import: ${mo
     assert.equal(imported.performance_goal,spec.performance_goal);
     assert.equal(imported.goal,spec.goal);
     await rm(original,{recursive:true});
+    const relocated=join(root,'relocated');await cp(instance,relocated,{recursive:true});
+    await rm(instance,{recursive:true});
+    const relocatedSource=join(relocated,relative(instance,imported.source));
     for(const check of ['command','performance_command']) {
-      const result=await promisify(execFile)('bash',['-c',imported.verifier[check]],{cwd:imported.source});
+      const result=await promisify(execFile)('bash',['-c',imported.verifier[check]],{cwd:relocatedSource});
       assert.equal(Number(result.stdout.trim()),42);
     }
   }finally{await rm(root,{recursive:true,force:true});}
