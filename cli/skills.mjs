@@ -1,6 +1,7 @@
-import { readFile, access } from 'node:fs/promises';
+import { readFile, access, appendFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { tune } from '../controller/skill-evolution.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
@@ -42,7 +43,13 @@ export async function run(config, values = {}) {
       ({ modelRuntime, model } = await modelFromProfile(profile));
     }
     const { generateCandidate } = await import('../controller/skill-evolution.mjs');
-    return generateCandidate({ ...options, modelRuntime, model });
+    const { ensureKnowledgeService } = values.knowledge ?? await import('./knowledge.mjs');
+    const { createKdbBridge } = values.knowledge ?? await import('../integrations/kdb-extension.mjs');
+    const url = await ensureKnowledgeService(config);
+    const bridge = createKdbBridge({ url, attemptId: task?.id ?? `manual-${randomUUID()}`,
+      agentDir: join(options.directory, 'agent'), event: async (type, data) =>
+        appendFile(join(options.directory, 'knowledge-events.jsonl'), JSON.stringify({ type, data }) + '\n') });
+    return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension] });
   };
   const evaluate = async request => {
     const runtime = values.runtime ?? await import(config.skills?.runtimeModule

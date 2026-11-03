@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile, rename, cp } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, cp, appendFile } from 'node:fs/promises';
 import { join, resolve, relative, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { stages } from './workflow.mjs';
+import { Type } from 'typebox';
 
 const scopes = ['global-kdb', ...stages];
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
@@ -11,16 +12,21 @@ const save = async (path, value) => {
   await writeFile(tmp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
   await rename(tmp, path);
 };
-const original = task => task?.kind === 'original' && task.completed === true &&
-  ['phase2', 'inference'].includes(task.phase) && task.id && task.projectId;
+const completed = task => task?.completed === true && task.id && task.projectId &&
+  ['phase2', 'inference'].includes(task.phase);
+const originals = history => history.filter(task => completed(task) && task.kind === 'original');
+const usageTypes = new Set(['skill-read', 'knowledge-retrieved', 'guidance-contradicted',
+  'verification', 'stage-completed', 'attempt-error', 'rejected', 'accepted']);
+const compactTask = task => ({ id: task.id, projectId: task.projectId, kind: task.kind,
+  phase: task.phase, completed: task.completed, outcome: task.outcome,
+  events: (task.events ?? []).filter(event => usageTypes.has(event.type)) });
 
-// History contains only completed originals; retries/diagnostics cannot advance cadence.
 export function cadenceDecision(history, task, lastEvaluated = 0) {
-  if (!original(task) || history.some(x => x.id === task.id))
-    return { analyse: false, evaluate: false };
-  const projects = new Set([...history, task].map(x => x.projectId)).size;
-  return { analyse: true, evaluate: projects - lastEvaluated >= 8, projects,
-    allowPruning: new Set([...history, task].map(x => x.id)).size >= 24 };
+  if (!completed(task) || history.some(x => x.id === task.id)) return { analyse: false, evaluate: false };
+  const counted = originals([...history, task]);
+  const projects = new Set(counted.map(x => x.projectId)).size;
+  return { analyse: true, evaluate: task.kind === 'original' && projects - lastEvaluated >= 8, projects,
+    allowPruning: new Set(counted.map(x => x.id)).size >= 24 };
 }
 
 // Correctness improvements precede timing; every candidate correctness result must pass.
@@ -80,31 +86,49 @@ export function applyProposal(current, changes, { allowPruning, history }) {
   return [...entries.values()];
 }
 
-// One native Pi turn; SDK owns tools, context, provider retry, and native session persistence.
-export async function generateCandidate({ directory, input, modelRuntime, model, native, seconds = 240 }) {
+// Native Pi owns tool turns, correction, context, retry and compaction.
+export async function generateCandidate({ directory, input, modelRuntime, model, native,
+  seconds = 240, extensions = [], validate = () => {} }) {
   if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Writer elapsed seconds must be positive');
   const started = performance.now();
   const sdk = native ?? await import('@earendil-works/pi-coding-agent');
   await mkdir(directory, { recursive: true });
+  await save(join(directory, 'current-guidance.json'), input.entries ?? []);
+  await save(join(directory, 'current-usage.json'), { context: input.context, userinfo: input.userinfo,
+    actualEvents: input.actualEvents, originals: originals(input.history ?? []).length });
+  await writeFile(join(directory, 'usage-history.jsonl'), (input.history ?? []).map(x => JSON.stringify(x)).join('\n'));
   const agentDir = join(directory, 'agent');
   await mkdir(agentDir, { recursive: true });
   const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true } });
   const manager = sdk.SessionManager.create(directory, directory);
+  let submitted;
+  const id = Type.String({ pattern: '^[a-z0-9-]+$' });
+  const contradiction = { contradictoryEvidence: Type.Optional(Type.Array(Type.String())) };
+  const parameters = Type.Object({ changes: Type.Array(Type.Union([
+    Type.Object({ action: Type.Literal('remove'), id, ...contradiction }),
+    Type.Object({ action: Type.Literal('upsert'), id, scope: Type.Union(scopes.map(scope => Type.Literal(scope))),
+      text: Type.String({ minLength: 1 }), critical: Type.Boolean(), negative: Type.Boolean(), ...contradiction })
+  ])) });
+  const extension = pi => {
+    pi.registerTool({ name: 'submit_changes', label: 'Submit skill changes',
+      description: 'Validate and submit candidate guidance. Correct any rejection using the returned reason.',
+      parameters, execute: async (_id, { changes }) => {
+        await validate(changes);
+        submitted = changes;
+        return { content: [{ type: 'text', text: 'Candidate changes accepted.' }], details: {} };
+      } });
+    for (const type of ['before_provider_request', 'provider_stream_event'])
+      pi.on(type, async payload => appendFile(join(directory, 'provider.jsonl'), JSON.stringify(payload) + '\n'));
+  };
   const loader = new sdk.DefaultResourceLoader({ cwd: directory, agentDir, settingsManager,
-    noExtensions: true, noSkills: true, noContextFiles: true,
-    extensionFactories: [pi => {
-      for (const type of ['before_provider_request', 'provider_stream_event'])
-        pi.on(type, async payload => {
-          const { appendFile } = await import('node:fs/promises');
-          await appendFile(join(directory, 'provider.jsonl'), JSON.stringify(payload) + '\n');
-        });
-    }] });
+    noExtensions: true, noSkills: true, noContextFiles: true, extensionFactories: [extension, ...extensions] });
   await loader.reload();
   const { session } = await sdk.createAgentSession({ cwd: directory, agentDir, settingsManager, modelRuntime, model,
-    tools: [], sessionManager: manager, resourceLoader: loader });
+    tools: ['read', 'grep', 'find', 'ls', 'submit_changes', 'mcp__kdb__search', 'mcp__kdb__read_entry'],
+    sessionManager: manager, resourceLoader: loader });
   const responses = [];
   const unsubscribe = session.subscribe(event => {
-    if (event.type === 'message_end' && event.message.role === 'assistant') responses.push(event.message);
+    if (event.type === 'message_end') responses.push(event.message);
   });
   let timer, expired = false;
   try {
@@ -112,24 +136,24 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
     if (remaining <= 0) throw new Error('Writer elapsed allocation exhausted');
     timer = setTimeout(() => { expired = true; void session.abort().catch(() => {}); }, remaining);
     await session.bindExtensions({});
-    await session.prompt(`Propose English Ascend workflow guidance changes as JSON {"changes":[]} only.
-Prioritize error avoidance, detection and recovery before performance. Retain negative lessons.
-Use actual KDB retrieval and skill-read events as evidence, never inferred tool use.
-Do not remove critical guidance without contradictory evidence; unused guidance requires 24 distinct originals.
-Each change: action upsert/remove, id, scope, text, critical boolean, negative boolean,
-optional contradictoryEvidence (references to recorded guidance-contradicted events).
-Existing entries and original-task evidence:\n${JSON.stringify(input)}`);
+    await session.prompt(`Read current-guidance.json and current-usage.json with native read tools.
+Use usage-history.jsonl only for relevant prior usage. Resolve cited collection/entry_id with mcp__kdb__read_entry
+and search positive/negative evidence with mcp__kdb__search; indexed source files may be absent.
+Propose English guidance prioritizing error avoidance, detection and recovery before performance. Retain negatives.
+Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning needs 24 distinct originals.
+Submit via submit_changes; correct any rejection. A final text response does not publish changes.`);
     await session.waitForIdle();
     if (expired) throw new Error('Writer elapsed allocation exhausted');
-    const last = responses.at(-1);
-    if (!last || last.stopReason === 'error') throw new Error('Native candidate generation failed');
-    const text = last.content.filter(x => x.type === 'text').map(x => x.text).join('\n');
-    return JSON.parse(text).changes;
+    if (!submitted) throw new Error('Native writer did not submit validated changes');
+    return submitted;
   } finally {
     clearTimeout(timer);
-    await save(join(directory, 'responses.json'), responses);
-    unsubscribe?.();
-    session.dispose();
+    try {
+      await save(join(directory, 'responses.json'), responses);
+      const messages = manager.getEntries?.().filter(entry => entry.type === 'message').map(entry => entry.message) ?? responses;
+      await writeFile(join(directory, 'sft.native.jsonl'), messages.map(x => JSON.stringify(x)).join('\n'));
+      await session.extensionRunner?.emit({ type: 'session_shutdown', reason: 'quit' });
+    } finally { unsubscribe?.(); session.dispose(); }
   }
 }
 
@@ -194,9 +218,11 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (task?.phase === 'phase1') return { analyse: false, evaluate: false };
   if (!state.pending) {
     const events = (manual ? context.events : task?.events) ?? [];
-    const entry = manual ? { ...context, userinfo, manual: true, events } : { ...task, events };
-    const history = manual ? state.history : [...state.history, entry];
-    const projectIds = current.skills?.tuningProjectIds ?? [...new Set(history.map(x => x.projectId))].sort().slice(0, 2);
+    const rawEntry = manual ? { ...context, userinfo, manual: true, events } : { ...task, events };
+    const entry = compactTask(rawEntry);
+    const history = (manual ? state.history : [...state.history, entry]).map(compactTask);
+    const counted = originals(history);
+    const projectIds = current.skills?.tuningProjectIds ?? [...new Set(counted.map(x => x.projectId))].sort().slice(0, 2);
     const shouldEvaluate = Boolean(decision.evaluate || (manual &&
       (current.skills?.tuningProjectIds !== undefined || projectIds.length >= 2)));
     const active = current.skills?.activeVersion;
@@ -205,16 +231,18 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const entries = await readEntries(source);
     const proposalRoot = join(directory, 'proposals', randomUUID());
     await mkdir(proposalRoot, { recursive: true });
-    await save(join(proposalRoot, 'evidence.json'), entry);
-    const changes = await generate({ directory: proposalRoot, input: { entries, history, userinfo, context: entry,
-      actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
-      native, modelRuntime, model, seconds: current.skill_writer_seconds ?? 240 });
-    if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
-    const updated = applyProposal(entries, changes, { allowPruning: new Set(history.map(x => x.id)).size >= 24,
+    await save(join(proposalRoot, 'evidence.json'), rawEntry);
+    const validate = changes => applyProposal(entries, changes, {
+      allowPruning: new Set(counted.map(x => x.id)).size >= 24,
       history: manual ? [...history, entry] : history });
+    const changes = await generate({ directory: proposalRoot, input: { entries, history, userinfo, context: { ...entry, userinfo },
+      actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
+      validate, native, modelRuntime, model, seconds: current.skill_writer_seconds ?? 240 });
+    if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
+    const updated = validate(changes);
     const candidate = await writeVersion(root, updated, source);
     state.history = history;
-    state.pending = shouldEvaluate ? { active, candidate, projects: new Set(history.map(x => x.projectId)).size,
+    state.pending = shouldEvaluate ? { active, candidate, projects: new Set(counted.map(x => x.projectId)).size,
       projectIds, proposalRoot, manual } : null;
     state.candidate = candidate;
     await save(statePath, state);
@@ -222,7 +250,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   }
   if (typeof evaluate !== 'function') throw new Error('Canonical evaluator required');
   const ids = state.pending.projectIds ?? current.skills?.tuningProjectIds ??
-    [...new Set(state.history.map(x => x.projectId))].sort().slice(0, 2);
+    [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2);
   const runs = current.skills?.runsPerArm ?? 2;
   evaluateDecision([], ids, runs); // Validate design before executing any wave.
   const pending = state.pending;
