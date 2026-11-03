@@ -11,7 +11,7 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true}) {
   await mkdir(attemptPath,{recursive:true});
   const event=(type,data)=>state.event(attempt.id,type,data);
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
@@ -131,7 +131,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
     if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});
-    state.finish(attempt.id,accepted?'passed':'failed');
+    state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
     event('attempt-error',{message:error.message,stage:workflow.stage});

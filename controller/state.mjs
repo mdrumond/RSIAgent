@@ -60,14 +60,14 @@ export class State {
     return this.db.prepare('SELECT type,data FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
       .map(row=>({type:row.type,data:JSON.parse(row.data)}));
   }
-  finish(id, outcome) {
+  finish(id, outcome, {settleProject=true}={}) {
     if (!['passed','failed'].includes(outcome)) throw new Error('Invalid outcome');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const attempt = this.attempt(id);
       if (!attempt || attempt.outcome) throw new Error('Attempt already closed');
       this.db.prepare('UPDATE attempts SET outcome=? WHERE id=?').run(outcome,id);
-      this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome,attempt.project);
+      if(settleProject)this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome,attempt.project);
       this.db.exec('COMMIT');
     } catch(error) { this.db.exec('ROLLBACK'); throw error; }
   }
