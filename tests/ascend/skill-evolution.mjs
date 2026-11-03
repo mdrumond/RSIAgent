@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cadenceDecision, evaluateDecision, applyProposal, generateCandidate, tune } from '../../controller/skill-evolution.mjs';
+import { cadenceDecision, evaluateDecision, applyProposal, tune } from '../../controller/skill-evolution.mjs';
 import { run } from '../../cli/skills.mjs';
+import { nativeWriter } from './skill-proposal-fixture.mjs';
 
 const task = (n, extra = {}) => ({ id: `original-${n}`, projectId: `project-${n}`,
   kind: 'original', phase: 'phase2', completed: true,
@@ -81,16 +82,6 @@ test('negative retention and evidence-gated critical pruning are enforced', () =
   assert.deepEqual(applyProposal([ordinary], remove, options), []);
 });
 
-test('native publisher injection reads saved evidence and disposes its session', async t => {
-  const root = await fixture(t);
-  let observed;
-  const { native, flags } = nativeWriter(input => { observed = input; });
-  assert.deepEqual(await generateCandidate({ directory: join(root, 'proposal'),
-    input: { entries: [guidance], actualEvents: task(0).events }, native }), []);
-  assert.equal(observed.actualEvents.length, 1);
-  assert.ok(flags.disposed);
-  assert.equal((await load(join(root, 'proposal', 'responses.json'))).length, 1);
-});
 
 test('eight originals evaluate in isolated arms, preserve evidence and promote only passing candidate', async t => {
   const root = await fixture(t);
@@ -133,93 +124,6 @@ test('Phase1 CLI does not access action files, runtime or actor profile', async 
   assert.equal((await run({ mode: 'phase1' }, { config: '/absent' })).analyse, false);
 });
 
-test('actual Pi readonly KDB lookup and validated publisher repair a rejected proposal', { timeout: 20000 }, async t => {
-  const sdk = await import('@earendil-works/pi-coding-agent');
-  const { InMemoryCredentialStore } = await import('@earendil-works/pi-ai');
-  const { createServer } = await import('node:http');
-  const { spawn, execFileSync } = await import('node:child_process');
-  const { resolve } = await import('node:path');
-  const root = await fixture(t);
-  const source = process.env.RSI_KDB_TEST_ROOT ?? resolve('.');
-  const python = process.env.RSI_KDB_TEST_PYTHON ?? 'python3.12';
-  const env = { ...process.env, PYTHONPATH: [source, join(source, 'tests', 'ascend')].join(':') };
-  const evidenceText = `observed-${Date.now()} cancellation failure`;
-  const evidenceFile = join(root, 'reference.md');
-  await writeFile(evidenceFile, evidenceText);
-  const seed = JSON.parse(execFileSync(python, ['-c',
-    "from ascend_tools.kdb import KDB;from kdb_fixture import Embeddings;import sys,json;d=KDB(sys.argv[1],Embeddings());d.add_repo(sys.argv[2],'baseline','a3',paths=['reference.md']);print(json.dumps(d.search('cancellation')[0]));d.close()",
-    join(root, 'knowledge.sqlite'), root], { env, encoding: 'utf8' }));
-  await rm(evidenceFile);
-  const { createServer: createSocket } = await import('node:net');
-  const socket = createSocket();
-  await new Promise(resolve => socket.listen(0, '127.0.0.1', resolve));
-  const port = socket.address().port;
-  await new Promise(resolve => socket.close(resolve));
-  const service = spawn(python, ['-m', 'ascend_tools.kdb_service', '--db', join(root, 'knowledge.sqlite'),
-    '--port', String(port), '--embedding-factory', 'kdb_fixture:Embeddings'], { env, stdio: 'ignore' });
-  t.after(async () => { if (service.exitCode === null) {
-    const { once } = await import('node:events'); const closed = once(service, 'exit'); service.kill(); await closed;
-  } });
-  const deadline = Date.now() + 5000;
-  while (true) {
-    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {}
-    if (Date.now() > deadline) throw new Error('KDB readiness deadline');
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  const directory = join(root, 'native-proposal');
-  const proposal = [{ action: 'upsert', id: 'recovery', scope: 'debug', text: evidenceText,
-    critical: false, negative: true }];
-  const calls = [['read', { path: 'current-guidance.json' }], ['read', { path: 'current-usage.json' }],
-    ['mcp__kdb__read_entry', { collection: seed.collection, entry_id: seed.chunk_id }],
-    ['submit_changes', { changes: [{ action: 'remove', id: guidance.id }] }],
-    ['submit_changes', { changes: proposal }]];
-  let requests = 0;
-  const server = createServer(async (request, response) => {
-    let body = ''; for await (const chunk of request) body += chunk;
-    const input = JSON.parse(body);
-    const i = requests++;
-    assert.ok(!input.tools.some(tool => ['write', 'edit', 'bash', 'mcp__kdb__record_lesson'].includes(tool.function.name)));
-    const call = calls[i];
-    const delta = call ? { tool_calls: [{ index: 0, id: `tool-${i}`, type: 'function',
-      function: { name: call[0], arguments: JSON.stringify(call[1]) } }] } : { content: 'Done' };
-    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
-    const chunk = (delta, finish_reason = null) => 'data: ' + JSON.stringify({
-      id: `proposal-${i}`, object: 'chat.completion.chunk', created: 1, model: 'proposal',
-      choices: [{ index: 0, delta, finish_reason }] }) + '\n\n';
-    response.end(chunk(delta) + chunk({}, call ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n');
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
-  const modelRuntime = await sdk.ModelRuntime.create({ credentials: new InMemoryCredentialStore(),
-    modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
-  modelRuntime.registerProvider('skill-test', {
-    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: 'openai-completions',
-    models: [{ id: 'proposal', name: 'Proposal test', reasoning: false, input: ['text'],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 1024 }]
-  });
-  await modelRuntime.setRuntimeApiKey('skill-test', 'local-test-placeholder');
-  const extension = sdk.createMcpExtension({ loadConfig: () => ({ servers: [{ name: 'kdb',
-    source: join(directory, 'agent', 'mcp.json'), scope: 'extension', config: {
-      url: `http://127.0.0.1:${port}/mcp`, headers: { 'X-Attempt-Id': 'writer' }, exposure: 'direct'
-    } }], errors: [], autoEnableCodemode: false }), logPath: join(directory, 'mcp.log') });
-  const submitted = await generateCandidate({ directory, input: { entries: [guidance], history: [],
-    context: task(0), actualEvents: task(0).events }, modelRuntime,
-    model: modelRuntime.getModel('skill-test', 'proposal'), extensions: [extension],
-    validate: changes => applyProposal([guidance], changes, { allowPruning: false, history: [] }) });
-  assert.deepEqual(submitted, proposal);
-  assert.equal(requests, 6);
-  const messages = await load(join(directory, 'responses.json'));
-  const toolResults = messages.filter(message => message.role === 'toolResult');
-  assert.ok(toolResults.some(message => message.toolName === 'submit_changes' && message.isError));
-  const lookup = toolResults.find(message => message.toolName === 'mcp__kdb__read_entry');
-  assert.equal(JSON.parse(lookup.content[0].text).text, evidenceText);
-  assert.ok((await readFile(join(directory, 'sft.native.jsonl'), 'utf8')).length > 0);
-  assert.ok((await readFile(join(directory, 'provider.jsonl'), 'utf8')).length > 0);
-  const count = execFileSync(python, ['-c',
-    "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);print(c.execute(\"SELECT count(*) FROM knowledge_events WHERE operation='read_entry' AND attempt_id='writer'\").fetchone()[0])",
-    join(root, 'knowledge.sqlite')], { encoding: 'utf8' });
-  assert.equal(count.trim(), '1');
-});
 
 test('CLI uses instance.json and invokes bootstrap then canonical wave for each fresh arm', async t => {
   const root = await fixture(t);
@@ -266,35 +170,6 @@ test('CLI consumes action file task and requires an explicit writer profile', as
 
 const knowledgeStub = { async ensureKnowledgeService() { return 'http://127.0.0.1:8765/mcp'; },
   createKdbBridge() { return { extension: () => {} }; } };
-function nativeWriter(onInput = () => {}, hang = false) {
-  let listener, release, directory;
-  const tools = {};
-  const flags = { aborted: false, disposed: false };
-  return { flags, native: {
-    SettingsManager: { inMemory: () => ({}) }, SessionManager: { create: () => ({}) },
-    DefaultResourceLoader: class {
-      constructor(options) { this.options = options; directory = options.cwd; }
-      async reload() { for (const factory of this.options.extensionFactories)
-        await factory({ registerTool(tool) { tools[tool.name] = tool; }, on() {} }); }
-    },
-    createAgentSession: async options => {
-      assert.ok(!options.tools.includes('write') && !options.tools.includes('bash'));
-      return { session: {
-        subscribe(fn) { listener = fn; return () => {}; }, async bindExtensions() {},
-        async prompt() {
-          const current = await load(join(directory, 'current-usage.json'));
-          onInput({ ...current, entries: await load(join(directory, 'current-guidance.json')) });
-          if (hang) await new Promise(resolve => { release = resolve; });
-          else await tools.submit_changes.execute('submit', { changes: [] });
-          listener({ type: 'message_end', message: { role: 'assistant', content: [] } });
-        },
-        async waitForIdle() {}, async abort() { flags.aborted = true; release?.(); },
-        dispose() { flags.disposed = true; }
-      } };
-    }
-  } };
-}
-
 test('first CLI update needs no A/B configuration; cadence defaults to two stable originals', async t => {
   const root = await fixture(t);
   const current = { ...config, root, skills: { activeVersion: 'baseline' } };
@@ -370,14 +245,6 @@ test('Markdown baseline seeds protected entries and preserves original relative 
   assert.equal((await load(join(root, 'instance.json'))).skills.activeVersion, 'baseline');
 });
 
-test('native writer elapsed allocation aborts and retains response evidence', async t => {
-  const root = await fixture(t);
-  const { native, flags } = nativeWriter(() => {}, true);
-  await assert.rejects(generateCandidate({ directory: join(root, 'timed'), input: {}, native,
-    seconds: 0.02 }), /elapsed allocation/);
-  assert.ok(flags.aborted && flags.disposed);
-  assert.equal((await load(join(root, 'timed', 'responses.json'))).length, 1);
-});
 
 test('investigation and retry update candidate but only originals advance cadence; state drops Pi telemetry', async t => {
   const root = await fixture(t);
