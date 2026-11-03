@@ -22,7 +22,7 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   await mkdir(directory, { recursive: true });
   await save(join(directory, 'current-guidance.json'), input.entries ?? []);
   await save(join(directory, 'current-usage.json'), { context: input.context, userinfo: input.userinfo,
-    actualEvents: input.actualEvents, originals: input.originalCount ?? 0 });
+    actualEvents: input.actualEvents, originals: input.originalCount ?? 0, pruneAfterTasks: input.pruneAfterTasks ?? 24 });
   await writeFile(join(directory, 'usage-history.jsonl'), (input.history ?? []).map(x => JSON.stringify(x)).join('\n'));
   const agentDir = join(directory, 'agent');
   await mkdir(agentDir, { recursive: true });
@@ -68,12 +68,13 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
     if (remaining <= 0) throw new Error('Writer elapsed allocation exhausted');
     timer = setTimeout(() => { expired = true; void session.abort().catch(() => {}); }, remaining);
     await session.bindExtensions({});
+    if (expired) throw new Error('Writer elapsed allocation exhausted');
     signal?.throwIfAborted();
     await session.prompt(`Read current-guidance.json and current-usage.json with native read tools.
 Use usage-history.jsonl only for relevant prior usage. Resolve cited collection/entry_id with mcp__kdb__read_entry
 and search positive/negative evidence with mcp__kdb__search; indexed source files may be absent.
 Propose English guidance prioritizing error avoidance, detection and recovery before performance. Retain negatives.
-Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning needs 24 distinct originals.
+Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning must meet the original-task threshold in current-usage.json.
 Submit via submit_changes; correct any rejection. A final text response does not publish changes.`);
     await session.waitForIdle();
     signal?.throwIfAborted();
