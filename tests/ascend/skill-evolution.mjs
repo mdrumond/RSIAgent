@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cadenceDecision, evaluateDecision, applyProposal, tune } from '../../controller/skill-evolution.mjs';
+import { cadenceDecision, evaluateDecision, applyProposal, candidateVersion, tune } from '../../controller/skill-evolution.mjs';
 import { run } from '../../cli/skills.mjs';
 import { nativeWriter } from './skill-proposal-fixture.mjs';
 
@@ -131,7 +131,7 @@ test('Phase1 CLI does not access action files, runtime or actor profile', async 
 test('CLI uses instance.json and invokes bootstrap then canonical wave for each fresh arm', async t => {
   const root = await fixture(t);
   await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({
-    history: history(8), lastEvaluated: 0, candidate: 'baseline',
+    history: history(8), lastEvaluated: 0, candidate: 'baseline', candidateBase: 'baseline',
     pending: { active: 'baseline', candidate: 'baseline', projects: 8 }
   }));
   // Different immutable candidate prevents interrupted-promotion reconciliation.
@@ -326,4 +326,30 @@ test('stopped canonical bootstrap/wave retains partial A/B and never promotes or
     const evaluations = join(root, 'skills', 'evaluations'), ids = await readdir(evaluations);
     assert.equal((await load(join(evaluations, ids[0], 'results.json'))).length, waves);
   }
+});
+
+test('authoritative user edit supersedes pending candidate without deleting evidence or version history', async t => {
+  const root = await fixture(t);
+  await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({ history: history(7), lastEvaluated: 0 }));
+  await assert.rejects(tune({ instanceRoot: root, config, task: task(7), generate: async () => [],
+    evaluate: async () => { throw new Error('paused'); } }), /paused/);
+  const before = await load(join(root, 'skills', 'evolution.json'));
+  assert.equal(candidateVersion(before, 'baseline'), before.candidate);
+  const edited = { ...config, revision: 1, skills: { ...config.skills, activeVersion: 'user-edit' } };
+  const directory = join(root, 'skills', 'versions', 'user-edit');
+  await cp(join(root, 'skills', 'versions', 'baseline'), directory, { recursive: true });
+  await writeFile(join(directory, 'guidance.json'), JSON.stringify([{ ...guidance, id: 'user-entry' }]));
+  await writeFile(join(root, 'instance.json'), JSON.stringify(edited));
+  assert.equal(candidateVersion(before, edited.skills.activeVersion), 'user-edit');
+  await tune({ instanceRoot: root, config: edited, task: task(7), generate: async () => assert.fail('duplicate update') });
+  const invalidated = await load(join(root, 'skills', 'evolution.json'));
+  assert.equal(invalidated.candidate, null); assert.equal(invalidated.pending, null);
+  assert.equal(invalidated.history.length, 8); assert.equal(invalidated.lastEvaluated, 0);
+  assert.equal((await readdir(join(root, 'skills', 'evaluations'))).length, 1);
+  await readFile(join(root, 'skills', 'versions', before.candidate, 'guidance.json'));
+  const updated = await tune({ instanceRoot: root, config: edited, task: task(8, { kind: 'retry' }),
+    generate: async ({ input }) => { assert.equal(input.entries[0].id, 'user-entry'); return []; } });
+  const after = await load(join(root, 'skills', 'evolution.json'));
+  assert.equal(after.candidateBase, 'user-edit');
+  assert.equal(candidateVersion(after, 'user-edit'), updated.candidate);
 });

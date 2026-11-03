@@ -30,6 +30,9 @@ export function cadenceDecision(history, task, lastEvaluated = 0) {
     allowPruning: new Set(counted.map(x => x.id)).size >= 24 };
 }
 
+// Recovery must never override an active user edit with an older candidate.
+export const candidateVersion = (state, active) => state.candidateBase === active ? state.candidate ?? active : active;
+
 // Correctness improvements precede timing; every candidate correctness result must pass.
 export function evaluateDecision(results, projectIds, runs = 2) {
   if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 2)
@@ -142,8 +145,14 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
     state.pending = null;
+    state.candidateBase = current.skills.activeVersion;
     await save(statePath, state, signal);
     return { promote: true, reason: 'recovered-promotion' };
+  }
+  if ((state.candidate && state.candidateBase !== current.skills.activeVersion) ||
+      (state.pending && state.pending.active !== current.skills.activeVersion)) {
+    state.candidate = null; state.pending = null; state.candidateBase = current.skills.activeVersion;
+    await save(statePath, state, signal);
   }
   const decision = cadenceDecision(state.history, task, state.lastEvaluated);
   if (!decision.analyse && !manual && !state.pending) return decision;
@@ -180,6 +189,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     state.pending = shouldEvaluate ? { active, candidate, projects: new Set(counted.map(x => x.projectId)).size,
       projectIds, proposalRoot, manual } : null;
     state.candidate = candidate;
+    state.candidateBase = active;
     await save(statePath, state, signal);
     if (!shouldEvaluate) return { ...decision, analyse: true, evaluate: false, candidate };
   }
@@ -219,6 +229,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     latest.skills.activeVersion = pending.candidate;
     latest.revision = (latest.revision ?? 0) + 1;
     await save(configPath, latest, signal);
+    state.candidateBase = latest.skills.activeVersion;
   }
   signal?.throwIfAborted();
   if (!pending.manual) state.lastEvaluated = pending.projects;
