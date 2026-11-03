@@ -1,8 +1,11 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { readFile } from 'node:fs/promises';
+import { parseEnv } from 'node:util';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 
 export async function modelFromProfile(profile) {
-  const key=process.env[profile.credential_env];
+  const key=process.env[profile.credential_env] ?? (profile.credentials_file
+    ? parseEnv(await readFile(profile.credentials_file,'utf8'))[profile.credential_env] : undefined);
   if (!key) throw new Error(`Missing credential environment variable ${profile.credential_env}`);
   const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),
     modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
@@ -12,5 +15,6 @@ export async function modelFromProfile(profile) {
   }
   runtime.registerProvider(profile.provider,{baseUrl:profile.base_url});
   await runtime.setRuntimeApiKey(profile.provider,key);
-  return {modelRuntime:runtime,model:runtime.getModel(profile.provider,profile.model)};
+  const model=runtime.getModel(profile.provider,profile.model);
+  return {modelRuntime:runtime,model:profile.max_tokens?{...model,maxTokens:Math.min(model.maxTokens,profile.max_tokens)}:model};
 }
