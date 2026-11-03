@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
 const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
-  ['queued', 'dispatching', 'running', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
+  ['queued', 'dispatching', 'running', 'retrying', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
 async function sourceSnapshot(path) {
@@ -274,7 +274,7 @@ export async function createEnvironment(options, context) {
       await event('execution-state', { handle, purpose: 'transfer', ...normalize(result) });
       if (!terminal.has(result.state)) result = await client(['observe', handle]);
       while (!terminal.has(result.state)) {
-        if (!['queued', 'dispatching', 'running'].includes(result.state)) throw new Error(`Transfer unresolved; observe ${handle}`);
+        if (!['queued', 'dispatching', 'running', 'retrying'].includes(result.state)) throw new Error(`Transfer unresolved; observe ${handle}`);
         await delay(options.pollMs ?? 250);
         result = await client(['observe', handle]);
       }
