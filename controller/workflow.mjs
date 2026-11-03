@@ -30,9 +30,9 @@ export class Workflow {
     await this.event('skill-read',{stage:this.stage,...result.evidence});
     return result.content;
   }
-  async query(query,kind) {
+  async query(query,kind,ctx) {
     if (!['good','negative'].includes(kind)) throw new Error('Query good and negative evidence separately');
-    const result = await this.search({query,kind});
+    const result = await this.search({query,kind},ctx);
     this.facts[kind] = true;
     await this.event('knowledge-retrieved',{stage:this.stage,query,kind,evidence:result.evidence});
     return result.content;

@@ -6,6 +6,8 @@ export class State {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
+    if (version === 0 && this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().length)
+      throw new Error('Existing unversioned state is unsupported; bootstrap a fresh instance');
     if (version !== 0 && version !== 1) throw new Error('Unsupported instance; bootstrap a fresh instance');
     this.db.exec(`CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY, spec TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued'

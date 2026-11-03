@@ -11,7 +11,7 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,skillMap,extensions=[]}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[]}) {
   await mkdir(attemptPath,{recursive:true});
   const event=(type,data)=>state.event(attempt.id,type,data);
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
@@ -19,13 +19,14 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     exclude:(label,fn)=>clock.exclude(label,fn)});
   const checkVerifier=await freezeFiles(project.verifier.files,project.source);
   let session,timer,accepted=false;
+  const diagnostics=[];
   const workflow=new Workflow({clock,event,fingerprint:()=>fingerprint(project.source),
     readSkill:async stage=>{
       const path=skillMap[stage];
       if (!path) throw new Error(`No skill mapped to ${stage}`);
       const content=await readFile(path,'utf8');
       return {content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
-    },search:request=>knowledge.search({...request,attempt_id:attempt.id}),
+    },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
     verify:async()=>{
       await checkVerifier();
       let output='';
@@ -41,7 +42,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       parameters:Type.Object({}),execute:async()=>result(await workflow.skill())});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
-      execute:async(_id,args)=>result(await workflow.query(args.query,args.kind))});
+      execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier.',
       parameters:Type.Object({}),execute:async()=>result(await workflow.validate())});
     pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete current step after using its skill and required evidence.',
@@ -79,7 +80,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     const loader=new sdk.DefaultResourceLoader({cwd:project.source,noExtensions:true,noSkills:true,
       extensionFactories:[extension,...extensions]});
     await loader.reload();
-    ({session}=await sdk.createAgentSession({cwd:project.source,modelRuntime,model,
+    ({session}=await sdk.createAgentSession({cwd:project.source,modelRuntime,model,thinkingLevel,
       sessionManager:manager,resourceLoader:loader}));
     session.agent.toolExecution='sequential';
     await session.bindExtensions({});
@@ -87,6 +88,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
+      if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
+        diagnostics.push(e.message.errorMessage ?? 'Native provider error');
       event('pi-event',{type:e.type,stage:workflow.stage,elapsed:clock.elapsed});
     });
     timer=setInterval(()=>{
@@ -97,6 +100,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     await session.waitForIdle();
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
+    if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});
     state.finish(attempt.id,accepted?'passed':'failed');
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
