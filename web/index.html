@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ascend instance</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+<header><h1>Ascend instance</h1><button id="refresh">Refresh status</button></header>
+<p id="message" role="status" aria-live="polite">Loading settings…</p>
+<main>
+<section><h2>Projects and attempts</h2><div id="status"></div>
+<div class="actions"><label>Wave <select id="mode"><option>phase1</option><option>phase2</option><option>inference</option><option>revisit</option></select></label>
+<button id="wave">Start wave</button><button id="campaign">Start campaign</button><button id="stop">Stop</button><button id="resume">Resume</button></div></section>
+<section><h2>Instance settings</h2>
+<p>JSON editors retain additional settings. Save before starting a wave.</p>
+<button id="reload-settings" type="button">Reload settings (discard edits)</button>
+<p id="settings-conflict" role="alert" hidden>Settings changed on the server. Your edits remain here; copy any you want to keep, then reload settings before saving.</p>
+<form id="settings">
+<label>Baseline KDB path <input id="baseline" type="text"></label>
+<label>Skills map (JSON) <textarea id="skillsmap" rows="4"></textarea></label>
+<label>Curriculum (JSON) <textarea id="curriculum" rows="4"></textarea></label>
+<label>Actors (JSON) <textarea id="actors" rows="4"></textarea></label>
+<label>Environment (JSON) <textarea id="environment" rows="5"></textarea></label>
+<label>All settings (JSON) <textarea id="config" rows="10"></textarea></label>
+<p>Apply the full JSON editor to the fields before saving changes made there.</p>
+<button id="apply" type="button">Apply JSON to fields</button><button type="submit">Save settings</button>
+</form></section>
+<section><h2>Skill content</h2>
+<label>Scope <select id="skill-scope"></select></label>
+<button id="skill-load" type="button">Load skill</button>
+<label>Content <textarea id="skill-content" rows="12"></textarea></label>
+<button id="skill-save" type="button">Save new skill version</button></section>
+<section><h2>Folder browser</h2><form id="browse"><label>Path <input id="path" value="."></label><button>Browse</button></form>
+<p>Paths are resolved by the configured CLI environment. Select a folder to browse it.</p><div id="folders"></div><pre id="browse-result"></pre></section>
+<section><h2>Add project</h2><form id="project-form"><label>Project specification (JSON)
+<textarea id="project" rows="8">{"id":"","goal":"","source":"","target":"","actor_seconds":28800,"verifier":{}}</textarea></label><button>Add project</button></form></section>
+<section><h2>Skilltune</h2><form id="tune-form"><label>User information <textarea id="userinfo" rows="4"></textarea></label>
+<label>Action (JSON) <textarea id="tune-action" rows="3">{}</textarea></label>
+<button>Save user information and tune</button></form></section>
+<section><h2>Knowledge database</h2><form id="kdb-form"><label>Action (JSON) <textarea id="kdb-action" rows="4">{}</textarea></label><button>Run KDB action</button></form><pre id="action-result"></pre></section>
+</main><script src="/assets/app.js" defer></script>
+</body></html>
