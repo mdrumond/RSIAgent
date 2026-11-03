@@ -61,10 +61,15 @@ export async function provider(scenario, {nativeSession} = {}) {
             'Independent arithmetic oracle failed; attached verifier output records the actual mismatch.') :
             'Attached native session records observed execution and tool results; no separate numeric claim is made.',
             useful:scenario !== 'freeze' && prompt.includes('this investigation') && passed,paths:[path]})];
+        } else if (prompt.startsWith('Read current-guidance.json')) {
+          plan=[tool('read',{path:'current-guidance.json'}),tool('read',{path:'current-usage.json'}),
+            tool('mcp__kdb__search',{query:'independent numeric oracle',kind:'good',limit:1}),
+            tool('submit_changes',{changes:[{action:'upsert',id:'numeric-oracle',scope:'debug',
+              text:'Use the independent numeric oracle before accepting a candidate.',critical:false,negative:false}]})];
         } else if (prompt.startsWith('Goal:')) {
           const unrelated = prompt.includes('Goal: unrelated');
           const small = prompt.includes('Goal: SMALL');
-          const pass = unrelated || scenario === 'interrupt' || (scenario !== 'freeze' && (small || originals++ > 0));
+          const pass = unrelated || scenario === 'phase2' || scenario === 'interrupt' || (scenario !== 'freeze' && (small || originals++ > 0));
           plan = workflow({pass,interrupt:scenario === 'interrupt'});
         } else throw new Error(`Unknown scripted conversation: ${prompt.slice(0,100)}`);
         plans.set(key,plan);
