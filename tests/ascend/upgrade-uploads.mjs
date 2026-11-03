@@ -54,6 +54,7 @@ export function createEnvironment(options,context){return generic(options,{...co
     event, exclude: async (_, fn) => fn(), client: async args => {
       if (args[0] === 'capabilities') return { state: 'available' };
       if (args[0] === 'preflight') return { state: 'completed' };
+      if (args[0] === 'download') return { state: 'completed' };
       if (args[0] === 'upload') {
         upload++;
         const current = `remote:fake:transfer:upload${upload}`;
@@ -158,6 +159,27 @@ test('known terminal native job permits installation; ambiguous job never does',
   await fs.writeFile(f.observations, JSON.stringify({ ...f.statuses, [job]: { state: 'completed', exit: 0 } }));
   await upgrade(f.instance, f.release);
 });
+
+for (const kind of ['download', 'upload', 'unknown-download', 'nonexcluded-download', 'closed-run'])
+  test(`handleless synchronous transfer eligibility: ${kind}`, async t => {
+    const f = await fixture(t);
+    await f.environment.browse('/retained/output');
+    const row = f.state.db.prepare("SELECT sequence,data FROM events WHERE type='execution-submitting' ORDER BY sequence DESC LIMIT 1").get();
+    const data = JSON.parse(row.data);
+    if (kind === 'upload') data.kind = 'upload';
+    if (kind === 'closed-run') data.kind = 'run';
+    if (kind === 'nonexcluded-download') data.accountingExcluded = false;
+    f.state.db.prepare('UPDATE events SET data=? WHERE sequence=?').run(JSON.stringify(data), row.sequence);
+    if (kind === 'unknown-download') {
+      const response = f.state.db.prepare("SELECT sequence,data FROM events WHERE type='execution-submitted' ORDER BY sequence DESC LIMIT 1").get();
+      f.state.db.prepare('UPDATE events SET data=? WHERE sequence=?')
+        .run(JSON.stringify({ ...JSON.parse(response.data), closed: false }), response.sequence);
+    }
+    const before = await f.snapshot();
+    if (kind === 'download' || kind === 'upload') await upgrade(f.instance, f.release);
+    else await assert.rejects(upgrade(f.instance, f.release), /external executions/);
+    assert.deepEqual(await f.snapshot(), before);
+  });
 
 test('failed staged activation restores archived machinery and leaves attempt evidence unchanged', async t => {
   const f = await fixture(t), before = await f.snapshot();

@@ -382,6 +382,9 @@ export async function createEnvironment(options, context) {
           if (responses.some(e => e.data.handle)) return false;
           continue;
         }
+        if (['upload', 'download'].includes(data.kind) && data.accountingExcluded === true &&
+            responses.some(e => e.type === 'execution-submitted' && e.data.closed === true) &&
+            !responses.some(e => e.data.handle)) continue;
         const receipt = data.receiptFile ? await json(data.receiptFile) : null;
         const ids = new Set([...responses.map(e => e.data.handle), receipt?.handle].filter(Boolean));
         if (ids.size !== 1) return false;
