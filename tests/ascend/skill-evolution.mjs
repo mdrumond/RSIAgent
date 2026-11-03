@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cadenceDecision, evaluateDecision, applyProposal, tune } from '../../controller/skill-evolution.mjs';
@@ -22,6 +22,9 @@ async function fixture(t) {
   return root;
 }
 const load = async path => JSON.parse(await readFile(path, 'utf8'));
+const lockedRun = (config, values = {}) => run(config, {
+  lock: async (_config, operation) => operation(),
+  readConfig: async root => ({ ...await load(join(root, 'instance.json')), root }), ...values });
 
 test('cadence excludes phase1, retries, diagnostics, duplicates and repeated projects', () => {
   for (const extra of [{ phase: 'phase1' }, { completed: false }])
@@ -146,7 +149,7 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
       return { correct: true, score: 1 };
     }
   };
-  const result = await run({ ...config, root }, { runtime });
+  const result = await lockedRun({ ...config, root }, { runtime });
   assert.equal(result.promote, false);
   assert.equal(calls.length, 16);
   for (let i = 0; i < calls.length; i += 2) {
@@ -160,7 +163,7 @@ test('CLI consumes action file task and requires an explicit writer profile', as
   const root = await fixture(t);
   const action = join(root, 'action.json');
   await writeFile(action, JSON.stringify({ task: task(0), userinfo: 'Prefer recovery guidance.' }));
-  await assert.rejects(run({ ...config, root }, { config: action,
+  await assert.rejects(lockedRun({ ...config, root }, { config: action,
     runtime: { async bootstrap() {}, async wave() {} } }), /skill_writer_actor or actor/);
   const proposals = await readdir(join(root, 'skills', 'proposals'));
   const evidence = await load(join(root, 'skills', 'proposals', proposals[0], 'evidence.json'));
@@ -175,7 +178,7 @@ test('first CLI update needs no A/B configuration; cadence defaults to two stabl
   const current = { ...config, root, skills: { activeVersion: 'baseline' } };
   await writeFile(join(root, 'instance.json'), JSON.stringify(current));
   const { native } = nativeWriter();
-  const first = await run(current, { task: task(0), native, knowledge: knowledgeStub, modelRuntime: {}, model: {} });
+  const first = await lockedRun(current, { task: task(0), native, knowledge: knowledgeStub, modelRuntime: {}, model: {} });
   assert.ok(first.candidate);
   assert.equal(first.evaluate, false);
   const evaluated = [];
@@ -200,7 +203,7 @@ test('manual CLI uses selected State events without increasing original cadence'
   await writeFile(action, JSON.stringify({ userinfo: 'repair', projectId: 'selected' }));
   let input;
   const { native } = nativeWriter(value => { input = value; });
-  const result = await run({ ...config, root }, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {},
+  const result = await lockedRun({ ...config, root }, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {},
     runtime: { async bootstrap(request) { await mkdir(request.instanceRoot); },
       async wave() { return { correct: true, score: 1 }; } } });
   assert.equal(result.promote, false);
@@ -213,7 +216,7 @@ test('manual CLI uses selected State events without increasing original cadence'
   const noIds = { ...config, root, skills: { activeVersion: 'baseline' } };
   await writeFile(join(root, 'instance.json'), JSON.stringify(noIds));
   await writeFile(action, JSON.stringify({ userinfo: 'recover' }));
-  assert.equal((await run(noIds, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} })).analyse, true);
+  assert.equal((await lockedRun(noIds, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} })).analyse, true);
   assert.equal((await load(join(root, 'skills', 'evolution.json'))).history.length, 0);
 });
 
@@ -266,4 +269,35 @@ test('investigation and retry update candidate but only originals advance cadenc
   assert.equal(state.history.length, 3);
   const many = Array.from({ length: 30 }, (_, i) => task(i, { kind: 'investigation' }));
   assert.equal(cadenceDecision(many, task(31)).allowPruning, false);
+});
+
+test('CLI refreshes after lock claim and preserves executed mode while using fresh skills and userinfo', async t => {
+  const root = await fixture(t);
+  await cp(join(root, 'skills', 'versions', 'baseline'), join(root, 'skills', 'versions', 'promoted'), { recursive: true });
+  const fresh = { ...config, mode: 'phase1', revision: 1, userinfo: 'fresh', skills: { activeVersion: 'promoted' } };
+  const stale = { ...config, root, revision: 0, userinfo: 'stale' };
+  let held = false, claims = 0;
+  const lock = async (_config, operation) => {
+    claims++; held = true;
+    if (claims === 1) await writeFile(join(root, 'instance.json'), JSON.stringify(fresh));
+    try { return await operation(); } finally { held = false; }
+  };
+  let observed;
+  const { native } = nativeWriter(input => { assert.equal(held, true); observed = input; });
+  const dependencies = { lock, readConfig: async path => {
+    assert.equal(held, true); return { ...await load(join(path, 'instance.json')), root: path };
+  }, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} };
+  const result = await run(stale, { ...dependencies, task: task(0) });
+  assert.ok(result.candidate);
+  assert.equal(observed.userinfo, 'fresh');
+  assert.equal(observed.context.phase, 'phase2');
+  assert.equal(held, false);
+  const latest = await load(join(root, 'instance.json'));
+  assert.equal(latest.skills.activeVersion, 'promoted');
+  assert.equal(latest.revision, 1);
+  latest.mode = 'phase2';
+  await writeFile(join(root, 'instance.json'), JSON.stringify(latest));
+  assert.ok((await run(stale, { ...dependencies, manual: true })).candidate);
+  assert.equal(claims, 2);
+  assert.equal(held, false);
 });

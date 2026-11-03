@@ -124,7 +124,8 @@ async function writeVersion(root, entries, source) {
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
   task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
   const current = await json(configPath);
-  if (current.skills?.tuningDisabled || current.mode === 'phase1') return { analyse: false, evaluate: false };
+  const mode = task?.phase ?? config?.mode ?? current.mode;
+  if (current.skills?.tuningDisabled || mode === 'phase1') return { analyse: false, evaluate: false };
   if (config?.skills?.activeVersion !== current.skills?.activeVersion)
     throw new Error('Stale instance configuration');
   const root = resolve(instanceRoot);
@@ -193,6 +194,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       const skillVersion = pending[arm];
       const isolatedConfig = structuredClone(current);
       isolatedConfig.root = isolatedRoot;
+      isolatedConfig.mode = mode;
       isolatedConfig.skills = { ...isolatedConfig.skills, activeVersion: skillVersion, tuningDisabled: true };
       const result = await evaluate({ instanceRoot: isolatedRoot, config: isolatedConfig,
         sourceInstanceRoot: root, projectId, run, arm, skillVersion });
