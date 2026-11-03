@@ -50,7 +50,7 @@ export async function bootstrap(request) {
   const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,...settings}=request.config;
   const environment=structuredClone(original.environment);
   request.signal?.throwIfAborted();
-  await createInstance(request.instanceRoot,{...settings,resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
+  await createInstance(request.instanceRoot,{...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
     skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
     machinery:resolve(new URL('..',import.meta.url).pathname)});
