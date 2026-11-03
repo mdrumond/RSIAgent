@@ -57,7 +57,7 @@ export class State {
       .run(attempt,type,JSON.stringify(data),new Date().toISOString());
   }
   events(id) {
-    return this.db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id)
+    return this.db.prepare('SELECT type,data FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
       .map(row=>({type:row.type,data:JSON.parse(row.data)}));
   }
   finish(id, outcome) {
