@@ -154,3 +154,22 @@ test('elapsed expiry during extension binding cannot start a later prompt', asyn
     seconds: 0.1 }), /elapsed allocation/);
   assert.equal(prompts, 0); assert.ok(flags.aborted && flags.disposed);
 });
+
+test('archive failures still shut down and dispose, preserving the earliest error', async t => {
+  for (const promptFails of [false, true]) {
+    const root = await fixture(t), directory = join(root, 'archive'), events = [];
+    const { native } = nativeWriter(), create = native.createAgentSession, first = new Error('provider failed');
+    native.createAgentSession = async options => {
+      const result = await create(options), { session } = result, prompt = session.prompt;
+      session.prompt = async () => { await prompt(); await mkdir(join(directory, 'responses.json'));
+        if (promptFails) throw first; };
+      session.extensionRunner = { async emit() { events.push('shutdown'); throw new Error('cleanup failed'); } };
+      session.dispose = () => events.push('dispose');
+      return result;
+    };
+    await assert.rejects(generateCandidate({ directory, input: {}, native }),
+      error => promptFails ? error === first : error.code === 'EISDIR');
+    assert.deepEqual(events, ['shutdown', 'dispose']);
+    assert.equal((await readFile(join(directory, 'sft.native.jsonl'), 'utf8')).length > 0, true);
+  }
+});
