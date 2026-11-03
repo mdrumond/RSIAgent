@@ -43,7 +43,7 @@ export class Workflow {
     const before = await this.fingerprint();
     const result = await this.verify(signal);
     const after = await this.fingerprint();
-    this.validation = {passed:result.passed === true && before === after, fingerprint:after};
+    this.validation = {passed:result.passed === true && before === after, fingerprint:after,evidence:result.evidence};
     await this.event('verification',{...this.validation,evidence:result.evidence});
     return this.validation;
   }
