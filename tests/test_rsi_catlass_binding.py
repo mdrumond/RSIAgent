@@ -921,6 +921,7 @@ def test_original_retry_preserves_full_catlass_workload_and_actual_lease(catlass
                     controller_placement='local', outer_handle='remote:bz-a5:job:admitted')
     profiles = tmp_path/'retry-profiles.json'
     profiles.write_text(json.dumps(dict(profiles={'target':dict(metadata=metadata,
+        guard='rsi.catlass_project_config:device_guard',
         project_binder='rsi.catlass_project_config:bind_project', project_configuration=binding)})))
     original_profiles = profiles.read_bytes()
     original_seed = cases.read_bytes()
