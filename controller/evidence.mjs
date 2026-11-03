@@ -10,7 +10,10 @@ export async function fingerprint(root) {
       const path=join(directory,name), stat=await lstat(path);
       if (stat.isSymbolicLink()) throw new Error('Project symlinks need explicit materialization');
       if (stat.isDirectory()) await visit(path);
-      else if (stat.isFile()) { hash.update(relative(root,path)); hash.update('\0'); hash.update(await readFile(path)); }
+      else if (stat.isFile()) {
+        const content=createHash('sha256').update(await readFile(path)).digest('hex');
+        hash.update(JSON.stringify([relative(root,path),content])+'\n');
+      }
     }
   }
   await visit(resolve(root));

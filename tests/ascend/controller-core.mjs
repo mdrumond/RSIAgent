@@ -152,3 +152,16 @@ test('stale acceptance resumes through revision and verifies edited source afres
   while(resumed.stage!=='acceptance')await step(resumed);
   assert.equal((await step(resumed)).accepted,true);assert.equal(verified,2);
 });
+
+test('source fingerprints distinguish file boundaries from arbitrary binary content',async()=>{
+  const {mkdtemp,writeFile,rm}=await import('node:fs/promises');
+  const {join}=await import('node:path');const {tmpdir}=await import('node:os');
+  const {fingerprint}=await import('../../controller/evidence.mjs');
+  const root=await mkdtemp(join(tmpdir(),'ascend-tree-'));
+  try {
+    await writeFile(join(root,'a'),'x');await writeFile(join(root,'b'),'y');
+    const first=await fingerprint(root);
+    await rm(join(root,'b'));await writeFile(join(root,'a'),Buffer.from('xb\0y'));
+    assert.notEqual(await fingerprint(root),first);
+  }finally{await rm(root,{recursive:true,force:true});}
+});
