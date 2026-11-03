@@ -46,6 +46,14 @@ async function setup(t,scenario,ids) {
   const run=async(command,...args)=>start(command,...args).output;
   t.after(async()=>{
     try {
+      await run('stop');
+      await until(async()=>{
+        const control=rows(instance,"SELECT value FROM control WHERE key='owner'")[0];
+        const owner=control && JSON.parse(control.value);
+        return !owner || await ownerStopped(owner);
+      },5000);
+    }catch(error){t.diagnostic(`Controller cleanup retained for inspection: ${error.message}`);}
+    try {
       const receipt=JSON.parse(await readFile(join(instance,'knowledge-service.json'),'utf8'));
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
     }catch(error){if(error.code!=='ENOENT' && error.code!=='ESRCH')throw error;}
@@ -144,7 +152,7 @@ test('CLI freezes at the configured unsuccessful recovery-round limit', {timeout
   const f=await setup(t,'freeze',['freeze']);
   const campaign=await f.run('campaign','--detach');
   assert.equal(campaign.submitted,true);
-  await until(()=>rows(f.root,"SELECT frozen FROM projects WHERE id='freeze'")[0]?.frozen===1);
+  await until(async()=>(await f.run('status')).projects.find(p=>p.id==='freeze')?.frozen===1);
   await until(()=>{
     const owner=rows(f.root,"SELECT value FROM control WHERE key='owner'")[0];
     return owner && JSON.parse(owner.value)===null;

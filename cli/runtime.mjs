@@ -71,7 +71,7 @@ export async function operate(command,config,options={}) {
       try {
         const {ensureKnowledgeService}=await import('./knowledge.mjs');
         const {deliverLessons}=await import('./memory.mjs');
-        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config)});
+        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config),signal:options.signal});
       }catch(error){state.event(null,'memory-update-error',{message:error.message});}
     }
     const finalize=pendingOutcomes(state,policy(config));
