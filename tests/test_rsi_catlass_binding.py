@@ -886,3 +886,76 @@ def test_project_spec_accepts_explicit_campaign_budget_without_resetting_it(tmp_
     assert spec.budgets is limits
     assert spec.to_dict()['budgets']['actor_seconds'] == 28800
     assert spec.command == tuple(config.commands['test'])
+
+
+def test_original_retry_preserves_full_catlass_workload_and_actual_lease(catlass_parent, tmp_path, monkeypatch):
+    from dataclasses import asdict, replace
+    import os
+    import shutil
+    from core.artifacts import ContentAddressedArtifacts
+    from rsi.catlass_project_config import case_identity
+    from rsi.curriculum_materialization import materialize_child
+    from rsi.curriculum_research import DiagnosticProposal
+    from rsi.executor_profiles import ExecutorProfiles
+    from rsi.phase1_recovery import Phase1Recovery
+    from rsi.project_runner import ProjectConfig
+    from rsi.services import BoundCycle
+    from rsi.setup_telemetry import SetupTelemetry
+    spec, config, binding, cases, seed = catlass_parent
+    spec = replace(spec, budgets=replace(spec.budgets, actor_seconds=28800, wall_seconds=None))
+    child = materialize_child(spec, dict(config=asdict(config), binding=binding),
+        DiagnosticProposal('Isolate one case', 'Understand the original failure', 'Retain measured evidence',
+                           'catlass.case-subset', {'case_indices':[0]}),
+        root=tmp_path/'diagnostic', remaining=9600, evidence_refs=('a'*64,), operation_id='diagnostic')
+    assert len(json.loads(Path(child.spec.correctness_ref).read_text())['cases']) == 1
+    archived = tmp_path/'original-runner'
+    shutil.copytree(config.source, archived/'project')
+    (archived/'project/candidate.py').write_text('def kernel():\n    return 7  # latest ORIGINAL source\n')
+    (archived/'frozen').mkdir()
+    shutil.copyfile(config.verifier, archived/'frozen/verify.py')
+    local = ContentAddressedArtifacts(archived/'artifacts')
+    (archived/'runner.json').write_text(json.dumps(dict(contract=local.put_json(
+        dict(spec=spec.to_dict(), config=asdict(config))))))
+    (archived/'service-binding.json').write_text(json.dumps(dict(worker_profile='target')))
+    metadata = dict(target='bz-a5', runtime='catlass-dsl', physical_device=3, executor_identity=None,
+                    controller_placement='local', outer_handle='remote:bz-a5:job:admitted')
+    profiles = tmp_path/'retry-profiles.json'
+    profiles.write_text(json.dumps(dict(profiles={'target':dict(metadata=metadata,
+        project_binder='rsi.catlass_project_config:bind_project', project_configuration=binding)})))
+    original_profiles = profiles.read_bytes()
+    original_seed = cases.read_bytes()
+    store = ContentAddressedArtifacts(tmp_path/'retry-artifacts')
+    cycle = SimpleNamespace(root=tmp_path/'cycle', store=store, config=dict(project_configs={}),
+        services=SimpleNamespace(executor_factory=ExecutorProfiles(str(profiles)),
+            curriculum_researcher=None, curriculum_materializer=None, setup=SetupTelemetry(store)),
+        scheduler=SimpleNamespace(state=dict(memory='accepted-diagnostic-memory', derived_projects={}), _save=lambda:None))
+    recovery = Phase1Recovery(cycle)
+    cycle.curriculum = recovery
+    cycle.project_executor_factory = BoundCycle.project_executor_factory.__get__(cycle)
+    row = dict(artifact_ref=store.put_json(dict(root=str(archived))))
+    retry = recovery.original_retry(spec, row, dict(operation_id='retry-original'))
+    assert retry.project_id == spec.project_id and retry.goal == spec.goal and retry.budgets == spec.budgets
+    retry_config = recovery.project_config(retry)
+    assert '--cases' not in retry_config.commands['test']
+    assert Path(retry.correctness_ref).read_bytes() == original_seed
+    assert Path(retry_config.verifier).read_bytes() == Path(config.verifier).read_bytes()
+    assert (Path(retry_config.source)/'candidate.py').read_bytes() == (archived/'project/candidate.py').read_bytes()
+    assert (Path(retry_config.source)/'reference-skills/oracle.txt').read_bytes() == (Path(config.source)/'reference-skills/oracle.txt').read_bytes()
+    assert retry.command == tuple(retry_config.commands['test'])
+    branch = tmp_path/'retry-lease'
+    branch.mkdir()
+    request = SimpleNamespace(root=branch/'runner', reopen=False, device='3', project_id='retry-operation', dispatch_id='retry-dispatch')
+    (branch/'worker.json').write_text(json.dumps(dict(pid=os.getpid(), dispatch_id=request.dispatch_id)))
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','3')
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE',metadata['outer_handle'])
+    monkeypatch.setenv('RSI_CPL_RUNTIME','catlass-dsl')
+    factory = recovery.executor_factory(retry)
+    resolved = factory.bind_project('target',request,
+        dict(operation_id=request.project_id, spec=retry.to_dict(), config=asdict(retry_config)), remaining=lambda:28800.)
+    frozen = runpy.run_path(resolved['config']['verifier'])['FROZEN_CONTRACT']
+    assert frozen['physical_device'] == 3 and frozen['cases'] == seed['cases']
+    assert frozen['case_hash'] == case_identity(seed)
+    assert resolved['spec']['budgets'] == spec.budgets.to_dict()
+    assert recovery.original_retry(spec, row, dict(operation_id='retry-original')) == retry
+    assert cases.read_bytes() == original_seed and profiles.read_bytes() == original_profiles
+    assert len(json.loads(Path(child.spec.correctness_ref).read_text())['cases']) == 1

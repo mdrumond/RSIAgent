@@ -45,25 +45,37 @@ class Phase1Recovery:
         config = asdict(config) if isinstance(config, ProjectConfig) else config
         binding = wire.get('binding') if isinstance(wire, dict) else None
         if binding:
-            from rsi.curriculum_materialization import _argument, _copy_source, _triton_bindings
-            from rsi.triton_worker_binding import case_identity
+            from rsi.curriculum_materialization import _cases, _catlass, _copy_source, _triton_bindings
             import shutil
             previous = ProjectConfig.from_dict(config)
+            catlass = _catlass(binding)
+            original_cases, original_seed = _cases(previous, binding, parent_spec.project_id)
             root = self.cycle.root / 'original-retries' / context['operation_id']
             root.mkdir(parents=True)  # Partial preparations require observation, never overwrite.
             inputs = root / 'inputs'
             inputs.mkdir()
             oracle, cases = root / 'verify.py', inputs / 'cases.json'
             with self.cycle.services.setup.measure('original-retry-inputs', context['operation_id']):
-                _copy_source(previous, root / 'project', triton=True)
+                _copy_source(previous, root / 'project', triton=not catlass)
                 shutil.copyfile(previous.verifier, oracle)
-                shutil.copyfile(_argument(previous, '--cases'), cases)
-                spec, rebuilt, binding = _triton_bindings(parent_spec, previous, binding,
-                    replace(spec, correctness_ref=str(cases)), root / 'project', cases, inputs, oracle, root)
+                shutil.copyfile(original_cases, cases)
+                if catlass:
+                    from rsi.catlass_project_config import case_identity, subset_configuration
+                    commands = {name: ['{verifier}' if arg == str(Path(previous.verifier).resolve()) else arg
+                                      for arg in argv] for name, argv in previous.commands.items()}
+                    rebuilt = replace(previous, source=str(root / 'project'), verifier=str(oracle), commands=commands)
+                    spec = replace(spec, correctness_ref=str(cases), command=tuple(commands['test']))
+                    binding = subset_configuration(binding, spec.project_id, cases)
+                else:
+                    from rsi.triton_worker_binding import case_identity
+                    spec, rebuilt, binding = _triton_bindings(parent_spec, previous, binding,
+                        replace(spec, correctness_ref=str(cases)), root / 'project', cases, inputs, oracle, root)
             if any(getattr(rebuilt, field) != getattr(previous, field) for field in
                    ('editable_files', 'generated_paths', 'retained_paths', 'performance_seconds')):
                 raise ValueError('original retry changed editable/output or performance policy')
-            if case_identity(rebuilt) != case_identity(previous):
+            same_cases = (case_identity(json.loads(cases.read_bytes())) == case_identity(original_seed)
+                          if catlass else case_identity(rebuilt) == case_identity(previous))
+            if not same_cases or oracle.read_bytes() != Path(previous.verifier).read_bytes():
                 raise ValueError('original retry changed the full cases or independent oracle')
             config = asdict(rebuilt)
         elif tuple(config['commands']['test']) != spec.command:
