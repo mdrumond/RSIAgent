@@ -3,6 +3,12 @@ import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+export function validateAcceptance(spec) {
+  if (spec.performance_goal != null &&
+      (typeof spec.verifier?.performance_command !== 'string' || !spec.verifier.performance_command.trim()))
+    throw new Error('performance_goal requires verifier.performance_command');
+}
+
 export class State {
   constructor(file) {
     this.db = new DatabaseSync(file);
@@ -24,6 +30,7 @@ export class State {
       PRAGMA user_version=1;`);
   }
   add(spec) {
+    validateAcceptance(spec);
     if (!spec.id || !spec.goal || !(spec.actor_seconds > 0)) throw new Error('Invalid project');
     if(spec.verifier)spec={...spec,verifier:{...spec.verifier,hashes:Object.fromEntries(spec.verifier.files.map(path=>
       [resolve(path),createHash('sha256').update(readFileSync(path)).digest('hex')]))}};
