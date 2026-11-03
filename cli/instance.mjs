@@ -20,6 +20,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
   if (!baseline || !skills || !environment) throw new Error('Baseline KDB, skills and environment configuration required');
+  const {validateSkillMap}=await import('./skill-input.mjs');
+  await validateSkillMap(resolve(skills),JSON.parse(await readFile(join(skills,'skill-map.json'),'utf8')));
   const basestat=await stat(baseline);
   if (!basestat.isFile()) throw new Error('Baseline KDB must be a SQLite file');
   await mkdir(destination,{recursive:false,mode:0o700});
@@ -34,7 +36,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__'].includes(path.split(sep).at(-1))});
   await copyMachinery(machinery,join(destination,'machinery'),install);
-  const config={...settings,format:1,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
+  const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
@@ -45,6 +47,7 @@ export async function updateConfig(root,change) {
   const current=await readConfig(root);
   const next=await change(current);
   if (next.format !== 1) throw new Error('Current format required');
+  next.revision=(current.revision??0)+1;
   delete next.root;
   const {rename}=await import('node:fs/promises');
   const path=join(current.root,'instance.json');

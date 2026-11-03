@@ -14,7 +14,7 @@ export async function main(argv=process.argv.slice(2)) {
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','project','wave','resume','stop','dashboard','kdb','tune']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','resume','stop','dashboard','kdb','tune']};
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
@@ -32,9 +32,8 @@ export async function main(argv=process.argv.slice(2)) {
     if (!values.config)return {...config,skillsmap:map};
     const input=JSON.parse(await readFile(values.config,'utf8'));
     if(input.skillsmap && JSON.stringify(input.skillsmap)!==JSON.stringify(map)) {
-      const version='user-'+randomUUID(),directory=join(root,'skills','versions',version);
-      await cp(skillRoot,directory,{recursive:true});
-      await writeFile(join(directory,'skill-map.json'),JSON.stringify(input.skillsmap,null,2)+'\n');
+      const {copyVersion}=await import('./skill-input.mjs');
+      const version=await copyVersion(config,input.skillsmap);
       input.skills={...config.skills,...input.skills,activeVersion:version};
     }
     delete input.skillsmap;
@@ -60,7 +59,14 @@ export async function main(argv=process.argv.slice(2)) {
       await rename(join(root,'knowledge.sqlite'),join(root,'knowledge-before-'+randomUUID()+'.sqlite'));
       await rename(next,join(root,'knowledge.sqlite'));
     }
-    return updateConfig(root,current=>({...current,...input,format:1}));
+    return updateConfig(root,current=>{
+      if(input.revision!==undefined && input.revision!==(current.revision??0))throw new Error('Inputs changed; refresh before saving');
+      return {...current,...input,format:1};
+    });
+  }
+  if(command==='skill') {
+    const action=JSON.parse(await readFile(values.config,'utf8'));
+    return (await import('./skill-input.mjs')).run(config,action);
   }
   if(command==='project') {
     if(!values.project) return config.projects;
