@@ -7,9 +7,10 @@ export { generateCandidate };
 
 const scopes = ['global-kdb', ...stages];
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
-const save = async (path, value) => {
+const save = async (path, value, signal) => {
   const tmp = `${path}.${randomUUID()}.tmp`;
   await writeFile(tmp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+  signal?.throwIfAborted();
   await rename(tmp, path);
 };
 const completed = task => task?.completed === true && task.id && task.projectId &&
@@ -122,7 +123,8 @@ async function writeVersion(root, entries, source) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal }) {
+  signal?.throwIfAborted();
   const current = await json(configPath);
   const mode = task?.phase ?? config?.mode ?? current.mode;
   if (current.skills?.tuningDisabled || mode === 'phase1') return { analyse: false, evaluate: false };
@@ -140,7 +142,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
     state.pending = null;
-    await save(statePath, state);
+    await save(statePath, state, signal);
     return { promote: true, reason: 'recovered-promotion' };
   }
   const decision = cadenceDecision(state.history, task, state.lastEvaluated);
@@ -165,17 +167,20 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const validate = changes => applyProposal(entries, changes, {
       allowPruning: new Set(counted.map(x => x.id)).size >= 24,
       history: manual ? [...history, entry] : history });
+    signal?.throwIfAborted();
     const changes = await generate({ directory: proposalRoot, input: { entries, history, originalCount: new Set(counted.map(x => x.id)).size, userinfo, context: { ...entry, userinfo },
       actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
-      validate, native, modelRuntime, model, seconds: current.skill_writer_seconds ?? 240 });
+      validate, native, modelRuntime, model, signal, seconds: current.skill_writer_seconds ?? 240 });
+    signal?.throwIfAborted();
     if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
     const updated = validate(changes);
     const candidate = await writeVersion(root, updated, source);
+    signal?.throwIfAborted();
     state.history = history;
     state.pending = shouldEvaluate ? { active, candidate, projects: new Set(counted.map(x => x.projectId)).size,
       projectIds, proposalRoot, manual } : null;
     state.candidate = candidate;
-    await save(statePath, state);
+    await save(statePath, state, signal);
     if (!shouldEvaluate) return { ...decision, analyse: true, evaluate: false, candidate };
   }
   if (typeof evaluate !== 'function') throw new Error('Canonical evaluator required');
@@ -187,9 +192,12 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (current.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
   const results = [];
   const evaluationRoot = join(directory, 'evaluations', randomUUID());
+  signal?.throwIfAborted();
   await mkdir(evaluationRoot, { recursive: true });
+  await save(join(evaluationRoot, 'results.json'), results);
   for (const projectId of ids) for (let run = 0; run < runs; run++) {
     for (const arm of run % 2 ? ['candidate', 'active'] : ['active', 'candidate']) {
+      signal?.throwIfAborted();
       const isolatedRoot = join(evaluationRoot, randomUUID());
       const skillVersion = pending[arm];
       const isolatedConfig = structuredClone(current);
@@ -197,11 +205,12 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       isolatedConfig.mode = mode;
       isolatedConfig.skills = { ...isolatedConfig.skills, activeVersion: skillVersion, tuningDisabled: true };
       const result = await evaluate({ instanceRoot: isolatedRoot, config: isolatedConfig,
-        sourceInstanceRoot: root, projectId, run, arm, skillVersion });
+        sourceInstanceRoot: root, projectId, run, arm, skillVersion, signal });
       results.push({ ...result, projectId, run, arm, instanceRoot: isolatedRoot });
       await save(join(evaluationRoot, 'results.json'), results);
     }
   }
+  signal?.throwIfAborted();
   const verdict = evaluateDecision(results, ids, runs);
   await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   if (verdict.promote) {
@@ -209,10 +218,11 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     if (latest.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
     latest.skills.activeVersion = pending.candidate;
     latest.revision = (latest.revision ?? 0) + 1;
-    await save(configPath, latest);
+    await save(configPath, latest, signal);
   }
+  signal?.throwIfAborted();
   if (!pending.manual) state.lastEvaluated = pending.projects;
   state.pending = null;
-  await save(statePath, state);
+  await save(statePath, state, signal);
   return { ...verdict, candidate: pending.candidate, evaluationRoot };
 }

@@ -138,18 +138,19 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
   const pending = await load(join(root, 'skills', 'evolution.json'));
   pending.pending.candidate = 'candidate';
   await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify(pending));
-  const calls = [];
+  const calls = [], controller = new AbortController();
   const runtime = {
-    async bootstrap(request) { calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
+    async bootstrap(request) { assert.equal(request.signal, controller.signal); calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
     async wave(request) {
       calls.push(['wave', request.instanceRoot]);
       assert.deepEqual(request.projectIds.length, 1);
       assert.equal(request.evaluation, true);
+      assert.equal(request.signal, controller.signal);
       assert.equal(request.config.root, request.instanceRoot);
       return { correct: true, score: 1 };
     }
   };
-  const result = await lockedRun({ ...config, root }, { runtime });
+  const result = await lockedRun({ ...config, root }, { runtime, signal: controller.signal });
   assert.equal(result.promote, false);
   assert.equal(calls.length, 16);
   for (let i = 0; i < calls.length; i += 2) {
@@ -300,4 +301,29 @@ test('CLI refreshes after lock claim and preserves executed mode while using fre
   assert.ok((await run(stale, { ...dependencies, manual: true })).candidate);
   assert.equal(claims, 2);
   assert.equal(held, false);
+});
+
+test('stopped canonical bootstrap/wave retains partial A/B and never promotes or consumes cadence', async t => {
+  for (const stopAt of ['bootstrap', 'wave']) {
+    const root = await fixture(t), controller = new AbortController();
+    await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({ history: history(8), lastEvaluated: 0,
+      pending: { active: 'baseline', candidate: 'candidate', projects: 8 } }));
+    let waves = 0;
+    const runtime = {
+      async bootstrap(request) {
+        assert.equal(request.signal, controller.signal);
+        await mkdir(request.instanceRoot); await writeFile(join(request.instanceRoot, 'partial.log'), 'retained');
+        if (stopAt === 'bootstrap') controller.abort();
+      },
+      async wave(request) { waves++; assert.equal(request.signal, controller.signal);
+        controller.abort(); return { correct: true, score: 2 }; }
+    };
+    await assert.rejects(lockedRun({ ...config, root }, { runtime, signal: controller.signal }), { name: 'AbortError' });
+    assert.equal(waves, stopAt === 'wave' ? 1 : 0);
+    assert.equal((await load(join(root, 'instance.json'))).skills.activeVersion, 'baseline');
+    const state = await load(join(root, 'skills', 'evolution.json'));
+    assert.equal(state.lastEvaluated, 0); assert.ok(state.pending);
+    const evaluations = join(root, 'skills', 'evaluations'), ids = await readdir(evaluations);
+    assert.equal((await load(join(evaluations, ids[0], 'results.json'))).length, waves);
+  }
 });

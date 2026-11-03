@@ -11,12 +11,14 @@ import { tune } from '../controller/skill-evolution.mjs';
 // Both functions retain native provider/session/SFT and verifier evidence inside that instance.
 // Programmatic callers may supply values.runtime with these exact functions instead.
 export async function run(config, values = {}) {
+  values.signal?.throwIfAborted();
   if (config.skills?.tuningDisabled || (values.task?.phase ?? config.mode) === 'phase1')
     return { analyse: false, evaluate: false };
   const instanceRoot = resolve(config.root);
   const executedMode = values.task?.phase ?? config.mode;
   const lock = values.lock ?? (await import('./evolution-lock.mjs')).withSkillLock;
   return await lock(config, async () => {
+    values.signal?.throwIfAborted();
     const readConfig = values.readConfig ?? (await import('./instance.mjs')).readConfig;
     config = { ...await readConfig(instanceRoot), root: instanceRoot };
     if (values.task) config.mode = executedMode;
@@ -42,6 +44,7 @@ export async function run(config, values = {}) {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     const generate = async options => {
+      values.signal?.throwIfAborted();
       let { modelRuntime, model } = values;
       if (!modelRuntime || !model) {
         if (modelRuntime || model) throw new Error('Inject both modelRuntime and model');
@@ -54,6 +57,7 @@ export async function run(config, values = {}) {
       const { ensureKnowledgeService } = values.knowledge ?? await import('./knowledge.mjs');
       const { createKdbBridge } = values.knowledge ?? await import('../integrations/kdb-extension.mjs');
       const url = await ensureKnowledgeService(config);
+      values.signal?.throwIfAborted();
       const bridge = createKdbBridge({ url, attemptId: task?.id ?? `manual-${randomUUID()}`,
         agentDir: join(options.directory, 'agent'), event: async (type, data) =>
           appendFile(join(options.directory, 'knowledge-events.jsonl'), JSON.stringify({ type, data }) + '\n') });
@@ -69,11 +73,13 @@ export async function run(config, values = {}) {
         await access(request.instanceRoot);
         throw new Error('Evaluation instance already exists');
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      request.signal?.throwIfAborted();
       await runtime.bootstrap(request);
+      request.signal?.throwIfAborted();
       return runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
-        projectIds: [request.projectId], evaluation: true });
+        projectIds: [request.projectId], evaluation: true, signal: request.signal });
     };
     return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
-      task, userinfo, manual, context, evaluate, generate, native: values.native });
+      task, userinfo, manual, context, evaluate, generate, native: values.native, signal: values.signal });
   });
 }
