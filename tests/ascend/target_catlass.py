@@ -164,3 +164,42 @@ def test_kernel_reload_stages_current_bytes_despite_same_size_timestamp_and_cach
     assert catlass.load_kernel(path,expected_sha256=catlass.sha(path))(None,None,None)==2
     with pytest.raises(ValueError,match="candidate source identity mismatch"):
         catlass.load_kernel(path,expected_sha256="0"*64)
+
+
+def test_bitcode_child_selects_validated_package_before_inherited_package_and_keeps_dependencies(tmp_path, monkeypatch):
+    import json
+    preferred, inherited = tmp_path/'preferred', tmp_path/'inherited'
+    output = tmp_path/'child-selection.json'
+    for root,label in [(preferred,'preferred'),(inherited,'inherited')]:
+        package=root/'catlass';package.mkdir(parents=True)
+        (package/'__init__.py').write_text('')
+        (package/'bc_compile.py').write_text(
+            'import json,pathlib,registry_dependency\n'+
+            f'pathlib.Path({str(output)!r}).write_text(json.dumps([{label!r},registry_dependency.VALUE]))\n')
+    (inherited/'registry_dependency.py').write_text("VALUE='registry-preserved'\n")
+    monkeypatch.setenv('PYTHONPATH',str(inherited))
+    monkeypatch.setattr(sys,'path',sys.path.copy())
+    monkeypatch.setattr(sys,'version_info',(3,11))
+    monkeypatch.setattr(catlass,'check_runtime',lambda identity:
+        catlass.configure_target_python_paths(identity['target_python_paths']))
+    monkeypatch.setattr(catlass,'local_probe',lambda **kwargs:dict(admitted=True))
+    monkeypatch.setattr(catlass,'load_kernel',lambda *args,**kwargs:object())
+    tla=SimpleNamespace(arch=SimpleNamespace(RowMajor='row'),compile=lambda *args,**kwargs:object())
+    torch=SimpleNamespace(__version__='fixture',__file__=__file__,float32='f32',tensor=lambda values,**kwargs:Tensor(values),
+                          npu=SimpleNamespace(set_device=lambda _:None))
+    monkeypatch.setitem(sys.modules,'torch',torch)
+    monkeypatch.setitem(sys.modules,'torch_npu',SimpleNamespace(__version__='fixture',__file__=__file__))
+    monkeypatch.setitem(sys.modules,'catlass',SimpleNamespace(tla=tla))
+    monkeypatch.setitem(sys.modules,'catlass.tla',tla)
+    monkeypatch.setitem(sys.modules,'catlass.tla.runtime',SimpleNamespace(from_dlpack=lambda value,**kwargs:value))
+    for name in ('ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'):
+        monkeypatch.delenv(name,raising=False)
+    identity=dict(device_health=dict(product='a5'),target_python_paths=[str(preferred)],
+                  expected_versions=dict(torch='fixture',torch_npu='fixture'),
+                  module_sha256=dict(torch=catlass.sha(__file__),torch_npu=catlass.sha(__file__)))
+    args=SimpleNamespace(mode='compile',physical_device=0,candidate=str(tmp_path/'candidate.py'),source_sha256='trusted')
+    report=dict(compile='not-run',launch='not-run',correctness='not-run',device_evidence=False)
+    catlass.execute(args,dict(abi_version=1,operation='add',cases=[dict(length=3,block_count=1,seed=17)]),
+                    identity,tmp_path,report,lambda:None)
+    assert json.loads(output.read_text())==['preferred','registry-preserved']
+    assert __import__('os').environ['PYTHONPATH']==str(inherited)

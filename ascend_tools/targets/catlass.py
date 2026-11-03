@@ -147,7 +147,12 @@ def execute(args, contract, identity, directory, report, save):
     torch.npu.set_device(0)
     kernel = load_kernel(Path(args.candidate), contract.get('allowed_helpers', ()), contract.get('entrypoint', 'kernel'), expected_sha256=args.source_sha256)
     os.environ['CATLASS_DSL_CACHE_DIR'] = str(directory/'cache')
-    subprocess.run([sys.executable, '-m', 'catlass.bc_compile'], check=True)
+    child_environment = os.environ.copy()
+    paths = identity.get('target_python_paths', [])
+    if paths:
+        inherited = child_environment.get('PYTHONPATH')
+        child_environment['PYTHONPATH'] = os.pathsep.join(paths + ([inherited] if inherited else []))
+    subprocess.run([sys.executable, '-m', 'catlass.bc_compile'], check=True, env=child_environment)
     report.update(physical_device=physical, logical_device=0, cases=[])
     for index, case in enumerate(contract['cases']):
         if type(case['length']) is not int or not 1 <= case['length'] <= 512 or type(case['block_count']) is not int or case['block_count'] < 1:
