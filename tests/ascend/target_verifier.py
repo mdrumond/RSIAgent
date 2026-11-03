@@ -86,3 +86,31 @@ def test_nonfinite_candidate_retains_a_valid_failure_report(tmp_path):
     assert report['status'] == 'failed'
     assert retained['correctness'] == 'failed'
     assert retained['cases'][0]['actual'] == ['nan', 'nan', 'nan']
+
+
+@pytest.mark.parametrize('physical', [0, 1])
+def test_same_frozen_toolchain_accepts_explicit_leased_device(tmp_path, monkeypatch, physical):
+    from ascend_tools.targets.runner import bind_device
+    manifest = tmp_path/'runtime.json'
+    manifest.write_text(json.dumps(dict(target='a3-triton', device_health=dict(product='a3', chip=0))))
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    for name in ('ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
+        monkeypatch.delenv(name, raising=False)
+    assert bind_device(SimpleNamespace(physical_device=physical), json.loads(manifest.read_text()), 'a3') == physical
+    assert __import__('os').environ['ASCEND_PHYSICAL_DEVICE'] == str(physical)
+    assert __import__('os').environ['ASCEND_RT_VISIBLE_DEVICES'] == str(physical)
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize('name', ['ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'])
+def test_execution_binding_rejects_mask_or_assignment_mismatch(monkeypatch, name):
+    from ascend_tools.targets.runner import bind_device
+    monkeypatch.setenv(name, '0')
+    with pytest.raises(ValueError, match='mismatch'):
+        bind_device(SimpleNamespace(physical_device=1), dict(device_health=dict(product='a3')), 'a3')
+
+
+def test_frozen_device_affinity_is_not_silently_reinterpreted():
+    from ascend_tools.targets.runner import runtime_check
+    with pytest.raises(ValueError, match='must not bind'):
+        runtime_check(dict(physical_device=0), 'a3-triton')
