@@ -11,7 +11,7 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[]}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal}) {
   await mkdir(attemptPath,{recursive:true});
   const event=(type,data)=>state.event(attempt.id,type,data);
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
@@ -19,6 +19,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     exclude:(label,fn)=>clock.exclude(label,fn)});
   const checkVerifier=await freezeFiles(project.verifier.files,project.source);
   let session,timer,accepted=false;
+  const abort=()=>{void session?.abort();};
+  signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
   const workflow=new Workflow({clock,event,fingerprint:()=>fingerprint(project.source),
     readSkill:async stage=>{
@@ -96,8 +98,10 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
       if (!clock.remaining) void session.abort();
     },1000);
+    if(signal?.aborted)throw new Error('Attempt interrupted');
     await session.prompt(`Goal: ${project.goal}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project.`);
     await session.waitForIdle();
+    if(signal?.aborted)throw new Error('Attempt interrupted');
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
     if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});
@@ -109,6 +113,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     // Keep the attempt open until the caller confirms all recorded external handles stopped.
     throw error;
   } finally {
+    signal?.removeEventListener('abort',abort);
     clearInterval(timer);
     session?.dispose();
   }
