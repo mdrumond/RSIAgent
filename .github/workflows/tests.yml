@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: '22.23.3'
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: npm-shrinkwrap.json
       - run: python -m pip install -e '.[dev]'
       - run: npm ci
       - name: Native controller, environment and MCP CPU contracts
