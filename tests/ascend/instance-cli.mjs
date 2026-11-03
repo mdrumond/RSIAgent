@@ -1,0 +1,55 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { stages } from '../../controller/workflow.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { bootstrap, readConfig, updateConfig, upgrade } from '../../cli/instance.mjs';
+import { main } from '../../cli/main.mjs';
+
+test('bootstrap snapshots own memory, skills and machinery; CLI changes persist independently',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'ascend-instance-'));
+  try {
+    const baseline=join(root,'baseline.sqlite'),db=new DatabaseSync(baseline);
+    db.exec('PRAGMA journal_mode=WAL; CREATE TABLE knowledge (text TEXT); INSERT INTO knowledge VALUES (\'baseline\')');
+    const skills=join(root,'baseline-skills');await mkdir(skills);
+    const map=Object.fromEntries(['global-kdb',...stages].map(scope=>[scope,scope+'.md']));
+    for(const file of Object.values(map))await writeFile(join(skills,file),'Baseline guidance');
+    await writeFile(join(skills,'skill-map.json'),JSON.stringify(map));
+    const machinery=join(root,'release');await mkdir(machinery);await mkdir(join(machinery,'controller'));
+    await writeFile(join(machinery,'controller','marker.mjs'),'export const marker=1');
+    const instance=join(root,'instance');
+    await bootstrap(instance,{baseline,skills,machinery,environment:{module:'./local.mjs',options:{mode:'local'}}});
+    const memory=new DatabaseSync(join(instance,'knowledge.sqlite'));
+    assert.equal(memory.prepare('SELECT text FROM knowledge').get().text,'baseline');memory.close();
+    db.exec("UPDATE knowledge SET text='changed'");db.close();
+    assert.equal((await readConfig(instance)).skills.activeVersion,'baseline');
+    await updateConfig(instance,c=>({...c,mode:'phase2',concurrency:2}));
+    assert.equal((await main(['config','--instance',instance])).mode,'phase2');
+    assert.equal(await readFile(join(instance,'machinery','controller','marker.mjs'),'utf8'),'export const marker=1');
+    const projectSource=join(root,'input');await mkdir(projectSource);await writeFile(join(projectSource,'answer.py'),'answer=42');
+    const verifier=join(root,'verify.py');await writeFile(verifier,'assert 6*7==42');
+    const project={id:'python',goal:'numeric',actor_seconds:240,source:projectSource,verifier:{command:'python ../verify.py',files:[verifier]}};
+    const spec=join(root,'project.json');await writeFile(spec,JSON.stringify(project));
+    await main(['project','--instance',instance,'--project',spec]);
+    const status=await main(['status','--instance',instance]);
+    assert.equal(status.projects[0].status,'queued');
+    assert.equal(status.projects[0].id,'python');
+    await writeFile(spec,JSON.stringify({...project,goal:'edited numeric goal'}));
+    await main(['project','--instance',instance,'--project',spec]);
+    assert.equal((await readConfig(instance)).projects.length,1);
+    const action=join(root,'skill-edit.json');await writeFile(action,JSON.stringify({scope:'design',content:'Inspect prior failures first'}));
+    const edited=await main(['skill','--instance',instance,'--config',action]);
+    assert.notEqual(edited.version,'baseline');
+    assert.equal(await readFile(join(instance,'skills','versions','baseline','design.md'),'utf8'),'Baseline guidance');
+    await writeFile(action,JSON.stringify({scope:'design'}));
+    assert.equal((await main(['skill','--instance',instance,'--config',action])).content,'Inspect prior failures first');
+    await writeFile(join(machinery,'controller','marker.mjs'),'export const marker=2');
+    await upgrade(instance,machinery);
+    assert.equal(await readFile(join(instance,'machinery','controller','marker.mjs'),'utf8'),'export const marker=2');
+    assert.equal((await main(['status','--instance',instance])).projects[0].id,'python');
+    assert.ok((await main(['browse','--instance',instance])).entries.some(e=>e.name==='machinery' && e.isDirectory));
+    await assert.rejects(bootstrap(join(machinery,'nested'),{baseline,skills,machinery,environment:{}}));
+  }finally{await rm(root,{recursive:true,force:true});}
+});
