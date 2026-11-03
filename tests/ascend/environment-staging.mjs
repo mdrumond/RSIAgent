@@ -14,7 +14,7 @@ async function fixture(t) {
   await writeFile(join(source, 'value.txt'), 'one');
   await writeFile(join(source, 'run.sh'), '#!/bin/bash\ncat value.txt\n', { mode: 0o755 });
   const calls = [], events = [], jobs = new Map(), excluded = [];
-  const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0 };
+  const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0, uploadStates: null };
   let sequence = 0;
   const operations = sdk.createLocalBashOperations();
   const context = {
@@ -32,6 +32,12 @@ async function fixture(t) {
         const destination = join(remote, args[3]);
         await mkdir(dirname(destination), { recursive: true });
         await cp(args[2], destination, { recursive: true });
+        if (control.uploadStates) {
+          const handle = `remote:${args[1]}:transfer:${++sequence}`;
+          jobs.set(handle, { states: [...control.uploadStates] });
+          control.uploadStates = null;
+          return { state: 'queued', handle };
+        }
         return { state: 'completed' };
       }
       if (args[0] === 'download') { await cp(join(remote, args[2]), args[3]); return { state: 'completed' }; }
@@ -49,6 +55,7 @@ async function fixture(t) {
       }
       if (args[0] === 'observe') {
         const job = jobs.get(args[1]);
+        if (job.states) return { state: job.states.shift() ?? 'completed' };
         if (job.sync && control.disconnected) return { state: 'observation-unavailable' };
         return { state: job.state, exit: job.exit };
       }
@@ -222,3 +229,26 @@ test('retained root mode and directory-to-symlink changes fail before restore; e
     await chmod(join(f.workspace, f.sourceUploads()[0][3]), 0o755);
   }
 });
+
+
+test('native upload retrying is observed on the same handle before one workload delivers full output', async t => {
+  const f = await fixture(t);
+  f.control.uploadStates = ['retrying', 'retrying', 'completed'];
+  const expected = 'complete-output\n'.repeat(10000);
+  assert.equal(await f.run(`python3 -c "print(('complete-output'+chr(10))*10000,end='')"`), expected);
+  assert.equal(f.sourceUploads().length, 1);
+  assert.equal(f.manifests().length, 1);
+  assert.equal(f.runs(true).length, 1); assert.equal(f.runs(false).length, 1);
+  const observations = f.calls.filter(args => args[0] === 'observe' && args[1].includes(':transfer:'));
+  assert.equal(observations.length, 3);
+  assert.equal(new Set(observations.map(args => args[1])).size, 1);
+  assert.equal(f.events.filter(e => e.type === 'execution-output' && e.partial === false).length, 1);
+});
+
+for (const state of ['unknown', 'observation-unavailable'])
+  test(`native upload ${state} blocks without resubmitting or launching workload`, async t => {
+    const f = await fixture(t); f.control.uploadStates = [state];
+    await assert.rejects(f.environment.execute('touch must-not-run', f.source), /Transfer unresolved/);
+    assert.equal(f.sourceUploads().length, 1); assert.equal(f.manifests().length, 0);
+    assert.equal(f.runs(true).length, 0); assert.equal(f.runs(false).length, 0);
+  });
