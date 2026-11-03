@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
+import { validateAcceptance } from './state.mjs';
 import { fingerprint, freezeFiles } from './evidence.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
@@ -12,6 +13,7 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
   knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true}) {
+  validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
   let activeOperation=null;
   const event=(type,data)=>state.event(attempt.id,type,{...data,
@@ -53,14 +55,24 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       return {content:guidance+'\n\n'+content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
     },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
     verify:async(verifySignal)=>{
-      await checkVerifier();
-      let output='';
-      const response=await execute(project.verifier.command,project.source,{
-        timeout:clock.remaining,signal:verifySignal??signal,purpose:'verification',onData:data=>{output+=data.toString();}});
-      await checkVerifier();
-      const evidence=join(attemptPath,`verify-${Date.now()}.log`);
-      await appendFile(evidence,output);
-      return {passed:response.settled === true && response.exitCode === 0,evidence};
+      const check=async(command,purpose)=>{
+        clock.check();
+        await checkVerifier();
+        let output='';
+        const response=await execute(command,project.source,{
+          timeout:clock.remaining,signal:verifySignal??signal,purpose,
+          onData:data=>{output+=data.toString();}});
+        await checkVerifier();
+        const evidence=join(attemptPath,`verify-${purpose}-${Date.now()}.log`);
+        await appendFile(evidence,output);
+        return {passed:response.exitCode === 0,exitCode:response.exitCode,evidence};
+      };
+      const correctness=await check(project.verifier.command,'verification');
+      const performance=project.verifier.performance_command
+        ? correctness.passed ? await check(project.verifier.performance_command,'performance')
+          : {passed:false,skipped:true} : null;
+      return {correctness,performance,passed:correctness.passed && (!performance || performance.passed),
+        evidence:{correctness:correctness.evidence,performance:performance?.evidence??null}};
     }}).restore(state.events(attempt.id));
   const extension=pi=>{
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
@@ -83,6 +95,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     pi.registerTool(sdk.createBashTool(project.source,{operations:{exec:async(command,cwd,options)=>{
       clock.check();
       const response=await execute(command,cwd,{...options,
+        purpose:project.purpose??(project.performance_goal?'performance':'ordinary'),
         timeout:Math.min(options.timeout ?? Infinity,clock.remaining)});
       if (!response.settled) throw new Error('Execution remains observable; resolve its recorded handle before continuing');
       return {exitCode:response.exitCode};
@@ -131,7 +144,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       if (!clock.remaining) void session.abort();
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');
-    await session.prompt(`Goal: ${project.goal}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project.`);
+    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project.`);
     await session.waitForIdle();
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
