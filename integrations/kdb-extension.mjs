@@ -57,7 +57,8 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
         remaining -= text.length;
         return {collection:hit.collection, chunk_id:hit.chunk_id, path:hit.path,
           start_line:hit.start_line, end_line:hit.end_line, source_sha256:hit.source_sha256,
-          kind:hit.kind, target:hit.target, score:hit.score, text,
+          kind:hit.kind, target:hit.target, language:hit.language,
+          kernel_languages:hit.kernel_languages, score:hit.score, text,
           truncated:text.length !== hit.text.length};
       });
       const evidence = content.map(hit => ({

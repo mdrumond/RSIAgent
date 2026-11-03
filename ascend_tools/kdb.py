@@ -46,13 +46,12 @@ class KDB:
             LEFT JOIN knowledge_scopes s ON c.name=s.collection
         ''').fetchall()
         for row in rows:
-            manifest = self.db.manifest(row['name'])
             scoped_kind = row['kind'] or 'good'
             if kind != 'all' and kind != scoped_kind:
                 continue
-            scopes = (row['target'],) if row['target'] else (
-                manifest.language, *manifest.kernel_languages)
-            if target is None or target in scopes:
+            # Programming languages do not imply a device/profile binding.
+            # Imported baseline collections without an explicit target are universal.
+            if target is None or row['target'] is None or target == row['target']:
                 selected.append((row, scoped_kind))
         if not selected:
             return []
@@ -83,8 +82,11 @@ class KDB:
             if keyword_rank is not None:
                 score += 1 / (RRF_K + keyword_rank)
             scoped_kind, scoped_target = metadata[name]
+            manifest = self.db.manifest(name)
             hits.append(dict(asdict(hit), collection=name, kind=scoped_kind,
-                             target=scoped_target, score=score, vector_rank=rank,
+                             target=scoped_target, language=manifest.language,
+                             kernel_languages=list(manifest.kernel_languages),
+                             score=score, vector_rank=rank,
                              lexical_rank=keyword_rank, lexical_score=None,
                              source_sha256=self.db.source_fingerprint(name, hit.path).sha256))
         return sorted(hits, key=lambda hit: (-hit['score'], hit['collection'],
