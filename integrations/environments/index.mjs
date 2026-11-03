@@ -238,7 +238,7 @@ export async function createEnvironment(options, context) {
     });
     if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
     const spool = posix.join(runRoot, 'output');
-    const configuration = { command, verifiers: opts.purpose === 'verification' ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
+    const configuration = { command, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
       spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) =>
         key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (opts.env ?? {}))) && process.env[key] !== value)) }, timeout: remaining() ?? null };
     const script = join(dir, 'command.sh');

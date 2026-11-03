@@ -191,13 +191,14 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const verified = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'verifier-attempts', pollMs: 1 }, context);
   await verified.prepare({ project: { id: 'verified', source: project, verifier: { files: [verifier], command: 'python3 ../verify.py' } }, attempt: { id: 'v' } });
   let verifiedOutput = '';
-  const verify = () => verified.execute('python3 ../verify.py', project, { purpose: 'verification', onData: data => { verifiedOutput += data; } });
+  const verify = (purpose = 'verification') => verified.execute('python3 ../verify.py', project, { purpose, onData: data => { verifiedOutput += data; } });
   assert.equal((await verify()).exitCode, 0);
   assert.equal(verifiedOutput, 'verified\n');
   await writeFile(join(project, 'mutate'), '1');
-  assert.equal((await verify()).exitCode, 125); // mutation during verification rejects success
+  assert.equal((await verify('performance')).exitCode, 125); // performance self-mutation rejects success
   assert.equal((await verified.execute('rm verified.marker', project)).exitCode, 0);
   assert.equal((await verify()).exitCode, 125); // existing corruption prevents verifier launch
+  assert.equal((await verify('performance')).exitCode, 125);
   assert.equal((await verified.execute('test ! -e verified.marker', project)).exitCode, 0);
 });
 
