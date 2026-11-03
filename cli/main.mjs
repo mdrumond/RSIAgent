@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { readFile, cp, writeFile, rename } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { bootstrap, readConfig, updateConfig } from './instance.mjs';
@@ -21,8 +23,39 @@ export async function main(argv=process.argv.slice(2)) {
   const root=resolve(values.instance??arg??'.');
   const config=await readConfig(root);
   if (command==='config') {
-    if (!values.config)return config;
+    const skillRoot=join(root,'skills','versions',config.skills.activeVersion);
+    const map=JSON.parse(await readFile(join(skillRoot,'skill-map.json'),'utf8'));
+    if (!values.config)return {...config,skillsmap:map};
     const input=JSON.parse(await readFile(values.config,'utf8'));
+    if(input.skillsmap && JSON.stringify(input.skillsmap)!==JSON.stringify(map)) {
+      const version='user-'+randomUUID(),directory=join(root,'skills','versions',version);
+      await cp(skillRoot,directory,{recursive:true});
+      await writeFile(join(directory,'skill-map.json'),JSON.stringify(input.skillsmap,null,2)+'\n');
+      input.skills={...config.skills,...input.skills,activeVersion:version};
+    }
+    delete input.skillsmap;
+    if(input.baselineKDB && input.baselineKDB!==config.baselineKDB) {
+      const ledger=new State(join(root,'state.sqlite'));
+      try {if(ledger.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n)throw new Error('Baseline is frozen after first attempt; bootstrap a fresh instance');}
+      finally {ledger.close();}
+      let service;try {service=JSON.parse(await readFile(join(root,'knowledge-service.json'),'utf8'));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+      if(service) {
+        const {ownerStopped}=await import('../controller/lifecycle.mjs');
+        if(!service.owner?.start || !service.owner?.boot)throw new Error('KDB owner cannot be verified');
+        if(!await ownerStopped(service.owner)) {
+          process.kill(service.owner.pid,'SIGTERM');
+          const {setTimeout:delay}=await import('node:timers/promises');
+          const deadline=performance.now()+5000;
+          while(!await ownerStopped(service.owner) && performance.now()<deadline)await delay(50);
+          if(!await ownerStopped(service.owner))throw new Error('KDB service has not stopped');
+        }
+      }
+      const next=join(root,'knowledge-next.sqlite'),db=new DatabaseSync(input.baselineKDB,{readOnly:true});
+      try{db.prepare('VACUUM INTO ?').run(next);}finally{db.close();}
+      await rename(join(root,'knowledge.sqlite'),join(root,'knowledge-before-'+randomUUID()+'.sqlite'));
+      await rename(next,join(root,'knowledge.sqlite'));
+    }
     return updateConfig(root,current=>({...current,...input,format:1}));
   }
   if(command==='project') {
@@ -43,7 +76,7 @@ export async function main(argv=process.argv.slice(2)) {
     const {readdir}=await import('node:fs/promises');
     const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     const path=resolve(action.path??root);
-    return {path,entries:(await readdir(path,{withFileTypes:true})).filter(e=>e.isDirectory()).map(e=>e.name)};
+    return {path,entries:(await readdir(path,{withFileTypes:true})).filter(e=>e.isDirectory()).map(e=>({name:e.name,path:join(path,e.name),isDirectory:true}))};
   }
   if(command==='status') {
     const state=new State(join(root,'state.sqlite'));
@@ -59,7 +92,7 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==='dashboard') {
     const {spawn}=await import('node:child_process');
     const child=spawn(config.python??'python',['-m','ascend_tools.dashboard','--instance',root,
-      '--port',values.port??'46731'],{stdio:'inherit',env:{...process.env,
+      '--port',values.port??'46731','--node',process.execPath],{stdio:'inherit',env:{...process.env,
         PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)}});
     return new Promise((res,rej)=>{child.on('error',rej);child.on('close',code=>code?rej(new Error('Dashboard failed')):res({stopped:true}));});
   }

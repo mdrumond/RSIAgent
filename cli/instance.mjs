@@ -1,6 +1,8 @@
 import { cp, mkdir, readFile, writeFile, realpath, stat } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { dirname, delimiter } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 export async function readConfig(root) {
@@ -12,7 +14,7 @@ export async function readConfig(root) {
 const within=(parent,child)=>{const rel=relative(parent,child);return rel==='' || (!rel.startsWith('..'+sep) && rel!=='..');};
 
 export async function bootstrap(destination,{baseline,skills,environment,projects=[],repository,
-  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800}={}) {
+  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,...settings}={}) {
   destination=resolve(destination);machinery=await realpath(machinery);
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
@@ -32,7 +34,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     filter:path=>!['node_modules','.venv','__pycache__'].includes(path.split(sep).at(-1))});
   const release=join(destination,'machinery');
   await mkdir(release);
-  for (const item of ['controller','cli','ascend_tools','web','package.json','package-lock.json']) {
+  for (const item of ['controller','cli','ascend_tools','web','templates','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
     const from=join(machinery,item);
     try {await stat(from);} catch(error) {if(error.code==='ENOENT')continue;throw error;}
     await cp(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))});
@@ -42,9 +44,19 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     try {await cp(join(machinery,'integrations',item),join(release,'integrations',item),{recursive:true});}
     catch(error) {if(error.code!=='ENOENT')throw error;}
   }
-  const config={format:1,mode,actor_seconds,failed_recovery_rounds:5,recovery:true,
-    concurrency:1,tune_every:8,skills:{activeVersion:'baseline'},environment,projects};
+  const config={...settings,format:1,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds:5,recovery:true,
+    concurrency:1,tune_every:8,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
+  if(install) {
+    try {await stat(join(release,'package.json'));}
+    catch(error){if(error.code==='ENOENT')return config;throw error;}
+    await new Promise((ok,no)=>{
+      const child=spawn('npm',['ci','--ignore-scripts','--prefix',release],{
+        env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
+      let error='';child.stderr.on('data',data=>error+=data);child.on('error',no);
+      child.on('close',code=>code?no(new Error('Instance dependency installation failed: '+error)):ok());
+    });
+  }
   return config;
 }
 
