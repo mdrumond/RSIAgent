@@ -82,7 +82,7 @@ def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, 
     monkeypatch.setitem(sys.modules, 'catlass.tla', tla)
     monkeypatch.setitem(sys.modules, 'catlass.tla.runtime', SimpleNamespace(from_dlpack=lambda x, **kw:x))
     monkeypatch.setattr(catlass, 'check_runtime', lambda identity: dict(synthetic=True))
-    monkeypatch.setattr(catlass, 'load_kernel', lambda *args: object())
+    monkeypatch.setattr(catlass, 'load_kernel', lambda *args,**kwargs: object())
     monkeypatch.setattr(catlass, 'local_probe', lambda **kw: dict(admitted=True))
     monkeypatch.setattr(catlass.subprocess, 'run', lambda *args, **kw: calls.append('bc_compile'))
     for name in ('ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
@@ -92,7 +92,7 @@ def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, 
                     module_sha256=dict(torch=catlass.sha(__file__), torch_npu=catlass.sha(__file__)))
     report = dict(compile='not-run', launch='not-run', correctness='not-run', device_evidence=False)
     contract = dict(abi_version=1, operation='add', cases=[dict(length=3, block_count=1, seed=17)])
-    args = SimpleNamespace(mode=mode, physical_device=physical, candidate=str(tmp_path/'candidate.py'))
+    args = SimpleNamespace(mode=mode, physical_device=physical, candidate=str(tmp_path/'candidate.py'),source_sha256='trusted-synthetic-source')
     if bad:
         with pytest.raises(ValueError, match='numeric mismatch'):
             catlass.execute(args, contract, identity, tmp_path, report, lambda: None)
@@ -106,3 +106,61 @@ def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, 
     assert calls.index('bc_compile') < calls.index('compile')
     assert __import__('os').environ['ASCEND_PHYSICAL_DEVICE'] == str(physical)
     assert 'physical_device' not in identity
+
+
+@pytest.mark.parametrize('changed', [None, 'compiler_bridge', 'hivmc-a5'])
+def test_current_pipeline_uses_catlass_selected_bridge_and_backend(tmp_path, monkeypatch, changed):
+    from contextlib import nullcontext
+    files = {}
+    for name in ('compiler_bridge', 'hivmc-a5', 'catlass', 'manifest', 'cann'):
+        path = tmp_path/name
+        path.write_text(name)
+        files[name] = path
+    selected = {name: files[name] for name in ('compiler_bridge', 'hivmc-a5')}
+    execution = SimpleNamespace(resolve_bridge_extension_path=lambda:selected['compiler_bridge'],
+                                _find_hivmc_a5=lambda:selected['hivmc-a5'])
+    monkeypatch.setitem(sys.modules, 'catlass', SimpleNamespace(__file__=str(files['catlass'])))
+    monkeypatch.setitem(sys.modules, 'catlass._mlir', SimpleNamespace(ir=SimpleNamespace(Context=nullcontext)))
+    monkeypatch.setitem(sys.modules, 'catlass.execution', execution)
+    monkeypatch.setattr(catlass.sys, 'version_info', (3, 11))
+    monkeypatch.setattr(catlass, 'checked_git', lambda repo,*args:
+        'master-sha' if args==('rev-parse','HEAD') else '160000 commit dep-sha\tdependency' if args[0]=='ls-tree' else '')
+    monkeypatch.delenv('TLA_DSL_COMPILE', raising=False)
+    monkeypatch.setenv('PATH', '')
+    profile = dict(catlass_source=str(tmp_path),source_revision='master-sha',dependency_gitlink='dependency',
+        dependency_revision='dep-sha',cann_version='9.3.0',cann_version_file=str(files['cann']),cann_version_contents='cann',
+        pipeline_manifest=str(files['manifest']),pipeline_manifest_sha256=catlass.sha(files['manifest']),
+        compiler_paths={name:str(files[name]) for name in selected},
+        compiler_consumer_files=[dict(path=str(files[name]),sha256=catlass.sha(files[name])) for name in selected],
+        module_sha256=dict(catlass=catlass.sha(files['catlass'])))
+    if changed:
+        selected[changed] = files['manifest']
+        with pytest.raises(ValueError,match='compiler path mismatch'):
+            catlass.check_runtime(profile)
+    else:
+        assert catlass.check_runtime(profile)['source_revision']=='master-sha'
+
+
+def test_kernel_reload_stages_current_bytes_despite_same_size_timestamp_and_cached_source(tmp_path, monkeypatch):
+    import ast
+    import inspect
+    import os
+    import py_compile
+    # A staging decorator reads source, as the actual DSL does; invoke its staged result.
+    def stage(function):
+        tree = ast.parse(inspect.getsource(function))
+        value = next(node.value.value for node in ast.walk(tree) if isinstance(node, ast.Return))
+        return lambda *_: value
+    monkeypatch.setitem(sys.modules, 'catlass.tla', SimpleNamespace(kernel=stage))
+    monkeypatch.setitem(sys.modules, 'catlass', SimpleNamespace(tla=sys.modules['catlass.tla']))
+    path = tmp_path/'candidate.py'
+    first = 'import catlass.tla as tla\n@tla.kernel\ndef kernel(a,b,c):\n    return 1\n'
+    path.write_text(first)
+    timestamp = path.stat().st_mtime_ns
+    py_compile.compile(str(path),doraise=True)
+    assert catlass.load_kernel(path,expected_sha256=catlass.sha(path))(None,None,None)==1
+    path.write_text(first.replace('return 1','return 2'))
+    os.utime(path,ns=(timestamp,timestamp))
+    assert catlass.load_kernel(path,expected_sha256=catlass.sha(path))(None,None,None)==2
+    with pytest.raises(ValueError,match="candidate source identity mismatch"):
+        catlass.load_kernel(path,expected_sha256="0"*64)

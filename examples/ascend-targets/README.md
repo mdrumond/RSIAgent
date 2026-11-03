@@ -39,12 +39,14 @@ Python3.11 and device_health with product a5 and chip null.
 Additional required fields: catlass_source, source_revision, dependency_gitlink,
 dependency_revision, cann_version (9.3.x), cann_version_file,
 cann_version_contents, pipeline_manifest, pipeline_manifest_sha256,
-compiler_paths (TlaCompile/hivmc-a5), module_sha256 (catlass/torch/torch_npu), and
+compiler_paths (compiler_bridge/hivmc-a5), module_sha256 (catlass/torch/torch_npu), and
 expected_versions (torch/torch_npu). Selected compiler files must be in
 compiler_consumer_files with exact hashes. Paths are resolved exclusively from
 ignored environment settings; the leaf never discovers or rebuilds dependencies.
 A fresh per-run cache is prepared with `python -m catlass.bc_compile` before
-compiling. The installed Catlass MLIR bindings must construct `ir.Context()`.
+compiling. Catlass supplies its own MLIR bindings, which must construct `ir.Context()`.
+Compiler identity uses the actual in-process bridge and backend selected by
+Catlass execution resolvers; no standalone TlaCompile PATH binding is required.
 
 A5 compile mode stops after `tla.compile`; test mode separately launches,
 synchronizes, retains tensors, checks unmodified inputs and compares numerical

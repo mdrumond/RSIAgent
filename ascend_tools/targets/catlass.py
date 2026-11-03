@@ -3,17 +3,15 @@
 No orchestration imports. Compilation, launch, and comparison are separate facts.
 """
 import ast
-import importlib.util
 import math
 import os
 from pathlib import Path
 import random
-import shutil
 import struct
 import subprocess
 import sys
 
-from .runner import sha, compare, bind_device
+from .runner import sha, compare, bind_device, load_candidate
 from .health import local_probe
 
 ABI_VERSION = 1
@@ -57,7 +55,7 @@ def reference(operation, left, right):
         return [struct.unpack('e', struct.pack('e', a))[0] for a in left]
     raise ValueError('unknown frozen operation')
 
-def load_kernel(path, allowed_helpers=(), entrypoint='kernel'):
+def load_kernel(path, allowed_helpers=(), entrypoint='kernel', *, expected_sha256):
     tree = ast.parse(path.read_text())
     # ABI v1 accepts kernel definitions, documented Catlass imports and numeric
     # constants. It does not execute an Actor-owned host launch/fallback.
@@ -86,9 +84,7 @@ def load_kernel(path, allowed_helpers=(), entrypoint='kernel'):
                     and value.value.id == 'tla' and value.attr in ('Float16', 'Float32', 'BFloat16')):
                 continue
         raise ValueError('candidate module violates frozen Catlass ABI v1')
-    spec = importlib.util.spec_from_file_location('rsi_catlass_candidate', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_candidate('rsi_catlass_candidate', path, expected_sha256)
     return getattr(module, entrypoint)
 
 
@@ -110,15 +106,16 @@ def check_runtime(profile):
         raise ValueError('installed pipeline manifest mismatch')
     fingerprints = {str(Path(item['path']).resolve()): item['sha256']
                     for item in profile['compiler_consumer_files']}
-    for name, variable in [('TlaCompile', 'TLA_DSL_COMPILE'), ('hivmc-a5', 'TLA_DSL_HIVMC_A5')]:
-        selected = os.environ.get(variable) or shutil.which(name)
-        expected = str(Path(profile['compiler_paths'][name]).resolve())
-        if selected is None or str(Path(selected).resolve()) != expected:
-            raise ValueError('runtime compiler path mismatch')
-        if expected not in fingerprints or sha(expected) != fingerprints[expected]:
-            raise ValueError('selected compiler fingerprint mismatch')
     import catlass
     from catlass._mlir import ir
+    from catlass.execution import resolve_bridge_extension_path, _find_hivmc_a5
+    selected = {'compiler_bridge': resolve_bridge_extension_path(), 'hivmc-a5': _find_hivmc_a5()}
+    for name, path in selected.items():
+        expected = str(Path(profile['compiler_paths'][name]).resolve())
+        if path is None or str(Path(path).resolve()) != expected:
+            raise ValueError('runtime compiler path mismatch: '+name)
+        if expected not in fingerprints or sha(expected) != fingerprints[expected]:
+            raise ValueError('selected compiler fingerprint mismatch: '+name)
     if sha(catlass.__file__) != profile['module_sha256']['catlass']:
         raise ValueError('imported Catlass package identity mismatch')
     with ir.Context():
@@ -148,7 +145,7 @@ def execute(args, contract, identity, directory, report, save):
         if str(module.__version__) != identity['expected_versions'][name] or sha(module.__file__) != identity['module_sha256'][name]:
             raise ValueError('imported runtime identity mismatch: '+name)
     torch.npu.set_device(0)
-    kernel = load_kernel(Path(args.candidate), contract.get('allowed_helpers', ()), contract.get('entrypoint', 'kernel'))
+    kernel = load_kernel(Path(args.candidate), contract.get('allowed_helpers', ()), contract.get('entrypoint', 'kernel'), expected_sha256=args.source_sha256)
     os.environ['CATLASS_DSL_CACHE_DIR'] = str(directory/'cache')
     subprocess.run([sys.executable, '-m', 'catlass.bc_compile'], check=True)
     report.update(physical_device=physical, logical_device=0, cases=[])
