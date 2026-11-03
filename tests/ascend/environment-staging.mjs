@@ -177,3 +177,27 @@ test('symlink trees retain fresh-transfer behavior; staging latency stays exclud
     assert.ok(configuration.timeout > 0.8 && configuration.timeout <= 1);
   }
 });
+
+test('partial snapshot deletion, content/type/mode changes, extra files and manifest tampering fail before workload', async t => {
+  for (const corruption of [
+    'rm ../exec-*/incoming/value.txt',
+    'printf cached-poison > ../exec-*/incoming/value.txt',
+    'chmod 700 ../exec-*/incoming/value.txt',
+    'chmod 700 ../exec-*/incoming/assets',
+    'printf extra > ../exec-*/incoming/extra.txt',
+    'rm ../exec-*/incoming/value.txt; mkdir ../exec-*/incoming/value.txt',
+    "printf '{}' > ../exec-*/sync.json",
+  ]) {
+    const f = await fixture(t);
+    await mkdir(join(f.source, 'assets'));
+    await writeFile(join(f.source, 'assets', 'reference.txt'), 'reference');
+    await f.run("incoming=$(printf '%s' ../exec-*/incoming); " + corruption.replaceAll('../exec-*/incoming', '"$incoming"') + '; printf poisoned > value.txt; printf kept > build.marker');
+    assert.equal(f.sourceUploads().length, 1);
+    const workloads = f.runs(false).length;
+    await assert.rejects(f.environment.execute('cat value.txt', f.source), /Copy failed/, corruption);
+    assert.equal(f.runs(false).length, workloads, corruption);
+    assert.equal(await readFile(join(f.workspace, 'owned/a/project/value.txt'), 'utf8'), 'poisoned');
+    assert.equal(await f.run('./run.sh; cat build.marker'), 'onekept');
+    assert.equal(f.sourceUploads().length, 2);
+  }
+});

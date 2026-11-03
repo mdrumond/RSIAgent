@@ -37,7 +37,7 @@ async function sourceSnapshot(path) {
     }
   }
   await walk(path);
-  return { files, cacheable, fingerprint: createHash('sha256').update(JSON.stringify(entries)).digest('hex') };
+  return { files, entries, cacheable, fingerprint: createHash('sha256').update(JSON.stringify(entries)).digest('hex') };
 }
 // A proc file opened before reaping can fail its subsequent read with ESRCH.
 export async function readProcessStat(pid, read = readFile) {
@@ -98,9 +98,25 @@ os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
 sys.exit(code if code>=0 else 128-code)
 `;
 
-const synchronize = `import errno, json, os, shutil, sys
-with open(sys.argv[1]) as manifest_input: c=json.load(manifest_input)
+const synchronize = `import errno, hashlib, json, os, shutil, stat, sys
+with open(sys.argv[1],'rb') as manifest_input: manifest_bytes=manifest_input.read()
+if hashlib.sha256(manifest_bytes).hexdigest()!=sys.argv[2]: raise ValueError('Source manifest identity mismatch')
+c=json.loads(manifest_bytes)
 if not os.path.isdir(c['incoming']): raise FileNotFoundError('Retained incoming source snapshot is missing')
+if c.get('snapshot') is not None:
+ expected={entry[0]:entry[1:] for entry in c['snapshot']}
+ actual={}
+ for directory, directories, files in os.walk(c['incoming'],followlinks=False):
+  for name in directories+files:
+   path=os.path.join(directory,name); relative=os.path.relpath(path,c['incoming']); info=os.lstat(path)
+   if stat.S_ISDIR(info.st_mode): actual[relative]=['directory',info.st_mode & 0o777]
+   elif stat.S_ISREG(info.st_mode):
+    digest=hashlib.sha256()
+    with open(path,'rb') as content:
+     for block in iter(lambda:content.read(1024*1024),b''): digest.update(block)
+    actual[relative]=['file',info.st_mode & 0o777,digest.hexdigest()]
+   else: actual[relative]=['other']
+ if actual!=expected: raise ValueError('Retained incoming source snapshot identity mismatch')
 os.makedirs(c['project'],exist_ok=True)
 manifest=c['project']+'/.environment-source-files.json'
 try:
@@ -323,14 +339,17 @@ export async function createEnvironment(options, context) {
       if (!reused) {
         await transfer(['upload', options.target, projectRoot, stage.incoming], dir);
         const configuration = { incoming: posix.join(options.workspacePath, stage.incoming),
-          project: posix.join(options.workspacePath, destination), files: snapshot.files };
+          project: posix.join(options.workspacePath, destination), files: snapshot.files,
+          snapshot: snapshot.cacheable ? snapshot.entries.filter(entry => entry[0] !== '') : null };
         const manifestDir = await mkdtemp(join(root, 'manifest-'));
         const manifest = join(manifestDir, 'sync.json');
-        await writeFile(manifest, JSON.stringify(configuration), { mode: 0o600 });
+        const bytes = JSON.stringify(configuration);
+        stage.manifestSha256 = createHash('sha256').update(bytes).digest('hex');
+        await writeFile(manifest, bytes, { mode: 0o600 });
         await transfer(['upload', options.target, manifest, stage.manifest], manifestDir);
       }
       const script = join(dir, 'sync.sh');
-      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, stage.manifest))}\n`, { mode: 0o600 });
+      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, stage.manifest))} ${quote(stage.manifestSha256)}\n`, { mode: 0o600 });
       const args = ['run', options.target, '--file', script, '--receipt-file', join(dir, 'sync-submission.json')];
       if (options.runtime) args.push('--runtime', options.runtime);
       stage = { ...stage, confirmed: false, receiptFile: join(dir, 'sync-submission.json') };
