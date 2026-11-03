@@ -10,24 +10,31 @@ export async function fingerprint(root) {
       const path=join(directory,name), stat=await lstat(path);
       if (stat.isSymbolicLink()) throw new Error('Project symlinks need explicit materialization');
       if (stat.isDirectory()) await visit(path);
-      else if (stat.isFile()) { hash.update(relative(root,path)); hash.update('\0'); hash.update(await readFile(path)); }
+      else if (stat.isFile()) {
+        const content=createHash('sha256').update(await readFile(path)).digest('hex');
+        hash.update(JSON.stringify([relative(root,path),content])+'\n');
+      }
     }
   }
   await visit(resolve(root));
   return hash.digest('hex');
 }
 
-export async function freezeFiles(files,source) {
+export async function freezeFiles(files,source,expected) {
   const frozen=[];
   for (const path of files) {
     const absolute=resolve(path), rel=relative(resolve(source),absolute);
     if (rel === '' || (!rel.startsWith('..'+sep) && !isAbsolute(rel))) throw new Error('Verifier must be outside editable source');
-    frozen.push([absolute,createHash('sha256').update(await readFile(absolute)).digest('hex')]);
+    const actual=createHash('sha256').update(await readFile(absolute)).digest('hex');
+    if(expected && expected[absolute] !== actual)throw new Error('Frozen verifier changed');
+    frozen.push([absolute,actual]);
   }
-  return async()=>{
+  const check=async()=>{
     for (const [path,expected] of frozen) {
       if (createHash('sha256').update(await readFile(path)).digest('hex') !== expected)
         throw new Error('Frozen verifier changed');
     }
   };
+  check.manifest=Object.fromEntries(frozen);
+  return check;
 }
