@@ -32,6 +32,14 @@ async function perform(action) {
 function loadFields(config) {
   el('config').value = format(config);
   el('baseline').value = config.baselineKDB ?? '';
+  const scopes = Object.keys(config.skillsmap ?? {});
+  const selected = el('skill-scope').value;
+  el('skill-scope').replaceChildren(...scopes.map(scope => {
+    const option = document.createElement('option');
+    option.value = scope; option.textContent = scope;
+    return option;
+  }));
+  el('skill-scope').value = scopes.includes(selected) ? selected : scopes[0] ?? '';
   fields.forEach(key => { el(key).value = format(config[key] ?? {}); });
   el('actors').value = format({actor: config.actor ?? {},
     curriculum: config.curriculum_actor ?? {}, writer: config.skill_writer_actor ?? {}});
@@ -73,6 +81,21 @@ el('settings').onsubmit = event => {
   });
 };
 el('refresh').onclick = () => perform(refresh);
+el('skill-scope').onchange = () => { el('skill-content').value = ''; };
+for (const action of ['load', 'save']) {
+  el(`skill-${action}`).onclick = () => perform(async () => {
+    const payload = {scope: el('skill-scope').value};
+    if (!payload.scope) throw new Error('Choose a skill scope');
+    if (action === 'save') {
+      if (dirty) throw new Error('Save settings before saving a skill');
+      payload.content = el('skill-content').value;
+    }
+    const result = await api('skill', 'POST', payload);
+    if (action === 'save') loadFields(await api('config'));
+    el('skill-scope').value = result.scope;
+    el('skill-content').value = result.content;
+  });
+}
 for (const action of ['wave', 'stop', 'resume']) {
   el(action).onclick = () => perform(async () => {
     if (dirty && action === 'wave') throw new Error('Save settings before starting a wave');

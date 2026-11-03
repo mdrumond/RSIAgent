@@ -97,6 +97,12 @@ def create_app(instance, machinery=None, node="node"):
         with lock:
             return jsonify(driver.call("project", value))
 
+    @app.post("/api/skill")
+    def skill():
+        value = body()
+        with lock:
+            return jsonify(driver.call("skill", value))
+
     @app.post("/api/browse")
     def browse():
         return jsonify(driver.call("browse", body()))

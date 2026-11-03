@@ -184,6 +184,7 @@ const fetch = async (url, options) => {
   await tick();
   await elements.get('folders').children[0].onclick();
   process.stdout.write(JSON.stringify({initialActors, requests,
+    scopes: elements.get('skill-scope').children.map(option => option.value),
     error: elements.get('message').textContent}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
@@ -203,6 +204,7 @@ const fetch = async (url, options) => {
     assert result["initialActors"] == {"actor": original["actor"],
         "curriculum": original["curriculum_actor"], "writer": original["skill_writer_actor"]}
     assert result["error"] == "Done"
+    assert result["scopes"] == ["design"]
     for req in result["requests"]:
         if req["method"] == "GET":
             continue
@@ -223,3 +225,18 @@ const fetch = async (url, options) => {
     assert saved["unknown"] == original["unknown"]
     assert [payload["path"] for argv, payload in calls if argv[2] == "browse"] == [
         "/workspace", "/workspace/child"]
+
+
+def test_skill_content_read_and_save_use_cli_json(harness):
+    client, calls, _, replies, _ = harness
+    for action in ({"scope": "design"}, {"scope": "design", "content": "Read evidence\nThen design\n"}):
+        result = {"scope": "design", "content": action.get("content", "Baseline skill"),
+                  "version": "user-new" if "content" in action else "baseline"}
+        replies["skill"] = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(result))
+        response = client.post("/api/skill", json=action)
+        assert response.status_code == 200
+        assert response.json == result
+        argv, payload = calls[-1]
+        assert argv[2] == "skill"
+        assert "--config" in argv
+        assert payload == action

@@ -21,6 +21,11 @@
 <p>Apply the full JSON editor to the fields before saving changes made there.</p>
 <button id="apply" type="button">Apply JSON to fields</button><button type="submit">Save settings</button>
 </form></section>
+<section><h2>Skill content</h2>
+<label>Scope <select id="skill-scope"></select></label>
+<button id="skill-load" type="button">Load skill</button>
+<label>Content <textarea id="skill-content" rows="12"></textarea></label>
+<button id="skill-save" type="button">Save new skill version</button></section>
 <section><h2>Folder browser</h2><form id="browse"><label>Path <input id="path" value="."></label><button>Browse</button></form>
 <p>Paths are resolved by the configured CLI environment. Select a folder to browse it.</p><div id="folders"></div><pre id="browse-result"></pre></section>
 <section><h2>Add project</h2><form id="project-form"><label>Project specification (JSON)
