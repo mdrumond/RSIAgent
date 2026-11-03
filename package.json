@@ -13,5 +13,21 @@
   },
   "scripts": {
     "test:controller": "node --test tests/ascend/controller*.mjs"
-  }
+  },
+  "bin": {
+    "ascend-rsi": "cli/main.mjs"
+  },
+  "files": [
+    "controller",
+    "cli",
+    "integrations/environments",
+    "integrations/kdb-extension.mjs",
+    "ascend_tools",
+    "web",
+    "templates/skills",
+    "examples/ascend-targets",
+    "docs/ascend-controller.md",
+    "pyproject.toml",
+    "npm-shrinkwrap.json"
+  ]
 }

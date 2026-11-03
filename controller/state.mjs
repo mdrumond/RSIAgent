@@ -3,10 +3,16 @@ import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+export function validateAcceptance(spec) {
+  if (spec.performance_goal != null &&
+      (typeof spec.verifier?.performance_command !== 'string' || !spec.verifier.performance_command.trim()))
+    throw new Error('performance_goal requires verifier.performance_command');
+}
+
 export class State {
   constructor(file) {
     this.db = new DatabaseSync(file);
-    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
     if (version === 0 && this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().length)
       throw new Error('Existing unversioned state is unsupported; bootstrap a fresh instance');
@@ -24,6 +30,7 @@ export class State {
       PRAGMA user_version=1;`);
   }
   add(spec) {
+    validateAcceptance(spec);
     if (!spec.id || !spec.goal || !(spec.actor_seconds > 0)) throw new Error('Invalid project');
     if(spec.verifier)spec={...spec,verifier:{...spec.verifier,hashes:Object.fromEntries(spec.verifier.files.map(path=>
       [resolve(path),createHash('sha256').update(readFileSync(path)).digest('hex')]))}};
@@ -57,17 +64,17 @@ export class State {
       .run(attempt,type,JSON.stringify(data),new Date().toISOString());
   }
   events(id) {
-    return this.db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id)
+    return this.db.prepare('SELECT type,data FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
       .map(row=>({type:row.type,data:JSON.parse(row.data)}));
   }
-  finish(id, outcome) {
+  finish(id, outcome, {settleProject=true}={}) {
     if (!['passed','failed'].includes(outcome)) throw new Error('Invalid outcome');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const attempt = this.attempt(id);
       if (!attempt || attempt.outcome) throw new Error('Attempt already closed');
       this.db.prepare('UPDATE attempts SET outcome=? WHERE id=?').run(outcome,id);
-      this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome,attempt.project);
+      if(settleProject)this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome,attempt.project);
       this.db.exec('COMMIT');
     } catch(error) { this.db.exec('ROLLBACK'); throw error; }
   }
