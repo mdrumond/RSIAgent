@@ -31,7 +31,7 @@ export async function operate(command,config,options={}) {
   if(options.detach && command!=='stop') {
     await mkdir(join(config.root,'logs'),{recursive:true});
     const log=await open(join(config.root,'logs','controller.log'),'a',0o600);
-    const child=spawn(process.execPath,[self,command,config.root,JSON.stringify({...options,detach:false})],
+    const child=spawn(process.execPath,[self,command,config.root,JSON.stringify({...options,detach:false,signal:undefined})],
       {detached:true,stdio:['ignore',log.fd,log.fd]});
     child.unref();await log.close();return {pid:child.pid,submitted:true};
   }
