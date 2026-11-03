@@ -17,7 +17,9 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
   const environment=await environmentFactory({instancePath:attemptPath,event,
     exclude:(label,fn)=>clock.exclude(label,fn)});
-  const checkVerifier=await freezeFiles(project.verifier.files,project.source);
+  const previous=state.events(attempt.id).find(e=>e.type==='verifier-frozen');
+  const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
+  if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
   let session,timer,accepted=false;
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});

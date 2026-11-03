@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 export class State {
   constructor(file) {
@@ -23,6 +25,8 @@ export class State {
   }
   add(spec) {
     if (!spec.id || !spec.goal || !(spec.actor_seconds > 0)) throw new Error('Invalid project');
+    if(spec.verifier)spec={...spec,verifier:{...spec.verifier,hashes:Object.fromEntries(spec.verifier.files.map(path=>
+      [resolve(path),createHash('sha256').update(readFileSync(path)).digest('hex')]))}};
     this.db.prepare('INSERT INTO projects(id,spec) VALUES (?,?)').run(spec.id, JSON.stringify(spec));
   }
   project(id) {

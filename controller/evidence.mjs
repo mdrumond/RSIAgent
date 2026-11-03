@@ -17,17 +17,21 @@ export async function fingerprint(root) {
   return hash.digest('hex');
 }
 
-export async function freezeFiles(files,source) {
+export async function freezeFiles(files,source,expected) {
   const frozen=[];
   for (const path of files) {
     const absolute=resolve(path), rel=relative(resolve(source),absolute);
     if (rel === '' || (!rel.startsWith('..'+sep) && !isAbsolute(rel))) throw new Error('Verifier must be outside editable source');
-    frozen.push([absolute,createHash('sha256').update(await readFile(absolute)).digest('hex')]);
+    const actual=createHash('sha256').update(await readFile(absolute)).digest('hex');
+    if(expected && expected[absolute] !== actual)throw new Error('Frozen verifier changed');
+    frozen.push([absolute,actual]);
   }
-  return async()=>{
+  const check=async()=>{
     for (const [path,expected] of frozen) {
       if (createHash('sha256').update(await readFile(path)).digest('hex') !== expected)
         throw new Error('Frozen verifier changed');
     }
   };
+  check.manifest=Object.fromEntries(frozen);
+  return check;
 }
