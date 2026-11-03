@@ -35,7 +35,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   await mkdir(join(destination,'projects'));
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
-  projects=await Promise.all(projects.map(project=>importProject(destination,project)));
+  projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
   await copyMachinery(machinery,join(destination,'machinery'),install);
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
@@ -126,9 +126,11 @@ export async function upgrade(root,machinery) {
 }
 
 export async function importProject(root,spec) {
-  if(!spec.source)return spec;
+  if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
+    throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
-  const source=await realpath(spec.source),files=spec.verifier?.files??[];
+  const source=await realpath(spec.source),files=spec.verifier.files;
+  if(!(await stat(source)).isDirectory())throw new Error('Project source must be a directory');
   const own=join(resolve(root),'projects',spec.id);
   if(within(own,source) && files.every(path=>within(own,resolve(path))))return spec;
   let common=source;

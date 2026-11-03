@@ -28,12 +28,15 @@ test('bootstrap snapshots own memory, skills and machinery; CLI changes persist 
     await updateConfig(instance,c=>({...c,mode:'phase2',concurrency:2}));
     assert.equal((await main(['config','--instance',instance])).mode,'phase2');
     assert.equal(await readFile(join(instance,'machinery','controller','marker.mjs'),'utf8'),'export const marker=1');
-    const spec=join(root,'project.json');await writeFile(spec,JSON.stringify({id:'python',goal:'numeric',actor_seconds:240}));
+    const projectSource=join(root,'input');await mkdir(projectSource);await writeFile(join(projectSource,'answer.py'),'answer=42');
+    const verifier=join(root,'verify.py');await writeFile(verifier,'assert 6*7==42');
+    const project={id:'python',goal:'numeric',actor_seconds:240,source:projectSource,verifier:{command:'python ../verify.py',files:[verifier]}};
+    const spec=join(root,'project.json');await writeFile(spec,JSON.stringify(project));
     await main(['project','--instance',instance,'--project',spec]);
     const status=await main(['status','--instance',instance]);
     assert.equal(status.projects[0].status,'queued');
     assert.equal(status.projects[0].id,'python');
-    await writeFile(spec,JSON.stringify({id:'python',goal:'edited numeric goal',actor_seconds:240}));
+    await writeFile(spec,JSON.stringify({...project,goal:'edited numeric goal'}));
     await main(['project','--instance',instance,'--project',spec]);
     assert.equal((await readConfig(instance)).projects.length,1);
     const action=join(root,'skill-edit.json');await writeFile(action,JSON.stringify({scope:'design',content:'Inspect prior failures first'}));

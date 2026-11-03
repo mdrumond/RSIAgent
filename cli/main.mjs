@@ -70,7 +70,7 @@ export async function main(argv=process.argv.slice(2)) {
   }
   if(command==='project') {
     if(!values.project) return config.projects;
-    const spec=await importProject(root,JSON.parse(await readFile(values.project,'utf8')));
+    const spec=await importProject(root,{actor_seconds:config.actor_seconds,...JSON.parse(await readFile(values.project,'utf8'))});
     const state=new State(join(root,'state.sqlite'));
     try {
       if(state.project(spec.id)) {
