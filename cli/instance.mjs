@@ -41,6 +41,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   await copyMachinery(machinery,join(destination,'machinery'),install);
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
+  const ledger=new State(join(destination,'state.sqlite'));
+  try {for(const project of projects)ledger.add(project);}finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
   return config;

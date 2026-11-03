@@ -11,7 +11,7 @@ import { copyVersion } from '../../cli/skill-input.mjs';
 import { main } from '../../cli/main.mjs';
 import { stages } from '../../controller/workflow.mjs';
 import { processIdentity,ownerStopped } from '../../controller/lifecycle.mjs';
-async function fixture(t) {
+async function fixture(t,{seed=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'ascend-config-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const baseline=join(root,'baseline.sqlite'),db=new DatabaseSync(baseline);
   db.exec("CREATE TABLE evidence(value); INSERT INTO evidence VALUES (42)");db.close();
@@ -20,9 +20,25 @@ async function fixture(t) {
   for(const file of Object.values(map))await writeFile(file,'independent evidence');
   await writeFile(join(skills,'skill-map.json'),JSON.stringify(map));
   const machinery=join(root,'release');await mkdir(machinery);
-  const instance=join(root,'instance');await bootstrap(instance,{baseline,skills,machinery,install:false,environment:{options:{mode:'local'}}});
+  const projects=[];
+  if(seed) {
+    const source=join(root,'input');await mkdir(source);await writeFile(join(source,'answer.py'),'answer=42');
+    const verifier=join(root,'verify.py');await writeFile(verifier,'assert 6*7==42');
+    projects.push({id:'seed',goal:'numeric answer',actor_seconds:240,source,verifier:{command:'python ../verify.py',files:[verifier]}});
+  }
+  const instance=join(root,'instance');await bootstrap(instance,{baseline,skills,machinery,projects,install:false,environment:{options:{mode:'local'}}});
   return {root,instance,skills};
 }
+test('bootstrap initializes queued projects before any wave or status reader',async t=>{
+  const {instance}=await fixture(t,{seed:true});
+  const db=new DatabaseSync(join(instance,'state.sqlite'),{readOnly:true});
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version,1);db.close();
+  const status=await main(['status','--instance',instance]);
+  assert.equal(status.projects.length,1);
+  assert.deepEqual({...status.projects[0]},{id:'seed',status:'queued',frozen:0,actor_seconds:240,goal:'numeric answer'});
+  assert.deepEqual(status.attempts,[]);
+  assert.equal(status.controller.state,'stopped');
+});
 test('stale baseline save leaves live memory and its service owner untouched',async t=>{
   const f=await fixture(t),before=await readConfig(f.instance);
   const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
