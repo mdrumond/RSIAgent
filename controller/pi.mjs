@@ -12,10 +12,12 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true}) {
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
-  const event=(type,data)=>state.event(attempt.id,type,data);
+  let activeOperation=null;
+  const event=(type,data)=>state.event(attempt.id,type,{...data,
+    operation:activeOperation??data.operation??data.submission,actor_elapsed:clock.elapsed});
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
   const environment=await environmentFactory({instancePath:attemptPath,event,
     exclude:(label,fn)=>clock.exclude(label,fn)});
@@ -27,15 +29,19 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
   const execute=async(command,cwd,options)=>{
+    const operation=randomUUID(),startElapsed=clock.elapsed;
+    activeOperation=operation;event('execution-starting',{operation,startElapsed});
     let response;
     try {
-      response=await environment.execute(command,cwd,options);
+      response=await environment.execute(command,cwd,{...options,operationId:operation});
       if(!response.settled)throw new Error(`Execution closure unknown: ${response.handle??'submission'}`);
+      state.checkpoint(attempt.id,clock.elapsed);
+      event('execution-settled',{operation,handle:response.handle});
       return response;
     } catch(error) {
-      event('execution-unresolved',{operation:randomUUID(),handle:response?.handle??null,message:error.message});
+      event('execution-unresolved',{operation,startElapsed,handle:response?.handle??null,message:error.message});
       uncertain=error;void session?.abort();throw error;
-    }
+    } finally {activeOperation=null;}
   };
   const workflow=new Workflow({clock,event,fingerprint:()=>fingerprint(project.source),
     readSkill:async stage=>{
@@ -109,6 +115,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
   };
   try {
+    if(signal?.aborted)throw new Error('Attempt interrupted');
+    clock.check();
     await environment.prepare({project,attempt});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
@@ -143,11 +151,16 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
     if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});
-    state.finish(attempt.id,accepted?'passed':'failed');
+    state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
     event('attempt-error',{message:error.message,stage:workflow.stage});
     state.checkpoint(attempt.id,clock.elapsed);
+    if(error.code==='ACTOR_ELAPSED_EXHAUSTED' && !uncertain && !signal?.aborted) {
+      event('rejected',{stage:workflow.stage,reason:error.code});
+      state.finish(attempt.id,'failed',{settleProject});
+      return {accepted:false,elapsed:clock.elapsed};
+    }
     // Keep the attempt open until the caller confirms all recorded external handles stopped.
     throw error;
   } finally {
