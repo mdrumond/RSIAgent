@@ -122,6 +122,7 @@ test('eight originals evaluate in isolated arms, preserve evidence and promote o
   assert.equal(new Set(seen.map(x => x.instanceRoot)).size, 8);
   const active = (await load(join(root, 'instance.json'))).skills.activeVersion;
   assert.notEqual(active, 'baseline');
+  assert.equal((await load(join(root, 'instance.json'))).revision, 1);
   assert.equal((await readdir(join(root, 'skills', 'versions'))).length, 9);
   assert.deepEqual(await load(join(seen[0].instanceRoot, 'sft.json')), ['retained']);
   assert.deepEqual(await load(join(root, 'skills', 'versions', 'baseline', 'guidance.json')), [guidance]);
@@ -138,10 +139,8 @@ test('inconclusive result keeps instance active; phase1 never invokes proposal o
     generate: async () => assert.fail('phase1 proposal') });
 });
 
-test('CLI requires runtime contract and regression project configuration', async () => {
-  await assert.rejects(run({ root: tmpdir(), skills: {} }), /tuningProjectIds/);
-  await assert.rejects(run(config, { runtime: {} }), /runtimeModule/);
-  assert.equal((await run({ mode: 'phase1' })).analyse, false);
+test('Phase1 CLI does not access action files, runtime or actor profile', async () => {
+  assert.equal((await run({ mode: 'phase1' }, { config: '/absent' })).analyse, false);
 });
 
 test('actual Pi SDK completes proposal through loopback provider with scoped agent/session evidence', async t => {
@@ -224,4 +223,108 @@ test('CLI consumes action file task and requires an explicit writer profile', as
   const evidence = await load(join(root, 'skills', 'proposals', proposals[0], 'evidence.json'));
   assert.equal(evidence.id, task(0).id);
   assert.equal((await run({ mode: 'phase1', root }, { config: '/missing-action.json' })).analyse, false);
+});
+
+function nativeWriter(onInput = () => {}, hang = false) {
+  let listener, release;
+  const flags = { aborted: false, disposed: false };
+  return { flags, native: {
+    SettingsManager: { inMemory: () => ({}) }, SessionManager: { create: () => ({}) },
+    DefaultResourceLoader: class { async reload() {} },
+    createAgentSession: async () => ({ session: {
+      subscribe(fn) { listener = fn; return () => {}; }, async bindExtensions() {},
+      async prompt(text) {
+        onInput(JSON.parse(text.slice(text.lastIndexOf('\n') + 1)));
+        if (hang) await new Promise(resolve => { release = resolve; });
+        listener({ type: 'message_end', message: { role: 'assistant',
+          content: [{ type: 'text', text: '{"changes":[]}' }] } });
+      },
+      async waitForIdle() {}, async abort() { flags.aborted = true; release?.(); },
+      dispose() { flags.disposed = true; }
+    } })
+  } };
+}
+
+test('first CLI update needs no A/B configuration; cadence defaults to two stable originals', async t => {
+  const root = await fixture(t);
+  const current = { ...config, root, skills: { activeVersion: 'baseline' } };
+  await writeFile(join(root, 'instance.json'), JSON.stringify(current));
+  const { native } = nativeWriter();
+  const first = await run(current, { task: task(0), native, modelRuntime: {}, model: {} });
+  assert.ok(first.candidate);
+  assert.equal(first.evaluate, false);
+  const evaluated = [];
+  for (let i = 1; i < 8; i++) await tune({ instanceRoot: root, config: current, task: task(i),
+    generate: async () => [], evaluate: async request => {
+      evaluated.push(request.projectId); return { correct: true, score: 1 };
+    } });
+  assert.deepEqual([...new Set(evaluated)], ['project-0', 'project-1']);
+  assert.equal(evaluated.length, 8);
+  assert.equal((await load(join(root, 'skills', 'evolution.json'))).history.length, 8);
+});
+
+test('manual CLI uses selected State events without increasing original cadence', async t => {
+  const { State } = await import('../../controller/state.mjs');
+  const root = await fixture(t);
+  const state = new State(join(root, 'state.sqlite'));
+  state.add({ id: 'selected', goal: 'numeric', actor_seconds: 20 });
+  const attempt = state.admit('selected', { pid: 1 });
+  state.event(attempt.id, 'knowledge-retrieved', { kind: 'negative', evidence: 'failed-case' });
+  state.finish(attempt.id, 'failed'); state.close();
+  const action = join(root, 'manual.json');
+  await writeFile(action, JSON.stringify({ userinfo: 'repair', projectId: 'selected' }));
+  let input;
+  const { native } = nativeWriter(value => { input = value; });
+  const result = await run({ ...config, root }, { config: action, native, modelRuntime: {}, model: {},
+    runtime: { async bootstrap(request) { await mkdir(request.instanceRoot); },
+      async wave() { return { correct: true, score: 1 }; } } });
+  assert.equal(result.promote, false);
+  assert.equal(input.context.projectId, 'selected');
+  assert.equal(input.actualEvents[0].data.evidence, 'failed-case');
+  const saved = await load(join(root, 'skills', 'evolution.json'));
+  assert.equal(saved.history.length, 0);
+  assert.equal(saved.lastEvaluated, 0);
+  assert.ok(saved.candidate);
+  const noIds = { ...config, root, skills: { activeVersion: 'baseline' } };
+  await writeFile(join(root, 'instance.json'), JSON.stringify(noIds));
+  await writeFile(action, JSON.stringify({ userinfo: 'recover' }));
+  assert.equal((await run(noIds, { config: action, native, modelRuntime: {}, model: {} })).analyse, true);
+  assert.equal((await load(join(root, 'skills', 'evolution.json'))).history.length, 0);
+});
+
+test('Markdown baseline seeds protected entries and preserves original relative assets in candidate', async t => {
+  const { stages } = await import('../../controller/workflow.mjs');
+  const root = await fixture(t);
+  const baseline = join(root, 'skills', 'versions', 'baseline');
+  await rm(join(baseline, 'guidance.json'));
+  await mkdir(join(baseline, 'fork'));
+  const map = {};
+  for (const scope of ['global-kdb', ...stages]) {
+    map[scope] = `fork/${scope}.md`;
+    await writeFile(join(baseline, map[scope]), `# ${scope}\n[asset](reference.bin)`);
+  }
+  await writeFile(join(baseline, 'fork', 'reference.bin'), Buffer.from([1, 2, 3]));
+  await writeFile(join(baseline, 'skill-map.json'), JSON.stringify(map));
+  const result = await tune({ instanceRoot: root, config, task: task(0), generate: async ({ input }) => {
+    assert.equal(input.entries.length, 10);
+    assert.ok(input.entries.every(entry => entry.critical));
+    return [];
+  } });
+  const candidate = join(root, 'skills', 'versions', result.candidate);
+  const generatedMap = await load(join(candidate, 'skill-map.json'));
+  assert.equal(generatedMap.design, 'fork/evolved-design.md');
+  assert.deepEqual(await readFile(join(candidate, 'fork', 'reference.bin')),
+    await readFile(join(baseline, 'fork', 'reference.bin')));
+  assert.deepEqual(await readFile(join(candidate, map.design)), await readFile(join(baseline, map.design)));
+  assert.equal((await load(join(candidate, 'guidance.json'))).length, 10);
+  assert.equal((await load(join(root, 'instance.json'))).skills.activeVersion, 'baseline');
+});
+
+test('native writer elapsed allocation aborts and retains response evidence', async t => {
+  const root = await fixture(t);
+  const { native, flags } = nativeWriter(() => {}, true);
+  await assert.rejects(generateCandidate({ directory: join(root, 'timed'), input: {}, native,
+    seconds: 0.02 }), /elapsed allocation/);
+  assert.ok(flags.aborted && flags.disposed);
+  assert.equal((await load(join(root, 'timed', 'responses.json'))).length, 1);
 });

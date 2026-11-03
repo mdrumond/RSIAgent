@@ -1,6 +1,7 @@
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdir, readFile, writeFile, rename, cp } from 'node:fs/promises';
+import { join, resolve, relative, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { stages } from './workflow.mjs';
 
 const scopes = ['global-kdb', ...stages];
@@ -80,7 +81,9 @@ export function applyProposal(current, changes, { allowPruning, history }) {
 }
 
 // One native Pi turn; SDK owns tools, context, provider retry, and native session persistence.
-export async function generateCandidate({ directory, input, modelRuntime, model, native }) {
+export async function generateCandidate({ directory, input, modelRuntime, model, native, seconds = 240 }) {
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Writer elapsed seconds must be positive');
+  const started = performance.now();
   const sdk = native ?? await import('@earendil-works/pi-coding-agent');
   await mkdir(directory, { recursive: true });
   const agentDir = join(directory, 'agent');
@@ -103,7 +106,11 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   const unsubscribe = session.subscribe(event => {
     if (event.type === 'message_end' && event.message.role === 'assistant') responses.push(event.message);
   });
+  let timer, expired = false;
   try {
+    const remaining = seconds * 1000 - (performance.now() - started);
+    if (remaining <= 0) throw new Error('Writer elapsed allocation exhausted');
+    timer = setTimeout(() => { expired = true; void session.abort().catch(() => {}); }, remaining);
     await session.bindExtensions({});
     await session.prompt(`Propose English Ascend workflow guidance changes as JSON {"changes":[]} only.
 Prioritize error avoidance, detection and recovery before performance. Retain negative lessons.
@@ -113,30 +120,47 @@ Each change: action upsert/remove, id, scope, text, critical boolean, negative b
 optional contradictoryEvidence (references to recorded guidance-contradicted events).
 Existing entries and original-task evidence:\n${JSON.stringify(input)}`);
     await session.waitForIdle();
-    await save(join(directory, 'responses.json'), responses);
+    if (expired) throw new Error('Writer elapsed allocation exhausted');
     const last = responses.at(-1);
     if (!last || last.stopReason === 'error') throw new Error('Native candidate generation failed');
     const text = last.content.filter(x => x.type === 'text').map(x => x.text).join('\n');
     return JSON.parse(text).changes;
   } finally {
+    clearTimeout(timer);
+    await save(join(directory, 'responses.json'), responses);
     unsubscribe?.();
     session.dispose();
   }
 }
 
-async function writeVersion(root, entries) {
+async function readEntries(directory) {
+  try { return await json(join(directory, 'guidance.json')); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const map = await json(join(directory, 'skill-map.json'));
+    return Promise.all(scopes.map(async scope => ({ id: `${scope}-baseline`, scope,
+      text: await readFile(resolve(directory, map[scope]), 'utf8'), critical: true, negative: false })));
+  }
+}
+
+async function writeVersion(root, entries, source) {
   const version = randomUUID();
   const directory = join(root, 'skills', 'versions', version);
-  await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, 'guidance.json'), JSON.stringify(entries, null, 2), { flag: 'wx' });
+  await cp(source, directory, { recursive: true, errorOnExist: true, force: false });
+  await writeFile(join(directory, 'guidance.json'), JSON.stringify(entries, null, 2));
+  let originalMap = {};
+  try { originalMap = await json(join(source, 'skill-map.json')); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
   const skillMap = {};
   for (const scope of scopes) {
-    const path = join(directory, `${scope}.md`);
+    const mapped = relative(source, resolve(source, originalMap[scope] ?? `${scope}.md`));
+    if (mapped.startsWith('../') || isAbsolute(mapped)) throw new Error('Mapped skills must belong to their version');
+    const name = join(dirname(mapped), `evolved-${scope}.md`);
     const selected = entries.filter(x => x.scope === scope).sort((a, b) => Number(b.critical) - Number(a.critical));
-    await writeFile(path, `# ${scope}\n\n${selected.map(x => x.text).join('\n\n')}\n`, { flag: 'wx' });
-    skillMap[scope] = `${scope}.md`;
+    await writeFile(join(directory, name), `# ${scope}\n\n${selected.map(x => x.text).join('\n\n')}\n`);
+    skillMap[scope] = name;
   }
-  await writeFile(join(directory, 'skill-map.json'), JSON.stringify(skillMap, null, 2), { flag: 'wx' });
+  await writeFile(join(directory, 'skill-map.json'), JSON.stringify(skillMap, null, 2));
   return version;
 }
 
@@ -145,7 +169,7 @@ async function writeVersion(root, entries) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
   const current = await json(configPath);
   if (current.skills?.tuningDisabled || current.mode === 'phase1') return { analyse: false, evaluate: false };
   if (config?.skills?.activeVersion !== current.skills?.activeVersion)
@@ -160,38 +184,45 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     state = { history: [], lastEvaluated: 0, pending: null };
   }
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
-    state.lastEvaluated = state.pending.projects;
+    if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
     state.pending = null;
     await save(statePath, state);
     return { promote: true, reason: 'recovered-promotion' };
   }
   const decision = cadenceDecision(state.history, task, state.lastEvaluated);
-  if (!decision.analyse && !state.pending) return decision;
+  if (!decision.analyse && !manual && !state.pending) return decision;
   if (task?.phase === 'phase1') return { analyse: false, evaluate: false };
   if (!state.pending) {
-    const events = task.events ?? [];
-    const entry = { ...task, events };
-    const history = [...state.history, entry];
+    const events = (manual ? context.events : task?.events) ?? [];
+    const entry = manual ? { ...context, userinfo, manual: true, events } : { ...task, events };
+    const history = manual ? state.history : [...state.history, entry];
+    const projectIds = current.skills?.tuningProjectIds ?? [...new Set(history.map(x => x.projectId))].sort().slice(0, 2);
+    const shouldEvaluate = Boolean(decision.evaluate || (manual &&
+      (current.skills?.tuningProjectIds !== undefined || projectIds.length >= 2)));
     const active = current.skills?.activeVersion;
     if (!/^[a-zA-Z0-9-]+$/.test(active ?? '')) throw new Error('Instance requires an active skill version');
-    const entries = await json(join(directory, 'versions', state.candidate ?? active, 'guidance.json'));
+    const source = join(directory, 'versions', state.candidate ?? active);
+    const entries = await readEntries(source);
     const proposalRoot = join(directory, 'proposals', randomUUID());
     await mkdir(proposalRoot, { recursive: true });
     await save(join(proposalRoot, 'evidence.json'), entry);
-    const changes = await generate({ directory: proposalRoot, input: { entries, history, userinfo,
+    const changes = await generate({ directory: proposalRoot, input: { entries, history, userinfo, context: entry,
       actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
-      native, modelRuntime, model });
+      native, modelRuntime, model, seconds: current.skill_writer_seconds ?? 240 });
     if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
-    const updated = applyProposal(entries, changes, { allowPruning: decision.allowPruning, history });
-    const candidate = await writeVersion(root, updated);
+    const updated = applyProposal(entries, changes, { allowPruning: new Set(history.map(x => x.id)).size >= 24,
+      history: manual ? [...history, entry] : history });
+    const candidate = await writeVersion(root, updated, source);
     state.history = history;
-    state.pending = decision.evaluate ? { active, candidate, projects: decision.projects, proposalRoot } : null;
+    state.pending = shouldEvaluate ? { active, candidate, projects: new Set(history.map(x => x.projectId)).size,
+      projectIds, proposalRoot, manual } : null;
     state.candidate = candidate;
     await save(statePath, state);
-    if (!decision.evaluate) return { ...decision, candidate };
+    if (!shouldEvaluate) return { ...decision, analyse: true, evaluate: false, candidate };
   }
   if (typeof evaluate !== 'function') throw new Error('Canonical evaluator required');
-  const ids = current.skills?.tuningProjectIds ?? [];
+  const ids = state.pending.projectIds ?? current.skills?.tuningProjectIds ??
+    [...new Set(state.history.map(x => x.projectId))].sort().slice(0, 2);
   const runs = current.skills?.runsPerArm ?? 2;
   evaluateDecision([], ids, runs); // Validate design before executing any wave.
   const pending = state.pending;
@@ -218,9 +249,10 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const latest = await json(configPath);
     if (latest.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
     latest.skills.activeVersion = pending.candidate;
+    latest.revision = (latest.revision ?? 0) + 1;
     await save(configPath, latest);
   }
-  state.lastEvaluated = pending.projects;
+  if (!pending.manual) state.lastEvaluated = pending.projects;
   state.pending = null;
   await save(statePath, state);
   return { ...verdict, candidate: pending.candidate, evaluationRoot };

@@ -14,16 +14,24 @@ export async function run(config, values = {}) {
     return { analyse: false, evaluate: false };
   const instanceRoot = resolve(config.root);
   const action = values.config ? JSON.parse(await readFile(resolve(values.config), 'utf8')) : {};
-  const ids = config.skills?.tuningProjectIds;
-  if (!Array.isArray(ids) || ids.length !== 2 || new Set(ids).size !== 2)
-    throw new Error('skills.tuningProjectIds requires two distinct canonical regression project IDs');
-  const runtimePath = config.skills?.runtimeModule;
-  const runtime = values.runtime ?? await import(runtimePath
-    ? pathToFileURL(resolve(instanceRoot, runtimePath)).href : new URL('./evaluation.mjs', import.meta.url).href);
-  if (typeof runtime?.bootstrap !== 'function' || typeof runtime?.wave !== 'function')
-    throw new Error('Provide skills.runtimeModule exporting bootstrap and wave, or values.runtime');
   const task = values.task ?? action.task;
   const userinfo = action.userinfo ?? config.userinfo;
+  const manual = !task && (values.manual === true || action.userinfo !== undefined || action.projectId !== undefined);
+  const context = { projectId: action.projectId, events: [] };
+  if (manual) {
+    try {
+      await access(join(instanceRoot, 'state.sqlite'));
+      const { State } = await import('../controller/state.mjs');
+      const state = new State(join(instanceRoot, 'state.sqlite'));
+      try {
+        if (context.projectId && !state.project(context.projectId)) throw new Error('Unknown tuning project');
+        const attempts = context.projectId
+          ? state.db.prepare('SELECT id FROM attempts WHERE project=? ORDER BY created').all(context.projectId)
+          : state.db.prepare('SELECT id FROM attempts ORDER BY created').all();
+        context.events = attempts.flatMap(attempt => state.events(attempt.id));
+      } finally { state.close(); }
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
   const generate = async options => {
     let { modelRuntime, model } = values;
     if (!modelRuntime || !model) {
@@ -37,6 +45,11 @@ export async function run(config, values = {}) {
     return generateCandidate({ ...options, modelRuntime, model });
   };
   const evaluate = async request => {
+    const runtime = values.runtime ?? await import(config.skills?.runtimeModule
+      ? pathToFileURL(resolve(instanceRoot, config.skills.runtimeModule)).href
+      : new URL('./evaluation.mjs', import.meta.url).href);
+    if (typeof runtime?.bootstrap !== 'function' || typeof runtime?.wave !== 'function')
+      throw new Error('Provide runtime bootstrap and wave');
     try {
       await access(request.instanceRoot);
       throw new Error('Evaluation instance already exists');
@@ -46,5 +59,5 @@ export async function run(config, values = {}) {
       projectIds: [request.projectId], evaluation: true });
   };
   return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
-    task, userinfo, evaluate, generate, native: values.native });
+    task, userinfo, manual, context, evaluate, generate, native: values.native });
 }
