@@ -79,10 +79,13 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
     await clock.exclude('setup',async()=>{
-    const loader=new sdk.DefaultResourceLoader({cwd:project.source,noExtensions:true,noSkills:true,
+    const agentDir=join(attemptPath,'agent');
+    await mkdir(agentDir,{recursive:true});
+    const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
+    const loader=new sdk.DefaultResourceLoader({cwd:project.source,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
       extensionFactories:[extension,...extensions]});
     await loader.reload();
-    ({session}=await sdk.createAgentSession({cwd:project.source,modelRuntime,model,thinkingLevel,
+    ({session}=await sdk.createAgentSession({cwd:project.source,agentDir,settingsManager,modelRuntime,model,thinkingLevel,
       sessionManager:manager,resourceLoader:loader}));
     session.agent.toolExecution='sequential';
     await session.bindExtensions({});
