@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile, cp, writeFile, rename } from 'node:fs/promises';
+import { readFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
@@ -11,17 +11,22 @@ import { State } from '../controller/state.mjs';
 export async function main(argv=process.argv.slice(2)) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
-    repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},
+    repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
+  const root=resolve(values.instance??arg??'.');
+  const operation=async()=>{
   if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','resume','stop','dashboard','kdb','tune']};
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
       skills:values.skills??config.skills,repository:values.repository??config.repository});
   }
-  const root=resolve(values.instance??arg??'.');
   const config=await readConfig(root);
+  if(values.detach && ['tune','kdb'].includes(command)) {
+    const action=JSON.parse(await readFile(values.config,'utf8'));
+    return (await import('./background.mjs')).startBackground(root,command,action);
+  }
   if(command==='upgrade') {
     const input=JSON.parse(await readFile(values.config,'utf8'));
     return upgrade(root,input.machinery);
@@ -91,7 +96,8 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==='status') {
     const state=new State(join(root,'state.sqlite'));
     try {
-      return {mode:config.mode,projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
+      const {requests}=await import('./background.mjs');
+      return {mode:config.mode,requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
@@ -111,6 +117,9 @@ export async function main(argv=process.argv.slice(2)) {
     return (await import(module)).run(config,values);
   }
   throw new Error(`Unknown command ${command}`);
+  };
+  if(values.request)return (await import('./background.mjs')).trackRequest(root,values.request,operation);
+  return operation();
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
   main().then(value=>console.log(JSON.stringify(value))).catch(error=>{
