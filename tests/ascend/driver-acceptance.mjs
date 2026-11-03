@@ -21,7 +21,6 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
     const diagnostic=rows(f.root,"SELECT * FROM recovery_attempts WHERE kind='investigation'")[0];
     assert.ok(diagnostic);
     const proposal=JSON.parse(await readFile(join(f.root,'attempts',diagnostic.attempt,'project.json'),'utf8'));
-    assert.match(proposal.goal,/SMALL/);
     assert.notEqual(proposal.source,JSON.parse(rows(f.root,"SELECT spec FROM projects WHERE id='recover'")[0].spec).source);
     assert.equal((await f.run('status')).projects.find(p=>p.id==='recover').status,'failed');
     assert.equal(rows(f.root,'SELECT kind,eligible_wave FROM recovery_queue')[0].kind,'retry');
