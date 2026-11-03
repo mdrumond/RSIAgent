@@ -62,8 +62,9 @@ class Tensor:
     def mark_compact_shape_dynamic(self, _): return self
 
 
+@pytest.mark.parametrize('physical', [0, 1])
 @pytest.mark.parametrize('mode,bad', [('compile', False), ('test', False), ('test', True)])
-def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, mode, bad):
+def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, mode, bad, physical):
     calls = []
     class Artifact:
         def __call__(self, a, b, out, **kwargs):
@@ -84,14 +85,14 @@ def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, 
     monkeypatch.setattr(catlass, 'load_kernel', lambda *args: object())
     monkeypatch.setattr(catlass, 'local_probe', lambda **kw: dict(admitted=True))
     monkeypatch.setattr(catlass.subprocess, 'run', lambda *args, **kw: calls.append('bc_compile'))
-    for name in ('ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
+    for name in ('ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('CATLASS_DSL_CACHE_DIR', 'overwritten')
-    identity = dict(physical_device=2, device_health=dict(product='a5'), expected_versions=dict(torch='test', torch_npu='test'),
+    identity = dict(device_health=dict(product='a5'), expected_versions=dict(torch='test', torch_npu='test'),
                     module_sha256=dict(torch=catlass.sha(__file__), torch_npu=catlass.sha(__file__)))
     report = dict(compile='not-run', launch='not-run', correctness='not-run', device_evidence=False)
     contract = dict(abi_version=1, operation='add', cases=[dict(length=3, block_count=1, seed=17)])
-    args = SimpleNamespace(mode=mode, candidate=str(tmp_path/'candidate.py'))
+    args = SimpleNamespace(mode=mode, physical_device=physical, candidate=str(tmp_path/'candidate.py'))
     if bad:
         with pytest.raises(ValueError, match='numeric mismatch'):
             catlass.execute(args, contract, identity, tmp_path, report, lambda: None)
@@ -103,3 +104,5 @@ def test_compile_launch_and_numeric_results_are_separate(tmp_path, monkeypatch, 
         assert ('launch' in calls) == (mode == 'test')
         assert report['correctness'] == ('passed' if mode == 'test' else 'not-run')
     assert calls.index('bc_compile') < calls.index('compile')
+    assert __import__('os').environ['ASCEND_PHYSICAL_DEVICE'] == str(physical)
+    assert 'physical_device' not in identity

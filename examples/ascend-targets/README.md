@@ -35,7 +35,7 @@ operations add/multiply/relu/convert retain the original independent oracle.
 Physical padding to 64 elements is distinct from the logical length (1..512).
 
 The runtime identity includes all common exact compiler/CANN file fingerprints,
-Python3.11, physical_device, and device_health with product a5 and chip null.
+Python3.11 and device_health with product a5 and chip null.
 Additional required fields: catlass_source, source_revision, dependency_gitlink,
 dependency_revision, cann_version (9.3.x), cann_version_file,
 cann_version_contents, pipeline_manifest, pipeline_manifest_sha256,

@@ -13,7 +13,7 @@ import struct
 import subprocess
 import sys
 
-from .runner import sha, compare
+from .runner import sha, compare, bind_device
 from .health import local_probe
 
 ABI_VERSION = 1
@@ -130,13 +130,7 @@ def check_runtime(profile):
 def execute(args, contract, identity, directory, report, save):
     if contract['abi_version'] != ABI_VERSION:
         raise ValueError('unknown Catlass kernel ABI')
-    physical = identity['physical_device']
-    if type(physical) is not int or physical < 0 or identity['device_health']['product'] != 'a5':
-        raise ValueError('explicit A5 physical-device identity required')
-    for name in ('ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
-        if os.environ.get(name) not in (None, str(physical)):
-            raise ValueError('existing device mask mismatch')
-    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = str(physical)
+    physical = bind_device(args, identity, 'a5')
     if args.mode == 'performance':
         report['performance'] = 'unmeasured'
         raise ValueError('A5 performance requires a separately validated timing adapter')
