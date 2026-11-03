@@ -30,6 +30,6 @@ export async function run(config, values = {}) {
     return runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
       projectIds: [request.projectId], evaluation: true });
   };
-  return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'config.json'),
+  return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
     task, evaluate, native: values.native, modelRuntime: values.modelRuntime, model: values.model });
 }

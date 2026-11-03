@@ -16,7 +16,7 @@ async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'skills-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'skills', 'versions', 'baseline'), { recursive: true });
-  await writeFile(join(root, 'config.json'), JSON.stringify(config));
+  await writeFile(join(root, 'instance.json'), JSON.stringify(config));
   await writeFile(join(root, 'skills', 'versions', 'baseline', 'guidance.json'), JSON.stringify([guidance]));
   return root;
 }
@@ -64,10 +64,15 @@ test('native SDK injection receives evidence and disposes its session', async t 
   const root = await fixture(t);
   let listener, prompted, disposed = false, bound = false;
   const native = {
+    SettingsManager: { inMemory: () => ({}) },
     SessionManager: { create: () => ({}) },
-    DefaultResourceLoader: class { async reload() {} },
+    DefaultResourceLoader: class {
+      constructor(options) { assert.equal(options.agentDir, join(root, 'proposal', 'agent')); }
+      async reload() {}
+    },
     createAgentSession: async options => {
       assert.deepEqual(options.tools, []);
+      assert.equal(options.agentDir, join(root, 'proposal', 'agent'));
       return { session: {
         subscribe(fn) { listener = fn; return () => {}; },
         async bindExtensions() { bound = true; },
@@ -100,7 +105,7 @@ test('eight originals evaluate in isolated arms, preserve evidence and promote o
   }
   assert.equal(seen.length, 8);
   assert.equal(new Set(seen.map(x => x.instanceRoot)).size, 8);
-  const active = (await load(join(root, 'config.json'))).skills.activeVersion;
+  const active = (await load(join(root, 'instance.json'))).skills.activeVersion;
   assert.notEqual(active, 'baseline');
   assert.equal((await readdir(join(root, 'skills', 'versions'))).length, 9);
   assert.deepEqual(await load(join(seen[0].instanceRoot, 'sft.json')), ['retained']);
@@ -113,7 +118,7 @@ test('inconclusive result keeps instance active; phase1 never invokes proposal o
   const result = await tune({ instanceRoot: root, config, task: task(7), generate: async () => [],
     evaluate: async () => ({ correct: true, score: 1 }) });
   assert.equal(result.promote, false);
-  assert.equal((await load(join(root, 'config.json'))).skills.activeVersion, 'baseline');
+  assert.equal((await load(join(root, 'instance.json'))).skills.activeVersion, 'baseline');
   await tune({ instanceRoot: root, config, task: task(8, { phase: 'phase1' }),
     generate: async () => assert.fail('phase1 proposal') });
 });
@@ -122,4 +127,73 @@ test('CLI requires runtime contract and regression project configuration', async
   await assert.rejects(run({ skills: {} }), /tuningProjectIds/);
   await assert.rejects(run(config), /runtimeModule/);
   assert.equal((await run({ phase: 'phase1' })).analyse, false);
+});
+
+test('actual Pi SDK completes proposal through loopback provider with scoped agent/session evidence', async t => {
+  const sdk = await import('@earendil-works/pi-coding-agent');
+  const { InMemoryCredentialStore } = await import('@earendil-works/pi-ai');
+  const { createServer } = await import('node:http');
+  const root = await fixture(t);
+  let requests = 0;
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    const input = JSON.parse(body);
+    requests++;
+    assert.equal(input.stream, true);
+    assert.equal(input.tools?.length ?? 0, 0);
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const chunk = (delta, finish_reason = null) => 'data: ' + JSON.stringify({
+      id: 'proposal-response', object: 'chat.completion.chunk', created: 1, model: 'proposal',
+      choices: [{ index: 0, delta, finish_reason }]
+    }) + '\n\n';
+    response.end(chunk({ role: 'assistant', content: '{"changes":[]}' }) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const modelRuntime = await sdk.ModelRuntime.create({ credentials: new InMemoryCredentialStore(),
+    modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+  modelRuntime.registerProvider('skill-test', {
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: 'openai-completions',
+    models: [{ id: 'proposal', name: 'Proposal test', reasoning: false, input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 1024 }]
+  });
+  await modelRuntime.setRuntimeApiKey('skill-test', 'local-test-placeholder');
+  const directory = join(root, 'native-proposal');
+  assert.deepEqual(await generateCandidate({ directory, input: task(0), modelRuntime,
+    model: modelRuntime.getModel('skill-test', 'proposal') }), []);
+  assert.equal(requests, 1);
+  assert.ok((await readdir(directory)).some(name => name.endsWith('.jsonl') && name !== 'provider.jsonl'));
+  assert.equal((await load(join(directory, 'responses.json'))).at(-1).role, 'assistant');
+  assert.ok((await readFile(join(directory, 'provider.jsonl'), 'utf8')).length > 0);
+});
+
+test('CLI uses instance.json and invokes bootstrap then canonical wave for each fresh arm', async t => {
+  const root = await fixture(t);
+  await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({
+    history: history(8), lastEvaluated: 0, candidate: 'baseline',
+    pending: { active: 'baseline', candidate: 'baseline', projects: 8 }
+  }));
+  // Different immutable candidate prevents interrupted-promotion reconciliation.
+  const pending = await load(join(root, 'skills', 'evolution.json'));
+  pending.pending.candidate = 'candidate';
+  await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify(pending));
+  const calls = [];
+  const runtime = {
+    async bootstrap(request) { calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
+    async wave(request) {
+      calls.push(['wave', request.instanceRoot]);
+      assert.deepEqual(request.projectIds.length, 1);
+      assert.equal(request.evaluation, true);
+      return { correct: true, score: 1 };
+    }
+  };
+  const result = await run(config, { instanceRoot: root, runtime });
+  assert.equal(result.promote, false);
+  assert.equal(calls.length, 16);
+  for (let i = 0; i < calls.length; i += 2) {
+    assert.equal(calls[i][0], 'bootstrap');
+    assert.equal(calls[i + 1][0], 'wave');
+    assert.equal(calls[i][1], calls[i + 1][1]);
+  }
 });

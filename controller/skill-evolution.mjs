@@ -79,8 +79,12 @@ export function applyProposal(current, changes, { allowPruning, history }) {
 export async function generateCandidate({ directory, input, modelRuntime, model, native }) {
   const sdk = native ?? await import('@earendil-works/pi-coding-agent');
   await mkdir(directory, { recursive: true });
+  const agentDir = join(directory, 'agent');
+  await mkdir(agentDir, { recursive: true });
+  const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true } });
   const manager = sdk.SessionManager.create(directory, directory);
-  const loader = new sdk.DefaultResourceLoader({ cwd: directory, noExtensions: true, noSkills: true,
+  const loader = new sdk.DefaultResourceLoader({ cwd: directory, agentDir, settingsManager,
+    noExtensions: true, noSkills: true, noContextFiles: true,
     extensionFactories: [pi => {
       for (const type of ['before_provider_request', 'provider_stream_event'])
         pi.on(type, async payload => {
@@ -89,7 +93,7 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
         });
     }] });
   await loader.reload();
-  const { session } = await sdk.createAgentSession({ cwd: directory, modelRuntime, model,
+  const { session } = await sdk.createAgentSession({ cwd: directory, agentDir, settingsManager, modelRuntime, model,
     tools: [], sessionManager: manager, resourceLoader: loader });
   const responses = [];
   const unsubscribe = session.subscribe(event => {
@@ -136,7 +140,7 @@ async function writeVersion(root, entries) {
 // evaluate({instanceRoot,config,projectId,run,arm,skillVersion}) must bootstrap a fresh isolated
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
-export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'config.json'),
+export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
   task, evaluate, generate = generateCandidate, native, modelRuntime, model }) {
   const current = await json(configPath);
   if (current.skills?.tuningDisabled || current.phase === 'phase1') return { analyse: false, evaluate: false };
