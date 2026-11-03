@@ -43,6 +43,63 @@ class KnowledgeTests(unittest.TestCase):
             self.assertEqual(len(db.search('loads', target='a3')), 2)
             db.close()
 
+    def test_repeated_outbox_delivery_survives_reopen_without_duplicate_embeddings(self):
+        class CountingEmbeddings(Embeddings):
+            calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                return super().embed(texts)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / 'evidence.log'
+            evidence.write_text('observed numeric verification failure\n')
+            backend = CountingEmbeddings()
+            arguments = dict(lesson='use aligned loads', outcome='good', applicability='a3',
+                             evidence=[{'path': str(evidence)}], attempt_id='attempt-1')
+            db = KDB(root / 'knowledge.sqlite', backend)
+            first = db.record_lesson(**arguments)
+            calls = backend.calls
+            db.close()
+            db = KDB(root / 'knowledge.sqlite', backend)
+            self.assertEqual(db.record_lesson(**arguments), first)
+            self.assertEqual(backend.calls, calls)
+            other = db.record_lesson(**dict(arguments, lesson='avoid naive reductions'))
+            self.assertNotEqual(other['entry_id'], first['entry_id'])
+            self.assertEqual(db.db.connection.execute(
+                'SELECT count(*) FROM collections').fetchone()[0], 2)
+            db.close()
+
+    def test_replay_finishes_file_staged_before_failed_index(self):
+        class UnavailableEmbeddings(Embeddings):
+            def embed(self, texts):
+                raise RuntimeError('embedding process interrupted')
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / 'evidence.log'
+            evidence.write_text('direct verifier output\n')
+            arguments = dict(lesson='avoid unaligned loads', outcome='negative',
+                             applicability='a3', evidence=[{'path': str(evidence)}],
+                             attempt_id='attempt-2')
+            path = root / 'knowledge.sqlite'
+            db = KDB(path, UnavailableEmbeddings())
+            with self.assertRaises(RuntimeError):
+                db.record_lesson(**arguments)
+            staged = list((root / 'knowledge.sqlite.lessons').glob('*.json'))
+            self.assertEqual(len(staged), 1)
+            self.assertEqual(db.db.connection.execute(
+                'SELECT count(*) FROM collections').fetchone()[0], 0)
+            db.close()
+            db = KDB(path, Embeddings())
+            record = db.record_lesson(**arguments)
+            self.assertEqual(staged[0].stem, record['entry_id'])
+            self.assertEqual(db.record_lesson(**arguments), record)
+            hits = db.search('unaligned loads', kind='negative', target='a3')
+            self.assertEqual(len(hits), 1)
+            db.close()
+
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, read, write, root):

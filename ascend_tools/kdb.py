@@ -5,7 +5,8 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-import uuid
+import os
+import tempfile
 
 from .knowledge import KnowledgeDB
 
@@ -113,17 +114,37 @@ class KDB:
                 refs.append({'entry_id': ref['entry_id'], 'collection': ref['collection']})
             else:
                 raise ValueError('evidence requires a file or indexed entry')
-        entry_id = uuid.uuid4().hex
-        record = dict(entry_id=entry_id, lesson=lesson, outcome=outcome,
-                      applicability=applicability, evidence=refs, attempt_id=attempt_id)
+        # Outbox replay must identify the same logical delivery after a crash.
+        # Evidence order does not change the lesson identity.
+        refs.sort(key=lambda ref: json.dumps(ref, sort_keys=True))
+        content = dict(lesson=lesson, outcome=outcome, applicability=applicability,
+                       evidence=refs, attempt_id=attempt_id)
+        identity = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        entry_id = hashlib.sha256(identity.encode()).hexdigest()
+        record = dict(entry_id=entry_id, **content)
         root = self.db.path.parent / (self.db.path.name + '.lessons')
         root.mkdir(exist_ok=True)
         source = root / (entry_id + '.json')
-        source.write_text(json.dumps(record, indent=2) + '\n')
-        try:
-            self.add_repo(str(root), 'lesson-' + entry_id, 'lesson',
-                          target=applicability, kind=outcome, paths=[source.name])
-        except BaseException:
-            source.unlink()
-            raise
+        if source.exists():
+            if json.loads(source.read_text()) != record:
+                raise ValueError('persisted lesson does not match its content identity')
+        else:
+            fd, temporary = tempfile.mkstemp(prefix='.', suffix='.tmp', dir=root)
+            try:
+                with os.fdopen(fd, 'w') as output:
+                    output.write(json.dumps(record, indent=2) + '\n')
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, source)
+                directory = os.open(root, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        # index() returns an existing immutable collection without embedding again.
+        # Keep a staged file after an indexing failure: replay completes this step.
+        self.add_repo(str(root), 'lesson-' + entry_id, 'lesson',
+                      target=applicability, kind=outcome, paths=[source.name])
         return record
