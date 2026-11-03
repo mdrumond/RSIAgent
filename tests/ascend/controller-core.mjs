@@ -117,3 +117,18 @@ test('verifier mutation is detected across original retries and resumed attempts
     await assert.rejects(freezeFiles([verifier],source,hashes));
   }finally{state.close();await rm(root,{recursive:true,force:true});}
 });
+
+test('private provider setup reads its key without exposing dotenv values to actor processes',async()=>{
+  const {mkdtemp,writeFile,rm}=await import('node:fs/promises');
+  const {join}=await import('node:path');const {tmpdir}=await import('node:os');
+  const {modelFromProfile}=await import('../../controller/model.mjs');
+  const root=await mkdtemp(join(tmpdir(),'ascend-provider-'));
+  const name='ASCEND_FIXTURE_PROVIDER_KEY',other='ASCEND_FIXTURE_UNRELATED';
+  try {
+    const file=join(root,'credentials.env');await writeFile(file,`${name}=fixture-only\n${other}=private-fixture\n`);
+    const {model}=await modelFromProfile({provider:'deepseek',model:'deepseek-flash',
+      base_url:'http://127.0.0.1',credential_env:name,credentials_file:file,max_tokens:1024});
+    assert.equal(model.maxTokens,1024);
+    assert.equal(process.env[name],undefined);assert.equal(process.env[other],undefined);
+  }finally{await rm(root,{recursive:true,force:true});}
+});
