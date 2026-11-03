@@ -40,9 +40,8 @@ actual private paths before running it:
   "mode": "phase1",
   "actor_seconds": 28800,
   "environment": {
-    "extensionModule": "/path/to/machinery/integrations/environments/index.mjs",
-    "instructionFile": "/path/to/private/access.md",
-    "options": {"mode": "local"}
+    "module": "/path/to/machinery/integrations/environments/index.mjs",
+    "options": {"mode": "local", "instructionFile": "/path/to/private/access.md"}
   },
   "projects": []
 }
@@ -50,8 +49,9 @@ actual private paths before running it:
 
 For CPL execution, options select `mode: "cpl"`, a registered `target` and named
 `runtime`, the registry's `workspacePath`, and a task-owned `remoteDirectory`.
-Resolve these from private registry configuration. The environment example in
-`integrations/environments/example.json` describes the shape. Access instructions
+Resolve these from private registry configuration. The driver imports
+`environment.module` and passes `environment.options` to the extension; put
+`instructionFile` inside `options`. Access instructions
 explain how the actor should use the selected environment; credentials stay in
 private configuration. Execution uses the installed remote-access client.
 
