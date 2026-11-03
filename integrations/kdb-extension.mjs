@@ -1,0 +1,84 @@
+/** Native Pi MCP configuration and workflow retrieval adapter. No transport client. */
+import { createMcpExtension } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
+import { join } from 'node:path';
+
+const searchTool = 'mcp__kdb__search';
+
+function decode(result) {
+  // Pi wraps the complete MCP CallToolResult in structuredContent. FastMCP
+  // wraps a list return value once more in {result:[...]}.
+  const wire = result?.structuredContent;
+  if (!wire || wire.isError) throw new Error('KDB returned no successful structured MCP result');
+  const hits = wire.structuredContent?.result;
+  if (!Array.isArray(hits)) throw new Error('KDB search returned an invalid result');
+  return hits;
+}
+
+export function createKdbBridge({url, attemptId, agentDir, target, event = async () => {}}) {
+  const endpoint = new URL(url);
+  if (endpoint.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(endpoint.hostname)) {
+    throw new Error('Instance KDB must use loopback HTTP');
+  }
+  if (!attemptId || !agentDir) throw new Error('KDB requires attemptId and attempt agentDir');
+  const config = {
+    servers: [{name: 'kdb', source: join(agentDir, 'mcp.json'), scope: 'extension', config: {
+      url: endpoint.href, headers: {'X-Attempt-Id': attemptId}, exposure: 'direct',
+    }}], errors: [], autoEnableCodemode: false,
+  };
+  const nativeExtension = createMcpExtension({loadConfig: () => config, logPath: join(agentDir, 'mcp.log')});
+  const extension = async pi => {
+    await nativeExtension(pi);
+    pi.on('tool_result', async result => {
+      if (!result.toolName.startsWith('mcp__kdb__')) return;
+      await event('knowledge-tool-result', {
+        attempt_id: attemptId, tool: result.toolName, tool_call_id: result.toolCallId,
+        parent_tool_call_id: result.parentToolCallId, failed: result.isError,
+      });
+    });
+  };
+  const knowledge = {
+    async search(request, ctx) {
+      if (!ctx?.executeTool) throw new Error('KDB retrieval requires a live Pi tool context');
+      if (request.attempt_id !== undefined && request.attempt_id !== attemptId) {
+        throw new Error('KDB attempt correlation mismatch');
+      }
+      const limit = request.limit ?? 8;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 10) {
+        throw new Error('Workflow KDB limit must be 1..10');
+      }
+      const args = {query: request.query, kind: request.kind ?? 'all', limit};
+      if (target !== undefined) args.target = target;
+      const outcome = await ctx.executeTool(searchTool, args);
+      if (outcome.isError) throw new Error('Native KDB search failed or was blocked');
+      let remaining = 12000;
+      const content = decode(outcome.result).slice(0,limit).map(hit => {
+        const text = hit.text.slice(0,Math.min(2000,remaining));
+        remaining -= text.length;
+        return {collection:hit.collection, chunk_id:hit.chunk_id, path:hit.path,
+          start_line:hit.start_line, end_line:hit.end_line, source_sha256:hit.source_sha256,
+          kind:hit.kind, target:hit.target, language:hit.language,
+          kernel_languages:hit.kernel_languages, score:hit.score, text,
+          truncated:text.length !== hit.text.length};
+      });
+      const evidence = content.map(hit => ({
+        collection: hit.collection, entry_id: hit.chunk_id, path: hit.path,
+        start_line: hit.start_line, end_line: hit.end_line, sha256: hit.source_sha256,
+      }));
+      return {content, evidence};
+    },
+  };
+  // PRIMARY may register this instead of its existing rsi_knowledge definition.
+  // query forwards ctx through Workflow.query into knowledge.search(request,ctx).
+  const knowledgeTool = (query = (text, kind, ctx) => knowledge.search({query:text, kind},ctx)) => ({
+    name:'rsi_knowledge', label:'Retrieve knowledge',
+    description:'Retrieve positive or negative evidence using native MCP tools.',
+    parameters:Type.Object({query:Type.String({minLength:1}),
+      kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
+    execute:async (_id, args, _signal, _onUpdate, ctx) => {
+      const value = await query(args.query, args.kind, ctx);
+      return {content:[{type:'text',text:JSON.stringify(value)}],details:{}};
+    },
+  });
+  return {extension, knowledge, knowledgeTool};
+}

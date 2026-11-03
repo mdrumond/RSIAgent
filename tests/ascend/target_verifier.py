@@ -114,3 +114,37 @@ def test_frozen_device_affinity_is_not_silently_reinterpreted():
     from ascend_tools.targets.runner import runtime_check
     with pytest.raises(ValueError, match='must not bind'):
         runtime_check(dict(physical_device=0), 'a3-triton')
+
+
+@pytest.mark.parametrize('decorated', [False, True])
+def test_timestamp_bytecode_and_decorator_source_cannot_hide_new_wrong_candidate(tmp_path, decorated):
+    import ast
+    import linecache
+    import os
+    import py_compile
+    prefix = """import ast, inspect, textwrap
+def capture(function):
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    tree.body[0].decorator_list = []
+    namespace = {}
+    exec(compile(tree, function.__code__.co_filename, 'exec'), namespace)
+    return namespace[function.__name__]
+@capture
+""" if decorated else ''
+    args = request(tmp_path, prefix+'def run(a,b):\n return [x+y for x,y in zip(a,b)]\n')
+    candidate = Path(args.candidate)
+    original = candidate.read_bytes()
+    metadata = candidate.stat()
+    py_compile.compile(str(candidate), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    linecache.getlines(str(candidate.resolve()))
+    changed = original.replace(b'x+y', b'x-y')
+    assert len(changed) == len(original)
+    candidate.write_bytes(changed)
+    os.utime(candidate, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    args.source_sha256 = hashlib.sha256(changed).hexdigest()
+    report = verify(args)
+    assert report['status'] == 'failed'
+    assert report['correctness'] == 'failed'
+    assert report['cases'][0]['actual'] == [3., -10., -.25]
+    assert (Path(args.artifacts)/'candidate.py').read_bytes() == changed
+    assert report['source_sha256'] == args.source_sha256
