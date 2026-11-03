@@ -86,14 +86,8 @@ def execute(args, contract, identity, directory, report, save):
     """Observe real JIT returns; candidate scores and metadata are never consumed."""
     import os
     from .health import local_probe
-    from .runner import sha
-    physical = identity['physical_device']
-    if type(physical) is not int or physical < 0 or identity['device_health']['product'] != 'a3':
-        raise ValueError('explicit A3 physical-device identity required')
-    existing = os.environ.get('ASCEND_RT_VISIBLE_DEVICES')
-    if existing is not None and existing != str(physical):
-        raise ValueError('existing physical-device mask mismatch')
-    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = str(physical)
+    from .runner import sha, bind_device
+    physical = bind_device(args, identity, 'a3')
     os.environ['TRITON_CACHE_DIR'] = str(directory/'cache')
     health = dict(identity['device_health'], require_idle=args.mode == 'performance')
     report['health'] = local_probe(physical_device=physical, configuration=health, remaining=lambda: None)

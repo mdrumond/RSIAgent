@@ -1,5 +1,5 @@
 import { readFile, readdir, mkdtemp, writeFile, mkdir, rename } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
@@ -10,7 +10,8 @@ const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
 const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ['queued', 'dispatching', 'running', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
-  ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}) });
+  ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
+  ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
 async function sourceFiles(path, prefix = '') {
   const files = [];
   for (const entry of await readdir(path, { withFileTypes: true })) {
@@ -19,6 +20,14 @@ async function sourceFiles(path, prefix = '') {
     else files.push(name);
   }
   return files;
+}
+// A proc file opened before reaping can fail its subsequent read with ESRCH.
+export async function readProcessStat(pid, read = readFile) {
+  try { return await read(`/proc/${pid}/stat`, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ESRCH') return null;
+    throw error;
+  }
 }
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 async function save(path, value) {
@@ -45,8 +54,9 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
 }
 
 // The payload supervisor enforces workload elapsed time, not CLI observation time.
-const supervisor = String.raw`import hashlib, json, os, signal, subprocess, sys
+const supervisor = String.raw`import hashlib, json, os, signal, subprocess, sys, time
 c=json.loads(sys.argv[1]); os.makedirs(c['spool'],exist_ok=True)
+started=time.monotonic()
 def intact():
  try:
   return all(hashlib.sha256(open(path,'rb').read()).hexdigest()==digest for path,digest in c['verifiers'])
@@ -64,12 +74,14 @@ with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as 
   finally: stop()
   if not intact(): err.write(b'Frozen verifier changed after execution\n'); code=125
 with open(c['spool']+'/exit','w') as f: f.write(str(code))
+with open(c['spool']+'/timing.json.tmp','w') as f:
+ json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey']},f); f.flush(); os.fsync(f.fileno())
+os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
 sys.exit(code if code>=0 else 128-code)
 `;
 
-const synchronize = `import json, os, shutil, sys
+const synchronize = `import errno, json, os, shutil, sys
 c=json.loads(sys.argv[1]); os.makedirs(c['project'],exist_ok=True)
-shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True)
 manifest=c['project']+'/.environment-source-files.json'
 try:
  with open(manifest) as f: previous=json.load(f)
@@ -77,6 +89,17 @@ except FileNotFoundError: previous=[]
 for name in set(previous)-set(c['files']):
  try: os.unlink(c['project']+'/'+name)
  except FileNotFoundError: pass
+parents=set()
+for name in previous:
+ parent=os.path.dirname(name)
+ while parent: parents.add(parent); parent=os.path.dirname(parent)
+for name in sorted(parents,key=lambda p:p.count('/'),reverse=True):
+ try: os.rmdir(c['project']+'/'+name)
+ except OSError as error:
+  if error.errno==errno.ENOENT: continue
+  if error.errno in (errno.ENOTEMPTY,errno.EEXIST) and name not in c['files']: continue
+  raise
+shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True)
 with open(manifest,'w') as f: json.dump(c['files'],f)
 `;
 
@@ -91,6 +114,7 @@ export async function createEnvironment(options, context) {
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
+  const executionReceipts = new Map();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     (remote ? '\nBash runs in a synchronized remote attempt directory. Use project-relative Bash paths. Native read/write/edit tools operate on the LOCAL project; edits sync before each Bash call.' : '');
   const check = handle => {
@@ -106,15 +130,15 @@ export async function createEnvironment(options, context) {
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
       const pid = Number(original.slice(0, original.indexOf(' ')));
       const fields = text => text.slice(text.lastIndexOf(')') + 2).split(' ');
-      try {
-        const current = await readFile(`/proc/${pid}/stat`, 'utf8');
-        if (fields(current)[19] !== fields(original)[19]) return { state: 'unknown' };
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      const current = await readProcessStat(pid);
+      if (current && fields(current)[19] !== fields(original)[19]) return { state: 'unknown' };
       let live = false;
       for (const name of await readdir('/proc')) {
         if (!/^\d+$/.test(name)) continue;
         try {
-          const stat = fields(await readFile(`/proc/${name}/stat`, 'utf8'));
+          const processStat = await readProcessStat(name);
+          if (processStat === null) continue;
+          const stat = fields(processStat);
           if (Number(stat[2]) === pid && !['Z', 'X'].includes(stat[0])) live = true;
         } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') return { state: 'unknown' }; }
       }
@@ -123,10 +147,42 @@ export async function createEnvironment(options, context) {
       return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}) };
     } catch { return { state: 'unknown' }; }
   }
+  async function executionTiming(handle) {
+    if (handle.includes(':transfer:')) return { executionSeconds: 0, accountingExcluded: true };
+    let receipt = executionReceipts.get(handle);
+    if (!receipt) for (const name of await readdir(root)) {
+      const dir = join(root, name);
+      try {
+        const execution = await json(join(dir, 'execution.json'));
+        if (execution.handle === handle || (!execution.handle && execution.receiptFile && (await json(execution.receiptFile)).handle === handle)) receipt = { ...execution, dir };
+      } catch { /* another operation */ }
+      if (!receipt) try {
+        if ((await json(join(dir, 'sync-submission.json'))).handle === handle) return { executionSeconds: 0, accountingExcluded: true };
+      } catch { /* not a setup receipt */ }
+      if (receipt) { executionReceipts.set(handle, receipt); break; }
+    }
+    if (receipt?.timingKey && receipt.spool) {
+      const path = join(receipt.dir, 'timing.json');
+      try {
+        let timing;
+        try { timing = await json(path); } catch {
+          const dir = await mkdtemp(join(root, 'timing-'));
+          await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir));
+          timing = await json(path);
+        }
+        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0) return { executionSeconds: timing.executionSeconds };
+      } catch { /* terminal work without complete timing is not free work */ }
+    }
+    await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
+    return { accountingUnresolved: true };
+  }
   async function observe(handle) {
     check(handle);
     let state;
-    try { state = remote ? normalize(await client(['observe', handle])) : await localState(handle); }
+    try {
+      state = remote ? normalize(await client(['observe', handle])) : await localState(handle);
+      if (remote && state.state === 'stopped' && state.executionSeconds === undefined) Object.assign(state, await executionTiming(handle));
+    }
     catch { state = { state: 'unknown' }; }
     await event('execution-state', { handle, ...state });
     return state;
@@ -149,16 +205,32 @@ export async function createEnvironment(options, context) {
     }
     return { state: 'unknown' };
   }
+  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false) {
+    const operation = randomUUID();
+    await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
+    let result, cause;
+    try { result = await client(args); }
+    catch (error) {
+      cause = error;
+      if (receipt) try { result = await json(receipt); } catch { /* absence is not closure */ }
+    }
+    if (result?.handle || (allowCompleted && result?.state === 'completed')) {
+      await event('execution-submitted', { submission: operation, handle: result.handle ?? null, closed: !result.handle, accountingExcluded });
+      return result;
+    }
+    if (result?.admitted === false || result?.submitted === false) {
+      await event('execution-not-admitted', { submission: operation, closed: true });
+      throw new Error(`CPL ${args[0]} was not admitted`);
+    }
+    const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
+    await event('execution-unresolved', { operation, submission: operation, handle: null, message });
+    throw new Error(message, { cause });
+  }
   async function transfer(args, dir) {
     const upload = args[0] === 'upload';
     if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
     else args.push('--timeout', '0');
-    let result;
-    try { result = await client(args); }
-    catch (error) {
-      if (!upload) throw error;
-      try { result = await json(join(dir, 'transfer.json')); } catch { throw error; }
-    }
+    let result = await submit(args, upload ? join(dir, 'transfer.json') : undefined, true, true);
     const handle = result.handle;
     if (handle) {
       await event('execution-handle', { handle, purpose: 'transfer' });
@@ -216,10 +288,7 @@ export async function createEnvironment(options, context) {
       await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
       const args = ['run', options.target, '--file', script, '--receipt-file', join(dir, 'sync-submission.json')];
       if (options.runtime) args.push('--runtime', options.runtime);
-      let submitted;
-      try { submitted = await client(args); }
-      catch (error) { try { submitted = await json(join(dir, 'sync-submission.json')); } catch { throw error; } }
-      if (!submitted.handle) throw new Error('Copy submission identity unknown; do not resubmit');
+      const submitted = await submit(args, join(dir, 'sync-submission.json'), false, true);
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
       do {
@@ -230,24 +299,24 @@ export async function createEnvironment(options, context) {
     });
     if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
     const spool = posix.join(runRoot, 'output');
-    const configuration = { command, verifiers: opts.purpose === 'verification' ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
-      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) => process.env[key] !== value)) }, timeout: remaining() ?? null };
+    const timingKey = randomUUID();
+    const configuration = { command, timingKey, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
+      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) =>
+        key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (opts.env ?? {}))) && process.env[key] !== value)) }, timeout: remaining() ?? null };
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
     await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(supervisor)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
     const args = ['run', options.target, '--file', script, '--receipt-file', receipt];
     if (options.runtime) args.push('--runtime', options.runtime);
     if (opts.resourceId !== undefined) args.push('--npu', String(opts.resourceId));
-    let submitted;
-    try { submitted = await client(args); }
-    catch (error) {
-      try { submitted = await json(receipt); }
-      catch { throw new Error('Submission identity unknown; do not resubmit', { cause: error }); }
-    }
+    const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, cwd: configuration.cwd };
+    await save(join(dir, 'execution.json'), receiptData);
+    const submitted = await submit(args, receipt);
     handle = submitted.handle;
-    if (!handle) throw new Error('CPL returned no handle; do not resubmit');
     check(handle);
-    await save(join(dir, 'execution.json'), { handle, spool, cwd: configuration.cwd });
+    receiptData.handle = handle;
+    await save(join(dir, 'execution.json'), receiptData);
+    executionReceipts.set(handle, { ...receiptData, dir });
     await event('execution-handle', { handle });
     let state;
     for (;;) {
@@ -268,10 +337,30 @@ export async function createEnvironment(options, context) {
         if (opts.onData) opts.onData(Buffer.from(`\nOutput unavailable/partial; full remote archive: ${spool}\n`));
       }
     }
-    return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped' };
+    return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped',
+      ...(state.executionSeconds === undefined ? { accountingUnresolved: true } : { executionSeconds: state.executionSeconds }) };
+  }
+  async function reconcileOperation({ operation, events }) {
+    const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
+    const handles = new Set();
+    if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
+    let executionSeconds = 0;
+    for (const { data } of pending) {
+      const response = events.find(event => ['execution-submitted', 'execution-not-admitted'].includes(event.type) && event.data.submission === data.submission);
+      if (response?.type === 'execution-not-admitted' || (response?.data.closed && data.accountingExcluded)) continue;
+      let handle = response?.data.handle;
+      if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
+      if (!handle) return { closed: false, accountingUnresolved: true, handles: [...handles] };
+      if (handles.has(handle)) continue;
+      handles.add(handle);
+      const state = await observe(handle);
+      if (state.state !== 'stopped' || (!data.accountingExcluded && !Number.isFinite(state.executionSeconds))) return { closed: false, accountingUnresolved: true, handles: [...handles] };
+      if (!data.accountingExcluded) executionSeconds += state.executionSeconds;
+    }
+    return { closed: true, executionSeconds, handles: [...handles] };
   }
   return {
-    instructions, execute, observe, stop,
+    instructions, execute, observe, stop, reconcileOperation,
     async prepare({ project, attempt }) {
       return exclude('setup', async () => {
         if (remote) {
@@ -317,18 +406,9 @@ export async function createEnvironment(options, context) {
 export async function createEnvironmentTools(environment, cwd, sdk) {
   sdk ??= await import('@earendil-works/pi-coding-agent');
   return [sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
-    // Pi supplies its whole LOCAL shell environment; forward only tool overrides.
-    const env = Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) => process.env[key] !== value));
-    const result = await environment.execute(command, cwd, { ...opts, env });
+    const result = await environment.execute(command, cwd, opts);
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
   } } })];
 }
 
-export function createExtension(options, context) {
-  return async pi => {
-    const environment = await createEnvironment(options, context);
-    for (const tool of await createEnvironmentTools(environment, options.cwd)) pi.registerTool(tool);
-    pi.on('before_agent_start', async event => ({ systemPrompt: `${event.systemPrompt}\n${environment.instructions}` }));
-  };
-}

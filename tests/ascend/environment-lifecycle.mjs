@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, mkdir, readdir } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
+import { createEnvironment, createEnvironmentTools, readProcessStat } from '../../integrations/environments/index.mjs';
 
 async function fixture(t, override) {
   const instancePath = await mkdtemp(join(tmpdir(), 'environment-test-'));
@@ -150,6 +150,7 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const project = join(instancePath, 'source'), workspace = join(instancePath, 'remote');
   await mkdir(project); await mkdir(workspace);
   await writeFile(join(project, 'old.py'), 'old');
+  await writeFile(join(project, 'layout-node'), 'old file');
   const jobs = new Map(); let sequence = 0, loseObserver = false;
   const context = { instancePath, sdk, event: async () => {}, exclude: async (label, fn) => {
     assert.ok(['setup','transfer'].includes(label)); return fn();
@@ -176,27 +177,178 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   await environment.prepare({ project: { id: 'p', sourceDirectory: project }, attempt: { id: 'a' } });
   assert.equal((await environment.execute('printf built > build.marker', project)).exitCode, 0);
   await rm(join(project, 'old.py'));
+  await rm(join(project, 'layout-node')); await mkdir(join(project, 'layout-node'));
+  await writeFile(join(project, 'layout-node', 'nested.py'), 'new directory');
   await writeFile(join(project, 'new.py'), "from pathlib import Path\nassert not Path('old.py').exists()\nprint(Path('build.marker').read_text())\n");
   let output = '';
   assert.equal((await environment.execute('python3 new.py', project, { onData: data => { output += data; } })).exitCode, 0);
   assert.equal(output, 'built\n');
+  assert.equal((await environment.execute("python3 -c \"from pathlib import Path; assert Path('layout-node/nested.py').read_text() == 'new directory'; assert Path('build.marker').read_text() == 'built'\"", project)).exitCode, 0);
+  await rm(join(project, 'layout-node', 'nested.py')); await rm(join(project, 'layout-node'), { recursive: true });
+  await writeFile(join(project, 'layout-node'), 'new file');
+  assert.equal((await environment.execute("python3 -c \"from pathlib import Path; assert Path('layout-node').read_text() == 'new file'; assert Path('build.marker').read_text() == 'built'\"", project)).exitCode, 0);
   // The caller disappears after dispatch; workload timeout still closes the child.
   loseObserver = true;
   const timeoutJob = await environment.execute("python3 -c 'import time; time.sleep(30)'", project, { timeout: 0.1 });
   for (const job of jobs.values()) await job.completion;
   assert.equal(jobs.get(timeoutJob.handle).exit, 124);
+  const timed = await environment.observe(timeoutJob.handle);
+  assert.ok(timed.executionSeconds > 0 && timed.executionSeconds < 5);
+  const freshObserver = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'attempts' }, context);
+  assert.equal((await freshObserver.observe(timeoutJob.handle)).executionSeconds, timed.executionSeconds);
   const verifier = join(instancePath, 'verify.py');
   await writeFile(join(project, 'value.txt'), '7');
   await writeFile(verifier, "from pathlib import Path\nassert int(Path('value.txt').read_text()) == 7\nPath('verified.marker').write_text('ran')\nif Path('mutate').exists(): Path(__file__).write_text('changed')\nprint('verified')\n");
   const verified = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'verifier-attempts', pollMs: 1 }, context);
   await verified.prepare({ project: { id: 'verified', source: project, verifier: { files: [verifier], command: 'python3 ../verify.py' } }, attempt: { id: 'v' } });
   let verifiedOutput = '';
-  const verify = () => verified.execute('python3 ../verify.py', project, { purpose: 'verification', onData: data => { verifiedOutput += data; } });
+  const verify = (purpose = 'verification') => verified.execute('python3 ../verify.py', project, { purpose, onData: data => { verifiedOutput += data; } });
   assert.equal((await verify()).exitCode, 0);
   assert.equal(verifiedOutput, 'verified\n');
   await writeFile(join(project, 'mutate'), '1');
-  assert.equal((await verify()).exitCode, 125); // mutation during verification rejects success
+  assert.equal((await verify('performance')).exitCode, 125); // performance self-mutation rejects success
   assert.equal((await verified.execute('rm verified.marker', project)).exitCode, 0);
   assert.equal((await verify()).exitCode, 125); // existing corruption prevents verifier launch
+  assert.equal((await verify('performance')).exitCode, 125);
   assert.equal((await verified.execute('test ! -e verified.marker', project)).exitCode, 0);
+});
+
+test('missing submission receipts persist unresolved events before errors and survive observer restart without dispatch', async t => {
+  for (const phase of ['work', 'setup', 'prepare']) {
+    const f = await fixture(t), trace = [];
+    let submissions = 0;
+    const context = { ...f.context, event: async (type, data) => {
+      await f.context.event(type, data);
+      await writeFile(join(f.instancePath, 'events.json'), JSON.stringify(f.events));
+      if (type === 'execution-unresolved') trace.push('persisted');
+    }, client: async args => {
+      const file = args[args.indexOf('--file') + 1];
+      if ((phase === 'prepare' && args[0] === 'upload') ||
+          (args[0] === 'run' && file.endsWith(phase === 'setup' ? 'sync.sh' : 'command.sh'))) {
+        submissions++;
+        if (phase === 'setup') return { state: 'queued' };
+        throw new Error('HTTP400 text without structured admission evidence');
+      }
+      return f.context.client(args);
+    } };
+    const verifier = join(f.instancePath, 'verify.py');
+    await writeFile(verifier, 'assert True');
+    const spec = { project: { id: 'p', source: f.project, ...(phase === 'prepare' ? { verifier: { files: [verifier] } } : {}) }, attempt: { id: phase } };
+    const environment = await createEnvironment(f.options, context);
+    await assert.rejects(async () => {
+      try { await environment.prepare(spec); if (phase !== 'prepare') await environment.execute('true', f.project); }
+      catch (error) { trace.push('exception'); throw error; }
+    });
+    assert.deepEqual(trace, ['persisted', 'exception']);
+    const marker = JSON.parse(await readFile(join(f.instancePath, 'events.json'), 'utf8')).at(-1);
+    assert.equal(marker.type, 'execution-unresolved'); assert.equal(marker.handle, null);
+    assert.match(marker.operation, /^[0-9a-f-]{36}$/);
+    await createEnvironment(f.options, context);
+    assert.equal(submissions, 1);
+    assert.deepEqual(JSON.parse(await readFile(join(f.instancePath, 'events.json'), 'utf8')).at(-1), marker);
+  }
+  const rejected = await fixture(t, async args => args[0] === 'run' ? { admitted: false, state: 'rejected' } : undefined);
+  await assert.rejects(rejected.environment.execute('true', rejected.project));
+  assert.equal(rejected.events.some(event => event.type === 'execution-unresolved'), false);
+});
+
+test('native SDK session PATH and local session-file metadata do not override remote runtime', async t => {
+  const sdk = await import(process.env.PI_SDK_MODULE ?? '@earendil-works/pi-coding-agent');
+  const f = await fixture(t);
+  const tool = sdk.createBashTool(f.project, { operations: { exec: (command, cwd, options) => f.environment.execute(command, cwd, options) } });
+  await tool.execute('native-env', { command: 'true' }, undefined, undefined, {
+    cwd: f.project, sessionManager: { getSessionId: () => 'native-session', getSessionFile: () => '/local/attempt/session.jsonl' },
+  });
+  const run = f.calls.find(args => args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith('command.sh'));
+  const script = await readFile(run[run.indexOf('--file') + 1], 'utf8');
+  const config = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -2));
+  assert.equal(Object.hasOwn(config.env, 'PATH'), false);
+  assert.equal(Object.hasOwn(config.env, 'PI_SESSION_FILE'), false);
+  assert.equal(config.env.PI_SESSION_ID, 'native-session');
+});
+
+test('SIGKILL after native receipt recovers the same operation and completed duration without resubmission', async t => {
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { appendFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'environment-crash-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, 'project'); await mkdir(project);
+  await writeFile(join(project, 'source.py'), 'answer=42');
+  const module = new URL('../../integrations/environments/index.mjs', import.meta.url).href;
+  const script = `import {createEnvironment} from ${JSON.stringify(module)};
+    import {writeFile,appendFile} from 'node:fs/promises';
+    const root=process.argv[1],project=root+'/project';
+    const environment=await createEnvironment({mode:'cpl',target:'fake',workspacePath:'/registered',remoteDirectory:'owned'}, {
+      instancePath:root,sdk:{createLocalBashOperations:()=>({})},exclude:async(_,fn)=>fn(),
+      event:async(type,data)=>appendFile(root+'/events.jsonl',JSON.stringify({type,data:{...data,operation:'crash-op',actor_elapsed:3}})+'\\n'),
+      client:async args=>{
+        if(args[0]==='capabilities')return {state:'available'};
+        if(args[0]==='run') {
+          const sync=args[args.indexOf('--file')+1].endsWith('sync.sh');
+          const result={handle:'remote:fake:job:'+(sync?'sync':'orphan')};
+          await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify(result));
+          if(!sync)process.kill(process.pid,'SIGKILL');
+          return result;
+        }
+        return {state:'completed',exit:0};
+      }});
+    await environment.prepare({project:{id:'p',source:project},attempt:{id:'a'}});
+    await environment.execute('unrepeated original command',project);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, root], { stdio: 'ignore' });
+  const [code, signal] = await once(child, 'exit');
+  assert.equal(code, null); assert.equal(signal, 'SIGKILL');
+  const events = (await readFile(join(root, 'events.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const pending = events.find(event => event.type === 'execution-submitting' && !event.data.accountingExcluded);
+  assert.ok(pending?.data.receiptFile);
+  assert.equal(events.some(event => event.type === 'execution-handle' && event.data.handle === 'remote:fake:job:orphan'), false);
+  const receiptDir = dirname(pending.data.receiptFile);
+  const metadata = JSON.parse(await readFile(join(receiptDir, 'execution.json'), 'utf8'));
+  assert.equal(metadata.handle, null); assert.ok(metadata.timingKey);
+  let terminal = false, downloads = 0, submissions = 0, incomplete = false;
+  const options = { mode: 'cpl', target: 'fake' };
+  const context = { instancePath: root, sdk: { createLocalBashOperations: () => ({}) }, exclude: async (label, fn) => {
+    assert.equal(label, 'transfer'); return fn();
+  }, event: async (type, data) => {
+    events.push({ type, data: { ...data, operation: 'crash-op' } });
+    await appendFile(join(root, 'events.jsonl'), JSON.stringify(events.at(-1)) + '\n');
+  }, client: async args => {
+    if (['run','upload'].includes(args[0])) { submissions++; throw new Error('must not resubmit'); }
+    if (args[0] === 'observe') return args[1].endsWith(':sync') ? { state: 'completed', exit: 0 } : { state: terminal ? 'completed' : 'running', exit: 0 };
+    if (args[0] === 'download') {
+      assert.equal(terminal, true); downloads++;
+      await writeFile(args[3], JSON.stringify({ completed: !incomplete, executionSeconds: 30.125, key: metadata.timingKey }));
+      return { state: 'completed' };
+    }
+    throw new Error('unexpected operation');
+  } };
+  const resumed = await createEnvironment(options, context);
+  assert.equal((await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 })).closed, false);
+  assert.equal(downloads, 0);
+  terminal = true;
+  const result = await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 });
+  assert.equal(result.closed, true); assert.equal(result.executionSeconds, 30.125);
+  assert.ok(result.handles.includes('remote:fake:job:orphan'));
+  assert.equal((await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 })).executionSeconds, 30.125);
+  assert.equal(downloads, 1); assert.equal(submissions, 0);
+  incomplete = true; await rm(join(receiptDir, 'timing.json'));
+  assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
+  await rm(pending.data.receiptFile);
+  assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
+  assert.equal(submissions, 0);
+});
+
+
+test('reaped process proc descriptor reports absence without hiding permission failures', async t => {
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { open } = await import('node:fs/promises');
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  const descriptor = await open(`/proc/${child.pid}/stat`, 'r');
+  try {
+    const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+    assert.equal(await readProcessStat(child.pid, () => descriptor.readFile('utf8')), null);
+    await assert.rejects(readProcessStat(child.pid, async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); }), { code: 'EACCES' });
+  } finally { await descriptor.close(); }
 });
