@@ -23,8 +23,10 @@ numeric verification. The controller does not import CPL or guess device IDs.
 
 ## Fresh bootstrap
 
-Use Node 22.23.3 and host Python 3.12. Install root Node dependencies and the
-Python helper package first. Production BGE queries additionally require the
+Use Node 22.23.3. Python 3.12 is the tested, recommended host; packaging permits
+Python 3.11 and newer. Full Python 3.11 host runtime acceptance remains untested.
+Registered target kernels use Python 3.11 and their own pinned dependencies.
+Install root Node dependencies and the Python helper package first. Production BGE queries additionally require the
 `embeddings` extra and the pinned model already available in its configured
 cache. No embedding model download or corpus reindex is part of bootstrap.
 
@@ -55,7 +57,6 @@ private configuration. Execution uses the installed remote-access client.
 
 ```bash
 node cli/main.mjs bootstrap "$INSTANCE" --config "$BOOTSTRAP_JSON"
-npm ci --prefix "$INSTANCE/machinery"
 node "$INSTANCE/machinery/cli/main.mjs" status --instance "$INSTANCE"
 ```
 
@@ -64,8 +65,11 @@ the baseline SQLite database, copies baseline skills into instance-owned
 versioned storage, and copies the supported machinery. An optional `repository`
 input copies a starting repository. The instance owns `instance.json`, current
 `state.sqlite`, `knowledge.sqlite`, skills, projects and execution evidence.
-Install dependencies for the copied Node machinery rather than relying on a
-source-checkout `node_modules` directory being copied.
+Bootstrap automatically runs `npm ci --ignore-scripts` for the copied Node
+machinery using its standard `npm-shrinkwrap.json`; source `node_modules` is not
+copied. If installation needs repair, rerun
+`npm ci --ignore-scripts --prefix "$INSTANCE/machinery"`. Extra bootstrap
+settings, including actor profiles, are preserved in the instance configuration.
 
 Only the current instance format is accepted. Existing historical state is not
 migrated, adopted or replayed. Preserve old research evidence separately.
@@ -78,7 +82,15 @@ node "$INSTANCE/machinery/cli/main.mjs" config --instance "$INSTANCE" --config "
 node "$INSTANCE/machinery/cli/main.mjs" project --instance "$INSTANCE" --project "$PROJECT_JSON"
 ```
 
-The config command reads or writes JSON settings. Use it for actor allocation,
+The config command reads or writes JSON settings. Actor profiles are root
+`actor` (kernel work), `curriculum_actor` (task generation) and
+`skill_writer_actor` (skill generation). Each profile supplies its provider,
+model and credential environment variable; private credential files and explicit
+model metadata may be configured as needed. Bootstrap preserves these root
+fields. The dashboard actor editor projects them as `{actor, curriculum, writer}`
+and writes back those same canonical root fields.
+
+Use config for actor allocation,
 concurrency, environment instructions/options, model selection, curriculum,
 skills map, baseline KDB configuration and user information. Store path and
 machine values only in the private instance. Defaults are 28,800 actor seconds,
@@ -150,6 +162,12 @@ node "$INSTANCE/machinery/cli/main.mjs" kdb --instance "$INSTANCE" --config "$KD
 node "$INSTANCE/machinery/cli/main.mjs" config --instance "$INSTANCE" --config "$SETTINGS_JSON"
 node "$INSTANCE/machinery/cli/main.mjs" tune --instance "$INSTANCE" --config "$TUNE_ACTION_JSON"
 ```
+
+The config read view includes the actual active `skillsmap`. Skill-map edits
+create a new immutable user skill version and update the active pointer.
+`baselineKDB` records the bootstrap baseline path; changing it is permitted only
+before any attempts exist. After an attempt, create a fresh instance for a
+different baseline.
 
 Persist `userinfo` through config before invoking a tuning action; the dashboard
 performs this ordering automatically. Tuning counts distinct completed original

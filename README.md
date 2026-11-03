@@ -12,9 +12,10 @@ old campaign state is never loaded into a new instance.
 
 ## Install
 
-Use Node **22.23.3** and host Python **3.12**. Target kernel execution uses the
-interpreter and dependencies pinned in its selected environment, independently
-of the host Python installation.
+Use Node **22.23.3**. Python **3.12** is the tested, recommended host; the helper
+package permits Python **3.11+**. Full host runtime acceptance on Python 3.11 is
+not yet established. Target kernels use their registered Python **3.11** runtime
+and pinned dependencies independently of the host installation.
 
 ```bash
 npm ci
@@ -23,7 +24,7 @@ python -m pip install -e .
 python -m pip install -e '.[embeddings]'
 ```
 
-The Node lockfile pins Pi 1.3.0. The Python package installs only `ascend_tools`,
+The standard npm shrinkwrap pins Pi 1.3.0. The Python package installs only `ascend_tools`,
 with MCP 1.27.2 and Flask 3.0.3. The optional embedding runtime pins Torch 2.10.0
 and Transformers 5.0.0. The Python wheel contains helpers; the Node CLI and web
 assets are supplied by the source machinery and copied into each instance.
@@ -44,14 +45,13 @@ node "$INSTANCE/machinery/cli/main.mjs" status --instance "$INSTANCE"
 
 All variables above refer to user-selected paths. Keep credentials, machine
 paths and target runtime settings in private configuration outside this source.
-Install the copied machinery's Node dependencies before executing its CLI:
+Bootstrap automatically installs copied-machinery dependencies with `npm ci`,
+using the copied standard `npm-shrinkwrap.json`. If that installation needs
+repair, rerun `npm ci --ignore-scripts --prefix "$INSTANCE/machinery"`.
 
-```bash
-npm ci --prefix "$INSTANCE/machinery"
-```
-
-Use `config --config "$SETTINGS_JSON"` to write settings, then start a bounded
-wave when ready:
+Actor profiles use root `actor`, `curriculum_actor` and `skill_writer_actor`
+fields in bootstrap/settings JSON. Use `config --config "$SETTINGS_JSON"` to
+write settings, then start a bounded wave when ready:
 
 ```bash
 node "$INSTANCE/machinery/cli/main.mjs" wave --instance "$INSTANCE" --mode phase1 --detach
