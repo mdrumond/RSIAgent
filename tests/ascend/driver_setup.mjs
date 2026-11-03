@@ -83,9 +83,9 @@ export async function setup(t,scenario,ids) {
   const boot=execute(process.execPath,[cli,'bootstrap',instance,'--config',input]);await boot.output;
   cli=join(instance,'machinery','cli','main.mjs');
   // Install only the configurable test embedding module, never replace runtime code.
-  await cp(fixture,join(instance,'machinery','driver_fixture.py'));
+  await cp(fixture,join(instance,'machinery','ascend_tools','fixture_embeddings.py'));
   const settings=join(root,'settings.json');await writeFile(settings,JSON.stringify({python,
-    embedding_factory:'driver_fixture:Embeddings',target:'cpu',investigation_seconds:120,
+    embedding_factory:'ascend_tools.fixture_embeddings:Embeddings',target:'cpu',investigation_seconds:120,
     failed_recovery_rounds:2,concurrency:1,curriculum_seconds:30,
     actor:{provider:'driver-fixture',model:'scripted',credential_env:'DRIVER_FIXTURE_KEY',base_url:server.url,
       metadata:{id:'scripted',name:'Scripted SSE acceptance',api:'openai-completions',reasoning:false,
