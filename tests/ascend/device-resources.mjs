@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { State } from '../../controller/state.mjs';
+import { ActorClock } from '../../controller/budget.mjs';
+import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
@@ -31,7 +34,7 @@ outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
 print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], jobs = new Map();
-  let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0;
+  let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
   const client = async args => {
     calls.push(args);
     if (args[0] === 'npu') return { state: 'completed', profiles: [{ target: 'fixture', devices: enabled.map(id => ({ id, enabled: true })) }] };
@@ -48,6 +51,9 @@ print(outputs[query])
         content = JSON.stringify(response);
       }
       jobs.set(handle, content);
+      if (file.endsWith('probe.sh')) lastProbe = { handle, receipt:args[args.indexOf('--receipt-file')+1] };
+      if (hideSubmission) throw new Error('lost native reply and receipt not yet visible');
+      if (args.includes('--receipt-file')) await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));
       return { handle, state: 'queued' };
     }
     if (args[0] === 'observe') return { state: disconnect ? 'observation-unavailable' : 'completed', exit: 0 };
@@ -61,7 +67,7 @@ print(outputs[query])
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, rows, telemetry,
-    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; },
+    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
 
@@ -104,7 +110,7 @@ for (const physical of [0, 1]) test(`lease ${physical}: assigned opaque lease re
   assert.equal(config.env.ASCEND_PHYSICAL_DEVICE, String(physical));
   assert.equal(config.env.ASCEND_RT_VISIBLE_DEVICES, String(physical));
   assert.equal(config.env.ASCEND_VISIBLE_DEVICES, String(physical));
-  assert.ok(config.timeout > 0 && config.timeout < 3);
+  assert.ok(config.timeout > 2.8 && config.timeout <= 3);
   await assert.rejects(bound.execute('work',f.source,{ resourceId:'0' }), /opaque|Assigned/);
   f.rows[physical].busy = true; await f.update();
   await assert.rejects(bound.execute('work',f.source), /admission refused/);
@@ -147,4 +153,57 @@ test('explicit project device affinity is a recorded filter and never falls back
   assert.deepEqual(rows[0].metadata.deviceAffinity,[1]);
   assert.ok(f.events.some(row => row.type === 'resource-policy' && row.deviceAffinity?.[0] === 1));
   f.setEnabled([0]); assert.deepEqual(await bound.resources(),[]);
+});
+
+
+for (const failure of ['policy','busy','unknown']) test(`core probe-only reconciliation: ${failure}`, async t => {
+  const f=await fixture(t);
+  const lease=(await f.environment.resources()).find(row=>row.available);
+  const file=join(f.context.instancePath,'state.sqlite');
+  let state=new State(file),depth=0;
+  t.after(()=>state.close());
+  state.add({id:'p',goal:'numeric',actor_seconds:30,source:f.source,verifier:{files:[],command:'true'}});
+  const attempt=state.admit('p',{pid:2147483647,start:'gone',boot:'gone'});
+  state.checkpoint(attempt.id,2);
+  state.event(attempt.id,'execution-starting',{operation:'probe-only',startElapsed:2});
+  const clock=new ActorClock(30,2);
+  const context={...f.context,resource:lease,
+    exclude:(label,fn)=>clock.exclude(label,async()=>{depth++;try{return await fn();}finally{depth--;}}),
+    event:async(type,data)=>{
+      if(type==='execution-submitting' && data.accountingExcluded)assert.ok(depth>0);
+      state.event(attempt.id,type,{...data,operation:'probe-only'});
+    }};
+  const bound=await createEnvironment(f.options,context);
+  if(failure==='policy')f.setEnabled([]);
+  if(failure==='busy'){f.rows[0].busy=true;await f.update();}
+  if(failure==='unknown')f.hideSubmission(true);
+  await assert.rejects(bound.execute('must-not-run',f.source));
+  state.event(attempt.id,'execution-unresolved',{operation:'probe-only',startElapsed:2,handle:null});
+  const submitted=f.calls.filter(args=>args[0]==='run').length;
+  if(failure==='unknown'){
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),bound),false);
+    const probe=f.lastProbe();
+    await writeFile(probe.receipt,JSON.stringify({handle:probe.handle}));
+    f.disconnect(true);
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),bound),false);
+    f.disconnect(false);f.hideSubmission(false);
+  }
+  state.close();state=new State(file);
+  const restarted=await createEnvironment(f.options,context);
+  const resumed=await state.resume(attempt.id,a=>attemptStopped(state,a,restarted),await processIdentity());
+  assert.equal(resumed.id,attempt.id);assert.equal(resumed.elapsed,2);
+  assert.equal(f.calls.filter(args=>args[0]==='run').length,submitted);
+  assert.ok(clock.elapsed<2.2,'actual setup exclusion must not charge probe latency');
+  const reconciliation=state.events(attempt.id).find(row=>row.type==='execution-reconciled');
+  assert.equal(reconciliation.data.executionSeconds,0);
+});
+
+test('waiting behind another execution still consumes the caller timeout',async t=>{
+  const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
+  const bound=await createEnvironment(f.options,{...f.context,resource:lease});
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'queue'}});
+  const first=bound.execute('one',f.source,{timeout:3});
+  const queued=assert.rejects(bound.execute('two',f.source,{timeout:.01}),/elapsed/);
+  assert.equal((await first).exitCode,0);await queued;
+  assert.equal(f.calls.filter(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')).length,1);
 });
