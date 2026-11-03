@@ -1,0 +1,33 @@
+{
+  "name": "ascend-rsi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "typebox": "1.3.27",
+    "@earendil-works/pi-ai": "1.3.0"
+  },
+  "scripts": {
+    "test:controller": "node --test tests/ascend/controller*.mjs"
+  },
+  "bin": {
+    "ascend-rsi": "cli/main.mjs"
+  },
+  "files": [
+    "controller",
+    "cli",
+    "integrations/environments",
+    "integrations/kdb-extension.mjs",
+    "ascend_tools",
+    "web",
+    "templates/skills",
+    "examples/ascend-targets",
+    "docs/ascend-controller.md",
+    "pyproject.toml",
+    "npm-shrinkwrap.json"
+  ]
+}

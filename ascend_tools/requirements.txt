@@ -1,0 +1,2 @@
+# Standard protocol adapter; base domain retrieval has no third-party imports.
+mcp==1.27.2
