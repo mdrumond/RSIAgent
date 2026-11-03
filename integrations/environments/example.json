@@ -1,0 +1,12 @@
+{
+  "extensionModule": "./integrations/environments/index.mjs",
+  "instructionFile": "./private/access.md",
+  "options": {
+    "mode": "cpl",
+    "target": "registered-target",
+    "runtime": "registered-runtime",
+    "cwd": "configured-workspace",
+    "uploads": [],
+    "downloadDirectory": "./private/downloads"
+  }
+}
