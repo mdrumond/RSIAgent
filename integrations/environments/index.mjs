@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, lstat, readlink, rm } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -12,14 +12,32 @@ const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ['queued', 'dispatching', 'running', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
-async function sourceFiles(path, prefix = '') {
-  const files = [];
-  for (const entry of await readdir(path, { withFileTypes: true })) {
-    const name = posix.join(prefix, entry.name);
-    if (entry.isDirectory()) files.push(...await sourceFiles(join(path, entry.name), name));
-    else files.push(name);
+async function sourceSnapshot(path) {
+  const files = [], entries = [];
+  let cacheable = true;
+  async function walk(directory, prefix = '') {
+    const mode = (await lstat(directory)).mode & 0o777;
+    entries.push([prefix, 'directory', mode]);
+    const children = await readdir(directory, { withFileTypes: true });
+    children.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    for (const entry of children) {
+      const name = posix.join(prefix, entry.name), file = join(directory, entry.name);
+      if (entry.isDirectory()) { await walk(file, name); continue; }
+      files.push(name);
+      const stat = await lstat(file);
+      if (entry.isFile()) {
+        const hash = createHash('sha256');
+        for await (const data of createReadStream(file)) hash.update(data);
+        entries.push([name, 'file', stat.mode & 0o777, hash.digest('hex')]);
+      } else {
+        // A retained symlink can resolve to mutable remote data; keep fresh-transfer behavior.
+        cacheable = false;
+        entries.push([name, 'other', stat.mode & 0o777, entry.isSymbolicLink() ? await readlink(file) : null]);
+      }
+    }
   }
-  return files;
+  await walk(path);
+  return { files, cacheable, fingerprint: createHash('sha256').update(JSON.stringify(entries)).digest('hex') };
 }
 // A proc file opened before reaping can fail its subsequent read with ESRCH.
 export async function readProcessStat(pid, read = readFile) {
@@ -82,6 +100,7 @@ sys.exit(code if code>=0 else 128-code)
 
 const synchronize = `import errno, json, os, shutil, sys
 with open(sys.argv[1]) as manifest_input: c=json.load(manifest_input)
+if not os.path.isdir(c['incoming']): raise FileNotFoundError('Retained incoming source snapshot is missing')
 os.makedirs(c['project'],exist_ok=True)
 manifest=c['project']+'/.environment-source-files.json'
 try:
@@ -221,7 +240,7 @@ export async function createEnvironment(options, context) {
     }
     if (result?.admitted === false || result?.submitted === false) {
       await event('execution-not-admitted', { submission: operation, closed: true });
-      throw new Error(`CPL ${args[0]} was not admitted`);
+      throw Object.assign(new Error(`CPL ${args[0]} was not admitted`), { code: 'CPL_NOT_ADMITTED' });
     }
     const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
@@ -280,27 +299,59 @@ export async function createEnvironment(options, context) {
     if (subdir === '..' || subdir.startsWith('../') || isAbsolute(subdir)) throw new Error('Bash cwd must be inside local project');
     const runRoot = posix.join(attemptRoot, dir.slice(dir.lastIndexOf('/') + 1));
     const destination = posix.join(attemptRoot, projectLayout);
-    const incoming = posix.join(runRoot, 'incoming');
-    const files = await sourceFiles(projectRoot);
+    const cachePath = join(root, 'source-staging.json');
     await copy('transfer', async () => {
-      await transfer(['upload', options.target, projectRoot, incoming], dir);
-      const configuration = { incoming: posix.join(options.workspacePath, incoming), project: posix.join(options.workspacePath, destination), files };
-      const manifestDir = await mkdtemp(join(root, 'manifest-'));
-      const manifest = join(manifestDir, 'sync.json'), remoteManifest = posix.join(runRoot, 'sync.json');
-      await writeFile(manifest, JSON.stringify(configuration), { mode: 0o600 });
-      await transfer(['upload', options.target, manifest, remoteManifest], manifestDir);
+      const snapshot = await sourceSnapshot(projectRoot);
+      const key = createHash('sha256').update(JSON.stringify([options.target, options.runtime,
+        options.workspacePath, attemptRoot, projectRoot, projectLayout, snapshot.fingerprint])).digest('hex');
+      let retained;
+      try { retained = await json(cachePath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      // An interrupted synchronization is observed through its existing native receipt, never replayed.
+      if (retained && !retained.confirmed) {
+        let receipt;
+        try { receipt = await json(retained.receiptFile); } catch { /* no identity is not closure */ }
+        if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
+        const state = await observe(receipt.handle);
+        if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
+        if (state.exitCode !== 0) { await rm(cachePath); throw new Error(`Source synchronization failed: ${receipt.handle}`); }
+        retained.confirmed = true;
+        await save(cachePath, retained);
+      }
+      const reused = Boolean(snapshot.cacheable && retained?.confirmed && retained.key === key);
+      let stage = reused ? retained : { key, cacheable: snapshot.cacheable,
+        incoming: posix.join(runRoot, 'incoming'), manifest: posix.join(runRoot, 'sync.json') };
+      if (!reused) {
+        await transfer(['upload', options.target, projectRoot, stage.incoming], dir);
+        const configuration = { incoming: posix.join(options.workspacePath, stage.incoming),
+          project: posix.join(options.workspacePath, destination), files: snapshot.files };
+        const manifestDir = await mkdtemp(join(root, 'manifest-'));
+        const manifest = join(manifestDir, 'sync.json');
+        await writeFile(manifest, JSON.stringify(configuration), { mode: 0o600 });
+        await transfer(['upload', options.target, manifest, stage.manifest], manifestDir);
+      }
       const script = join(dir, 'sync.sh');
-      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, remoteManifest))}\n`, { mode: 0o600 });
+      await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, stage.manifest))}\n`, { mode: 0o600 });
       const args = ['run', options.target, '--file', script, '--receipt-file', join(dir, 'sync-submission.json')];
       if (options.runtime) args.push('--runtime', options.runtime);
-      const submitted = await submit(args, join(dir, 'sync-submission.json'), false, true);
+      stage = { ...stage, confirmed: false, receiptFile: join(dir, 'sync-submission.json') };
+      await save(cachePath, stage);
+      let submitted;
+      try { submitted = await submit(args, stage.receiptFile, false, true); }
+      catch (error) { if (error.code === 'CPL_NOT_ADMITTED') await rm(cachePath); throw error; }
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
       do {
         state = await observe(submitted.handle);
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
-      if (state.state !== 'stopped' || state.exitCode !== 0) throw new Error(`Copy unresolved or failed: ${submitted.handle}`);
+      if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);
+      if (state.exitCode !== 0) { await rm(cachePath); throw new Error(`Copy failed: ${submitted.handle}`); }
+      if ((await sourceSnapshot(projectRoot)).fingerprint !== snapshot.fingerprint) {
+        await rm(cachePath); throw new Error('Local source changed during staging; wait for edits to settle');
+      }
+      if (snapshot.cacheable) await save(cachePath, { ...stage, confirmed: true });
+      else await rm(cachePath);
+      await event('source-staged', { reused, fingerprint: snapshot.fingerprint });
     });
     if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
     const spool = posix.join(runRoot, 'output');
