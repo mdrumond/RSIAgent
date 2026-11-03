@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { State } from '../../controller/state.mjs';
 import { stages } from '../../controller/workflow.mjs';
-import { RecoveryQueue, modePolicy, nextWave, admitJob, recordOutcome } from '../../controller/recovery.mjs';
+import { RecoveryQueue, modePolicy, nextWave, admitJob, recordOutcome, pendingOutcomes, outcomeRecorded } from '../../controller/recovery.mjs';
 
 function fixture(t, options = {}, file = ':memory:') {
   const state = new State(file);
@@ -239,4 +239,62 @@ test('CLI outcomes handle inference opt-out and reject duplicate or conflicting 
   assert.deepEqual(nextWave(state, { ...options, wave: 1 }), []);
   assert.throws(() => recordOutcome(state, { ...options, attemptId: job.attempt.id, ...result() }));
   assert.equal(queue.lessons().length, 1);
+});
+
+test('resource collision rolls back original and recovery admission without orphan attempts', t => {
+  const { state, queue, original } = fixture(t);
+  state.add({ id: 'holder', goal: 'occupy opaque resource', actor_seconds: 240 });
+  state.add({ id: 'queued', goal: 'wait without admission', actor_seconds: 240 });
+  const holder = admitJob(state, { projectId: 'holder', wave: 0, resourceId: 'opaque-slot' });
+  queue.enqueue(original('recover').id, 0);
+  const attempts = state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n;
+  for (const projectId of ['queued', 'recover']) {
+    assert.throws(() => admitJob(state, { projectId, wave: 1, resourceId: 'opaque-slot' }));
+    assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n, attempts);
+    assert.equal(state.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='job-admitted'").get().n, 1);
+  }
+  assert.equal(state.project('queued').status, 'queued');
+  assert.equal(state.project('recover').status, 'failed');
+  assert.equal(queue.entry('recover').attempt, null);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM recovery_attempts').get().n, 0);
+  assert.equal(state.db.prepare('SELECT attempt FROM resource_leases').get().attempt, holder.attempt.id);
+  state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(holder.attempt.id);
+  const claimed = queue.claim('recover', 1, {}, 'opaque-slot');
+  assert.equal(claimed.kind, 'investigation');
+  assert.equal(state.db.prepare('SELECT attempt FROM resource_leases').get().attempt, claimed.attempt.id);
+});
+
+test('restart finds settled outcomes for postprocessing only, separate from memory acknowledgement', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'ascend-outcomes-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const { state } = fixture(t, {}, join(directory, 'state.sqlite'));
+  state.add({ id: 'failed', goal: 'original remains immutable', actor_seconds: 240 });
+  state.add({ id: 'open', goal: 'interrupted actor', actor_seconds: 240 });
+  const failed = admitJob(state, { projectId: 'failed', wave: 2 });
+  admitJob(state, { projectId: 'open', wave: 2 });
+  state.checkpoint(failed.attempt.id, 77, 'original-native-session');
+  state.finish(failed.attempt.id, 'failed'); // crash before summary / recordOutcome
+  const reopened = fixture(t, {}, join(directory, 'state.sqlite'));
+  const [pending] = pendingOutcomes(reopened.state);
+  assert.equal(pending.id, failed.attempt.id);
+  assert.equal(pending.kind, 'original');assert.equal(pending.wave, 2);
+  assert.equal(pending.elapsed, 77);assert.equal(pending.session, 'original-native-session');
+  assert.equal(outcomeRecorded(reopened.state, failed.attempt.id), false);
+  assert.deepEqual(nextWave(reopened.state, { wave: 3 }), []);
+  recordOutcome(reopened.state, { attemptId: pending.id, wave: pending.wave, ...result() });
+  assert.equal(reopened.queue.outcomeRecorded(pending.id), true);
+  assert.equal(reopened.queue.lessons().length, 1); // KDB delivery still pending
+  assert.deepEqual(reopened.queue.pendingOutcomes(), []);
+  assert.equal(nextWave(state, { wave: 3 })[0].kind, 'investigation');
+  const investigation = admitJob(state, { projectId: 'failed', wave: 3 });
+  state.finish(investigation.attempt.id, 'passed'); // second crash after actor closure
+  const [diagnostic] = reopened.queue.pendingOutcomes();
+  assert.equal(diagnostic.id, investigation.attempt.id);assert.equal(diagnostic.kind, 'investigation');
+  assert.equal(diagnostic.wave, 3);
+  recordOutcome(reopened.state, { attemptId: diagnostic.id, wave: diagnostic.wave, ...result(true, true) });
+  assert.deepEqual(pendingOutcomes(state), []);
+  assert.equal(nextWave(state, { wave: 4 })[0].kind, 'retry');
+  assert.equal(state.project('failed').status, 'failed');
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n, 3);
+  assert.equal(state.attempt(failed.attempt.id).session, 'original-native-session');
 });

@@ -30,7 +30,9 @@ export class RecoveryQueue {
       kind TEXT NOT NULL, wave INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS recovery_lessons (
       id INTEGER PRIMARY KEY, attempt TEXT NOT NULL UNIQUE REFERENCES attempts(id),
-      data TEXT NOT NULL, recorded INTEGER NOT NULL DEFAULT 0);`);
+      data TEXT NOT NULL, recorded INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS resource_leases (resource TEXT PRIMARY KEY NOT NULL,
+      attempt TEXT NOT NULL UNIQUE REFERENCES attempts(id));`);
   }
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE');
@@ -69,7 +71,7 @@ export class RecoveryQueue {
       WHERE q.attempt IS NULL AND q.eligible_wave<=? AND p.frozen=0 AND p.status='failed'
       ORDER BY q.eligible_wave,q.project`).all(wave);
   }
-  claim(projectId, wave, owner = {}) {
+  claim(projectId, wave, owner = {}, resourceId) {
     this.wave(wave);
     return this.transaction(() => {
       const queue = this.entry(projectId), project = this.state.project(projectId);
@@ -81,6 +83,8 @@ export class RecoveryQueue {
       const id = randomUUID();
       this.db.prepare('INSERT INTO attempts(id,project,owner,created) VALUES (?,?,?,?)')
         .run(id, projectId, JSON.stringify(owner), new Date().toISOString());
+      if (resourceId !== undefined)
+        this.db.prepare('INSERT INTO resource_leases(resource,attempt) VALUES (?,?)').run(resourceId, id);
       if (!original) {
         this.db.prepare('INSERT INTO recovery_attempts(attempt,project,kind,wave) VALUES (?,?,?,?)')
           .run(id, projectId, kind, wave);
@@ -189,6 +193,20 @@ export class RecoveryQueue {
       return result;
     });
   }
+  // Settled actors awaiting postprocessing must never enter the actor runner again.
+  pendingOutcomes() {
+    return this.db.prepare(`SELECT a.*, COALESCE(r.kind,'original') AS kind, r.wave
+      FROM attempts a LEFT JOIN recovery_attempts r ON r.attempt=a.id
+      LEFT JOIN recovery_lessons l ON l.attempt=a.id
+      WHERE a.outcome IS NOT NULL AND l.id IS NULL ORDER BY a.created,a.rowid`).all()
+      .map(attempt => {
+        const admission = this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted'").get(attempt.id);
+        return { ...attempt, wave: attempt.wave ?? (admission ? JSON.parse(admission.data).wave : null) };
+      });
+  }
+  outcomeRecorded(attemptId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM recovery_lessons WHERE attempt=?').get(attemptId));
+  }
   lessons() {
     return this.db.prepare('SELECT id,data FROM recovery_lessons WHERE recorded=0 ORDER BY id').all()
       .map(row => ({ id: row.id, ...JSON.parse(row.data) }));
@@ -207,8 +225,8 @@ export class RecoveryQueue {
 export function nextWave(state, { wave, ...options }) {
   return new RecoveryQueue(state, options).jobs(wave);
 }
-export function admitJob(state, { projectId, wave, owner = {}, ...options }) {
-  return new RecoveryQueue(state, options).claim(projectId, wave, owner);
+export function admitJob(state, { projectId, wave, owner = {}, resourceId, ...options }) {
+  return new RecoveryQueue(state, options).claim(projectId, wave, owner, resourceId);
 }
 export function recordOutcome(state, { attemptId, wave, passed, useful = false,
   findings, evidence = [], ...options }) {
@@ -216,4 +234,11 @@ export function recordOutcome(state, { attemptId, wave, passed, useful = false,
   const result = { passed, useful, findings, evidence };
   const recovery = state.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId);
   return recovery ? queue.complete(attemptId, result, wave) : queue.recordOriginal(attemptId, result, wave);
+}
+
+export function pendingOutcomes(state, options = {}) {
+  return new RecoveryQueue(state, options).pendingOutcomes();
+}
+export function outcomeRecorded(state, attemptId, options = {}) {
+  return new RecoveryQueue(state, options).outcomeRecorded(attemptId);
 }
