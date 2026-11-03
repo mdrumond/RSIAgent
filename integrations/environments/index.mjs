@@ -45,7 +45,7 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
 }
 
 // The payload supervisor enforces workload elapsed time, not CLI observation time.
-const supervisor = `import hashlib, json, os, signal, subprocess, sys
+const supervisor = String.raw`import hashlib, json, os, signal, subprocess, sys
 c=json.loads(sys.argv[1]); os.makedirs(c['spool'],exist_ok=True)
 def intact():
  try:
