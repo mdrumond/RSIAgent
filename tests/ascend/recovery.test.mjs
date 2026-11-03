@@ -1,19 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { State } from '../../controller/state.mjs';
 import { stages } from '../../controller/workflow.mjs';
 import { RecoveryQueue, modePolicy, nextWave, admitJob, recordOutcome, pendingOutcomes, outcomeRecorded } from '../../controller/recovery.mjs';
 
+function projectSpec(t, id, goal) {
+  const root = mkdtempSync(join(tmpdir(), 'ascend-recovery-source-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, 'source'), verifier = join(root, 'verify.py');
+  mkdirSync(source);
+  writeFileSync(join(source, 'answer.py'), 'def answer(): return 42\n');
+  writeFileSync(verifier, `import runpy\nassert runpy.run_path(${JSON.stringify(join(source, 'answer.py'))})["answer"]() == 42\n`);
+  return { id, goal, source, actor_seconds: 240,
+    verifier: { command: `python "${verifier}"`, files: [verifier] } };
+}
+
 function fixture(t, options = {}, file = ':memory:') {
   const state = new State(file);
   t.after(() => state.close());
   const queue = new RecoveryQueue(state, options);
   function original(id = 'original') {
-    state.add({ id, goal: 'immutable goal', verifier: { command: 'verify frozen source' },
-      source: 'latest-broken-source', actor_seconds: 240 });
+    state.add(projectSpec(t, id, 'immutable goal'));
     const attempt = state.admit(id, {});
     state.finish(attempt.id, 'failed');
     return attempt;
@@ -190,8 +200,8 @@ test('event failure rolls back queue insertion atomically', t => {
 
 test('CLI boundary selects and admits originals and recovery without duplicate bookkeeping', t => {
   const { state, queue } = fixture(t);
-  state.add({ id: 'new', goal: 'original goal', actor_seconds: 240 });
-  state.add({ id: 'other', goal: 'another goal', actor_seconds: 240 });
+  state.add(projectSpec(t, 'new', 'original goal'));
+  state.add(projectSpec(t, 'other', 'another goal'));
   const options = { wave: 0, investigationSeconds: 120 };
   const initial = nextWave(state, options);
   assert.deepEqual(initial.map(job => [job.projectId, job.kind]), [['new', 'original'], ['other', 'original']]);
@@ -223,7 +233,7 @@ test('CLI boundary selects and admits originals and recovery without duplicate b
 
 test('CLI selection never readmits interrupted original; resume retains attempt and remaining allocation', async t => {
   const { state } = fixture(t);
-  state.add({ id: 'interrupted', goal: 'same source', actor_seconds: 240 });
+  state.add(projectSpec(t, 'interrupted', 'same source'));
   const job = admitJob(state, { projectId: 'interrupted', wave: 0 });
   state.checkpoint(job.attempt.id, 100, 'same-pi-session');
   assert.deepEqual(nextWave(state, { wave: 10 }), []);
@@ -238,7 +248,7 @@ test('CLI selection never readmits interrupted original; resume retains attempt 
 
 test('CLI outcomes handle inference opt-out and reject duplicate or conflicting originals atomically', t => {
   const { state, queue } = fixture(t);
-  state.add({ id: 'inference', goal: 'fixed goal', actor_seconds: 240 });
+  state.add(projectSpec(t, 'inference', 'fixed goal'));
   const options = { mode: 'inference', inferenceRecovery: false, wave: 0 };
   const job = admitJob(state, { ...options, projectId: 'inference' });
   assert.throws(() => recordOutcome(state, { ...options, wave: -1, attemptId: job.attempt.id, ...result() }));
@@ -254,8 +264,8 @@ test('CLI outcomes handle inference opt-out and reject duplicate or conflicting 
 
 test('resource collision rolls back original and recovery admission without orphan attempts', t => {
   const { state, queue, original } = fixture(t);
-  state.add({ id: 'holder', goal: 'occupy opaque resource', actor_seconds: 240 });
-  state.add({ id: 'queued', goal: 'wait without admission', actor_seconds: 240 });
+  state.add(projectSpec(t, 'holder', 'occupy opaque resource'));
+  state.add(projectSpec(t, 'queued', 'wait without admission'));
   const holder = admitJob(state, { projectId: 'holder', wave: 0, resourceId: 'opaque-slot' });
   queue.enqueue(original('recover').id, 0);
   const attempts = state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n;
@@ -279,8 +289,8 @@ test('restart finds settled outcomes for postprocessing only, separate from memo
   const directory = mkdtempSync(join(tmpdir(), 'ascend-outcomes-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const { state } = fixture(t, {}, join(directory, 'state.sqlite'));
-  state.add({ id: 'failed', goal: 'original remains immutable', actor_seconds: 240 });
-  state.add({ id: 'open', goal: 'interrupted actor', actor_seconds: 240 });
+  state.add(projectSpec(t, 'failed', 'original remains immutable'));
+  state.add(projectSpec(t, 'open', 'interrupted actor'));
   const failed = admitJob(state, { projectId: 'failed', wave: 2 });
   admitJob(state, { projectId: 'open', wave: 2 });
   state.checkpoint(failed.attempt.id, 77, 'original-native-session');
@@ -315,7 +325,7 @@ test('restart finds settled outcomes for postprocessing only, separate from memo
 
 test('unacknowledged findings block only their recovery project until actual memory acknowledgement', t => {
   const { state, queue } = fixture(t);
-  for (const id of ['recover', 'unrelated']) state.add({ id, goal: id, actor_seconds: 240 });
+  for (const id of ['recover', 'unrelated']) state.add(projectSpec(t, id, id));
   const original = admitJob(state, { projectId: 'recover', wave: 0 });
   recordOutcome(state, { attemptId: original.attempt.id, wave: 0, ...result() });
   const [failure] = queue.lessons(); // memory sink failed: no acknowledgement
