@@ -15,7 +15,7 @@ async function save(path, value) {
 }
 
 // Health parsing and admission remain entirely in the target foundation helper.
-const probe = `import hashlib,json,sys,time
+const probe = `import hashlib,json,os,sys,time
 c=json.loads(sys.argv[1]); source=c['source']
 if hashlib.sha256(source.encode()).hexdigest()!=c['sha256']: raise ValueError('health helper identity mismatch')
 ns={'__name__':'_ascend_health'}; exec(compile(source,'trusted-ascend-health.py','exec'),ns)
@@ -23,7 +23,11 @@ deadline=time.monotonic()+c['seconds']; rows=[]
 for device in c['devices']:
  rows.append(ns['local_probe'](physical_device=device,configuration=c['configuration'],remaining=lambda:max(0.,deadline-time.monotonic())))
  if time.monotonic()>=deadline: break
-print(json.dumps({'observed_at':time.time(),'devices':rows},allow_nan=False))
+report=json.dumps({'observed_at':time.time(),'devices':rows},allow_nan=False)
+print(report,file=sys.stderr if 'command' in c else sys.stdout,flush=True)
+if 'command' in c:
+ if len(rows)!=1 or rows[0]['admitted'] is not True: raise SystemExit(125)
+ os.execvp('bash',['bash','-c',c['command']])
 `;
 
 /** CPL options plus health:{product,chip,allow_alarm?,allow_busy?}, instructionFile,
@@ -85,6 +89,7 @@ export async function createEnvironment(options, context) {
   }
   async function snapshot(devices, purpose, emit, budget = seconds) {
     if (!(budget > 0)) throw new Error('Resource probe elapsed allocation exhausted');
+    const callDeadline = performance.now() + budget * 1000;
     const submission = randomUUID();
     let pending;
     try { pending = await readJson(pendingPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -120,7 +125,7 @@ export async function createEnvironment(options, context) {
     await emit('execution-submitted', { submission, handle: pending.handle, closed: false, accountingExcluded: true });
     await context.event('execution-handle', { handle: pending.handle, purpose: 'resource-health' });
     const elapsed = () => Number(process.hrtime.bigint() - BigInt(pending.startedMonotonic)) / 1e9;
-    const deadline = performance.now() + Math.max(0, (pending.seconds - elapsed()) * 1000);
+    const deadline = Math.min(callDeadline, performance.now() + Math.max(0, (pending.seconds - elapsed()) * 1000));
     let observed;
     do {
       try { observed = await client(['observe', pending.handle]); }
@@ -129,7 +134,8 @@ export async function createEnvironment(options, context) {
       if (terminal.has(observed.state)) break;
       if (!['queued', 'dispatching', 'running'].includes(observed.state) || performance.now() >= deadline)
         throw new Error(`Probe unresolved; observe ${pending.handle}`);
-      await delay(options.pollMs ?? 250);
+      await delay(Math.max(0, Math.min(options.pollMs ?? 250, deadline - performance.now())));
+      if (performance.now() >= deadline) throw new Error(`Probe unresolved; observe ${pending.handle}`);
     } while (true);
     if (observed.state !== 'completed' || observed.exit !== 0) {
       await unlink(pendingPath);
@@ -179,13 +185,18 @@ export async function createEnvironment(options, context) {
           const devices = await enabled();
           const physical = devices.find(device => idFor(device) === requested);
           if (physical === undefined) throw new Error('Assigned resource is not enabled for this target/runtime');
-          const result = await snapshot([physical], opts.purpose ?? 'ordinary', emit);
+          const result = await snapshot([physical], opts.purpose ?? 'ordinary', emit, remaining() ?? seconds);
           const row = result.devices.find(item => item.physical_device === physical);
           if (row?.admitted !== true || !(await enabled()).includes(physical)) throw new Error('Fresh resource admission refused');
           return physical;
         }); } finally { excludedMs += performance.now() - setupStarted; }
         bindings.ASCEND_PHYSICAL_DEVICE = bindings.ASCEND_RT_VISIBLE_DEVICES = bindings.ASCEND_VISIBLE_DEVICES = String(physical);
-        return environment.execute(command, cwd, { ...opts, timeout: remaining(), resourceId: physical,
+        // Generic sync completes before this payload runs. Probe and exec share the
+        // same declared native workload, masks, supervisor, receipt and elapsed budget.
+        const request = { source, sha256: healthSha256, seconds, devices: [physical], command,
+          configuration: { ...options.health, require_idle: timing(opts.purpose) || options.health.require_idle === true } };
+        const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
+        return environment.execute(guarded, cwd, { ...opts, timeout: remaining(), resourceId: physical,
           env: { ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
       });
     },

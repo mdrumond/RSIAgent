@@ -34,6 +34,7 @@ outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
 print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], jobs = new Map();
+  let runWorkload = false, onSync = async () => {}, running = false;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
   const client = async args => {
     calls.push(args);
@@ -50,14 +51,22 @@ print(outputs[query])
         const response = JSON.parse(out.stdout); response.observed_at += clockSkew;
         content = JSON.stringify(response);
       }
-      jobs.set(handle, content);
+      if (file.endsWith('sync.sh')) await onSync();
+      let exit = 0;
+      if (file.endsWith('command.sh') && runWorkload) {
+        const script = await readFile(file,'utf8');
+        const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+        try { await promisify(execFile)('bash',['-c',config.command],{env:{...process.env,...config.env,PATH:bin+':'+process.env.PATH,ASCEND_TEST_TELEMETRY:telemetry}}); }
+        catch(error) { exit = error.code; }
+      }
+      jobs.set(handle, {content,exit});
       if (file.endsWith('probe.sh')) lastProbe = { handle, receipt:args[args.indexOf('--receipt-file')+1] };
       if (hideSubmission) throw new Error('lost native reply and receipt not yet visible');
       if (args.includes('--receipt-file')) await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));
       return { handle, state: 'queued' };
     }
-    if (args[0] === 'observe') return { state: disconnect ? 'observation-unavailable' : 'completed', exit: 0 };
-    if (args[0] === 'logs') return { state: 'completed', content: jobs.get(args[1]) };
+    if (args[0] === 'observe') return { state: disconnect ? 'observation-unavailable' : running ? 'running' : 'completed', exit: jobs.get(args[1])?.exit ?? 0 };
+    if (args[0] === 'logs') return { state: 'completed', content: jobs.get(args[1])?.content };
     throw new Error('unexpected CPL operation '+args[0]);
   };
   const context = { instancePath, client, sdk: { createLocalBashOperations: () => ({}) },
@@ -68,6 +77,7 @@ print(outputs[query])
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, rows, telemetry,
     setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
+    runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
 
@@ -106,7 +116,7 @@ for (const physical of [0, 1]) test(`lease ${physical}: assigned opaque lease re
   assert.equal(run[run.indexOf('--npu')+1], String(physical));
   assert.equal(run[run.indexOf('--runtime')+1], 'registered');
   const script = await readFile(run[run.indexOf('--file')+1], 'utf8');
-  const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2));
+  const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
   assert.equal(config.env.ASCEND_PHYSICAL_DEVICE, String(physical));
   assert.equal(config.env.ASCEND_RT_VISIBLE_DEVICES, String(physical));
   assert.equal(config.env.ASCEND_VISIBLE_DEVICES, String(physical));
@@ -206,4 +216,38 @@ test('waiting behind another execution still consumes the caller timeout',async 
   const queued=assert.rejects(bound.execute('two',f.source,{timeout:.01}),/elapsed/);
   assert.equal((await first).exitCode,0);await queued;
   assert.equal(f.calls.filter(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')).length,1);
+});
+
+
+test('workload guard after sync refuses changed health before arbitrary Bash', async t => {
+  const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
+  const bound=await createEnvironment(f.options,{...f.context,resource:lease});
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'post-sync'}});
+  f.runWorkload();
+  const marker=join(f.context.instancePath,'executed');
+  f.onSync(async()=>{ f.rows[0].busy=true; await f.update(); });
+  assert.equal((await bound.execute(`touch '${marker}'`,f.source,{timeout:3})).exitCode,125);
+  await assert.rejects(readFile(marker),{code:'ENOENT'});
+  f.rows[0].busy=false; await f.update();
+  f.onSync(async()=>{});
+  assert.equal((await bound.execute(`touch '${marker}'`,f.source,{timeout:3})).exitCode,0);
+  assert.equal(await readFile(marker,'utf8'),'');
+});
+
+test('short caller bounds pending-probe observation and retains same handle',async t=>{
+  const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
+  const bound=await createEnvironment({...f.options,pollMs:500},{...f.context,resource:lease});
+  f.disconnect(true);
+  await assert.rejects(bound.execute('true',f.source,{timeout:3}),/unresolved/);
+  const handle=f.lastProbe().handle,submitted=f.calls.filter(a=>a[0]==='run').length;
+  f.disconnect(false);f.running(true);
+  const started=performance.now();
+  await assert.rejects(bound.execute('true',f.source,{timeout:.02}),/unresolved/);
+  assert.ok(performance.now()-started<200,'current caller must not wait original probe allocation');
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,submitted);
+  assert.equal(f.lastProbe().handle,handle);
+  f.running(false);
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'pending'}});
+  assert.equal((await bound.execute('true',f.source,{timeout:3})).exitCode,0);
+  assert.equal(f.calls.filter(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('probe.sh')).length,2);
 });
