@@ -205,6 +205,8 @@ def run(contract, mode, case_index=None, capture_root=None, profile_capture=Fals
     if isolated_validation:
         if case_index is not None:
             raise ValueError('validation must cover all frozen cases')
+        # Path admission is stdlib-only; do not initialize an NPU in this parent.
+        configure_target_python_paths(contract['runtime_identity'].get('target_python_paths', []))
         result=profile_validation(contract,source_hash=expected_source,started=started)
         if project_hash(contract)!=expected_source:
             raise ValueError('source changed during capability validation')

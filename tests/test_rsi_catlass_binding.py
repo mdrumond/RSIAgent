@@ -975,7 +975,7 @@ def test_original_retry_preserves_full_catlass_workload_and_actual_lease(catlass
 
 
 @pytest.mark.parametrize('kind,exitcode', [('api-ast-ir',0),('printf-numeric',0),('msdebug-mssanitizer',0),
-    ('device-environment-5xxxx',0),('msprof-basic',0),('language-conversion',0),('api-ast-ir',7)])
+    ('device-environment-5xxxx',0),('msprof-basic',0),('language-conversion',0),('missing-feature',0),('api-ast-ir',7)])
 def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools(tmp_path, monkeypatch, kind, exitcode):
     """CPU protocol witness: real child PID/closure, no target runtime in parent."""
     import os
@@ -1052,3 +1052,48 @@ def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools
     assert order==['numeric-exited','guard-after-reap','capability']
     assert result['numeric_child_exited_before_capability'] is True and result['correctness'] is True
     assert result['cases'][0]['case']==contract['cases'][0]
+
+
+def test_missing_feature_parent_uses_frozen_python_paths_without_target_context(fake_consumer, tmp_path, monkeypatch):
+    driver, contract, calls = fake_consumer
+    from rsi import catlass_capabilities as gates
+    import importlib
+    modules = tmp_path/'registered-python-path'
+    package = modules/'catlass'
+    package.mkdir(parents=True)
+    imported = tmp_path/'package-imported'
+    (package/'__init__.py').write_text('from . import tla\n')
+    (package/'tla.py').write_text('from pathlib import Path\n'
+        +f'Path({str(imported)!r}).write_text("pure API inspection; no device initialized")\n'
+        +'def cmp(*args): pass\ndef where(*args): pass\n')
+    for name in tuple(sys.modules):
+        if name=='catlass' or name.startswith('catlass.'):
+            monkeypatch.delitem(sys.modules,name)
+    monkeypatch.setattr(sys,'path',list(sys.path))
+    # Pure-Python fixture models the frozen 3.11 interpreter without loading any
+    # controller or target extension. The production version guard stays intact.
+    monkeypatch.setattr(driver,'sys',SimpleNamespace(version_info=(3,11),path=sys.path,
+                                                   executable=sys.executable,version=sys.version))
+    contract['runtime_identity']['target_python_paths']=[str(modules)]
+    contract['exercise']=dict(kind='missing-feature',missing_api='unavailable_relu')
+    Path('candidate.py').write_text('def kernel(a,b,c):\n    return tla.where(tla.cmp(a,b),a,b)\n')
+    def numeric_child(argv, **kwargs):
+        kwargs['directory'].mkdir(parents=True)
+        receipt=dict(source_hash=os.environ['RSI_EXPECTED_SOURCE_HASH'],
+            candidate_sha256=hashlib.sha256(Path('candidate.py').read_bytes()).hexdigest(),
+            case_hash=contract['case_hash'],identity=contract['runtime_identity'],correctness=True,
+            physical_device=contract['physical_device'],outer_cpl_handle=contract['outer_cpl_handle'],
+            device_addressing='masked-logical-zero',
+            cases=[dict(case=case,launched=True,numeric_match=True) for case in contract['cases']])
+        return SimpleNamespace(returncode=0,stdout=('RSI_CATLASS_RESULT='+json.dumps(receipt)).encode())
+    def forbidden_runtime(*args):
+        raise AssertionError('the parent must not initialize a target context')
+    import os
+    monkeypatch.setattr(gates,'run_retained',numeric_child)
+    monkeypatch.setattr(driver,'check_runtime',forbidden_runtime)
+    importlib.invalidate_caches()
+    result=driver.run(contract,'validation')
+    assert imported.is_file() and Path(sys.modules['catlass.tla'].__file__).parent==package
+    assert result['capability_evidence']['evidence']['absent_api']=='unavailable_relu'
+    assert result['numeric_child_exited_before_capability'] is True
+    assert calls==[]  # Numeric work belongs to the child, not this parent.
