@@ -75,7 +75,9 @@ export class State {
     const attempt = this.attempt(id);
     if (!attempt || attempt.outcome) throw new Error('Attempt is not resumable');
     if (!await confirmStopped(attempt)) throw new Error('Previous execution is not confirmed stopped');
-    this.db.prepare('UPDATE attempts SET owner=? WHERE id=? AND outcome IS NULL').run(JSON.stringify(owner),id);
+    const claimed=this.db.prepare('UPDATE attempts SET owner=? WHERE id=? AND outcome IS NULL AND owner=?')
+      .run(JSON.stringify(owner),id,attempt.owner);
+    if(!claimed.changes)throw new Error('Attempt ownership changed during resume');
     return this.attempt(id);
   }
   close() { this.db.close(); }
