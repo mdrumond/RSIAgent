@@ -1,0 +1,11 @@
+{
+  "extensionModule": "./integrations/environments/index.mjs",
+  "instructionFile": "./private/access.md",
+  "options": {
+    "mode": "cpl",
+    "target": "registered-target",
+    "runtime": "registered-runtime",
+    "workspacePath": "/configured/registry/workspace",
+    "remoteDirectory": "task-owned-attempts"
+  }
+}

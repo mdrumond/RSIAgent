@@ -208,6 +208,31 @@ def test_cli_default_resolves_to_offline_pinned_backend(tmp_path, monkeypatch):
     assert captured[0].local_files_only is True
 
 
+@pytest.mark.parametrize('factory', [False, True])
+def test_cli_embedding_cache_only_configures_production_backend(tmp_path, monkeypatch, factory):
+    from ascend_tools import embeddings, kdb_service
+    cache = tmp_path / 'private-model-cache'
+    captured = []
+    constructor = MagicMock(wraps=PinnedBGEEmbeddings)
+    monkeypatch.setattr(embeddings, 'PinnedBGEEmbeddings', constructor)
+    monkeypatch.setattr(kdb_service, 'create_server', lambda backend, **kwargs:
+                        captured.append(backend.db.embeddings) or SimpleNamespace(run=lambda **kwargs: None))
+    arguments = ['kdb', '--db', str(tmp_path / 'knowledge.sqlite'), '--embedding-cache', str(cache)]
+    if factory:
+        arguments += ['--embedding-factory', 'kdb_fixture:Embeddings']
+    monkeypatch.setattr(sys, 'argv', arguments)
+    kdb_service.main()
+    if factory:
+        constructor.assert_not_called()
+        from kdb_fixture import Embeddings
+        assert isinstance(captured[0], Embeddings)
+    else:
+        constructor.assert_called_once_with(cache_dir=cache, local_files_only=True)
+        assert captured[0].cache_dir == cache
+        assert captured[0].local_files_only is True
+        assert captured[0]._encoder is None
+
+
 def test_kdb_prefixes_bge_queries_but_not_indexed_passages(tmp_path):
     tokenizer = RecordingTokenizer()
     backend, _ = _fake_backend(tokenizer, FakeEncoder())

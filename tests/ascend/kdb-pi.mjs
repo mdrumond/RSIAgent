@@ -87,6 +87,7 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       const result=await tool.execute('retrieve',{query:'aligned loads',kind:'good'});
       const data=JSON.parse(result.content[0].text);
       assert.equal(data.content.length,1);
+      assert.equal(data.content[0].language,'triton');
       assert.equal(data.evidence[0].collection,'baseline');
       assert.equal(data.evidence[0].sha256.length,64);
       await unlink(join(root,'kernel.py'));
