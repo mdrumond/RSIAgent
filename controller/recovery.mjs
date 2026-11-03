@@ -73,34 +73,47 @@ export class RecoveryQueue {
     this.wave(wave);
     return this.transaction(() => {
       const queue = this.entry(projectId), project = this.state.project(projectId);
-      if (!this.policy.recovery || !queue || queue.attempt || queue.eligible_wave > wave ||
-          project.frozen || project.status !== 'failed') throw new Error('Recovery is not eligible');
+      const original = project?.status === 'queued' && !queue;
+      if (!project || project.frozen || (!original && (!this.policy.recovery || !queue ||
+          queue.attempt || queue.eligible_wave > wave || project.status !== 'failed')))
+        throw new Error('Job is not eligible');
+      const kind = original ? 'original' : queue.kind;
       const id = randomUUID();
       this.db.prepare('INSERT INTO attempts(id,project,owner,created) VALUES (?,?,?,?)')
         .run(id, projectId, JSON.stringify(owner), new Date().toISOString());
-      this.db.prepare('INSERT INTO recovery_attempts(attempt,project,kind,wave) VALUES (?,?,?,?)')
-        .run(id, projectId, queue.kind, wave);
-      this.db.prepare('UPDATE recovery_queue SET attempt=? WHERE project=?').run(id, projectId);
+      if (!original) {
+        this.db.prepare('INSERT INTO recovery_attempts(attempt,project,kind,wave) VALUES (?,?,?,?)')
+          .run(id, projectId, kind, wave);
+        this.db.prepare('UPDATE recovery_queue SET attempt=? WHERE project=?').run(id, projectId);
+      }
       this.db.prepare("UPDATE projects SET status='running' WHERE id=?").run(projectId);
-      const actorSeconds = queue.kind === 'investigation' ? this.investigationSeconds : project.spec.actor_seconds;
-      this.state.event(id, 'recovery-started', { kind: queue.kind, wave, actor_seconds: actorSeconds });
+      const actorSeconds = kind === 'investigation' ? this.investigationSeconds : project.spec.actor_seconds;
+      this.state.event(id, 'job-admitted', { kind, wave, actor_seconds: actorSeconds });
       return { attempt: this.db.prepare('SELECT * FROM attempts WHERE id=?').get(id),
-        project: this.state.project(projectId), kind: queue.kind, actor_seconds: actorSeconds,
-        origin_attempt: queue.origin, failed_rounds: queue.failed_rounds, policy: this.policy };
+        project: this.state.project(projectId), kind, actor_seconds: actorSeconds,
+        origin_attempt: queue?.origin ?? null, failed_rounds: queue?.failed_rounds ?? 0, policy: this.policy };
     });
+  }
+  jobs(wave) {
+    this.wave(wave);
+    const originals = this.db.prepare(`SELECT id FROM projects WHERE status='queued' AND frozen=0
+      AND NOT EXISTS (SELECT 1 FROM recovery_queue q WHERE q.project=projects.id) ORDER BY id`).all();
+    return [
+      ...originals.map(row => ({ projectId: row.id, kind: 'original', project: this.state.project(row.id),
+        actor_seconds: this.state.project(row.id).spec.actor_seconds,
+        origin_attempt: null, failed_rounds: 0, eligible_wave: wave })),
+      ...this.ready(wave).map(row => ({ projectId: row.project, kind: row.kind,
+        project: this.state.project(row.project), origin_attempt: row.origin,
+        actor_seconds: row.kind === 'investigation' ? this.investigationSeconds :
+          this.state.project(row.project).spec.actor_seconds,
+        failed_rounds: row.failed_rounds, eligible_wave: row.eligible_wave })),
+    ];
   }
   // May close an active attempt or consume the same outcome already closed by State.finish.
   // Findings are an outbox: caller records each lesson in KDB, then acknowledges it.
   complete(attemptId, { passed, useful = false, findings, evidence = [] }, wave) {
     this.wave(wave);
-    if (typeof passed !== 'boolean' || typeof findings !== 'string' || !findings.trim())
-      throw new Error('Outcome and findings are required');
-    if (!Array.isArray(evidence) || evidence.length > 16 || evidence.some(ref =>
-      !ref || typeof ref !== 'object' || Array.isArray(ref) ||
-      Object.keys(ref).some(key => !['path', 'sha256', 'entry_id'].includes(key)) ||
-      !Object.values(ref).every(value => typeof value === 'string' && value.length <= 4096) ||
-      !(ref.entry_id || (ref.path && ref.sha256)))) throw new Error('Use bounded direct evidence references');
-    if (findings.length > 32000) throw new Error('Findings must be compact');
+    this.validateResult({ passed, findings, evidence });
     return this.transaction(() => {
       const recovery = this.db.prepare('SELECT * FROM recovery_attempts WHERE attempt=?').get(attemptId);
       if (!recovery || recovery.completed) throw new Error('Recovery attempt is not open');
@@ -134,6 +147,48 @@ export class RecoveryQueue {
       return result;
     });
   }
+  validateResult({ passed, findings, evidence }) {
+    if (typeof passed !== 'boolean' || typeof findings !== 'string' || !findings.trim())
+      throw new Error('Outcome and findings are required');
+    if (!Array.isArray(evidence) || evidence.length > 16 || evidence.some(ref =>
+      !ref || typeof ref !== 'object' || Array.isArray(ref) ||
+      Object.keys(ref).some(key => !['path', 'sha256', 'entry_id'].includes(key)) ||
+      !Object.values(ref).every(value => typeof value === 'string' && value.length <= 4096) ||
+      !(ref.entry_id || (ref.path && ref.sha256)))) throw new Error('Use bounded direct evidence references');
+    if (findings.length > 32000) throw new Error('Findings must be compact');
+  }
+  recordOriginal(attemptId, { passed, useful = false, findings, evidence = [] }, wave) {
+    this.wave(wave);
+    this.validateResult({ passed, findings, evidence });
+    return this.transaction(() => {
+      const attempt = this.db.prepare('SELECT * FROM attempts WHERE id=?').get(attemptId);
+      if (!attempt || this.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId))
+        throw new Error('Not an original attempt');
+      const latest = this.db.prepare('SELECT id FROM attempts WHERE project=? ORDER BY rowid DESC LIMIT 1').get(attempt.project);
+      if (latest.id !== attemptId) throw new Error('Original attempt has been superseded');
+      if (this.db.prepare('SELECT 1 FROM recovery_lessons WHERE attempt=?').get(attemptId))
+        throw new Error('Original outcome already recorded');
+      const admission = this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted'").get(attemptId);
+      if (admission && wave < JSON.parse(admission.data).wave) throw new Error('Completion precedes admission wave');
+      const project = this.state.project(attempt.project);
+      if (project.frozen || this.entry(attempt.project)) throw new Error('Original is already in recovery');
+      const outcome = passed ? 'passed' : 'failed';
+      if (attempt.outcome && attempt.outcome !== outcome) throw new Error('Conflicting attempt outcome');
+      this.db.prepare('UPDATE attempts SET outcome=? WHERE id=?').run(outcome, attemptId);
+      this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome, attempt.project);
+      const lesson = { attempt_id: attemptId, project: attempt.project, kind: 'original',
+        outcome, useful: useful === true, findings, evidence };
+      this.db.prepare('INSERT INTO recovery_lessons(attempt,data) VALUES (?,?)').run(attemptId, JSON.stringify(lesson));
+      if (!passed && this.policy.recovery) {
+        this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave)
+          VALUES (?,?,'investigation',?)`).run(attempt.project, attemptId, wave + 1);
+      }
+      const result = { accepted: passed, frozen: false, failed_rounds: 0,
+        next: this.entry(attempt.project) ?? null };
+      this.state.event(attemptId, 'original-completed', { ...result, lesson });
+      return result;
+    });
+  }
   lessons() {
     return this.db.prepare('SELECT id,data FROM recovery_lessons WHERE recorded=0 ORDER BY id').all()
       .map(row => ({ id: row.id, ...JSON.parse(row.data) }));
@@ -146,4 +201,19 @@ export class RecoveryQueue {
     return this.db.prepare(`SELECT COUNT(DISTINCT a.project) AS count FROM attempts a
       LEFT JOIN recovery_attempts r ON r.attempt=a.id WHERE a.outcome IS NOT NULL AND r.attempt IS NULL`).get().count;
   }
+}
+
+// One selection/admission/outcome boundary for the CLI; OS lifecycle belongs to CLI/core.
+export function nextWave(state, { wave, ...options }) {
+  return new RecoveryQueue(state, options).jobs(wave);
+}
+export function admitJob(state, { projectId, wave, owner = {}, ...options }) {
+  return new RecoveryQueue(state, options).claim(projectId, wave, owner);
+}
+export function recordOutcome(state, { attemptId, wave, passed, useful = false,
+  findings, evidence = [], ...options }) {
+  const queue = new RecoveryQueue(state, options);
+  const result = { passed, useful, findings, evidence };
+  const recovery = state.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId);
+  return recovery ? queue.complete(attemptId, result, wave) : queue.recordOriginal(attemptId, result, wave);
 }

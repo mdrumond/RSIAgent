@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { State } from '../../controller/state.mjs';
 import { stages } from '../../controller/workflow.mjs';
-import { RecoveryQueue, modePolicy } from '../../controller/recovery.mjs';
+import { RecoveryQueue, modePolicy, nextWave, admitJob, recordOutcome } from '../../controller/recovery.mjs';
 
 function fixture(t, options = {}, file = ':memory:') {
   const state = new State(file);
@@ -177,4 +177,66 @@ test('event failure rolls back queue insertion atomically', t => {
   assert.throws(() => queue.enqueue(attempt.id, 0));
   assert.equal(queue.entry('original'), undefined);
   assert.equal(state.project('original').status, 'failed');
+});
+
+test('CLI boundary selects and admits originals and recovery without duplicate bookkeeping', t => {
+  const { state, queue } = fixture(t);
+  state.add({ id: 'new', goal: 'original goal', actor_seconds: 240 });
+  state.add({ id: 'other', goal: 'another goal', actor_seconds: 240 });
+  const options = { wave: 0, investigationSeconds: 120 };
+  const initial = nextWave(state, options);
+  assert.deepEqual(initial.map(job => [job.projectId, job.kind]), [['new', 'original'], ['other', 'original']]);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n, 0);
+  const original = admitJob(state, { ...options, projectId: 'new' });
+  assert.equal(original.project.status, 'running');
+  assert.equal(original.kind, 'original');
+  assert.throws(() => admitJob(state, { ...options, projectId: 'new' }));
+  const failed = recordOutcome(state, { ...options, attemptId: original.attempt.id, ...result() });
+  assert.equal(failed.failed_rounds, 0);
+  assert.equal(failed.next.eligible_wave, 1);
+  assert.deepEqual(nextWave(state, options).map(job => job.projectId), ['other']);
+  const next = nextWave(state, { ...options, wave: 1 });
+  assert.deepEqual(next.map(job => [job.projectId, job.kind]), [['other', 'original'], ['new', 'investigation']]);
+  assert.equal(next[1].actor_seconds, 120);
+  const diagnostic = admitJob(state, { ...options, wave: 1, projectId: 'new' });
+  recordOutcome(state, { ...options, wave: 1, attemptId: diagnostic.attempt.id, ...result(true, true) });
+  assert.equal(nextWave(state, { ...options, wave: 1 }).length, 1);
+  const retry = admitJob(state, { ...options, wave: 2, projectId: 'new' });
+  assert.equal(retry.kind, 'retry');
+  state.finish(retry.attempt.id, 'passed');
+  recordOutcome(state, { ...options, wave: 2, attemptId: retry.attempt.id, ...result(true) });
+  assert.equal(state.project('new').status, 'passed');
+  assert.equal(queue.lessons().length, 3);
+  assert.equal(queue.completedOriginals(), 1);
+});
+
+test('CLI selection never readmits interrupted original; resume retains attempt and remaining allocation', async t => {
+  const { state } = fixture(t);
+  state.add({ id: 'interrupted', goal: 'same source', actor_seconds: 240 });
+  const job = admitJob(state, { projectId: 'interrupted', wave: 0 });
+  state.checkpoint(job.attempt.id, 100, 'same-pi-session');
+  assert.deepEqual(nextWave(state, { wave: 10 }), []);
+  const resumed = await state.resume(job.attempt.id, async () => true, { resumed: true });
+  assert.equal(resumed.id, job.attempt.id);
+  assert.equal(resumed.elapsed, 100);
+  assert.equal(resumed.session, 'same-pi-session');
+  recordOutcome(state, { attemptId: resumed.id, wave: 10, ...result(true) });
+  assert.equal(state.project('interrupted').status, 'passed');
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n, 1);
+});
+
+test('CLI outcomes handle inference opt-out and reject duplicate or conflicting originals atomically', t => {
+  const { state, queue } = fixture(t);
+  state.add({ id: 'inference', goal: 'fixed goal', actor_seconds: 240 });
+  const options = { mode: 'inference', inferenceRecovery: false, wave: 0 };
+  const job = admitJob(state, { ...options, projectId: 'inference' });
+  assert.throws(() => recordOutcome(state, { ...options, wave: -1, attemptId: job.attempt.id, ...result() }));
+  assert.equal(state.attempt(job.attempt.id).outcome, null);
+  state.finish(job.attempt.id, 'failed');
+  assert.throws(() => recordOutcome(state, { ...options, attemptId: job.attempt.id, ...result(true) }));
+  const done = recordOutcome(state, { ...options, attemptId: job.attempt.id, ...result() });
+  assert.equal(done.next, null);
+  assert.deepEqual(nextWave(state, { ...options, wave: 1 }), []);
+  assert.throws(() => recordOutcome(state, { ...options, attemptId: job.attempt.id, ...result() }));
+  assert.equal(queue.lessons().length, 1);
 });
