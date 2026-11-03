@@ -16,7 +16,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const [command,arg]=positionals;
   const root=resolve(values.instance??arg??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','resume','stop','dashboard','kdb','tune']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','stop','dashboard','kdb','tune']};
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
@@ -124,8 +124,9 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
-  if (['wave','resume','stop'].includes(command)) {
-    const {operate}=await import('./runtime.mjs');
+  if (['wave','campaign','resume','stop'].includes(command)) {
+    const {operate,campaign}=await import('./runtime.mjs');
+    if(command==='campaign' && !values.detach)return campaign(config,{...values,signal,mode:values.mode??config.mode});
     return operate(command,config,{...values,signal,mode:values.mode??config.mode});
   }
   if(command==='dashboard') {
