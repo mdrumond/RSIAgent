@@ -185,6 +185,10 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const timeoutJob = await environment.execute("python3 -c 'import time; time.sleep(30)'", project, { timeout: 0.1 });
   for (const job of jobs.values()) await job.completion;
   assert.equal(jobs.get(timeoutJob.handle).exit, 124);
+  const timed = await environment.observe(timeoutJob.handle);
+  assert.ok(timed.executionSeconds > 0 && timed.executionSeconds < 5);
+  const freshObserver = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'attempts' }, context);
+  assert.equal((await freshObserver.observe(timeoutJob.handle)).executionSeconds, timed.executionSeconds);
   const verifier = join(instancePath, 'verify.py');
   await writeFile(join(project, 'value.txt'), '7');
   await writeFile(verifier, "from pathlib import Path\nassert int(Path('value.txt').read_text()) == 7\nPath('verified.marker').write_text('ran')\nif Path('mutate').exists(): Path(__file__).write_text('changed')\nprint('verified')\n");
@@ -254,4 +258,75 @@ test('native SDK session PATH and local session-file metadata do not override re
   assert.equal(Object.hasOwn(config.env, 'PATH'), false);
   assert.equal(Object.hasOwn(config.env, 'PI_SESSION_FILE'), false);
   assert.equal(config.env.PI_SESSION_ID, 'native-session');
+});
+
+test('SIGKILL after native receipt recovers the same operation and completed duration without resubmission', async t => {
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { appendFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'environment-crash-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, 'project'); await mkdir(project);
+  await writeFile(join(project, 'source.py'), 'answer=42');
+  const module = new URL('../../integrations/environments/index.mjs', import.meta.url).href;
+  const script = `import {createEnvironment} from ${JSON.stringify(module)};
+    import {writeFile,appendFile} from 'node:fs/promises';
+    const root=process.argv[1],project=root+'/project';
+    const environment=await createEnvironment({mode:'cpl',target:'fake',workspacePath:'/registered',remoteDirectory:'owned'}, {
+      instancePath:root,sdk:{createLocalBashOperations:()=>({})},exclude:async(_,fn)=>fn(),
+      event:async(type,data)=>appendFile(root+'/events.jsonl',JSON.stringify({type,data:{...data,operation:'crash-op',actor_elapsed:3}})+'\\n'),
+      client:async args=>{
+        if(args[0]==='capabilities')return {state:'available'};
+        if(args[0]==='run') {
+          const sync=args[args.indexOf('--file')+1].endsWith('sync.sh');
+          const result={handle:'remote:fake:job:'+(sync?'sync':'orphan')};
+          await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify(result));
+          if(!sync)process.kill(process.pid,'SIGKILL');
+          return result;
+        }
+        return {state:'completed',exit:0};
+      }});
+    await environment.prepare({project:{id:'p',source:project},attempt:{id:'a'}});
+    await environment.execute('unrepeated original command',project);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, root], { stdio: 'ignore' });
+  const [code, signal] = await once(child, 'exit');
+  assert.equal(code, null); assert.equal(signal, 'SIGKILL');
+  const events = (await readFile(join(root, 'events.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const pending = events.find(event => event.type === 'execution-submitting' && !event.data.accountingExcluded);
+  assert.ok(pending?.data.receiptFile);
+  assert.equal(events.some(event => event.type === 'execution-handle' && event.data.handle === 'remote:fake:job:orphan'), false);
+  const receiptDir = dirname(pending.data.receiptFile);
+  const metadata = JSON.parse(await readFile(join(receiptDir, 'execution.json'), 'utf8'));
+  assert.equal(metadata.handle, null); assert.ok(metadata.timingKey);
+  let terminal = false, downloads = 0, submissions = 0, incomplete = false;
+  const options = { mode: 'cpl', target: 'fake' };
+  const context = { instancePath: root, sdk: { createLocalBashOperations: () => ({}) }, exclude: async (label, fn) => {
+    assert.equal(label, 'transfer'); return fn();
+  }, event: async (type, data) => {
+    events.push({ type, data: { ...data, operation: 'crash-op' } });
+    await appendFile(join(root, 'events.jsonl'), JSON.stringify(events.at(-1)) + '\n');
+  }, client: async args => {
+    if (['run','upload'].includes(args[0])) { submissions++; throw new Error('must not resubmit'); }
+    if (args[0] === 'observe') return args[1].endsWith(':sync') ? { state: 'completed', exit: 0 } : { state: terminal ? 'completed' : 'running', exit: 0 };
+    if (args[0] === 'download') {
+      assert.equal(terminal, true); downloads++;
+      await writeFile(args[3], JSON.stringify({ completed: !incomplete, executionSeconds: 30.125, key: metadata.timingKey }));
+      return { state: 'completed' };
+    }
+    throw new Error('unexpected operation');
+  } };
+  const resumed = await createEnvironment(options, context);
+  assert.equal((await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 })).closed, false);
+  assert.equal(downloads, 0);
+  terminal = true;
+  const result = await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 });
+  assert.equal(result.closed, true); assert.equal(result.executionSeconds, 30.125);
+  assert.ok(result.handles.includes('remote:fake:job:orphan'));
+  assert.equal((await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 })).executionSeconds, 30.125);
+  assert.equal(downloads, 1); assert.equal(submissions, 0);
+  incomplete = true; await rm(join(receiptDir, 'timing.json'));
+  assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
+  await rm(pending.data.receiptFile);
+  assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
+  assert.equal(submissions, 0);
 });
