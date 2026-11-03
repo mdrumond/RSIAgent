@@ -15,6 +15,7 @@ from rsi.project_binding import admission_hash, source_identity, validate_resolu
 from rsi.python_execution import atomic_json, ingest_elapsed
 from rsi.setup_telemetry import SetupTelemetry
 from rsi.skills import SkillBundle
+from rsi.worker_setup import checkpoint, close_pre_runner, binding_intervals
 
 
 def memory_wire(admitted):
@@ -116,6 +117,7 @@ class ProjectWorkerFactory:
 
     def __call__(self, request):
         self.prepare_worker(request)
+        checkpoint(request, 'binding')
         from rsi.services import InstanceServices
         admitted = json.loads(self.admission_json)
         operation = admitted['operations'][request.project_id]
@@ -159,12 +161,14 @@ class ProjectWorkerFactory:
             admission_elapsed = json.loads(admission_path.read_text())['elapsed'] if admission_path.exists() else 0.
             source_elapsed = (operation.get('source_interval', {}).get('elapsed', 0.)
                               if request.actor_elapsed == 0 else 0.)
-            deadline = monotonic_start + max(0., request.actor_seconds - request.actor_elapsed - admission_elapsed - source_elapsed)
+            setup_only_binding = executor.setup_only_binding(profile)
+            deadline = (None if setup_only_binding else monotonic_start + max(0.,
+                request.actor_seconds - request.actor_elapsed - admission_elapsed - source_elapsed))
             def remaining():
-                limits = [max(0., deadline - time.monotonic())]
+                limits = [] if deadline is None else [max(0., deadline - time.monotonic())]
                 if admitted['wall_deadline'] is not None:
                     limits.append(max(0., admitted['wall_deadline'] - time.time()))
-                return min(limits)
+                return min(limits) if limits else None
             resolution = executor.bind_project(profile, request, logical, remaining=remaining)
             if request.root.exists():
                 raise ValueError('host binder must not precreate the canonical runner root')
@@ -185,7 +189,9 @@ class ProjectWorkerFactory:
                                    generated_paths=config.get('generated_paths', ())) != evidence[key]:
                     raise ValueError('host binder source identity differs from actual input tree')
             elapsed = time.monotonic() - monotonic_start
-            binding_interval = dict(started=started, elapsed=elapsed, ended=max(time.time(), started + elapsed))
+            binding_interval = dict(started=started, elapsed=elapsed, ended=max(time.time(), started + elapsed),
+                interval_id='lease-binding:' + request.dispatch_id,
+                actor_billable=not setup_only_binding)
             project_binding['resolved_binding_ref'] = services.store.put_json(resolution)
             project_binding['logical_admission_hash'] = admission_hash(logical)
         config = (resolution['config'] if resolution else
@@ -194,6 +200,7 @@ class ProjectWorkerFactory:
         if resolution and resolution['evidence']['logical_source_identity'] != operation['logical_source_identity']:
             raise ValueError('resolved source no longer authenticates the frozen logical admission')
         backend = services.store.put_json(project_binding)
+        checkpoint(request, 'local-setup', binding_interval)
         runner = composition.runner(request.root, spec=ProjectSpec.from_dict(spec),
             bundle=SkillBundle.from_dict(json.loads(request.skills)), config=config,
             memory_ref=admitted['memory'], backend_identity=backend, reopen=request.reopen,
@@ -225,12 +232,13 @@ class ProjectWorkerFactory:
                 observed_start=interval['started'], observed_end=interval['ended'],
                 observed_execution_start=interval['started'],
                 observed_execution_end=interval['started'] + interval['elapsed'])
-        if binding_interval:
-            ingest_elapsed(runner.workflow.accounting, 'lease-binding:' + request.dispatch_id,
-                {'elapsed': binding_interval['elapsed']}, category='execution',
-                observed_start=binding_interval['started'], observed_end=binding_interval['ended'],
-                observed_execution_start=binding_interval['started'],
-                observed_execution_end=binding_interval['started'] + binding_interval['elapsed'])
+        for interval in binding_intervals(request.root.parent):
+            if interval.get('actor_billable', True):
+                ingest_elapsed(runner.workflow.accounting, interval['interval_id'],
+                    {'elapsed': interval['elapsed']}, category='execution',
+                    observed_start=interval['started'], observed_end=interval['ended'],
+                    observed_execution_start=interval['started'],
+                    observed_execution_end=interval['started'] + interval['elapsed'])
         source_interval = operation.get('source_interval')
         if source_interval:
             ingest_elapsed(runner.workflow.accounting, 'logical-source:' + request.project_id,
@@ -414,15 +422,26 @@ class WaveBindings:
         if not path.exists():
             return False
         record = json.loads(path.read_text())
-        if record['dispatch_id'] != row['dispatch_id'] or record['receipt'].get('admitted') is True:
-            return False  # Binder/create failure is not proof of admission-only work.
+        if record['dispatch_id'] != row['dispatch_id']:
+            return False
         wave = self.cycle.scheduler.state['active_wave']
         admitted = self.cycle.store.read_json(wave['admission_ref'])
         request = pool._request(operation, row)
         receipt = record['receipt']
+        setup_closure = None
+        if receipt.get('admitted') is True:
+            executor = self._factory(wave).executor_for(operation)
+            setup_only = (isinstance(executor, FrozenExecutorFactory)
+                          and executor.setup_only_binding(record['profile']))
+            contracts = admitted['operations'][operation].get('binding_contracts', admitted.get('binding_contracts', {}))
+            setup_closure = close_pre_runner(branch, row['dispatch_id'], record, setup_only=setup_only,
+                                            binding_required=bool(contracts.get(record['profile'])))
+            if setup_closure is None:
+                return False
         unknown = ('probe_pending', 'probe_unknown', 'submission_unknown')
         def consumed():
             return (sum(r['elapsed'] for r in admission_intervals(branch))
+                    + sum(r['elapsed'] for r in binding_intervals(branch) if r.get('actor_billable', True))
                     + admitted['operations'][operation].get('source_interval', {}).get('elapsed', 0.))
         if receipt.get('failure', {}).get('type') in unknown:
             # Same dispatch/probe identity observes the retained handle; never
@@ -448,7 +467,7 @@ class WaveBindings:
                 elapsed=elapsed, ended=max(time.time(), started + elapsed)))
             atomic_json(observations, history)
         reference = self.cycle.store.put_json(dict(original=record, observed=receipt,
-            intervals=admission_intervals(branch)))
+            intervals=admission_intervals(branch), setup_closure=setup_closure))
         wave.setdefault('admission_receipts', {})[operation] = reference
         self.cycle.scheduler._save()
         elapsed = max(consumed(), row['actor_seconds'])
