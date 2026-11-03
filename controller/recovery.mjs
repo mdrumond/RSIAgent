@@ -155,12 +155,17 @@ export class RecoveryQueue {
   validateResult({ passed, findings, evidence }) {
     if (typeof passed !== 'boolean' || typeof findings !== 'string' || !findings.trim())
       throw new Error('Outcome and findings are required');
-    if (!Array.isArray(evidence) || evidence.length > 16 || evidence.some(ref =>
-      !ref || typeof ref !== 'object' || Array.isArray(ref) ||
-      Object.keys(ref).some(key => !['path', 'sha256', 'entry_id'].includes(key)) ||
-      !Object.values(ref).every(value => typeof value === 'string' && value.length <= 4096) ||
-      !(ref.entry_id || (ref.path && ref.sha256)))) throw new Error('Use bounded direct evidence references');
-    if (findings.length > 32000) throw new Error('Findings must be compact');
+    if (findings.length > 4000) throw new Error('Findings must be at most 4000 characters');
+    if (!Array.isArray(evidence) || evidence.length < 1 || evidence.length > 16 || evidence.some(ref => {
+      if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return true;
+      const fields = ['path', 'sha256', 'collection', 'entry_id', 'start_line', 'end_line'];
+      if (Object.entries(ref).some(([key, value]) => !fields.includes(key) ||
+        (['start_line', 'end_line'].includes(key) ? !Number.isSafeInteger(value) || value < 1 :
+          typeof value !== 'string' || !value.trim() || value.length > 4096))) return true;
+      if (ref.start_line !== undefined && ref.end_line !== undefined && ref.end_line < ref.start_line) return true;
+      // The sink resolves indexed references before paths; both native keys are mandatory.
+      return 'collection' in ref || 'entry_id' in ref ? !(ref.collection && ref.entry_id) : !(ref.path && ref.sha256);
+    })) throw new Error('Provide 1..16 bounded file/hash or collection/entry_id references');
   }
   recordOriginal(attemptId, { passed, useful = false, findings, evidence = [] }, wave) {
     this.wave(wave);
