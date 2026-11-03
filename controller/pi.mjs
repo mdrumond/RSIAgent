@@ -20,10 +20,17 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const previous=state.events(attempt.id).find(e=>e.type==='verifier-frozen');
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
-  let session,timer,accepted=false;
+  let session,timer,accepted=false,uncertain;
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
+  const execute=async(command,cwd,options)=>{
+    try {
+      const response=await environment.execute(command,cwd,options);
+      if(!response.settled)throw new Error(`Execution closure unknown: ${response.handle??'submission'}`);
+      return response;
+    } catch(error) {uncertain=error;void session?.abort();throw error;}
+  };
   const workflow=new Workflow({clock,event,fingerprint:()=>fingerprint(project.source),
     readSkill:async stage=>{
       const path=skillMap[stage];
@@ -34,7 +41,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     verify:async()=>{
       await checkVerifier();
       let output='';
-      const response=await environment.execute(project.verifier.command,project.source,{
+      const response=await execute(project.verifier.command,project.source,{
         timeout:clock.remaining, purpose:'verification',onData:data=>{output+=data.toString();}});
       await checkVerifier();
       const evidence=join(attemptPath,`verify-${Date.now()}.log`);
@@ -58,7 +65,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       }});
     pi.registerTool(sdk.createBashTool(project.source,{operations:{exec:async(command,cwd,options)=>{
       clock.check();
-      const response=await environment.execute(command,cwd,{...options,
+      const response=await execute(command,cwd,{...options,
         timeout:Math.min(options.timeout ?? Infinity,clock.remaining)});
       if (!response.settled) throw new Error('Execution remains observable; resolve its recorded handle before continuing');
       return {exitCode:response.exitCode};
@@ -73,6 +80,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     pi.on('tool_call',async()=>{
       clock.check();
+      if (uncertain) return {block:true,reason:'Execution closure is unknown; resume only after observation'};
       if (accepted) return {block:true,reason:'Project already accepted'};
     });
   };
@@ -107,6 +115,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     await session.prompt(`Goal: ${project.goal}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project.`);
     await session.waitForIdle();
     if(signal?.aborted)throw new Error('Attempt interrupted');
+    if(uncertain)throw uncertain;
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
     if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});

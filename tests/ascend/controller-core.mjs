@@ -100,3 +100,20 @@ test('live owners block resume and unverifiable ownership remains unknown',async
   assert.equal(await attemptStopped(state,{id:'a',owner},{observe:async()=>({state:'unknown'})}),false);
   assert.equal(await attemptStopped(state,{id:'a',owner},{observe:async()=>({state:'stopped'})}),true);
 });
+
+test('verifier mutation is detected across original retries and resumed attempts',async()=>{
+  const {mkdtemp,mkdir,writeFile,rm}=await import('node:fs/promises');
+  const {join}=await import('node:path');const {tmpdir}=await import('node:os');
+  const {freezeFiles}=await import('../../controller/evidence.mjs');
+  const root=await mkdtemp(join(tmpdir(),'ascend-verifier-')),state=new State(':memory:');
+  try {
+    const source=join(root,'source');await mkdir(source);
+    const verifier=join(root,'verify.py');await writeFile(verifier,'assert False');
+    state.add({id:'p',goal:'numeric',actor_seconds:240,source,verifier:{command:'python verify.py',files:[verifier]}});
+    const hashes=state.project('p').spec.verifier.hashes;
+    const check=await freezeFiles([verifier],source,hashes);await check();
+    await writeFile(verifier,'assert True');
+    await assert.rejects(check());
+    await assert.rejects(freezeFiles([verifier],source,hashes));
+  }finally{state.close();await rm(root,{recursive:true,force:true});}
+});
