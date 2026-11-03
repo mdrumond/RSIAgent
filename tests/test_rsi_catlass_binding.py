@@ -974,9 +974,9 @@ def test_original_retry_preserves_full_catlass_workload_and_actual_lease(catlass
     assert len(json.loads(Path(child.spec.correctness_ref).read_text())['cases']) == 1
 
 
-@pytest.mark.parametrize('kind', ['api-ast-ir','printf-numeric','msdebug-mssanitizer',
-                                  'device-environment-5xxxx','msprof-basic','language-conversion'])
-def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize('kind,exitcode', [('api-ast-ir',0),('printf-numeric',0),('msdebug-mssanitizer',0),
+    ('device-environment-5xxxx',0),('msprof-basic',0),('language-conversion',0),('api-ast-ir',7)])
+def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools(tmp_path, monkeypatch, kind, exitcode):
     """CPU protocol witness: real child PID/closure, no target runtime in parent."""
     import os
     import subprocess
@@ -1004,18 +1004,21 @@ def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools
     owner=tmp_path/'numeric-owner'
     pidfile=tmp_path/'numeric-pid'
     script=tmp_path/'numeric.py'
-    script.write_text('import os,json\nfrom pathlib import Path\n'
+    marker='independent-numeric-error-'+tmp_path.name
+    script.write_text('import os,json,sys\nfrom pathlib import Path\n'
         +f'Path({str(owner)!r}).write_text(str(os.getpid()))\n'
         +f'Path({str(pidfile)!r}).write_text(str(os.getpid()))\n'
         +f'print("RSI_CATLASS_RESULT="+json.dumps({receipt!r}))\n'
-        +f'Path({str(owner)!r}).unlink()\n')
+        +f'print({marker!r},file=sys.stderr)\n'
+        +f'Path({str(owner)!r}).unlink()\n'
+        +f'raise SystemExit({exitcode})\n')
     order=[]
     def completed(argv, **kwargs):
         assert argv[-2:]==['--mode','test']
         kwargs['directory'].mkdir(parents=True)
         process=subprocess.run([sys.executable,str(script)],capture_output=True)
         gates.persist_process(process,kwargs['directory'],'numeric')
-        assert process.returncode==0
+        assert process.returncode==exitcode
         order.append('numeric-exited')
         return process
     def guarded(*args, **kwargs):
@@ -1037,6 +1040,14 @@ def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools
     monkeypatch.setattr(driver,'capability_gate',capability,raising=False)
     monkeypatch.setattr(driver,'fresh_device_health',guarded,raising=False)
     monkeypatch.setattr(driver,'check_runtime',no_parent_runtime)
+    if exitcode:
+        with pytest.raises(ValueError) as error:
+            driver.run(contract,'validation')
+        assert marker in str(error.value)
+        assert order==['numeric-exited'] and not owner.exists()
+        with pytest.raises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
+        assert any(marker in path.read_text() for path in Path('outputs').rglob('*.stderr'))
+        return
     result=driver.run(contract,'validation')
     assert order==['numeric-exited','guard-after-reap','capability']
     assert result['numeric_child_exited_before_capability'] is True and result['correctness'] is True

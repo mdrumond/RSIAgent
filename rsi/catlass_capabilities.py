@@ -297,7 +297,8 @@ def profile_validation(contract, *, source_hash, started):
         process=run_retained([sys.executable,str(Path(__file__).resolve()),'--mode','test'],
                              directory=directory/'numeric-child',prefix='command')
         if process.returncode:
-            raise ValueError('numeric verification child failed before capability validation')
+            detail = process.stderr.decode(errors='replace')[-8192:]
+            raise ValueError('numeric verification child failed before capability validation: '+detail)
         numeric=verified_child_receipt(process.stdout,contract,contract['cases'])
         if (numeric.get('candidate_sha256')!=common['candidate_sha256']
                 or numeric.get('device_addressing')!='masked-logical-zero'
