@@ -256,3 +256,18 @@ class FrozenExecutorFactory:
     def guard(self, identity, request, **kwargs):
         self.metadata(identity)
         return self.factory.guard(identity, request, **kwargs)
+
+    def setup_only_binding(self, identity):
+        """Authenticate the audited copy-only binder against the frozen contract."""
+        self.metadata(identity)
+        expected = json.loads(self.bindings_json).get(identity)
+        if not expected or self.factory.binding_contract(identity) != expected:
+            return False
+        factory = self.factory
+        if isinstance(factory, ProjectConfigurationProfiles):
+            factory = factory.factory
+        if not isinstance(factory, ExecutorProfiles):
+            return False
+        from rsi.triton_worker_binding import bind_project
+        callback = factory.project_binding(identity)['callback']
+        return bool(callback and _callable(callback) is bind_project)
