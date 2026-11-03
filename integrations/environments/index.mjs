@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -364,8 +364,63 @@ export async function createEnvironment(options, context) {
     }
     return { closed: true, executionSeconds, handles: [...handles] };
   }
+  // Installation eligibility only: never settles work or permits its resumption.
+  async function canUpgrade({ attempt, events }) {
+    if (!remote || !isAbsolute(options.workspacePath ?? '') || !options.remoteDirectory ||
+        isAbsolute(options.remoteDirectory) || options.remoteDirectory.split('/').includes('..')) return false;
+    const staging = posix.join(options.remoteDirectory, encodeURIComponent(attempt.id));
+    const submitted = events.filter(e => e.type === 'execution-submitting');
+    const handles = new Set(), operations = new Set();
+    try {
+      for (const { data } of submitted) {
+        if (typeof data.submission !== 'string' || !data.submission) return false;
+        if (!['upload', 'download', 'run', 'resource-policy'].includes(data.kind)) return false;
+        operations.add(data.operation ?? data.submission);
+        const responses = events.filter(e => ['execution-submitted', 'execution-not-admitted'].includes(e.type) &&
+          e.data.submission === data.submission);
+        if (responses.some(e => e.type === 'execution-not-admitted')) {
+          if (responses.some(e => e.data.handle)) return false;
+          continue;
+        }
+        const receipt = data.receiptFile ? await json(data.receiptFile) : null;
+        const ids = new Set([...responses.map(e => e.data.handle), receipt?.handle].filter(Boolean));
+        if (ids.size !== 1) return false;
+        const [handle] = ids;
+        check(handle);
+        handles.add(handle);
+        let observed;
+        try { observed = await client(['observe', handle]); }
+        catch { observed = { state: 'unknown' }; }
+        if (terminal.has(observed.state)) continue;
+        if (data.kind !== 'upload' || data.accountingExcluded !== true ||
+            receipt?.operation !== 'upload' || receipt.target !== options.target || receipt.handle !== handle ||
+            !handle.startsWith(`remote:${options.target}:transfer:`) ||
+            !responses.some(e => e.data.handle === handle)) return false;
+        const path = await realpath(data.receiptFile), name = relative(root, path);
+        const match = /^(exec-[A-Za-z0-9]+|manifest-[A-Za-z0-9]+)\/transfer\.json$/.exec(name);
+        if (!match || path !== resolve(data.receiptFile)) return false;
+        if (match[1].startsWith('manifest-')) {
+          const manifest = await json(join(dirname(path), 'sync.json'));
+          const prefix = posix.join(options.workspacePath, staging) + '/';
+          const incoming = manifest.incoming?.slice(prefix.length);
+          if (!manifest.incoming?.startsWith(prefix) || !/^exec-[A-Za-z0-9]+\/incoming$/.test(incoming) ||
+              !manifest.project?.startsWith(prefix) || posix.normalize(manifest.project) !== manifest.project ||
+              !Array.isArray(manifest.files) || manifest.files.some(file => typeof file !== 'string' ||
+                posix.isAbsolute(file) || file.split('/').includes('..'))) return false;
+        }
+        // exec-* uploads have the fixed destination staging/exec-*/incoming.
+        // manifest-* uploads carry the existing sync configuration for that staging.
+      }
+      for (const { type, data } of events) {
+        if (type === 'execution-handle' && !handles.has(data.handle)) return false;
+        if (['execution-starting', 'execution-unresolved'].includes(type) &&
+            !operations.has(data.operation ?? data.submission)) return false;
+      }
+      return true;
+    } catch { return false; }
+  }
   return {
-    instructions, execute, observe, stop, reconcileOperation,
+    instructions, execute, observe, stop, reconcileOperation, canUpgrade,
     async prepare({ project, attempt }) {
       return exclude('setup', async () => {
         if (remote) {

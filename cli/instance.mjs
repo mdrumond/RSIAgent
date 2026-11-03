@@ -94,23 +94,41 @@ async function copyMachinery(machinery,release,install=true) {
 
 export async function upgrade(root,machinery) {
   const config=await readConfig(root);
-  const {State}=await import('../controller/state.mjs');
+  machinery=await realpath(machinery);
   const {ownerStopped,attemptStopped}=await import('../controller/lifecycle.mjs');
   const {pathToFileURL}=await import('node:url');
   const ledger=new State(join(root,'state.sqlite'));
-  try {
+  const staged=join(root,'machinery-next-'+randomUUID());
+  async function stoppedOwners() {
     if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
-      const row=ledger.db.prepare("SELECT value FROM control WHERE key='owner'").get();
-      const owner=row && JSON.parse(row.value);
-      if(owner && !await ownerStopped(owner))throw new Error('Stop the controller before upgrading');
+      for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer')").all()) {
+        const owner=JSON.parse(row.value);
+        if(owner && !await ownerStopped(owner))throw new Error('Stop the controller and skill writer before upgrading');
+      }
     }
+    for(const attempt of ledger.db.prepare('SELECT owner FROM attempts').all())
+      if(!await ownerStopped(attempt.owner))throw new Error('Upgrade requires confirmed stopped local workers');
+    if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='requests'").get())
+      for(const request of ledger.db.prepare("SELECT status,owner FROM requests WHERE status IN ('queued','running')").all())
+        if(request.status==='queued' || !await ownerStopped(request.owner))
+          throw new Error('Stop background requests before upgrading');
+  }
+  try {
+    await stoppedOwners();
+    await copyMachinery(machinery,staged);
     const pending=ledger.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all();
-    const module=pending.length?await import(pathToFileURL(resolve(root,config.environment.module))):null;
+    const installed=resolve(root,'machinery'),configured=resolve(root,config.environment.module);
+    // Inspect with the installed dependencies of the exact staged replacement.
+    // Older packaged plugins need not already implement the eligibility hook.
+    const plugin=within(installed,configured)?resolve(staged,relative(installed,configured)):configured;
+    const module=pending.length?await import(pathToFileURL(plugin)):null;
     for(const attempt of pending) {
       const environment=await module.createEnvironment(config.environment.options,{
-        instancePath:join(root,'attempts',attempt.id),event:(type,data)=>ledger.event(attempt.id,type,data),exclude:async(_label,fn)=>fn()});
-      if(!await ownerStopped(attempt.owner) || !await attemptStopped(ledger,attempt,environment))
-        throw new Error('Upgrade requires confirmed stopped local and external executions');
+        instancePath:join(root,'attempts',attempt.id),event:async()=>{},exclude:async(_label,fn)=>fn()});
+      const safe=environment.canUpgrade
+        ? await environment.canUpgrade({attempt,events:ledger.events(attempt.id)})
+        : await attemptStopped(ledger,attempt,environment);
+      if(!safe)throw new Error('Upgrade requires confirmed stopped local and external executions');
     }
     let receipt;
     try{receipt=JSON.parse(await readFile(join(root,'knowledge-service.json'),'utf8'));}
@@ -123,17 +141,19 @@ export async function upgrade(root,machinery) {
       while(!await ownerStopped(receipt.owner) && performance.now()<end)await delay(50);
       if(!await ownerStopped(receipt.owner))throw new Error('KDB process has not stopped');
     }
-    const staged=join(root,'machinery-next-'+randomUUID());
-    try {
-      await copyMachinery(await realpath(machinery),staged);
-      await mkdir(join(root,'archives'),{recursive:true});
-      const archive=join(root,'archives','machinery-'+Date.now());
-      await rename(join(root,'machinery'),archive);
-      try {await rename(staged,join(root,'machinery'));}
-      catch(error){await rename(archive,join(root,'machinery'));throw error;}
-    }finally{await rm(staged,{recursive:true,force:true});}
+    await mkdir(join(root,'archives'),{recursive:true});
+    const archive=join(root,'archives','machinery-'+Date.now());
+    ledger.db.exec('BEGIN IMMEDIATE');
+    await stoppedOwners();
+    await rename(join(root,'machinery'),archive);
+    try{await rename(staged,join(root,'machinery'));}
+    catch(error){await rename(archive,join(root,'machinery'));throw error;}
+    ledger.db.exec('COMMIT');
     return {upgraded:true,format:1};
-  }finally{ledger.close();}
+  }finally{
+    if(ledger.db.isTransaction)ledger.db.exec('ROLLBACK');
+    ledger.close();await rm(staged,{recursive:true,force:true});
+  }
 }
 
 export async function importProject(root,spec) {
