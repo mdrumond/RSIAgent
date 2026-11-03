@@ -96,6 +96,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
   };
   try {
+    if(signal?.aborted)throw new Error('Attempt interrupted');
     await environment.prepare({project,attempt});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
