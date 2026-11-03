@@ -12,7 +12,7 @@ export class ActorClock {
   }
   get elapsed() { return (this.saved + (this.depth ? 0 : this.now() - this.started)) / 1000; }
   get remaining() { return Math.max(0, this.limit / 1000 - this.elapsed); }
-  check() { if (!this.remaining) throw new Error('Actor elapsed allocation exhausted'); }
+  check() { if (!this.remaining) throw Object.assign(new Error('Actor elapsed allocation exhausted'),{code:'ACTOR_ELAPSED_EXHAUSTED'}); }
   async exclude(label, operation) {
     if (!['setup', 'transfer'].includes(label)) throw new Error('Unsupported clock exclusion');
     if (!this.depth++) this.saved += this.now() - this.started;
