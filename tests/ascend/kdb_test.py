@@ -15,6 +15,7 @@ from mcp.client.streamable_http import streamable_http_client
 import httpx
 
 from ascend_tools.kdb import KDB
+import kdb_fixture
 from kdb_fixture import Embeddings
 
 
@@ -208,11 +209,15 @@ class KnowledgeTests(unittest.TestCase):
             self.assertEqual(entry['evidence'][0]['path'], 'kernel.py')
             with self.assertRaises(ValueError):
                 db.read_entry('baseline', 'missing-id')
+            cli_env = dict(os.environ, PYTHONPATH=os.pathsep.join([
+                str(Path(__file__).resolve().parents[2]),
+                str(Path(kdb_fixture.__file__).resolve().parent),
+                os.environ.get('PYTHONPATH', '')]))
             cli = subprocess.run([sys.executable, '-m', 'ascend_tools.kdb_service',
                                   '--db', str(path), '--embedding-factory',
                                   'kdb_fixture:Embeddings', 'read-entry', '--arguments',
                                   json.dumps({'collection': 'baseline', 'entry_id': hit['chunk_id']})],
-                                 check=True, capture_output=True, text=True)
+                                 check=True, capture_output=True, text=True, env=cli_env)
             self.assertEqual(json.loads(cli.stdout), entry)
             db.db.embeddings = Embeddings()
             lesson = db.record_lesson('retain indexed citations', 'good', 'a3',
