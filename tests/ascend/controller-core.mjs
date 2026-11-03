@@ -202,3 +202,61 @@ test('orphan closure charges actual execution once without charging observer dow
       reconcileOperation:async()=>({closed:false,accountingUnresolved:true})}),false);
   }finally{state.close();}
 });
+
+test('confirmed excluded setup resumes without an actor origin and does not change its budget',async()=>{
+  const {processIdentity,attemptStopped}=await import('../../controller/lifecycle.mjs');
+  const state=new State(':memory:');
+  try {
+    state.add({id:'p',goal:'numeric',actor_seconds:120});
+    const attempt=state.admit('p',{...await processIdentity(),start:'previous-process'});
+    state.checkpoint(attempt.id,23,'retained-native-session');
+    state.event(attempt.id,'execution-submitting',{
+      submission:'setup',kind:'download',accountingExcluded:true});
+    let reconciliations=0;
+    const environment={observe:async()=>({state:'stopped'}),reconcileOperation:async()=>{
+      reconciliations++;return {closed:true,executionSeconds:0,handles:['native:transfer']};
+    }};
+    const resumed=await state.resume(attempt.id,
+      current=>attemptStopped(state,current,environment),await processIdentity());
+    assert.equal(resumed.id,attempt.id);
+    assert.equal(resumed.elapsed,23);
+    assert.equal(resumed.session,'retained-native-session');
+    assert.equal(resumed.outcome,null);
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),environment),false);
+    // A repeated closure observation after this owner stops is idempotent.
+    const stopped={...resumed,owner:attempt.owner};
+    assert.equal(await attemptStopped(state,stopped,environment),true);
+    assert.equal(reconciliations,1);
+    assert.equal(state.attempt(attempt.id).elapsed,23);
+  }finally{state.close();}
+});
+
+test('missing actor origins still block unexcluded, mixed, active and unresolved work',async t=>{
+  const {processIdentity,attemptStopped}=await import('../../controller/lifecycle.mjs');
+  for(const scenario of [
+    {name:'unclassified'}, {name:'charged',excluded:false},
+    {name:'mixed',excluded:true,mixed:true},
+    {name:'nonzero',excluded:true,seconds:1},
+    {name:'unresolved',excluded:true,closed:false},
+    {name:'actor boundary',excluded:true,started:true},
+  ])await t.test(scenario.name,async()=>{
+    const state=new State(':memory:');
+    try {
+      state.add({id:'p',goal:'numeric',actor_seconds:120});
+      const attempt=state.admit('p',{...await processIdentity(),start:'previous-process'});
+      state.checkpoint(attempt.id,23,'retained-native-session');
+      state.event(attempt.id,'execution-submitting',{
+        operation:'op',submission:'setup',accountingExcluded:scenario.excluded});
+      if(scenario.mixed)state.event(attempt.id,'execution-submitting',{
+        operation:'op',submission:'workload',accountingExcluded:false});
+      if(scenario.started)state.event(attempt.id,'execution-starting',{operation:'op'});
+      const environment={observe:async()=>({state:'stopped'}),reconcileOperation:async()=>({
+        closed:scenario.closed??true,executionSeconds:scenario.seconds??0,handles:['native:job']})};
+      await assert.rejects(state.resume(attempt.id,
+        current=>attemptStopped(state,current,environment),await processIdentity()));
+      assert.equal(state.attempt(attempt.id).elapsed,23);
+      assert.equal(state.attempt(attempt.id).session,'retained-native-session');
+      assert.equal(state.events(attempt.id).some(e=>e.type==='execution-reconciled'),false);
+    }finally{state.close();}
+  });
+});
