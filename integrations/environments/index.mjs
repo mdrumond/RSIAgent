@@ -420,7 +420,8 @@ export async function createEnvironment(options, context) {
     } catch { return false; }
   }
   return {
-    instructions, execute, observe, stop, reconcileOperation, canUpgrade,
+    instructions, execute, observe, stop, reconcileOperation,
+    ...(remote ? { canUpgrade } : {}),
     async prepare({ project, attempt }) {
       return exclude('setup', async () => {
         if (remote) {
