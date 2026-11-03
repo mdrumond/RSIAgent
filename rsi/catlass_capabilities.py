@@ -285,15 +285,19 @@ def fresh_device_health(contract, *, require_idle=False, remaining=lambda: None)
 
 
 def profile_validation(contract, *, source_hash, started):
-    """No NPU imports in parent; numeric child exits before profiler starts."""
+    """No NPU context in parent; reap numeric work before capability children.
+
+    The historical profiler entrypoint also serves IR and diagnostic validation.
+    """
+    kind = contract['exercise']['kind']
     common=dict(source_hash=source_hash,case_hash=contract['case_hash'],
                 candidate_sha256=sha('candidate.py'),physical_device=contract['physical_device'],
                 outer_cpl_handle=contract['outer_cpl_handle'])
-    with retained_evidence(common,'msprof-validation') as (directory,retained):
+    with retained_evidence(common,kind+'-validation') as (directory,retained):
         process=run_retained([sys.executable,str(Path(__file__).resolve()),'--mode','test'],
                              directory=directory/'numeric-child',prefix='command')
         if process.returncode:
-            raise ValueError('numeric verification child failed before profiling')
+            raise ValueError('numeric verification child failed before capability validation')
         numeric=verified_child_receipt(process.stdout,contract,contract['cases'])
         if (numeric.get('candidate_sha256')!=common['candidate_sha256']
                 or numeric.get('device_addressing')!='masked-logical-zero'
@@ -303,15 +307,18 @@ def profile_validation(contract, *, source_hash, started):
         (directory/'numeric-child'/'receipt.json').write_text(json.dumps(numeric,indent=2)+'\n')
         # run_retained/subprocess.run returned and reaped the child before this
         # gate performs strict fresh isolation. Parent has imported no NPU code.
+        fresh_device_health(contract, require_idle=kind=='msprof-basic')
         capability=capability_gate(contract,compile_original=None,
                                    candidate_hash=common['candidate_sha256'])
         if sha('candidate.py')!=common['candidate_sha256']:
-            raise ValueError('candidate changed between numeric and profile children')
+            raise ValueError('candidate changed between numeric and capability children')
         retained.update(outcome='required-capability-verified',exercise_validated=True,
                         numeric_child_exited=True,capability_evidence=capability)
         payload=dict(numeric,mode='validation',exercise_validated=True,
                      capability_evidence=capability,elapsed=time.monotonic()-started,
-                     numeric_child_exited_before_profile=True)
+                     numeric_child_exited_before_capability=True)
+        if kind=='msprof-basic':
+            payload['numeric_child_exited_before_profile']=True
     payload['orchestrator_evidence']=retained
     Path('outputs/catlass-result.json').write_text(json.dumps(payload,indent=2)+'\n')
     print('RSI_CATLASS_RESULT='+json.dumps(payload,sort_keys=True))

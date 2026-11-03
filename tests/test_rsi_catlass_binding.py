@@ -171,15 +171,22 @@ def fake_consumer(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules,'catlass',SimpleNamespace(tla=tla))
     monkeypatch.setitem(sys.modules,'catlass.tla',tla)
     monkeypatch.setitem(sys.modules,'catlass.tla.runtime',SimpleNamespace(from_dlpack=lambda tensor,**kw:tensor))
-    monkeypatch.setattr(driver,'check_runtime',lambda *args:{'source_revision':'src'})
+    identity = dict(source_revision='src',dependency_revision='dep',cann_version='9.3.0')
+    monkeypatch.setattr(driver,'check_runtime',lambda *args:dict(identity))
     monkeypatch.setattr(driver,'load_kernel',lambda *args:object())
     monkeypatch.setattr(driver.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0))
     contract = {'abi_version':1,'operation':'add','case_hash':'cases',
         'outer_cpl_handle':'remote:bz-a5:job:owned','execution_runtime':'catlass-dsl',
         'physical_device':2,'allowed_helpers':[],
-        'runtime_identity':{}, 'cases':[{'length':3,'block_count':2,'seed':17}],
+        'runtime_identity':identity, 'cases':[{'length':3,'block_count':2,'seed':17}],
         'execution_inputs':['candidate.py'],'generated_paths':['outputs','cache'],
         'exercise':{'kind':'numeric-only'}}
+    def numeric_child(argv, **kwargs):
+        assert argv[-2:] == ['--mode','test']
+        kwargs['directory'].mkdir(parents=True)
+        receipt = driver.run(contract,'test')  # This consumer fixture has no real NPU context.
+        return SimpleNamespace(returncode=0, stdout=('RSI_CATLASS_RESULT='+json.dumps(receipt)).encode())
+    monkeypatch.setattr(gates,'run_retained',numeric_child)
     return driver, contract, calls
 
 
@@ -515,7 +522,8 @@ def test_numeric_child_is_reaped_before_profile_without_parent_npu_context(tmp_p
     cases=[{'length':3,'block_count':1,'seed':17}]
     identity={'source_revision':'src','dependency_revision':'dep','cann_version':'9.3.0'}
     contract={'cases':cases,'case_hash':'cases','physical_device':2,
-              'outer_cpl_handle':'remote:bz-a5:job:owned','runtime_identity':identity}
+              'outer_cpl_handle':'remote:bz-a5:job:owned','runtime_identity':identity,
+              'exercise':{'kind':'msprof-basic'}}
     child={'source_hash':'source','candidate_sha256':hashlib.sha256(Path('candidate.py').read_bytes()).hexdigest(),
            'case_hash':'cases','identity':identity,'correctness':True,
            'physical_device':2,'outer_cpl_handle':contract['outer_cpl_handle'],
@@ -527,13 +535,17 @@ def test_numeric_child_is_reaped_before_profile_without_parent_npu_context(tmp_p
         order.append('numeric-exited')
         return SimpleNamespace(returncode=0,stdout=('RSI_CATLASS_RESULT='+json.dumps(child)).encode())
     def profile(*args,**kwargs):
-        assert order==['numeric-exited']
+        assert order==['numeric-exited','fresh-guard']
         order.append('profile')
         return {'outcome':'required-capability-verified'}
     monkeypatch.setattr(gates,'run_retained',completed_child)
     monkeypatch.setattr(gates,'capability_gate',profile)
+    def guard(*args, **kwargs):
+        assert order==['numeric-exited'] and kwargs['require_idle'] is True
+        order.append('fresh-guard')
+    monkeypatch.setattr(gates,'fresh_device_health',guard)
     result=gates.profile_validation(contract,source_hash='source',started=0.)
-    assert order==['numeric-exited','profile']
+    assert order==['numeric-exited','fresh-guard','profile']
     assert result['numeric_child_exited_before_profile'] is True and result['exercise_validated'] is True
 
 
@@ -960,3 +972,72 @@ def test_original_retry_preserves_full_catlass_workload_and_actual_lease(catlass
     assert recovery.original_retry(spec, row, dict(operation_id='retry-original')) == retry
     assert cases.read_bytes() == original_seed and profiles.read_bytes() == original_profiles
     assert len(json.loads(Path(child.spec.correctness_ref).read_text())['cases']) == 1
+
+
+@pytest.mark.parametrize('kind', ['api-ast-ir','printf-numeric','msdebug-mssanitizer',
+                                  'device-environment-5xxxx','msprof-basic','language-conversion'])
+def test_capability_validation_reaps_real_numeric_process_before_guard_and_tools(tmp_path, monkeypatch, kind):
+    """CPU protocol witness: real child PID/closure, no target runtime in parent."""
+    import os
+    import subprocess
+    from rsi import catlass_capabilities as gates
+    from rsi import catlass_verifier as driver
+    project=tmp_path/'project'
+    project.mkdir()
+    (project/'candidate.py').write_text('pass\n')
+    monkeypatch.chdir(project)
+    contract=dict(abi_version=1,operation='add',case_hash='cases',physical_device=2,
+        execution_runtime='catlass-dsl',outer_cpl_handle='remote:bz-a5:job:owned',
+        runtime_identity=dict(source_revision='src',dependency_revision='dep',cann_version='9.3.0'),
+        cases=[dict(length=3,block_count=1,seed=17)],exercise=dict(kind=kind),
+        execution_inputs=['candidate.py'],generated_paths=['outputs','cache'])
+    source=driver.project_hash(contract)
+    monkeypatch.setenv('RSI_EXPECTED_SOURCE_HASH',source)
+    monkeypatch.setenv('RSI_OUTER_CPL_HANDLE',contract['outer_cpl_handle'])
+    monkeypatch.setenv('RSI_CPL_RUNTIME','catlass-dsl')
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES','2')
+    receipt=dict(source_hash=source,candidate_sha256=hashlib.sha256(b'pass\n').hexdigest(),
+        case_hash='cases',identity=contract['runtime_identity'],correctness=True,
+        physical_device=2,outer_cpl_handle=contract['outer_cpl_handle'],
+        device_addressing='masked-logical-zero',
+        cases=[dict(case=contract['cases'][0],launched=True,numeric_match=True)])
+    owner=tmp_path/'numeric-owner'
+    pidfile=tmp_path/'numeric-pid'
+    script=tmp_path/'numeric.py'
+    script.write_text('import os,json\nfrom pathlib import Path\n'
+        +f'Path({str(owner)!r}).write_text(str(os.getpid()))\n'
+        +f'Path({str(pidfile)!r}).write_text(str(os.getpid()))\n'
+        +f'print("RSI_CATLASS_RESULT="+json.dumps({receipt!r}))\n'
+        +f'Path({str(owner)!r}).unlink()\n')
+    order=[]
+    def completed(argv, **kwargs):
+        assert argv[-2:]==['--mode','test']
+        kwargs['directory'].mkdir(parents=True)
+        process=subprocess.run([sys.executable,str(script)],capture_output=True)
+        gates.persist_process(process,kwargs['directory'],'numeric')
+        assert process.returncode==0
+        order.append('numeric-exited')
+        return process
+    def guarded(*args, **kwargs):
+        assert kwargs['require_idle'] is (kind=='msprof-basic')
+        assert not owner.exists()
+        if order:
+            with pytest.raises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
+            order.append('guard-after-reap')
+    def capability(*args, **kwargs):
+        assert order==['numeric-exited','guard-after-reap']
+        order.append('capability')
+        return dict(outcome='required-capability-verified')
+    def no_parent_runtime(*args, **kwargs):
+        raise AssertionError('parent must not initialize its own target runtime')
+    monkeypatch.setattr(gates,'run_retained',completed)
+    monkeypatch.setattr(gates,'fresh_device_health',guarded)
+    monkeypatch.setattr(gates,'capability_gate',capability)
+    monkeypatch.setattr(driver,'profile_validation',gates.profile_validation,raising=False)
+    monkeypatch.setattr(driver,'capability_gate',capability,raising=False)
+    monkeypatch.setattr(driver,'fresh_device_health',guarded,raising=False)
+    monkeypatch.setattr(driver,'check_runtime',no_parent_runtime)
+    result=driver.run(contract,'validation')
+    assert order==['numeric-exited','guard-after-reap','capability']
+    assert result['numeric_child_exited_before_capability'] is True and result['correctness'] is True
+    assert result['cases'][0]['case']==contract['cases'][0]

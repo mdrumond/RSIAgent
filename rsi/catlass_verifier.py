@@ -198,13 +198,16 @@ def run(contract, mode, case_index=None, capture_root=None, profile_capture=Fals
     elif contract.get('direct_physical') or os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!=str(physical):
         raise ValueError('ordinary launch must mask the admitted physical device')
     is_profile_validation=mode=='validation' and contract['exercise']['kind']=='msprof-basic'
+    isolated_validation=mode=='validation' and contract['exercise']['kind'] in {
+        'language-conversion', 'conversion', 'api-ast-ir', 'msprof-basic',
+        'msdebug-mssanitizer', 'printf-numeric', 'missing-feature', 'device-environment-5xxxx'}
     fresh_device_health(contract,require_idle=profile_capture or is_profile_validation)
-    if is_profile_validation:
+    if isolated_validation:
         if case_index is not None:
             raise ValueError('validation must cover all frozen cases')
         result=profile_validation(contract,source_hash=expected_source,started=started)
         if project_hash(contract)!=expected_source:
-            raise ValueError('source changed during profile validation')
+            raise ValueError('source changed during capability validation')
         return result
     identity = check_runtime(contract, capture_root)
     import torch
