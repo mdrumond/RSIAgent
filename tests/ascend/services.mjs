@@ -65,7 +65,9 @@ test('alive owner with delayed health is reused by concurrent callers; aborted w
 });
 
 test('dead SQLite startup claim recovers once and standard MCP delivery ACKs only success',{timeout:20000},async t=>{
-  const config=await fixture(t),python=config.python;
+  const config=await fixture(t);
+  const {stdout}=await promisify(execFile)(config.python,['-c','import sys; print(sys.executable)']);
+  const python=stdout.trim();
   const expired=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   const dead=await processIdentity(expired.pid),exited=once(expired,'exit');expired.kill('SIGKILL');await exited;
   setClaim(config,JSON.stringify(dead));
