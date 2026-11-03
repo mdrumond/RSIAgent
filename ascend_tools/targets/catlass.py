@@ -55,8 +55,36 @@ def reference(operation, left, right):
         return [struct.unpack('e', struct.pack('e', a))[0] for a in left]
     raise ValueError('unknown frozen operation')
 
+def _definition_form(node, *, annotation=False, constants=()):
+    if node is None:
+        return True
+    if isinstance(node, ast.Constant):
+        if annotation and isinstance(node.value, str):
+            try:
+                return _definition_form(ast.parse(node.value, mode='eval').body, annotation=True, constants=constants)
+            except SyntaxError:
+                return False
+        return not annotation or node.value is None or type(node.value) is int
+    if isinstance(node, ast.Name):
+        return node.id in constants or annotation and node.id in {'int', 'float', 'bool', 'str', 'tuple', 'list', 'dict'}
+    if isinstance(node, ast.Attribute):
+        return (isinstance(node.value, ast.Name) and node.value.id == 'tla' and
+                node.attr in {'Tensor', 'Constexpr', 'Float16', 'Float32', 'BFloat16',
+                              'Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32', 'UInt64', 'Bool'})
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_definition_form(item, annotation=annotation, constants=constants) for item in node.elts)
+    if isinstance(node, ast.Subscript):
+        return annotation and _definition_form(node.value, annotation=True, constants=constants) and _definition_form(node.slice, annotation=True, constants=constants)
+    return (not annotation and isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub))
+            and isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float))
+
+
 def load_kernel(path, allowed_helpers=(), entrypoint='kernel', *, expected_sha256):
     tree = ast.parse(path.read_text())
+    constants = {target.id for node in tree.body if isinstance(node, ast.Assign) and
+                 ((isinstance(node.value, ast.Constant) and type(node.value.value) in (int, float)) or
+                  isinstance(node.value, ast.Attribute) and _definition_form(node.value))
+                 for target in node.targets if isinstance(target, ast.Name)}
     # ABI v1 accepts kernel definitions, documented Catlass imports and numeric
     # constants. It does not execute an Actor-owned host launch/fallback.
     kernels = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == entrypoint]
@@ -72,9 +100,17 @@ def load_kernel(path, allowed_helpers=(), entrypoint='kernel', *, expected_sha25
         if isinstance(node, ast.Import) and all(a.name == 'catlass.tla' for a in node.names):
             continue
         if isinstance(node, ast.FunctionDef):
-            if node.name == entrypoint:
-                continue
-            if node.name in allowed_helpers and not node.decorator_list:
+            args = node.args
+            annotations = [arg.annotation for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                           *([args.vararg] if args.vararg else []), *([args.kwarg] if args.kwarg else [])]]
+            definitions_safe = (not getattr(node, 'type_params', []) and
+                all(_definition_form(value, annotation=True, constants=constants) for value in [*annotations, node.returns]) and
+                all(_definition_form(value, constants=constants) for value in [*args.defaults, *args.kw_defaults]))
+            approved_kernel = (len(node.decorator_list) == 1 and isinstance(node.decorator_list[0], ast.Attribute)
+                and isinstance(node.decorator_list[0].value, ast.Name) and node.decorator_list[0].value.id == 'tla'
+                and node.decorator_list[0].attr == 'kernel')
+            if definitions_safe and ((node.name == entrypoint and approved_kernel) or
+                    (node.name in allowed_helpers and node.name != entrypoint and not node.decorator_list)):
                 continue
         if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
             value = node.value

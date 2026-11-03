@@ -203,3 +203,36 @@ def test_bitcode_child_selects_validated_package_before_inherited_package_and_ke
                     identity,tmp_path,report,lambda:None)
     assert json.loads(output.read_text())==['preferred','registry-preserved']
     assert __import__('os').environ['PYTHONPATH']==str(inherited)
+
+
+@pytest.mark.parametrize('location',['decorator','annotation','helper-default','missing-decorator'])
+def test_definition_time_effects_are_rejected_before_module_execution(tmp_path, monkeypatch, location):
+    marker=tmp_path/'side-effect'
+    effect=f"__import__('pathlib').Path({str(marker)!r}).write_text('unexpected')"
+    decorator='@'+effect if location=='decorator' else '' if location=='missing-decorator' else '@tla.kernel'
+    annotation=effect if location=='annotation' else 'tla.Tensor'
+    helper=f'def helper(x={effect}):\n    return x\n' if location=='helper-default' else ''
+    source=f'import catlass.tla as tla\n{helper}{decorator}\ndef kernel(a: {annotation},b: tla.Tensor,c: tla.Tensor):\n    pass\n'
+    path=tmp_path/'candidate.py';path.write_text(source)
+    tla=SimpleNamespace(Tensor=object,kernel=lambda function:function)
+    monkeypatch.setitem(sys.modules,'catlass',SimpleNamespace(tla=tla))
+    monkeypatch.setitem(sys.modules,'catlass.tla',tla)
+    with pytest.raises(ValueError,match='ABI'):
+        catlass.load_kernel(path,allowed_helpers=['helper'],expected_sha256=catlass.sha(path))
+    assert not marker.exists()
+
+
+def test_approved_tensor_annotations_and_constexpr_helper_defaults_stage_and_call(tmp_path, monkeypatch):
+    class Constexpr:
+        def __class_getitem__(cls,kind): return kind
+    # CPU staging fixture; actual native annotated-kernel proof is retained separately.
+    tla=SimpleNamespace(Tensor=list,Constexpr=Constexpr,kernel=lambda function:function,
+                        compile=lambda function,*args:function)
+    monkeypatch.setitem(sys.modules,'catlass',SimpleNamespace(tla=tla))
+    monkeypatch.setitem(sys.modules,'catlass.tla',tla)
+    path=tmp_path/'candidate.py'
+    path.write_text('import catlass.tla as tla\nOFFSET=1\ndef helper(x: int,offset: tla.Constexpr[int]=OFFSET)->int:\n    return x+offset\n'
+                    '@tla.kernel\ndef kernel(a: tla.Tensor,b: tla.Tensor,c: tla.Tensor)->None:\n    c[0]=helper(a[0]+b[0])\n')
+    kernel=catlass.load_kernel(path,allowed_helpers=['helper'],expected_sha256=catlass.sha(path))
+    out=[0];compiled=tla.compile(kernel,[2],[3],out);compiled([2],[3],out)
+    assert out==[6]
