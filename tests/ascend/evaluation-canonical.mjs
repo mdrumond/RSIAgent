@@ -15,15 +15,16 @@ test('isolated evaluation runs its requested canonical project outside the produ
   const instanceRoot=join(round,'sample');
   await bootstrap({sourceInstanceRoot:f.root,instanceRoot,projectId:'unrelated',projectIds:['unrelated'],skillVersion:'baseline',config:requested});
   await cp(resolve('tests/ascend/driver_fixture.py'),join(instanceRoot,'machinery','driver_fixture.py'));
-  t.after(async()=>{
+  try {
+    const result=await wave({instanceRoot,config:requested,projectIds:['unrelated']});
+    assert.equal(result.correct,true);assert.equal(result.attempts.length,1);
+    assert.equal(rows(instanceRoot,"SELECT count(*) AS n FROM events WHERE type='stage-completed'")[0].n,8);
+    assert.ok(f.server.requests.some(r=>r.messages.some(m=>m.role==='tool')));
+  } finally {
     try{
       const receipt=JSON.parse(await readFile(join(instanceRoot,'knowledge-service.json'),'utf8'));
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
     }catch(error){if(error.code!=='ENOENT'&&error.code!=='ESRCH')throw error;}
-  });
-  const result=await wave({instanceRoot,config:requested,projectIds:['unrelated']});
-  assert.equal(result.correct,true);assert.equal(result.attempts.length,1);
-  assert.equal(rows(instanceRoot,"SELECT count(*) AS n FROM events WHERE type='stage-completed'")[0].n,8);
-  assert.ok(f.server.requests.some(r=>r.messages.some(m=>m.role==='tool')));
+  }
   f.pass();
 });
