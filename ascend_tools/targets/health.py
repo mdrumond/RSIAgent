@@ -112,7 +112,8 @@ def assess(raw, *, physical_device, configuration):
     """Apply the same strict parser and admission policy to retained raw queries."""
     product, _, _ = _configuration(configuration)
     measurements = _measure(raw, product, physical_device)
-    _require(not measurements['degraded'], 'unhealthy',
+    _require(not measurements['degraded'] or (configuration.get('allow_alarm') is True and
+             not configuration.get('require_idle', False)), 'unhealthy',
              'Alarm device requires explicit ordinary-work authorization; timing requires healthy idle')
     _require(measurements['idle'] or (not configuration.get('require_idle', False) and
              configuration.get('allow_busy') is True and measurements['memory_percent'] < 50),
@@ -125,7 +126,8 @@ def local_probe(*, physical_device, configuration, remaining):
 
     remaining() is the caller's actual elapsed allocation (or None for unlimited).
     Settings: product='a3'/'a5', chip=0/None, query_timeout_seconds (default 8),
-    allow_busy=False, require_idle=False. Unhealthy or Alarm devices are excluded.
+    allow_busy=False, allow_alarm=False, require_idle=False. Explicit Alarm
+    authorization is ordinary-work only; timing still requires healthy idle.
     No registry, CPL or controller imports.
     """
     started = time.monotonic()
