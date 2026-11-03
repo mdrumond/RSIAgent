@@ -90,6 +90,17 @@ class KDB:
         return sorted(hits, key=lambda hit: (-hit['score'], hit['collection'],
                                            hit['chunk_id']))[:limit]
 
+    def read_entry(self, collection: str, entry_id: str):
+        """Read indexed evidence without needing its original source checkout."""
+        citation = self._citation({'collection': collection, 'entry_id': entry_id})
+        row = self.db.connection.execute(
+            'SELECT text FROM chunks WHERE collection=? AND chunk_id=?',
+            (collection, entry_id)).fetchone()
+        encoded = row['text'].encode('utf-8')
+        text = encoded[:16384].decode('utf-8', errors='ignore')
+        return dict(citation, text=text, total_bytes=len(encoded),
+                    truncated=len(encoded) > 16384, evidence=[citation])
+
     def add_repo(self, path: str, collection: str, language: str,
                  target: str | None = None, kind: str = 'good',
                  paths: list[str] | None = None):

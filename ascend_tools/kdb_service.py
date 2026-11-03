@@ -41,6 +41,11 @@ def create_server(backend: KDB, *, port=8765):
         return invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit)
 
     @server.tool()
+    async def read_entry(collection: str, entry_id: str, ctx: Context) -> dict[str, Any]:
+        """Read stored chunk text (up to16KiB UTF-8) and direct validated evidence."""
+        return invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id)
+
+    @server.tool()
     async def add_repo(path: str, collection: str, language: str, ctx: Context,
                        target: str | None = None, kind: str = 'good',
                        paths: list[str] | None = None) -> dict[str, Any]:
@@ -77,7 +82,7 @@ def main():
     parser.add_argument('--transport', choices=['stdio', 'streamable-http'],
                         default='streamable-http')
     parser.add_argument('--embedding-factory', help='Optional module:factory for CPU tests')
-    parser.add_argument('command', nargs='?', choices=['serve', 'search', 'add-repo',
+    parser.add_argument('command', nargs='?', choices=['serve', 'search', 'read-entry', 'add-repo',
                                                      'record-lesson'], default='serve')
     parser.add_argument('--arguments', default='{}', help='JSON backend arguments')
     args = parser.parse_args()

@@ -90,6 +90,13 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       assert.equal(data.evidence[0].collection,'baseline');
       assert.equal(data.evidence[0].sha256.length,64);
       await unlink(join(root,'kernel.py'));
+      assert.ok(session.getActiveToolNames().includes('mcp__kdb__read_entry'));
+      const restored=await ctx.executeTool('mcp__kdb__read_entry',{
+        collection:data.evidence[0].collection,entry_id:data.evidence[0].entry_id});
+      assert.equal(restored.isError,false);
+      const restoredEntry=restored.result.structuredContent.structuredContent;
+      assert.equal(restoredEntry.text,'vector addition with aligned loads\n');
+      assert.deepEqual(restoredEntry.evidence,data.evidence);
       const lesson=await ctx.executeTool('mcp__kdb__record_lesson',{
         lesson:'avoid scalar alignment mistakes',outcome:'negative',applicability:'a3',
         evidence:data.evidence,attempt_id:'pi-attempt'});

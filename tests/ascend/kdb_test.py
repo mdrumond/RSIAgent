@@ -1,5 +1,6 @@
 """Behavioral retrieval and native MCP transport integration tests."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import socket
@@ -151,6 +152,45 @@ class KnowledgeTests(unittest.TestCase):
                              {ref['entry_id'] for ref in lesson['references']})
             db.close()
 
+    def test_read_entry_after_source_unlink_is_bounded_and_does_not_embed(self):
+        class NoEmbeddings(Embeddings):
+            def embed(self, texts):
+                raise AssertionError('entry lookup must not embed')
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'kernel.py'
+            original = 'é中' * 5000
+            source.write_text(original)
+            path = root / 'knowledge.sqlite'
+            db = KDB(path, Embeddings())
+            db.add_repo(str(root), 'baseline', 'python', paths=[source.name])
+            hit = db.search('loads')[0]
+            source.unlink()
+            db.close()
+            db = KDB(path, NoEmbeddings())
+            entry = db.read_entry('baseline', hit['chunk_id'])
+            self.assertTrue(entry['truncated'])
+            self.assertLessEqual(len(entry['text'].encode('utf-8')), 16384)
+            self.assertTrue(original.startswith(entry['text']))
+            self.assertEqual(entry['total_bytes'], len(original.encode('utf-8')))
+            self.assertEqual(entry['sha256'], hit['source_sha256'])
+            self.assertEqual(entry['evidence'][0]['entry_id'], hit['chunk_id'])
+            self.assertEqual(entry['evidence'][0]['path'], 'kernel.py')
+            with self.assertRaises(ValueError):
+                db.read_entry('baseline', 'missing-id')
+            cli = subprocess.run([sys.executable, '-m', 'ascend_tools.kdb_service',
+                                  '--db', str(path), '--embedding-factory',
+                                  'kdb_fixture:Embeddings', 'read-entry', '--arguments',
+                                  json.dumps({'collection': 'baseline', 'entry_id': hit['chunk_id']})],
+                                 check=True, capture_output=True, text=True)
+            self.assertEqual(json.loads(cli.stdout), entry)
+            db.db.embeddings = Embeddings()
+            lesson = db.record_lesson('retain indexed citations', 'good', 'a3',
+                                      entry['evidence'], 'attempt-1')
+            self.assertEqual(lesson['evidence'], entry['evidence'])
+            db.close()
+
     def test_global_ranking_beats_unrelated_singleton_collections_and_embeds_query_once(self):
         class SemanticEmbeddings(Embeddings):
             queries = 0
@@ -198,7 +238,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual({tool.name for tool in tools.tools},
-                             {'search', 'add_repo', 'record_lesson'})
+                             {'search', 'read_entry', 'add_repo', 'record_lesson'})
             result = await session.call_tool('add_repo', {
                 'path': str(root), 'collection': 'cpu', 'language': 'triton',
                 'target': 'a3', 'paths': ['kernel.py']})
@@ -212,6 +252,14 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                              path=hit['path'], start_line=hit['start_line'],
                              end_line=hit['end_line'], sha256=hit['source_sha256'])
             (root / 'kernel.py').unlink()
+            restored = await session.call_tool('read_entry', {
+                'collection': 'cpu', 'entry_id': hit['chunk_id']})
+            self.assertFalse(restored.isError)
+            self.assertEqual(restored.structuredContent['text'], 'vector addition\n')
+            self.assertEqual(restored.structuredContent['evidence'], [reference])
+            missing = await session.call_tool('read_entry', {
+                'collection': 'cpu', 'entry_id': 'absent'})
+            self.assertTrue(missing.isError)
             result = await session.call_tool('record_lesson', {
                 'lesson': 'aligned loads', 'outcome': 'negative', 'applicability': 'a3',
                 'evidence': [reference], 'attempt_id': 'cpu-1'})
@@ -269,7 +317,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 events = db.db.connection.execute(
                     'SELECT attempt_id,operation FROM knowledge_events').fetchall()
                 self.assertEqual([row['operation'] for row in events],
-                                 ['add_repo', 'search', 'record_lesson', 'record_lesson', 'skill.read'])
+                                 ['add_repo', 'search', 'read_entry', 'read_entry',
+                                  'record_lesson', 'record_lesson', 'skill.read'])
                 self.assertTrue(all(row['attempt_id'] == 'cpu-1' for row in events))
                 db.close()
 

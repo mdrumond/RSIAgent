@@ -12,3 +12,6 @@ Use returned evidence references directly when recording lessons. Indexed
 references remain valid after original source checkouts disappear. A lesson's
 delivery_id identifies idempotent delivery; its references list contains the
 actual indexed collection/entry IDs to cite in later lessons.
+Use read_entry(collection, entry_id) to recover actual stored text from prior
+retrieval citations when the original checkout is absent. Check truncated and
+total_bytes; returned evidence remains a direct citation to the full chunk.
