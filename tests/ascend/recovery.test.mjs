@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { State } from '../../controller/state.mjs';
 import { stages } from '../../controller/workflow.mjs';
 import { RecoveryQueue, modePolicy, nextWave, admitJob, recordOutcome, pendingOutcomes, outcomeRecorded } from '../../controller/recovery.mjs';
@@ -344,4 +345,72 @@ test('unacknowledged findings block only their recovery project until actual mem
   assert.deepEqual(queue.ready(1), []);
   assert.equal(queue.ready(2)[0].kind, 'retry');
   assert.equal(admitJob(state, { projectId: 'recover', wave: 2 }).kind, 'retry');
+});
+
+test('native citation outbox roundtrips through actual KDB before recovery becomes ready', t => {
+  const root = mkdtempSync(join(tmpdir(), 'ascend-recovery-kdb-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sink = action => JSON.parse(execFileSync(process.env.RECOVERY_PYTHON ?? process.env.PYTHON ?? 'python3.12',
+    ['-c', `import json,sys
+from pathlib import Path
+from ascend_tools.kdb import KDB
+from kdb_fixture import Embeddings
+path=Path(sys.argv[1]); action=json.loads(sys.argv[2]); db=KDB(path,Embeddings())
+if action['op']=='seed':
+ source=path.parent/'reference.py'; source.write_text('answer = 42\\n')
+ db.add_repo(str(path.parent),'baseline','python',target='cpu',paths=[source.name])
+ hit=db.search('answer',target='cpu')[0]
+ value=dict(collection=hit['collection'],entry_id=hit['chunk_id'],path=hit['path'],sha256=hit['source_sha256'],start_line=hit['start_line'],end_line=hit['end_line'])
+else: value=db.record_lesson(**action['arguments'])
+print(json.dumps(value)); db.close()
+`, join(root, 'knowledge.sqlite'), JSON.stringify(action)], { encoding: 'utf8', env: { ...process.env,
+      PYTHONPATH: [process.cwd(), join(process.cwd(), 'tests/ascend')].join(':') } }));
+  const citation = sink({ op: 'seed' });
+  rmSync(join(root, 'reference.py')); // native evidence remains valid without its source checkout
+  const { state, queue } = fixture(t);
+  state.add(projectSpec(t, 'native', 'reuse immutable indexed evidence'));
+  const original = admitJob(state, { projectId: 'native', wave: 0 });
+  recordOutcome(state, { attemptId: original.attempt.id, wave: 0, ...result(), evidence: [citation] });
+  const deliver = () => {
+    const [lesson] = queue.lessons();
+    const record = sink({ op: 'record', arguments: { lesson: lesson.findings,
+      outcome: lesson.outcome === 'passed' ? 'good' : 'negative', applicability: 'cpu',
+      evidence: lesson.evidence, attempt_id: lesson.attempt_id } });
+    assert.equal(record.evidence[0].entry_id, citation.entry_id);
+    assert.equal(record.evidence[0].collection, citation.collection);
+    assert.equal(queue.acknowledgeLesson(lesson.id), true);
+  };
+  assert.deepEqual(queue.ready(1), []); deliver();
+  const diagnostic = admitJob(state, { projectId: 'native', wave: 1 });
+  queue.complete(diagnostic.attempt.id, { ...result(true, true), findings: 'x'.repeat(4000),
+    evidence: [{ collection: citation.collection, entry_id: citation.entry_id }] }, 1);
+  assert.deepEqual(queue.ready(2), []); deliver();
+  assert.equal(queue.ready(2)[0].kind, 'retry');
+});
+
+test('undeliverable lesson schema is rejected before original or recovery outcome commits', t => {
+  const { state, queue } = fixture(t);
+  state.add(projectSpec(t, 'bounded', 'keep outcome and outbox atomic'));
+  const job = admitJob(state, { projectId: 'bounded', wave: 0 });
+  const invalid = [{ evidence: [] }, { findings: ' ' }, { findings: 'x'.repeat(4001) },
+    { evidence: Array(17).fill(result().evidence[0]) }, { evidence: [{ entry_id: 'native' }] },
+    { evidence: [{ collection: 'baseline' }] }, { evidence: [{ path: '', sha256: 'hash' }] },
+    { evidence: [{ collection: 'baseline', entry_id: 'native', start_line: 0 }] },
+    { evidence: [{ path: 'x'.repeat(4097), sha256: 'hash' }] }];
+  for (const patch of invalid) {
+    assert.throws(() => recordOutcome(state, { attemptId: job.attempt.id, wave: 0, ...result(), ...patch }));
+    assert.equal(state.attempt(job.attempt.id).outcome, null);
+    assert.equal(state.project('bounded').status, 'running');
+    assert.equal(queue.outcomeRecorded(job.attempt.id), false);
+    assert.deepEqual(queue.lessons(), []);
+    assert.equal(queue.entry('bounded'), undefined);
+  }
+  recordOutcome(state, { attemptId: job.attempt.id, wave: 0, ...result() }); acknowledgeLessons(queue);
+  const diagnostic = admitJob(state, { projectId: 'bounded', wave: 1 });
+  for (const patch of invalid) {
+    assert.throws(() => queue.complete(diagnostic.attempt.id, { ...result(), ...patch }, 1));
+    assert.equal(state.attempt(diagnostic.attempt.id).outcome, null);
+    assert.equal(queue.entry('bounded').failed_rounds, 0);
+    assert.deepEqual(queue.lessons(), []);
+  }
 });
