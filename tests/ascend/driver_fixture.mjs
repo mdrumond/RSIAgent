@@ -50,13 +50,13 @@ export async function provider(scenario, {nativeSession} = {}) {
             tool('submit_investigation',{goal:'SMALL arithmetic observation',
               question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py'})];
         } else if (prompt.startsWith('Inspect the native')) {
-          const marker = 'Events: ', suffix = '. Submit the compact findings';
-          const events = JSON.parse(prompt.slice(prompt.indexOf(marker)+marker.length,prompt.lastIndexOf(suffix)));
+          const context = JSON.parse(prompt.slice(prompt.indexOf('{'),prompt.lastIndexOf('}')+1));
+          const events = context.events;
           const verification = events.findLast(event => event.type === 'verification' && event.data.evidence);
-          const path = verification?.data.evidence?.correctness ?? await nativeSession?.();
+          const path = verification?.data.evidence?.correctness ?? context.session ?? await nativeSession?.();
           if (!path) throw new Error('Summary has neither verifier output nor an actual native session file');
           const passed = verification?.data.passed ?? prompt.includes('passed: true');
-          plan = [tool('record_findings',{findings:verification ? (passed ?
+          plan = [tool('read',{path}),tool('record_findings',{findings:verification ? (passed ?
             'Independent arithmetic oracle passed; attached verifier output records the result.' :
             'Independent arithmetic oracle failed; attached verifier output records the actual mismatch.') :
             'Attached native session records observed execution and tool results; no separate numeric claim is made.',
