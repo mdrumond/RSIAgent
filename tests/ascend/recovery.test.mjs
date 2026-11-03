@@ -24,6 +24,10 @@ const result = (passed = false, useful = false) => ({ passed, useful,
   findings: 'Observed a reproducible failure in the current source',
   evidence: [{ path: 'failure.json', sha256: 'digest' }] });
 
+function acknowledgeLessons(queue) {
+  for (const lesson of queue.lessons()) assert.equal(queue.acknowledgeLesson(lesson.id), true);
+}
+
 test('every mode uses canonical workflow; inference recovery can be disabled', t => {
   for (const mode of ['phase1', 'phase2', 'inference']) {
     const policy = modePolicy(mode);
@@ -57,6 +61,7 @@ test('investigation and original retry use separate future waves and fresh budge
   assert.equal(completed.failed_rounds, 0);
   assert.equal(state.project('original').status, 'failed');
   assert.deepEqual(queue.ready(4), []);
+  acknowledgeLessons(queue);
   const retry = queue.claim('original', 5);
   assert.equal(retry.kind, 'retry');
   assert.equal(retry.actor_seconds, 240);
@@ -76,8 +81,10 @@ test('unusable investigations and failed original retries consume one round each
   queue.enqueue(original().id, 0);
   const first = queue.claim('original', 1);
   assert.equal(queue.complete(first.attempt.id, result(true, false), 1).failed_rounds, 1);
+  acknowledgeLessons(queue);
   const second = queue.claim('original', 2);
   queue.complete(second.attempt.id, result(true, true), 2);
+  acknowledgeLessons(queue);
   const retry = queue.claim('original', 3);
   const done = queue.complete(retry.attempt.id, result(false), 3);
   assert.equal(done.failed_rounds, 2);
@@ -86,7 +93,7 @@ test('unusable investigations and failed original retries consume one round each
   assert.equal(state.project('original').status, 'failed');
   assert.throws(() => state.admit('original', {}));
   assert.deepEqual(queue.ready(4), []);
-  assert.equal(queue.lessons().length, 3);
+  assert.equal(queue.lessons().length, 1);
 });
 
 test('default fifth unsuccessful round freezes; initial failure is not a round', t => {
@@ -97,6 +104,7 @@ test('default fifth unsuccessful round freezes; initial failure is not a round',
     const done = queue.complete(job.attempt.id, result(), wave);
     assert.equal(done.failed_rounds, wave);
     assert.equal(done.frozen, wave === 5);
+    acknowledgeLessons(queue);
   }
   assert.equal(state.project('original').frozen, true);
 });
@@ -108,13 +116,14 @@ test('failed investigation leaves unrelated wave work eligible and persists find
   const a = queue.claim('a', 1);
   queue.complete(a.attempt.id, result(false), 1);
   assert.deepEqual(queue.ready(1).map(job => job.project), ['b']);
-  assert.deepEqual(queue.ready(2).map(job => job.project), ['b', 'a']);
+  assert.deepEqual(queue.ready(2).map(job => job.project), ['b']);
   const [lesson] = queue.lessons();
   assert.equal(lesson.attempt_id, a.attempt.id);
   assert.deepEqual(lesson.evidence, result().evidence);
   assert.equal(queue.acknowledgeLesson(lesson.id), true);
   assert.equal(queue.acknowledgeLesson(lesson.id), false);
   assert.deepEqual(queue.lessons(), []);
+  assert.deepEqual(queue.ready(2).map(job => job.project), ['b', 'a']);
 });
 
 test('useful evidence from an unsuccessful investigation still schedules original retry', t => {
@@ -195,18 +204,20 @@ test('CLI boundary selects and admits originals and recovery without duplicate b
   assert.equal(failed.failed_rounds, 0);
   assert.equal(failed.next.eligible_wave, 1);
   assert.deepEqual(nextWave(state, options).map(job => job.projectId), ['other']);
+  acknowledgeLessons(queue);
   const next = nextWave(state, { ...options, wave: 1 });
   assert.deepEqual(next.map(job => [job.projectId, job.kind]), [['other', 'original'], ['new', 'investigation']]);
   assert.equal(next[1].actor_seconds, 120);
   const diagnostic = admitJob(state, { ...options, wave: 1, projectId: 'new' });
   recordOutcome(state, { ...options, wave: 1, attemptId: diagnostic.attempt.id, ...result(true, true) });
   assert.equal(nextWave(state, { ...options, wave: 1 }).length, 1);
+  acknowledgeLessons(queue);
   const retry = admitJob(state, { ...options, wave: 2, projectId: 'new' });
   assert.equal(retry.kind, 'retry');
   state.finish(retry.attempt.id, 'passed');
   recordOutcome(state, { ...options, wave: 2, attemptId: retry.attempt.id, ...result(true) });
   assert.equal(state.project('new').status, 'passed');
-  assert.equal(queue.lessons().length, 3);
+  assert.equal(queue.lessons().length, 1);
   assert.equal(queue.completedOriginals(), 1);
 });
 
@@ -285,6 +296,8 @@ test('restart finds settled outcomes for postprocessing only, separate from memo
   assert.equal(reopened.queue.outcomeRecorded(pending.id), true);
   assert.equal(reopened.queue.lessons().length, 1); // KDB delivery still pending
   assert.deepEqual(reopened.queue.pendingOutcomes(), []);
+  assert.deepEqual(nextWave(state, { wave: 3 }), []);
+  acknowledgeLessons(reopened.queue);
   assert.equal(nextWave(state, { wave: 3 })[0].kind, 'investigation');
   const investigation = admitJob(state, { projectId: 'failed', wave: 3 });
   state.finish(investigation.attempt.id, 'passed'); // second crash after actor closure
@@ -293,8 +306,32 @@ test('restart finds settled outcomes for postprocessing only, separate from memo
   assert.equal(diagnostic.wave, 3);
   recordOutcome(reopened.state, { attemptId: diagnostic.id, wave: diagnostic.wave, ...result(true, true) });
   assert.deepEqual(pendingOutcomes(state), []);
+  acknowledgeLessons(reopened.queue);
   assert.equal(nextWave(state, { wave: 4 })[0].kind, 'retry');
   assert.equal(state.project('failed').status, 'failed');
   assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n, 3);
   assert.equal(state.attempt(failed.attempt.id).session, 'original-native-session');
+});
+
+test('unacknowledged findings block only their recovery project until actual memory acknowledgement', t => {
+  const { state, queue } = fixture(t);
+  for (const id of ['recover', 'unrelated']) state.add({ id, goal: id, actor_seconds: 240 });
+  const original = admitJob(state, { projectId: 'recover', wave: 0 });
+  recordOutcome(state, { attemptId: original.attempt.id, wave: 0, ...result() });
+  const [failure] = queue.lessons(); // memory sink failed: no acknowledgement
+  assert.equal(queue.acknowledgeLesson(-1), false);
+  assert.deepEqual(nextWave(state, { wave: 1 }).map(job => job.projectId), ['unrelated']);
+  assert.throws(() => queue.claim('recover', 1));
+  assert.equal(queue.acknowledgeLesson(failure.id), true);
+  assert.deepEqual(queue.ready(0), []); // acknowledgement does not bypass next-wave boundary
+  const investigation = queue.claim('recover', 1);
+  queue.complete(investigation.attempt.id, result(true, true), 1);
+  assert.deepEqual(queue.ready(2), []);
+  assert.throws(() => admitJob(state, { projectId: 'recover', wave: 2 }));
+  assert.deepEqual(nextWave(state, { wave: 2 }).map(job => job.projectId), ['unrelated']);
+  const [finding] = queue.lessons();
+  assert.equal(queue.acknowledgeLesson(finding.id), true);
+  assert.deepEqual(queue.ready(1), []);
+  assert.equal(queue.ready(2)[0].kind, 'retry');
+  assert.equal(admitJob(state, { projectId: 'recover', wave: 2 }).kind, 'retry');
 });

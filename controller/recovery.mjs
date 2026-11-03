@@ -69,6 +69,8 @@ export class RecoveryQueue {
     if (!this.policy.recovery) return [];
     return this.db.prepare(`SELECT q.* FROM recovery_queue q JOIN projects p ON p.id=q.project
       WHERE q.attempt IS NULL AND q.eligible_wave<=? AND p.frozen=0 AND p.status='failed'
+      AND NOT EXISTS (SELECT 1 FROM recovery_lessons l JOIN attempts a ON a.id=l.attempt
+        WHERE a.project=q.project AND l.recorded=0)
       ORDER BY q.eligible_wave,q.project`).all(wave);
   }
   claim(projectId, wave, owner = {}, resourceId) {
@@ -76,8 +78,7 @@ export class RecoveryQueue {
     return this.transaction(() => {
       const queue = this.entry(projectId), project = this.state.project(projectId);
       const original = project?.status === 'queued' && !queue;
-      if (!project || project.frozen || (!original && (!this.policy.recovery || !queue ||
-          queue.attempt || queue.eligible_wave > wave || project.status !== 'failed')))
+      if (!project || project.frozen || (!original && !this.ready(wave).some(row => row.project === projectId)))
         throw new Error('Job is not eligible');
       const kind = original ? 'original' : queue.kind;
       const id = randomUUID();
