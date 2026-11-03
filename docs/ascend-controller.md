@@ -180,11 +180,16 @@ module, not by a separate Python orchestration engine.
 ```bash
 node "$INSTANCE/machinery/cli/main.mjs" dashboard --instance "$INSTANCE" --port 46731
 node "$INSTANCE/machinery/cli/main.mjs" browse --instance "$INSTANCE" --config "$BROWSE_JSON"
+node "$INSTANCE/machinery/cli/main.mjs" skill --instance "$INSTANCE" --config "$SKILL_JSON"
 ```
 
 The dashboard listens on loopback only. It exposes settings/project JSON editors,
-a CLI-backed path browser, status, wave/stop/resume controls, KDB actions and
-skilltune user information. Browse JSON supplies a `path`; the CLI resolves and
+a CLI-backed path browser, skill-content editor, status, wave/stop/resume
+controls, KDB actions and skilltune user information. The skill selector uses
+active skillsmap scopes. A skill action `{scope}` reads content; `{scope, content}`
+saves a new immutable user version and updates the active pointer. Save refreshes
+the config projection and displays the returned content; Python performs
+no direct skill-file writes. Browse JSON supplies a `path`; the CLI resolves and
 lists it server-side. The browser never reads the user's machine filesystem
 directly. Every dashboard action uses a structured subprocess argument array
 and temporary JSON input file, with no shell interpolation or old RSI imports.
