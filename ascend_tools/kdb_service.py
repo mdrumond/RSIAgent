@@ -81,6 +81,7 @@ def main():
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--transport', choices=['stdio', 'streamable-http'],
                         default='streamable-http')
+    parser.add_argument('--embedding-cache', type=Path, help='Existing offline BGE model cache')
     parser.add_argument('--embedding-factory', help='Optional module:factory for CPU tests')
     parser.add_argument('command', nargs='?', choices=['serve', 'search', 'read-entry', 'add-repo',
                                                      'record-lesson'], default='serve')
@@ -92,7 +93,7 @@ def main():
         embeddings = getattr(import_module(module), factory)()
     else:
         from .embeddings import PinnedBGEEmbeddings
-        embeddings = PinnedBGEEmbeddings()
+        embeddings = PinnedBGEEmbeddings(cache_dir=args.embedding_cache, local_files_only=True)
     backend = KDB(args.db, embeddings)
     try:
         if args.command == 'serve':
