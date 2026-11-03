@@ -1,7 +1,8 @@
 import { join, resolve, dirname } from 'node:path';
 import { ownerStopped } from '../controller/lifecycle.mjs';
 import { bootstrap as createInstance, readConfig } from './instance.mjs';
-import { operate } from './runtime.mjs';
+import { spawn } from 'node:child_process';
+import { open } from 'node:fs/promises';
 import { State } from '../controller/state.mjs';
 
 // Every A/B sample gets its own state, source, verifier, memory and native evidence.
@@ -56,12 +57,24 @@ export async function bootstrap(request) {
     machinery:resolve(new URL('..',import.meta.url).pathname)});
 }
 export async function wave({instanceRoot,config,signal}) {
-  await operate('wave',{...config,...await readConfig(instanceRoot)},{mode:config.mode,signal});
+  const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);
+  try {
+    await new Promise((ok,no)=>{
+      let failure;
+      const child=spawn(process.execPath,[join(instanceRoot,'machinery','cli','main.mjs'),'wave',
+        '--instance',instanceRoot,'--mode',config.mode],{signal,stdio:['ignore',log.fd,log.fd]});
+      child.once('error',error=>{failure=error;if(!child.pid)no(error);});
+      child.once('close',code=>failure?no(failure):code?no(new Error('Evaluation wave failed; inspect evaluation-wave.log')):ok());
+    });
+  }finally{await log.close();}
   const state=new State(join(instanceRoot,'state.sqlite'));
   try {
     const attempts=state.db.prepare('SELECT * FROM attempts ORDER BY created').all();
-    const correct=attempts.length===1 && attempts[0].outcome==='passed';
+    const complete=attempts.length===1 && attempts[0].outcome!==null;
+    const events=complete?state.events(attempts[0].id):[];
+    const actorVerdict=events.some(event=>event.type==='accepted'||event.type==='rejected');
+    const correct=complete && actorVerdict ? attempts[0].outcome==='passed' : null;
     // Correctness dominates; lower charged elapsed is the common tie-break measurement.
-    return {correct,score:correct?-attempts[0].elapsed:0,attempts:attempts.map(a=>a.id),instanceRoot};
+    return {correct,reason:correct===null?'unavailable-or-incomplete':undefined,score:correct===true?-attempts[0].elapsed:0,attempts:attempts.map(a=>a.id),instanceRoot};
   }finally{state.close();}
 }
