@@ -109,6 +109,7 @@ The dashboard project editor submits the same JSON contract to the CLI.
 
 ```bash
 node "$INSTANCE/machinery/cli/main.mjs" wave --instance "$INSTANCE" --mode phase1 --detach
+node "$INSTANCE/machinery/cli/main.mjs" campaign --instance "$INSTANCE" --mode phase1 --detach
 node "$INSTANCE/machinery/cli/main.mjs" wave --instance "$INSTANCE" --mode phase2 --detach
 node "$INSTANCE/machinery/cli/main.mjs" wave --instance "$INSTANCE" --mode inference --detach
 node "$INSTANCE/machinery/cli/main.mjs" wave --instance "$INSTANCE" --mode revisit --detach
@@ -119,7 +120,15 @@ node "$INSTANCE/machinery/cli/main.mjs" resume --instance "$INSTANCE" --detach
 
 Run a chosen wave when requested; these examples do not prescribe running all
 modes in sequence. Detached commands return after starting the CLI driver.
-Status returns project and attempt JSON. Project states are queued, running,
+The public `campaign [--detach] --mode phaseX` command advances successive
+waves through the same canonical worker; choose phase1, phase2 or inference.
+It runs in the foreground unless detached. The existing `stop` command stops
+the campaign. An open attempt or no progress returns a blocked result requiring
+inspection and `resume`, rather than silently admitting replacement attempts.
+Optional private `config.campaign_seconds` bounds the campaign by elapsed time.
+Starting a campaign is an explicit user action, including from the dashboard.
+
+Status returns project, attempt and background-request JSON. Project states are queued, running,
 passed and failed, with freezing tracked separately. An attempt is persisted
 before setup or process execution starts.
 
