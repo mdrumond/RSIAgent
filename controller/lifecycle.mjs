@@ -15,6 +15,9 @@ export async function ownerStopped(owner) {
 }
 export async function attemptStopped(state,attempt,environment) {
   if (!await ownerStopped(attempt.owner)) return false;
+  return operationsStopped(state,attempt,environment);
+}
+export async function operationsStopped(state,attempt,environment) {
   let events=state.events(attempt.id);
   const finished=new Set(events.filter(e=>['execution-settled','execution-reconciled'].includes(e.type) &&
     (e.type==='execution-settled'||e.data.closed===true)).map(e=>e.data.operation));
