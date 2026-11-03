@@ -63,7 +63,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 'lesson': 'aligned loads', 'outcome': 'negative', 'applicability': 'a3',
                 'evidence': [{'path': str(root / 'kernel.py')}], 'attempt_id': 'cpu-1'})
             self.assertFalse(result.isError)
-            await session.read_resource('kdb://skill')
+            await session.read_resource('kdb://knowledge/skill')
 
     async def test_real_stdio_and_http(self):
         for transport in ('stdio', 'streamable-http'):
@@ -99,10 +99,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                                     except httpx.ConnectError:
                                         pass
                                     await asyncio.sleep(.05)
-                        async with streamable_http_client(
-                                f'http://127.0.0.1:{port}/mcp',
-                                headers={'X-Attempt-Id': 'cpu-1'}) as (read, write, _):
-                            await self.exercise(read, write, root)
+                        async with httpx.AsyncClient(headers={'X-Attempt-Id': 'cpu-1'}) as http:
+                            async with streamable_http_client(
+                                    f'http://127.0.0.1:{port}/mcp',
+                                    http_client=http) as (read, write, _):
+                                await self.exercise(read, write, root)
                     finally:
                         process.terminate()
                         await asyncio.to_thread(process.wait, timeout=10)

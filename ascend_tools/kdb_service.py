@@ -57,9 +57,9 @@ def create_server(backend: KDB, *, port=8765):
         return invoke(ctx, 'record_lesson', lesson=lesson, outcome=outcome,
                       applicability=applicability, evidence=evidence, attempt_id=attempt_id)
 
-    @server.resource('kdb://skill')
-    async def skill(ctx: Context) -> str:
-        backend.event('skill.read', attempt(ctx), resource='kdb://skill')
+    @server.resource('kdb://knowledge/skill')
+    async def skill() -> str:
+        backend.event('skill.read', attempt(server.get_context()), resource='kdb://knowledge/skill')
         return (Path(__file__).parent / 'templates/kdb/SKILL.md').read_text()
 
     @server.custom_route('/health', methods=['GET'])
