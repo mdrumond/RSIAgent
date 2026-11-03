@@ -141,7 +141,7 @@ def create_app(instance, machinery=None, node="node"):
             config = driver.call("config")
             config["userinfo"] = value["userinfo"]
             driver.call("config", config)
-            return jsonify(driver.call("tune", value))
+            return jsonify(driver.call("tune", value, detach=True))
 
     return app
 

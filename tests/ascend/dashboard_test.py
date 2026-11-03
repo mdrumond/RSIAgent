@@ -93,6 +93,8 @@ def test_tune_persists_userinfo_before_action(harness):
     assert calls[1][1]["userinfo"] == action["userinfo"]
     assert config["unknown"] == {"keep": True}
     assert calls[2][1] == action
+    assert "--detach" in calls[2][0]
+    assert "--detach" not in calls[1][0]
 
 
 def test_failed_config_prevents_tuning(harness):
