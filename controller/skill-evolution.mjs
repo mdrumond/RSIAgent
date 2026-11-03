@@ -144,12 +144,13 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     if (error.code !== 'ENOENT') throw error;
     state = { history: [], lastEvaluated: 0, pending: null };
   }
+  let recoveredPromotion;
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
     state.pending = null;
     state.candidateBase = current.skills.activeVersion;
     await save(statePath, state, signal);
-    return { promote: true, reason: 'recovered-promotion' };
+    recoveredPromotion = { promote: true, reason: 'recovered-promotion' };
   }
   if ((state.candidate && state.candidateBase !== current.skills.activeVersion) ||
       (state.pending && state.pending.active !== current.skills.activeVersion)) {
@@ -158,8 +159,9 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   }
   const every = current.tune_every ?? 8, pruneAfterTasks = current.skills?.pruneAfterTasks ?? 24;
   const decision = cadenceDecision(state.history, task, state.lastEvaluated, every, pruneAfterTasks);
-  if (!decision.analyse && !manual && !state.pending) return decision;
+  if (!decision.analyse && !manual && !state.pending) return recoveredPromotion ?? decision;
   if (task?.phase === 'phase1') return { analyse: false, evaluate: false };
+  const resumeIncoming = Boolean(state.pending) && (decision.analyse || manual);
   if (!state.pending) {
     const events = (manual ? context.events : task?.events) ?? [];
     const rawEntry = manual ? { ...context, userinfo, manual: true, events } : { ...task, events };
@@ -238,5 +240,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (!pending.manual) state.lastEvaluated = pending.projects;
   state.pending = null;
   await save(statePath, state, signal);
+  if (resumeIncoming) return tune({ instanceRoot, config: await json(configPath), configPath,
+    task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal });
   return { ...verdict, candidate: pending.candidate, evaluationRoot };
 }

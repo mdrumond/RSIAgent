@@ -372,3 +372,29 @@ test('configured two-original cadence evaluates earlier than default eight with 
   }
   assert.equal((await load(join(root, 'skills', 'evolution.json'))).lastEvaluated, 2);
 });
+
+test('finishing or reconciling older A/B consumes a different incoming task exactly once', async t => {
+  for (const ending of ['inconclusive', 'promoted', 'reconciled']) {
+    const root = await fixture(t), candidate = 'old-candidate';
+    await cp(join(root, 'skills', 'versions', 'baseline'), join(root, 'skills', 'versions', candidate), { recursive: true });
+    const current = ending === 'reconciled' ? { ...config, skills: { ...config.skills, activeVersion: candidate } } : config;
+    await writeFile(join(root, 'instance.json'), JSON.stringify(current));
+    await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({ history: history(8), lastEvaluated: 0,
+      candidate, candidateBase: 'baseline', pending: { active: 'baseline', candidate, projects: 8 } }));
+    let analyses = 0, arms = 0;
+    const incoming = task(8);
+    const generate = async ({ input }) => {
+      analyses++; assert.equal(input.context.id, incoming.id); assert.equal(input.history.length, 9); return [];
+    };
+    const evaluate = async ({ arm }) => { arms++; return { correct: true,
+      score: ending === 'promoted' && arm === 'candidate' ? 2 : 1 }; };
+    assert.equal((await tune({ instanceRoot: root, config: current, task: incoming, generate, evaluate })).analyse, true);
+    const saved = await load(join(root, 'skills', 'evolution.json'));
+    assert.equal(saved.history.length, 9); assert.equal(saved.history.filter(x => x.id === incoming.id).length, 1);
+    assert.equal(saved.lastEvaluated, 8); assert.equal(saved.pending, null);
+    assert.equal(analyses, 1); assert.equal(arms, ending === 'reconciled' ? 0 : 8);
+    const latest = await load(join(root, 'instance.json'));
+    assert.equal((await tune({ instanceRoot: root, config: latest, task: incoming, generate, evaluate })).analyse, false);
+    assert.equal(analyses, 1);
+  }
+});
