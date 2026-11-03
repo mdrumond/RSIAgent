@@ -8,12 +8,25 @@ import {mkdtemp,mkdir,writeFile,readFile,rm,stat,cp} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
+import {State} from '../../controller/state.mjs';
 import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 import {ensureKnowledgeService} from '../../cli/knowledge.mjs';
 import {deliverLessons} from '../../cli/memory.mjs';
 import {investigate} from '../../cli/curriculum.mjs';
 
 const read=async path=>JSON.parse(await readFile(path,'utf8'));
+function setClaim(config,value) {
+  const state=new State(join(config.root,'state.sqlite'));
+  try {
+    state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+    state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run('knowledge-startup',value);
+  }finally{state.close();}
+}
+function getClaim(config) {
+  const state=new State(join(config.root,'state.sqlite'));
+  try{return state.db.prepare('SELECT value FROM control WHERE key=?').get('knowledge-startup')?.value;}
+  finally{state.close();}
+}
 async function until(predicate) {
   const end=performance.now()+5000;
   while(!await predicate()) {if(performance.now()>=end)throw Error('fixture deadline');await delay(20);}
@@ -51,11 +64,11 @@ test('alive owner with delayed health is reused by concurrent callers; aborted w
   assert.equal(await ownerStopped(owner),false);
 });
 
-test('dead startup lock recovers once and standard MCP delivery ACKs only success',{timeout:20000},async t=>{
+test('dead SQLite startup claim recovers once and standard MCP delivery ACKs only success',{timeout:20000},async t=>{
   const config=await fixture(t),python=config.python;
   const expired=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   const dead=await processIdentity(expired.pid),exited=once(expired,'exit');expired.kill('SIGKILL');await exited;
-  const lock=join(config.root,'knowledge-service.json.lock');await writeFile(lock,JSON.stringify(dead));
+  setClaim(config,JSON.stringify(dead));
   await writeFile(join(config.root,'knowledge-service.json'),JSON.stringify({url:'http://127.0.0.1:1/mcp',owner:dead}));
   const serviceRoot=resolve(new URL('../..',import.meta.url).pathname),kdbRoot=resolve(process.env.SOURCE_KDB_ROOT??serviceRoot);
   const wrapper=join(config.root,'python-wrapper');
@@ -66,7 +79,7 @@ test('dead startup lock recovers once and standard MCP delivery ACKs only succes
   const urls=await Promise.all([ensureKnowledgeService(config),ensureKnowledgeService(config),ensureKnowledgeService(config)]).catch(async error=>{error.message+='\n'+await readFile(join(config.root,'logs','knowledge.log'),'utf8');throw error;});
   assert.equal(new Set(urls).size,1);
   assert.equal((await readFile(join(config.root,'launches'),'utf8')).trim().split('\n').length,1);
-  await assert.rejects(stat(lock),{code:'ENOENT'});
+  assert.equal(getClaim(config),undefined);
   const evidence=join(config.root,'evidence.log');await writeFile(evidence,'independent numeric evidence');
   const acknowledgements=[];
   let lesson={id:1,attempt_id:'success',outcome:'passed',findings:'numeric evidence',evidence:[{path:evidence}]};
@@ -82,12 +95,12 @@ test('dead startup lock recovers once and standard MCP delivery ACKs only succes
   abort.abort();await rejected;assert.deepEqual(acknowledgements,[1]);
 });
 
-test('live, unknown and empty legacy startup locks remain preserved on wait cancellation',async t=>{
+test('live, unknown and empty SQLite startup claims remain preserved on wait cancellation',async t=>{
   for(const value of [JSON.stringify(await processIdentity()),'{}','']) {
-    const config=await fixture(t),lock=join(config.root,'knowledge-service.json.lock');await writeFile(lock,value);
+    const config=await fixture(t);setClaim(config,value);
     const abort=new AbortController();setTimeout(()=>abort.abort(),40);
     await assert.rejects(ensureKnowledgeService(config,{signal:abort.signal}),{name:'AbortError'});
-    assert.equal(await readFile(lock,'utf8'),value);
+    assert.equal(getClaim(config),value);
     await assert.rejects(stat(join(config.root,'knowledge-service.json')),{code:'ENOENT'});
   }
 });
