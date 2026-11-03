@@ -160,7 +160,7 @@ archives. The pinned BGE model is
 ```bash
 node "$INSTANCE/machinery/cli/main.mjs" kdb --instance "$INSTANCE" --config "$KDB_ACTION_JSON"
 node "$INSTANCE/machinery/cli/main.mjs" config --instance "$INSTANCE" --config "$SETTINGS_JSON"
-node "$INSTANCE/machinery/cli/main.mjs" tune --instance "$INSTANCE" --config "$TUNE_ACTION_JSON"
+node "$INSTANCE/machinery/cli/main.mjs" tune --instance "$INSTANCE" --config "$TUNE_ACTION_JSON" --detach
 ```
 
 The config read view includes the actual active `skillsmap`. Skill-map edits
@@ -170,7 +170,9 @@ before any attempts exist. After an attempt, create a fresh instance for a
 different baseline.
 
 Persist `userinfo` through config before invoking a tuning action; the dashboard
-performs this ordering automatically. Tuning counts distinct completed original
+performs this ordering automatically and detaches the tune request. The CLI
+persists its action input in the instance before acknowledging launch; later
+status reports the request process/outcome. Tuning counts distinct completed original
 projects, excluding diagnostic/retry attempts, and evaluates candidates through
 the shared scheduler. Action JSON is interpreted by the corresponding CLI
 module, not by a separate Python orchestration engine.
