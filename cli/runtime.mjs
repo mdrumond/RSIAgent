@@ -71,7 +71,7 @@ export async function operate(command,config,options={}) {
       try {
         const {ensureKnowledgeService}=await import('./knowledge.mjs');
         const {deliverLessons}=await import('./memory.mjs');
-        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config),signal:options.signal});
+        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:options.signal}),signal:options.signal});
       }catch(error){state.event(null,'memory-update-error',{message:error.message});}
     }
     const finalize=pendingOutcomes(state,policy(config));
@@ -197,7 +197,7 @@ async function worker(root,id) {
         passed:current.outcome==='passed',signal:abort.signal});
       recordOutcome(state,{attemptId:id,wave:job.wave,passed:current.outcome==='passed',...findings,...policy(config)});
     }
-    if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config);
+    if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
@@ -221,7 +221,7 @@ async function worker(root,id) {
       state.db.prepare('UPDATE attempts SET owner=? WHERE id=? AND owner=?').run(JSON.stringify(me),id,attempt.owner);claimed=true;
     }else if(job.resume){await state.resume(id,a=>attemptStopped(state,a,env),me);claimed=true;}
     if(interrupted)throw new Error('Worker interrupted');
-    url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config);
+    url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
     bridge=createKdbBridge({url,attemptId:id,agentDir:path,target:config.target,event:(type,data)=>state.event(id,type,data)});
     const base=state.project(attempt.project).spec;
