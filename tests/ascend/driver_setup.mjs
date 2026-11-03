@@ -14,6 +14,7 @@ const python = process.env.DRIVER_PYTHON ?? 'python3.12';
 const quote = text => "'" + text.replaceAll("'", "'\\''") + "'";
 export const rows = (root,sql,file='state.sqlite') => {
   const db = new DatabaseSync(join(root,file),{readOnly:true});
+  db.exec('PRAGMA busy_timeout=5000');
   try {return db.prepare(sql).all();} finally {db.close();}
 };
 export async function until(check,timeout=15000) {

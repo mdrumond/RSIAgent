@@ -116,6 +116,7 @@ export async function operate(command,config,options={}) {
       return {attempt:attempt.id,outcome};
     };
     const results=[];
+    try {
     for(const job of jobs) {
       if(ctl.get('stop'))break;
       while(running.size>=concurrency)await Promise.race(running);
@@ -139,6 +140,10 @@ export async function operate(command,config,options={}) {
       running.add(pending);pending.then(()=>running.delete(pending),()=>running.delete(pending));
     }
     await Promise.all(running);
+    }catch(error){
+      try{ctl.set('stop',true);}finally{await Promise.allSettled([...running]);}
+      throw error;
+    }
     return {wave,results};
   } finally {options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
 }
