@@ -50,7 +50,7 @@ test('A/B samples freeze memory and source once, relocate both checks and block 
       assert.equal(own.skills.tuningDisabled,true);
     }
     const state=new State(join(round,'a','state.sqlite'));
-    state.add((await readConfig(join(round,'a'))).projects[0]);state.admit('p',{});state.close();
+    assert.ok(state.project('p'));state.admit('p',{});state.close();
     await assert.rejects(sample(request('c')),/unresolved evaluation instance/);
   }finally{await rm(root,{recursive:true,force:true});}
 });
