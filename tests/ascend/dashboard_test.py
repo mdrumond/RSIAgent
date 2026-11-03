@@ -70,11 +70,12 @@ def test_settings_and_project_propagation(harness):
 
 
 @pytest.mark.parametrize("mode", ["phase1", "phase2", "inference", "revisit"])
-def test_wave_detaches_and_passes_mode(harness, mode):
+@pytest.mark.parametrize("command", ["wave", "campaign"])
+def test_wave_detaches_and_passes_mode(harness, mode, command):
     client, calls, *_ = harness
-    assert client.post("/api/wave", json={"mode": mode}).status_code == 200
+    assert client.post(f"/api/{command}", json={"mode": mode}).status_code == 200
     assert calls[-1][0][-3:] == ["--detach", "--mode", mode]
-    assert calls[-1][0][2] == "wave"
+    assert calls[-1][0][2] == command
 
 
 def test_stop_resume_and_status(harness):
@@ -132,6 +133,7 @@ def test_driver_errors_are_http_errors(harness, response):
 def test_bad_requests_do_not_execute_cli(harness):
     client, calls, *_ = harness
     assert client.post("/api/wave", json={"mode": "other"}).status_code == 400
+    assert client.post("/api/campaign", json={"mode": "other"}).status_code == 400
     assert client.put("/api/config", json=[]).status_code == 400
     assert client.post("/api/tune", json={}).status_code == 400
     assert calls == []
@@ -189,6 +191,8 @@ const fetch = async (url, options) => {
   elements.get('browse').onsubmit({preventDefault() {}});
   await tick();
   await elements.get('folders').children[0].onclick();
+  document.getElementById('mode').value = 'phase2';
+  await elements.get('campaign').onclick();
   process.stdout.write(JSON.stringify({initialActors, requests,
     scopes: elements.get('skill-scope').children.map(option => option.value),
     statusRows: elements.get('status').children.filter(child => child.tagName === 'pre')
@@ -232,6 +236,8 @@ const fetch = async (url, options) => {
     assert saved["skillsmap"] == skillsmap
     assert saved["skills"] == original["skills"]
     assert saved["unknown"] == original["unknown"]
+    campaign = next(argv for argv, _ in calls if argv[2] == "campaign")
+    assert campaign[-3:] == ["--detach", "--mode", "phase2"]
     assert [payload["path"] for argv, payload in calls if argv[2] == "browse"] == [
         "/workspace", "/workspace/child"]
 
@@ -249,3 +255,27 @@ def test_skill_content_read_and_save_use_cli_json(harness):
         assert argv[2] == "skill"
         assert "--config" in argv
         assert payload == action
+
+
+def test_default_instance_machinery_serves_assets_and_drives_cli(monkeypatch, tmp_path):
+    instance = tmp_path / "instance"
+    machinery = instance / "machinery"
+    web = machinery / "web"
+    web.mkdir(parents=True)
+    assets = {"index.html": "<main>Instance UI</main>", "app.js": "window.instance = true;"}
+    for name, content in assets.items():
+        (web / name).write_text(content)
+    calls = []
+    state = {"projects": [], "attempts": [], "requests": []}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(state))
+
+    monkeypatch.setattr(subprocess, "run", run)
+    client = create_app(instance, node="node-test").test_client()
+    assert client.get("/").get_data(as_text=True) == assets["index.html"]
+    assert client.get("/assets/app.js").get_data(as_text=True) == assets["app.js"]
+    assert client.get("/api/status").json == state
+    assert calls == [["node-test", str(machinery / "cli/main.mjs"), "status",
+                      "--instance", str(instance)]]

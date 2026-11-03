@@ -17,7 +17,7 @@ class CLIError(Exception):
 class Driver:
     def __init__(self, instance, machinery=None, node="node"):
         self.instance = str(Path(instance).resolve())
-        self.machinery = Path(machinery or Path(__file__).resolve().parents[1])
+        self.machinery = Path(machinery or Path(self.instance) / "machinery").resolve()
         self.node = node
 
     def call(self, command, payload=None, *, detach=False, mode=None):
@@ -49,9 +49,9 @@ class Driver:
 
 
 def create_app(instance, machinery=None, node="node"):
-    web = Path(__file__).resolve().parents[1] / "web"
     app = Flask(__name__, static_folder=None)
     driver = Driver(instance, machinery, node)
+    web = driver.machinery / "web"
     # Serialize mutating requests, including config + tune, within this app.
     lock = threading.Lock()
 
@@ -108,13 +108,14 @@ def create_app(instance, machinery=None, node="node"):
         return jsonify(driver.call("browse", body()))
 
     @app.post("/api/wave")
+    @app.post("/api/campaign")
     def wave():
         value = body()
         mode = value.get("mode")
         if mode not in ("phase1", "phase2", "inference", "revisit"):
             raise BadRequest("Unknown wave mode")
         with lock:
-            return jsonify(driver.call("wave", detach=True, mode=mode))
+            return jsonify(driver.call(request.path.rsplit("/", 1)[-1], detach=True, mode=mode))
 
     @app.post("/api/stop")
     def stop():

@@ -97,10 +97,10 @@ for (const action of ['load', 'save']) {
     el('skill-content').value = result.content;
   });
 }
-for (const action of ['wave', 'stop', 'resume']) {
+for (const action of ['wave', 'campaign', 'stop', 'resume']) {
   el(action).onclick = () => perform(async () => {
-    if (dirty && action === 'wave') throw new Error('Save settings before starting a wave');
-    const value = await api(action, 'POST', action === 'wave' ? {mode: el('mode').value} : {});
+    if (dirty && ['wave', 'campaign'].includes(action)) throw new Error('Save settings before starting');
+    const value = await api(action, 'POST', ['wave', 'campaign'].includes(action) ? {mode: el('mode').value} : {});
     el('action-result').textContent = format(value);
     await refresh();
   });
