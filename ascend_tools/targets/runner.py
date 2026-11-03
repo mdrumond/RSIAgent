@@ -1,6 +1,8 @@
 """Public verifier boundary; inputs are frozen by the caller, never by candidates."""
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import hashlib
+import importlib.util
+import linecache
 import json
 import math
 import os
@@ -12,6 +14,24 @@ import traceback
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_candidate(name, path, expected_sha256):
+    """Execute verified source, never timestamp bytecode or stale decorator source."""
+    path = Path(path).resolve()
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError('candidate source identity mismatch')
+    linecache.cache.pop(str(path), None)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        exec(compile(data, str(path), 'exec'), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
 
 
 def frozen(path, digest):
@@ -110,8 +130,7 @@ def verify(args):
                 for name, path in [('candidate.py', args.candidate), ('cases.json', args.cases), ('runtime.json', args.runtime)]:
                     (directory/name).write_bytes(Path(path).read_bytes())
                 if args.target == 'cpu':
-                    from .triton import load_module
-                    model = load_module('_trusted_cpu_candidate', args.candidate)
+                    model = load_candidate('_trusted_cpu_candidate', args.candidate, args.source_sha256)
                     report['cases'] = []
                     if args.mode != 'test':
                         raise ValueError('CPU control provides numerical testing only')

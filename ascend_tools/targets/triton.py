@@ -1,23 +1,9 @@
 """A3 oracle and observed launches extracted from 13b978b."""
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import re
-import sys
 from contextlib import contextmanager
-
-def load_module(name, path):
-    """Register modules before executing decorators that inspect their module."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 def record(directory, name, value):
     """Append evidence before later work can fail."""
@@ -86,7 +72,7 @@ def execute(args, contract, identity, directory, report, save):
     """Observe real JIT returns; candidate scores and metadata are never consumed."""
     import os
     from .health import local_probe
-    from .runner import sha, bind_device
+    from .runner import sha, bind_device, load_candidate
     physical = bind_device(args, identity, 'a3')
     os.environ['TRITON_CACHE_DIR'] = str(directory/'cache')
     health = dict(identity['device_health'], require_idle=args.mode == 'performance')
@@ -110,7 +96,7 @@ def execute(args, contract, identity, directory, report, save):
         raise ValueError('active compiler target mismatch')
     report.update(compiler_target=observed, runtime_device_name=torch.npu.get_device_name(0),
                   physical_device=physical, logical_device=0, cases=[])
-    candidate = load_module('_trusted_triton_candidate', args.candidate).ModelNew().eval()
+    candidate = load_candidate('_trusted_triton_candidate', args.candidate, args.source_sha256).ModelNew().eval()
     with torch.no_grad(), launch_capture(JITFunction, directory) as launches:
         for index, case in enumerate(contract['cases']):
             inputs, expected = make_case(torch, contract['operation'], case)
