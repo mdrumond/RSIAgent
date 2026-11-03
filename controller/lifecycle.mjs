@@ -33,9 +33,18 @@ export async function operationsStopped(state,attempt,environment) {
   for(const [operation,data] of pending) {
     if(!environment.reconcileOperation)return false;
     const proof=await environment.reconcileOperation({operation,events,startElapsed:data.startElapsed});
-    if(!proof.closed || !Number.isFinite(proof.executionSeconds) || !Number.isFinite(data.startElapsed))return false;
-    elapsed=Math.max(elapsed,data.startElapsed+proof.executionSeconds);
-    state.checkpoint(attempt.id,elapsed);
+    if(!proof.closed || !Number.isFinite(proof.executionSeconds))return false;
+    if(Number.isFinite(data.startElapsed)) {
+      elapsed=Math.max(elapsed,data.startElapsed+proof.executionSeconds);
+      state.checkpoint(attempt.id,elapsed);
+    }else {
+      const submissions=events.filter(e=>e.type==='execution-submitting' &&
+        (e.data.operation??e.data.submission)===operation);
+      const actorStarted=events.some(e=>e.type==='execution-starting' &&
+        (e.data.operation??e.data.submission)===operation);
+      if(actorStarted || proof.executionSeconds!==0 || !submissions.length ||
+          submissions.some(e=>e.data.accountingExcluded!==true))return false;
+    }
     state.event(attempt.id,'execution-reconciled',{operation,closed:true,executionSeconds:proof.executionSeconds});
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
