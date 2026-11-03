@@ -4,16 +4,21 @@ import { randomUUID } from 'node:crypto';
 import { stages } from '../controller/workflow.mjs';
 
 export async function validateSkillMap(directory,map) {
-  for(const scope of ['global-kdb',...stages]) {
+  for(const scope of ['global-kdb',...stages])
     if(typeof map[scope]!=='string')throw new Error(`Map a skill file for ${scope}`);
-    const path=resolve(directory,map[scope]),rel=relative(directory,path);
+  const normalized={};
+  for(const [scope,value] of Object.entries(map)) {
+    if(typeof value!=='string')throw new Error(`Map a skill file for ${scope}`);
+    const path=resolve(directory,value),rel=relative(directory,path);
     if(rel==='..'||rel.startsWith('..'+sep))throw new Error('Skill files must belong to their immutable version');
     if(!(await readFile(path,'utf8')).trim())throw new Error(`Empty skill for ${scope}`);
+    normalized[scope]=rel;
   }
+  return normalized;
 }
 export async function copyVersion(config,map,edit) {
   const source=join(config.root,'skills','versions',config.skills.activeVersion);
-  await validateSkillMap(source,map);
+  map=await validateSkillMap(source,map);
   const version='user-'+randomUUID(),directory=join(config.root,'skills','versions',version);
   await cp(source,directory,{recursive:true});
   await writeFile(join(directory,'skill-map.json'),JSON.stringify(map,null,2)+'\n');

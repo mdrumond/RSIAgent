@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { dirname, delimiter } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { validateAcceptance } from '../controller/state.mjs';
+import { State, validateAcceptance } from '../controller/state.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -22,7 +22,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
   if (!baseline || !skills || !environment) throw new Error('Baseline KDB, skills and environment configuration required');
   const {validateSkillMap}=await import('./skill-input.mjs');
-  await validateSkillMap(resolve(skills),JSON.parse(await readFile(join(skills,'skill-map.json'),'utf8')));
+  const skillMap=await validateSkillMap(resolve(skills),JSON.parse(await readFile(join(skills,'skill-map.json'),'utf8')));
   const basestat=await stat(baseline);
   if (!basestat.isFile()) throw new Error('Baseline KDB must be a SQLite file');
   await mkdir(destination,{recursive:false,mode:0o700});
@@ -33,6 +33,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   } finally {source.close();}
   await mkdir(join(destination,'skills','versions'),{recursive:true});
   await cp(skills,join(destination,'skills','versions','baseline'),{recursive:true,errorOnExist:true});
+  await writeFile(join(destination,'skills','versions','baseline','skill-map.json'),JSON.stringify(skillMap,null,2)+'\n');
   await mkdir(join(destination,'projects'));
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
@@ -45,17 +46,24 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   return config;
 }
 
-export async function updateConfig(root,change) {
-  const current=await readConfig(root);
-  const next=await change(current);
-  if (next.format !== 1) throw new Error('Current format required');
-  next.revision=(current.revision??0)+1;
-  delete next.root;
-  const {rename}=await import('node:fs/promises');
-  const path=join(current.root,'instance.json');
-  await writeFile(path+'.tmp',JSON.stringify(next,null,2)+'\n',{mode:0o600});
-  await rename(path+'.tmp',path);
-  return next;
+export async function updateConfig(root,change,{activate,rollback}={}) {
+  const ledger=new State(join(root,'state.sqlite'));
+  let staged;
+  try {
+    ledger.db.exec('BEGIN IMMEDIATE');
+    const current=await readConfig(root),next=await change(current,ledger);
+    if(next.format!==1)throw new Error('Current format required');
+    next.revision=(current.revision??0)+1;delete next.root;
+    const path=join(current.root,'instance.json');staged=path+'.'+randomUUID()+'.tmp';
+    await writeFile(staged,JSON.stringify(next,null,2)+'\n',{mode:0o600});
+    await activate?.();
+    try {await rename(staged,path);}catch(error){await rollback?.();throw error;}
+    ledger.db.exec('COMMIT');
+    return next;
+  } catch(error) {
+    if(ledger.db.isTransaction)ledger.db.exec('ROLLBACK');
+    throw error;
+  } finally {ledger.close();if(staged)await rm(staged,{force:true});}
 }
 
 async function copyMachinery(machinery,release,install=true) {
@@ -146,9 +154,9 @@ export async function importProject(root,spec) {
   for(const path of files) {
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
     await mkdir(dirname(target),{recursive:true});await cp(absolute,target);copied.push(target);
-    for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(target);
+    for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
   }
-  for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(source).join(destination);
+  for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(source).join('.');
   const result={...spec,source:destination};
   if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied};
   return result;
