@@ -54,7 +54,9 @@ def test_settings_and_project_propagation(harness):
     client, calls, config, _, _ = harness
     original = client.get("/api/config").json
     settings = {**original, "baselineKDB": "/data/a b.sqlite", "skillsmap": {"design": "x"},
-                "curriculum": ["add"], "actors": {"seconds": 240}}
+                "curriculum": ["add"], "actor": {"seconds": 240},
+                "curriculum_actor": {"model": "curriculum"},
+                "skill_writer_actor": {"model": "writer"}}
     assert client.put("/api/config", json=settings).json == settings
     assert config == settings
     project = {"id": "p; literal", "goal": "g", "actor_seconds": 240}
@@ -127,3 +129,97 @@ def test_bad_requests_do_not_execute_cli(harness):
     assert client.put("/api/config", json=[]).status_code == 400
     assert client.post("/api/tune", json={}).status_code == 400
     assert calls == []
+
+
+def test_executed_frontend_forwards_canonical_config_and_browse_contract(harness):
+    """Run the shipped JS and replay its fetches through Flask into the CLI driver."""
+    client, calls, config, replies, _ = harness
+    original = {**config, "actor": {"model": "kernel"},
+                "curriculum_actor": {"model": "curriculum"},
+                "skill_writer_actor": {"model": "writer"},
+                "skills": {"activeVersion": "baseline"},
+                "skillsmap": {"design": "baseline/design.md"},
+                "baselineKDB": "/baseline/old.sqlite"}
+    edited = {"actor": {"model": "edited-kernel", "thinkingLevel": "off"},
+              "curriculum": {"model": "edited-curriculum"},
+              "writer": {"model": "edited-writer"}}
+    skillsmap = {"design": "/private/skills/new design.md"}
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const elements = new Map();
+function element() {
+  return {value: '', textContent: '', children: [],
+    addEventListener() {}, append(...nodes) { this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; }};
+}
+const document = {
+  getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
+  createElement: element, querySelectorAll: () => []
+};
+const requests = [];
+const fetch = async (url, options) => {
+  const body = options.body === undefined ? undefined : JSON.parse(options.body);
+  requests.push({url, method: options.method, body});
+  let value = {};
+  if (url === '/api/config') value = body ?? input.config;
+  if (url === '/api/status') value = {projects: [], attempts: []};
+  if (url === '/api/browse') value = {path: body.path, entries: [
+    {name: 'child', path: '/workspace/child', isDirectory: true}]};
+  return {ok: true, json: async () => value};
+};
+(async () => {
+  vm.runInNewContext(input.source, {document, fetch});
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  await tick();
+  const initialActors = JSON.parse(elements.get('actors').value);
+  elements.get('actors').value = JSON.stringify(input.actors);
+  elements.get('skillsmap').value = JSON.stringify(input.skillsmap);
+  elements.get('baseline').value = '/baseline/new database.sqlite';
+  elements.get('settings').onsubmit({preventDefault() {}});
+  await tick();
+  elements.get('path').value = '/workspace';
+  elements.get('browse').onsubmit({preventDefault() {}});
+  await tick();
+  await elements.get('folders').children[0].onclick();
+  process.stdout.write(JSON.stringify({initialActors, requests,
+    error: elements.get('message').textContent}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    # Popen is separate from the monkeypatched subprocess.run CLI boundary.
+    with subprocess.Popen(["node", "-e", script], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        try:
+            stdout, stderr = process.communicate(json.dumps({
+                "source": (Path(__file__).resolve().parents[2] / "web/app.js").read_text(),
+                "config": original, "actors": edited, "skillsmap": skillsmap}), timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        assert process.returncode == 0, stderr
+    result = json.loads(stdout)
+    assert result["initialActors"] == {"actor": original["actor"],
+        "curriculum": original["curriculum_actor"], "writer": original["skill_writer_actor"]}
+    assert result["error"] == "Done"
+    for req in result["requests"]:
+        if req["method"] == "GET":
+            continue
+        if req["url"] == "/api/browse":
+            replies["browse"] = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "path": req["body"]["path"], "entries": [
+                    {"name": "child", "path": "/workspace/child", "isDirectory": True}]}))
+        response = client.open(req["url"], method=req["method"], json=req["body"])
+        assert response.status_code == 200
+    saved = next(payload for argv, payload in calls if argv[2] == "config")
+    assert saved["actor"] == edited["actor"]
+    assert saved["curriculum_actor"] == edited["curriculum"]
+    assert saved["skill_writer_actor"] == edited["writer"]
+    assert "actors" not in saved
+    assert saved["baselineKDB"] == "/baseline/new database.sqlite"
+    assert saved["skillsmap"] == skillsmap
+    assert saved["skills"] == original["skills"]
+    assert saved["unknown"] == original["unknown"]
+    assert [payload["path"] for argv, payload in calls if argv[2] == "browse"] == [
+        "/workspace", "/workspace/child"]

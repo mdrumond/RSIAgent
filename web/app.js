@@ -2,7 +2,7 @@
 const el = id => document.getElementById(id);
 const format = value => JSON.stringify(value, null, 2);
 const parse = id => JSON.parse(el(id).value);
-const fields = ['skillsmap', 'curriculum', 'actors', 'environment'];
+const fields = ['skillsmap', 'curriculum', 'environment'];
 let dirty = false;
 
 async function api(path, method = 'GET', data) {
@@ -33,6 +33,8 @@ function loadFields(config) {
   el('config').value = format(config);
   el('baseline').value = config.baselineKDB ?? '';
   fields.forEach(key => { el(key).value = format(config[key] ?? {}); });
+  el('actors').value = format({actor: config.actor ?? {},
+    curriculum: config.curriculum_actor ?? {}, writer: config.skill_writer_actor ?? {}});
   el('userinfo').value = typeof config.userinfo === 'string'
     ? config.userinfo : format(config.userinfo ?? '');
 }
@@ -60,6 +62,11 @@ el('settings').onsubmit = event => {
     const config = parse('config');
     config.baselineKDB = el('baseline').value;
     fields.forEach(key => { config[key] = parse(key); });
+    const actors = parse('actors');
+    config.actor = actors.actor;
+    config.curriculum_actor = actors.curriculum;
+    config.skill_writer_actor = actors.writer;
+    delete config.actors;
     const saved = await api('config', 'PUT', config);
     loadFields(saved);
     dirty = false;
