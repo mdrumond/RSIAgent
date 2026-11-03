@@ -1,7 +1,8 @@
 import { readFile, readdir, mkdtemp, writeFile, mkdir, rename } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, relative, isAbsolute, posix } from 'node:path';
+import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -44,17 +45,24 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
 }
 
 // The payload supervisor enforces workload elapsed time, not CLI observation time.
-const supervisor = `import json, os, signal, subprocess, sys, time
+const supervisor = `import hashlib, json, os, signal, subprocess, sys
 c=json.loads(sys.argv[1]); os.makedirs(c['spool'],exist_ok=True)
+def intact():
+ try:
+  return all(hashlib.sha256(open(path,'rb').read()).hexdigest()==digest for path,digest in c['verifiers'])
+ except OSError: return False
 with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as err:
- p=subprocess.Popen(['bash','-c',c['command']],cwd=c['cwd'],env={**os.environ,**c['env']},stdout=out,stderr=err,start_new_session=True)
- def stop(*args):
-  try: os.killpg(p.pid,signal.SIGKILL)
-  except ProcessLookupError: pass
- signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
- try: code=p.wait(timeout=c['timeout'])
- except subprocess.TimeoutExpired: stop(); p.wait(); code=124
- finally: stop()
+ if not intact(): err.write(b'Frozen verifier changed before execution\n'); code=125
+ else:
+  p=subprocess.Popen(['bash','-c',c['command']],cwd=c['cwd'],env={**os.environ,**c['env']},stdout=out,stderr=err,start_new_session=True)
+  def stop(*args):
+   try: os.killpg(p.pid,signal.SIGKILL)
+   except ProcessLookupError: pass
+  signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
+  try: code=p.wait(timeout=c['timeout'])
+  except subprocess.TimeoutExpired: stop(); p.wait(); code=124
+  finally: stop()
+  if not intact(): err.write(b'Frozen verifier changed after execution\n'); code=125
 with open(c['spool']+'/exit','w') as f: f.write(str(code))
 sys.exit(code if code>=0 else 128-code)
 `;
@@ -82,7 +90,7 @@ export async function createEnvironment(options, context) {
   const local = sdk.createLocalBashOperations();
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
-  let projectRoot, attemptRoot;
+  let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     (remote ? '\nBash runs in a synchronized remote attempt directory. Use project-relative Bash paths. Native read/write/edit tools operate on the LOCAL project; edits sync before each Bash call.' : '');
   const check = handle => {
@@ -198,7 +206,7 @@ export async function createEnvironment(options, context) {
     const subdir = relative(projectRoot, resolve(cwd ?? projectRoot));
     if (subdir === '..' || subdir.startsWith('../') || isAbsolute(subdir)) throw new Error('Bash cwd must be inside local project');
     const runRoot = posix.join(attemptRoot, dir.slice(dir.lastIndexOf('/') + 1));
-    const destination = posix.join(attemptRoot, 'project');
+    const destination = posix.join(attemptRoot, projectLayout);
     const incoming = posix.join(runRoot, 'incoming');
     const files = await sourceFiles(projectRoot);
     await copy('transfer', async () => {
@@ -222,7 +230,7 @@ export async function createEnvironment(options, context) {
     });
     if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
     const spool = posix.join(runRoot, 'output');
-    const configuration = { command, cwd: posix.join(options.workspacePath, destination, subdir),
+    const configuration = { command, verifiers: opts.purpose === 'verification' ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
       spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) => process.env[key] !== value)) }, timeout: remaining() ?? null };
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
@@ -270,9 +278,26 @@ export async function createEnvironment(options, context) {
           if (!isAbsolute(options.workspacePath ?? '') || !options.remoteDirectory || isAbsolute(options.remoteDirectory) || options.remoteDirectory.split('/').includes('..')) throw new Error('Configure absolute registry workspacePath and relative task-owned remoteDirectory');
           projectRoot = resolve(project.sourceDirectory ?? project.source ?? options.projectDirectory ?? '');
           attemptRoot = posix.join(options.remoteDirectory, encodeURIComponent(String(attempt.id)));
+          const verifierFiles = (project.verifier?.files ?? []).map(file => resolve(file));
+          let layoutRoot = projectRoot;
+          for (const file of verifierFiles) {
+            const rel = relative(projectRoot, file);
+            if (rel === '' || (!rel.startsWith('../') && !isAbsolute(rel))) throw new Error('Verifier must be outside editable source');
+            while (relative(layoutRoot, file).startsWith('../')) layoutRoot = dirname(layoutRoot);
+          }
+          projectLayout = verifierFiles.length ? posix.join('tree', relative(layoutRoot, projectRoot)) : 'project';
+          frozen = [];
+          for (const file of verifierFiles) frozen.push({ local: file,
+            remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
+            sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
           const capabilities = await client(['capabilities', options.target]);
           if (capabilities.state !== 'available') throw new Error('CPL target unavailable');
           if ((await client(['preflight', options.target])).state !== 'completed') throw new Error('CPL preflight failed');
+          for (const file of frozen) await exclude('transfer', async () => {
+            const dir = await mkdtemp(join(root, 'verifier-'));
+            await transfer(['upload', options.target, file.local, file.remote], dir);
+          });
+          await event('verifier-staged', { files: frozen.map(({ remote, sha256 }) => ({ path: remote, sha256 })) });
         }
         await event('environment-prepared', { project: project.id, attempt: attempt.id });
         return { instructions };

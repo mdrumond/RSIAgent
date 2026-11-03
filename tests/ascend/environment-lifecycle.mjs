@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
 
@@ -155,7 +155,7 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
     assert.ok(['setup','transfer'].includes(label)); return fn();
   }, client: async args => {
     if (args[0] === 'capabilities') return { state: 'available' };
-    if (args[0] === 'upload') { await cp(args[2], join(workspace, args[3]), { recursive: true }); return { state: 'completed' }; }
+    if (args[0] === 'upload') { await mkdir(dirname(join(workspace, args[3])), { recursive: true }); await cp(args[2], join(workspace, args[3]), { recursive: true }); return { state: 'completed' }; }
     if (args[0] === 'download') { await cp(join(workspace, args[2]), args[3]); return { state: 'completed' }; }
     if (args[0] === 'run') {
       const handle = `remote:fake:job:${++sequence}`;
@@ -185,4 +185,18 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const timeoutJob = await environment.execute("python3 -c 'import time; time.sleep(30)'", project, { timeout: 0.1 });
   for (const job of jobs.values()) await job.completion;
   assert.equal(jobs.get(timeoutJob.handle).exit, 124);
+  const verifier = join(instancePath, 'verify.py');
+  await writeFile(join(project, 'value.txt'), '7');
+  await writeFile(verifier, "from pathlib import Path\nassert int(Path('value.txt').read_text()) == 7\nPath('verified.marker').write_text('ran')\nif Path('mutate').exists(): Path(__file__).write_text('changed')\nprint('verified')\n");
+  const verified = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'verifier-attempts', pollMs: 1 }, context);
+  await verified.prepare({ project: { id: 'verified', source: project, verifier: { files: [verifier], command: 'python3 ../verify.py' } }, attempt: { id: 'v' } });
+  let verifiedOutput = '';
+  const verify = () => verified.execute('python3 ../verify.py', project, { purpose: 'verification', onData: data => { verifiedOutput += data; } });
+  assert.equal((await verify()).exitCode, 0);
+  assert.equal(verifiedOutput, 'verified\n');
+  await writeFile(join(project, 'mutate'), '1');
+  assert.equal((await verify()).exitCode, 125); // mutation during verification rejects success
+  assert.equal((await verified.execute('rm verified.marker', project)).exitCode, 0);
+  assert.equal((await verify()).exitCode, 125); // existing corruption prevents verifier launch
+  assert.equal((await verified.execute('test ! -e verified.marker', project)).exitCode, 0);
 });
