@@ -24,7 +24,7 @@ async function fixture(t, override) {
       const overridden = override && await override(args, { events, versions });
       if (overridden !== undefined) return overridden;
       if (args[0] === 'capabilities') return { state: 'available' };
-      if (args[0] === 'upload') { versions.push(await readFile(join(args[2], 'program.py'), 'utf8')); return { state: 'completed', handle: 'remote:fake:transfer:copy' }; }
+      if (args[0] === 'upload') { if(args[2]===project)versions.push(await readFile(join(args[2], 'program.py'), 'utf8')); return { state: 'completed', handle: 'remote:fake:transfer:copy' }; }
       if (args[0] === 'download') { await writeFile(args[3], args[2].endsWith('stdout') ? output : ''); return { state: 'completed' }; }
       if (args[0] === 'run') return { handle: 'remote:fake:job:one' };
       return { state: 'completed', exit: 0 };
@@ -151,17 +151,25 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   await mkdir(project); await mkdir(workspace);
   await writeFile(join(project, 'old.py'), 'old');
   await writeFile(join(project, 'layout-node'), 'old file');
+  const references = join(project, 'references'); await mkdir(references);
+  const names = Array.from({length:1800},(_,i)=>`${String(i).padStart(4,'0')}-${'reference-'.repeat(12)}.txt`);
+  await Promise.all(names.map(name=>writeFile(join(references,name),'retained reference')));
   const jobs = new Map(); let sequence = 0, loseObserver = false;
+  let manifestBytes = 0, largestSync = 0;
   const context = { instancePath, sdk, event: async () => {}, exclude: async (label, fn) => {
     assert.ok(['setup','transfer'].includes(label)); return fn();
   }, client: async args => {
     if (args[0] === 'capabilities') return { state: 'available' };
-    if (args[0] === 'upload') { await mkdir(dirname(join(workspace, args[3])), { recursive: true }); await cp(args[2], join(workspace, args[3]), { recursive: true }); return { state: 'completed' }; }
+    if (args[0] === 'upload') {
+      if (args[2].endsWith('/sync.json')) manifestBytes = Math.max(manifestBytes,(await readFile(args[2])).length);
+      await mkdir(dirname(join(workspace, args[3])), { recursive: true }); await cp(args[2], join(workspace, args[3]), { recursive: true }); return { state: 'completed' };
+    }
     if (args[0] === 'download') { await cp(join(workspace, args[2]), args[3]); return { state: 'completed' }; }
     if (args[0] === 'run') {
       const handle = `remote:fake:job:${++sequence}`;
       const job = { state: 'running', setup: args[args.indexOf('--file') + 1].endsWith('sync.sh') }; jobs.set(handle, job);
       const script = await readFile(args[args.indexOf('--file') + 1], 'utf8');
+      if (job.setup) largestSync = Math.max(largestSync,Buffer.byteLength(script));
       job.completion = sdk.createLocalBashOperations().exec(script, workspace, { onData: () => {} }).then(result => {
         job.state = 'completed'; job.exit = result.exitCode;
       });
@@ -176,6 +184,11 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   const environment = await createEnvironment({ mode: 'cpl', target: 'fake', workspacePath: workspace, remoteDirectory: 'attempts', pollMs: 1 }, context);
   await environment.prepare({ project: { id: 'p', sourceDirectory: project }, attempt: { id: 'a' } });
   assert.equal((await environment.execute('printf built > build.marker', project)).exitCode, 0);
+  assert.ok(manifestBytes > 128 * 1024,'fixture must exceed the observed per-argument limit');
+  assert.ok(largestSync < 16 * 1024,'sync control payload must remain bounded with a large manifest');
+  assert.deepEqual((await readdir(join(workspace,'attempts/a/project/references'))).sort(),names.sort());
+  assert.equal(await readFile(join(workspace,'attempts/a/project/references',names[0]),'utf8'),'retained reference');
+  await rm(references,{recursive:true});
   await rm(join(project, 'old.py'));
   await rm(join(project, 'layout-node')); await mkdir(join(project, 'layout-node'));
   await writeFile(join(project, 'layout-node', 'nested.py'), 'new directory');
@@ -183,6 +196,7 @@ test('Python supervisor enforces elapsed timeout and preserves build outputs whi
   let output = '';
   assert.equal((await environment.execute('python3 new.py', project, { onData: data => { output += data; } })).exitCode, 0);
   assert.equal(output, 'built\n');
+  await assert.rejects(readdir(join(workspace,'attempts/a/project/references')),{code:'ENOENT'});
   assert.equal((await environment.execute("python3 -c \"from pathlib import Path; assert Path('layout-node/nested.py').read_text() == 'new directory'; assert Path('build.marker').read_text() == 'built'\"", project)).exitCode, 0);
   await rm(join(project, 'layout-node', 'nested.py')); await rm(join(project, 'layout-node'), { recursive: true });
   await writeFile(join(project, 'layout-node'), 'new file');
