@@ -14,7 +14,8 @@ const save = async (path, value) => {
 
 // Native Pi owns tool turns, correction, context, retry and compaction.
 export async function generateCandidate({ directory, input, modelRuntime, model, native,
-  seconds = 240, extensions = [], validate = () => {} }) {
+  seconds = 240, extensions = [], validate = () => {}, signal }) {
+  signal?.throwIfAborted();
   if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Writer elapsed seconds must be positive');
   const started = performance.now();
   const sdk = native ?? await import('@earendil-works/pi-coding-agent');
@@ -39,7 +40,9 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
     pi.registerTool({ name: 'submit_changes', label: 'Submit skill changes',
       description: 'Validate and submit candidate guidance. Correct any rejection using the returned reason.',
       parameters, execute: async (_id, { changes }) => {
+        signal?.throwIfAborted();
         await validate(changes);
+        signal?.throwIfAborted();
         submitted = changes;
         return { content: [{ type: 'text', text: 'Candidate changes accepted.' }], details: {} };
       } });
@@ -57,11 +60,15 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
     if (event.type === 'message_end') responses.push(event.message);
   });
   let timer, expired = false;
+  const abort = () => { void session.abort().catch(() => {}); };
+  signal?.addEventListener('abort', abort, { once: true });
   try {
+    signal?.throwIfAborted();
     const remaining = seconds * 1000 - (performance.now() - started);
     if (remaining <= 0) throw new Error('Writer elapsed allocation exhausted');
     timer = setTimeout(() => { expired = true; void session.abort().catch(() => {}); }, remaining);
     await session.bindExtensions({});
+    signal?.throwIfAborted();
     await session.prompt(`Read current-guidance.json and current-usage.json with native read tools.
 Use usage-history.jsonl only for relevant prior usage. Resolve cited collection/entry_id with mcp__kdb__read_entry
 and search positive/negative evidence with mcp__kdb__search; indexed source files may be absent.
@@ -69,11 +76,13 @@ Propose English guidance prioritizing error avoidance, detection and recovery be
 Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning needs 24 distinct originals.
 Submit via submit_changes; correct any rejection. A final text response does not publish changes.`);
     await session.waitForIdle();
+    signal?.throwIfAborted();
     if (expired) throw new Error('Writer elapsed allocation exhausted');
     if (!submitted) throw new Error('Native writer did not submit validated changes');
     return submitted;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     try {
       await save(join(directory, 'responses.json'), responses);
       const messages = manager.getEntries?.().filter(entry => entry.type === 'message').map(entry => entry.message) ?? responses;

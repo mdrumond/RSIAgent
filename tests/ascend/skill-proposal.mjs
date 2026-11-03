@@ -123,3 +123,14 @@ test('native writer elapsed allocation aborts and retains response evidence', as
   assert.ok(flags.aborted && flags.disposed);
   assert.equal((await load(join(root, 'timed', 'responses.json'))).length, 1);
 });
+
+test('external stop aborts native session, rejects submission and preserves partial messages', async t => {
+  const root = await fixture(t), controller = new AbortController();
+  const { native, flags } = nativeWriter(() => setTimeout(() => controller.abort(), 0), true);
+  await assert.rejects(generateCandidate({ directory: join(root, 'stopped'), input: {}, native,
+    signal: controller.signal }), { name: 'AbortError' });
+  assert.ok(flags.aborted && flags.disposed);
+  assert.equal((await load(join(root, 'stopped', 'responses.json'))).length, 1);
+  await assert.rejects(generateCandidate({ directory: join(root, 'never-started'), input: {}, native,
+    signal: controller.signal }), { name: 'AbortError' });
+});
