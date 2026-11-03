@@ -27,7 +27,7 @@ print(json.dumps({'observed_at':time.time(),'devices':rows},allow_nan=False))
 `;
 
 /** CPL options plus health:{product,chip,allow_alarm?,allow_busy?}, instructionFile,
- * profile? and probeSeconds? (default60). context.resource/options.resource is the
+ * profile?, deviceAffinity?:physicalIDs[] and probeSeconds? (default60). context.resource/options.resource is the
  * leased row or opaque id returned by resources(); no caller-selected raw NPU ID.
  * Idle-only availability keeps the core's parallel leases independent of health policy.
  */
@@ -37,6 +37,10 @@ export async function createEnvironment(options, context) {
   if (!['a3', 'a5'].includes(options.health?.product)) throw new Error('Explicit A3/A5 health profile required');
   const seconds = options.probeSeconds ?? 60;
   if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 120) throw new Error('probeSeconds must be in (0,120]');
+  if (options.deviceAffinity !== undefined && (!Array.isArray(options.deviceAffinity) || options.deviceAffinity.some(id => !Number.isInteger(id) || id < 0)))
+    throw new Error('deviceAffinity must contain explicit nonnegative physical IDs');
+  const affinity = options.deviceAffinity?.slice();
+  await context.event('resource-policy', { target: options.target, runtime: options.runtime, deviceAffinity: affinity ?? null });
   const client = context.client ?? createCplClient(options.clientPath);
   const assigned = context.resource ?? options.resource;
   const assignedId = typeof assigned === 'string' ? assigned : assigned?.id;
@@ -59,7 +63,7 @@ export async function createEnvironment(options, context) {
     if (policy.state !== 'completed') throw new Error('NPU permission inventory unavailable');
     const profile = policy.profiles?.find(row => row.target === options.target);
     if (!profile) throw new Error('NPU permission profile missing');
-    return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id);
+    return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !affinity || affinity.includes(id));
   }
   async function snapshot(devices, purpose, budget = seconds) {
     if (!(budget > 0)) throw new Error('Resource probe elapsed allocation exhausted');
@@ -122,7 +126,7 @@ export async function createEnvironment(options, context) {
         id: idFor(row.physical_device),
         available: row.admitted === true && row.measurements?.idle === true,
         metadata: { target: options.target, runtime: options.runtime, product: options.health.product,
-          physicalDevice: row.physical_device, logicalDevice: 0, observedAt: result.observed_at, checkedAt: result.checked_at,
+          physicalDevice: row.physical_device, logicalDevice: 0, deviceAffinity: affinity ?? null, observedAt: result.observed_at, checkedAt: result.checked_at,
           admitted: row.admitted === true, measurements: row.measurements, failure: row.failure,
           probeHandle: result.handle, healthSha256 },
       }));
@@ -143,9 +147,9 @@ export async function createEnvironment(options, context) {
         const result = await snapshot([physical], opts.purpose ?? 'ordinary', remaining() ?? seconds);
         const row = result.devices.find(item => item.physical_device === physical);
         if (row?.admitted !== true || !(await enabled()).includes(physical)) throw new Error('Fresh resource admission refused');
-        bindings.ASCEND_RT_VISIBLE_DEVICES = bindings.ASCEND_VISIBLE_DEVICES = String(physical);
+        bindings.ASCEND_PHYSICAL_DEVICE = bindings.ASCEND_RT_VISIBLE_DEVICES = bindings.ASCEND_VISIBLE_DEVICES = String(physical);
         return environment.execute(command, cwd, { ...opts, timeout: remaining(), resourceId: physical,
-          env: { ...opts.env, ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
+          env: { ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
       });
     },
   };

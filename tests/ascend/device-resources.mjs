@@ -89,23 +89,24 @@ test('ordinary Alarm/busy opt-ins retain policy, parallel availability stays idl
   assert.deepEqual(timing.filter(row => row.available).map(row => row.metadata.physicalDevice), [0]);
 });
 
-test('assigned opaque lease rechecks and forwards physical declaration, logical-zero mask and elapsed remainder', async t => {
-  const f = await fixture(t);
-  const lease = (await f.environment.resources()).find(row => row.available);
+for (const physical of [0, 1]) test(`lease ${physical}: assigned opaque lease rechecks and forwards physical declaration, logical-zero mask and elapsed remainder`, async t => {
+  const f = await fixture(t, { allow_alarm: true });
+  const lease = (await f.environment.resources()).find(row => row.available && row.metadata.physicalDevice === physical);
   const bound = await createEnvironment(f.options, { ...f.context, resource: lease });
   await bound.prepare({ project: { id:'p', source:f.source }, attempt:{ id:'a' } });
-  const result = await bound.execute('kernel-command', f.source, { timeout:3, env:{ ASCEND_RT_VISIBLE_DEVICES:'7' } });
+  const result = await bound.execute('kernel-command', f.source, { timeout:3, env:{ ASCEND_PHYSICAL_DEVICE:'7', ASCEND_RT_VISIBLE_DEVICES:'7' } });
   assert.equal(result.settled, true);
   const run = f.calls.find(args => args[0] === 'run' && args[args.indexOf('--file')+1].endsWith('command.sh'));
-  assert.equal(run[run.indexOf('--npu')+1], '0');
+  assert.equal(run[run.indexOf('--npu')+1], String(physical));
   assert.equal(run[run.indexOf('--runtime')+1], 'registered');
   const script = await readFile(run[run.indexOf('--file')+1], 'utf8');
   const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2));
-  assert.equal(config.env.ASCEND_RT_VISIBLE_DEVICES, '0');
-  assert.equal(config.env.ASCEND_VISIBLE_DEVICES, '0');
+  assert.equal(config.env.ASCEND_PHYSICAL_DEVICE, String(physical));
+  assert.equal(config.env.ASCEND_RT_VISIBLE_DEVICES, String(physical));
+  assert.equal(config.env.ASCEND_VISIBLE_DEVICES, String(physical));
   assert.ok(config.timeout > 0 && config.timeout < 3);
   await assert.rejects(bound.execute('work',f.source,{ resourceId:'0' }), /opaque|Assigned/);
-  f.rows[0].busy = true; await f.update();
+  f.rows[physical].busy = true; await f.update();
   await assert.rejects(bound.execute('work',f.source), /admission refused/);
 });
 
@@ -135,4 +136,15 @@ test('remote wall-clock skew does not replace local elapsed freshness', async t 
   const resources = await f.environment.resources();
   assert.equal(resources.filter(row => row.available).length, 1);
   assert.ok(resources[0].metadata.observedAt > resources[0].metadata.checkedAt + 3500);
+});
+
+
+test('explicit project device affinity is a recorded filter and never falls back', async t => {
+  const f = await fixture(t, { allow_alarm: true });
+  const bound = await createEnvironment({ ...f.options, deviceAffinity:[1] },f.context);
+  const rows = await bound.resources();
+  assert.deepEqual(rows.filter(row => row.available).map(row => row.metadata.physicalDevice), [1]);
+  assert.deepEqual(rows[0].metadata.deviceAffinity,[1]);
+  assert.ok(f.events.some(row => row.type === 'resource-policy' && row.deviceAffinity?.[0] === 1));
+  f.setEnabled([0]); assert.deepEqual(await bound.resources(),[]);
 });
