@@ -27,7 +27,7 @@ function workflow({pass, interrupt}) {
 }
 export async function provider(scenario, {nativeSession} = {}) {
   const requests = [], failures = [], plans = new Map();
-  let originals = 0;
+  let originals = 0, writers = 0;
   const server = createServer(async (req,res) => {
     try {
       if (req.url !== '/v1/chat/completions') throw new Error(`Unexpected provider route ${req.url}`);
@@ -64,8 +64,8 @@ export async function provider(scenario, {nativeSession} = {}) {
         } else if (prompt.startsWith('Read current-guidance.json')) {
           plan=[tool('read',{path:'current-guidance.json'}),tool('read',{path:'current-usage.json'}),
             tool('mcp__kdb__search',{query:'independent numeric oracle',kind:'good',limit:1}),
-            tool('submit_changes',{changes:[{action:'upsert',id:'numeric-oracle',scope:'debug',
-              text:'Use the independent numeric oracle before accepting a candidate.',critical:false,negative:false}]})];
+            tool('submit_changes',{changes:writers++===0?[{action:'upsert',id:'numeric-oracle',scope:'debug',
+              text:'Use the independent numeric oracle before accepting a candidate.',critical:false,negative:false}]:[]})];
         } else if (prompt.startsWith('Goal:')) {
           const unrelated = prompt.includes('Goal: unrelated');
           const small = prompt.includes('Goal: SMALL');
