@@ -11,6 +11,8 @@
 <button id="wave">Start wave</button><button id="campaign">Start campaign</button><button id="stop">Stop</button><button id="resume">Resume</button></div></section>
 <section><h2>Instance settings</h2>
 <p>JSON editors retain additional settings. Save before starting a wave.</p>
+<button id="reload-settings" type="button">Reload settings (discard edits)</button>
+<p id="settings-conflict" role="alert" hidden>Settings changed on the server. Your edits remain here; copy any you want to keep, then reload settings before saving.</p>
 <form id="settings">
 <label>Baseline KDB path <input id="baseline" type="text"></label>
 <label>Skills map (JSON) <textarea id="skillsmap" rows="4"></textarea></label>

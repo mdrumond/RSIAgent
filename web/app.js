@@ -5,6 +5,7 @@ const parse = id => JSON.parse(el(id).value);
 const fields = ['skillsmap', 'curriculum', 'environment'];
 let dirty = false;
 let loadedMode;
+let needsReload = false;
 
 async function api(path, method = 'GET', data) {
   const response = await fetch(`/api/${path}`, {
@@ -51,6 +52,18 @@ function loadFields(config) {
     ? config.userinfo : format(config.userinfo ?? '');
 }
 
+async function reloadSettings() {
+  loadFields(await api('config'));
+  dirty = false; needsReload = false;
+  el('settings-conflict').hidden = true;
+}
+
+async function settingsChanged() {
+  if (!dirty) return reloadSettings();
+  needsReload = true;
+  el('settings-conflict').hidden = false;
+}
+
 function table(title, rows) {
   const heading = document.createElement('h3');
   heading.textContent = title;
@@ -72,6 +85,7 @@ el('apply').onclick = () => perform(async () => { loadFields(parse('config')); d
 el('settings').onsubmit = event => {
   event.preventDefault();
   perform(async () => {
+    if (needsReload) throw new Error('Reload settings before saving; your edits are still available');
     const config = parse('config');
     config.baselineKDB = el('baseline').value;
     fields.forEach(key => { config[key] = parse(key); });
@@ -86,6 +100,7 @@ el('settings').onsubmit = event => {
   });
 };
 el('refresh').onclick = () => perform(refresh);
+el('reload-settings').onclick = () => perform(reloadSettings);
 el('skill-scope').onchange = () => { el('skill-content').value = ''; };
 for (const action of ['load', 'save']) {
   el(`skill-${action}`).onclick = () => perform(async () => {
@@ -130,13 +145,7 @@ el('project-form').onsubmit = event => {
   event.preventDefault();
   perform(async () => {
     await api('project', 'POST', parse('project'));
-    // Refresh the base config so later settings saves retain the added project.
-    const config = await api('config');
-    if (dirty) {
-      const edited = parse('config');
-      edited.projects = config.projects;
-      el('config').value = format(edited);
-    } else loadFields(config);
+    await settingsChanged();
     await refresh();
   });
 };
@@ -147,14 +156,10 @@ for (const action of ['tune', 'kdb']) {
       const payload = parse(`${action}-action`);
       if (action === 'tune') payload.userinfo = el('userinfo').value;
       const result = await api(action, 'POST', payload);
-      if (action === 'tune') {
-        const config = parse('config');
-        config.userinfo = payload.userinfo;
-        el('config').value = format(config);
-      }
+      if (action === 'tune') await settingsChanged();
       el('action-result').textContent = format(result);
       await refresh();
     });
   };
 }
-perform(async () => { loadFields(await api('config')); await refresh(); });
+perform(async () => { await reloadSettings(); await refresh(); });

@@ -143,7 +143,7 @@ def test_bad_requests_do_not_execute_cli(harness):
 def test_executed_frontend_forwards_canonical_config_and_browse_contract(harness, initial_mode, saved_mode):
     """Run the shipped JS and replay its fetches through Flask into the CLI driver."""
     client, calls, config, replies, state = harness
-    original = {**config, "mode": initial_mode, "actor": {"model": "kernel"},
+    original = {**config, "revision": 0, "mode": initial_mode, "actor": {"model": "kernel"},
                 "curriculum_actor": {"model": "curriculum"},
                 "skill_writer_actor": {"model": "writer"},
                 "skills": {"activeVersion": "baseline"},
@@ -159,8 +159,8 @@ const vm = require('node:vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const elements = new Map();
 function element() {
-  return {value: '', textContent: '', children: [],
-    addEventListener() {}, append(...nodes) { this.children.push(...nodes); },
+  return {value: '', textContent: '', children: [], listeners: {},
+    addEventListener(type, listener) { this.listeners[type] = listener; }, append(...nodes) { this.children.push(...nodes); },
     replaceChildren(...nodes) { this.children = nodes; }};
 }
 const document = {
@@ -168,11 +168,23 @@ const document = {
   createElement: tag => ({...element(), tagName: tag}), querySelectorAll: () => []
 };
 const requests = [];
+let serverConfig = structuredClone(input.config);
 const fetch = async (url, options) => {
   const body = options.body === undefined ? undefined : JSON.parse(options.body);
   requests.push({url, method: options.method, body});
   let value = {};
-  if (url === '/api/config') value = body ?? input.config;
+  if (url === '/api/config') {
+    if (body) {
+      if (body.revision !== serverConfig.revision)
+        return {ok: false, json: async () => ({error: 'Revision conflict'})};
+      serverConfig = {...body, revision: serverConfig.revision + 1};
+    }
+    value = serverConfig;
+  }
+  if (url === '/api/tune') serverConfig = {...serverConfig,
+    userinfo: body.userinfo, revision: serverConfig.revision + 1};
+  if (url === '/api/project') serverConfig = {...serverConfig,
+    projects: [...serverConfig.projects, body], revision: serverConfig.revision + 1};
   if (url === '/api/status') value = input.state;
   if (url === '/api/browse') value = {path: body.path, entries: [
     {name: 'child', path: '/workspace/child', isDirectory: true}]};
@@ -198,6 +210,29 @@ const fetch = async (url, options) => {
   elements.get('baseline').value = '/baseline/new database.sqlite';
   elements.get('settings').onsubmit({preventDefault() {}});
   await tick();
+  document.getElementById('tune-action').value = '{}';
+  elements.get('userinfo').value = 'Prefer reliable kernels';
+  elements.get('tune-form').onsubmit({preventDefault() {}});
+  await tick();
+  const afterTune = JSON.parse(elements.get('config').value);
+  elements.get('settings').onsubmit({preventDefault() {}});
+  await tick();
+  const afterTuneSave = JSON.parse(elements.get('config').value);
+  elements.get('baseline').value = '/draft/keep.sqlite';
+  elements.get('settings').listeners.input();
+  document.getElementById('project').value = JSON.stringify({id: 'new-project', goal: 'g', actor_seconds: 240});
+  elements.get('project-form').onsubmit({preventDefault() {}});
+  await tick();
+  const draft = {baseline: elements.get('baseline').value,
+    config: JSON.parse(elements.get('config').value), conflict: !elements.get('settings-conflict').hidden};
+  const writesBefore = requests.filter(r => r.method === 'PUT').length;
+  elements.get('settings').onsubmit({preventDefault() {}});
+  await tick();
+  const writesAfter = requests.filter(r => r.method === 'PUT').length;
+  await elements.get('reload-settings').onclick();
+  const reloaded = JSON.parse(elements.get('config').value);
+  elements.get('settings').onsubmit({preventDefault() {}});
+  await tick();
   document.getElementById('path').value = '/workspace';
   elements.get('browse').onsubmit({preventDefault() {}});
   await tick();
@@ -205,6 +240,7 @@ const fetch = async (url, options) => {
   await elements.get('campaign').onclick();
   process.stdout.write(JSON.stringify({initialActors, initialMode, preservedMode,
     savedMode: elements.get('mode').value, requests,
+    afterTune, afterTuneSave, draft, writesBefore, writesAfter, reloaded,
     scopes: elements.get('skill-scope').children.map(option => option.value),
     statusRows: elements.get('status').children.filter(child => child.tagName === 'pre')
       .map(child => JSON.parse(child.textContent)),
@@ -230,6 +266,16 @@ const fetch = async (url, options) => {
     assert result["initialMode"] == initial_mode
     assert result["preservedMode"] == "revisit"
     assert result["savedMode"] == saved_mode
+    assert result["afterTune"]["revision"] == 3
+    assert result["afterTune"]["userinfo"] == "Prefer reliable kernels"
+    assert result["afterTuneSave"]["revision"] == 4
+    assert result["draft"]["baseline"] == "/draft/keep.sqlite"
+    assert result["draft"]["config"]["revision"] == 4
+    assert result["draft"]["config"]["projects"] == []
+    assert result["draft"]["conflict"] is True
+    assert result["writesAfter"] == result["writesBefore"]
+    assert result["reloaded"]["revision"] == 5
+    assert result["reloaded"]["projects"][0]["id"] == "new-project"
     assert result["scopes"] == ["design"]
     assert result["statusRows"] == [state["projects"], state["attempts"], state["requests"]]
     for req in result["requests"]:
