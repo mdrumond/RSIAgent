@@ -279,14 +279,16 @@ test('CLI refreshes after lock claim and preserves executed mode while using fre
   const fresh = { ...config, mode: 'phase1', revision: 1, userinfo: 'fresh', skills: { activeVersion: 'promoted' } };
   const stale = { ...config, root, revision: 0, userinfo: 'stale' };
   let held = false, claims = 0;
-  const lock = async (_config, operation) => {
+  const controller = new AbortController();
+  const lock = async (_config, operation, options) => {
+    assert.equal(options.signal, controller.signal);
     claims++; held = true;
     if (claims === 1) await writeFile(join(root, 'instance.json'), JSON.stringify(fresh));
     try { return await operation(); } finally { held = false; }
   };
   let observed;
   const { native } = nativeWriter(input => { assert.equal(held, true); observed = input; });
-  const dependencies = { lock, readConfig: async path => {
+  const dependencies = { lock, signal: controller.signal, readConfig: async path => {
     assert.equal(held, true); return { ...await load(join(path, 'instance.json')), root: path };
   }, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} };
   const result = await run(stale, { ...dependencies, task: task(0) });

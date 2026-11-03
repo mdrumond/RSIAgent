@@ -82,5 +82,5 @@ export async function run(config, values = {}) {
     };
     return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
       task, userinfo, manual, context, evaluate, generate, native: values.native, signal: values.signal });
-  });
+  }, { signal: values.signal });
 }
