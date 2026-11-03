@@ -132,3 +132,23 @@ test('private provider setup reads its key without exposing dotenv values to act
     assert.equal(process.env[name],undefined);assert.equal(process.env[other],undefined);
   }finally{await rm(root,{recursive:true,force:true});}
 });
+
+test('stale acceptance resumes through revision and verifies edited source afresh',async()=>{
+  let source='original',verified=0;const events=[];
+  const options={clock:new ActorClock(240),event:async(type,data)=>events.push({type,data}),
+    fingerprint:async()=>source,verify:async()=>{verified++;return {passed:true};},
+    readSkill:async()=>({content:'guidance',evidence:{}}),search:async()=>({content:[],evidence:[]})};
+  async function step(flow) {
+    await flow.skill();
+    if(['design','optimisation'].includes(flow.stage))for(const kind of ['good','negative'])await flow.query('prior evidence',kind);
+    if(flow.stage==='validation')await flow.validate();
+    return flow.advance({reflection:'Use prior failures to validate the revised source'});
+  }
+  const first=new Workflow(options);
+  while(first.stage!=='acceptance')await step(first);
+  source='edited';const resumed=new Workflow(options).restore(events);await resumed.skill();
+  await assert.rejects(resumed.advance());
+  await resumed.advance({next:'implementation',reflection:'Final edit invalidated prior verification'});
+  while(resumed.stage!=='acceptance')await step(resumed);
+  assert.equal((await step(resumed)).accepted,true);assert.equal(verified,2);
+});
