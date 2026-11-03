@@ -53,7 +53,22 @@ def raw_output(directory):
                 os.close(original)
 
 
+def bind_device(args, identity, product):
+    """Bind trusted execution argv; frozen toolchain metadata has no leased device."""
+    physical = args.physical_device
+    if type(physical) is not int or physical < 0 or identity['device_health']['product'] != product:
+        raise ValueError('explicit matching product and physical device required')
+    for name in ('ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
+        if os.environ.get(name) not in (None, str(physical)):
+            raise ValueError('execution physical-device environment/mask mismatch')
+    for name in ('ASCEND_PHYSICAL_DEVICE', 'ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
+        os.environ[name] = str(physical)
+    return physical
+
+
 def runtime_check(identity, target):
+    if target != 'cpu' and 'physical_device' in identity:
+        raise ValueError('frozen runtime identity must not bind a physical device; use explicit execution argv and affinity selection')
     if identity['target'] != target or identity['python'] != sys.version.split()[0]:
         raise ValueError('target/Python runtime identity mismatch')
     if target != 'cpu' and sys.version_info[:2] != (3, 11):
@@ -68,7 +83,7 @@ def runtime_check(identity, target):
 def verify(args):
     directory = Path(args.artifacts).resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    report = dict(target=args.target, mode=args.mode, status='failed', device_evidence=False,
+    report = dict(target=args.target, mode=args.mode, physical_device=getattr(args, 'physical_device', None), status='failed', device_evidence=False,
                   compile='not-run', launch='not-run', correctness='not-run', performance='not-run',
                   source_sha256=args.source_sha256, cases_sha256=args.cases_sha256,
                   runtime_sha256=args.runtime_sha256,
