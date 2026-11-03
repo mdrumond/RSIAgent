@@ -160,16 +160,20 @@ export async function campaign(config,options={}) {
   try {
     while(!abort.signal.aborted) {
       const current=await readConfig(config.root),state=stateFor(config.root);
-      let stopped,open;
+      let stopped;
       try {
         stopped=control(state).get('stop');
-        open=state.db.prepare('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').get();
       }finally{state.close();}
       if(stopped && waves.length)return {waves,reason:'stopped'};
-      if(open)return {waves,reason:'requires-resume'};
       const result=await operate('wave',current,{...options,detach:false,signal:abort.signal});
       waves.push(result);
-      if(!result.results.length)return {waves,reason:'complete-or-blocked'};
+      if(!result.results.length) {
+        const ledger=stateFor(config.root);
+        try {
+          const open=ledger.db.prepare('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').get();
+          return {waves,reason:open?'requires-resume':'complete-or-blocked'};
+        }finally{ledger.close();}
+      }
     }
     return {waves,reason:seconds!==undefined && (performance.now()-started)/1000>=seconds?'elapsed':'stopped'};
   }finally{clearTimeout(timer);options.signal?.removeEventListener('abort',stop);}

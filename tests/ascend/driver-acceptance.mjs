@@ -4,6 +4,61 @@ import {readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {ownerStopped} from '../../controller/lifecycle.mjs';
 import {setup,rows,until} from './driver_setup.mjs';
+import {campaign} from '../../cli/runtime.mjs';
+import {readConfig} from '../../cli/instance.mjs';
+
+test('campaign advances unrelated work without replaying an interrupted attempt or its reserved resource',
+  {timeout:120000},async t=>{
+    const f=await setup(t,'interrupt',['interrupt','unrelated']);
+    const module=join(f.root,'machinery','cpu-resources.mjs');
+    await writeFile(module,`import {createEnvironment as base} from './integrations/environments/index.mjs';
+export async function createEnvironment(options,context){
+ const environment=await base(options,context);
+ return {...environment,resources:async()=>[{id:'cpu-held',available:true},{id:'cpu-free',available:true}]};
+}\n`);
+    const settings=join(f.root,'campaign-settings.json');
+    const environment={module:'machinery/cpu-resources.mjs',options:{mode:'local'}};
+    await writeFile(settings,JSON.stringify({environment,curriculum:{phase1:['interrupt']}}));
+    await f.run('config','--config',settings);
+    const wave=f.start('wave');
+    await until(()=>{
+      const [attempt]=rows(f.root,'SELECT * FROM attempts');
+      return attempt?.elapsed>=1 && attempt.session && rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
+    });
+    await assert.rejects(campaign(await readConfig(f.root)),/Instance controller is already running/);
+    await f.run('stop');await wave.output;
+    const [interrupted]=rows(f.root,'SELECT * FROM attempts');
+    assert.equal(interrupted.outcome,null);
+    const project=rows(f.root,"SELECT * FROM projects WHERE id='interrupt'");
+    const events=rows(f.root,'SELECT * FROM events WHERE attempt=\''+interrupted.id+'\'');
+    const session=await readFile(interrupted.session);
+    const leases=rows(f.root,'SELECT * FROM resource_leases');
+    assert.equal(leases.length,1);assert.equal(leases[0].resource,'cpu-held');
+    await writeFile(settings,JSON.stringify({curriculum:{phase1:['interrupt','unrelated']}}));
+    await f.run('config','--config',settings);
+    const requests=f.server.requests.length;
+    const result=await f.run('campaign');
+    assert.equal(result.reason,'requires-resume');
+    assert.equal(result.waves[0].results.length,1);
+    assert.equal(result.waves.at(-1).results.length,0);
+    const attempts=rows(f.root,'SELECT * FROM attempts');
+    assert.equal(attempts.length,2);
+    assert.deepEqual(attempts.find(row=>row.id===interrupted.id),interrupted);
+    assert.deepEqual(rows(f.root,"SELECT * FROM projects WHERE id='interrupt'"),project);
+    assert.deepEqual(rows(f.root,'SELECT * FROM events WHERE attempt=\''+interrupted.id+'\''),events);
+    assert.deepEqual(await readFile(interrupted.session),session);
+    assert.deepEqual(rows(f.root,'SELECT * FROM resource_leases'),leases);
+    const unrelated=attempts.find(row=>row.project==='unrelated');
+    assert.equal(unrelated.outcome,'passed');
+    assert.equal(JSON.parse(await readFile(join(f.root,'attempts',unrelated.id,'job.json'),'utf8')).resource.id,'cpu-free');
+    const admission=rows(f.root,`SELECT data FROM events WHERE attempt='${unrelated.id}' AND type='job-admitted'`);
+    assert.equal(admission.length,1);
+    const accepted=rows(f.root,`SELECT type FROM events WHERE attempt='${unrelated.id}'`);
+    assert.ok(accepted.some(row=>row.type==='accepted'));
+    assert.ok(accepted.some(row=>row.type==='execution-handle'));
+    assert.ok(f.server.requests.slice(requests).some(request=>request.messages.some(message=>message.role==='tool')));
+    f.pass();
+  });
 
 test('CLI original failure -> smaller canonical investigation -> memory -> original retry; unrelated work proceeds',
   {timeout:120000},async t=>{
