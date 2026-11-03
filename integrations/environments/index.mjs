@@ -21,6 +21,14 @@ async function sourceFiles(path, prefix = '') {
   }
   return files;
 }
+// A proc file opened before reaping can fail its subsequent read with ESRCH.
+export async function readProcessStat(pid, read = readFile) {
+  try { return await read(`/proc/${pid}/stat`, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ESRCH') return null;
+    throw error;
+  }
+}
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 async function save(path, value) {
   await writeFile(path + '.tmp', JSON.stringify(value), { mode: 0o600 });
@@ -112,15 +120,15 @@ export async function createEnvironment(options, context) {
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
       const pid = Number(original.slice(0, original.indexOf(' ')));
       const fields = text => text.slice(text.lastIndexOf(')') + 2).split(' ');
-      try {
-        const current = await readFile(`/proc/${pid}/stat`, 'utf8');
-        if (fields(current)[19] !== fields(original)[19]) return { state: 'unknown' };
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      const current = await readProcessStat(pid);
+      if (current && fields(current)[19] !== fields(original)[19]) return { state: 'unknown' };
       let live = false;
       for (const name of await readdir('/proc')) {
         if (!/^\d+$/.test(name)) continue;
         try {
-          const stat = fields(await readFile(`/proc/${name}/stat`, 'utf8'));
+          const processStat = await readProcessStat(name);
+          if (processStat === null) continue;
+          const stat = fields(processStat);
           if (Number(stat[2]) === pid && !['Z', 'X'].includes(stat[0])) live = true;
         } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') return { state: 'unknown' }; }
       }

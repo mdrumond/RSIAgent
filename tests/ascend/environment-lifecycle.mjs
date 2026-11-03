@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, mkdir, readdir } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
+import { createEnvironment, createEnvironmentTools, readProcessStat } from '../../integrations/environments/index.mjs';
 
 async function fixture(t, override) {
   const instancePath = await mkdtemp(join(tmpdir(), 'environment-test-'));
@@ -329,4 +329,19 @@ test('SIGKILL after native receipt recovers the same operation and completed dur
   await rm(pending.data.receiptFile);
   assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
   assert.equal(submissions, 0);
+});
+
+
+test('reaped process proc descriptor reports absence without hiding permission failures', async t => {
+  const { spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { open } = await import('node:fs/promises');
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  const descriptor = await open(`/proc/${child.pid}/stat`, 'r');
+  try {
+    const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+    assert.equal(await readProcessStat(child.pid, () => descriptor.readFile('utf8')), null);
+    await assert.rejects(readProcessStat(child.pid, async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); }), { code: 'EACCES' });
+  } finally { await descriptor.close(); }
 });
