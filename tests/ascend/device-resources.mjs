@@ -31,7 +31,7 @@ outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
 print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], jobs = new Map();
-  let enabled = [0,1,2,3], disconnect = false, sequence = 0;
+  let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0;
   const client = async args => {
     calls.push(args);
     if (args[0] === 'npu') return { state: 'completed', profiles: [{ target: 'fixture', devices: enabled.map(id => ({ id, enabled: true })) }] };
@@ -44,7 +44,8 @@ print(outputs[query])
       let content = '';
       if (file.endsWith('probe.sh')) {
         const out = await promisify(execFile)('bash', [file], { env: { ...process.env, PATH: bin+':'+process.env.PATH, ASCEND_TEST_TELEMETRY: telemetry } });
-        content = out.stdout;
+        const response = JSON.parse(out.stdout); response.observed_at += clockSkew;
+        content = JSON.stringify(response);
       }
       jobs.set(handle, content);
       return { handle, state: 'queued' };
@@ -60,7 +61,7 @@ print(outputs[query])
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, rows, telemetry,
-    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; },
+    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; },
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
 
@@ -126,4 +127,12 @@ test('actual user instruction file is required rather than fabricated defaults',
   const f = await fixture(t);
   await assert.rejects(createEnvironment({ ...f.options, instructionFile:undefined },f.context), /instructionFile/);
   await assert.rejects(createEnvironment({ ...f.options, instructionFile:join(f.source,'missing') },f.context), /ENOENT/);
+});
+
+
+test('remote wall-clock skew does not replace local elapsed freshness', async t => {
+  const f = await fixture(t); f.setClockSkew(3600);
+  const resources = await f.environment.resources();
+  assert.equal(resources.filter(row => row.available).length, 1);
+  assert.ok(resources[0].metadata.observedAt > resources[0].metadata.checkedAt + 3500);
 });

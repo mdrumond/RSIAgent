@@ -71,7 +71,7 @@ export async function createEnvironment(options, context) {
       const file = join(dir, 'probe.sh'), receipt = join(dir, 'native-submission.json');
       const request = { source, sha256: healthSha256, seconds: Math.min(seconds, budget), devices, configuration };
       await writeFile(file, `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}\n`, { mode: 0o600 });
-      pending = { started: Date.now(), seconds: request.seconds, devices, configuration, receipt, handle: null };
+      pending = { started: Date.now(), startedMonotonic: process.hrtime.bigint().toString(), seconds: request.seconds, devices, configuration, receipt, handle: null };
       // Persist ambiguous submission BEFORE calling transport; never infer no work from no ID.
       await save(pendingPath, pending);
       let submitted;
@@ -84,7 +84,8 @@ export async function createEnvironment(options, context) {
     }
     if (!pending.handle) throw new Error(`Probe submission identity unknown; do not resubmit (${pendingPath})`);
     await context.event('execution-handle', { handle: pending.handle, purpose: 'resource-health' });
-    const deadline = performance.now() + Math.max(0, pending.seconds * 1000 - (Date.now() - pending.started));
+    const elapsed = () => Number(process.hrtime.bigint() - BigInt(pending.startedMonotonic)) / 1e9;
+    const deadline = performance.now() + Math.max(0, (pending.seconds - elapsed()) * 1000);
     let observed;
     do {
       try { observed = await client(['observe', pending.handle]); }
@@ -102,12 +103,13 @@ export async function createEnvironment(options, context) {
     // If log retrieval disconnects, retain pending handle and retry the SAME logs next call.
     const logs = await client(['logs', pending.handle, '--stream', 'stdout', '--tail', '1']);
     const result = JSON.parse(logs.content);
-    await save(join(root, 'last-observation.json'), { ...result, handle: pending.handle, healthSha256 });
+    await save(join(root, 'last-observation.json'), { ...result, checked_at: Date.now() / 1000, handle: pending.handle, healthSha256 });
     await unlink(pendingPath);
-    const age = Date.now() / 1000 - result.observed_at;
-    if (!Number.isFinite(age) || age < -5 || age > seconds || JSON.stringify(configuration) !== JSON.stringify(pending.configuration))
+    // Remote wall clocks may differ; freshness is local elapsed since this exact submission.
+    const age = elapsed();
+    if (!Number.isFinite(age) || age < 0 || age > seconds || JSON.stringify(configuration) !== JSON.stringify(pending.configuration))
       throw new Error('Resolved probe is stale or belongs to a different policy; request a fresh snapshot');
-    return { ...result, handle: pending.handle };
+    return { ...result, checked_at: Date.now() / 1000, handle: pending.handle };
   }
   async function resources({ purpose = 'ordinary', target } = {}) {
     if (target && target !== options.target && target !== options.profile) return [];
@@ -120,7 +122,7 @@ export async function createEnvironment(options, context) {
         id: idFor(row.physical_device),
         available: row.admitted === true && row.measurements?.idle === true,
         metadata: { target: options.target, runtime: options.runtime, product: options.health.product,
-          physicalDevice: row.physical_device, logicalDevice: 0, observedAt: result.observed_at,
+          physicalDevice: row.physical_device, logicalDevice: 0, observedAt: result.observed_at, checkedAt: result.checked_at,
           admitted: row.admitted === true, measurements: row.measurements, failure: row.failure,
           probeHandle: result.handle, healthSha256 },
       }));
