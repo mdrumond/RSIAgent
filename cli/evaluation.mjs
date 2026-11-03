@@ -43,7 +43,7 @@ export async function bootstrap(request) {
     });
     await createInstance(inputs,{baseline:join(original.root,'knowledge.sqlite'),
       skills:join(original.root,'skills','versions',request.skillVersion),
-      environment:original.environment,projects,install:false});
+      environment:original.environment,projects,install:false,machinery:join(original.root,'machinery')});
     frozen=await readConfig(inputs);
   }
   const project=frozen.projects.find(project=>project.id===request.projectId);
@@ -54,7 +54,7 @@ export async function bootstrap(request) {
   await createInstance(request.instanceRoot,{...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
     skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
-    machinery:resolve(new URL('..',import.meta.url).pathname)});
+    machinery:join(original.root,'machinery')});
 }
 export async function wave({instanceRoot,config,signal}) {
   const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);

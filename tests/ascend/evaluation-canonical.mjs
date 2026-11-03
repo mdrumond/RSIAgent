@@ -14,7 +14,6 @@ test('isolated evaluation runs its requested canonical project outside the produ
   const requested={...config,curriculum:{phase1:[]},actor:{...config.actor,credentials_file:credentials}};
   const instanceRoot=join(round,'sample');
   await bootstrap({sourceInstanceRoot:f.root,instanceRoot,projectId:'unrelated',projectIds:['unrelated'],skillVersion:'baseline',config:requested});
-  await cp(resolve('tests/ascend/driver_fixture.py'),join(instanceRoot,'machinery','driver_fixture.py'));
   try {
     const result=await wave({instanceRoot,config:requested,projectIds:['unrelated']});
     assert.equal(result.correct,true);assert.equal(result.attempts.length,1);
@@ -32,5 +31,28 @@ test('isolated evaluation runs its requested canonical project outside the produ
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
     }catch(error){if(error.code!=='ENOENT'&&error.code!=='ESRCH')throw error;}
   }
+  f.pass();
+});
+
+
+test('phase2 completed tasks write skills and run a real eight-arm canonical A/B round',{timeout:120000},async t=>{
+  const f=await setup(t,'phase2',['unrelated','second']);
+  const input=join(f.root,'phase2.json');
+  await writeFile(input,JSON.stringify({mode:'phase2',tune_every:2,curriculum:{phase2:['unrelated','second']}}));
+  await f.run('config','--config',input);await f.run('wave','--mode','phase2');
+  const status=await f.run('status');assert.ok(status.projects.every(p=>p.status==='passed'));
+  const evolution=JSON.parse(await readFile(join(f.root,'skills','evolution.json'),'utf8'));
+  assert.equal(evolution.history.length,2);assert.equal(evolution.lastEvaluated,2);assert.equal(evolution.pending,null);
+  assert.equal(rows(f.root,"SELECT count(*) AS n FROM events WHERE type='skills-updated'")[0].n,2);
+  assert.equal(rows(f.root,"SELECT count(*) AS n FROM events WHERE type='skill-update-error'")[0].n,0);
+  const evaluations=rows(f.root,"SELECT data FROM events WHERE type='evaluation-started'");assert.equal(evaluations.length,8);
+  for(const event of evaluations){
+    const child=JSON.parse(event.data).instanceRoot;
+    assert.equal(rows(child,"SELECT count(*) AS n FROM attempts WHERE outcome='passed'")[0].n,1);
+    assert.equal(rows(child,"SELECT count(*) AS n FROM events WHERE type='stage-completed'")[0].n,8);
+    const receipt=JSON.parse(await readFile(join(child,'knowledge-service.json'),'utf8'));
+    if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
+  }
+  assert.ok(f.server.requests.some(r=>r.messages.some(m=>m.tool_calls?.some(c=>c.function.name==='submit_changes'))));
   f.pass();
 });
