@@ -4,6 +4,7 @@ const format = value => JSON.stringify(value, null, 2);
 const parse = id => JSON.parse(el(id).value);
 const fields = ['skillsmap', 'curriculum', 'environment'];
 let dirty = false;
+let loadedMode;
 
 async function api(path, method = 'GET', data) {
   const response = await fetch(`/api/${path}`, {
@@ -30,6 +31,9 @@ async function perform(action) {
 }
 
 function loadFields(config) {
+  const mode = config.mode ?? 'phase1';
+  if (loadedMode !== mode) el('mode').value = mode;
+  loadedMode = mode;
   el('config').value = format(config);
   el('baseline').value = config.baselineKDB ?? '';
   const scopes = Object.keys(config.skillsmap ?? {});

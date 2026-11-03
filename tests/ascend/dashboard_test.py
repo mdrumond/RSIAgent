@@ -139,10 +139,11 @@ def test_bad_requests_do_not_execute_cli(harness):
     assert calls == []
 
 
-def test_executed_frontend_forwards_canonical_config_and_browse_contract(harness):
+@pytest.mark.parametrize("initial_mode,saved_mode", [("phase2", "inference"), ("inference", "phase2")])
+def test_executed_frontend_forwards_canonical_config_and_browse_contract(harness, initial_mode, saved_mode):
     """Run the shipped JS and replay its fetches through Flask into the CLI driver."""
     client, calls, config, replies, state = harness
-    original = {**config, "actor": {"model": "kernel"},
+    original = {**config, "mode": initial_mode, "actor": {"model": "kernel"},
                 "curriculum_actor": {"model": "curriculum"},
                 "skill_writer_actor": {"model": "writer"},
                 "skills": {"activeVersion": "baseline"},
@@ -178,10 +179,20 @@ const fetch = async (url, options) => {
   return {ok: true, json: async () => value};
 };
 (async () => {
+  document.getElementById('mode').value = 'phase1';
   vm.runInNewContext(input.source, {document, fetch});
   const tick = () => new Promise(resolve => setImmediate(resolve));
   await tick();
   const initialActors = JSON.parse(elements.get('actors').value);
+  const initialMode = elements.get('mode').value;
+  await elements.get('wave').onclick();
+  elements.get('mode').value = 'revisit';
+  elements.get('settings').onsubmit({preventDefault() {}});
+  await tick();
+  const preservedMode = elements.get('mode').value;
+  const config = JSON.parse(elements.get('config').value);
+  config.mode = input.savedMode;
+  elements.get('config').value = JSON.stringify(config);
   elements.get('actors').value = JSON.stringify(input.actors);
   elements.get('skillsmap').value = JSON.stringify(input.skillsmap);
   elements.get('baseline').value = '/baseline/new database.sqlite';
@@ -191,9 +202,9 @@ const fetch = async (url, options) => {
   elements.get('browse').onsubmit({preventDefault() {}});
   await tick();
   await elements.get('folders').children[0].onclick();
-  document.getElementById('mode').value = 'phase2';
   await elements.get('campaign').onclick();
-  process.stdout.write(JSON.stringify({initialActors, requests,
+  process.stdout.write(JSON.stringify({initialActors, initialMode, preservedMode,
+    savedMode: elements.get('mode').value, requests,
     scopes: elements.get('skill-scope').children.map(option => option.value),
     statusRows: elements.get('status').children.filter(child => child.tagName === 'pre')
       .map(child => JSON.parse(child.textContent)),
@@ -206,7 +217,7 @@ const fetch = async (url, options) => {
         try:
             stdout, stderr = process.communicate(json.dumps({
                 "source": (Path(__file__).resolve().parents[2] / "web/app.js").read_text(),
-                "config": original, "actors": edited, "skillsmap": skillsmap, "state": state}), timeout=10)
+                "config": original, "actors": edited, "skillsmap": skillsmap, "state": state, "savedMode": saved_mode}), timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate()
@@ -216,6 +227,9 @@ const fetch = async (url, options) => {
     assert result["initialActors"] == {"actor": original["actor"],
         "curriculum": original["curriculum_actor"], "writer": original["skill_writer_actor"]}
     assert result["error"] == "Done"
+    assert result["initialMode"] == initial_mode
+    assert result["preservedMode"] == "revisit"
+    assert result["savedMode"] == saved_mode
     assert result["scopes"] == ["design"]
     assert result["statusRows"] == [state["projects"], state["attempts"], state["requests"]]
     for req in result["requests"]:
@@ -227,7 +241,7 @@ const fetch = async (url, options) => {
                     {"name": "child", "path": "/workspace/child", "isDirectory": True}]}))
         response = client.open(req["url"], method=req["method"], json=req["body"])
         assert response.status_code == 200
-    saved = next(payload for argv, payload in calls if argv[2] == "config")
+    saved = next(payload for argv, payload in reversed(calls) if argv[2] == "config")
     assert saved["actor"] == edited["actor"]
     assert saved["curriculum_actor"] == edited["curriculum"]
     assert saved["skill_writer_actor"] == edited["writer"]
@@ -237,7 +251,9 @@ const fetch = async (url, options) => {
     assert saved["skills"] == original["skills"]
     assert saved["unknown"] == original["unknown"]
     campaign = next(argv for argv, _ in calls if argv[2] == "campaign")
-    assert campaign[-3:] == ["--detach", "--mode", "phase2"]
+    assert campaign[-3:] == ["--detach", "--mode", saved_mode]
+    wave = next(argv for argv, _ in calls if argv[2] == "wave")
+    assert wave[-3:] == ["--detach", "--mode", initial_mode]
     assert [payload["path"] for argv, payload in calls if argv[2] == "browse"] == [
         "/workspace", "/workspace/child"]
 
