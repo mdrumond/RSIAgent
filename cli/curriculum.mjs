@@ -42,7 +42,7 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
   const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
   const {performance_goal: _parentPerformance, ...investigationBase}=base;
   return {...investigationBase,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
-    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:`python ${quote(verifier)}`}};
+    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:`python ${quote(relative(source,verifier))}`}};
 }
 
 export async function summarize({config,job,path,state,bridge,passed,signal}) {
