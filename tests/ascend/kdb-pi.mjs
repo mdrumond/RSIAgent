@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { once } from 'node:events';
@@ -89,6 +89,17 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       assert.equal(data.content.length,1);
       assert.equal(data.evidence[0].collection,'baseline');
       assert.equal(data.evidence[0].sha256.length,64);
+      await unlink(join(root,'kernel.py'));
+      const lesson=await ctx.executeTool('mcp__kdb__record_lesson',{
+        lesson:'avoid scalar alignment mistakes',outcome:'negative',applicability:'a3',
+        evidence:data.evidence,attempt_id:'pi-attempt'});
+      assert.equal(lesson.isError,false,JSON.stringify(lesson.result));
+      const recorded=lesson.result.structuredContent.structuredContent;
+      assert.notEqual(recorded.delivery_id,recorded.entry_id);
+      const chained=await ctx.executeTool('mcp__kdb__record_lesson',{
+        lesson:'use aligned vector accesses',outcome:'good',applicability:'a3',
+        evidence:recorded.references,attempt_id:'pi-attempt'});
+      assert.equal(chained.isError,false,JSON.stringify(chained.result));
       assert.ok(events.some(event=>event.tool==='mcp__kdb__search' &&
         event.parent_tool_call_id==='retrieve' && !event.failed));
       await assert.rejects(bridge.knowledge.search({query:'loads',attempt_id:'other'},ctx));

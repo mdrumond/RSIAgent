@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -42,14 +43,14 @@ def create_server(backend: KDB, *, port=8765):
     @server.tool()
     async def add_repo(path: str, collection: str, language: str, ctx: Context,
                        target: str | None = None, kind: str = 'good',
-                       paths: list[str] | None = None) -> dict:
+                       paths: list[str] | None = None) -> dict[str, Any]:
         """Index selected repository files as an immutable collection."""
         return invoke(ctx, 'add_repo', path=path, collection=collection,
                       language=language, target=target, kind=kind, paths=paths)
 
     @server.tool()
     async def record_lesson(lesson: str, outcome: str, applicability: str,
-                            evidence: list[dict], attempt_id: str, ctx: Context) -> dict:
+                            evidence: list[dict], attempt_id: str, ctx: Context) -> dict[str, Any]:
         """Store a compact lesson backed by direct evidence references."""
         correlation = attempt(ctx)
         if correlation is not None and correlation != attempt_id:
