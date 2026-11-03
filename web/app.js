@@ -75,6 +75,7 @@ function table(title, rows) {
 async function refresh() {
   const state = await api('status');
   el('status').replaceChildren();
+  table('Controller / wave', state.controller);
   table('Projects', state.projects);
   table('Attempts', state.attempts);
   table('Background operations', state.requests);

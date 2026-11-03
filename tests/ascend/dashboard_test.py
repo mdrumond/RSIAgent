@@ -14,7 +14,8 @@ def harness(monkeypatch, tmp_path):
     calls = []
     config = {"format": 1, "environment": {"options": {"runtime": "named"}},
               "projects": [], "unknown": {"keep": True}}
-    state = {"projects": [{"id": "p", "status": "queued"}], "attempts": [], "requests": [
+    state = {"controller": {"state": "running", "wave": 4, "stopRequested": False},
+             "projects": [{"id": "p", "status": "queued"}], "attempts": [], "requests": [
         {"id": "tune-1", "kind": "tune", "status": "queued", "result": None, "error": None},
         {"id": "kdb-1", "kind": "kdb", "status": "passed", "result": {"indexed": 3}, "error": None},
         {"id": "kdb-2", "kind": "kdb", "status": "failed", "result": None, "error": "Input unavailable"}]}
@@ -277,7 +278,7 @@ const fetch = async (url, options) => {
     assert result["reloaded"]["revision"] == 5
     assert result["reloaded"]["projects"][0]["id"] == "new-project"
     assert result["scopes"] == ["design"]
-    assert result["statusRows"] == [state["projects"], state["attempts"], state["requests"]]
+    assert result["statusRows"] == [state["controller"], state["projects"], state["attempts"], state["requests"]]
     for req in result["requests"]:
         if req["method"] == "GET":
             continue
