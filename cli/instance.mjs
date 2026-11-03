@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { dirname, delimiter } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { validateAcceptance } from '../controller/state.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -126,6 +127,7 @@ export async function upgrade(root,machinery) {
 }
 
 export async function importProject(root,spec) {
+  validateAcceptance(spec);
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
@@ -139,15 +141,15 @@ export async function importProject(root,spec) {
   const destination=join(tree,relative(common,source));
   const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
   await cp(source,destination,{recursive:true,filter});
-  let command=spec.verifier?.command;
+  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
   const copied=[];
   for(const path of files) {
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
     await mkdir(dirname(target),{recursive:true});await cp(absolute,target);copied.push(target);
-    command=command.split(absolute).join(target);
+    for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(target);
   }
-  if(command)command=command.split(source).join(destination);
+  for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(source).join(destination);
   const result={...spec,source:destination};
-  if(spec.verifier)result.verifier={...spec.verifier,command,files:copied};
+  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied};
   return result;
 }
