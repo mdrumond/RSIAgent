@@ -37,11 +37,11 @@ export class Workflow {
     await this.event('knowledge-retrieved',{stage:this.stage,query,kind,evidence:result.evidence});
     return result.content;
   }
-  async validate() {
+  async validate(signal) {
     this.clock.check();
     if (this.stage !== 'validation') throw new Error('Verification belongs to validation');
     const before = await this.fingerprint();
-    const result = await this.verify();
+    const result = await this.verify(signal);
     const after = await this.fingerprint();
     this.validation = {passed:result.passed === true && before === after, fingerprint:after};
     await this.event('verification',{...this.validation,evidence:result.evidence});
@@ -54,7 +54,7 @@ export class Workflow {
       if (!this.facts.good || !this.facts.negative) throw new Error('Retrieve positive and negative knowledge first');
       if (!reflection.trim()) throw new Error('Record what previous evidence supports and rules out');
     }
-    if (this.stage === 'acceptance') {
+    if (this.stage === 'acceptance' && next===undefined) {
       if (!this.validation?.passed || this.validation.fingerprint !== await this.fingerprint())
         throw new Error('Acceptance requires a passing verifier on the current source');
       await this.event('accepted',{});
@@ -62,7 +62,7 @@ export class Workflow {
     }
     const destination = next ?? stages[this.index+1];
     const allowed = [stages[this.index+1]];
-    if (['debug','optimisation','validation'].includes(this.stage)) allowed.push('design','implementation');
+    if (['debug','optimisation','validation','acceptance'].includes(this.stage)) allowed.push('design','implementation');
     if (!allowed.includes(destination)) throw new Error(`Current stage ${this.stage}; permitted destinations: ${allowed.join(', ')}. Use rsi_advance for the next step.`);
     if (this.stage === 'validation' && destination === 'acceptance' && !this.validation?.passed)
       throw new Error('Validation did not pass');

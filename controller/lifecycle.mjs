@@ -15,8 +15,12 @@ export async function ownerStopped(owner) {
 }
 export async function attemptStopped(state,attempt,environment) {
   if (!await ownerStopped(attempt.owner)) return false;
-  const handles=new Set(state.events(attempt.id)
-    .filter(e=>e.type==='execution-handle').map(e=>e.data.handle));
+  const events=state.events(attempt.id);
+  const reconciled=new Set(events.filter(e=>e.type==='execution-reconciled' && e.data.closed===true).map(e=>e.data.operation));
+  const unresolved=events.filter(e=>e.type==='execution-unresolved' && !reconciled.has(e.data.operation));
+  if(unresolved.some(e=>!e.data.handle))return false;
+  const handles=new Set([...events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle),
+    ...unresolved.map(e=>e.data.handle)]);
   for (const handle of handles) {
     if (!handle || (await environment.observe(handle)).state !== 'stopped') return false;
   }

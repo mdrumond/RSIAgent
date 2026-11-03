@@ -2,7 +2,7 @@ import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { mkdir, appendFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
 import { fingerprint, freezeFiles } from './evidence.mjs';
@@ -25,11 +25,15 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
   const execute=async(command,cwd,options)=>{
+    let response;
     try {
-      const response=await environment.execute(command,cwd,options);
+      response=await environment.execute(command,cwd,options);
       if(!response.settled)throw new Error(`Execution closure unknown: ${response.handle??'submission'}`);
       return response;
-    } catch(error) {uncertain=error;void session?.abort();throw error;}
+    } catch(error) {
+      event('execution-unresolved',{operation:randomUUID(),handle:response?.handle??null,message:error.message});
+      uncertain=error;void session?.abort();throw error;
+    }
   };
   const workflow=new Workflow({clock,event,fingerprint:()=>fingerprint(project.source),
     readSkill:async stage=>{
@@ -42,11 +46,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       event('skill-read',{stage:'global-kdb',path:globalPath,sha256:createHash('sha256').update(guidance).digest('hex')});
       return {content:guidance+'\n\n'+content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
     },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
-    verify:async()=>{
+    verify:async(verifySignal)=>{
       await checkVerifier();
       let output='';
       const response=await execute(project.verifier.command,project.source,{
-        timeout:clock.remaining, purpose:'verification',onData:data=>{output+=data.toString();}});
+        timeout:clock.remaining,signal:verifySignal??signal,purpose:'verification',onData:data=>{output+=data.toString();}});
       await checkVerifier();
       const evidence=join(attemptPath,`verify-${Date.now()}.log`);
       await appendFile(evidence,output);
@@ -59,7 +63,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier.',
-      parameters:Type.Object({}),execute:async()=>result(await workflow.validate())});
+      parameters:Type.Object({}),execute:async(_id,_args,nativeSignal)=>result(await workflow.validate(nativeSignal))});
     pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance automatically to the next canonical step. Do not specify a step name. Design and optimisation require reflection.',
       parameters:Type.Object({reflection:Type.Optional(Type.String())}),
       execute:async(_id,args)=>{
@@ -136,6 +140,9 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   } finally {
     signal?.removeEventListener('abort',abort);
     clearInterval(timer);
-    session?.dispose();
+    if(session) {
+      try {await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}
+      finally {session.dispose();}
+    }
   }
 }
