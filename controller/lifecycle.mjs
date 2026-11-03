@@ -18,8 +18,14 @@ export async function attemptStopped(state,attempt,environment) {
   let events=state.events(attempt.id);
   const finished=new Set(events.filter(e=>['execution-settled','execution-reconciled'].includes(e.type) &&
     (e.type==='execution-settled'||e.data.closed===true)).map(e=>e.data.operation));
-  const pending=new Map(events.filter(e=>['execution-starting','execution-unresolved'].includes(e.type) &&
-    !finished.has(e.data.operation)).map(e=>[e.data.operation,e.data]));
+  const pending=new Map();
+  for(const {type,data} of events) {
+    if(!['execution-starting','execution-unresolved','execution-submitting'].includes(type))continue;
+    const operation=data.operation??data.submission;
+    if(finished.has(operation))continue;
+    const previous=pending.get(operation);
+    pending.set(operation,{...previous,...data,startElapsed:previous?.startElapsed??data.startElapsed??data.actor_elapsed});
+  }
   let elapsed=attempt.elapsed;
   for(const [operation,data] of pending) {
     if(!environment.reconcileOperation)return false;

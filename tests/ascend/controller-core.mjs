@@ -179,3 +179,26 @@ test('parallel workers retain all evidence in the shared WAL ledger',async()=>{
     assert.equal(state.db.prepare("SELECT count(*) AS n FROM events WHERE type='parallel'").get().n,200);
   }finally{state.close();await rm(root,{recursive:true,force:true});}
 });
+
+test('orphan closure charges actual execution once without charging observer downtime',async()=>{
+  const state=new State(':memory:');
+  try {
+    state.add({id:'p',goal:'numeric',actor_seconds:120});
+    const attempt=state.admit('p',{...await (await import('../../controller/lifecycle.mjs')).processIdentity(),start:'previous-process'});
+    state.checkpoint(attempt.id,16);
+    state.event(attempt.id,'execution-starting',{operation:'op',startElapsed:10});
+    state.event(attempt.id,'execution-submitting',{operation:'op',submission:'native',actor_elapsed:16});
+    const {attemptStopped}=await import('../../controller/lifecycle.mjs');
+    let observations=0;
+    const environment={observe:async()=>({state:'stopped'}),reconcileOperation:async()=>{
+      observations++;return {closed:true,executionSeconds:30,handles:['native:job']};
+    }};
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),environment),true);
+    assert.equal(state.attempt(attempt.id).elapsed,40);
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),environment),true);
+    assert.equal(state.attempt(attempt.id).elapsed,40);assert.equal(observations,1);
+    state.event(attempt.id,'execution-starting',{operation:'missing',startElapsed:40});
+    assert.equal(await attemptStopped(state,state.attempt(attempt.id),{...environment,
+      reconcileOperation:async()=>({closed:false,accountingUnresolved:true})}),false);
+  }finally{state.close();}
+});

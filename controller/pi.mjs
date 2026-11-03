@@ -15,7 +15,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   await mkdir(attemptPath,{recursive:true});
   let activeOperation=null;
   const event=(type,data)=>state.event(attempt.id,type,{...data,
-    operation:activeOperation??data.operation,actor_elapsed:clock.elapsed});
+    operation:activeOperation??data.operation??data.submission,actor_elapsed:clock.elapsed});
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
   const environment=await environmentFactory({instancePath:attemptPath,event,
     exclude:(label,fn)=>clock.exclude(label,fn)});
