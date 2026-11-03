@@ -34,7 +34,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   await cp(skills,join(destination,'skills','versions','baseline'),{recursive:true,errorOnExist:true});
   await mkdir(join(destination,'projects'));
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
-    filter:path=>!['node_modules','.venv','__pycache__'].includes(path.split(sep).at(-1))});
+    filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
+  projects=await Promise.all(projects.map(project=>importProject(destination,project)));
   await copyMachinery(machinery,join(destination,'machinery'),install);
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
@@ -122,4 +123,29 @@ export async function upgrade(root,machinery) {
     }finally{await rm(staged,{recursive:true,force:true});}
     return {upgraded:true,format:1};
   }finally{ledger.close();}
+}
+
+export async function importProject(root,spec) {
+  if(!spec.source)return spec;
+  if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
+  const source=await realpath(spec.source),files=spec.verifier?.files??[];
+  const own=join(resolve(root),'projects',spec.id);
+  if(within(own,source) && files.every(path=>within(own,resolve(path))))return spec;
+  let common=source;
+  for(const path of files)while(!within(common,resolve(path)))common=dirname(common);
+  const tree=join(own,'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
+  const destination=join(tree,relative(common,source));
+  const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
+  await cp(source,destination,{recursive:true,filter});
+  let command=spec.verifier?.command;
+  const copied=[];
+  for(const path of files) {
+    const absolute=resolve(path),target=join(tree,relative(common,absolute));
+    await mkdir(dirname(target),{recursive:true});await cp(absolute,target);copied.push(target);
+    command=command.split(absolute).join(target);
+  }
+  if(command)command=command.split(source).join(destination);
+  const result={...spec,source:destination};
+  if(spec.verifier)result.verifier={...spec.verifier,command,files:copied};
+  return result;
 }

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { bootstrap, readConfig, updateConfig, upgrade } from './instance.mjs';
+import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 
 export async function main(argv=process.argv.slice(2)) {
@@ -70,7 +70,7 @@ export async function main(argv=process.argv.slice(2)) {
   }
   if(command==='project') {
     if(!values.project) return config.projects;
-    const spec=JSON.parse(await readFile(values.project,'utf8'));
+    const spec=await importProject(root,JSON.parse(await readFile(values.project,'utf8')));
     const state=new State(join(root,'state.sqlite'));
     try {
       if(state.project(spec.id)) {
