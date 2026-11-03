@@ -70,10 +70,19 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
         await delay(25);
       }
       assert.ok(session.getActiveToolNames().includes('mcp__kdb__search'));
+      // Seed the public replay state with a recorded assistant tool request;
+      // native nested calls correctly reject calls outside an assistant turn.
+      session.agent.state.messages=[{role:'assistant',content:[
+        {type:'toolCall',id:'seed',name:'rsi_knowledge',arguments:{}},
+        {type:'toolCall',id:'retrieve',name:'rsi_knowledge',arguments:{}},
+        {type:'toolCall',id:'blocked',name:'rsi_knowledge',arguments:{}}],
+        api:'test',provider:'test',model:'test',stopReason:'toolUse',timestamp:Date.now(),
+        usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
+          cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}}];
       const ctx=session.extensionRunner.createToolContext('seed',new AbortController().signal);
       const indexed=await ctx.executeTool('mcp__kdb__add_repo',{
         path:root,collection:'baseline',language:'triton',target:'a3',paths:['kernel.py']});
-      assert.equal(indexed.isError,false);
+      assert.equal(indexed.isError,false,JSON.stringify(indexed.result));
       const tool=session.agent.state.tools.find(tool=>tool.name==='rsi_knowledge');
       const result=await tool.execute('retrieve',{query:'aligned loads',kind:'good'});
       const data=JSON.parse(result.content[0].text);
