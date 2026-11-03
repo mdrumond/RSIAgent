@@ -193,7 +193,7 @@ async function worker(root,id) {
       recordOutcome(state,{attemptId:id,wave:job.wave,passed:current.outcome==='passed',...findings,...policy(config)});
     }
     if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config);
-    await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url});
+    await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
