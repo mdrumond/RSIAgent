@@ -36,7 +36,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       const path=skillMap[stage];
       if (!path) throw new Error(`No skill mapped to ${stage}`);
       const content=await readFile(path,'utf8');
-      return {content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
+      const globalPath=skillMap['global-kdb'];
+      if(!globalPath)throw new Error('No global KDB skill mapped');
+      const guidance=await readFile(globalPath,'utf8');
+      event('skill-read',{stage:'global-kdb',path:globalPath,sha256:createHash('sha256').update(guidance).digest('hex')});
+      return {content:guidance+'\n\n'+content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
     },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
     verify:async()=>{
       await checkVerifier();
