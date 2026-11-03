@@ -22,6 +22,19 @@ async function curriculumSession({config,path,bridge,prompt,tool,signal}) {
   }finally{signal?.removeEventListener('abort',abort);clearTimeout(timer);
     try{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}finally{session.dispose();}}
 }
+async function artifactFile(root,name,source) {
+  const file=resolve(root,name),rel=relative(root,file);
+  if(rel==='..'||rel.startsWith('..'+sep) || (source && (file===source || file.startsWith(source+sep))))
+    throw new Error('Artifact must be inside this attempt and outside editable source: '+file);
+  let info;
+  try {info=await stat(file);}
+  catch(error) {
+    if(error.code!=='ENOENT')throw error;
+    throw new Error('Artifact is missing. Create the local file before submitting: '+file);
+  }
+  if(!info.isFile())throw new Error('Artifact must be a regular file, not a directory: '+file);
+  return file;
+}
 const reply=()=>({content:[{type:'text',text:'Recorded'}],details:{}});
 function diagnosticContext(state,id,limit) {
   const events=state.events(id).filter(event=>event.type!=='pi-event');
@@ -41,11 +54,9 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
     `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation using tools/KDB. Preserve the original project and verifier. Submit only the investigation goal, question and verifier filename. Negative results are useful; do not promise the original target will pass.`,
     tool:{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
       parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1})}),
-      execute:async(_id,args)=>{proposal=args;return reply();}}});
+      execute:async(_id,args)=>{await artifactFile(root,args.verifier,source);proposal=args;return reply();}}});
   if(!proposal)throw new Error('Curriculum did not submit an investigation');
-  const verifier=resolve(root,proposal.verifier),rel=relative(root,verifier);
-  if(rel.startsWith('..'+sep)||rel==='..'||verifier.startsWith(source+sep)||!(await stat(verifier)).isFile())
-    throw new Error('Investigation verifier must be a file outside editable source inside its attempt');
+  const verifier=await artifactFile(root,proposal.verifier,source);
   const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
   const {performance_goal: _parentPerformance, ...investigationBase}=base;
   return {...investigationBase,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
@@ -59,17 +70,19 @@ export async function summarize({config,job,path,state,bridge,passed,signal}) {
     `Frozen verifier passed: ${passed}. Summarize actual findings and failures as compact reusable memory. `+
     `For an investigation, useful=true ONLY when new observed evidence addresses the original gap, even if the investigation failed. `+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.attempt.id,30))}\n`+
-    `Read the recorded native session and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
+    `Controller diagnostic snapshot: ${join(path,'diagnostics.json')}. Read the recorded native session when present and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
     tool:{name:'record_findings',label:'Record findings',description:'Record evidence-based findings and usefulness.',
       parameters:Type.Object({findings:Type.String({minLength:1,maxLength:4000}),useful:Type.Boolean(),
         paths:Type.Array(Type.String(),{minItems:1,maxItems:16})}),
-      execute:async(_id,args)=>{findings=args;return reply();}}});
+      execute:async(_id,args)=>{
+        for(const name of args.paths)await artifactFile(path,name);
+        findings=args;return reply();
+      }}});
   if(!findings)throw new Error('Curriculum did not record attempt findings');
   const {createHash}=await import('node:crypto');
   const evidence=[];
   for(const name of findings.paths) {
-    const file=resolve(path,name),rel=relative(path,file);
-    if(rel==='..'||rel.startsWith('..'+sep))throw new Error('Evidence must belong to this attempt');
+    const file=await artifactFile(path,name);
     evidence.push({path:file,sha256:createHash('sha256').update(await readFile(file)).digest('hex')});
   }
   return {...findings,evidence};

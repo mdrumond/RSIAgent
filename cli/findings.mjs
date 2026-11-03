@@ -7,14 +7,14 @@ export async function findingsFor(options) {
   const {state,job,path,passed}=options,file=join(path,'findings.json');
   try{return JSON.parse(await readFile(file,'utf8'));}
   catch(error){if(error.code!=='ENOENT')throw error;}
+  const events=state.events(job.attempt.id).filter(e=>['verification','rejected','attempt-error','stage-completed'].includes(e.type)).slice(-12);
+  const evidence=join(path,'diagnostics.json'),content=JSON.stringify(events,null,2)+'\n';
+  await writeFile(evidence,content);
   let findings;
   try {findings=await summarize(options);}
   catch(error) {
     if(options.signal?.aborted)throw error;
     state.event(job.attempt.id,'summary-error',{message:error.message});
-    const events=state.events(job.attempt.id).filter(e=>['verification','rejected','attempt-error','stage-completed'].includes(e.type)).slice(-12);
-    const evidence=join(path,'diagnostics.json'),content=JSON.stringify(events,null,2)+'\n';
-    await writeFile(evidence,content);
     const verified=events.some(e=>e.type==='verification' && e.data.passed);
     findings={findings:`Observed ${job.kind} outcome: ${passed?'passed':'failed'}. `+
       JSON.stringify(events.filter(e=>e.type!=='stage-completed')).slice(0,3500),
