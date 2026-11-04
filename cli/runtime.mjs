@@ -19,9 +19,9 @@ function control(state) {
     set:(key,value)=>state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run(key,JSON.stringify(value))
   };
 }
-async function environment(config,path,event,exclude,resource) {
+async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
-  return module.createEnvironment(config.environment.options,{instancePath:path,event,exclude,resource});
+  return module.createEnvironment(config.environment.options,{instancePath:path,event,exclude,resource,signal});
 }
 export async function operate(command,config,options={}) {
   if(options.signal?.aborted)throw new Error('Wave interrupted');
@@ -36,8 +36,9 @@ export async function operate(command,config,options={}) {
     child.unref();await log.close();return {pid:child.pid,submitted:true};
   }
   const state=stateFor(config.root), ctl=control(state);
-  let owned=false;
-  const abort=()=>ctl.set('stop',true);
+  let owned=false,watcher;
+  const schedulerAbort=new AbortController();
+  const abort=()=>{ctl.set('stop',true);schedulerAbort.abort(new Error('Wave interrupted'));};
   options.signal?.addEventListener('abort',abort,{once:true});
   try {
     if(command==='stop') {
@@ -63,6 +64,8 @@ export async function operate(command,config,options={}) {
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
       ctl.set('owner',owner);ctl.set('stop',false);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
+    watcher=setInterval(()=>{if(ctl.get('stop'))schedulerAbort.abort(new Error('Wave interrupted'));},100);
+    if(options.signal?.aborted)abort();
     if((await readConfig(config.root)).mode!==config.mode)await updateConfig(config.root,current=>({...current,mode:config.mode}));
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     const wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
@@ -84,7 +87,7 @@ export async function operate(command,config,options={}) {
           const selected=config.curriculum?.[config.mode];
           return Array.isArray(selected)?selected.includes(job.projectId):(!job.project.spec.phase || job.project.spec.phase===config.mode);
         })));
-    const access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn());
+    const access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
     const running=new Set();
     const requested=options.concurrency??config.concurrency??1;
     const concurrency=requested==='auto'?Math.max(1,jobs.length):Number(requested);
@@ -145,7 +148,7 @@ export async function operate(command,config,options={}) {
       throw error;
     }
     return {wave,results};
-  } finally {options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
+  } finally {clearInterval(watcher);options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
 }
 
 // A campaign only advances waves; every actor still uses operate and the same worker.
@@ -219,7 +222,7 @@ async function worker(root,id) {
     if(!job.resume) {
       state.db.prepare('UPDATE attempts SET owner=? WHERE id=?').run(JSON.stringify(me),id);claimed=true;
     }
-    env=await environment(config,path,(type,data)=>state.event(id,type,data),async(_label,fn)=>fn(),job.resource);
+    env=await environment(config,path,(type,data)=>state.event(id,type,data),async(_label,fn)=>fn(),job.resource,abort.signal);
     if(job.finalize) {
       if(!await ownerStopped(attempt.owner))throw new Error('Previous postprocessor remains live');
       state.db.prepare('UPDATE attempts SET owner=? WHERE id=? AND owner=?').run(JSON.stringify(me),id,attempt.owner);claimed=true;
@@ -250,7 +253,7 @@ async function worker(root,id) {
       state.event(id,'task-constructed',{goal:project.goal,kind:job.kind,actor_seconds:project.actor_seconds});
       await (await import('../controller/pi.mjs')).runAttempt({state,attempt:state.attempt(id),project,attemptPath:path,
         signal:abort.signal,settleProject:job.kind!=='investigation',
-        environmentFactory:ctx=>environment(config,path,ctx.event,ctx.exclude,job.resource),
+        environmentFactory:ctx=>environment(config,path,ctx.event,ctx.exclude,job.resource,ctx.signal),
         ...await (await import('../controller/model.mjs')).modelFromProfile(config.actor),
         skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension]});
     }
