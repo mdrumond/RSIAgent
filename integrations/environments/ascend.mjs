@@ -267,6 +267,8 @@ export async function createEnvironment(options, context) {
       return result.devices.filter(row => devices.includes(row.physical_device) && permitted.has(row.physical_device)).map(row => ({
         id: idFor(row.physical_device),
         available: row.admitted === true && row.measurements?.idle === true,
+        ...(local?{env:{ASCEND_PHYSICAL_DEVICE:String(row.physical_device),
+          ASCEND_RT_VISIBLE_DEVICES:String(row.physical_device),ASCEND_VISIBLE_DEVICES:String(row.physical_device)}}:{}),
         metadata: { target: options.target, runtime: options.runtime, product: options.health.product,
           physicalDevice: row.physical_device, logicalDevice: 0, deviceAffinity: affinity ?? null, observedAt: result.observed_at, checkedAt: result.checked_at,
           admitted: row.admitted === true, measurements: row.measurements, failure: row.failure,
@@ -276,7 +278,7 @@ export async function createEnvironment(options, context) {
   }
   return {
     ...environment, resources,
-    instructions:environment.instructions+(local?'\nUse rsi_target for device execution, compilation and profiling: it applies the leased physical-device masks. Native local bash is for persistent file editing and inherits the worker launch environment; it does not select a leased device.':''),
+    instructions:environment.instructions+(local?'\nUse rsi_target for device execution, compilation and profiling: it applies the leased physical-device masks. Native local bash inherits the same worker-assigned device masks; rsi_target additionally performs fresh device admission.':''),
     async execute(command, cwd, opts = {}) {
       const started = performance.now();
       let excludedMs = 0;

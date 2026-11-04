@@ -111,6 +111,7 @@ export async function operate(command,config,options={}) {
     const launch=async(job,resource)=>{
       const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy(config)});
       const attempt=admitted.attempt;
+      const assignedResource=resource??admitted.resource;
       const latest=await readConfig(config.root);
       let skillVersion=admitted.skillVersion??latest.skills.activeVersion;
       if(!job.resume && admitted.kind!=='original') {
@@ -122,9 +123,9 @@ export async function operate(command,config,options={}) {
       }
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
       const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
-      await writeFile(join(path,'job.json'),JSON.stringify({...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:resource??admitted.resource}),{mode:0o600});
+      await writeFile(join(path,'job.json'),JSON.stringify({...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource}),{mode:0o600});
       const log=await open(join(path,'worker.log'),'a',0o600);
-      const child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd]});
+      const child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
       let complete=false;
       child.once('exit',()=>{complete=true;});
       child.once('error',error=>{state.event(attempt.id,'worker-spawn-error',{message:error.message});complete=true;});

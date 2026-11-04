@@ -153,11 +153,18 @@ test('public CLI auto scheduler overlaps two masks and admits third only after f
   const module=join(driver.root,'machinery','local-devices-fixture.mjs');
   const payload=`import os,time,json; from pathlib import Path; root=Path(${JSON.stringify(gate)}); name=os.environ['FIXTURE_ATTEMPT']; p=os.environ['ASCEND_PHYSICAL_DEVICE']; assert p==os.environ['ASCEND_RT_VISIBLE_DEVICES']==os.environ['ASCEND_VISIBLE_DEVICES']; (root/(name+'.started')).write_text(json.dumps({'physical':p,'logical':0}));\nwhile not (root/(name+'.release')).exists() and not (root/'release-all').exists(): time.sleep(.01)`;
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/ascend.mjs';
+import {createBashTool} from '@earendil-works/pi-coding-agent';
 export async function createEnvironment(options,context){
  const environment=await base(options,{...context,client:async args=>{
   if(args[0]!=='npu')throw Error('Unexpected local transport operation');
   return {state:'completed',profiles:[{target:options.target,devices:[0,1].map(id=>({id,enabled:true}))}]};
  }});
+ if(context.resource?.env&&context.instancePath.includes('/attempts/')){
+  const file=${JSON.stringify(gate)}+'/'+context.instancePath.split('/').at(-1)+'.native-mask';
+  const shellQuote=${quote.toString()};
+  const code='import os,json; from pathlib import Path; Path('+JSON.stringify(file)+').write_text(json.dumps({k:os.environ[k] for k in ["ASCEND_PHYSICAL_DEVICE","ASCEND_RT_VISIBLE_DEVICES","ASCEND_VISIBLE_DEVICES"]}))';
+  await createBashTool(context.instancePath).execute('worker-native-mask',{command:'python3 -c '+shellQuote(code),timeout:5});
+ }
  return {...environment,execute:(command,cwd,opts)=>environment.execute(command.includes('holding execution')?
  'python3 -c '+${JSON.stringify(quote(payload))}:command,cwd,{...opts,env:{...opts.env,FIXTURE_ATTEMPT:context.instancePath.split('/').at(-1)}})};
 }
@@ -185,6 +192,13 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   const pair=rows(driver.root,'SELECT * FROM attempts ORDER BY rowid');
   const masks=await Promise.all(pair.map(async a=>JSON.parse(await readFile(join(gate,a.id+'.started'),'utf8'))));
   assert.deepEqual(new Set(masks.map(m=>m.physical)),new Set(['0','1']));
+  for(const [i,a] of pair.entries()){
+    const native=JSON.parse(await readFile(join(gate,a.id+'.native-mask'),'utf8'));
+    const job=JSON.parse(await readFile(join(driver.root,'attempts',a.id,'job.json'),'utf8'));
+    for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES']){
+      assert.equal(native[key],masks[i].physical);assert.equal(job.resource.env[key],native[key]);
+    }
+  }
   assert.equal(rows(driver.root,'SELECT * FROM resource_leases').length,2);
   await writeFile(join(gate,'hold-attempt'),pair[0].id);await writeFile(join(gate,pair[0].id+'.release'),'release');
   await driverUntil(()=>exists(join(gate,'finalizer-entered')),30000);
@@ -198,6 +212,8 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   assert.equal(await ownerStopped(first.owner),true);
   const third=rows(driver.root,"SELECT * FROM attempts WHERE project='third'")[0];
   assert.equal(JSON.parse(await readFile(join(gate,third.id+'.started'),'utf8')).physical,masks[0].physical);
+  const thirdNative=JSON.parse(await readFile(join(gate,third.id+'.native-mask'),'utf8'));
+  for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'])assert.equal(thirdNative[key],masks[0].physical);
   await writeFile(join(gate,'release-all'),'release');await wave.output;
   const finished=rows(driver.root,'SELECT * FROM attempts');assert.equal(finished.length,3);
   assert.ok(finished.every(a=>a.outcome==='passed'));assert.equal(rows(driver.root,'SELECT * FROM resource_leases').length,0);
