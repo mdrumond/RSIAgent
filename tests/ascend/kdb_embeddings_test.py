@@ -196,12 +196,21 @@ def test_empty_input_does_not_load_model():
     assert backend.embed([]) == []
 
 
+def _capture_server(factory, captured):
+    def run(**kwargs):
+        backend = factory()
+        try:
+            captured.append(backend.db.embeddings)
+        finally:
+            backend.close()
+    return SimpleNamespace(run=run)
+
+
 def test_cli_default_resolves_to_offline_pinned_backend(tmp_path, monkeypatch):
     from ascend_tools import kdb_service
     captured = []
-    server = SimpleNamespace(run=lambda **kwargs: None)
     monkeypatch.setattr(kdb_service, 'create_server',
-                        lambda backend, **kwargs: captured.append(backend.db.embeddings) or server)
+                        lambda factory, **kwargs: _capture_server(factory, captured))
     monkeypatch.setattr(sys, 'argv', ['kdb', '--db', str(tmp_path / 'knowledge.sqlite')])
     kdb_service.main()
     assert isinstance(captured[0], PinnedBGEEmbeddings)
@@ -215,8 +224,8 @@ def test_cli_embedding_cache_only_configures_production_backend(tmp_path, monkey
     captured = []
     constructor = MagicMock(wraps=PinnedBGEEmbeddings)
     monkeypatch.setattr(embeddings, 'PinnedBGEEmbeddings', constructor)
-    monkeypatch.setattr(kdb_service, 'create_server', lambda backend, **kwargs:
-                        captured.append(backend.db.embeddings) or SimpleNamespace(run=lambda **kwargs: None))
+    monkeypatch.setattr(kdb_service, 'create_server', lambda factory, **kwargs:
+                        _capture_server(factory, captured))
     arguments = ['kdb', '--db', str(tmp_path / 'knowledge.sqlite'), '--embedding-cache', str(cache)]
     if factory:
         arguments += ['--embedding-factory', 'kdb_fixture:Embeddings']
