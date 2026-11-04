@@ -39,7 +39,10 @@ export class Workflow {
   }
   async validate(signal) {
     this.clock.check();
-    if (this.stage !== 'validation') throw new Error('Verification belongs to validation');
+    if (this.stage !== 'validation') throw new Error(`Verification belongs to validation; current stage: ${this.stage}. ` +
+      (this.stage === 'acceptance'
+        ? 'Use rsi_revise with to="implementation" or "design" and a reflection, then complete canonical steps and run fresh rsi_verify in validation before acceptance.'
+        : 'Read the current step skill and advance through canonical steps to validation.'));
     const before = await this.fingerprint();
     const result = await this.verify(signal);
     const after = await this.fingerprint();
@@ -56,7 +59,8 @@ export class Workflow {
     }
     if (this.stage === 'acceptance' && next===undefined) {
       if (!this.validation?.passed || this.validation.fingerprint !== await this.fingerprint())
-        throw new Error('Acceptance requires a passing verifier on the current source');
+        throw new Error((this.validation?.passed ? 'Source changed after passing verification. ' : 'Acceptance requires a passing verifier on the current source. ') +
+          'All project files, including documentation and receipts, affect the source fingerprint. Complete edits before validation; keep post-validation receipts outside project source and read retained verifier logs without copying them into source. Use rsi_revise with to="implementation" or "design" and a reflection, then complete canonical steps and run fresh verification in validation before acceptance.');
       await this.event('accepted',{});
       return {accepted:true};
     }
