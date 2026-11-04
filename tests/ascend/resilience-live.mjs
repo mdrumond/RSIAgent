@@ -20,7 +20,7 @@ test('missing live credentials are blocked before fixture resources or paid disp
 });
 
 test('safe live preflight makes no request; real native canonical fixture uses a scripted loopback provider',{timeout:45000},async t=>{
-  const root=await mkdtemp(join(tmpdir(),'live-native-')),requests=[],cleanup=[];let complete=false;const abort=new AbortController();
+  const root=await mkdtemp(join(tmpdir(),'live-native-')),requests=[],cleanup=[];let complete=false,compactCalls=null;const abort=new AbortController();
   const calls=[];for(const stage of stages){calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])calls.push(['rsi_knowledge',{query:'integer sum',kind}]);
     if(stage==='implementation')calls.push(['write',{path:'solution.py',content:'def solve(values):\n    return sum(values)\n'}],['rsi_target',{command:'python -c "import solution;assert solution.solve([2,3])==5"'}]);
@@ -28,7 +28,7 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   }
   const server=createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests.push(body);
-    const index=body.messages.reduce((count,m)=>count+(m.tool_calls?.length??0),0),call=calls[index];
+    const index=body.messages.reduce((count,m)=>count+(m.tool_calls?.length??0),0),call=compactCalls===null?calls[index]:compactCalls.shift();
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'live-fixture',object:'chat.completion.chunk',created:1,model:'deepseek-flash',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
@@ -51,5 +51,11 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   const fixture=await createLiveFixture({directory:join(root,'case'),signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
   const result=await fixture.run();assert.equal(result.accepted,true);fixture.verifyAccepted();
   assert.ok(requests.length>0);assert.ok(requests[0].tools.some(t=>t.function.name==='mcp__kdb__search'));
-  assert.ok(fixture.observations.some(e=>e.tool==='rsi_target'&&!e.error));complete=true;
+  assert.ok(fixture.observations.some(e=>e.tool==='rsi_target'&&!e.error));
+  compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
+    null,['read',{path:'proof.txt'}],['bash',{command:"python -c \"assert int(open('proof.txt').read()) == sum(6 for _ in range(7))\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
+  const compactRoot=join(root,'compaction');await mkdir(compactRoot);
+  const compact=await cases.find(c=>c.id==='deepseek-compaction').run({directory:compactRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
+  assert.equal(compact.compacted,true);assert.ok(compact.toolCallsBefore>=2);assert.ok(compact.toolCallsAfter>=3);
+  assert.deepEqual(compactCalls,[]);complete=true;
 });

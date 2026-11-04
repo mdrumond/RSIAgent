@@ -192,7 +192,7 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
     },
     command,
     async openSession(){
-      const path=join(root,'compact');await mkdir(path);const settings=sdk.SettingsManager.inMemory({retry:{enabled:false}});
+      const path=join(root,'compact');await mkdir(path);const settings=sdk.SettingsManager.inMemory({compaction:{enabled:false,reserveTokens:256,keepRecentTokens:128},retry:{enabled:false}});
       const bridge=createKdbBridge({url:mcpUrl,attemptId:'compaction',agentDir:path});
       const loader=new sdk.DefaultResourceLoader({cwd:fixture.project.source,agentDir:path,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[bridge.extension,pi=>{for(const type of ['before_provider_request','provider_stream_event','after_provider_response'])pi.on(type,event=>appendFile(join(path,'provider.jsonl'),JSON.stringify(event)+'\n'));}]});await loader.reload();
       const {session}=await sdk.createAgentSession({cwd:fixture.project.source,agentDir:path,settingsManager:settings,...await modelFromProfile(config.actor),thinkingLevel:'off',resourceLoader:loader,sessionManager:sdk.SessionManager.create(fixture.project.source,path)});

@@ -103,6 +103,7 @@ export const cases=[
     let exhausted=false;const timer=setTimeout(()=>{exhausted=true;session.abortCompaction();void session.abort();},(f.config.investigation_seconds??300)*1000),abort=()=>{session.abortCompaction();void session.abort();};ctx.signal.addEventListener('abort',abort,{once:true});
     let calls=0;session.subscribe(event=>{if(event.type==='tool_execution_end')calls++;});
     try{
+      await session.prompt('Retain this bounded background for later numeric tool work. Acknowledge briefly without tools. '+ 'The immutable arithmetic contract is six times seven equals forty two. '.repeat(80));await session.waitForIdle();
       await session.prompt('Use native bash to write proof.txt containing the integer42 computed as6*7. Retrieve positive arithmetic evidence using mcp__kdb__search. Then report what the file and tool actually returned.');await session.waitForIdle();
       assert.ok(calls>=2);const first=calls;assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');
       await session.compact('Keep the exact proof.txt path, numeric result42 and indexed citation; further tool work follows.');
