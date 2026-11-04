@@ -12,6 +12,9 @@ const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ['queued', 'dispatching', 'running', 'retrying', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
+// Strip SDK-inherited spawn values, retaining explicit deltas and session identity.
+const targetEnvironment = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key,value]) =>
+  key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (env ?? {}))) && process.env[key] !== value));
 async function sourceSnapshot(path) {
   const files = [], entries = [];
   let cacheable = true;
@@ -405,8 +408,7 @@ export async function createEnvironment(options, context) {
     const spool = posix.join(runRoot, 'output');
     const timingKey = randomUUID();
     const configuration = { command, timingKey, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
-      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key, value]) =>
-        key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (opts.env ?? {}))) && process.env[key] !== value)) }, timeout: remaining() ?? null };
+      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
     await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(supervisor)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
@@ -571,7 +573,8 @@ export async function createEnvironment(options, context) {
 export async function createEnvironmentTools(environment, cwd, sdk) {
   sdk ??= await import('@earendil-works/pi-coding-agent');
   const tool=sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
-    const result = await environment.execute(command, cwd, opts);
+    // Use the same delta/session filter as the CPL supervisor for local tools.
+    const result = await environment.execute(command, cwd, {...opts,env:targetEnvironment(opts.env)});
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
   } } });
