@@ -60,6 +60,57 @@ test('stable attempt directories map local cwd and sync edits; full output reach
   assert.deepEqual(config.env, { ENVIRONMENT_TEST_VALUE: 'tool-override' });
 });
 
+for (const failure of ['closed', 'closed-at-stop', 'not-admitted', 'unknown']) test(`sync setup proof: ${failure}`, async t => {
+  const f = await fixture(t), reason = {stage:'ssh_preflight',message:'open failed'};
+  const abort = new AbortController(), hasHandle = failure.startsWith('closed');
+  const environment = await createEnvironment(f.options, {...f.context, client:async args => {
+    if (args[0] === 'observe' && args[1] === 'remote:fake:job:sync') {
+      if (failure === 'closed-at-stop') abort.abort();
+      return failure === 'unknown' ? {state:'observation-unavailable'} : {state:'failed',exit:null,reason};
+    }
+    if (failure === 'not-admitted' && args[0] === 'run' && args[args.indexOf('--file')+1].endsWith('sync.sh'))
+      return {admitted:false,reason};
+    return f.context.client(args);
+  }});
+  await environment.prepare({project:{source:f.project},attempt:{id:failure}});
+  await assert.rejects(environment.execute('must-not-run',f.project,{signal:abort.signal}), error => {
+    if (failure === 'unknown') {assert.equal(error.closure,undefined);return true;}
+    assert.equal(error.code,hasHandle ? 'SETUP_CLOSED' : 'CPL_NOT_ADMITTED');
+    assert.equal(error.closure.closed,true);assert.equal(error.closure.payloadStarted,false);
+    assert.deepEqual(error.closure.handles,hasHandle ? ['remote:fake:job:sync'] : []);
+    assert.match(error.message,/open failed/);return true;
+  });
+  assert.equal(f.calls.some(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('command.sh')),false);
+});
+
+for (const failure of ['failed-upload','unknown-upload','running-upload','unidentified-upload',
+                        'failed-download','not-admitted-download']) test(`transfer setup proof: ${failure}`,async t=>{
+  const handle='remote:fake:transfer:proof',reason={stage:'transfer',message:'copy failed'};
+  let observations=0;
+  const f=await fixture(t,async args=>{
+    if(args[0]==='upload'&&failure.endsWith('upload')){
+      if(failure==='unidentified-upload')return {state:'observation-unavailable'};
+      return {handle,state:failure==='failed-upload'?'failed':'running',reason};
+    }
+    if(args[0]==='observe'&&args[1]===handle){
+      if(failure==='running-upload'&&observations++===0)return {state:'running'};
+      return {state:'observation-unavailable'};
+    }
+    if(args[0]==='download'&&failure.endsWith('download'))return failure==='not-admitted-download'
+      ?{admitted:false,reason}:{handle,state:'failed',reason};
+  });
+  const work=failure.endsWith('upload')?f.environment.execute('must-not-run',f.project):f.environment.browse('artifact');
+  await assert.rejects(work,error=>{
+    if(failure==='failed-upload'){
+      assert.equal(error.code,'SETUP_CLOSED');assert.deepEqual(error.closure.handles,[handle]);
+      assert.equal(error.closure.payloadStarted,false);assert.deepEqual(error.closure.reason.reason,reason);
+    }else assert.equal(error.closure,undefined);
+    return true;
+  });
+  assert.equal(f.calls.filter(a=>a[0]==='upload').length,failure.endsWith('upload')?1:0);
+  assert.equal(f.calls.some(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('command.sh')),false);
+});
+
 test('disconnect preserves handle; new observer can stop without resubmission', async t => {
   let connected = false, cancelled = false;
   const f = await fixture(t, async (args, { events }) => {

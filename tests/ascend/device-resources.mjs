@@ -88,6 +88,30 @@ print(outputs[query])
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
 
+for(const failure of ['closed','closed-at-stop','not-admitted','unknown'])test(`health setup proof: ${failure}`,async t=>{
+  const f=await fixture(t),reason={stage:'ssh_preflight',message:'open failed'};
+  const abort=new AbortController(),hasHandle=failure.startsWith('closed');
+  const environment=await createEnvironment(f.options,{...f.context,signal:abort.signal,client:async(args,settings)=>{
+    if(failure==='not-admitted'&&args[0]==='run')return {admitted:false,reason};
+    if(args[0]==='observe'){
+      if(failure==='closed-at-stop'){
+        if(!args.includes('--wait'))return {state:'running'};
+        abort.abort();
+      }
+      return failure==='unknown'?{state:'observation-unavailable'}:{state:'failed',exit:null,reason};
+    }
+    return f.context.client(args,settings);
+  }});
+  await assert.rejects(environment.resources(),error=>{
+    if(failure==='unknown'){assert.equal(error.closure,undefined);return true;}
+    assert.equal(error.code,hasHandle?'SETUP_CLOSED':'CPL_NOT_ADMITTED');
+    assert.equal(error.closure.closed,true);assert.equal(error.closure.payloadStarted,false);
+    assert.deepEqual(error.closure.handles,hasHandle?[f.lastProbe().handle]:[]);
+    assert.match(error.message,/open failed/);return true;
+  });
+  assert.equal(f.calls.some(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('command.sh')),false);
+});
+
 test('fresh parser-backed discovery filters permission, busy, Alarm, and unresponsive devices', async t => {
   const f = await fixture(t);
   const first = await f.environment.resources({ target: 'fixture' });

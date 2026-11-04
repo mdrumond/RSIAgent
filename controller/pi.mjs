@@ -41,6 +41,15 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       event('execution-settled',{operation,handle:response.handle});
       return response;
     } catch(error) {
+      const closure=error.closure;
+      if(['SETUP_CLOSED','CPL_NOT_ADMITTED'].includes(error.code) && closure?.closed===true &&
+          closure.payloadStarted===false && Array.isArray(closure.handles) &&
+          (error.code==='CPL_NOT_ADMITTED'||closure.handles.length>0)) {
+        state.checkpoint(attempt.id,clock.elapsed);
+        event('execution-settled',{operation,startElapsed,handle:closure.handles[0]??null,
+          setupClosure:closure,message:error.message});
+        throw error; // Native Pi receives a normal tool error and owns its next action.
+      }
       event('execution-unresolved',{operation,startElapsed,handle:response?.handle??null,message:error.message});
       uncertain=error;void session?.abort();throw error;
     } finally {activeOperation=null;}
