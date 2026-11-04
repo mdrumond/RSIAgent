@@ -54,7 +54,7 @@ export async function until(check,{signal,seconds=20}={}){
 export async function createEnvironment(options,context){
   const {fixtureUrl,...settings}=options;
   const native=fixtureUrl?connect(fixtureUrl):settings.mode==='cpl'?createCplClient(settings.clientPath):null;
-  const client=native?((args,options={})=>native(args,{...options,signal:AbortSignal.any([context.signal,options.signal].filter(Boolean))})):null;
+  const client=native?((args,options={})=>native(args,{...options,signal:options.signal??context.signal})):null;
   return genericEnvironment(settings,{...context,resources:async()=>[{id:'live-cpu',available:true}],...(client?{client}:{})});
 }
 export async function runLiveActor({config,state,attempt,signal,extensions=[],environmentFactory,prepareSession,mcpUrl}){
