@@ -269,7 +269,7 @@ test('missing submission receipts persist unresolved events before errors and su
 test('native SDK session PATH and local session-file metadata do not override remote runtime', async t => {
   const sdk = await import(process.env.PI_SDK_MODULE ?? '@earendil-works/pi-coding-agent');
   const f = await fixture(t);
-  const tool = sdk.createBashTool(f.project, { operations: { exec: (command, cwd, options) => f.environment.execute(command, cwd, options) } });
+  const [tool] = await createEnvironmentTools(f.environment,f.project,sdk);
   await tool.execute('native-env', { command: 'true' }, undefined, undefined, {
     cwd: f.project, sessionManager: { getSessionId: () => 'native-session', getSessionFile: () => '/local/attempt/session.jsonl' },
   });

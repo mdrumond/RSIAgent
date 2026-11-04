@@ -7,6 +7,7 @@ import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
 import { validateAcceptance } from './state.mjs';
 import { fingerprint, freezeFiles } from './evidence.mjs';
+import { createEnvironmentTools } from '../integrations/environments/index.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 
@@ -25,6 +26,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
   let session,timer,accepted=false,uncertain;
+  const nativeBash=new Map();
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
@@ -75,7 +77,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       return {correctness,performance,passed:correctness.passed && (!performance || performance.passed),
         evidence:{correctness:correctness.evidence,performance:performance?.evidence??null}};
     }}).restore(state.events(attempt.id));
-  const extension=pi=>{
+  const extension=async pi=>{
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
       parameters:Type.Object({}),execute:async()=>result({stage:workflow.stage,skill:await workflow.skill(),history:workflow.history})});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',
@@ -94,14 +96,13 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'After debugging or validation, return to design or implementation with the observed reason.',
       parameters:Type.Object({to:Type.Union([Type.Literal('design'),Type.Literal('implementation')]),reflection:Type.String({minLength:1})}),
       execute:async(_id,args)=>result(await workflow.advance({next:args.to,reflection:args.reflection}))});
-    pi.registerTool(sdk.createBashTool(project.source,{operations:{exec:async(command,cwd,options)=>{
+    const [target]=await createEnvironmentTools({execute:async(command,cwd,options)=>{
       clock.check();
-      const response=await execute(command,cwd,{...options,
+      return execute(command,cwd,{...options,
         purpose:project.purpose??(project.performance_goal?'performance':'ordinary'),
-        timeout:Math.min(options.timeout ?? Infinity,clock.remaining)});
-      if (!response.settled) throw new Error('Execution remains observable; resolve its recorded handle before continuing');
-      return {exitCode:response.exitCode};
-    }}}));
+        timeout:Math.min(options.timeout??Infinity,clock.remaining)});
+    }},project.source,sdk);
+    pi.registerTool(target);
     for (const type of ['before_provider_request','provider_stream_event']) {
       pi.on(type,async payload=>{
         await appendFile(join(attemptPath,'provider.jsonl'),JSON.stringify(payload)+'\n');
@@ -139,6 +140,14 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
+      if(e.type==='tool_execution_start' && e.toolName==='bash') {
+        const operation=randomUUID();nativeBash.set(e.toolCallId,operation);
+        event('native-bash-started',{operation,tool_call_id:e.toolCallId,session:manager.getSessionFile()});
+      }
+      if(e.type==='tool_execution_end' && e.toolName==='bash' && nativeBash.has(e.toolCallId)) {
+        event('native-bash-completed',{operation:nativeBash.get(e.toolCallId),tool_call_id:e.toolCallId});
+        nativeBash.delete(e.toolCallId);
+      }
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
       if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
         diagnostics.push(e.message.errorMessage ?? 'Native provider error');

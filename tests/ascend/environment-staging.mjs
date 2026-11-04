@@ -252,3 +252,54 @@ for (const state of ['unknown', 'observation-unavailable'])
     assert.equal(f.sourceUploads().length, 1); assert.equal(f.manifests().length, 0);
     assert.equal(f.runs(true).length, 0); assert.equal(f.runs(false).length, 0);
   });
+
+// Exercise the controller's actual native/default tool registration, not just
+// the environment helper: shadowing bash breaks the local read immediately.
+test('canonical native bash edits persist locally and rsi_target restores updated execution snapshots',{timeout:20000},async t=>{
+  const {State}=await import('../../controller/state.mjs');
+  const {runAttempt}=await import('../../controller/pi.mjs');
+  const {stages}=await import('../../controller/workflow.mjs');
+  const {InMemoryCredentialStore}=await import('@earendil-works/pi-ai');
+  const {createServer}=await import('node:http');const {once}=await import('node:events');
+  const f=await fixture(t),state=new State(join(f.root,'state.sqlite'));t.after(()=>state.close());
+  const q=value=>"'"+value.replaceAll("'","'\\''")+"'";
+  const write=value=>`python3 -c ${q(`from pathlib import Path;Path('helper.py').write_text('value=${value}\\n')`)}`;
+  const inspect=`python3 -c ${q("import runpy;print(runpy.run_path('helper.py')['value'])")}; cat value.txt`;
+  const actions=[['bash',{command:write(1)}],['read',{path:'helper.py'}],
+    ['rsi_target',{command:inspect+'; printf target-only > value.txt'}],['bash',{command:write(2)}],
+    ['rsi_target',{command:inspect}],['rsi_target',{command:inspect}]];
+  const plan=[];for(const stage of stages){plan.push(['rsi_skill',{}]);
+    if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])plan.push(['rsi_knowledge',{kind,query:'numeric evidence'}]);
+    if(stage==='implementation')plan.push(...actions);
+    if(stage==='validation')plan.push(['rsi_verify',{}]);
+    plan.push(['rsi_advance',{reflection:'Retain independent evidence and persistent local source.'}]);}
+  const replies=new Map();
+  const server=createServer(async(req,res)=>{
+    let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
+    for(const message of body.messages.filter(m=>m.role==='tool'))replies.set(message.tool_call_id,message.content);
+    const index=body.messages.reduce((n,m)=>n+(m.tool_calls?.length??0),0),call=plan[index];
+    res.writeHead(200,{'Content-Type':'text/event-stream'});
+    const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'workspace',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
+    if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
+    else{frame({role:'assistant',content:'Done.'});frame({},'stop');}res.end('data: [DONE]\n\n');
+  });server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
+  const runtime=await f.sdk.ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
+  runtime.registerProvider('workspace-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
+  await runtime.setRuntimeApiKey('workspace-fixture','fixture-only');
+  const verifier=join(f.root,'verify.py');await writeFile(verifier,`from pathlib import Path\nimport runpy\nassert Path.cwd().is_relative_to(Path(${JSON.stringify(f.workspace)}))\nassert runpy.run_path('helper.py')['value']==2\nassert Path('value.txt').read_text()=='one'\nprint('target oracle passed')\n`);
+  const skillMap={};for(const stage of [...stages,'global-kdb']){skillMap[stage]=join(f.root,stage+'.md');await writeFile(skillMap[stage],'Use the independent oracle.');}
+  state.add({id:'p',source:f.source,goal:'Persistent helper',actor_seconds:30,verifier:{files:[verifier],command:'PYTHONDONTWRITEBYTECODE=1 python3 ../verify.py'}});
+  const attempt=state.admit('p',{});
+  const result=await runAttempt({state,attempt,project:state.project('p').spec,attemptPath:join(f.root,'attempt'),skillMap,
+    modelRuntime:runtime,model:runtime.getModel('workspace-fixture','scripted'),knowledge:{search:async()=>({content:[],evidence:[]})},environmentFactory:async()=>f.environment});
+  assert.equal(result.accepted,true);
+  assert.equal(await readFile(join(f.source,'helper.py'),'utf8'),'value=2\n');
+  assert.equal(await readFile(join(f.source,'value.txt'),'utf8'),'one');
+  const implementation=plan.findIndex(([name,args])=>name==='bash'&&args.command===write(1));
+  assert.match(replies.get('call-'+(implementation+1)),/value=1/);
+  for(const offset of [4,5])assert.match(replies.get('call-'+(implementation+offset)),/2\none/);
+  assert.equal(f.runs(false).length,4); // Three target requests plus frozen verification.
+  assert.deepEqual(f.events.filter(e=>e.type==='source-staged').map(e=>e.reused),[false,false,true,true]);
+  assert.equal(state.events(attempt.id).find(e=>e.type==='verification').data.passed,true);
+});

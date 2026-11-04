@@ -19,6 +19,12 @@ export async function attemptStopped(state,attempt,environment) {
 }
 export async function operationsStopped(state,attempt,environment) {
   let events=state.events(attempt.id);
+  const completedBash=events.filter(e=>e.type==='native-bash-completed');
+  const closedBash=new Set(completedBash.map(e=>e.data.operation));
+  // Worker death cannot prove its detached native SDK shell has stopped.
+  if(events.some(e=>e.type==='native-bash-started' && !closedBash.has(e.data.operation)))return false;
+  const nativeElapsed=Math.max(attempt.elapsed,...completedBash.map(e=>e.data.actor_elapsed).filter(Number.isFinite));
+  if(nativeElapsed>attempt.elapsed)state.checkpoint(attempt.id,nativeElapsed);
   const finished=new Set(events.filter(e=>['execution-settled','execution-reconciled'].includes(e.type) &&
     (e.type==='execution-settled'||e.data.closed===true)).map(e=>e.data.operation));
   const pending=new Map();
@@ -29,7 +35,7 @@ export async function operationsStopped(state,attempt,environment) {
     const previous=pending.get(operation);
     pending.set(operation,{...previous,...data,startElapsed:previous?.startElapsed??data.startElapsed??data.actor_elapsed});
   }
-  let elapsed=attempt.elapsed;
+  let elapsed=nativeElapsed;
   for(const [operation,data] of pending) {
     if(!environment.reconcileOperation)return false;
     const proof=await environment.reconcileOperation({operation,events,startElapsed:data.startElapsed});

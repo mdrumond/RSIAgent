@@ -153,7 +153,8 @@ export async function createEnvironment(options, context) {
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
   const executionReceipts = new Map();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
-    (remote ? '\nBash runs in a synchronized remote attempt directory. Use project-relative Bash paths. Native read/write/edit tools operate on the LOCAL project; edits sync before each Bash call.' : '');
+    '\nNative bash/read/write/edit operate in the LOCAL project; use them for persistent source edits. rsi_target executes commands in the configured target environment.' +
+    (remote ? ' Target commands use a synchronized execution snapshot: local edits sync first, and target-side source edits are overwritten on the next synchronization. Use project-relative paths with rsi_target.' : '');
   const check = handle => {
     if (remote && !handle.startsWith(`remote:${options.target}:`)) throw new Error('Handle belongs to another target');
     if (!remote && !/^local:exec-[A-Za-z0-9]+$/.test(handle)) throw new Error('Invalid local handle');
@@ -313,7 +314,7 @@ export async function createEnvironment(options, context) {
     }
     if (!projectRoot || !attemptRoot) throw new Error('Call prepare with project.sourceDirectory and attempt.id before remote execute');
     const subdir = relative(projectRoot, resolve(cwd ?? projectRoot));
-    if (subdir === '..' || subdir.startsWith('../') || isAbsolute(subdir)) throw new Error('Bash cwd must be inside local project');
+    if (subdir === '..' || subdir.startsWith('../') || isAbsolute(subdir)) throw new Error('Target execution cwd must be inside local project');
     const runRoot = posix.join(attemptRoot, dir.slice(dir.lastIndexOf('/') + 1));
     const destination = posix.join(attemptRoot, projectLayout);
     const cachePath = join(root, 'source-staging.json');
@@ -540,10 +541,12 @@ export async function createEnvironment(options, context) {
 
 export async function createEnvironmentTools(environment, cwd, sdk) {
   sdk ??= await import('@earendil-works/pi-coding-agent');
-  return [sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
+  const tool=sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
     const result = await environment.execute(command, cwd, opts);
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
-  } } })];
+  } } });
+  return [{...tool,name:'rsi_target',label:'Run target command',
+    description:'Execute a command in the configured target environment. Remote targets use an execution snapshot; use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'}];
 }
 
