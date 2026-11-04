@@ -204,24 +204,26 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   assert.deepEqual(await readFile(first.session),session);driver.pass();
 });
 
-test('native target tool omits implicit spawn env while direct API retains explicit overrides',{timeout:20000},async t=>{
+test('native target tool filters inherited env but retains session identity and explicit overrides',{timeout:20000},async t=>{
   const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0];
   const runtime={...f.options.env,CANN_HOME:'configured-cann',LD_LIBRARY_PATH:'configured-libraries'};
   const bound=await f.bind(row,{env:runtime});let reached=false;
   const [tool]=await createEnvironmentTools({execute:(command,cwd,opts)=>{
-    assert.equal(Object.hasOwn(opts,'env'),false);reached=true;
-    return bound.environment.execute(command,cwd,{...opts,env:{UNIQUE_CALL:'preserved'}});
+    assert.equal(Object.hasOwn(opts.env,'PATH'),false);assert.equal(Object.hasOwn(opts.env,'PI_SESSION_FILE'),false);
+    assert.equal(opts.env.PI_SESSION_ID,'native-session');reached=true;
+    return bound.environment.execute(command,cwd,{...opts,env:{...opts.env,UNIQUE_CALL:'preserved'}});
   }},f.source);
-  const code="import os,json; print(json.dumps({k:os.environ[k] for k in ['PATH','CANN_HOME','LD_LIBRARY_PATH','UNIQUE_CALL','ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES']}))";
-  const result=await tool.execute('native-env',{command:'python3 -c '+quote(code),timeout:10});
+  const code="import os,json; print(json.dumps({k:os.environ[k] for k in ['PATH','CANN_HOME','LD_LIBRARY_PATH','UNIQUE_CALL','ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES','PI_SESSION_ID']}))";
+  const result=await tool.execute('native-env',{command:'python3 -c '+quote(code),timeout:10},undefined,undefined,
+    {cwd:f.source,sessionManager:{getSessionId:()=> 'native-session',getSessionFile:()=> '/local/session.jsonl'}});
   assert.equal(reached,true);
   const value=JSON.parse(result.content.filter(c=>c.type==='text').map(c=>c.text).join('\n').trim().split('\n').at(-1));
   assert.equal(value.PATH,runtime.PATH);assert.equal(value.CANN_HOME,runtime.CANN_HOME);
-  assert.equal(value.LD_LIBRARY_PATH,runtime.LD_LIBRARY_PATH);assert.equal(value.UNIQUE_CALL,'preserved');
+  assert.equal(value.LD_LIBRARY_PATH,runtime.LD_LIBRARY_PATH);assert.equal(value.UNIQUE_CALL,'preserved');assert.equal(value.PI_SESSION_ID,'native-session');
   for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'])assert.equal(value[key],'0');
   let output='';const explicit=await bound.environment.execute('python3 -c '+quote(code),f.source,{timeout:10,
-    env:{CANN_HOME:'explicit-cann',UNIQUE_CALL:'explicit',ASCEND_PHYSICAL_DEVICE:'7'},onData:b=>output+=b});
+    env:{CANN_HOME:'explicit-cann',UNIQUE_CALL:'explicit',PI_SESSION_ID:'direct-session',ASCEND_PHYSICAL_DEVICE:'7'},onData:b=>output+=b});
   assert.equal(explicit.exitCode,0);const direct=JSON.parse(output.trim().split('\n').at(-1));
-  assert.equal(direct.CANN_HOME,'explicit-cann');assert.equal(direct.UNIQUE_CALL,'explicit');
+  assert.equal(direct.CANN_HOME,'explicit-cann');assert.equal(direct.UNIQUE_CALL,'explicit');assert.equal(direct.PI_SESSION_ID,'direct-session');
   assert.equal(direct.PATH,runtime.PATH);assert.equal(direct.ASCEND_PHYSICAL_DEVICE,'0');
 });
