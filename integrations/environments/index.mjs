@@ -146,7 +146,11 @@ export async function createEnvironment(options, context) {
   const exclude = (label, fn) => context.exclude(label, fn);
   const root = join(context.instancePath, '.executions');
   await mkdir(root, { recursive: true, mode: 0o700 });
-  const client = context.client ?? createCplClient(options.clientPath);
+  const nativeClient = context.client ?? createCplClient(options.clientPath);
+  const client = (args, {signal = context.signal} = {}) => {
+    signal?.throwIfAborted();
+    return nativeClient(args, {signal});
+  };
   const local = sdk.createLocalBashOperations();
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
@@ -185,7 +189,7 @@ export async function createEnvironment(options, context) {
       return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}) };
     } catch { return { state: 'unknown' }; }
   }
-  async function executionTiming(handle) {
+  async function executionTiming(handle, signal) {
     if (handle.includes(':transfer:')) return { executionSeconds: 0, accountingExcluded: true };
     let receipt = executionReceipts.get(handle);
     if (!receipt) for (const name of await readdir(root)) {
@@ -205,7 +209,7 @@ export async function createEnvironment(options, context) {
         let timing;
         try { timing = await json(path); } catch {
           const dir = await mkdtemp(join(root, 'timing-'));
-          await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir));
+          await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir, signal));
           timing = await json(path);
         }
         if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0) return { executionSeconds: timing.executionSeconds };
@@ -214,12 +218,12 @@ export async function createEnvironment(options, context) {
     await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
     return { accountingUnresolved: true };
   }
-  async function observe(handle) {
+  async function observe(handle, {signal = context.signal} = {}) {
     check(handle);
     let state;
     try {
-      state = remote ? normalize(await client(['observe', handle])) : await localState(handle);
-      if (remote && state.state === 'stopped' && state.executionSeconds === undefined) Object.assign(state, await executionTiming(handle));
+      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle);
+      if (remote && state.state === 'stopped' && state.executionSeconds === undefined) Object.assign(state, await executionTiming(handle, signal));
     }
     catch { state = { state: 'unknown' }; }
     await event('execution-state', { handle, ...state });
@@ -227,8 +231,9 @@ export async function createEnvironment(options, context) {
   }
   async function stop(handle) {
     check(handle);
+    const signal = AbortSignal.timeout(5000);
     if (remote) {
-      try { await client(['cancel', handle]); } catch { /* observe is authoritative */ }
+      try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
     } else {
       const state = await localState(handle);
       if (state.state === 'running') {
@@ -237,17 +242,18 @@ export async function createEnvironment(options, context) {
     }
     const deadline = performance.now() + 5000;
     while (performance.now() < deadline) {
-      const state = await observe(handle);
+      const state = await observe(handle, {signal});
       if (state.state !== 'running') return state;
       await delay(50);
     }
     return { state: 'unknown' };
   }
-  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false) {
+  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
+    signal?.throwIfAborted();
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
-    try { result = await client(args); }
+    try { result = await client(args, {signal}); }
     catch (error) {
       cause = error;
       if (receipt) try { result = await json(receipt); } catch { /* absence is not closure */ }
@@ -264,27 +270,35 @@ export async function createEnvironment(options, context) {
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
     throw new Error(message, { cause });
   }
-  async function transfer(args, dir) {
+  async function transfer(args, dir, signal = context.signal) {
     const upload = args[0] === 'upload';
     if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
     else args.push('--timeout', '0');
-    let result = await submit(args, upload ? join(dir, 'transfer.json') : undefined, true, true);
+    let result = await submit(args, upload ? join(dir, 'transfer.json') : undefined, true, true, signal);
     const handle = result.handle;
     if (handle) {
       await event('execution-handle', { handle, purpose: 'transfer' });
       await event('execution-state', { handle, purpose: 'transfer', ...normalize(result) });
-      if (!terminal.has(result.state)) result = await client(['observe', handle]);
-      while (!terminal.has(result.state)) {
-        if (!['queued', 'dispatching', 'running', 'retrying'].includes(result.state)) throw new Error(`Transfer unresolved; observe ${handle}`);
-        await delay(options.pollMs ?? 250);
-        result = await client(['observe', handle]);
+      try {
+        while (!terminal.has(result.state)) {
+          signal?.throwIfAborted();
+          if (!['queued', 'dispatching', 'running', 'retrying'].includes(result.state)) throw new Error(`Transfer unresolved; observe ${handle}`);
+          result = await client(['observe', handle], {signal});
+          if (!terminal.has(result.state)) await delay(options.pollMs ?? 250, undefined, {signal});
+        }
+        if (!upload && result.state === 'completed') await client(['fetch', handle, args[3]], {signal});
+      } catch (error) {
+        if (signal?.aborted) await stop(handle);
+        throw error;
       }
-      if (!upload && result.state === 'completed') await client(['fetch', handle, args[3]]);
     }
     if (result.state !== 'completed') throw new Error(`Transfer did not complete: ${handle ?? result.state}`);
     return result;
   }
   async function execute(command, cwd, opts = {}) {
+    opts = {...opts, signal: context.signal && opts.signal
+      ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal};
+    const signal = opts.signal;
     const started = performance.now();
     let excludedMs = 0;
     const copy = async (label, fn) => {
@@ -329,7 +343,7 @@ export async function createEnvironment(options, context) {
         let receipt;
         try { receipt = await json(retained.receiptFile); } catch { /* no identity is not closure */ }
         if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
-        const state = await observe(receipt.handle);
+        const state = await observe(receipt.handle, {signal});
         if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
         if (state.exitCode !== 0) { await rm(cachePath); throw new Error(`Source synchronization failed: ${receipt.handle}`); }
         retained.confirmed = true;
@@ -339,7 +353,7 @@ export async function createEnvironment(options, context) {
       let stage = reused ? retained : { key, cacheable: snapshot.cacheable,
         incoming: posix.join(runRoot, 'incoming'), manifest: posix.join(runRoot, 'sync.json') };
       if (!reused) {
-        await transfer(['upload', options.target, projectRoot, stage.incoming], dir);
+        await transfer(['upload', options.target, projectRoot, stage.incoming], dir, signal);
         const configuration = { incoming: posix.join(options.workspacePath, stage.incoming),
           project: posix.join(options.workspacePath, destination), files: snapshot.files,
           snapshot: snapshot.cacheable ? snapshot.entries : null };
@@ -348,7 +362,7 @@ export async function createEnvironment(options, context) {
         const bytes = JSON.stringify(configuration);
         stage.manifestSha256 = createHash('sha256').update(bytes).digest('hex');
         await writeFile(manifest, bytes, { mode: 0o600 });
-        await transfer(['upload', options.target, manifest, stage.manifest], manifestDir);
+        await transfer(['upload', options.target, manifest, stage.manifest], manifestDir, signal);
       }
       const script = join(dir, 'sync.sh');
       await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(synchronize)} ${quote(posix.join(options.workspacePath, stage.manifest))} ${quote(stage.manifestSha256)}\n`, { mode: 0o600 });
@@ -357,12 +371,13 @@ export async function createEnvironment(options, context) {
       stage = { ...stage, confirmed: false, receiptFile: join(dir, 'sync-submission.json') };
       await save(cachePath, stage);
       let submitted;
-      try { submitted = await submit(args, stage.receiptFile, false, true); }
+      try { submitted = await submit(args, stage.receiptFile, false, true, signal); }
       catch (error) { if (error.code === 'CPL_NOT_ADMITTED') await rm(cachePath); throw error; }
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
       do {
-        state = await observe(submitted.handle);
+        state = await observe(submitted.handle, {signal});
+        if (signal?.aborted) { await stop(submitted.handle); signal.throwIfAborted(); }
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
       if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);
@@ -388,7 +403,7 @@ export async function createEnvironment(options, context) {
     if (opts.resourceId !== undefined) args.push('--npu', String(opts.resourceId));
     const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, cwd: configuration.cwd };
     await save(join(dir, 'execution.json'), receiptData);
-    const submitted = await submit(args, receipt);
+    const submitted = await submit(args, receipt, false, false, signal);
     handle = submitted.handle;
     check(handle);
     receiptData.handle = handle;
@@ -397,7 +412,9 @@ export async function createEnvironment(options, context) {
     await event('execution-handle', { handle });
     let state;
     for (;;) {
-      state = opts.signal?.aborted || remaining() === 0 ? await stop(handle) : await observe(handle);
+      const stopping = signal?.aborted || remaining() === 0;
+      state = stopping ? await stop(handle) : await observe(handle, {signal});
+      if (!stopping && signal?.aborted) state = await stop(handle);
       if (state.state !== 'running') break;
       await delay(Math.min(options.pollMs ?? 250, (remaining() ?? 1) * 1000));
     }
@@ -405,7 +422,7 @@ export async function createEnvironment(options, context) {
       try {
         for (const stream of ['stdout', 'stderr']) {
           const path = join(dir, stream);
-          await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir));
+          await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir, signal));
           if (opts.onData) for await (const chunk of createReadStream(path)) opts.onData(chunk);
         }
         await event('execution-output', { handle, stdout: join(dir, 'stdout'), stderr: join(dir, 'stderr'), partial: false });

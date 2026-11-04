@@ -49,7 +49,11 @@ export async function createEnvironment(options, context) {
     throw new Error('deviceAffinity must contain explicit nonnegative physical IDs');
   const affinity = options.deviceAffinity?.slice();
   await context.event('resource-policy', { target: options.target, runtime: options.runtime, deviceAffinity: affinity ?? null });
-  const client = context.client ?? createCplClient(options.clientPath);
+  const nativeClient = context.client ?? createCplClient(options.clientPath);
+  const client = (args, {signal = context.signal} = {}) => {
+    signal?.throwIfAborted();
+    return nativeClient(args, {signal});
+  };
   const assigned = context.resource ?? options.resource;
   const assignedId = typeof assigned === 'string' ? assigned : assigned?.id;
   const idFor = physical => 'ascend-' + digest(JSON.stringify([options.target, options.runtime, physical]));
@@ -91,7 +95,7 @@ export async function createEnvironment(options, context) {
     if (!profile) throw new Error('NPU permission profile missing');
     return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !affinity || affinity.includes(id));
   }
-  async function snapshot(devices, purpose, emit, budget = seconds, signal) {
+  async function snapshot(devices, purpose, emit, budget = seconds, signal = context.signal) {
     if (!(budget > 0)) throw new Error('Resource probe elapsed allocation exhausted');
     const deadlineSignal=AbortSignal.timeout(Math.ceil(observationSeconds*1000));
     const observationSignal=signal?AbortSignal.any([signal,deadlineSignal]):deadlineSignal;
