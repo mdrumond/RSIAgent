@@ -5,7 +5,17 @@ Supported tiers are `local`, `deepseek`, `remote`, and `all`; select `--case ID`
 for replay, `--seed INTEGER`, and `--profile normal|slow|bursty`. The default
 round allocation is 5400 elapsed seconds including setup and transport. The last
 300 seconds are reserved for cleanup/reporting; actor allocations remain separate.
-All required tiers must be registered for an unfiltered `all` run to pass.
+The manifest lists mandatory scenarios. Missing scenarios make the selected
+tier incomplete. An unfiltered `all` run executes local, DeepSeek, then remote
+cases; an earlier tier's failure, blockage or missing coverage blocks later
+tiers. Explicit `--case` replay reports that case only, not comprehensive coverage.
+SIGINT/SIGTERM interrupts active work and runs registered cleanup before reporting.
+
+The local tier includes existing Node/Python regressions and a ten-minute seeded
+workspace soak. Set `RESILIENCE_PYTHON` to an existing interpreter with pytest,
+Flask and FastMCP. Reports retain active-case progress, required/completed case
+IDs, schedules and subprocess output. Use a fresh output directory for each run;
+failed runs are evidence and are never overwritten or automatically retried.
 
 Case modules named `*.case.mjs` export `cases`, an array of unique `{id, tier,
 async run(context)}` entries. Context contains `directory`, `signal`, `seed`,

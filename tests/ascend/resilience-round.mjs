@@ -1,0 +1,87 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm,readFile,writeFile,mkdir} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {runCases} from './resilience/runner.mjs';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
+import {closeRegressionServices} from './resilience/regression-cleanup.mjs';
+
+async function output(t){const dir=await mkdtemp(join(tmpdir(),'resilience-round-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));return dir;}
+async function service(t){
+  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  const exited=once(child,'exit');await once(child,'spawn');const owner=await processIdentity(child.pid);
+  t.after(async()=>{if(!await ownerStopped(owner))child.kill('SIGKILL');await exited;});return {owner,exited};
+}
+test('interrupted regression cleanup closes only receipt-owned detached services',async t=>{
+  const root=await output(t),owned=await service(t),unrelated=await service(t);
+  await writeFile(join(root,'knowledge-service.json'),JSON.stringify({owner:owned.owner}));
+  const abort=new AbortController();let timer;
+  const report=await runCases([{id:'regression',tier:'local',async run(ctx){
+    ctx.onCleanup(options=>closeRegressionServices(root,options));
+    const {createLocalBashOperations}=await import('@earendil-works/pi-coding-agent');
+    timer=setTimeout(()=>abort.abort(Error('Operator interruption')),50);
+    await createLocalBashOperations().exec('sleep 30',root,{signal:ctx.signal,onData:()=>{}});
+  }}],{output:join(root,'report'),tier:'local',signal:abort.signal,deadlineSeconds:5,cleanupSeconds:2});
+  clearTimeout(timer);await owned.exited;assert.equal(report.status,'incomplete');
+  const proof=JSON.parse(await readFile(join(root,'regression-service-closure.json'),'utf8'));
+  assert.equal(proof[0].state,'stopped');
+  assert.equal(await ownerStopped(unrelated.owner),false);
+});
+test('exhausted regression cleanup retains every unresolved receipt and fails',async t=>{
+  const root=await output(t),owned=await service(t),abort=new AbortController();
+  for(const name of ['first','second']){await mkdir(join(root,name));
+    await writeFile(join(root,name,'knowledge-service.json'),JSON.stringify({owner:owned.owner}));}
+  abort.abort(Error('Round cleanup elapsed allocation exhausted'));
+  await assert.rejects(closeRegressionServices(root,{signal:abort.signal,remainingSeconds:0}));
+  const proof=JSON.parse(await readFile(join(root,'regression-service-closure.json'),'utf8'));
+  assert.equal(proof.length,2);assert.ok(proof.every(p=>p.state==='unknown'&&p.error));
+  assert.equal(await ownerStopped(owned.owner),false);
+});
+test('local failure prevents provider and remote dispatch despite registration order',async t=>{
+  const called=[],make=(id,tier)=>({id,tier,async run(){called.push(id);if(tier==='local')throw Error('oracle failed');}});
+  const report=await runCases([make('remote','remote'),make('paid','deepseek'),make('cpu','local')],
+    {output:await output(t),deadlineSeconds:10,cleanupSeconds:1});
+  assert.deepEqual(called,['cpu']);assert.equal(report.status,'failed');
+  assert.deepEqual(report.results.map(r=>r.status),['failed','blocked','blocked']);
+});
+test('missing mandatory local scenario blocks paid work and is incomplete',async t=>{
+  let submitted=false;
+  const report=await runCases([{id:'cpu',tier:'local',run:async()=>{}},
+    {id:'paid',tier:'deepseek',run:async()=>{submitted=true;}},{id:'remote',tier:'remote',run:async()=>{}}],
+  {output:await output(t),deadlineSeconds:10,cleanupSeconds:1,requiredCases:[{id:'missing',tier:'local'}]});
+  assert.equal(submitted,false);assert.equal(report.status,'incomplete');
+  assert.equal(report.results.find(r=>r.id==='missing').status,'incomplete');
+});
+test('external interruption retains cleanup evidence and never starts next case',async t=>{
+  const abort=new AbortController(),dir=await output(t);let next=false,closed=false;
+  const report=await runCases([{id:'active',tier:'local',async run(ctx){
+    ctx.onCleanup(async({signal,remainingSeconds})=>{
+      assert.equal(signal.aborted,false);assert.ok(remainingSeconds>0);closed=true;
+    });
+    const active=JSON.parse(await readFile(join(dir,'report.json'),'utf8'));
+    assert.equal(active.activeCase,'active');abort.abort(Error('operator stop'));ctx.signal.throwIfAborted();
+  }},{id:'next',tier:'local',run:async()=>{next=true;}}],
+  {output:dir,tier:'local',signal:abort.signal,deadlineSeconds:10,cleanupSeconds:1});
+  assert.equal(closed,true);assert.equal(next,false);assert.equal(report.status,'incomplete');
+  assert.equal(JSON.parse(await readFile(join(dir,'report.json'),'utf8')).activeCase,undefined);
+});
+test('registering a mandatory local case in a paid tier cannot satisfy local admission',async t=>{
+  let paid=false;
+  const report=await runCases([{id:'cpu',tier:'local',run:async()=>{}},
+    {id:'misregistered',tier:'deepseek',run:async()=>{paid=true;}},
+    {id:'target',tier:'remote',run:async()=>{}}],
+  {output:await output(t),deadlineSeconds:10,cleanupSeconds:1,requiredCases:[{id:'misregistered',tier:'local'}]});
+  assert.equal(report.status,'incomplete');assert.equal(paid,false);
+  assert.equal(report.results.find(r=>r.id==='misregistered'&&r.tier==='local').status,'incomplete');
+});
+test('passing prerequisites execute all tiers and report mandatory coverage',async t=>{
+  const called=[],requiredCases=['local','deepseek','remote'].map(tier=>({id:tier,tier}));
+  const report=await runCases([...requiredCases].reverse().map(item=>({...item,run:async()=>{called.push(item.id);}})),
+    {output:await output(t),requiredCases,deadlineSeconds:10,cleanupSeconds:1});
+  assert.equal(report.status,'passed');assert.deepEqual(called,['local','deepseek','remote']);
+  assert.deepEqual(report.coverage.completed,requiredCases.map(c=>c.id));
+});
