@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, cp, rm, symlink } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -22,7 +22,7 @@ export async function until(check,timeout=15000) {
   while (Date.now()<end) {const value=await check();if(value)return value;await delay(50);}
   throw new Error('Timed out waiting for observable driver transition');
 }
-export async function setup(t,scenario,ids) {
+export async function setup(t,scenario,ids,{install=true}={}) {
   const root = await mkdtemp(join(process.env.DRIVER_ARTIFACTS ?? tmpdir(),'driver-acceptance-'));
   const instance = join(root,'instance'), server = await provider(scenario,{nativeSession:async()=>
     rows(instance,'SELECT session FROM attempts WHERE session IS NOT NULL ORDER BY rowid DESC LIMIT 1')[0]?.session});
@@ -78,9 +78,10 @@ export async function setup(t,scenario,ids) {
     projects.push({id,goal:id,source,actor_seconds:120,
       verifier:{files:[fixture],command:`${quote(python)} ${quote(fixture)} verify ${quote(source)}`}});
   }
-  const config={baseline,skills,projects,environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local'}}};
+  const config={baseline,skills,projects,install,environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local'}}};
   const input=join(root,'bootstrap.json');await writeFile(input,JSON.stringify(config));
   const boot=execute(process.execPath,[cli,'bootstrap',instance,'--config',input]);await boot.output;
+  if(!install)await symlink(resolve('node_modules'),join(instance,'machinery','node_modules'),'dir');
   cli=join(instance,'machinery','cli','main.mjs');
   // Install only the configurable test embedding module, never replace runtime code.
   await cp(fixture,join(instance,'machinery','ascend_tools','fixture_embeddings.py'));
