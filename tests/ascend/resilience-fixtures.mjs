@@ -85,6 +85,14 @@ test('public command discovers real case modules without circular imports',async
   const report=JSON.parse(stdout);assert.equal(report.status,'passed');
   assert.equal(report.results[0].evidence.nativeBashEdit,true);
 });
+test('public command accepts a relative report directory from outside the checkout',async t=>{
+  const root=await directory(t),entry=new URL('./resilience/cli.mjs',import.meta.url).pathname;
+  const {stdout}=await promisify(execFile)(process.execPath,[entry,'--tier','local','--case','workspace-snapshots',
+    '--deadline-seconds','310','--output','relative/report'],{cwd:root});
+  const report=JSON.parse(stdout);assert.equal(report.status,'passed');
+  assert.equal(report.output,join(root,'relative','report'));assert.ok(report.revision);
+  assert.equal(JSON.parse(await readFile(join(report.output,'report.json'),'utf8')).status,'passed');
+});
 for(const phase of ['preflight','upload'])test(`case cancellation reaches native ${phase} without caller settings`,async t=>{
   const root=await directory(t),abort=new AbortController();let dispatched=false;
   const source=join(root,'source');await mkdir(source);await writeFile(join(source,'answer.py'),'value=42\n');

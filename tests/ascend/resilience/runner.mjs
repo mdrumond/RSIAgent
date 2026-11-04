@@ -1,5 +1,6 @@
 import {mkdir,writeFile,mkdtemp,access} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {tmpdir} from 'node:os';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
@@ -14,7 +15,7 @@ export async function runCases(cases,{output,tier='all',caseId,seed=1,profile='n
   const selected=cases.filter(c=>(tier==='all'||c.tier===tier)&&(!caseId||c.id===caseId));
   if(!selected.length)throw Error('No matching resilience cases');
   if(new Set(cases.map(c=>c.id)).size!==cases.length)throw Error('Duplicate resilience case id');
-  output??=await mkdtemp(join(tmpdir(),'rsi-resilience-'));await mkdir(output,{recursive:true});
+  output=resolve(output??await mkdtemp(join(tmpdir(),'rsi-resilience-')));await mkdir(output,{recursive:true});
   try {await access(join(output,'report.json'));throw Error('Use a fresh report directory');}
   catch(error){if(error.code!=='ENOENT')throw error;}
   const started=performance.now(),cutoff=started+(deadlineSeconds-cleanupSeconds)*1000;
@@ -23,7 +24,8 @@ export async function runCases(cases,{output,tier='all',caseId,seed=1,profile='n
   if(tier==='all'&&!caseId)for(const required of ['local','deepseek','remote'])
     if(!cases.some(c=>c.tier===required))report.results.push({id:`tier:${required}`,tier:required,
       status:'incomplete',reason:'Required tier has no registered cases'});
-  try {report.revision=(await promisify(execFile)('git',['rev-parse','HEAD'])).stdout.trim();}catch{report.revision=null;}
+  try {report.revision=(await promisify(execFile)('git',['-C',fileURLToPath(new URL('../../..',import.meta.url)),
+    'rev-parse','HEAD'])).stdout.trim();}catch{report.revision=null;}
   const save=()=>writeFile(join(output,'report.json'),JSON.stringify(report,null,2)+'\n');
   for(const item of selected) {
     const remaining=cutoff-performance.now();
