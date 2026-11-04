@@ -65,7 +65,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
         await checkVerifier();
         const evidence=join(attemptPath,`verify-${purpose}-${Date.now()}.log`);
         await appendFile(evidence,output);
-        return {passed:response.exitCode === 0,exitCode:response.exitCode,evidence};
+        const evidence_sha256=createHash('sha256').update(await readFile(evidence)).digest('hex');
+        return {passed:response.exitCode === 0,exitCode:response.exitCode,evidence,evidence_sha256};
       };
       const correctness=await check(project.verifier.command,'verification');
       const performance=project.verifier.performance_command
@@ -81,7 +82,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       reachesTools:()=>['mcp__kdb__search'],
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
-    pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier.',
+    pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier. Returns controller-local evidence paths and SHA-256 digests for lesson references.',
       parameters:Type.Object({}),execute:async(_id,_args,nativeSignal)=>result(await workflow.validate(nativeSignal))});
     pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance automatically to the next canonical step. Do not specify a step name. Design and optimisation require reflection.',
       parameters:Type.Object({reflection:Type.Optional(Type.String())}),
