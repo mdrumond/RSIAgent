@@ -134,6 +134,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     session.agent.toolExecution='sequential';
     if(knowledge.prepareSession)await knowledge.prepareSession(session,{signal});
     else await session.bindExtensions({});
+    session.setActiveToolsByName(session.getActiveToolNames().filter(name=>
+      !name.startsWith('mcp__kdb__') || ['mcp__kdb__search','mcp__kdb__read_entry'].includes(name)));
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
@@ -147,7 +149,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       if (!clock.remaining) void session.abort();
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');
-    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project.`);
+    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.`);
     await session.waitForIdle();
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
