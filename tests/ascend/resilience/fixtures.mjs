@@ -29,7 +29,7 @@ export async function target({root,scheduler=schedule()}={}) {
   await mkdir(workspace,{recursive:true});
   const operations=sdk.createLocalBashOperations();
   const save=()=>writeFile(join(root,'backend.json'),JSON.stringify([...jobs].map(([handle,j])=>
-    ({handle,state:j.state,exit:j.exit})),null,2));
+    ({handle,state:j.state,exit:j.exit,stdout:j.stdout})),null,2));
   const client=async(args,{signal}={})=>{
     calls.push(args);const override=await scheduler.at(args[0],{handle:args[1]},signal);
     if(override)return override;
