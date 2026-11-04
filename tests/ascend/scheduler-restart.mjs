@@ -40,8 +40,16 @@ async function seededLease(f,owner,{terminal=true,unknown=false,held=false}={}){
 
 test('public CLI scheduler loss leaves worker running; restart reclaims only its settled lease without replay',
   {timeout:120000},async t=>{
-  const f=await setup(t,'interrupt',['first','unrelated'],{install:false});
-  const entered=join(f.root,'entered'),release=join(f.root,'release'),module=join(f.root,'machinery','restart-environment.mjs');
+  let f,release;
+  t.after(async()=>{
+    if(!f)return;
+    if(release)await writeFile(release,'release');
+    await f.run('stop');
+    await until(async()=>{for(const row of rows(f.root,'SELECT owner FROM attempts'))if(!await ownerStopped(row.owner))return false;return true;},15000);
+  });
+  f=await setup(t,'interrupt',['first','unrelated'],{install:false});
+  release=join(f.root,'release');
+  const entered=join(f.root,'entered'),module=join(f.root,'machinery','restart-environment.mjs');
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/index.mjs';
 export async function createEnvironment(options,context){
  const env=await base(options,context);
@@ -49,8 +57,6 @@ export async function createEnvironment(options,context){
  ${JSON.stringify(`python -c "from pathlib import Path; import time; Path('${entered}').touch();\nwhile not Path('${release}').exists(): time.sleep(.01)"`)}:command,cwd,opts)};
 }\n`);
   await configure(f,{curriculum:{phase1:['first']},environment:{module:'machinery/restart-environment.mjs',options:{mode:'local'}}});
-  t.after(async()=>{await writeFile(release,'release');await f.run('stop');
-    await until(async()=>{for(const row of rows(f.root,'SELECT owner FROM attempts'))if(!await ownerStopped(row.owner))return false;return true;},15000);});
   const wave=f.start('wave'),killed=assert.rejects(wave.output);
   await until(async()=>{try{await readFile(entered);return true;}catch(error){if(error.code!=='ENOENT')throw error;}});
   const [original]=rows(f.root,'SELECT * FROM attempts');
