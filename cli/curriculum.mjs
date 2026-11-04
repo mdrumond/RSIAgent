@@ -85,7 +85,7 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
   const root=join(path,'investigation');await mkdir(root,{recursive:true});
   const source=join(root,'source');
   const prior=job.resume && state.events(job.attempt.id).some(e=>e.type==='curriculum-session'&&e.data.role==='investigation');
-  if(!prior)await cp(base.source,source,{recursive:true});
+  if(!prior)await cp(base.source,source,{recursive:true,verbatimSymlinks:true});
   let proposal=job.resume?state.events(job.attempt.id).findLast(e=>e.type==='curriculum-proposal')?.data.proposal:undefined;
   if(!proposal)await curriculumSession({config,path:root,bridge,signal,state,attemptId:job.attempt.id,role:'investigation',resume:job.resume,accepted:()=>Boolean(proposal),prompt:
     `Read the failed project's diagnostics and existing KDB memory. Original goal: ${base.goal}.\n`+

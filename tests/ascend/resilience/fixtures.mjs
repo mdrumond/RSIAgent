@@ -29,7 +29,7 @@ export async function target({root,scheduler=schedule()}={}) {
   await mkdir(workspace,{recursive:true});
   const operations=sdk.createLocalBashOperations();
   const save=()=>writeFile(join(root,'backend.json'),JSON.stringify([...jobs].map(([handle,j])=>
-    ({handle,state:j.state,exit:j.exit})),null,2));
+    ({handle,state:j.state,exit:j.exit,stdout:j.stdout})),null,2));
   const client=async(args,{signal}={})=>{
     calls.push(args);const override=await scheduler.at(args[0],{handle:args[1]},signal);
     if(override)return override;
@@ -41,7 +41,7 @@ export async function target({root,scheduler=schedule()}={}) {
       const handle=`remote:fixture:transfer:${++sequence}`,abort=new AbortController();
       const job={state:'running',stdout:'',abort};jobs.set(handle,job);await save();
       job.done=(async()=>{await mkdir(dirname(destination),{recursive:true});
-        await cp(source,destination,{recursive:true});job.state=abort.signal.aborted?'cancelled':'completed';})()
+        await cp(source,destination,{recursive:true,verbatimSymlinks:true});job.state=abort.signal.aborted?'cancelled':'completed';})()
         .catch(error=>{job.state='failed';job.stdout=String(error);}).then(save);
       if(args.includes('--receipt-file'))await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));
       await scheduler.at(`${args[0]}.after-receipt`,{handle},signal);

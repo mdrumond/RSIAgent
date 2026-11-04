@@ -8,6 +8,37 @@ import {createLiveFixture,constructionResume,digest,until} from './live-harness.
 import {readProcessStat} from '../../../integrations/environments/index.mjs';
 import {processIdentity,ownerStopped,attemptStopped} from '../../../controller/lifecycle.mjs';
 
+export function verifyInvestigation(f,child){
+  const outcome=f.state.attempt(child.id).outcome,events=f.state.events(child.id);
+  assert.ok(['passed','failed'].includes(outcome),'Investigation must be terminal');
+  if(outcome==='passed')f.verifyAccepted(child);
+  else{
+    assert.equal(events.some(e=>e.type==='accepted'),false);
+    assert.ok(events.some(e=>e.type==='verification'&&e.data.passed===false),'Failed investigation requires actual negative verification');
+    assert.ok(events.some(e=>e.type==='recovery-completed'&&e.data.lesson?.evidence?.length));
+  }
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM recovery_lessons WHERE recorded=0').get().n,0);
+  return outcome==='passed';
+}
+
+export function verifyPostCompaction(events){
+  const boundary=events.findLastIndex(e=>e.type==='compaction_end'&&e.result);
+  assert.ok(boundary>=0,'Native compaction must complete');
+  const starts=new Map(),successful=[];
+  for(const e of events.slice(boundary+1)){
+    if(e.type==='tool_execution_start')starts.set(e.toolCallId,e);
+    if(e.type==='tool_execution_end'&&!e.isError&&!e.result?.isError&&!e.result?.structuredContent?.isError){
+      const start=starts.get(e.toolCallId);if(start?.toolName===e.toolName)successful.push({...e,args:start.args});
+    }
+  }
+  const text=e=>(e.result.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
+  assert.ok(successful.some(e=>e.toolName==='read'&&/(^|\/)proof\.txt$/.test(e.args.path)&&text(e).trim()==='42'),'Successful post-compaction proof read required');
+  assert.ok(successful.some(e=>e.toolName==='bash'&&e.args.command.includes('proof.txt')&&e.args.command.includes('sum(')&&e.result.structuredContent?.exit_code===0&&/\b42\b/.test(text(e))&&(/\bassert\b/.test(e.args.command)||/equal=\s*True\b/.test(text(e)))),'Successful independent post-compaction Bash result required');
+  assert.ok(successful.some(e=>e.toolName==='mcp__kdb__search'&&e.args.kind==='negative'&&e.args.query?.trim()&&
+    e.result.structuredContent?.structuredContent?.result?.some(r=>r.kind==='negative'&&r.collection&&r.chunk_id&&r.text)),'Successful post-compaction indexed negative search required');
+  return successful.map(e=>({id:e.toolCallId,tool:e.toolName}));
+}
+
 export const cases=[
   {id:'deepseek-readiness',tier:'deepseek',async run(ctx){
     let before=0,after=0;
@@ -101,27 +132,28 @@ export const cases=[
   {id:'deepseek-compaction',tier:'deepseek',async run(ctx){
     const f=await createLiveFixture(ctx,{admit:false}),session=await f.openSession(),file=session.sessionManager.getSessionFile();
     let exhausted=false;const timer=setTimeout(()=>{exhausted=true;session.abortCompaction();void session.abort();},(f.config.investigation_seconds??300)*1000),abort=()=>{session.abortCompaction();void session.abort();};ctx.signal.addEventListener('abort',abort,{once:true});
-    let calls=0;session.subscribe(event=>{if(event.type==='tool_execution_end')calls++;});
+    let calls=0;const trace=[];session.subscribe(event=>{trace.push(event);if(event.type==='tool_execution_end')calls++;});
     try{
+      await session.prompt('Retain this bounded background for later numeric tool work. Acknowledge briefly without tools. '+ 'The immutable arithmetic contract is six times seven equals forty two. '.repeat(80));await session.waitForIdle();
       await session.prompt('Use native bash to write proof.txt containing the integer42 computed as6*7. Retrieve positive arithmetic evidence using mcp__kdb__search. Then report what the file and tool actually returned.');await session.waitForIdle();
       assert.ok(calls>=2);const first=calls;assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');
       await session.compact('Keep the exact proof.txt path, numeric result42 and indexed citation; further tool work follows.');
       assert.ok(session.sessionManager.getEntries().some(e=>e.type==='compaction'));
       await session.prompt('After compaction use native read to inspect proof.txt, native bash to independently assert its integer equals sum(6 for _ in range(7)), and mcp__kdb__search for negative arithmetic evidence. Report only observed results.');await session.waitForIdle();
-      ctx.signal.throwIfAborted();assert.equal(exhausted,false);assert.ok(calls>=first+3);assert.equal(session.sessionManager.getSessionFile(),file);
-      assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');return {session:file,compacted:true,toolCallsBefore:first,toolCallsAfter:calls-first};
+      ctx.signal.throwIfAborted();assert.equal(exhausted,false);const postTools=verifyPostCompaction(trace);assert.equal(session.sessionManager.getSessionFile(),file);
+      assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');return {session:file,compacted:true,toolCallsBefore:first,toolCallsAfter:calls-first,postTools};
     }finally{clearTimeout(timer);ctx.signal.removeEventListener('abort',abort);}
   }},
   {id:'deepseek-wave-recovery',tier:'deepseek',async run(ctx){
     const f=await createLiveFixture(ctx,{admit:false}),parent=await f.seedFailure(),original=structuredClone(f.state.project('numeric').spec);
     const first=await f.command('wave');assert.equal(first.results.length,1);
-    const child=f.state.db.prepare('SELECT * FROM attempts WHERE id<>?').get(parent.id);assert.ok(child);f.verifyAccepted(child);
+    const child=f.state.db.prepare('SELECT * FROM attempts WHERE id<>?').get(parent.id);assert.ok(child);const investigationPassed=verifyInvestigation(f,child);
     const recovery=f.state.db.prepare('SELECT kind,eligible_wave FROM recovery_queue WHERE project=?').get('numeric');
     assert.equal(recovery.kind,'retry');assert.ok(recovery.eligible_wave>first.wave);
     await f.command('wave');const retry=f.state.db.prepare('SELECT * FROM attempts WHERE id<>? AND id<>?').get(parent.id,child.id);
     assert.ok(retry);f.verifyAccepted(retry);assert.equal(f.state.project('numeric').status,'passed');
     assert.deepEqual(f.state.project('numeric').spec,original);assert.deepEqual(f.state.attempt(parent.id),parent);
     assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM recovery_lessons WHERE recorded=0').get().n,0);
-    return {original:parent.id,investigation:child.id,retry:retry.id,nextWaveRecovery:true};
+    return {original:parent.id,investigation:child.id,investigationPassed,retry:retry.id,projectPassed:true,nextWaveRecovery:true};
   }}
 ];
