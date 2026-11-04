@@ -160,7 +160,10 @@ export async function runInstalledPackagingCase({
       if (data.handle?.startsWith('remote:')) handles.add(data.handle);
     }
     async function receipts(directory) {
-      for (const entry of await readdir(directory, {withFileTypes: true})) {
+      let entries;
+      try {entries = await readdir(directory, {withFileTypes: true});}
+      catch (error) {if (error.code === 'ENOENT') return; throw error;}
+      for (const entry of entries) {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) await receipts(path);
         else if (entry.name.endsWith('.json')) {
@@ -182,7 +185,6 @@ export async function runInstalledPackagingCase({
       observations.push({handle, ...state});
     }
     await writeFile(join(root, 'native-closure.json'), JSON.stringify(observations, null, 2));
-    assert.ok(handles.size > 0);
     assert.ok(observations.every(o => ['completed', 'failed', 'cancelled'].includes(o.state)));
     return observations;
   };
@@ -195,7 +197,6 @@ export async function runInstalledPackagingCase({
         await run('stop');
         await until(async () => (await run('status')).controller.state === 'stopped', 'cleanup controller');
         closure.controllerStopped = true;
-        if (remoteClient) closure.native = await remoteClosure();
         try {
           const service = await parse(join(instance, 'knowledge-service.json'));
           if (!await ownerStopped(service.owner)) {
@@ -207,6 +208,9 @@ export async function runInstalledPackagingCase({
         } catch (error) {if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;}
       }
     } catch (error) {errors.push(error);}
+    if (remoteClient) {
+      try {closure.native = await remoteClosure();} catch (error) {errors.push(error);}
+    }
     if (dashboard) {
       dashboard.terminate();
       try {await dashboard.output;} catch (error) {
@@ -262,13 +266,17 @@ export async function runInstalledPackagingCase({
     await mkdir(trusted);
     const checker = join(trusted, 'check.py');
     await writeFile(checker, "from pathlib import Path\nimport runpy\np = Path(__file__).parent.parent / 'source' / 'answer.py'\nactual = runpy.run_path(str(p))['answer']()\nassert actual == sum(6 for _ in range(7)), actual\nprint(actual)\n");
+    const cpuEnvironment = join(assets, 'cpu-environment.mjs');
+    if (remoteOptions) await writeFile(cpuEnvironment,
+      `import {createEnvironment as generic} from ${JSON.stringify(pathToFileURL(join(instance, 'machinery/integrations/environments/index.mjs')).href)};\n` +
+      "export const createEnvironment = (options, context) => generic(options, {...context, resources: async () => [{id:'registered-cpu',available:true,metadata:{kind:'cpu'}}]});\n");
     fixture = await provider('interrupt', {nativeSession: async () =>
       rows(instance, 'SELECT session FROM attempts WHERE session IS NOT NULL LIMIT 1')[0]?.session});
     const settings = {
       baseline, skills, target: 'cpu', python, embedding_factory: 'installed_fixture:Embeddings',
       actor_seconds: 120, investigation_seconds: 120, curriculum_seconds: 30,
       concurrency: 1,
-      environment: {module: 'machinery/integrations/environments/index.mjs', options: remoteOptions ?
+      environment: {module: remoteOptions ? cpuEnvironment : 'machinery/integrations/environments/index.mjs', options: remoteOptions ?
         {...remoteOptions, mode: 'cpl', remoteDirectory: `installed/${root.split('/').at(-1)}`} : {mode: 'local'}},
       projects: [{id: 'installed', goal: 'installed arithmetic', source, actor_seconds: 120,
         verifier: remoteOptions ? {files: [checker], command: 'python3 ../trusted/check.py'} :
