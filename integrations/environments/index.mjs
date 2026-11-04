@@ -55,10 +55,10 @@ async function save(path, value) {
 
 // Only the installed public CLI owns remote protocols and credentials.
 export function createCplClient(executable = join(homedir(), '.agents/skills/remote-access/scripts/cpl-remote')) {
-  return async args => {
+  return async (args,{signal}={}) => {
     await readFile(join(homedir(), '.agents/skills/remote-access/SKILL.md'), 'utf8');
     return new Promise((resolve, reject) => {
-      const child = spawn(executable, ['--json', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(executable, ['--json', ...args], { stdio: ['ignore', 'pipe', 'pipe'],signal });
       let output = '', error = '';
       child.stdout.on('data', data => { output += data; });
       child.stderr.on('data', data => { error += data; });

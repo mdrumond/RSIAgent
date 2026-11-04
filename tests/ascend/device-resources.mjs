@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createCplClient, createEnvironmentTools } from '../../integrations/environments/index.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { State } from '../../controller/state.mjs';
@@ -34,9 +36,10 @@ outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
 print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], jobs = new Map();
-  let runWorkload = false, onSync = async () => {}, running = false;
+  let runWorkload = false, onSync = async () => {}, running = false, queued = 0;
+  let waitSignal;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
-  const client = async args => {
+  const client = async (args,{signal}={}) => {
     calls.push(args);
     if (args[0] === 'npu') return { state: 'completed', profiles: [{ target: 'fixture', devices: enabled.map(id => ({ id, enabled: true })) }] };
     if (args[0] === 'capabilities') return { state: 'available' };
@@ -65,6 +68,8 @@ print(outputs[query])
       if (args.includes('--receipt-file')) await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));
       return { handle, state: 'queued' };
     }
+    if(args[0]==='observe' && queued>0){queued--;return {state:'queued'};}
+    if(args[0]==='observe' && waitSignal && args.includes('--wait'))return waitSignal(signal);
     if (args[0] === 'observe') return { state: disconnect ? 'observation-unavailable' : running ? 'running' : 'completed', exit: jobs.get(args[1])?.exit ?? 0 };
     if (args[0] === 'logs') return { state: 'completed', content: jobs.get(args[1])?.content };
     throw new Error('unexpected CPL operation '+args[0]);
@@ -77,7 +82,7 @@ print(outputs[query])
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, rows, telemetry,
     setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
-    runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
+    queued:value=>{queued=value;}, wait:fn=>{waitSignal=fn;},runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
 
@@ -234,13 +239,14 @@ test('workload guard after sync refuses changed health before arbitrary Bash', a
   assert.equal(await readFile(marker,'utf8'),'');
 });
 
-test('short caller bounds pending-probe observation and retains same handle',async t=>{
+test('explicit observation allowance bounds pending-probe wait and retains same handle',async t=>{
   const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
-  const bound=await createEnvironment({...f.options,pollMs:500},{...f.context,resource:lease});
+  const bound=await createEnvironment({...f.options,pollMs:500,probeObservationSeconds:.02},{...f.context,resource:lease});
   f.disconnect(true);
   await assert.rejects(bound.execute('true',f.source,{timeout:3}),/unresolved/);
   const handle=f.lastProbe().handle,submitted=f.calls.filter(a=>a[0]==='run').length;
   f.disconnect(false);f.running(true);
+  f.wait(signal=>delay(500,undefined,{signal}).then(()=>({state:'running'})));
   const started=performance.now();
   await assert.rejects(bound.execute('true',f.source,{timeout:.02}),/unresolved/);
   assert.ok(performance.now()-started<200,'current caller must not wait original probe allocation');
@@ -250,4 +256,80 @@ test('short caller bounds pending-probe observation and retains same handle',asy
   await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'pending'}});
   assert.equal((await bound.execute('true',f.source,{timeout:3})).exitCode,0);
   assert.equal(f.calls.filter(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('probe.sh')).length,2);
+});
+
+
+async function stalePending(f) {
+  const path=join(dirname(dirname(f.lastProbe().receipt)),'pending.json');
+  const value=JSON.parse(await readFile(path,'utf8'));
+  value.startedMonotonic=(process.hrtime.bigint()-10_000_000_000n).toString();
+  delete value.freshnessMonotonic;
+  await writeFile(path,JSON.stringify(value));return path;
+}
+
+test('native SDK stale pending closure retains evidence then one fresh probe admits workload',async t=>{
+  const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
+  let depth=0;const clock=new ActorClock(30,2);
+  const bound=await createEnvironment(f.options,{...f.context,resource:lease,
+    exclude:(label,fn)=>clock.exclude(label,async()=>{depth++;try{return await fn();}finally{depth--;}})});
+  f.disconnect(true);await assert.rejects(bound.execute('must-not-run',f.source,{timeout:3}),/unresolved/);
+  const old=f.lastProbe().handle,pending=await stalePending(f);
+  const runs=f.calls.filter(a=>a[0]==='run').length;
+  f.disconnect(false);f.runWorkload();f.running(true);
+  f.wait(async()=>{await delay(20);f.running(false);return {state:'completed',exit:0};});
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'stale'}});
+  const marker=join(f.context.instancePath,'accepted');
+  const [tool]=await createEnvironmentTools(bound,f.source);
+  const result=await tool.execute('cpu',{command:`touch '${marker}'`,timeout:3});
+  assert.notEqual(result.isError,true);assert.equal(await readFile(marker,'utf8'),'');
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,runs+3);
+  assert.equal(f.calls.filter(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('probe.sh')).length,3);
+  const completed=f.events.find(e=>e.type==='resource-probe-completed'&&e.handle===old);
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]===old&&a.includes('--wait')));
+  assert.equal(completed.executionSeconds,0);assert.equal(completed.accountingExcluded,true);
+  assert.equal(JSON.parse(await readFile(completed.observation,'utf8')).handle,old);
+  assert.ok(f.events.some(e=>e.type==='resource-probe-stale'&&e.handle===old));
+  await assert.rejects(readFile(pending),{code:'ENOENT'});
+  assert.ok(clock.elapsed<2.5);assert.equal(depth,0);
+});
+
+test('confirmed queued time does not age measurements; completion never resets freshness',async t=>{
+  const f=await fixture(t);f.disconnect(true);await assert.rejects(f.environment.resources(),/unresolved/);
+  const old=f.lastProbe().handle;await stalePending(f);
+  f.disconnect(false);f.queued(1);
+  assert.ok((await f.environment.resources()).some(row=>row.available));
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,1);
+  assert.equal(f.events.find(e=>e.type==='resource-probe-completed').handle,old);
+  assert.equal(f.events.some(e=>e.type==='resource-probe-stale'),false);
+});
+
+test('probe cancellation retains receipt and never submits replacement',async t=>{
+  const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
+  const bound=await createEnvironment(f.options,{...f.context,resource:lease});
+  const abort=new AbortController();f.running(true);
+  f.wait(async()=>{abort.abort();return {state:'observation-unavailable'};});
+  const count=f.calls.filter(a=>a[0]==='run').length;
+  await assert.rejects(bound.execute('must-not-run',f.source,{timeout:3,signal:abort.signal}),/abort/i);
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,count+1);
+  const pending=JSON.parse(await readFile(join(dirname(dirname(f.lastProbe().receipt)),'pending.json'),'utf8'));
+  assert.equal(pending.handle,f.lastProbe().handle);
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a.includes('--wait')));
+});
+
+
+test('standard CPL client cancellation closes only its local observer process',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'probe-observer-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const executable=join(root,'observer'),identity=join(root,'pid');
+  await writeFile(executable,`#!/usr/bin/env python3
+import os,time
+open(${JSON.stringify(identity)},'w').write(str(os.getpid()))
+time.sleep(10)
+`,{mode:0o700});
+  const abort=new AbortController(),pending=createCplClient(executable)(['observe','same-handle','--wait'],{signal:abort.signal});
+  let pid;const deadline=performance.now()+2000;
+  while(!pid&&performance.now()<deadline){try{pid=Number(await readFile(identity,'utf8'));}catch{}await delay(5);}
+  assert.ok(pid);abort.abort();await assert.rejects(pending,{name:'AbortError'});
+  let stopped=false;
+  while(!stopped&&performance.now()<deadline){try{process.kill(pid,0);}catch(error){if(error.code==='ESRCH')stopped=true;else throw error;}await delay(5);}
+  assert.equal(stopped,true);
 });
