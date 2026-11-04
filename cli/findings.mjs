@@ -7,7 +7,7 @@ export async function findingsFor(options) {
   const {state,job,path,passed}=options,file=join(path,'findings.json');
   try{return JSON.parse(await readFile(file,'utf8'));}
   catch(error){if(error.code!=='ENOENT')throw error;}
-  const events=state.events(job.attempt.id).filter(e=>['verification','rejected','attempt-error','stage-completed'].includes(e.type)).slice(-12);
+  const events=state.events(job.attempt.id).filter(e=>['verification','rejected','attempt-error','stage-completed','curriculum-session','curriculum-interrupted'].includes(e.type)).slice(-12);
   const evidence=join(path,'diagnostics.json'),content=JSON.stringify(events,null,2)+'\n';
   await writeFile(evidence,content);
   let findings;

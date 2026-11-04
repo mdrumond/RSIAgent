@@ -124,7 +124,11 @@ test('native curriculum returns executable source-relative verifier after reloca
   config.actor={provider:'service-fixture',model:'scripted',base_url:`http://127.0.0.1:${server.address().port}/v1`,credential_env:'SERVICE_FIXTURE_KEY',
     metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
   const path=join(config.root,'attempt');await mkdir(path);
-  const spec=await investigate({config,path,job:{origin_attempt:'failed',actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state:{events:()=>[],attempt:()=>({})},bridge:{extension:()=>{}}});
+  const state=new State(join(config.root,'curriculum.sqlite'));t.after(()=>state.close());
+  state.add({id:'p',source,goal:'numeric',actor_seconds:120,verifier:{files:[],command:'true'}});
+  const attempt=state.admit('p',await processIdentity());
+  const spec=await investigate({config,path,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state,bridge:{extension:()=>{}}});
+  assert.equal(state.events(attempt.id).find(e=>e.type==='curriculum-session').data.role,'investigation');
   assert.equal(spec.performance_goal,undefined);
   const relocated=join(config.root,'relocated');await cp(join(path,'investigation'),relocated,{recursive:true});await rm(path,{recursive:true});
   const result=await promisify(execFile)('bash',['-c',spec.verifier.command],{cwd:join(relocated,'source')});assert.equal(Number(result.stdout.trim()),42);
@@ -176,7 +180,7 @@ test('native summary and investigation retrieve authoritative diagnostics despit
     metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
   const findings=await summarize({config,path,state,job:{attempt},bridge:{extension:()=>{}},passed:true});
   assert.equal(findings.evidence[0].path,evidence);
-  await investigate({config,path,state,job:{origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric'},bridge:{extension:()=>{}}});
+  await investigate({config,path,state,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric'},bridge:{extension:()=>{}}});
   assert.deepEqual(retrieved,[{session,evidence},{session,evidence}]);
   assert.equal(state.events(attempt.id).filter(event=>event.type==='pi-event').length,80);
 });
