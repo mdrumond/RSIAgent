@@ -1,0 +1,97 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+import {once} from 'node:events';
+import {spawnSync} from 'node:child_process';
+import {mkdtemp,mkdir,writeFile,rm,readdir} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {loadLiveProfile,createLiveFixture,digest} from './resilience/live-harness.mjs';
+import {cases,verifyInvestigation} from './resilience/live.case.mjs';
+import {RecoveryQueue} from '../../controller/recovery.mjs';
+import {processIdentity} from '../../controller/lifecycle.mjs';
+import {runCases} from './resilience/runner.mjs';
+import {stages} from '../../controller/workflow.mjs';
+
+test('missing live credentials are blocked before fixture resources or paid dispatch',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'live-blocked-')),old=process.env.RESILIENCE_LIVE_PROFILE;
+  t.after(async()=>{if(old===undefined)delete process.env.RESILIENCE_LIVE_PROFILE;else process.env.RESILIENCE_LIVE_PROFILE=old;await rm(root,{recursive:true,force:true});});
+  delete process.env.RESILIENCE_LIVE_PROFILE;
+  const report=await runCases(cases,{output:join(root,'report'),tier:'deepseek',caseId:'deepseek-readiness',deadlineSeconds:10,cleanupSeconds:2});
+  assert.equal(report.status,'blocked');assert.equal(report.results[0].status,'blocked');
+  assert.deepEqual(await readdir(join(root,'report/deepseek-readiness')),[]);
+});
+
+test('safe live preflight makes no request; real native canonical fixture uses a scripted loopback provider',{timeout:45000},async t=>{
+  const root=await mkdtemp(join(tmpdir(),'live-native-')),requests=[],cleanup=[];let complete=false,compactCalls=null,summaryPayload='Numeric fact 42. '.repeat(256);const abort=new AbortController();
+  const calls=[];for(const stage of stages){calls.push(['rsi_skill',{}]);
+    if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])calls.push(['rsi_knowledge',{query:'integer sum',kind}]);
+    if(stage==='implementation')calls.push(['write',{path:'solution.py',content:'def solve(values):\n    return sum(values)\n'}],['rsi_target',{command:'python -c "import solution;assert solution.solve([2,3])==5"'}]);
+    if(stage==='validation')calls.push(['rsi_verify',{}]);calls.push(['rsi_advance',{reflection:'Observed independent integer evidence retained.'}]);
+  }
+  const server=createServer(async(req,res)=>{
+    let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests.push(body);
+    const index=body.messages.reduce((count,m)=>count+(m.tool_calls?.length??0),0),call=compactCalls===null?calls[index]:body.tools?.length?compactCalls.shift():null;
+    res.writeHead(200,{'Content-Type':'text/event-stream'});
+    const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'live-fixture',object:'chat.completion.chunk',created:1,model:'deepseek-flash',choices:[{index:0,delta,finish_reason}]})+'\n\n');
+    if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
+    else{
+      const summarizing=compactCalls!==null&&!body.tools?.length,limit=body.max_tokens??body.max_completion_tokens??0;
+      const payload=summarizing?summaryPayload:'Verified.',capacity=summarizing?limit*4:payload.length;
+      frame({role:'assistant',content:payload.slice(0,capacity)});frame({},payload.length>capacity?'length':'stop');
+    }res.end('data: [DONE]\n\n');
+  });server.listen(0,'127.0.0.1');await once(server,'listening');
+  const key='LIVE_SANITY_KEY',previous=process.env[key],old=process.env.RESILIENCE_LIVE_PROFILE;
+  process.env[key]='fixture-only';const path=join(root,'profile.json');process.env.RESILIENCE_LIVE_PROFILE=path;
+  await writeFile(path,JSON.stringify({python:process.env.PYTHON??'python3',actor:{provider:'deepseek',model:'deepseek-flash',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`},actor_seconds:30}));
+  t.after(async()=>{
+    const errors=[];for(const fn of cleanup.reverse())try{await fn({signal:AbortSignal.timeout(15000),remainingSeconds:15});}catch(error){errors.push(error.message);}
+    server.closeAllConnections();await new Promise(ok=>server.close(ok));
+    if(previous===undefined)delete process.env[key];else process.env[key]=previous;
+    if(old===undefined)delete process.env.RESILIENCE_LIVE_PROFILE;else process.env.RESILIENCE_LIVE_PROFILE=old;
+    if(complete&&!errors.length)await rm(root,{recursive:true,force:true});else t.diagnostic('Retained scripted fixture: '+root);assert.deepEqual(errors,[]);
+  });
+  const metadata=await loadLiveProfile();assert.equal(metadata.credentialsAvailable,true);assert.equal(metadata.provider,'deepseek');
+  for(const name of ['actor','credential_env','credentials_file','key'])assert.equal(Object.hasOwn(metadata,name),false);
+  assert.equal(requests.length,0);
+  await mkdir(join(root,'case'));
+  const fixture=await createLiveFixture({directory:join(root,'case'),signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
+  const result=await fixture.run();assert.equal(result.accepted,true);fixture.verifyAccepted();
+  assert.ok(requests.length>0);assert.ok(requests[0].tools.some(t=>t.function.name==='mcp__kdb__search'));
+  assert.ok(fixture.observations.some(e=>e.tool==='rsi_target'&&!e.error));
+  const negativeRoot=join(root,'capped-summary');await mkdir(negativeRoot);
+  const negative=await createLiveFixture({directory:negativeRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)},{admit:false});
+  const capped=await negative.openSession(),original=capped.sessionManager.getSessionFile();compactCalls=[null,null];
+  await capped.prompt('Retain numeric history. '+ 'Six times seven equals forty two. '.repeat(160));
+  await capped.prompt('Acknowledge this second bounded history turn. '+ 'Retain the arithmetic contract. '.repeat(128));summaryPayload='Numeric fact 42. '.repeat(4096);
+  await assert.rejects(capped.compact(),/token cap/);
+  assert.equal(capped.sessionManager.getEntries().some(e=>e.type==='compaction'),false);
+  assert.equal(capped.sessionManager.getSessionFile(),original);summaryPayload='Numeric fact 42. '.repeat(256);
+  const summaryStart=requests.length;
+  compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
+    ['read',{path:'proof.txt'}],['bash',{command:"python -c \"v=int(open('proof.txt').read()); assert v == sum(6 for _ in range(7)); print(v)\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
+  const compactRoot=join(root,'compaction');await mkdir(compactRoot);
+  const compact=await cases.find(c=>c.id==='deepseek-compaction').run({directory:compactRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
+  assert.equal(compact.compacted,true);assert.ok(compact.toolCallsBefore>=2);assert.ok(compact.toolCallsAfter>=3);
+  const summaries=requests.slice(summaryStart).filter(r=>!r.tools?.length);assert.ok(summaries.length>0);
+  assert.ok(summaries.every(r=>(r.max_tokens??r.max_completion_tokens)*4>=summaryPayload.length&&(r.max_tokens??r.max_completion_tokens)<=metadata.maxTokens));
+  assert.deepEqual(compactCalls,[]);
+  compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
+    ['read',{path:'absent-proof.txt'}],['bash',{command:'exit 1'}],['mcp__kdb__search',{query:'integer sum',kind:'invalid'}],null];
+  const badRoot=join(root,'failed-post-tools');await mkdir(badRoot);
+  await assert.rejects(cases.find(c=>c.id==='deepseek-compaction').run({directory:badRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)}),/Successful post-compaction/);
+  assert.deepEqual(compactCalls,[]);
+  await negative.seedFailure();const queue=new RecoveryQueue(negative.state);
+  for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);
+  const child=queue.claim('numeric',1,await processIdentity()).attempt;
+  const check=spawnSync(negative.project.verifier.command,{shell:true,cwd:negative.project.source,encoding:'utf8'});
+  assert.equal(check.error,undefined);assert.notEqual(check.status,0);
+  negative.state.event(child.id,'verification',{passed:false,exitCode:check.status});
+  negative.state.finish(child.id,'failed');const log=join(negativeRoot,'negative-verifier.log');await writeFile(log,check.stdout+check.stderr);
+  queue.complete(child.id,{passed:false,useful:true,findings:'Independent frozen verifier rejected the unchanged implementation.',evidence:[{path:log,sha256:await digest(log)}]},1);
+  assert.throws(()=>verifyInvestigation(negative,child));
+  for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);
+  assert.equal(verifyInvestigation(negative,child),false);assert.equal(queue.ready(1).length,0);
+  assert.equal(queue.ready(2)[0].kind,'retry');assert.equal(negative.state.project('numeric').status,'failed');
+  assert.equal(negative.state.events(child.id).some(e=>e.type==='accepted'),false);complete=true;
+});
