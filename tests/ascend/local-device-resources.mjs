@@ -174,7 +174,7 @@ if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv a
 os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
 `,{mode:0o700});
   const patch=join(driver.root,'local-config.json');
-  await writeFile(patch,JSON.stringify({python:wrapper,concurrency:'auto',environment:{module:'machinery/local-devices-fixture.mjs',options:{...health.options,
+  await writeFile(patch,JSON.stringify({python:wrapper,concurrency:'auto',environment:{module:'machinery/local-devices-fixture.mjs',options:{...health.options,profile:config.target,
     env:{...health.options.env,ASCEND_PHYSICAL_DEVICE:'7',ASCEND_RT_VISIBLE_DEVICES:'7',ASCEND_VISIBLE_DEVICES:'7'}}}}));
   await driver.run('config','--config',patch);wave=driver.start('wave');void wave.output.catch(()=>{});
   await driverUntil(async()=>{
