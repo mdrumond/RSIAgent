@@ -17,7 +17,9 @@ async function curriculumSession({config,path,bridge,prompt,tool,signal,state,at
   const interrupt=cause=>{reason??=cause;void session.abort();};
   const abort=()=>interrupt('external-signal');
   try {
-    session.agent.toolExecution='sequential';await session.bindExtensions({});
+    session.agent.toolExecution='sequential';
+    if(bridge.prepareSession)await bridge.prepareSession(session,{signal});
+    else await session.bindExtensions({});
     await state.event(attemptId,'curriculum-session',{role,session:session.sessionManager.getSessionFile(),allocation_seconds:seconds});
     signal?.addEventListener('abort',abort,{once:true});
     timer=setTimeout(()=>interrupt('elapsed-allocation'),seconds*1000);
