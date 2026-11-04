@@ -33,7 +33,7 @@ jobs:
           tests=()
           for file in tests/ascend/*.mjs; do
             case "$file" in
-              *_fixture.mjs|*_setup.mjs|*-fixture.mjs|*-worker.mjs|*/resilience-installed.mjs) continue ;;
+              *_fixture.mjs|*_setup.mjs|*-fixture.mjs|*-worker.mjs) continue ;;
             esac
             tests+=("$file")
           done
