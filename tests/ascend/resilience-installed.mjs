@@ -183,6 +183,7 @@ export async function runInstalledPackagingCase({
     env.PYTHONPATH = packageRoot;
     const baseline = join(assets, 'baseline.sqlite');
     await exec(python, [fixturePython, 'baseline', baseline]);
+    delete env.PYTHONPATH;
     const skills = join(assets, 'skills');
     await mkdir(skills);
     const scopes = ['preflight', 'task-construction', 'design', 'implementation', 'test',
@@ -214,7 +215,6 @@ export async function runInstalledPackagingCase({
     cli = join(instance, 'machinery', 'cli', 'main.mjs');
     const machinery = join(instance, 'machinery');
     await cp(fixturePython, join(instance, 'installed_fixture.py'));
-    env.PYTHONPATH = machinery;
     const sdkPath = join(machinery, 'node_modules', '@earendil-works', 'pi-coding-agent');
     assert.equal((await lstat(sdkPath)).isSymbolicLink(), false);
     assert.ok(inside(machinery, await realpath(sdkPath)));
