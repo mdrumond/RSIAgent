@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createCplClient, createEnvironmentTools } from '../../integrations/environments/index.mjs';
@@ -269,9 +271,12 @@ async function stalePending(f) {
 
 test('native SDK stale pending closure retains evidence then one fresh probe admits workload',async t=>{
   const f=await fixture(t),lease=(await f.environment.resources()).find(row=>row.available);
-  let depth=0;const clock=new ActorClock(30,2);
+  let depth=0,now=0,exclusions=0;const clock=new ActorClock(30,2,()=>now);
   const bound=await createEnvironment(f.options,{...f.context,resource:lease,
-    exclude:(label,fn)=>clock.exclude(label,async()=>{depth++;try{return await fn();}finally{depth--;}})});
+    exclude:(label,fn)=>clock.exclude(label,async()=>{
+      depth++;exclusions++;now+=10000;
+      try{return await fn();}finally{now+=10000;depth--;}
+    })});
   f.disconnect(true);await assert.rejects(bound.execute('must-not-run',f.source,{timeout:3}),/unresolved/);
   const old=f.lastProbe().handle,pending=await stalePending(f);
   const runs=f.calls.filter(a=>a[0]==='run').length;
@@ -290,7 +295,8 @@ test('native SDK stale pending closure retains evidence then one fresh probe adm
   assert.equal(JSON.parse(await readFile(completed.observation,'utf8')).handle,old);
   assert.ok(f.events.some(e=>e.type==='resource-probe-stale'&&e.handle===old));
   await assert.rejects(readFile(pending),{code:'ENOENT'});
-  assert.ok(clock.elapsed<2.5);assert.equal(depth,0);
+  assert.ok(exclusions>0);assert.equal(clock.elapsed,2);assert.equal(depth,0);
+  now+=750;assert.equal(clock.elapsed,2.75);
 });
 
 test('confirmed queued time does not age measurements; completion never resets freshness',async t=>{
@@ -325,11 +331,23 @@ import os,time
 open(${JSON.stringify(identity)},'w').write(str(os.getpid()))
 time.sleep(10)
 `,{mode:0o700});
-  const abort=new AbortController(),pending=createCplClient(executable)(['observe','same-handle','--wait'],{signal:abort.signal});
-  let pid;const deadline=performance.now()+2000;
-  while(!pid&&performance.now()<deadline){try{pid=Number(await readFile(identity,'utf8'));}catch{}await delay(5);}
-  assert.ok(pid);abort.abort();await assert.rejects(pending,{name:'AbortError'});
-  let stopped=false;
-  while(!stopped&&performance.now()<deadline){try{process.kill(pid,0);}catch(error){if(error.code==='ESRCH')stopped=true;else throw error;}await delay(5);}
-  assert.equal(stopped,true);
+  const instructions=join(root,'observer-instructions.md');
+  await writeFile(instructions,'Local observer fixture instructions');
+  const read=fs.readFile,skill=join(homedir(),'.agents/skills/remote-access/SKILL.md');
+  let instructionReads=0;
+  const mocked=t.mock.method(fs,'readFile',async(path,...args)=>{
+    if(path===skill){instructionReads++;return read(instructions,...args);}
+    return read(path,...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const abort=new AbortController(),pending=createCplClient(executable)(['observe','same-handle','--wait'],{signal:abort.signal});
+    let pid;const deadline=performance.now()+2000;
+    while(!pid&&performance.now()<deadline){try{pid=Number(await readFile(identity,'utf8'));}catch{}await delay(5);}
+    assert.ok(pid);abort.abort();await assert.rejects(pending,{name:'AbortError'});
+    let stopped=false;
+    while(!stopped&&performance.now()<deadline){try{process.kill(pid,0);}catch(error){if(error.code==='ESRCH')stopped=true;else throw error;}await delay(5);}
+    assert.equal(stopped,true);
+    assert.equal(instructionReads,1);
+  }finally{mocked.mock.restore();syncBuiltinESMExports();}
 });
