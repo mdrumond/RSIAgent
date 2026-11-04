@@ -148,6 +148,10 @@ test('stale acceptance resumes through revision and verifies edited source afres
   while(first.stage!=='acceptance')await step(first);
   source='edited';const resumed=new Workflow(options).restore(events);await resumed.skill();
   await assert.rejects(resumed.advance());
+  assert.equal(resumed.stage,'acceptance');
+  await assert.rejects(resumed.validate());
+  assert.equal(verified,1);assert.equal(resumed.stage,'acceptance');
+  assert.equal(events.some(e=>e.type==='accepted'),false);
   await resumed.advance({next:'implementation',reflection:'Final edit invalidated prior verification'});
   while(resumed.stage!=='acceptance')await step(resumed);
   assert.equal((await step(resumed)).accepted,true);assert.equal(verified,2);
