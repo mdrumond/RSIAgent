@@ -170,7 +170,7 @@ export async function importProject(root,spec) {
   const tree=join(own,'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
   const destination=join(tree,relative(common,source));
   const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
-  await cp(source,destination,{recursive:true,filter});
+  await cp(source,destination,{recursive:true,verbatimSymlinks:true,filter});
   const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
   const copied=[];
   for(const path of files) {

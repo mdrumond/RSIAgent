@@ -136,7 +136,16 @@ for name in sorted(parents,key=lambda p:p.count('/'),reverse=True):
   if error.errno==errno.ENOENT: continue
   if error.errno in (errno.ENOTEMPTY,errno.EEXIST) and name not in c['files']: continue
   raise
-shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True)
+# Replace physical entries, never write through an old destination symlink.
+for directory, directories, files in os.walk(c['incoming'],followlinks=False):
+ for name in directories+files:
+  source=os.path.join(directory,name)
+  destination=os.path.join(c['project'],os.path.relpath(source,c['incoming']))
+  if os.path.islink(destination): os.unlink(destination)
+  elif os.path.islink(source) and os.path.lexists(destination):
+   if os.path.isdir(destination): os.rmdir(destination)
+   else: os.unlink(destination)
+shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True,symlinks=True)
 with open(manifest,'w') as f: json.dump(c['files'],f)
 `;
 
