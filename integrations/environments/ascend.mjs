@@ -37,8 +37,9 @@ if 'command' in c:
  * Idle-only availability keeps the core's parallel leases independent of health policy.
  */
 export async function createEnvironment(options, context) {
-  if (options.mode !== 'cpl' || !options.target || !options.runtime || !options.instructionFile)
-    throw new Error('Ascend binding requires CPL target, registered runtime, and instructionFile');
+  const local = options.mode === 'local';
+  if ((!local && options.mode !== 'cpl') || !options.target || !options.runtime || !options.instructionFile)
+    throw new Error('Ascend binding requires target, registered runtime, and instructionFile');
   if (!['a3', 'a5'].includes(options.health?.product)) throw new Error('Explicit A3/A5 health profile required');
   const seconds = options.probeSeconds ?? 60;
   const observationSeconds = options.probeObservationSeconds ?? 300;
@@ -56,7 +57,8 @@ export async function createEnvironment(options, context) {
   };
   const assigned = context.resource ?? options.resource;
   const assignedId = typeof assigned === 'string' ? assigned : assigned?.id;
-  const idFor = physical => 'ascend-' + digest(JSON.stringify([options.target, options.runtime, physical]));
+  const idFor = physical => 'ascend-' + digest(JSON.stringify(local
+    ? ['local', options.target, options.runtime, physical] : [options.target, options.runtime, physical]));
   const root = join(context.instancePath, '.ascend-resources', digest(JSON.stringify([options.target, options.runtime, assignedId ?? 'inventory'])));
   await mkdir(root, { recursive: true, mode: 0o700 });
   const pendingPath = join(root, 'pending.json');
@@ -64,6 +66,16 @@ export async function createEnvironment(options, context) {
   const healthSha256 = digest(source);
   const bindings = { ...options.env };
   const environment = await genericEnvironment({ ...options, env: bindings }, { ...context, client });
+  let localPending;
+  const localProbe = local ? await genericEnvironment(options, {...context,event:async(type,data)=>{
+    if(type==='execution-handle'&&localPending){
+      localPending.handle=data.handle;await save(pendingPath,localPending);
+      await context.event('execution-submitted',{submission:localPending.submission,handle:data.handle,
+        closed:false,accountingExcluded:true});
+    }
+    await context.event(type,{...data,purpose:'resource-health',
+      ...(type==='execution-state'&&data.state==='stopped'?{executionSeconds:0,accountingExcluded:true}:{})});
+  }}) : null;
   let queue = Promise.resolve();
   function serial(fn) {
     const result = queue.then(fn);
@@ -95,8 +107,62 @@ export async function createEnvironment(options, context) {
     if (!profile) throw new Error('NPU permission profile missing');
     return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !affinity || affinity.includes(id));
   }
+  async function localSnapshot(devices,purpose,emit,budget,signal) {
+    const bounded=AbortSignal.any([AbortSignal.timeout(Math.ceil(Math.min(observationSeconds,budget)*1000)),signal].filter(Boolean));
+    const configuration={...options.health,require_idle:timing(purpose)||options.health.require_idle===true};
+    try {for(;;){
+      bounded.throwIfAborted();
+      try{localPending=await readJson(pendingPath);}catch(error){if(error.code!=='ENOENT')throw error;localPending=null;}
+      if(!localPending){
+        const dir=await mkdtemp(join(root,'probe-')),submission=randomUUID();
+        localPending={submission,startedMonotonic:process.hrtime.bigint().toString(),devices,configuration,
+          seconds:Math.min(seconds,budget),output:join(dir,'stdout.json'),handle:null};
+        const request={source,sha256:healthSha256,seconds:localPending.seconds,devices,configuration};
+        await save(pendingPath,localPending);
+        if(bounded.aborted){await unlink(pendingPath);bounded.throwIfAborted();}
+        await emit('execution-submitting',{submission,receiptFile:pendingPath,kind:'run',accountingExcluded:true});
+        const command=`${quote(options.python??'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))} > ${quote(localPending.output)}`;
+        let result;
+        try{result=await localProbe.execute(command,context.instancePath,{signal:bounded,
+          timeout:Math.min(seconds,budget,observationSeconds),env:options.env});}
+        catch(error){
+          // Generic local execution records its handle before spawning native Bash.
+          if(!localPending.handle){await unlink(pendingPath);await emit('execution-not-admitted',{submission,closed:true});}
+          throw error;
+        }
+        if(!result.settled)throw new Error(`Local probe closure unknown; observe ${localPending.handle}`);
+        if(result.exitCode!==0){await unlink(pendingPath);throw new Error(`Health probe failed: ${localPending.handle}`);}
+      }else{
+        await emit('execution-submitting',{submission:localPending.submission,receiptFile:pendingPath,kind:'run',accountingExcluded:true});
+        if(!localPending.handle)throw new Error('Local probe submission identity unknown; do not resubmit');
+        await emit('execution-submitted',{submission:localPending.submission,handle:localPending.handle,closed:false,accountingExcluded:true});
+        await context.event('execution-handle',{handle:localPending.handle,purpose:'resource-health'});
+        let observed;
+        do{
+          bounded.throwIfAborted();observed=await localProbe.observe(localPending.handle);
+          if(observed.state==='running')await delay(25,undefined,{signal:bounded});
+        }while(observed.state==='running');
+        if(observed.state!=='stopped')throw new Error(`Local probe unresolved; observe ${localPending.handle}`);
+        if(observed.exitCode!==0){await unlink(pendingPath);throw new Error(`Health probe failed: ${localPending.handle}`);}
+      }
+      const result=await readJson(localPending.output),retained={...result,checked_at:Date.now()/1000,
+        handle:localPending.handle,healthSha256};
+      const observation=join(dirname(localPending.output),'observation.json');
+      await save(observation,retained);await save(join(root,'last-observation.json'),retained);
+      await context.event('resource-probe-completed',{handle:localPending.handle,receipt:pendingPath,observation,
+        executionSeconds:0,accountingExcluded:true});
+      const age=Number(process.hrtime.bigint()-BigInt(localPending.startedMonotonic))/1e9;
+      await unlink(pendingPath);
+      if(!Number.isFinite(age)||age<0||age>seconds||JSON.stringify(devices)!==JSON.stringify(localPending.devices)||
+          JSON.stringify(configuration)!==JSON.stringify(localPending.configuration)){
+        await context.event('resource-probe-stale',{handle:localPending.handle,age});continue;
+      }
+      return retained;
+    }}finally{localPending=null;}
+  }
   async function snapshot(devices, purpose, emit, budget = seconds, signal = context.signal) {
     if (!(budget > 0)) throw new Error('Resource probe elapsed allocation exhausted');
+    if(local)return localSnapshot(devices,purpose,emit,budget,signal);
     const deadlineSignal=AbortSignal.timeout(Math.ceil(observationSeconds*1000));
     const observationSignal=signal?AbortSignal.any([signal,deadlineSignal]):deadlineSignal;
     const callDeadline=performance.now()+observationSeconds*1000;
@@ -210,6 +276,7 @@ export async function createEnvironment(options, context) {
   }
   return {
     ...environment, resources,
+    instructions:environment.instructions+(local?'\nUse rsi_target for device execution, compilation and profiling: it applies the leased physical-device masks. Native local bash is for persistent file editing and inherits the worker launch environment; it does not select a leased device.':''),
     async execute(command, cwd, opts = {}) {
       const started = performance.now();
       let excludedMs = 0;
@@ -236,7 +303,7 @@ export async function createEnvironment(options, context) {
           configuration: { ...options.health, require_idle: timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
         return environment.execute(guarded, cwd, { ...opts, timeout: remaining(), resourceId: physical,
-          env: { ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
+          env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
       });
     },
   };
