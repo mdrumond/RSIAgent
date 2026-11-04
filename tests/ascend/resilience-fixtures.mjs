@@ -4,6 +4,8 @@ import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {schedule,target,serve,connect} from './resilience/fixtures.mjs';
 import {runCases,Blocked} from './resilience/runner.mjs';
 import {cases} from './resilience/workspace.case.mjs';
@@ -71,4 +73,11 @@ test('blocking CPU work cannot pass after its elapsed deadline',async t=>{
     const end=performance.now()+40;while(performance.now()<end){};
   }}],{output:join(root,'report'),tier:'local',cleanupSeconds:0,deadlineSeconds:.02});
   assert.equal(report.status,'incomplete');assert.equal(report.results[0].status,'incomplete');
+});
+test('public command discovers real case modules without circular imports',async t=>{
+  const root=await directory(t),entry=new URL('./resilience/cli.mjs',import.meta.url).pathname;
+  const {stdout}=await promisify(execFile)(process.execPath,[entry,'--tier','local','--case','workspace-snapshots',
+    '--deadline-seconds','310','--output',join(root,'report')]);
+  const report=JSON.parse(stdout);assert.equal(report.status,'passed');
+  assert.equal(report.results[0].evidence.nativeBashEdit,true);
 });

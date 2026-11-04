@@ -13,7 +13,7 @@
   },
   "scripts": {
     "test:controller": "node --test tests/ascend/controller*.mjs",
-    "test:resilience": "node tests/ascend/resilience/runner.mjs"
+    "test:resilience": "node tests/ascend/resilience/cli.mjs"
   },
   "bin": {
     "ascend-rsi": "cli/main.mjs"
