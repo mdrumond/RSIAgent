@@ -1,4 +1,6 @@
 import test from 'node:test';
+import fs from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,rm,readFile} from 'node:fs/promises';
 import {join} from 'node:path';
@@ -111,4 +113,44 @@ export const createEnvironment=async(_options,context)=>({resources:async()=>{
   assert.equal(JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='owner'").get().value),null);
   assert.equal(state.db.prepare('SELECT count(*) AS n FROM attempts').get().n,0);
   assert.equal(state.events(null).some(e=>e.type==='execution-submitting'),false);
+});
+test('cancellation before sync dispatch clears only positively undispatched cache and fresh attempt continues',async t=>{
+  let sync=0,commands=0;
+  const f=await fixture(t,async(args)=>{
+    if(args[0]==='run'){
+      const setup=args[args.indexOf('--file')+1].endsWith('sync.sh');
+      if(setup)sync++;else commands++;
+      const handle=`remote:fixture:job:${setup?'sync':'command'}`;
+      await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle}));
+      return {state:'queued',handle};
+    }
+  });
+  await f.prepare();const cache=join(f.root,'.executions','source-staging.json'),rename=fs.rename;
+  const mocked=t.mock.method(fs,'rename',async(from,to)=>{
+    await rename(from,to);
+    if(to===cache&&!JSON.parse(await readFile(cache,'utf8')).confirmed)f.abort.abort();
+  });syncBuiltinESMExports();
+  try{await assert.rejects(f.environment.execute('python answer.py',f.source),error=>error.code==='CPL_NOT_ADMITTED');}
+  finally{mocked.mock.restore();syncBuiltinESMExports();}
+  assert.equal(sync,0);assert.equal(commands,0);
+  assert.equal(f.events.some(e=>e.type==='execution-submitting'&&e.data.kind==='run'),false);
+  await assert.rejects(readFile(cache),{code:'ENOENT'});
+  const fresh=await createEnvironment(f.options,{...f.context,signal:new AbortController().signal});
+  await fresh.prepare({project:f.project,attempt:{id:'a'}});
+  assert.equal((await fresh.execute('python answer.py',f.source)).settled,true);
+  assert.equal(sync,1);assert.equal(commands,1);
+});
+for(const state of ['completed','unknown'])test(`initial retained download timeout is observed once; observed ${state}`,async t=>{
+  const handle='remote:fixture:transfer:download';
+  const f=await fixture(t,async(args)=>{
+    if(args[0]==='download')return {state:'unknown',handle};
+    if(args[0]==='observe')return {state,handle};
+    if(args[0]==='fetch'){await writeFile(args[2],'retained output');return {state:'completed'};}
+  });
+  if(state==='completed'){
+    assert.equal((await f.environment.browse('report.log')).state,'completed');
+    const fetch=f.calls.find(c=>c.args[0]==='fetch');assert.equal(await readFile(fetch.args[2],'utf8'),'retained output');
+  }else{await assert.rejects(f.environment.browse('report.log'),/Transfer unresolved/);assert.equal(f.calls.some(c=>c.args[0]==='fetch'),false);}
+  assert.equal(f.calls.filter(c=>c.args[0]==='download').length,1);
+  assert.equal(f.calls.filter(c=>c.args[0]==='observe'&&c.args[1]===handle).length,1);
 });

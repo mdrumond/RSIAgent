@@ -249,7 +249,8 @@ export async function createEnvironment(options, context) {
     return { state: 'unknown' };
   }
   async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
-    signal?.throwIfAborted();
+    if (signal?.aborted) throw Object.assign(new Error(`CPL ${args[0]} was not admitted`),
+      {code: 'CPL_NOT_ADMITTED', cause: signal.reason});
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
@@ -280,6 +281,8 @@ export async function createEnvironment(options, context) {
       await event('execution-handle', { handle, purpose: 'transfer' });
       await event('execution-state', { handle, purpose: 'transfer', ...normalize(result) });
       try {
+        // An initial timeout marker still has an observable native identity.
+        if (!terminal.has(result.state)) result = await client(['observe', handle], {signal});
         while (!terminal.has(result.state)) {
           signal?.throwIfAborted();
           if (!['queued', 'dispatching', 'running', 'retrying'].includes(result.state)) throw new Error(`Transfer unresolved; observe ${handle}`);
