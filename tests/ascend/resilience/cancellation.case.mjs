@@ -46,5 +46,6 @@ export const cases=[{id:'registered-cpu-cancellation',tier:'remote',async run(ct
     ['completed','failed','cancelled'].includes(c.result?.state)));
   assert.equal(calls.filter(c=>c.operation==='run'&&c.file.endsWith('command.sh')).length,1);
   return {scope:'Registered CPU cancellation only; no model/NPU',handle,noReplay:true,
+    projectPassed:false,held:result.accountingUnresolved===true,
     result,closure:'closure.json',nativeCalls:'native-calls.json'};
 }}];
