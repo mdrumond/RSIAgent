@@ -2,23 +2,24 @@ import assert from 'node:assert/strict';
 import {mkdir,readdir,writeFile} from 'node:fs/promises';
 import {join,dirname,delimiter} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {execFile} from 'node:child_process';
-import {promisify} from 'node:util';
 import {setTimeout as delay} from 'node:timers/promises';
 import {runCases,Blocked} from './runner.mjs';
 import {cases as workspace} from './workspace.case.mjs';
 
 const root=fileURLToPath(new URL('../../..',import.meta.url));
 async function program(ctx,name,command,args,env=process.env) {
-  let stdout='',stderr='';
+  const {createLocalBashOperations}=await import('@earendil-works/pi-coding-agent');
+  const quote=value=>"'"+String(value).replaceAll("'","'\\''")+"'";
+  let output='';
   try {
-    ({stdout,stderr}=await promisify(execFile)(command,args,{cwd:root,env,signal:ctx.signal,maxBuffer:32*1024*1024}));
-  }catch(error){stdout=error.stdout??'';stderr=error.stderr??'';throw error;}
-  finally {
-    await writeFile(join(ctx.directory,name+'.stdout'),stdout);
-    await writeFile(join(ctx.directory,name+'.stderr'),stderr);
+    const result=await createLocalBashOperations().exec([command,...args].map(quote).join(' '),root,
+      {env,signal:ctx.signal,onData:data=>{output+=data.toString();}});
+    assert.equal(result.exitCode,0,`${name} failed; retained ${name}.log`);
   }
-  return stdout;
+  finally {
+    await writeFile(join(ctx.directory,name+'.log'),output);
+  }
+  return output;
 }
 const sample={id:'seeded-workspace',tier:'local',async run(ctx){
   return workspace[0].run(ctx);
@@ -34,7 +35,7 @@ export const cases=[{id:'existing-regressions',tier:'local',async run(ctx){
     PATH:dirname(process.execPath)+delimiter+process.env.PATH};
   await program(ctx,'node',process.execPath,['--test','--test-concurrency=1',...files],env);
   await program(ctx,'python',python,['-m','pytest','-q','tests/ascend'],env);
-  return {nodeEntryPoints:files,python:'tests/ascend',logs:['node.stdout','node.stderr','python.stdout','python.stderr']};
+  return {nodeEntryPoints:files,python:'tests/ascend',logs:['node.log','python.log']};
 }},sample,{id:'seeded-soak',tier:'local',async run(ctx){
   const until=performance.now()+600000,completed=[];let seed=ctx.seed;
   while(performance.now()<until) {
