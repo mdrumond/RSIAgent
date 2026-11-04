@@ -70,12 +70,30 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
   const profile=await profileInput();await loadLiveProfile();
   const seconds=actorSeconds??profile.actor_seconds??300;
   const root=join(ctx.directory,'instance'),source=join(ctx.directory,'input/source'),skills=join(ctx.directory,'skills');
-  const observations=[],sessions=[],processes=[],environments=new Map();let state,config,backend,proxy;const mcpTimeline=[];
+  const observations=[],sessions=[],processes=[];let state,config,backend,proxy;const mcpTimeline=[];
   const save=(name,value)=>writeFile(join(ctx.directory,name),JSON.stringify(value,null,2)+'\n');
+  async function command(command,{preload,signal=ctx.signal}={}){
+      const args=[join(root,'machinery/cli/main.mjs'),command,'--instance',root],env={...process.env};
+      if(preload)env.NODE_OPTIONS=[env.NODE_OPTIONS??'',`--import=${preload}`].join(' ');
+      const child=spawn(process.execPath,args,{env,stdio:['ignore','pipe','pipe'],signal});processes.push(child);
+      let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
+      const [code]=await once(child,'close');await appendFile(join(ctx.directory,'cli.jsonl'),JSON.stringify({command,code,stdout,stderr})+'\n');assert.equal(code,0);return JSON.parse(stdout.trim().split('\n').at(-1));
+  }
   ctx.onCleanup(async cleanup=>{
     const failures=[],closed=[];
+    if(config&&state)try{
+      await command('stop',{signal:cleanup.signal});
+      await until(async()=>{for(const attempt of state.db.prepare('SELECT owner FROM attempts').all()){
+        const owner=JSON.parse(attempt.owner);if(owner?.pid!==process.pid&&!await ownerStopped(owner))return false;
+      }return true;},{signal:cleanup.signal,seconds:10});
+    }catch(error){failures.push(error.message);}
     for(const session of sessions)try{session.abortCompaction();await session.abort();await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});session.dispose();const file=session.sessionManager.getSessionFile();const rows=(await readFile(file,'utf8')).split('\n').filter(Boolean).map(JSON.parse);await writeFile(join(dirname(file),'sft.native.jsonl'),JSON.stringify({raw_session:file,messages:rows.filter(e=>e.type==='message').map(e=>e.message)})+'\n');}catch(error){failures.push(error.message);}
     if(state)for(const attempt of state.db.prepare('SELECT * FROM attempts').all()){
+      const native=state.events(attempt.id),ended=new Set(native.filter(e=>e.type==='native-bash-completed').map(e=>e.data.operation));
+      if(native.some(e=>e.type==='native-bash-started'&&!ended.has(e.data.operation)))try{
+        const proof=await json(join(ctx.directory,'process-closure.json'));
+        if(!proof.workerClosed||!proof.nativeGroupStopped||proof.errors.length)throw Error('Native Bash group closure unproven');
+      }catch(error){failures.push('Unmatched native Bash: '+error.message);}
       let env;
       try{env=await factory({instancePath:join(root,'attempts',attempt.id),signal:cleanup.signal,event:()=>{},exclude:async(_,fn)=>fn()});}
       catch(error){failures.push(error.message);continue;}
@@ -141,8 +159,7 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
   }
   async function factory(context){
     const base=environmentFactory??(async c=>(await import(pathToFileURL(resolve(root,config.environment.module)))).createEnvironment(config.environment.options,c));
-    const e=await base({...context,signal:context.signal??ctx.signal});
-    const id=context.instancePath?.split('/').at(-1);if(id)environments.set(id,e);return e;
+    return base({...context,signal:context.signal??ctx.signal});
   }
   const fixture={ctx,config,state,project:state.project('numeric').spec,observations,sessions,save,factory,mcpTimeline,
     attempt:admit?state.admit('numeric',await processIdentity()):null,
@@ -167,13 +184,7 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
       state.finish(attempt.id,'failed');recordOutcome(state,{attemptId:attempt.id,wave:0,passed:false,findings:'Independent integer verifier rejects constant0 on [2,3]. Investigate a smaller two-integer case.',evidence:[{path,sha256:await digest(path)}]});
       return state.attempt(attempt.id);
     },
-    async command(command,{preload}={}){
-      const args=[join(root,'machinery/cli/main.mjs'),command,'--instance',root],env={...process.env};
-      if(preload)env.NODE_OPTIONS=[env.NODE_OPTIONS??'',`--import=${preload}`].join(' ');
-      const child=spawn(process.execPath,args,{env,stdio:['ignore','pipe','pipe'],signal:ctx.signal});processes.push(child);
-      let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
-      const [code]=await once(child,'close');await appendFile(join(ctx.directory,'cli.jsonl'),JSON.stringify({command,code,stdout,stderr})+'\n');assert.equal(code,0);return JSON.parse(stdout.trim().split('\n').at(-1));
-    },
+    command,
     async openSession(){
       const path=join(root,'compact');await mkdir(path);const settings=sdk.SettingsManager.inMemory({retry:{enabled:false}});
       const bridge=createKdbBridge({url:mcpUrl,attemptId:'compaction',agentDir:path});
