@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
+import {createEnvironmentTools} from '../../integrations/environments/index.mjs';
 import {State} from '../../controller/state.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {setup,rows,until as driverUntil} from './driver_setup.mjs';
@@ -201,4 +202,22 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   const finished=rows(driver.root,'SELECT * FROM attempts');assert.equal(finished.length,3);
   assert.ok(finished.every(a=>a.outcome==='passed'));assert.equal(rows(driver.root,'SELECT * FROM resource_leases').length,0);
   assert.deepEqual(await readFile(first.session),session);driver.pass();
+});
+
+test('native SDK inherited environment cannot replace local runtime PATH/CANN or leased masks',{timeout:20000},async t=>{
+  const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0];
+  const runtime={...f.options.env,CANN_HOME:'configured-cann',LD_LIBRARY_PATH:'configured-libraries'};
+  const bound=await f.bind(row,{env:runtime});let inherited=false;
+  const [tool]=await createEnvironmentTools({execute:(command,cwd,opts)=>{
+    assert.ok(opts.env.PATH);inherited=true;
+    return bound.environment.execute(command,cwd,{...opts,env:{...opts.env,CANN_HOME:'inherited-cann',
+      LD_LIBRARY_PATH:'inherited-libraries',UNIQUE_CALL:'preserved',ASCEND_PHYSICAL_DEVICE:'7',
+      ASCEND_RT_VISIBLE_DEVICES:'7',ASCEND_VISIBLE_DEVICES:'7'}});
+  }},f.source);
+  const result=await tool.execute('native-env',{command:'python3 -c '+quote("import os,json; print(json.dumps({k:os.environ[k] for k in ['PATH','CANN_HOME','LD_LIBRARY_PATH','UNIQUE_CALL','ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES']}))"),timeout:10});
+  assert.equal(inherited,true);
+  const value=JSON.parse(result.content.filter(c=>c.type==='text').map(c=>c.text).join('\n').trim().split('\n').at(-1));
+  assert.equal(value.PATH,runtime.PATH);assert.equal(value.CANN_HOME,runtime.CANN_HOME);
+  assert.equal(value.LD_LIBRARY_PATH,runtime.LD_LIBRARY_PATH);assert.equal(value.UNIQUE_CALL,'preserved');
+  for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'])assert.equal(value[key],'0');
 });
