@@ -235,8 +235,13 @@ async function worker(root,id) {
     let project={...base,actor_seconds:job.actor_seconds};
     if(!job.finalize && job.kind==='investigation') {
       const file=join(path,'project.json');
-      if(job.resume)project=JSON.parse(await readFile(file,'utf8'));
+      let constructed;
+      try{constructed=JSON.parse(await readFile(file,'utf8'));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+      if(constructed)project=constructed;
       else {
+        if(state.attempt(id).session || state.events(id).some(e=>e.type==='task-constructed'))
+          throw new Error('Constructed investigation project is missing; cannot reconstruct an actor attempt');
         project=await (await import('./curriculum.mjs')).investigate({config,job,base,path,state,bridge,signal:abort.signal});
         await writeFile(file,JSON.stringify(project),{mode:0o600});
       }
