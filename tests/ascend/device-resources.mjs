@@ -93,6 +93,7 @@ test('fresh parser-backed discovery filters permission, busy, Alarm, and unrespo
   const first = await f.environment.resources({ target: 'fixture' });
   assert.deepEqual(first.filter(row => row.available).map(row => row.metadata.physicalDevice), [0]);
   assert.ok(first.every(row => row.id.startsWith('ascend-') && row.metadata.healthSha256.length === 64));
+  assert.ok(first.every(row => !Object.hasOwn(row,'env')),'CPL rows must not mask controller workers');
   f.rows[0].busy = true; await f.update();
   assert.equal((await f.environment.resources()).some(row => row.available), false);
   f.setEnabled([]);

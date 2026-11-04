@@ -30,6 +30,11 @@ Install root Node dependencies and the Python helper package first. Production B
 `embeddings` extra and the pinned model already available in its configured
 cache. No embedding model download or corpus reindex is part of bootstrap.
 
+Environment resource rows may include an `env` map of string values. The CLI applies
+that map only to the selected worker process, preserving the same resource on
+resume and finalization. Local Ascend rows bind all three physical-device masks;
+CPL rows omit them so remote device IDs do not change controller-host masks.
+
 A private bootstrap JSON file has this shape; replace the example paths with
 actual private paths before running it:
 
