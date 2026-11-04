@@ -9,7 +9,7 @@ export const cases = [
   const python = process.env.DRIVER_PYTHON ?? process.env.PYTHON ?? 'python3.12';
   const remoteProfile = item.tier === 'remote' ? process.env.INSTALLED_REMOTE_PROFILE : null;
   if (item.tier === 'remote' && !remoteProfile) throw new Blocked('Set INSTALLED_REMOTE_PROFILE to ignored registered CPL CPU options');
-  const {runInstalledPackagingCase, InstalledPrerequisiteError} = await import('../resilience-installed.mjs');
+  const {runInstalledPackagingCase, InstalledPrerequisiteError} = await import('./installed-fixture.mjs');
   await ctx.event({type: 'installed-case-input', seed: ctx.seed, profile: ctx.profile});
   try {
     return await runInstalledPackagingCase({artifactRoot: ctx.directory, python, remoteProfile, signal: ctx.signal,

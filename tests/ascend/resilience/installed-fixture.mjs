@@ -10,9 +10,9 @@ import {tmpdir} from 'node:os';
 import {join, dirname, delimiter, relative, isAbsolute} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
-import {provider} from './driver_fixture.mjs';
+import {provider} from '../driver_fixture.mjs';
 
-const checkout = fileURLToPath(new URL('../..', import.meta.url));
+const checkout = fileURLToPath(new URL('../../..', import.meta.url));
 const execPrerequisite = promisify(execFile);
 export class InstalledPrerequisiteError extends Error {}
 export async function installedPrerequisites(python, signal) {
@@ -76,7 +76,7 @@ export async function runInstalledPackagingCase({
   let remoteClient;
   if (remoteOptions) {
     assert.ok(remoteOptions.target && remoteOptions.runtime && remoteOptions.workspacePath);
-    const {createCplClient} = await import('../../integrations/environments/index.mjs');
+    const {createCplClient} = await import('../../../integrations/environments/index.mjs');
     remoteClient = createCplClient(remoteOptions.clientPath);
     assert.equal((await remoteClient(['capabilities', remoteOptions.target], {signal})).state, 'available');
     assert.equal((await remoteClient(['preflight', remoteOptions.target], {signal})).state, 'completed');
@@ -376,13 +376,3 @@ export async function runInstalledPackagingCase({
   return result;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const abort = new AbortController();
-  const stop = () => abort.abort(new Error('Installed acceptance interrupted'));
-  process.on('SIGTERM', stop); process.on('SIGINT', stop);
-  runInstalledPackagingCase({signal: abort.signal}).then(result => console.log(JSON.stringify(result))).catch(error => {
-    if (error instanceof InstalledPrerequisiteError) console.error(JSON.stringify({outcome: 'blocked', reason: error.message}));
-    else console.error(error.stack);
-    process.exitCode = 1;
-  }).finally(() => {process.off('SIGTERM', stop); process.off('SIGINT', stop);});
-}
