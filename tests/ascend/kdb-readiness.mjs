@@ -55,7 +55,7 @@ async function fixture(t,{listDelay=0,missing=false,unavailable=false,extension=
   const {session}=await createAgentSession({cwd:root,agentDir,modelRuntime,model:modelRuntime.getModel('ready-fixture','scripted'),settingsManager:settings,sessionManager:SessionManager.inMemory(root),resourceLoader:loader,noTools:'builtin'});
   t.after(async()=>{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});session.dispose();for(const timer of timers)clearTimeout(timer);server.closeAllConnections();await new Promise(ok=>server.close(ok));await rm(root,{recursive:true,force:true});});
   const uiPrompts=[];session.subscribe(event=>{if(event.type==='ui_prompt_start')uiPrompts.push(event);});
-  return {session,bridge,events,requests,queries,listing,uiPrompts,root,modelRuntime};
+  return {session,bridge,events,requests,queries,listing,uiPrompts,root,modelRuntime,base};
 }
 
 test('native tools/list beyond the 10s soft wait is ready before first provider; both nested queries succeed',{timeout:25000},async t=>{
@@ -104,4 +104,17 @@ test('canonical actor missing required KDB fails setup before provider or execut
     knowledge:f.bridge.knowledge,extensions:[f.bridge.extension],skillMap:{},
     modelRuntime:f.modelRuntime,model:f.modelRuntime.getModel('ready-fixture','scripted')}),/Required native KDB/);
   assert.equal(f.requests.length,0);assert.equal(executions,0);assert.equal(state.attempt(attempt.id).outcome,null);
+});
+
+
+test('curriculum uses the same required native discovery before its first provider request',{timeout:15000},async t=>{
+  const {summarize}=await import('../../cli/curriculum.mjs');
+  const f=await fixture(t,{missing:true});
+  const key='READINESS_CURRICULUM_KEY',previous=process.env[key];process.env[key]='fixture-only';
+  t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});
+  const model=f.modelRuntime.getModel('ready-fixture','scripted');
+  await assert.rejects(summarize({path:f.root,bridge:f.bridge,passed:false,job:{attempt:{id:'readiness'}},
+    state:{events:()=>[],attempt:()=>({session:null}),event:()=>{}},
+    config:{curriculum_seconds:10,actor:{provider:'ready-fixture',model:'scripted',credential_env:key,base_url:f.base+'/provider/v1',metadata:model}}}),/Required native KDB/);
+  assert.equal(f.requests.length,0);assert.equal(f.queries.length,0);
 });
