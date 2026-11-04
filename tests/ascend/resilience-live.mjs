@@ -20,7 +20,7 @@ test('missing live credentials are blocked before fixture resources or paid disp
 });
 
 test('safe live preflight makes no request; real native canonical fixture uses a scripted loopback provider',{timeout:45000},async t=>{
-  const root=await mkdtemp(join(tmpdir(),'live-native-')),requests=[],cleanup=[];let complete=false,compactCalls=null;const abort=new AbortController();
+  const root=await mkdtemp(join(tmpdir(),'live-native-')),requests=[],cleanup=[];let complete=false,compactCalls=null,summaryPayload='Numeric fact 42. '.repeat(256);const abort=new AbortController();
   const calls=[];for(const stage of stages){calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])calls.push(['rsi_knowledge',{query:'integer sum',kind}]);
     if(stage==='implementation')calls.push(['write',{path:'solution.py',content:'def solve(values):\n    return sum(values)\n'}],['rsi_target',{command:'python -c "import solution;assert solution.solve([2,3])==5"'}]);
@@ -32,7 +32,11 @@ test('safe live preflight makes no request; real native canonical fixture uses a
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'live-fixture',object:'chat.completion.chunk',created:1,model:'deepseek-flash',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
-    else{frame({role:'assistant',content:'Verified.'});frame({},'stop');}res.end('data: [DONE]\n\n');
+    else{
+      const summarizing=compactCalls!==null&&!body.tools?.length,limit=body.max_tokens??body.max_completion_tokens??0;
+      const payload=summarizing?summaryPayload:'Verified.',capacity=summarizing?limit*4:payload.length;
+      frame({role:'assistant',content:payload.slice(0,capacity)});frame({},payload.length>capacity?'length':'stop');
+    }res.end('data: [DONE]\n\n');
   });server.listen(0,'127.0.0.1');await once(server,'listening');
   const key='LIVE_SANITY_KEY',previous=process.env[key],old=process.env.RESILIENCE_LIVE_PROFILE;
   process.env[key]='fixture-only';const path=join(root,'profile.json');process.env.RESILIENCE_LIVE_PROFILE=path;
@@ -52,10 +56,21 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   const result=await fixture.run();assert.equal(result.accepted,true);fixture.verifyAccepted();
   assert.ok(requests.length>0);assert.ok(requests[0].tools.some(t=>t.function.name==='mcp__kdb__search'));
   assert.ok(fixture.observations.some(e=>e.tool==='rsi_target'&&!e.error));
+  const negativeRoot=join(root,'capped-summary');await mkdir(negativeRoot);
+  const negative=await createLiveFixture({directory:negativeRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)},{admit:false});
+  const capped=await negative.openSession(),original=capped.sessionManager.getSessionFile();compactCalls=[null,null];
+  await capped.prompt('Retain numeric history. '+ 'Six times seven equals forty two. '.repeat(160));
+  await capped.prompt('Acknowledge this second bounded history turn. '+ 'Retain the arithmetic contract. '.repeat(128));summaryPayload='Numeric fact 42. '.repeat(4096);
+  await assert.rejects(capped.compact(),/token cap/);
+  assert.equal(capped.sessionManager.getEntries().some(e=>e.type==='compaction'),false);
+  assert.equal(capped.sessionManager.getSessionFile(),original);summaryPayload='Numeric fact 42. '.repeat(256);
+  const summaryStart=requests.length;
   compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
     ['read',{path:'proof.txt'}],['bash',{command:"python -c \"assert int(open('proof.txt').read()) == sum(6 for _ in range(7))\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
   const compactRoot=join(root,'compaction');await mkdir(compactRoot);
   const compact=await cases.find(c=>c.id==='deepseek-compaction').run({directory:compactRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
   assert.equal(compact.compacted,true);assert.ok(compact.toolCallsBefore>=2);assert.ok(compact.toolCallsAfter>=3);
+  const summaries=requests.slice(summaryStart).filter(r=>!r.tools?.length);assert.ok(summaries.length>0);
+  assert.ok(summaries.every(r=>(r.max_tokens??r.max_completion_tokens)*4>=summaryPayload.length&&(r.max_tokens??r.max_completion_tokens)<=metadata.maxTokens));
   assert.deepEqual(compactCalls,[]);complete=true;
 });
