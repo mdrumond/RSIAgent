@@ -37,7 +37,44 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
       });
     });
   };
+  // The native /mcp commands await discovery and own reconnect behavior. No
+  // provider request is made by these commands. Keep headless native diagnostics.
+  const prepareSession = async (session, {signal} = {}) => {
+    const writes = [];
+    const record = (type, data) => {
+      const write = Promise.resolve().then(() => event(type, {attempt_id:attemptId, ...data}));
+      writes.push(write); void write.catch(() => {});
+    };
+    let cancel;
+    const cancelled = new Promise((_resolve, reject) => {
+      cancel = () => reject(signal.reason ?? new Error('KDB setup cancelled'));
+    });
+    signal?.addEventListener('abort', cancel, {once:true});
+    const command = async text => {
+      signal?.throwIfAborted();
+      await Promise.race([session.prompt(text), cancelled]);
+      signal?.throwIfAborted();
+    };
+    try {
+      signal?.throwIfAborted();
+      const defaults = session.extensionRunner.getUIContext();
+      await session.bindExtensions({mode:'print',uiContext:{...defaults,
+        notify:(message, level) => record('knowledge-notification', {message, level})},
+        onError:error => record('knowledge-extension-error', error)});
+      if (!session.extensionRunner.getCommand('mcp')) throw new Error('Required native MCP command is not registered');
+      await command('/mcp');
+      if (!session.getCallableToolNames().includes(searchTool)) await command('/mcp reconnect kdb');
+      if (!session.getCallableToolNames().includes(searchTool)) {
+        throw new Error('Required native KDB search unavailable after MCP startup/reconnect; inspect knowledge diagnostics');
+      }
+      await event('knowledge-ready', {attempt_id:attemptId, tool:searchTool});
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+      await Promise.all(writes);
+    }
+  };
   const knowledge = {
+    prepareSession,
     async search(request, ctx) {
       if (!ctx?.executeTool) throw new Error('KDB retrieval requires a live Pi tool context');
       if (request.attempt_id !== undefined && request.attempt_id !== attemptId) {
@@ -73,6 +110,7 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
   const knowledgeTool = (query = (text, kind, ctx) => knowledge.search({query:text, kind},ctx)) => ({
     name:'rsi_knowledge', label:'Retrieve knowledge',
     description:'Retrieve positive or negative evidence using native MCP tools.',
+    reachesTools:() => [searchTool],
     parameters:Type.Object({query:Type.String({minLength:1}),
       kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
     execute:async (_id, args, _signal, _onUpdate, ctx) => {
@@ -80,5 +118,5 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
       return {content:[{type:'text',text:JSON.stringify(value)}],details:{}};
     },
   });
-  return {extension, knowledge, knowledgeTool};
+  return {extension, knowledge, knowledgeTool, prepareSession};
 }

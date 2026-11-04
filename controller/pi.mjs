@@ -78,6 +78,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
       parameters:Type.Object({}),execute:async()=>result({stage:workflow.stage,skill:await workflow.skill(),history:workflow.history})});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',
+      reachesTools:()=>['mcp__kdb__search'],
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier.',
@@ -130,7 +131,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     ({session}=await sdk.createAgentSession({cwd:project.source,agentDir,settingsManager,modelRuntime,model,thinkingLevel,
       sessionManager:manager,resourceLoader:loader}));
     session.agent.toolExecution='sequential';
-    await session.bindExtensions({});
+    if(knowledge.prepareSession)await knowledge.prepareSession(session,{signal});
+    else await session.bindExtensions({});
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
