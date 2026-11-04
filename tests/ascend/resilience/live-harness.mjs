@@ -29,7 +29,10 @@ async function profileInput(path=process.env.RESILIENCE_LIVE_PROFILE){
   if(!path)throw new Blocked('Set RESILIENCE_LIVE_PROFILE to an ignored native DeepSeek profile');
   let profile;try{profile=await json(path);}catch{throw new Blocked('Live profile is not readable JSON');}
   if(!profile.python||profile.actor?.provider!=='deepseek')throw new Blocked('Live profile requires Python and native provider deepseek');
-  return {...profile,actor:{...profile.actor,max_tokens:8192}};
+  for(const value of [profile.actor_seconds??300,profile.curriculum_seconds??180])if(!Number.isFinite(value)||value<=0)throw new Blocked('Live profile requires positive elapsed allocations');
+  const actor={...profile.actor,max_tokens:Math.min(profile.actor.max_tokens??8192,8192)};
+  if(actor.credentials_file)actor.credentials_file=resolve(dirname(path),actor.credentials_file);
+  return {...profile,actor};
 }
 // Read-only preflight: modelFromProfile disables discovery/network refresh. Never return credentials/profile data.
 export async function loadLiveProfile(path){
@@ -188,7 +191,7 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
     async openSession(){
       const path=join(root,'compact');await mkdir(path);const settings=sdk.SettingsManager.inMemory({retry:{enabled:false}});
       const bridge=createKdbBridge({url:mcpUrl,attemptId:'compaction',agentDir:path});
-      const loader=new sdk.DefaultResourceLoader({cwd:fixture.project.source,agentDir:path,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[bridge.extension,pi=>pi.on('before_provider_request',event=>appendFile(join(path,'provider.jsonl'),JSON.stringify(event)+'\n'))]});await loader.reload();
+      const loader=new sdk.DefaultResourceLoader({cwd:fixture.project.source,agentDir:path,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[bridge.extension,pi=>{for(const type of ['before_provider_request','provider_stream_event','after_provider_response'])pi.on(type,event=>appendFile(join(path,'provider.jsonl'),JSON.stringify(event)+'\n'));}]});await loader.reload();
       const {session}=await sdk.createAgentSession({cwd:fixture.project.source,agentDir:path,settingsManager:settings,...await modelFromProfile(config.actor),thinkingLevel:'off',resourceLoader:loader,sessionManager:sdk.SessionManager.create(fixture.project.source,path)});
       sessions.push(session);session.subscribe(event=>{void appendFile(join(path,'native-events.jsonl'),JSON.stringify(event)+'\n');});await bridge.prepareSession(session,{signal:ctx.signal});
       session.setActiveToolsByName(session.getActiveToolNames().filter(name=>!['mcp__kdb__record_lesson','mcp__kdb__add_repo'].includes(name)));return session;
