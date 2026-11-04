@@ -69,12 +69,17 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   assert.equal(capped.sessionManager.getSessionFile(),original);summaryPayload='Numeric fact 42. '.repeat(256);
   const summaryStart=requests.length;
   compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
-    ['read',{path:'proof.txt'}],['bash',{command:"python -c \"assert int(open('proof.txt').read()) == sum(6 for _ in range(7))\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
+    ['read',{path:'proof.txt'}],['bash',{command:"python -c \"v=int(open('proof.txt').read()); assert v == sum(6 for _ in range(7)); print(v)\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
   const compactRoot=join(root,'compaction');await mkdir(compactRoot);
   const compact=await cases.find(c=>c.id==='deepseek-compaction').run({directory:compactRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
   assert.equal(compact.compacted,true);assert.ok(compact.toolCallsBefore>=2);assert.ok(compact.toolCallsAfter>=3);
   const summaries=requests.slice(summaryStart).filter(r=>!r.tools?.length);assert.ok(summaries.length>0);
   assert.ok(summaries.every(r=>(r.max_tokens??r.max_completion_tokens)*4>=summaryPayload.length&&(r.max_tokens??r.max_completion_tokens)<=metadata.maxTokens));
+  assert.deepEqual(compactCalls,[]);
+  compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
+    ['read',{path:'absent-proof.txt'}],['bash',{command:'exit 1'}],['mcp__kdb__search',{query:'integer sum',kind:'invalid'}],null];
+  const badRoot=join(root,'failed-post-tools');await mkdir(badRoot);
+  await assert.rejects(cases.find(c=>c.id==='deepseek-compaction').run({directory:badRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)}),/Successful post-compaction/);
   assert.deepEqual(compactCalls,[]);
   await negative.seedFailure();const queue=new RecoveryQueue(negative.state);
   for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);

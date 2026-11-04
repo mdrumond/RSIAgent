@@ -21,6 +21,24 @@ export function verifyInvestigation(f,child){
   return outcome==='passed';
 }
 
+export function verifyPostCompaction(events){
+  const boundary=events.findLastIndex(e=>e.type==='compaction_end'&&e.result);
+  assert.ok(boundary>=0,'Native compaction must complete');
+  const starts=new Map(),successful=[];
+  for(const e of events.slice(boundary+1)){
+    if(e.type==='tool_execution_start')starts.set(e.toolCallId,e);
+    if(e.type==='tool_execution_end'&&!e.isError&&!e.result?.isError&&!e.result?.structuredContent?.isError){
+      const start=starts.get(e.toolCallId);if(start?.toolName===e.toolName)successful.push({...e,args:start.args});
+    }
+  }
+  const text=e=>(e.result.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
+  assert.ok(successful.some(e=>e.toolName==='read'&&/(^|\/)proof\.txt$/.test(e.args.path)&&text(e).trim()==='42'),'Successful post-compaction proof read required');
+  assert.ok(successful.some(e=>e.toolName==='bash'&&e.args.command.includes('proof.txt')&&e.args.command.includes('sum(')&&e.result.structuredContent?.exit_code===0&&/\b42\b/.test(text(e))&&(/\bassert\b/.test(e.args.command)||/equal=\s*True\b/.test(text(e)))),'Successful independent post-compaction Bash result required');
+  assert.ok(successful.some(e=>e.toolName==='mcp__kdb__search'&&e.args.kind==='negative'&&e.args.query?.trim()&&
+    e.result.structuredContent?.structuredContent?.result?.some(r=>r.kind==='negative'&&r.collection&&r.chunk_id&&r.text)),'Successful post-compaction indexed negative search required');
+  return successful.map(e=>({id:e.toolCallId,tool:e.toolName}));
+}
+
 export const cases=[
   {id:'deepseek-readiness',tier:'deepseek',async run(ctx){
     let before=0,after=0;
@@ -114,7 +132,7 @@ export const cases=[
   {id:'deepseek-compaction',tier:'deepseek',async run(ctx){
     const f=await createLiveFixture(ctx,{admit:false}),session=await f.openSession(),file=session.sessionManager.getSessionFile();
     let exhausted=false;const timer=setTimeout(()=>{exhausted=true;session.abortCompaction();void session.abort();},(f.config.investigation_seconds??300)*1000),abort=()=>{session.abortCompaction();void session.abort();};ctx.signal.addEventListener('abort',abort,{once:true});
-    let calls=0;session.subscribe(event=>{if(event.type==='tool_execution_end')calls++;});
+    let calls=0;const trace=[];session.subscribe(event=>{trace.push(event);if(event.type==='tool_execution_end')calls++;});
     try{
       await session.prompt('Retain this bounded background for later numeric tool work. Acknowledge briefly without tools. '+ 'The immutable arithmetic contract is six times seven equals forty two. '.repeat(80));await session.waitForIdle();
       await session.prompt('Use native bash to write proof.txt containing the integer42 computed as6*7. Retrieve positive arithmetic evidence using mcp__kdb__search. Then report what the file and tool actually returned.');await session.waitForIdle();
@@ -122,8 +140,8 @@ export const cases=[
       await session.compact('Keep the exact proof.txt path, numeric result42 and indexed citation; further tool work follows.');
       assert.ok(session.sessionManager.getEntries().some(e=>e.type==='compaction'));
       await session.prompt('After compaction use native read to inspect proof.txt, native bash to independently assert its integer equals sum(6 for _ in range(7)), and mcp__kdb__search for negative arithmetic evidence. Report only observed results.');await session.waitForIdle();
-      ctx.signal.throwIfAborted();assert.equal(exhausted,false);assert.ok(calls>=first+3);assert.equal(session.sessionManager.getSessionFile(),file);
-      assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');return {session:file,compacted:true,toolCallsBefore:first,toolCallsAfter:calls-first};
+      ctx.signal.throwIfAborted();assert.equal(exhausted,false);const postTools=verifyPostCompaction(trace);assert.equal(session.sessionManager.getSessionFile(),file);
+      assert.equal((await readFile(join(f.project.source,'proof.txt'),'utf8')).trim(),'42');return {session:file,compacted:true,toolCallsBefore:first,toolCallsAfter:calls-first,postTools};
     }finally{clearTimeout(timer);ctx.signal.removeEventListener('abort',abort);}
   }},
   {id:'deepseek-wave-recovery',tier:'deepseek',async run(ctx){
