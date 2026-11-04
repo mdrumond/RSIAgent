@@ -35,6 +35,15 @@ test('external interruption retains cleanup evidence and never starts next case'
   assert.equal(closed,true);assert.equal(next,false);assert.equal(report.status,'incomplete');
   assert.equal(JSON.parse(await readFile(join(dir,'report.json'),'utf8')).activeCase,undefined);
 });
+test('registering a mandatory local case in a paid tier cannot satisfy local admission',async t=>{
+  let paid=false;
+  const report=await runCases([{id:'cpu',tier:'local',run:async()=>{}},
+    {id:'misregistered',tier:'deepseek',run:async()=>{paid=true;}},
+    {id:'target',tier:'remote',run:async()=>{}}],
+  {output:await output(t),deadlineSeconds:10,cleanupSeconds:1,requiredCases:[{id:'misregistered',tier:'local'}]});
+  assert.equal(report.status,'incomplete');assert.equal(paid,false);
+  assert.equal(report.results.find(r=>r.id==='misregistered'&&r.tier==='local').status,'incomplete');
+});
 test('passing prerequisites execute all tiers and report mandatory coverage',async t=>{
   const called=[],requiredCases=['local','deepseek','remote'].map(tier=>({id:tier,tier}));
   const report=await runCases([...requiredCases].reverse().map(item=>({...item,run:async()=>{called.push(item.id);}})),

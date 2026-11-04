@@ -26,7 +26,7 @@ export async function runCases(cases,{output,tier='all',caseId,seed=1,profile='n
   if(tier==='all'&&!caseId)for(const required of ['local','deepseek','remote'])
     if(!cases.some(c=>c.tier===required))report.results.push({id:`tier:${required}`,tier:required,
       status:'incomplete',reason:'Required tier has no registered cases'});
-  for(const required of requiredCases)if(!selected.some(c=>c.id===required.id))
+  for(const required of requiredCases)if(!selected.some(c=>c.id===required.id&&c.tier===required.tier))
     report.results.push({...required,status:'incomplete',reason:'Required case is not registered'});
   try {report.revision=(await promisify(execFile)('git',['-C',fileURLToPath(new URL('../../..',import.meta.url)),
     'rev-parse','HEAD'])).stdout.trim();}catch{report.revision=null;}
