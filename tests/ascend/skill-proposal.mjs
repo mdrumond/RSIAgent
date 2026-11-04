@@ -130,6 +130,36 @@ test('native writer elapsed allocation aborts and retains response evidence', as
   assert.equal((await load(join(root, 'timed', 'responses.json'))).length, 1);
 });
 
+test('writer deadline during input read is latched before the pending wait', { timeout: 2000 }, async t => {
+  for (const hang of [true, false]) {
+    const root = await fixture(t), directory = join(root, 'delayed'), controller = new AbortController();
+    let releaseRead, timer, submitted = 0, shutdown = 0, readStarted = false;
+    const pendingRead = new Promise(resolve => { releaseRead = resolve; });
+    const { native, flags } = nativeWriter(() => {}, hang, async path => {
+      if (!readStarted) {
+        readStarted = true;
+        timer = setTimeout(() => controller.abort(), 20);
+      }
+      await pendingRead;
+      return load(path);
+    });
+    const create = native.createAgentSession;
+    native.createAgentSession = async options => {
+      const result = await create(options), abort = result.session.abort;
+      result.session.abort = async () => { await abort(); releaseRead(); };
+      result.session.extensionRunner = { async emit() { shutdown++; } };
+      return result;
+    };
+    try {
+      await assert.rejects(generateCandidate({ directory, input: {}, native, signal: controller.signal,
+        validate: () => { submitted++; } }), { name: 'AbortError' });
+      assert.ok(readStarted && flags.aborted && flags.disposed);
+      assert.equal(submitted, 0); assert.equal(shutdown, 1);
+      assert.equal((await load(join(directory, 'responses.json'))).length, 1);
+    } finally { clearTimeout(timer); }
+  }
+});
+
 test('external stop aborts native session, rejects submission and preserves partial messages', async t => {
   const root = await fixture(t), controller = new AbortController();
   const { native, flags } = nativeWriter(() => setTimeout(() => controller.abort(), 0), true);

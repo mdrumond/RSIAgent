@@ -177,15 +177,21 @@ for (const failure of ['policy','busy','unknown']) test(`core probe-only reconci
   const f=await fixture(t);
   const lease=(await f.environment.resources()).find(row=>row.available);
   const file=join(f.context.instancePath,'state.sqlite');
-  let state=new State(file),depth=0;
+  let state=new State(file),depth=0,now=0,exclusions=0;
   t.after(()=>state.close());
   state.add({id:'p',goal:'numeric',actor_seconds:30,source:f.source,verifier:{files:[],command:'true'}});
   const attempt=state.admit('p',{pid:2147483647,start:'gone',boot:'gone'});
   state.checkpoint(attempt.id,2);
   state.event(attempt.id,'execution-starting',{operation:'probe-only',startElapsed:2});
-  const clock=new ActorClock(30,2);
+  const clock=new ActorClock(30,2,()=>now);
   const context={...f.context,resource:lease,
-    exclude:(label,fn)=>clock.exclude(label,async()=>{depth++;try{return await fn();}finally{depth--;}}),
+    exclude:(label,fn)=>clock.exclude(label,async()=>{
+      depth++;exclusions++;now+=10000;
+      assert.equal(clock.elapsed,2);
+      try{return await fn();}finally{
+        now+=10000;assert.equal(clock.elapsed,2);depth--;
+      }
+    }),
     event:async(type,data)=>{
       if(type==='execution-submitting' && data.accountingExcluded)assert.ok(depth>0);
       state.event(attempt.id,type,{...data,operation:'probe-only'});
@@ -210,7 +216,8 @@ for (const failure of ['policy','busy','unknown']) test(`core probe-only reconci
   const resumed=await state.resume(attempt.id,a=>attemptStopped(state,a,restarted),await processIdentity());
   assert.equal(resumed.id,attempt.id);assert.equal(resumed.elapsed,2);
   assert.equal(f.calls.filter(args=>args[0]==='run').length,submitted);
-  assert.ok(clock.elapsed<2.2,'actual setup exclusion must not charge probe latency');
+  assert.ok(exclusions>0);assert.equal(depth,0);assert.equal(clock.elapsed,2);
+  now+=750;assert.equal(clock.elapsed,2.75);
   const reconciliation=state.events(attempt.id).find(row=>row.type==='execution-reconciled');
   assert.equal(reconciliation.data.executionSeconds,0);
 });
