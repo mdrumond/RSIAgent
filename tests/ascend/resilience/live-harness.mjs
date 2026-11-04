@@ -12,7 +12,6 @@ import * as sdk from '@earendil-works/pi-coding-agent';
 import {Blocked} from './runner.mjs';
 import {schedule,target,serve,connect} from './fixtures.mjs';
 import {bootstrap,readConfig} from '../../../cli/instance.mjs';
-import {ensureKnowledgeService} from '../../../cli/knowledge.mjs';
 import {modelFromProfile} from '../../../controller/model.mjs';
 import {State} from '../../../controller/state.mjs';
 import {processIdentity,ownerStopped,attemptStopped} from '../../../controller/lifecycle.mjs';
@@ -25,6 +24,10 @@ import {createEnvironment as genericEnvironment,createCplClient} from '../../../
 const repository=fileURLToPath(new URL('../../..',import.meta.url));
 const json=async path=>JSON.parse(await readFile(path,'utf8'));
 export const digest=async path=>createHash('sha256').update(await readFile(path)).digest('hex');
+async function ensureKnowledgeService(config,options){
+  const module=await import(pathToFileURL(join(config.root,'machinery/cli/knowledge.mjs')));
+  return module.ensureKnowledgeService(config,options);
+}
 async function profileInput(path=process.env.RESILIENCE_LIVE_PROFILE){
   if(!path)throw new Blocked('Set RESILIENCE_LIVE_PROFILE to an ignored native DeepSeek profile');
   let profile;try{profile=await json(path);}catch{throw new Blocked('Live profile is not readable JSON');}
