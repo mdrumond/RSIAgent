@@ -8,6 +8,19 @@ import {createLiveFixture,constructionResume,digest,until} from './live-harness.
 import {readProcessStat} from '../../../integrations/environments/index.mjs';
 import {processIdentity,ownerStopped,attemptStopped} from '../../../controller/lifecycle.mjs';
 
+export function verifyInvestigation(f,child){
+  const outcome=f.state.attempt(child.id).outcome,events=f.state.events(child.id);
+  assert.ok(['passed','failed'].includes(outcome),'Investigation must be terminal');
+  if(outcome==='passed')f.verifyAccepted(child);
+  else{
+    assert.equal(events.some(e=>e.type==='accepted'),false);
+    assert.ok(events.some(e=>e.type==='verification'&&e.data.passed===false),'Failed investigation requires actual negative verification');
+    assert.ok(events.some(e=>e.type==='recovery-completed'&&e.data.lesson?.evidence?.length));
+  }
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM recovery_lessons WHERE recorded=0').get().n,0);
+  return outcome==='passed';
+}
+
 export const cases=[
   {id:'deepseek-readiness',tier:'deepseek',async run(ctx){
     let before=0,after=0;
@@ -116,13 +129,13 @@ export const cases=[
   {id:'deepseek-wave-recovery',tier:'deepseek',async run(ctx){
     const f=await createLiveFixture(ctx,{admit:false}),parent=await f.seedFailure(),original=structuredClone(f.state.project('numeric').spec);
     const first=await f.command('wave');assert.equal(first.results.length,1);
-    const child=f.state.db.prepare('SELECT * FROM attempts WHERE id<>?').get(parent.id);assert.ok(child);f.verifyAccepted(child);
+    const child=f.state.db.prepare('SELECT * FROM attempts WHERE id<>?').get(parent.id);assert.ok(child);const investigationPassed=verifyInvestigation(f,child);
     const recovery=f.state.db.prepare('SELECT kind,eligible_wave FROM recovery_queue WHERE project=?').get('numeric');
     assert.equal(recovery.kind,'retry');assert.ok(recovery.eligible_wave>first.wave);
     await f.command('wave');const retry=f.state.db.prepare('SELECT * FROM attempts WHERE id<>? AND id<>?').get(parent.id,child.id);
     assert.ok(retry);f.verifyAccepted(retry);assert.equal(f.state.project('numeric').status,'passed');
     assert.deepEqual(f.state.project('numeric').spec,original);assert.deepEqual(f.state.attempt(parent.id),parent);
     assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM recovery_lessons WHERE recorded=0').get().n,0);
-    return {original:parent.id,investigation:child.id,retry:retry.id,nextWaveRecovery:true};
+    return {original:parent.id,investigation:child.id,investigationPassed,retry:retry.id,projectPassed:true,nextWaveRecovery:true};
   }}
 ];
