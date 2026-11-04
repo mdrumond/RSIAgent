@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {runCases,Blocked} from './runner.mjs';
 import {cases as workspace} from './workspace.case.mjs';
+import {closeRegressionServices} from './regression-cleanup.mjs';
 
 const root=fileURLToPath(new URL('../../..',import.meta.url));
 async function program(ctx,name,command,args,env=process.env) {
@@ -30,8 +31,11 @@ export const cases=[{id:'existing-regressions',tier:'local',async run(ctx){
   catch{throw new Blocked('Select existing Python with pytest, Flask and FastMCP using RESILIENCE_PYTHON');}
   const files=(await readdir(join(root,'tests','ascend'))).filter(f=>f.endsWith('.mjs')&&
     !/(?:_fixture|_setup|-worker|-fixture)\.mjs$/.test(f)).map(f=>'tests/ascend/'+f).sort();
-  const artifacts=join(ctx.directory,'native-tests');await mkdir(artifacts);
+  const artifacts=join(ctx.directory,'native-tests'),temporary=join(ctx.directory,'temporary');
+  await mkdir(artifacts);await mkdir(temporary);
+  ctx.onCleanup(options=>closeRegressionServices(ctx.directory,options));
   const env={...process.env,PYTHON:python,DRIVER_PYTHON:python,RSI_KDB_TEST_PYTHON:python,RECOVERY_PYTHON:python,DRIVER_ARTIFACTS:artifacts,
+    TMPDIR:temporary,TEMP:temporary,TMP:temporary,
     PATH:dirname(process.execPath)+delimiter+process.env.PATH};
   await program(ctx,'node',process.execPath,['--test','--test-concurrency=1',...files],env);
   await program(ctx,'python',python,['-m','pytest','-q','tests/ascend'],env);

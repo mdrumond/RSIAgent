@@ -1,12 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,writeFile,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runCases} from './resilience/runner.mjs';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
+import {closeRegressionServices} from './resilience/regression-cleanup.mjs';
 
 async function output(t){const dir=await mkdtemp(join(tmpdir(),'resilience-round-'));
   t.after(()=>rm(dir,{recursive:true,force:true}));return dir;}
+async function service(t){
+  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  const exited=once(child,'exit');await once(child,'spawn');const owner=await processIdentity(child.pid);
+  t.after(async()=>{if(!await ownerStopped(owner))child.kill('SIGKILL');await exited;});return {owner,exited};
+}
+test('interrupted regression cleanup closes only receipt-owned detached services',async t=>{
+  const root=await output(t),owned=await service(t),unrelated=await service(t);
+  await writeFile(join(root,'knowledge-service.json'),JSON.stringify({owner:owned.owner}));
+  const proof=await closeRegressionServices(root,{signal:new AbortController().signal,remainingSeconds:2});
+  await owned.exited;assert.equal(proof[0].state,'stopped');
+  assert.equal(await ownerStopped(unrelated.owner),false);
+});
+test('exhausted regression cleanup retains every unresolved receipt and fails',async t=>{
+  const root=await output(t),owned=await service(t),abort=new AbortController();
+  for(const name of ['first','second']){await mkdir(join(root,name));
+    await writeFile(join(root,name,'knowledge-service.json'),JSON.stringify({owner:owned.owner}));}
+  abort.abort(Error('Round cleanup elapsed allocation exhausted'));
+  await assert.rejects(closeRegressionServices(root,{signal:abort.signal,remainingSeconds:0}));
+  const proof=JSON.parse(await readFile(join(root,'regression-service-closure.json'),'utf8'));
+  assert.equal(proof.length,2);assert.ok(proof.every(p=>p.state==='unknown'&&p.error));
+  assert.equal(await ownerStopped(owned.owner),false);
+});
 test('local failure prevents provider and remote dispatch despite registration order',async t=>{
   const called=[],make=(id,tier)=>({id,tier,async run(){called.push(id);if(tier==='local')throw Error('oracle failed');}});
   const report=await runCases([make('remote','remote'),make('paid','deepseek'),make('cpu','local')],
