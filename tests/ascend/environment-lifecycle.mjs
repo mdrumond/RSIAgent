@@ -83,6 +83,34 @@ for (const failure of ['closed', 'closed-at-stop', 'not-admitted', 'unknown']) t
   assert.equal(f.calls.some(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('command.sh')),false);
 });
 
+for (const failure of ['failed-upload','unknown-upload','running-upload','unidentified-upload',
+                        'failed-download','not-admitted-download']) test(`transfer setup proof: ${failure}`,async t=>{
+  const handle='remote:fake:transfer:proof',reason={stage:'transfer',message:'copy failed'};
+  let observations=0;
+  const f=await fixture(t,async args=>{
+    if(args[0]==='upload'&&failure.endsWith('upload')){
+      if(failure==='unidentified-upload')return {state:'observation-unavailable'};
+      return {handle,state:failure==='failed-upload'?'failed':'running',reason};
+    }
+    if(args[0]==='observe'&&args[1]===handle){
+      if(failure==='running-upload'&&observations++===0)return {state:'running'};
+      return {state:'observation-unavailable'};
+    }
+    if(args[0]==='download'&&failure.endsWith('download'))return failure==='not-admitted-download'
+      ?{admitted:false,reason}:{handle,state:'failed',reason};
+  });
+  const work=failure.endsWith('upload')?f.environment.execute('must-not-run',f.project):f.environment.browse('artifact');
+  await assert.rejects(work,error=>{
+    if(failure==='failed-upload'){
+      assert.equal(error.code,'SETUP_CLOSED');assert.deepEqual(error.closure.handles,[handle]);
+      assert.equal(error.closure.payloadStarted,false);assert.deepEqual(error.closure.reason.reason,reason);
+    }else assert.equal(error.closure,undefined);
+    return true;
+  });
+  assert.equal(f.calls.filter(a=>a[0]==='upload').length,failure.endsWith('upload')?1:0);
+  assert.equal(f.calls.some(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('command.sh')),false);
+});
+
 test('disconnect preserves handle; new observer can stop without resubmission', async t => {
   let connected = false, cancelled = false;
   const f = await fixture(t, async (args, { events }) => {

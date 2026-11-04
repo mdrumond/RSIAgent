@@ -269,8 +269,13 @@ export async function createEnvironment(options, context) {
     return { state: 'unknown' };
   }
   async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
-    if (signal?.aborted) throw Object.assign(closedSetupError(`CPL ${args[0]} was not admitted`,
-      {notAdmitted: true}), {cause: signal.reason});
+    const rejected = reason => {
+      const error = closedSetupError(`CPL ${args[0]} was not admitted`, {notAdmitted:true,reason});
+      // A refused artifact download says nothing about earlier payload closure.
+      if (args[0] === 'download') delete error.closure;
+      return error;
+    };
+    if (signal?.aborted) throw Object.assign(rejected(), {cause: signal.reason});
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
@@ -285,7 +290,7 @@ export async function createEnvironment(options, context) {
     }
     if (result?.admitted === false || result?.submitted === false) {
       await event('execution-not-admitted', { submission: operation, closed: true });
-      throw closedSetupError(`CPL ${args[0]} was not admitted`, {notAdmitted: true, reason: result.reason});
+      throw rejected(result.reason);
     }
     const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
@@ -315,7 +320,11 @@ export async function createEnvironment(options, context) {
         throw error;
       }
     }
-    if (result.state !== 'completed') throw new Error(`Transfer did not complete: ${handle ?? result.state}`);
+    if (result.state !== 'completed') {
+      if (upload && handle && terminal.has(result.state))
+        throw closedSetupError(`Transfer did not complete: ${handle}`, {handle, reason: result});
+      throw new Error(`Transfer did not complete: ${handle ?? result.state}`);
+    }
     return result;
   }
   async function execute(command, cwd, opts = {}) {
