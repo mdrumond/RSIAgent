@@ -15,6 +15,23 @@ import {provider} from '../driver_fixture.mjs';
 const checkout = fileURLToPath(new URL('../../..', import.meta.url));
 const execPrerequisite = promisify(execFile);
 export class InstalledPrerequisiteError extends Error {}
+export async function observeNativeClosure(handles, client, {signal, remainingSeconds}, archive) {
+  const bounded = AbortSignal.any([signal, AbortSignal.timeout(Math.max(0, Math.floor(remainingSeconds * 1000)))]);
+  const observations = await Promise.all([...handles].map(async handle => {
+    let state = {state: 'unknown'};
+    try {
+      await until(async () => {
+        state = await client(['observe', handle], {signal: bounded});
+        return ['completed', 'failed', 'cancelled'].includes(state.state);
+      }, `native closure ${handle}`, remainingSeconds, bounded);
+      return {handle, ...state};
+    } catch (error) {return {handle, ...state, error: error.message};}
+  }));
+  await archive(observations);
+  const unresolved = observations.filter(o => !['completed', 'failed', 'cancelled'].includes(o.state));
+  if (unresolved.length) throw new AggregateError(unresolved.map(o => new Error(`${o.handle}: ${o.error ?? o.state}`)), 'Unresolved native cleanup');
+  return observations;
+}
 export async function installedPrerequisites(python, signal) {
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 23)) throw new InstalledPrerequisiteError('Node >=22.23 required');
@@ -68,8 +85,9 @@ export async function runInstalledPackagingCase({
   artifactRoot = process.env.INSTALLED_ARTIFACTS ?? tmpdir(),
   python = process.env.DRIVER_PYTHON ?? process.env.PYTHON ?? 'python3.12',
   remoteProfile = process.env.INSTALLED_REMOTE_PROFILE,
-  signal, onCleanup = () => {}, event = async () => {},
+  signal, onCleanup, event = async () => {},
 } = {}) {
+  assert.equal(typeof onCleanup, 'function', 'Runner cleanup context required');
   signal?.throwIfAborted();
   await installedPrerequisites(python, signal);
   const remoteOptions = remoteProfile ? await parse(remoteProfile) : null;
@@ -92,10 +110,12 @@ export async function runInstalledPackagingCase({
     PATH: dirname(process.execPath) + delimiter + process.env.PATH};
   delete env.NODE_PATH;
   delete env.PYTHONPATH;
-  let sequence = 0, dashboard, fixture, cli, ownerStopped, cleaning = false, cleanupPromise;
+  let sequence = 0, dashboard, fixture, cli, ownerStopped, cleaning = false, cleanupPromise, cleanupSignal;
+  let cleanupDeadline = Infinity;
+  const activeSignal = () => cleaning ? cleanupSignal : signal;
   const commands = [], snapshots = [];
   const launch = (command, args, {cwd = outside, seconds = 180} = {}) => {
-    if (!cleaning) signal?.throwIfAborted();
+    activeSignal()?.throwIfAborted();
     const prefix = join(root, `process-${sequence++}`);
     const child = spawn(command, args, {cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
     let stdout = '', stderr = '';
@@ -103,21 +123,23 @@ export async function runInstalledPackagingCase({
     const terminate = () => {
       if (child.exitCode !== null || child.signalCode !== null) return;
       try {process.kill(-child.pid, 'SIGTERM');} catch {}
-      forced ??= setTimeout(() => {try {process.kill(-child.pid, 'SIGKILL');} catch {}}, 5000);
+      forced ??= setTimeout(() => {try {process.kill(-child.pid, 'SIGKILL');} catch {}},
+        Math.max(0, Math.min(5000, cleanupDeadline - performance.now())));
     };
     const abort = () => terminate();
-    if (!cleaning) signal?.addEventListener('abort', abort, {once: true});
-    if (!cleaning && signal?.aborted) abort();
+    const childSignal = activeSignal();
+    childSignal?.addEventListener('abort', abort, {once: true});
+    if (childSignal?.aborted) abort();
     child.stdout.on('data', data => {stdout += data;});
     child.stderr.on('data', data => {stderr += data;});
     const timer = setTimeout(() => {
       expired = true;
       terminate();
-    }, seconds * 1000);
+    }, Math.max(0, Math.min(seconds * 1000, cleanupDeadline - performance.now())));
     const output = (async () => {
       let code;
       try {[code] = await once(child, 'close');} finally {
-        clearTimeout(timer); clearTimeout(forced); signal?.removeEventListener('abort', abort);
+        clearTimeout(timer); clearTimeout(forced); childSignal?.removeEventListener('abort', abort);
       }
       await writeFile(prefix + '.stdout', stdout);
       await writeFile(prefix + '.stderr', stderr);
@@ -153,7 +175,7 @@ export async function runInstalledPackagingCase({
     return http;
   };
   let result, failure;
-  const remoteClosure = async () => {
+  const remoteClosure = async context => {
     const handles = new Set();
     for (const row of rows(instance, 'SELECT data FROM events')) {
       const data = JSON.parse(row.data);
@@ -175,41 +197,36 @@ export async function runInstalledPackagingCase({
       }
     }
     await receipts(join(instance, 'attempts'));
-    const observations = [];
-    for (const handle of handles) {
-      let state;
-      await until(async () => {
-        state = await remoteClient(['observe', handle]);
-        return ['completed', 'failed', 'cancelled'].includes(state.state);
-      }, `native closure ${handle}`, 60).catch(error => {state = {...state, error: error.message};});
-      observations.push({handle, ...state});
-    }
-    await writeFile(join(root, 'native-closure.json'), JSON.stringify(observations, null, 2));
-    assert.ok(observations.every(o => ['completed', 'failed', 'cancelled'].includes(o.state)));
-    return observations;
+    return observeNativeClosure(handles, remoteClient, context,
+      observations => writeFile(join(root, 'native-closure.json'), JSON.stringify(observations, null, 2)));
   };
-  const cleanup = () => cleanupPromise ??= (async () => {
+  const cleanup = context => cleanupPromise ??= (async () => {
     cleaning = true;
+    cleanupDeadline = performance.now() + context.remainingSeconds * 1000;
+    cleanupSignal = AbortSignal.any([context.signal, AbortSignal.timeout(Math.max(0, Math.floor(context.remainingSeconds * 1000)))]);
     const errors = [];
     const closure = {};
     try {
       if (cli && ownerStopped) {
         await run('stop');
-        await until(async () => (await run('status')).controller.state === 'stopped', 'cleanup controller');
+        await until(async () => (await run('status')).controller.state === 'stopped', 'cleanup controller', context.remainingSeconds, cleanupSignal);
         closure.controllerStopped = true;
+      }
+    } catch (error) {errors.push(error);}
+    if (ownerStopped) {
         try {
           const service = await parse(join(instance, 'knowledge-service.json'));
           if (!await ownerStopped(service.owner)) {
             process.kill(service.owner.pid, 'SIGTERM');
-            await until(() => ownerStopped(service.owner), 'owned KDB shutdown');
+            await until(() => ownerStopped(service.owner), 'owned KDB shutdown', context.remainingSeconds, cleanupSignal);
           }
           closure.knowledgeOwner = service.owner;
           closure.knowledgeStopped = await ownerStopped(service.owner);
-        } catch (error) {if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;}
-      }
-    } catch (error) {errors.push(error);}
+        } catch (error) {if (error.code !== 'ENOENT' && error.code !== 'ESRCH') errors.push(error);}
+    }
     if (remoteClient) {
-      try {closure.native = await remoteClosure();} catch (error) {errors.push(error);}
+      try {closure.native = await remoteClosure({signal: cleanupSignal,
+        remainingSeconds: Math.max(0, (cleanupDeadline - performance.now()) / 1000)});} catch (error) {errors.push(error);}
     }
     if (dashboard) {
       dashboard.terminate();
@@ -228,7 +245,12 @@ export async function runInstalledPackagingCase({
     await writeFile(join(root, 'commands.json'), JSON.stringify(commands, null, 2));
     if (errors.length) throw new AggregateError(errors, 'Installed fixture cleanup failed');
   })();
-  onCleanup(cleanup);
+  onCleanup(async context => {
+    try {await cleanup(context);} catch (error) {failure ??= error; if (result) result.passed = false;}
+    await writeFile(join(root, 'result.json'), JSON.stringify(failure ?
+      {passed: false, error: failure.message, partial: result} : result, null, 2));
+    if (failure) throw failure;
+  });
   try {
     const packed = JSON.parse(await exec('npm', ['pack', '--json', '--pack-destination', assets], {cwd: checkout}));
     const tarball = join(assets, packed[0].filename);
@@ -367,10 +389,6 @@ export async function runInstalledPackagingCase({
   } catch (error) {
     failure = error;
     await writeFile(join(root, 'failure.txt'), error.stack ?? String(error));
-  } finally {
-    try {await cleanup();} catch (error) {failure ??= error;}
-    await writeFile(join(root, 'result.json'), JSON.stringify(failure ?
-      {passed: false, error: failure.message, partial: result} : result, null, 2));
   }
   if (failure) throw failure;
   return result;
