@@ -5,6 +5,6 @@ export const requiredCases=[
   ...['deepseek-readiness','deepseek-workspace-revision','deepseek-construction-resume',
     'deepseek-worker-loss','deepseek-compaction','deepseek-wave-recovery'].map(id=>({id,tier:'deepseek'})),
   ...['remote-workspace','remote-construction-resume','remote-observer-resume','installed-cli-dashboard-cpl',
-    'registered-cpu-transport','registered-cpu-cancellation']
+    'registered-cpu-transport','registered-cpu-cancellation','registered-cpu-source-symlinks']
     .map(id=>({id,tier:'remote'})),
 ];

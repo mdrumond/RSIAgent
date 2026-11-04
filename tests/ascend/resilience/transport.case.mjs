@@ -24,7 +24,7 @@ export function caseClient({native,signal,readInstructions,event=async()=>{}}) {
     }
   };
   return {client,handles,async close(environment,directory,{milliseconds=60000,signal}={}){
-    active=AbortSignal.any([AbortSignal.timeout(milliseconds),signal].filter(Boolean));const observations=[];
+    active=AbortSignal.any([AbortSignal.timeout(Math.max(1,Math.floor(milliseconds))),signal].filter(Boolean));const observations=[];
     for(const handle of handles) {
       let state;
       try {
