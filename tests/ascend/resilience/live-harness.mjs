@@ -29,7 +29,10 @@ async function profileInput(path=process.env.RESILIENCE_LIVE_PROFILE){
   if(!path)throw new Blocked('Set RESILIENCE_LIVE_PROFILE to an ignored native DeepSeek profile');
   let profile;try{profile=await json(path);}catch{throw new Blocked('Live profile is not readable JSON');}
   if(!profile.python||profile.actor?.provider!=='deepseek')throw new Blocked('Live profile requires Python and native provider deepseek');
-  return {...profile,actor:{...profile.actor,max_tokens:8192}};
+  for(const value of [profile.actor_seconds??300,profile.curriculum_seconds??180])if(!Number.isFinite(value)||value<=0)throw new Blocked('Live profile requires positive elapsed allocations');
+  const actor={...profile.actor,max_tokens:Math.min(profile.actor.max_tokens??8192,8192)};
+  if(actor.credentials_file)actor.credentials_file=resolve(dirname(path),actor.credentials_file);
+  return {...profile,actor};
 }
 // Read-only preflight: modelFromProfile disables discovery/network refresh. Never return credentials/profile data.
 export async function loadLiveProfile(path){
@@ -70,12 +73,30 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
   const profile=await profileInput();await loadLiveProfile();
   const seconds=actorSeconds??profile.actor_seconds??300;
   const root=join(ctx.directory,'instance'),source=join(ctx.directory,'input/source'),skills=join(ctx.directory,'skills');
-  const observations=[],sessions=[],processes=[],environments=new Map();let state,config,backend,proxy;const mcpTimeline=[];
+  const observations=[],sessions=[],processes=[];let state,config,backend,proxy;const mcpTimeline=[];
   const save=(name,value)=>writeFile(join(ctx.directory,name),JSON.stringify(value,null,2)+'\n');
+  async function command(command,{preload,signal=ctx.signal}={}){
+      const args=[join(root,'machinery/cli/main.mjs'),command,'--instance',root],env={...process.env};
+      if(preload)env.NODE_OPTIONS=[env.NODE_OPTIONS??'',`--import=${preload}`].join(' ');
+      const child=spawn(process.execPath,args,{env,stdio:['ignore','pipe','pipe'],signal});processes.push(child);
+      let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
+      const [code]=await once(child,'close');await appendFile(join(ctx.directory,'cli.jsonl'),JSON.stringify({command,code,stdout,stderr})+'\n');assert.equal(code,0);return JSON.parse(stdout.trim().split('\n').at(-1));
+  }
   ctx.onCleanup(async cleanup=>{
     const failures=[],closed=[];
+    if(config&&state)try{
+      await command('stop',{signal:cleanup.signal});
+      await until(async()=>{for(const attempt of state.db.prepare('SELECT owner FROM attempts').all()){
+        const owner=JSON.parse(attempt.owner);if(owner?.pid!==process.pid&&!await ownerStopped(owner))return false;
+      }return true;},{signal:cleanup.signal,seconds:10});
+    }catch(error){failures.push(error.message);}
     for(const session of sessions)try{session.abortCompaction();await session.abort();await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});session.dispose();const file=session.sessionManager.getSessionFile();const rows=(await readFile(file,'utf8')).split('\n').filter(Boolean).map(JSON.parse);await writeFile(join(dirname(file),'sft.native.jsonl'),JSON.stringify({raw_session:file,messages:rows.filter(e=>e.type==='message').map(e=>e.message)})+'\n');}catch(error){failures.push(error.message);}
     if(state)for(const attempt of state.db.prepare('SELECT * FROM attempts').all()){
+      const native=state.events(attempt.id),ended=new Set(native.filter(e=>e.type==='native-bash-completed').map(e=>e.data.operation));
+      if(native.some(e=>e.type==='native-bash-started'&&!ended.has(e.data.operation)))try{
+        const proof=await json(join(ctx.directory,'process-closure.json'));
+        if(!proof.workerClosed||!proof.nativeGroupStopped||proof.errors.length)throw Error('Native Bash group closure unproven');
+      }catch(error){failures.push('Unmatched native Bash: '+error.message);}
       let env;
       try{env=await factory({instancePath:join(root,'attempts',attempt.id),signal:cleanup.signal,event:()=>{},exclude:async(_,fn)=>fn()});}
       catch(error){failures.push(error.message);continue;}
@@ -141,8 +162,7 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
   }
   async function factory(context){
     const base=environmentFactory??(async c=>(await import(pathToFileURL(resolve(root,config.environment.module)))).createEnvironment(config.environment.options,c));
-    const e=await base({...context,signal:context.signal??ctx.signal});
-    const id=context.instancePath?.split('/').at(-1);if(id)environments.set(id,e);return e;
+    return base({...context,signal:context.signal??ctx.signal});
   }
   const fixture={ctx,config,state,project:state.project('numeric').spec,observations,sessions,save,factory,mcpTimeline,
     attempt:admit?state.admit('numeric',await processIdentity()):null,
@@ -167,17 +187,11 @@ export async function createLiveFixture(ctx,{environment,environmentFactory,acto
       state.finish(attempt.id,'failed');recordOutcome(state,{attemptId:attempt.id,wave:0,passed:false,findings:'Independent integer verifier rejects constant0 on [2,3]. Investigate a smaller two-integer case.',evidence:[{path,sha256:await digest(path)}]});
       return state.attempt(attempt.id);
     },
-    async command(command,{preload}={}){
-      const args=[join(root,'machinery/cli/main.mjs'),command,'--instance',root],env={...process.env};
-      if(preload)env.NODE_OPTIONS=[env.NODE_OPTIONS??'',`--import=${preload}`].join(' ');
-      const child=spawn(process.execPath,args,{env,stdio:['ignore','pipe','pipe'],signal:ctx.signal});processes.push(child);
-      let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
-      const [code]=await once(child,'close');await appendFile(join(ctx.directory,'cli.jsonl'),JSON.stringify({command,code,stdout,stderr})+'\n');assert.equal(code,0);return JSON.parse(stdout.trim().split('\n').at(-1));
-    },
+    command,
     async openSession(){
       const path=join(root,'compact');await mkdir(path);const settings=sdk.SettingsManager.inMemory({retry:{enabled:false}});
       const bridge=createKdbBridge({url:mcpUrl,attemptId:'compaction',agentDir:path});
-      const loader=new sdk.DefaultResourceLoader({cwd:fixture.project.source,agentDir:path,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[bridge.extension,pi=>pi.on('before_provider_request',event=>appendFile(join(path,'provider.jsonl'),JSON.stringify(event)+'\n'))]});await loader.reload();
+      const loader=new sdk.DefaultResourceLoader({cwd:fixture.project.source,agentDir:path,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[bridge.extension,pi=>{for(const type of ['before_provider_request','provider_stream_event','after_provider_response'])pi.on(type,event=>appendFile(join(path,'provider.jsonl'),JSON.stringify(event)+'\n'));}]});await loader.reload();
       const {session}=await sdk.createAgentSession({cwd:fixture.project.source,agentDir:path,settingsManager:settings,...await modelFromProfile(config.actor),thinkingLevel:'off',resourceLoader:loader,sessionManager:sdk.SessionManager.create(fixture.project.source,path)});
       sessions.push(session);session.subscribe(event=>{void appendFile(join(path,'native-events.jsonl'),JSON.stringify(event)+'\n');});await bridge.prepareSession(session,{signal:ctx.signal});
       session.setActiveToolsByName(session.getActiveToolNames().filter(name=>!['mcp__kdb__record_lesson','mcp__kdb__add_repo'].includes(name)));return session;

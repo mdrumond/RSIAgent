@@ -4,7 +4,6 @@ import { readFile, rename, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 
@@ -145,7 +144,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   if(values.request)return (await import('./background.mjs')).trackRequest(root,values.request,operation);
   return operation();
 }
-if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
+if(import.meta.main) {
   const abort=new AbortController();
   const stop=()=>abort.abort();process.on('SIGTERM',stop);process.on('SIGINT',stop);
   main(undefined,{signal:abort.signal}).then(value=>console.log(JSON.stringify(value))).catch(error=>{

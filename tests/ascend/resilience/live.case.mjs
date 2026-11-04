@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import {readFile,writeFile,readlink} from 'node:fs/promises';
+import {readFile,writeFile,readlink,readdir} from 'node:fs/promises';
 import {join} from 'node:path';
 import {once} from 'node:events';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {createLiveFixture,constructionResume,digest,until} from './live-harness.mjs';
+import {readProcessStat} from '../../../integrations/environments/index.mjs';
 import {processIdentity,ownerStopped,attemptStopped} from '../../../controller/lifecycle.mjs';
 
 export const cases=[
@@ -49,25 +50,52 @@ export const cases=[
   }},
   {id:'deepseek-worker-loss',tier:'deepseek',async run(ctx){
     const f=await createLiveFixture(ctx,{admit:false,goal:'First read rsi_skill. Before advancing preflight use native LOCAL bash to run Python that writes its os.getpid() into worker-child.pid and sleeps60 seconds. This is an isolated worker-lifetime diagnostic; do not use rsi_target for that command.'});
-    let nativeOwner;
+    let nativeOwner,group;
+    const fields=stat=>stat.slice(stat.lastIndexOf(')')+2).split(' ');
+    const groupMembers=async()=>{const live=[];for(const name of await readdir('/proc')){
+      if(!/^\d+$/.test(name))continue;const stat=await readProcessStat(name);if(!stat)continue;const row=fields(stat);
+      if(Number(row[2])===group.pgid&&!['Z','X'].includes(row[0]))live.push(Number(name));
+    }return live;};
     const child=spawn(process.execPath,[fileURLToPath(new URL('./live-worker.mjs',import.meta.url)),f.config.root],{stdio:['ignore','pipe','pipe']});
     let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);const exited=once(child,'exit');void exited.catch(()=>{});
+    async function capture(pid){
+      assert.equal(await readlink(`/proc/${pid}/cwd`),f.project.source);
+      const stat=await readProcessStat(pid);assert.ok(stat);let parent=Number(fields(stat)[1]),owned=false;
+      while(parent>1){if(parent===child.pid){owned=true;break;}const ancestor=await readProcessStat(parent);if(!ancestor)break;parent=Number(fields(ancestor)[1]);}
+      assert.ok(owned,'Milestone PID must descend from this exact native worker');
+      nativeOwner=await processIdentity(pid);group={pgid:Number(fields(stat)[2]),start:fields(stat)[19]};
+    }
     ctx.onCleanup(async cleanup=>{
+      const errors=[];
+      if(!nativeOwner)try{await capture(Number(await readFile(join(f.project.source,'worker-child.pid'),'utf8')));}
+      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))errors.push(error.message);}
       if(child.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await exited;}
-      if(!nativeOwner)try{const pid=Number(await readFile(join(f.project.source,'worker-child.pid'),'utf8'));
-        if(await readlink(`/proc/${pid}/cwd`)===f.project.source&&(await readFile(`/proc/${pid}/cmdline`,'utf8')).includes('worker-child.pid'))nativeOwner=await processIdentity(pid);
-      }catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;}
-      if(nativeOwner&&!await ownerStopped(nativeOwner)){process.kill(nativeOwner.pid,'SIGKILL');await until(()=>ownerStopped(nativeOwner),{signal:cleanup.signal});}
+      if(nativeOwner&&!group){const stat=await readProcessStat(nativeOwner.pid);if(stat){const row=fields(stat);group={pgid:Number(row[2]),start:row[19]};}}
+      if(group){
+        const stat=await readProcessStat(nativeOwner.pid),own=fields(await readProcessStat(process.pid));
+        if(stat&&fields(stat)[19]===group.start&&Number(fields(stat)[2])===group.pgid){
+          assert.ok(group.pgid>1&&group.pgid!==Number(own[2]),'Only the known detached fixture group may be killed');
+          try{process.kill(-group.pgid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}
+        }else if((await groupMembers()).length)errors.push('Native group identity unavailable; retain held/unknown evidence');
+        if(!errors.length)await until(async()=>!(await groupMembers()).length,{signal:cleanup.signal});
+      }else{
+        for(const a of f.state.db.prepare('SELECT id FROM attempts').all()){
+          const events=f.state.events(a.id),closed=new Set(events.filter(e=>e.type==='native-bash-completed').map(e=>e.data.operation));
+          if(events.some(e=>e.type==='native-bash-started'&&!closed.has(e.data.operation)))errors.push('Native Bash closure identity missing');
+        }
+      }
+      await f.save('process-closure.json',{workerClosed:child.exitCode!==null||child.signalCode!==null,nativeGroupStopped:group?!(await groupMembers()).length:errors.length===0,group,errors});
+      assert.deepEqual(errors,[],'Unknown native Bash closure must fail cleanup');
       await f.save('worker-output.json',{output,owner:nativeOwner});
     });
     const pid=await until(async()=>{try{return Number(await readFile(join(f.project.source,'worker-child.pid'),'utf8'));}catch{return false;}},{signal:ctx.signal,seconds:60});
-    assert.equal(await readlink(`/proc/${pid}/cwd`),f.project.source);assert.ok((await readFile(`/proc/${pid}/cmdline`,'utf8')).includes('worker-child.pid'));
-    nativeOwner=await processIdentity(pid);const attempt=f.state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').get();assert.ok(attempt?.session);
+    await capture(pid);const attempt=f.state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').get();assert.ok(attempt?.session);
     child.kill('SIGKILL');await exited;assert.equal(await ownerStopped(nativeOwner),false);
-    const starts=f.state.events(attempt.id).filter(e=>e.type==='native-bash-started');assert.equal(starts.length,1);
+    const recorded=f.state.events(attempt.id),completed=new Set(recorded.filter(e=>e.type==='native-bash-completed').map(e=>e.data.operation));
+    const starts=recorded.filter(e=>e.type==='native-bash-started');assert.equal(starts.filter(e=>!completed.has(e.data.operation)).length,1);
     await assert.rejects(f.state.resume(attempt.id,a=>attemptStopped(f.state,a,{}),await processIdentity()),/Previous execution/);
     assert.equal(f.state.attempt(attempt.id).outcome,null);assert.equal(f.state.attempt(attempt.id).session,attempt.session);
-    assert.equal(f.state.events(attempt.id).filter(e=>e.type==='native-bash-started').length,1);
+    assert.equal(f.state.events(attempt.id).filter(e=>e.type==='native-bash-started').length,starts.length);
     return {id:attempt.id,session:attempt.session,safeHeld:true,replayPrevented:true};
   }},
   {id:'deepseek-compaction',tier:'deepseek',async run(ctx){
