@@ -13,8 +13,8 @@ const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
 // Strip SDK-inherited spawn values, retaining explicit deltas and session identity.
-const targetEnvironment = (env = {}) => Object.fromEntries(Object.entries(env).filter(([key,value]) =>
-  key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in env)) && process.env[key] !== value));
+const targetEnvironment = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key,value]) =>
+  key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (env ?? {}))) && process.env[key] !== value));
 async function sourceSnapshot(path) {
   const files = [], entries = [];
   let cacheable = true;
