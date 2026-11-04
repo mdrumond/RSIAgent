@@ -1,6 +1,7 @@
 /** Installed-package acceptance; all instance inputs and processes live outside the checkout. */
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
+import {spawn, execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {once} from 'node:events';
 import {createServer} from 'node:net';
 import {DatabaseSync} from 'node:sqlite';
@@ -12,6 +13,24 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {provider} from './driver_fixture.mjs';
 
 const checkout = fileURLToPath(new URL('../..', import.meta.url));
+const execPrerequisite = promisify(execFile);
+export class InstalledPrerequisiteError extends Error {}
+export async function installedPrerequisites(python, signal) {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 22 || (major === 22 && minor < 23)) throw new InstalledPrerequisiteError('Node >=22.23 required');
+  const env = {...process.env};
+  delete env.PYTHONPATH;
+  delete env.NODE_PATH;
+  try {
+    await execPrerequisite('npm', ['--version'], {env, signal, timeout: 10000});
+    await execPrerequisite(python, ['-c',
+      "import sys, importlib.util; assert sys.version_info >= (3,11); assert all(importlib.util.find_spec(name) for name in ('flask', 'mcp.server.fastmcp')); import flask; from mcp.server.fastmcp import FastMCP"],
+    {env, signal, timeout: 10000});
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new InstalledPrerequisiteError(`npm and Python >=3.11 with Flask/FastMCP required: ${error.stderr ?? error.message}`);
+  }
+}
 const parse = async path => JSON.parse(await readFile(path, 'utf8'));
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const inside = (root, path) => {
@@ -51,6 +70,7 @@ export async function runInstalledPackagingCase({
   signal, onCleanup = () => {}, event = async () => {},
 } = {}) {
   signal?.throwIfAborted();
+  await installedPrerequisites(python, signal);
   await mkdir(artifactRoot, {recursive: true});
   const root = await mkdtemp(join(artifactRoot, 'ascend-installed-'));
   assert.equal(inside(await realpath(checkout), await realpath(root)), false,
@@ -300,6 +320,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const stop = () => abort.abort(new Error('Installed acceptance interrupted'));
   process.on('SIGTERM', stop); process.on('SIGINT', stop);
   runInstalledPackagingCase({signal: abort.signal}).then(result => console.log(JSON.stringify(result))).catch(error => {
-    console.error(error.stack); process.exitCode = 1;
+    if (error instanceof InstalledPrerequisiteError) console.error(JSON.stringify({outcome: 'blocked', reason: error.message}));
+    else console.error(error.stack);
+    process.exitCode = 1;
   }).finally(() => {process.off('SIGTERM', stop); process.off('SIGINT', stop);});
 }
