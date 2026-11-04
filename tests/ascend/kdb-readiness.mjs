@@ -118,3 +118,38 @@ test('curriculum uses the same required native discovery before its first provid
     config:{curriculum_seconds:10,actor:{provider:'ready-fixture',model:'scripted',credential_env:key,base_url:f.base+'/provider/v1',metadata:model}}}),/Required native KDB/);
   assert.equal(f.requests.length,0);assert.equal(f.queries.length,0);
 });
+
+
+test('abort during delayed native session_start binding is handled before the command race exists',{timeout:15000},async()=>{
+  const {execFile}=await import('node:child_process');
+  const {promisify}=await import('node:util');
+  const script=`
+    import {mkdtemp,rm} from 'node:fs/promises';
+    import {tmpdir} from 'node:os';
+    import {join} from 'node:path';
+    import {setTimeout as delay} from 'node:timers/promises';
+    import {createAgentSession,DefaultResourceLoader,ModelRuntime,SettingsManager,SessionManager} from '@earendil-works/pi-coding-agent';
+    import {InMemoryCredentialStore} from '@earendil-works/pi-ai';
+    import {createKdbBridge} from ${JSON.stringify(new URL('../../integrations/kdb-extension.mjs',import.meta.url).href)};
+    const root=await mkdtemp(join(tmpdir(),'readiness-bind-abort-'));
+    const abort=new AbortController();let shutdown=false,providerRequests=0;
+    const bridge=createKdbBridge({url:'http://127.0.0.1:9/mcp',attemptId:'binding-abort',agentDir:root});
+    const settings=SettingsManager.inMemory({});
+    const loader=new DefaultResourceLoader({cwd:root,agentDir:root,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,
+      extensionFactories:[bridge.extension,pi=>{
+        pi.on('session_start',async()=>{abort.abort(new Error('cancel during binding'));await delay(100);});
+        pi.on('before_provider_request',()=>{providerRequests++;});
+        pi.on('session_shutdown',()=>{shutdown=true;});
+      }]});
+    await loader.reload();
+    const modelRuntime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
+    const {session}=await createAgentSession({cwd:root,agentDir:root,modelRuntime,settingsManager:settings,sessionManager:SessionManager.inMemory(root),resourceLoader:loader,noTools:'builtin'});
+    let cancelled=false;
+    try{await bridge.prepareSession(session,{signal:abort.signal});}
+    catch(error){if(error.message!=='cancel during binding')throw error;cancelled=true;}
+    finally{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});session.dispose();await rm(root,{recursive:true,force:true});}
+    console.log(JSON.stringify({cancelled,shutdown,providerRequests}));
+  `;
+  const result=await promisify(execFile)(process.execPath,['--input-type=module','-e',script],{cwd:new URL('../..',import.meta.url).pathname});
+  assert.deepEqual(JSON.parse(result.stdout.trim()),{cancelled:true,shutdown:true,providerRequests:0});
+});

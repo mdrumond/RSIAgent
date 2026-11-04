@@ -49,6 +49,8 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
     const cancelled = new Promise((_resolve, reject) => {
       cancel = () => reject(signal.reason ?? new Error('KDB setup cancelled'));
     });
+    // Binding can await asynchronous session_start hooks before command() races it.
+    void cancelled.catch(() => {});
     signal?.addEventListener('abort', cancel, {once:true});
     const command = async text => {
       signal?.throwIfAborted();
