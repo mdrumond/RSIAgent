@@ -5,7 +5,7 @@ import {promisify} from 'node:util';
 import {once} from 'node:events';
 import {createServer} from 'node:net';
 import {DatabaseSync} from 'node:sqlite';
-import {mkdtemp, mkdir, writeFile, readFile, cp, lstat, realpath} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, cp, lstat, realpath, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, dirname, delimiter, relative, isAbsolute} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
@@ -67,10 +67,20 @@ function view(status) {
 export async function runInstalledPackagingCase({
   artifactRoot = process.env.INSTALLED_ARTIFACTS ?? tmpdir(),
   python = process.env.DRIVER_PYTHON ?? process.env.PYTHON ?? 'python3.12',
+  remoteProfile = process.env.INSTALLED_REMOTE_PROFILE,
   signal, onCleanup = () => {}, event = async () => {},
 } = {}) {
   signal?.throwIfAborted();
   await installedPrerequisites(python, signal);
+  const remoteOptions = remoteProfile ? await parse(remoteProfile) : null;
+  let remoteClient;
+  if (remoteOptions) {
+    assert.ok(remoteOptions.target && remoteOptions.runtime && remoteOptions.workspacePath);
+    const {createCplClient} = await import('../../integrations/environments/index.mjs');
+    remoteClient = createCplClient(remoteOptions.clientPath);
+    assert.equal((await remoteClient(['capabilities', remoteOptions.target], {signal})).state, 'available');
+    assert.equal((await remoteClient(['preflight', remoteOptions.target], {signal})).state, 'completed');
+  }
   await mkdir(artifactRoot, {recursive: true});
   const root = await mkdtemp(join(artifactRoot, 'ascend-installed-'));
   assert.equal(inside(await realpath(checkout), await realpath(root)), false,
@@ -143,6 +153,39 @@ export async function runInstalledPackagingCase({
     return http;
   };
   let result, failure;
+  const remoteClosure = async () => {
+    const handles = new Set();
+    for (const row of rows(instance, 'SELECT data FROM events')) {
+      const data = JSON.parse(row.data);
+      if (data.handle?.startsWith('remote:')) handles.add(data.handle);
+    }
+    async function receipts(directory) {
+      for (const entry of await readdir(directory, {withFileTypes: true})) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) await receipts(path);
+        else if (entry.name.endsWith('.json')) {
+          try {
+            const data = await parse(path);
+            if (data.handle?.startsWith('remote:')) handles.add(data.handle);
+          } catch {}
+        }
+      }
+    }
+    await receipts(join(instance, 'attempts'));
+    const observations = [];
+    for (const handle of handles) {
+      let state;
+      await until(async () => {
+        state = await remoteClient(['observe', handle]);
+        return ['completed', 'failed', 'cancelled'].includes(state.state);
+      }, `native closure ${handle}`, 60).catch(error => {state = {...state, error: error.message};});
+      observations.push({handle, ...state});
+    }
+    await writeFile(join(root, 'native-closure.json'), JSON.stringify(observations, null, 2));
+    assert.ok(handles.size > 0);
+    assert.ok(observations.every(o => ['completed', 'failed', 'cancelled'].includes(o.state)));
+    return observations;
+  };
   const cleanup = () => cleanupPromise ??= (async () => {
     cleaning = true;
     const errors = [];
@@ -152,6 +195,7 @@ export async function runInstalledPackagingCase({
         await run('stop');
         await until(async () => (await run('status')).controller.state === 'stopped', 'cleanup controller');
         closure.controllerStopped = true;
+        if (remoteClient) closure.native = await remoteClosure();
         try {
           const service = await parse(join(instance, 'knowledge-service.json'));
           if (!await ownerStopped(service.owner)) {
@@ -211,18 +255,24 @@ export async function runInstalledPackagingCase({
     for (const scope of scopes) await writeFile(join(skills, scope + '.md'),
       'Read the current skill. Retrieve good and negative evidence in design and optimisation; use the frozen verifier.');
     await writeFile(join(skills, 'skill-map.json'), JSON.stringify(Object.fromEntries(scopes.map(s => [s, s + '.md']))));
-    const source = join(assets, 'project');
+    const source = join(assets, 'source');
     await mkdir(source);
     await writeFile(join(source, 'answer.py'), 'def answer(): return 0\n');
+    const trusted = join(assets, 'trusted');
+    await mkdir(trusted);
+    const checker = join(trusted, 'check.py');
+    await writeFile(checker, "from pathlib import Path\nimport runpy\np = Path(__file__).parent.parent / 'source' / 'answer.py'\nactual = runpy.run_path(str(p))['answer']()\nassert actual == sum(6 for _ in range(7)), actual\nprint(actual)\n");
     fixture = await provider('interrupt', {nativeSession: async () =>
       rows(instance, 'SELECT session FROM attempts WHERE session IS NOT NULL LIMIT 1')[0]?.session});
     const settings = {
       baseline, skills, target: 'cpu', python, embedding_factory: 'installed_fixture:Embeddings',
       actor_seconds: 120, investigation_seconds: 120, curriculum_seconds: 30,
       concurrency: 1,
-      environment: {module: 'machinery/integrations/environments/index.mjs', options: {mode: 'local'}},
+      environment: {module: 'machinery/integrations/environments/index.mjs', options: remoteOptions ?
+        {...remoteOptions, mode: 'cpl', remoteDirectory: `installed/${root.split('/').at(-1)}`} : {mode: 'local'}},
       projects: [{id: 'installed', goal: 'installed arithmetic', source, actor_seconds: 120,
-        verifier: {files: [fixturePython], command: `${quote(python)} ${quote(fixturePython)} verify ${quote(source)}`}}],
+        verifier: remoteOptions ? {files: [checker], command: 'python3 ../trusted/check.py'} :
+          {files: [fixturePython], command: `${quote(python)} ${quote(fixturePython)} verify ${quote(source)}`}}],
       actor: {provider: 'installed-fixture', model: 'scripted', credential_env: 'INSTALLED_FIXTURE_KEY', base_url: fixture.url,
         metadata: {id: 'scripted', name: 'Installed fixture', api: 'openai-completions', reasoning: false,
           input: ['text'], contextWindow: 128000, maxTokens: 8192,
@@ -244,7 +294,7 @@ export async function runInstalledPackagingCase({
     socket.listen(0, '127.0.0.1'); await once(socket, 'listening');
     const port = socket.address().port;
     await new Promise(resolve => socket.close(resolve));
-    const server = launch(process.execPath, [cli, 'dashboard', '--instance', instance, '--port', String(port)], {seconds: 180});
+    const server = launch(process.execPath, [cli, 'dashboard', '--instance', instance, '--port', String(port)], {seconds: 600});
     dashboard = {...server, url: `http://127.0.0.1:${port}`};
     await until(async () => {
       if (dashboard.child.exitCode !== null) throw new Error(`Dashboard exited; artifacts=${root}`);
@@ -264,8 +314,11 @@ export async function runInstalledPackagingCase({
     await until(() => {
       const [attempt] = rows(instance, 'SELECT * FROM attempts');
       return attempt?.elapsed >= 1 && attempt.session &&
-        rows(instance, "SELECT 1 FROM events WHERE type='execution-handle'").length;
-    }, 'native actor target command before stop', 45, signal);
+        rows(instance, "SELECT data FROM events WHERE type='execution-handle'").some(row => {
+          const data = JSON.parse(row.data);
+          return !data.purpose && (!remoteOptions || data.handle?.includes(':job:'));
+        });
+    }, 'native actor workload handle before stop', remoteOptions ? 180 : 45, signal);
     const running = await compareStatus('running');
     assert.equal(running.controller.state, 'running');
     assert.equal(running.projects[0].status, 'running');
@@ -286,7 +339,7 @@ export async function runInstalledPackagingCase({
       const state = await run('status');
       if (state.attempts[0]?.outcome === 'failed') throw new Error(`Installed actor failed; artifacts=${root}`);
       return state.controller.state === 'stopped' && state.attempts[0]?.outcome === 'passed';
-    }, 'same installed actor pass', 60, signal);
+    }, 'same installed actor pass', remoteOptions ? 240 : 60, signal);
     const passed = await compareStatus('passed');
     assert.equal(passed.projects[0].status, 'passed');
     assert.equal(passed.attempts.length, 1);
