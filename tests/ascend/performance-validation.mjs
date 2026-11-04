@@ -36,7 +36,7 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
     calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])
       calls.push(['rsi_knowledge',{query:'prior facts',kind}]);
-    if(stage==='implementation')calls.push(['bash',{command:'python3.12 -c "print(42)"'}]);
+    if(stage==='implementation')calls.push(['rsi_target',{command:'python3.12 -c "print(42)"'}]);
     if(stage==='validation') {calls.push(['rsi_verify',{}]);if(!accepted)break;}
     calls.push(['rsi_advance',{reflection:'Use independent numeric and performance criteria.'}]);
   }
@@ -116,4 +116,34 @@ asyncio.run(main())
     server.closeAllConnections();await new Promise(resolve=>server.close(resolve));state.close();
     if(!process.env.PERFORMANCE_PROOF_DIR)await rm(root,{recursive:true,force:true});
   }
+});
+
+for(const reason of ['elapsed','external'])test(`default native bash stops on ${reason} abort without target dispatch`,{timeout:10000},async()=>{
+  const root=await mkdtemp(join(tmpdir(),'native-bash-abort-')),source=join(root,'source');await mkdir(source);
+  const state=new State(join(root,'state.sqlite')),abort=new AbortController();let dispatches=0;
+  const command=`python3 -c "import os,time;open('local.pid','w').write(str(os.getpid()));time.sleep(30)"`;
+  const server=createServer(async(req,res)=>{
+    let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
+    const called=body.messages.some(m=>m.role==='tool');res.writeHead(200,{'Content-Type':'text/event-stream'});
+    const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'abort',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
+    if(!called){frame({role:'assistant',tool_calls:[{index:0,id:'local',type:'function',function:{name:'bash',arguments:JSON.stringify({command})}}]});frame({},'tool_calls');}
+    else{frame({role:'assistant',content:'Stopped.'});frame({},'stop');}res.end('data: [DONE]\n\n');
+  });server.listen(0,'127.0.0.1');await once(server,'listening');
+  try {
+    const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
+    runtime.registerProvider('abort-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
+    await runtime.setRuntimeApiKey('abort-fixture','fixture-only');
+    state.add({id:'p',source,goal:'Bounded local operation',actor_seconds:reason==='elapsed'?.2:10,verifier:{files:[],command:'true'}});
+    const attempt=state.admit('p',{});
+    const running=runAttempt({state,attempt,project:state.project('p').spec,attemptPath:join(root,'attempt'),signal:abort.signal,
+      environmentFactory:async()=>({prepare:async()=>{},execute:async()=>{dispatches++;throw Error('unexpected target dispatch');}}),
+      knowledge:{search:async()=>({content:[],evidence:[]})},skillMap:{},modelRuntime:runtime,model:runtime.getModel('abort-fixture','scripted')});
+    const {setTimeout:wait}=await import('node:timers/promises');let pid;const deadline=performance.now()+3000;
+    while(!pid&&performance.now()<deadline){try{pid=Number(await readFile(join(source,'local.pid'),'utf8'));}catch{}await wait(10);}
+    assert.ok(pid);
+    if(reason==='external'){abort.abort();await assert.rejects(running,/interrupted/);assert.equal(state.attempt(attempt.id).outcome,null);}
+    else{assert.equal((await running).accepted,false);assert.equal(state.attempt(attempt.id).outcome,'failed');}
+    let stopped=false;while(!stopped&&performance.now()<deadline){try{process.kill(pid,0);}catch(error){if(error.code==='ESRCH')stopped=true;else throw error;}await wait(10);}
+    assert.equal(stopped,true);assert.equal(dispatches,0);
+  }finally{server.closeAllConnections();await new Promise(ok=>server.close(ok));state.close();await rm(root,{recursive:true,force:true});}
 });

@@ -113,6 +113,7 @@ test('native curriculum returns executable source-relative verifier after reloca
     ['submit_investigation',{goal:'independent numeric check',question:'Is the result42?',verifier:'verify.py'}]];
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
+    assert.ok(body.tools.every(tool=>!['bash','rsi_target'].includes(tool.function.name)));
     const index=body.messages.reduce((n,m)=>n+(m.tool_calls?.length??0),0);res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(index<calls.length){const [name,args]=calls[index];frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name,arguments:JSON.stringify(args)}}]});frame({},'tool_calls');}
@@ -148,6 +149,7 @@ test('native summary and investigation retrieve authoritative diagnostics despit
   const retrieved=[];
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
+    assert.ok(body.tools.every(tool=>!['bash','rsi_target'].includes(tool.function.name)));
     const prompt=body.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:m.content.map(part=>part.text??'').join('\n')).join('\n');
     const context=JSON.parse(prompt.split('Attempt diagnostics: ')[1].split('\n')[0]);
     const logs=context.diagnostics.find(event=>event.type==='verification')?.data.evidence;

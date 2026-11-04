@@ -15,7 +15,7 @@ export function nativeWriter(onInput = () => {}, hang = false) {
         await factory({ registerTool(tool) { tools[tool.name] = tool; }, on() {} }); }
     },
     createAgentSession: async options => {
-      assert.ok(!options.tools.includes('write') && !options.tools.includes('bash'));
+      assert.ok(!options.tools.includes('write') && !options.tools.includes('bash') && !options.tools.includes('rsi_target'));
       return { session: {
         subscribe(fn) { listener = fn; return () => {}; }, async bindExtensions() {},
         async prompt() {

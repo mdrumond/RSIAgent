@@ -13,7 +13,7 @@ function workflow({pass, interrupt}) {
     }
     if (stage === 'implementation') {
       if (pass) calls.push(tool('write',{path:'answer.py',content:'def answer(): return 6 * 7\n'}));
-      calls.push(tool('bash',{command:interrupt ?
+      calls.push(tool('rsi_target',{command:interrupt ?
         'python -c "import time; print(\'holding execution\',flush=True); time.sleep(30)"' :
         'python -c "import answer; print(answer.answer())"'}));
     }

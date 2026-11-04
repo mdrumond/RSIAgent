@@ -78,7 +78,7 @@ test('actual Pi readonly KDB lookup and validated publisher repair a rejected pr
     let body = ''; for await (const chunk of request) body += chunk;
     const input = JSON.parse(body);
     const i = requests++;
-    assert.ok(!input.tools.some(tool => ['write', 'edit', 'bash', 'mcp__kdb__record_lesson'].includes(tool.function.name)));
+    assert.ok(!input.tools.some(tool => ['write', 'edit', 'bash', 'rsi_target', 'mcp__kdb__record_lesson'].includes(tool.function.name)));
     const call = calls[i];
     const delta = call ? { tool_calls: [{ index: 0, id: `tool-${i}`, type: 'function',
       function: { name: call[0], arguments: JSON.stringify(call[1]) } }] } : { content: 'Done' };
