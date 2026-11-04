@@ -12,8 +12,10 @@ export function schedule({seed=1,profile='normal',faults=[]}={}) {
     random=(Math.imul(random,1664525)+1013904223)>>>0;
     const milliseconds=profile==='slow'?250:profile==='bursty'&&random%5===0?1000:10;
     const fault=faults.find(f=>f.point===point&&f.occurrence===occurrence);
-    events.push({point,occurrence,milliseconds,...details,...(fault?{fault}: {})});
-    await delay(milliseconds,undefined,{signal});
+    const event={point,occurrence,milliseconds,...details,...(fault?{fault}: {})};
+    events.push(event);const before=performance.now();
+    try{await delay(milliseconds,undefined,{signal});}
+    finally{event.observedMilliseconds=performance.now()-before;}
     if(fault?.disconnect)throw Error(`Injected disconnect at ${point}`);
     return fault?.state?{state:fault.state}:null;
   }};

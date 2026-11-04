@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -9,12 +9,16 @@ import {promisify} from 'node:util';
 import {schedule,target,serve,connect} from './resilience/fixtures.mjs';
 import {runCases,Blocked} from './resilience/runner.mjs';
 import {cases} from './resilience/workspace.case.mjs';
+import {caseClient} from './resilience/transport.case.mjs';
+import {createEnvironment} from '../../integrations/environments/index.mjs';
 
 async function directory(t){const root=await mkdtemp(join(tmpdir(),'resilience-fixture-'));
   t.after(()=>rm(root,{recursive:true,force:true}));return root;}
 test('seeded burst schedules replay and abort delayed requests',async()=>{
   const collect=async seed=>{const s=schedule({seed,profile:'bursty'});
-    for(let i=0;i<4;i++)await s.at('readiness');return s.events;};
+    for(let i=0;i<4;i++)await s.at('readiness');
+    assert.ok(s.events.every(e=>Number.isFinite(e.observedMilliseconds)&&e.observedMilliseconds>=0));
+    return s.events.map(({observedMilliseconds,...chosen})=>chosen);};
   assert.deepEqual(await collect(1),await collect(1));
   assert.notDeepEqual(await collect(1),await collect(2));
   const abort=new AbortController();abort.abort();
@@ -80,4 +84,50 @@ test('public command discovers real case modules without circular imports',async
     '--deadline-seconds','310','--output',join(root,'report')]);
   const report=JSON.parse(stdout);assert.equal(report.status,'passed');
   assert.equal(report.results[0].evidence.nativeBashEdit,true);
+});
+for(const phase of ['preflight','upload'])test(`case cancellation reaches native ${phase} without caller settings`,async t=>{
+  const root=await directory(t),abort=new AbortController();let dispatched=false;
+  const source=join(root,'source');await mkdir(source);await writeFile(join(source,'answer.py'),'value=42\n');
+  const calls=[];
+  const scoped=caseClient({signal:abort.signal,readInstructions:async()=>{},native:async(args,{signal})=>{
+    calls.push(args[0]);
+    if(args[0]===phase){queueMicrotask(()=>abort.abort());await delay(1000,undefined,{signal});}
+    if(args[0]==='capabilities')return {state:'available'};
+    if(args[0]==='run')dispatched=true;
+    return {state:'completed'};
+  }});
+  const environment=await createEnvironment({mode:'cpl',target:'fixture',workspacePath:root,remoteDirectory:'owned'},
+    {instancePath:root,client:scoped.client,event:async()=>{},exclude:async(_,fn)=>fn()});
+  const prepare=()=>environment.prepare({project:{source,id:'p'},attempt:{id:'a'}});
+  if(phase==='preflight')await assert.rejects(prepare());
+  else {await prepare();await assert.rejects(environment.execute('python3 answer.py',source,{signal:abort.signal}));}
+  assert.ok(calls.includes(phase));
+  assert.equal(dispatched,false);
+});
+test('cleanup preserves unknown evidence and still stops subsequent owned work',async t=>{
+  const root=await directory(t),abort=new AbortController();abort.abort();
+  const stopped=[],scoped=caseClient({native:async()=>({}),signal:abort.signal,readInstructions:async()=>{}});
+  scoped.handles.add('unknown');scoped.handles.add('running');
+  await assert.rejects(scoped.close({observe:async h=>({state:h==='unknown'?'unknown':'running'}),
+    stop:async h=>{stopped.push(h);return {state:'stopped'};}},root));
+  assert.deepEqual(stopped,['running']);
+  const proof=JSON.parse(await readFile(join(root,'closure.json'),'utf8'));
+  assert.deepEqual(proof.map(o=>o.state),['unknown','stopped']);
+});
+test('cleanup has a separate bounded signal after the case is cancelled',async t=>{
+  const root=await directory(t),abort=new AbortController();abort.abort();
+  const scoped=caseClient({signal:abort.signal,readInstructions:async()=>{},native:async(_,{signal})=>{
+    await delay(1000,undefined,{signal});return {state:'completed'};
+  }});
+  scoped.handles.add('retained');
+  await assert.rejects(scoped.close({observe:async h=>scoped.client(['observe',h])},root,{milliseconds:10}));
+  assert.equal(JSON.parse(await readFile(join(root,'closure.json'),'utf8'))[0].state,'unknown');
+});
+test('cleanup receives the remaining round deadline and preserves its failure',async t=>{
+  const root=await directory(t);let aborted=false;
+  const report=await runCases([{id:'cleanup',tier:'local',run:async c=>{
+    c.onCleanup(async({signal})=>{try{await delay(1000,undefined,{signal});}finally{aborted=signal.aborted;}});
+  }}],{output:join(root,'report'),tier:'local',deadlineSeconds:.04,cleanupSeconds:0});
+  assert.equal(aborted,true);assert.equal(report.status,'failed');
+  assert.equal(report.results[0].cleanupErrors.length,1);
 });

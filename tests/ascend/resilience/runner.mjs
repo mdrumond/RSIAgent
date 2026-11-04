@@ -48,9 +48,14 @@ export async function runCases(cases,{output,tier='all',caseId,seed=1,profile='n
       result.error={name:error.name,message:error.message};}
     finally {
       clearTimeout(timer);
-      for(const cleanup of cleanups.reverse())try{await cleanup();}catch(error){
+      const cleanupAbort=new AbortController();
+      const remainingCleanup=()=>Math.max(0,deadlineSeconds*1000-(performance.now()-started));
+      const cleanupTimer=setTimeout(()=>cleanupAbort.abort(new Error('Round cleanup deadline reached')),remainingCleanup());
+      if(!remainingCleanup())cleanupAbort.abort(new Error('Round cleanup deadline reached'));
+      for(const cleanup of cleanups.reverse())try{await cleanup({signal:cleanupAbort.signal,remainingSeconds:remainingCleanup()/1000});}catch(error){
         result.status='failed';(result.cleanupErrors??=[]).push(error.message);
       }
+      clearTimeout(cleanupTimer);
     }
     result.elapsedSeconds=(performance.now()-before)/1000;report.results.push(result);await save();
   }

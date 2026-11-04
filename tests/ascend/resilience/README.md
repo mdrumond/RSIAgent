@@ -15,6 +15,9 @@ and assert observable expected outcomes before returning evidence. A safe held
 attempt is a successful safety scenario only when the case asserts that outcome;
 it is never represented as a successful project. Cleanup errors fail the case.
 Missing credentials/registered transport use `Blocked`, never a passing skip.
+Cleanup callbacks receive `{signal, remainingSeconds}` for the remaining round
+allocation. Propagate that signal to native cleanup requests, retain unknown
+handles, and attempt every owned handle before failing the aggregate closure.
 
 Keep schedules, native sessions, logs, receipts, and closure proofs under the case
 directory. Never log credentials or change a production instance. DeepSeek runs
