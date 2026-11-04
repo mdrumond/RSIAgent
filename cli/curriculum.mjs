@@ -12,24 +12,31 @@ async function curriculumSession({config,path,bridge,prompt,tool,signal,state,at
   await loader.reload();
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
     thinkingLevel:'off',tools:['read','write','edit','mcp__kdb__*',tool.name],resourceLoader:loader,sessionManager:sdk.SessionManager.create(path,join(path,'sessions'))});
-  session.agent.toolExecution='sequential';await session.bindExtensions({});
   const seconds=config.curriculum_seconds??240,started=performance.now();
-  await state.event?.(attemptId,'curriculum-session',{role,session:session.sessionManager.getSessionFile(),allocation_seconds:seconds});
-  let reason;
+  let reason,timer;
   const interrupt=cause=>{reason??=cause;void session.abort();};
-  const abort=()=>interrupt('external-signal');signal?.addEventListener('abort',abort,{once:true});
-  const timer=setTimeout(()=>interrupt('elapsed-allocation'),seconds*1000);
+  const abort=()=>interrupt('external-signal');
   try {
+    session.agent.toolExecution='sequential';await session.bindExtensions({});
+    await state.event(attemptId,'curriculum-session',{role,session:session.sessionManager.getSessionFile(),allocation_seconds:seconds});
+    signal?.addEventListener('abort',abort,{once:true});
+    timer=setTimeout(()=>interrupt('elapsed-allocation'),seconds*1000);
     if(signal?.aborted){reason='external-signal';throw new Error('Curriculum interrupted by external signal');}
     await session.prompt(prompt);await session.waitForIdle();
     if(reason && !accepted())throw new Error(reason==='elapsed-allocation'
       ? 'Curriculum elapsed allocation exhausted before '+role+' submission'
       : 'Curriculum interrupted by external signal');
-  }finally{signal?.removeEventListener('abort',abort);clearTimeout(timer);
-    if(reason)await state.event?.(attemptId,'curriculum-interrupted',{role,reason,allocation_seconds:seconds,
-      elapsed_seconds:(performance.now()-started)/1000,accepted:accepted(),session:session.sessionManager.getSessionFile()});
-    try{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}finally{session.dispose();}}
+  }finally{
+    signal?.removeEventListener('abort',abort);clearTimeout(timer);
+    try {
+      if(reason)await state.event(attemptId,'curriculum-interrupted',{role,reason,allocation_seconds:seconds,
+        elapsed_seconds:(performance.now()-started)/1000,accepted:accepted(),session:session.sessionManager.getSessionFile()});
+    }finally{
+      try{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}finally{session.dispose();}
+    }
+  }
 }
+
 async function artifactFile(root,name,source) {
   const file=resolve(root,name),rel=relative(root,file);
   if(rel==='..'||rel.startsWith('..'+sep) || (source && (file===source || file.startsWith(source+sep))))
@@ -52,11 +59,12 @@ function diagnosticContext(state,id,limit) {
     events:events.slice(-limit)};
 }
 export async function investigate({config,job,base,path,state,bridge,signal}) {
+  if(!job.attempt?.id)throw new Error('Investigation requires its current attempt');
   const root=join(path,'investigation');await mkdir(root,{recursive:true});
   const source=join(root,'source');
   await cp(base.source,source,{recursive:true});
   let proposal;
-  await curriculumSession({config,path:root,bridge,signal,state,attemptId:job.attempt?.id,role:'investigation',accepted:()=>Boolean(proposal),prompt:
+  await curriculumSession({config,path:root,bridge,signal,state,attemptId:job.attempt.id,role:'investigation',accepted:()=>Boolean(proposal),prompt:
     `Read the failed project's diagnostics and existing KDB memory. Original goal: ${base.goal}.\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.origin_attempt,20))}\n`+
     `Read the recorded native session and diagnostic evidence files before proposing an investigation.\n`+

@@ -10,6 +10,8 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {investigate,summarize} from '../../cli/curriculum.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
+import {State} from '../../controller/state.mjs';
+import {AgentSession} from '@earendil-works/pi-coding-agent';
 
 async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'investigation-admission-'));
@@ -38,11 +40,13 @@ async function fixture(t,plan) {
   t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});
   const config={root,curriculum_seconds:15,actor:{provider:'admission-fixture',model:'scripted',credential_env:key,
     base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
-  const state={events:()=>[],attempt:()=>({session:null})},bridge={extension:()=>{}};
-  const options={config,path,state,bridge,job:{origin_attempt:'old',attempt:{id:'new'},actor_seconds:120},base:{source,goal:'numeric'}};
-  const events=[];options.state={events:()=>events,attempt:()=>({session:null}),event:async(_id,type,data)=>events.push({type,data})};
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  state.add({id:'p',source,goal:'numeric',actor_seconds:120,verifier:{files:[],command:'true'}});
+  const attempt=state.admit('p',{}),bridge={extension:()=>{}};
+  const options={config,path,state,bridge,job:{origin_attempt:attempt.id,attempt,actor_seconds:120},base:{source,goal:'numeric'}};
   config.curriculum_seconds=1;
-  return {root,path,source,options,events,prompts,waitStarted,results:()=>received.at(-1)};
+  return {root,path,source,options,get events(){return state.events(attempt.id);},prompts,waitStarted,results:()=>received.at(-1)};
+
 }
 
 const proposal={goal:'Check numeric fact',question:'Is answer42?',verifier:'verify.py'};
@@ -106,3 +110,17 @@ test('external interruption after accepted proposal preserves its valid artifact
   const stopped=f.events.find(e=>e.type==='curriculum-interrupted').data;
   assert.equal(stopped.reason,'external-signal');assert.equal(stopped.accepted,true);
 });
+
+
+for(const type of ['curriculum-session','curriculum-interrupted'])
+  test(`native session shuts down and disposes when ${type} telemetry fails`,{timeout:15000},async t=>{
+    const f=await fixture(t,['wait']);let shutdown=0;
+    f.options.bridge={extension:pi=>pi.on('session_shutdown',async()=>{shutdown++;})};
+    const original=AgentSession.prototype.dispose;
+    const dispose=t.mock.method(AgentSession.prototype,'dispose',function(){return original.call(this);});
+    const event=f.options.state.event.bind(f.options.state);
+    f.options.state.event=(id,name,data)=>{if(name===type)throw new Error('telemetry disk failure');return event(id,name,data);};
+    await assert.rejects(investigate(f.options),/telemetry disk failure/);
+    assert.equal(shutdown,1);assert.equal(dispose.mock.callCount(),1);
+    assert.equal(f.options.state.attempt(f.options.job.attempt.id).session,null);
+  });
