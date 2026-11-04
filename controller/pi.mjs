@@ -84,7 +84,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       reachesTools:()=>['mcp__kdb__search'],
       parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
-    pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier. Returns controller-local evidence paths and SHA-256 digests for lesson references.',
+    pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier in validation after completing all project edits. All project files, including documentation and receipts, affect the source fingerprint; later edits require revision and fresh verification. Returns retained controller-local evidence paths and SHA-256 digests: read these directly and keep post-validation receipts outside project source.',
       parameters:Type.Object({}),execute:async(_id,_args,nativeSignal)=>result(await workflow.validate(nativeSignal))});
     pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance. Only accepted:true completes the workflow after the final acceptance gate; entering acceptance is not completion. Design and optimisation require reflection.',
       parameters:Type.Object({reflection:Type.Optional(Type.String())}),
@@ -93,7 +93,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
         accepted=Boolean(response.accepted);
         return result(response);
       }});
-    pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'After debugging or validation, return to design or implementation with the observed reason.',
+    pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'From debug, optimisation, validation, or acceptance, return to design or implementation with an observed reason. Then complete the canonical steps and fresh validation before accepting.',
       parameters:Type.Object({to:Type.Union([Type.Literal('design'),Type.Literal('implementation')]),reflection:Type.String({minLength:1})}),
       execute:async(_id,args)=>result(await workflow.advance({next:args.to,reflection:args.reflection}))});
     const [target]=await createEnvironmentTools({execute:async(command,cwd,options)=>{
