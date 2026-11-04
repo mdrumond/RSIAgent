@@ -51,7 +51,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                          headers=headers) as client:
                 async with streamable_http_client(
-                        'http://localhost/mcp', http_client=client) as streams:
+                        'http://127.0.0.1:8765/mcp', http_client=client) as streams:
                     yield streams
 
         async def session_work():
@@ -68,7 +68,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                     # These must finish BEFORE releasing the blocked backend.
                     async with asyncio.timeout(5):
                         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
-                            response = await client.get('http://localhost/health')
+                            response = await client.get('http://127.0.0.1:8765/health')
                             self.assertTrue(response.json()['ready'])
                         async with connection() as (read, write, _):
                             async with ClientSession(read, write) as session:
