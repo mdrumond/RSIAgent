@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp,mkdir,writeFile,readFile,rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,7 +31,7 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
   await mkdir(proofRoot,{recursive:true});
   const root=await mkdtemp(join(proofRoot,`ascend-performance-${scenario}-`));
   const state=new State(join(root,'state.sqlite')),calls=[],executions=[];
-  const accepted=scenario==='perf-pass';
+  const accepted=scenario==='perf-pass';let returnedVerification;
   for(const stage of stages) {
     calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])
@@ -40,6 +43,8 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
   const server=createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;
     const body=JSON.parse(raw),index=body.messages.reduce((n,m)=>n+(m.tool_calls?.length??0),0);
+    const verified=body.messages.find(m=>m.role==='tool'&&m.tool_call_id==='call-'+calls.findIndex(([name])=>name==='rsi_verify'));
+    if(verified)returnedVerification=JSON.parse(verified.content);
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',
       created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
@@ -84,6 +89,27 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
       ? ['performance','verification'] : ['performance','verification','performance']);
     assert.ok((await readFile(verdict.evidence.correctness,'utf8')).length>0);
     if(scenario!=='numeric-fail')assert.ok((await readFile(verdict.evidence.performance,'utf8')).length>0);
+    assert.deepEqual(returnedVerification.correctness,verdict.correctness);
+    assert.deepEqual(returnedVerification.performance,verdict.performance);
+    const checks=[returnedVerification.correctness,returnedVerification.performance].filter(check=>check?.evidence);
+    for(const check of checks)assert.equal(check.evidence_sha256,createHash('sha256').update(await readFile(check.evidence)).digest('hex'));
+    const recorded=await promisify(execFile)(process.env.PYTHON??'python3.12',['-c',`
+import asyncio,json,os,sys
+from mcp import ClientSession,StdioServerParameters
+from mcp.client.stdio import stdio_client
+async def main():
+    params=StdioServerParameters(command=sys.executable,args=['-m','ascend_tools.kdb_service','--db',sys.argv[1],'--transport','stdio','--embedding-factory','kdb_fixture:Embeddings'],env={'PYTHONPATH':os.environ['PYTHONPATH']})
+    async with stdio_client(params) as (reader,writer):
+        async with ClientSession(reader,writer) as session:
+            await session.initialize()
+            for check in json.loads(sys.argv[2]):
+                result=await session.call_tool('record_lesson',{'lesson':'Independent verifier result retained','outcome':'good' if check['passed'] else 'negative','applicability':'local-python','attempt_id':'verifier-proof','evidence':[{'path':check['evidence'],'sha256':check['evidence_sha256']}]})
+                assert not result.isError,result
+    print('accepted')
+asyncio.run(main())
+`,join(root,'knowledge.sqlite'),JSON.stringify(checks)],{env:{...process.env,
+      PYTHONPATH:[process.cwd(),join(process.cwd(),'tests/ascend'),process.env.PYTHONPATH??''].join(':')}});
+    assert.equal(recorded.stdout.trim(),'accepted');
     await writeFile(join(root,'verdict.json'),JSON.stringify({outcome,verdict,
       executions:executions.map(({command,purpose,timeout})=>({command,purpose,timeout}))},null,2));
   }finally {
