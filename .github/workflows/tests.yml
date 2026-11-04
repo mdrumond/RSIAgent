@@ -29,6 +29,14 @@ jobs:
         env:
           PYTHON: python
           PYTHONPATH: .:tests/ascend
-        run: node --test --test-concurrency=1 tests/ascend/*.mjs
+        run: |
+          tests=()
+          for file in tests/ascend/*.mjs; do
+            case "$file" in
+              *_fixture.mjs|*_setup.mjs|*-fixture.mjs|*-worker.mjs|*/resilience-installed.mjs) continue ;;
+            esac
+            tests+=("$file")
+          done
+          node --test --test-concurrency=1 "${tests[@]}"
       - name: Python knowledge, dashboard and target CPU contracts
         run: python -m pytest -q tests/ascend
