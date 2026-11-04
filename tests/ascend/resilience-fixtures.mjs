@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {performance} from 'node:perf_hooks';
 import {schedule,target,serve,connect} from './resilience/fixtures.mjs';
 import {runCases,Blocked} from './resilience/runner.mjs';
 import {cases} from './resilience/workspace.case.mjs';
@@ -14,6 +15,12 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 
 async function directory(t){const root=await mkdtemp(join(tmpdir(),'resilience-fixture-'));
   t.after(()=>rm(root,{recursive:true,force:true}));return root;}
+function deadlineClock(t){
+  let now=0;
+  t.mock.method(performance,'now',()=>now);
+  t.mock.timers.enable({apis:['setTimeout']});
+  return {elapse:milliseconds=>{now+=milliseconds;},timers:t.mock.timers};
+}
 test('seeded burst schedules replay and abort delayed requests',async()=>{
   const collect=async seed=>{const s=schedule({seed,profile:'bursty'});
     for(let i=0;i<4;i++)await s.at('readiness');
@@ -55,12 +62,16 @@ test('runner preserves blocked/failed outcomes, cleanup and does not retry',asyn
   assert.deepEqual(JSON.parse(await readFile(join(root,'report','report.json'),'utf8')).results,report.results);
 });
 test('round deadline aborts current work and leaves subsequent work incomplete',async t=>{
-  const root=await directory(t);let second=false,closed=false;
+  const root=await directory(t),clock=deadlineClock(t);let entered=false,second=false,closed=false;
   const report=await runCases([
-    {id:'slow',tier:'local',run:async c=>{c.onCleanup(()=>{closed=true;});await delay(1000,undefined,{signal:c.signal});}},
+    {id:'slow',tier:'local',run:async c=>{
+      entered=true;c.onCleanup(()=>{closed=true;});assert.equal(c.signal.aborted,false);
+      const cancelled=new Promise(resolve=>c.signal.addEventListener('abort',resolve,{once:true}));
+      clock.elapse(80);clock.timers.tick(80);await cancelled;c.signal.throwIfAborted();
+    }},
     {id:'next',tier:'local',run:async()=>{second=true;}},
   ],{output:join(root,'report'),tier:'local',cleanupSeconds:0,deadlineSeconds:.08});
-  assert.equal(report.status,'incomplete');assert.equal(second,false);assert.equal(closed,true);
+  assert.equal(entered,true);assert.equal(report.status,'incomplete');assert.equal(second,false);assert.equal(closed,true);
   assert.deepEqual(report.results.map(r=>r.status),['incomplete','incomplete']);
 });
 test('all tier cannot pass with missing required tiers and unknown cases never run',async t=>{
@@ -72,10 +83,15 @@ test('all tier cannot pass with missing required tiers and unknown cases never r
   assert.equal(report.results.filter(r=>r.status==='incomplete').length,2);
 });
 test('blocking CPU work cannot pass after its elapsed deadline',async t=>{
-  const root=await directory(t);
-  const report=await runCases([{id:'cpu',tier:'local',run:async()=>{
-    const end=performance.now()+40;while(performance.now()<end){};
+  const root=await directory(t),clock=deadlineClock(t);let iterations=0,closed=false;
+  const report=await runCases([{id:'cpu',tier:'local',run:async c=>{
+    c.onCleanup(()=>{closed=true;});assert.equal(c.signal.aborted,false);
+    const end=performance.now()+40;
+    while(performance.now()<end){iterations++;clock.elapse(1);}
+    // No timer callback can run during this synchronous CPU work.
+    assert.equal(c.signal.aborted,false);
   }}],{output:join(root,'report'),tier:'local',cleanupSeconds:0,deadlineSeconds:.02});
+  assert.ok(iterations>0);assert.ok(performance.now()>20);assert.equal(closed,true);
   assert.equal(report.status,'incomplete');assert.equal(report.results[0].status,'incomplete');
 });
 test('public command discovers real case modules without circular imports',async t=>{
@@ -132,10 +148,16 @@ test('cleanup has a separate bounded signal after the case is cancelled',async t
   assert.equal(JSON.parse(await readFile(join(root,'closure.json'),'utf8'))[0].state,'unknown');
 });
 test('cleanup receives the remaining round deadline and preserves its failure',async t=>{
-  const root=await directory(t);let aborted=false;
+  const root=await directory(t),clock=deadlineClock(t);let entered=false,aborted=false;
   const report=await runCases([{id:'cleanup',tier:'local',run:async c=>{
-    c.onCleanup(async({signal})=>{try{await delay(1000,undefined,{signal});}finally{aborted=signal.aborted;}});
+    entered=true;
+    c.onCleanup(async({signal,remainingSeconds})=>{
+      assert.equal(signal.aborted,false);assert.equal(remainingSeconds,.04);
+      const cancelled=new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));
+      clock.elapse(40);clock.timers.tick(40);await cancelled;
+      aborted=signal.aborted;signal.throwIfAborted();
+    });
   }}],{output:join(root,'report'),tier:'local',deadlineSeconds:.04,cleanupSeconds:0});
-  assert.equal(aborted,true);assert.equal(report.status,'failed');
+  assert.equal(entered,true);assert.equal(aborted,true);assert.equal(report.status,'failed');
   assert.equal(report.results[0].cleanupErrors.length,1);
 });
