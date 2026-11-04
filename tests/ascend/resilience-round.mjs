@@ -19,8 +19,16 @@ async function service(t){
 test('interrupted regression cleanup closes only receipt-owned detached services',async t=>{
   const root=await output(t),owned=await service(t),unrelated=await service(t);
   await writeFile(join(root,'knowledge-service.json'),JSON.stringify({owner:owned.owner}));
-  const proof=await closeRegressionServices(root,{signal:new AbortController().signal,remainingSeconds:2});
-  await owned.exited;assert.equal(proof[0].state,'stopped');
+  const abort=new AbortController();let timer;
+  const report=await runCases([{id:'regression',tier:'local',async run(ctx){
+    ctx.onCleanup(options=>closeRegressionServices(root,options));
+    const {createLocalBashOperations}=await import('@earendil-works/pi-coding-agent');
+    timer=setTimeout(()=>abort.abort(Error('Operator interruption')),50);
+    await createLocalBashOperations().exec('sleep 30',root,{signal:ctx.signal,onData:()=>{}});
+  }}],{output:join(root,'report'),tier:'local',signal:abort.signal,deadlineSeconds:5,cleanupSeconds:2});
+  clearTimeout(timer);await owned.exited;assert.equal(report.status,'incomplete');
+  const proof=JSON.parse(await readFile(join(root,'regression-service-closure.json'),'utf8'));
+  assert.equal(proof[0].state,'stopped');
   assert.equal(await ownerStopped(unrelated.owner),false);
 });
 test('exhausted regression cleanup retains every unresolved receipt and fails',async t=>{
