@@ -19,7 +19,7 @@ async function deadOwner(t){
   t.after(async()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await exit;});
   child.kill('SIGTERM');await exit;assert.equal(await ownerStopped(owner),true);return owner;
 }
-async function seededLease(f,owner,{terminal=true,unknown=false,held=false}={}){
+async function seededLease(f,owner,{terminal=true,unknown=false,held=false,recorded=true}={}){
   const state=new State(join(f.root,'state.sqlite'));
   try{
     const queue=new RecoveryQueue(state),job=queue.claim('holder',0,owner,'local'),id=job.attempt.id;
@@ -31,8 +31,11 @@ async function seededLease(f,owner,{terminal=true,unknown=false,held=false}={}){
     if(terminal){
       const log=join(path,'evidence.log');await writeFile(log,'Seeded settled outcome for restart admission fixture.\n');
       const sha256=createHash('sha256').update(await readFile(log)).digest('hex');
-      state.finish(id,'failed');recordOutcome(state,{attemptId:id,wave:0,passed:false,findings:'Retained outcome',evidence:[{path:log,sha256}]});
-      for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);
+      const findings={findings:'Retained outcome',useful:false,evidence:[{path:log,sha256}]};
+      await writeFile(join(path,'findings.json'),JSON.stringify(findings));
+      state.finish(id,'failed');
+      if(recorded){recordOutcome(state,{attemptId:id,wave:0,passed:false,...findings});
+        for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);}
     }
     return state.attempt(id);
   }finally{state.close();}
@@ -94,6 +97,43 @@ for(const scenario of ['active','live-owner','unknown-native','held-receipt'])te
   assert.deepEqual(rows(f.root,`SELECT * FROM attempts WHERE id='${before.id}'`)[0],before);
   assert.equal(rows(f.root,'SELECT * FROM attempts').length,1);
   assert.equal(f.server.requests.length,0);
+  f.pass();
+});
+
+test('pending finalization retains its lease until worker exit before concurrent unrelated admission',
+  {timeout:120000},async t=>{
+  let f,release,wave;
+  t.after(async()=>{if(!f)return;if(release)await writeFile(release,'release');
+    await f.run('stop');if(wave)await wave.output;
+  });
+  f=await setup(t,'phase2',['holder','unrelated'],{install:false});
+  const original=await seededLease(f,await deadOwner(t),{recorded:false});
+  const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
+  const python=config.python,entered=join(f.root,'finalizing.pid'),wrapper=join(f.root,'finalizing-python');
+  release=join(f.root,'release-finalization');
+  const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
+  await writeFile(wrapper,`#!${stdout.trim()}
+import os,sys,time
+from pathlib import Path
+if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and sys.argv[sys.argv.index('--attempt')+1]==${JSON.stringify(original.id)}:
+ Path(${JSON.stringify(entered)}).write_text(str(os.getpid()))
+ while not Path(${JSON.stringify(release)}).exists(): time.sleep(.01)
+os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
+`,{mode:0o700});
+  await configure(f,{python:wrapper,concurrency:2,curriculum:{phase1:['unrelated']}});
+  wave=f.start('wave');void wave.output.catch(()=>{});
+  await until(async()=>{try{await readFile(entered);return true;}catch(error){if(error.code!=='ENOENT')throw error;}});
+  assert.equal(rows(f.root,'SELECT attempt FROM resource_leases')[0].attempt,original.id);
+  assert.equal(rows(f.root,'SELECT * FROM attempts').length,1);
+  assert.equal(rows(f.root,'SELECT recorded FROM recovery_lessons')[0].recorded,0);
+  const finalizer=rows(f.root,'SELECT * FROM attempts')[0];assert.equal(await ownerStopped(finalizer.owner),false);
+  await writeFile(release,'release');await wave.output;
+  const attempts=rows(f.root,'SELECT * FROM attempts');assert.equal(attempts.length,2);
+  assert.equal(attempts.find(a=>a.project==='unrelated').outcome,'passed');
+  assert.equal(await ownerStopped(finalizer.owner),true);
+  assert.equal(rows(f.root,'SELECT * FROM resource_leases').length,0);
+  assert.equal(rows(f.root,`SELECT count(*) AS n FROM events WHERE attempt='${original.id}' AND type='resource-lease-reclaimed'`)[0].n,0);
+  assert.ok(rows(f.root,'SELECT recorded FROM recovery_lessons').every(row=>row.recorded===1));
   f.pass();
 });
 

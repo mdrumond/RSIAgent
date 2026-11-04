@@ -75,7 +75,7 @@ export async function operate(command,config,options={}) {
       JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
       schedulerAbort.signal.throwIfAborted();
       try {
-        if(!await ownerStopped(attempt.owner))continue;
+        if(!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
         const path=join(config.root,'attempts',attempt.id);
         const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
         const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
