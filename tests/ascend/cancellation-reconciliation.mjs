@@ -27,7 +27,7 @@ async function fixture(t,{settled=false,unknown=false,timing}={}) {
     {type:'execution-submitted',data:{submission:'work',handle}});
   const observer=await createEnvironment({mode:'cpl',target:'fixture',workspacePath:'/registered',remoteDirectory:'test'},
     {instancePath:directory,client:scoped.client,signal:cleanup.signal,event:async(type,data)=>events.push({type,data}),exclude:async(_,fn)=>fn()});
-  const evidence=cancellationEvidence({handle,settled,accountingUnresolved:timing===undefined},handle,body.signal);
+  const evidence=cancellationEvidence({handle,settled,accountingUnresolved:!settled||timing===undefined},handle,body.signal);
   return {directory,cleanup,handle,calls,events,observer,scoped,evidence};
 }
 for(const settled of [true,false])test(`cancelled work ${settled?'immediately stopped':'still running after stop budget'} closes without inventing timing`,async t=>{
