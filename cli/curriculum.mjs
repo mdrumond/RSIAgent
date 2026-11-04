@@ -22,23 +22,31 @@ async function curriculumSession({config,path,bridge,prompt,tool,signal,state,at
   const spent=()=>elapsed+(performance.now()-started)/1000;
   const checkpoint=()=>state.event(attemptId,'curriculum-checkpoint',{role,session:manager.getSessionFile(),allocation_seconds:seconds,elapsed_seconds:spent()});
   let reason,timer,checkpoints,telemetryError;
-  const interrupt=cause=>{reason??=cause;void session.abort();};
+  const readiness=new AbortController();
+  const interruption=()=>new Error(reason==='elapsed-allocation'
+    ? 'Curriculum elapsed allocation exhausted before '+role+' submission'
+    : 'Curriculum interrupted by external signal');
+  const interrupt=cause=>{reason??=cause;readiness.abort(interruption());void session.abort();};
   const abort=()=>interrupt('external-signal');
   try {
     session.agent.toolExecution='sequential';
     await state.event(attemptId,'curriculum-session',{role,session:manager.getSessionFile(),allocation_seconds:seconds,elapsed_seconds:elapsed});
-    if(bridge.prepareSession)await bridge.prepareSession(session,{signal});
-    else await session.bindExtensions({});
     signal?.addEventListener('abort',abort,{once:true});
     timer=setTimeout(()=>interrupt('elapsed-allocation'),Math.max(0,seconds-spent())*1000);
     checkpoints=setInterval(()=>{try{checkpoint();}catch(error){telemetryError=error;interrupt('telemetry-failure');}},1000);
-    if(signal?.aborted){reason='external-signal';throw new Error('Curriculum interrupted by external signal');}
-    if(spent()>=seconds){reason='elapsed-allocation';throw new Error('Curriculum elapsed allocation exhausted before '+role+' submission');}
+    if(signal?.aborted)interrupt('external-signal');
+    if(spent()>=seconds)interrupt('elapsed-allocation');
+    readiness.signal.throwIfAborted();
+    if(bridge.prepareSession)await bridge.prepareSession(session,{signal:readiness.signal});
+    else await session.bindExtensions({});
+    readiness.signal.throwIfAborted();
     await session.prompt(prompt);await session.waitForIdle();
     if(telemetryError)throw telemetryError;
-    if(reason && !accepted())throw new Error(reason==='elapsed-allocation'
-      ? 'Curriculum elapsed allocation exhausted before '+role+' submission'
-      : 'Curriculum interrupted by external signal');
+    if(reason && !accepted())throw interruption();
+  }catch(error){
+    if(telemetryError)throw telemetryError;
+    if(reason && !accepted())throw interruption();
+    throw error;
   }finally{
     signal?.removeEventListener('abort',abort);clearTimeout(timer);clearInterval(checkpoints);
     try {

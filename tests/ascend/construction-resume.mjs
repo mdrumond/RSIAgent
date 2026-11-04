@@ -5,6 +5,7 @@ import {once} from 'node:events';
 import {mkdtemp,mkdir,writeFile,readFile,rm,readdir,stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {setTimeout as delay} from 'node:timers/promises';
 import {State} from '../../controller/state.mjs';
 import {investigate} from '../../cli/curriculum.mjs';
 import {setup,rows,until} from './driver_setup.mjs';
@@ -65,6 +66,41 @@ test('resumed constructor uses original elapsed allocation even when config incr
   assert.equal(last.allocation_seconds,.6);assert.ok(last.elapsed_seconds>=.6);assert.equal(last.session,first.session);
   const requests=f.requests.length;await assert.rejects(investigate(f.options),/elapsed allocation exhausted/);
   assert.equal(f.requests.length,requests);assert.equal(f.options.state.attempt(f.options.job.attempt.id).elapsed,0);
+});
+
+for(const cause of ['elapsed','external'])test(`resumed constructor ${cause} cancellation interrupts readiness before provider work`,{timeout:15000},async t=>{
+  const f=await fixture(t,[['write',{path:'source/answer.py',content:'answer=42\n'}],'wait']);
+  f.options.config.curriculum_seconds=1.6;await interrupt(f);
+  const first=f.events().find(e=>e.type==='curriculum-interrupted').data;
+  const requestCount=f.requests.length,eventCount=f.events().length,abort=new AbortController();
+  let ready=false,setupSignal,shutdown=0,binding;
+  const setup=new Promise(ok=>binding=ok);
+  f.options.bridge={extension:pi=>pi.on('session_shutdown',()=>{shutdown++;}),
+    prepareSession:async(session,{signal})=>{
+      setupSignal=signal;await session.bindExtensions({});binding();
+      await delay(4000,undefined,{signal});ready=true;
+    }};
+  f.options.config.curriculum_seconds=480; // A resumed allocation remains the original1.6s.
+  const started=performance.now();
+  const pending=investigate({...f.options,signal:abort.signal});
+  const rejected=assert.rejects(pending,cause==='elapsed'?/elapsed allocation exhausted/:/external signal/);
+  await setup;if(cause==='external')abort.abort();await rejected;
+  assert.equal(setupSignal.aborted,true);assert.equal(ready,false);assert.equal(shutdown,1);
+  assert.ok(performance.now()-started<3000);assert.equal(f.requests.length,requestCount);
+  const last=f.events().filter(e=>e.type==='curriculum-interrupted').at(-1).data;
+  assert.equal(last.allocation_seconds,1.6);assert.equal(last.session,first.session);
+  assert.equal(last.reason,cause==='elapsed'?'elapsed-allocation':'external-signal');
+  assert.ok(last.elapsed_seconds>=first.elapsed_seconds);
+  if(cause==='elapsed'){
+    assert.ok(last.elapsed_seconds>=1.6);
+    const checkpoints=f.events().slice(eventCount).filter(e=>e.type==='curriculum-checkpoint');
+    assert.ok(checkpoints.some(e=>e.data.elapsed_seconds<last.elapsed_seconds && e.data.elapsed_seconds>=first.elapsed_seconds+1));
+    await assert.rejects(investigate(f.options),/elapsed allocation exhausted/);
+    assert.equal(f.requests.length,requestCount);
+  }
+  assert.equal(f.options.state.attempt(f.options.job.attempt.id).elapsed,0);
+  assert.equal(f.options.state.attempt(f.options.job.attempt.id).session,null);
+  assert.equal(await readFile(join(f.options.path,'investigation/source/answer.py'),'utf8'),'answer=42\n');
 });
 
 test('validated proposal survives interruption before manifest; resume rechecks artifacts without another provider call',{timeout:15000},async t=>{
