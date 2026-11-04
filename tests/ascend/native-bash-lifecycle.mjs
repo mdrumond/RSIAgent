@@ -33,6 +33,7 @@ for(const completed of [false,true])test(`native Bash ${completed?'completed per
     const id=await until(async()=>{try{return await readFile(join(root,'attempt-id'),'utf8');}catch{if(worker.exitCode!==null)throw Error(stderr);}});
     pid=await until(async()=>{try{return Number(await readFile(join(source,'child.pid'),'utf8'));}catch{if(worker.exitCode!==null)throw Error(stderr);}});
     await until(()=>state.events(id).find(e=>e.type===(completed?'native-bash-completed':'native-bash-started')));
+    if(completed)await until(()=>requests===2);
     const before=state.attempt(id),count=requests;
     worker.kill('SIGKILL');await exit;
     const events=state.events(id),starts=events.filter(e=>e.type==='native-bash-started'),ends=events.filter(e=>e.type==='native-bash-completed');

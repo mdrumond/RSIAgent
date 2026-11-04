@@ -7,6 +7,9 @@ import json
 import math
 import re
 import sqlite3
+import sys
+from collections import OrderedDict
+import numpy as np
 from itertools import islice
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -17,6 +20,30 @@ DEFAULT_EMBEDDING_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 20
 RRF_K = 60
+VECTOR_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _VectorMatrix:
+    ids: tuple[str, ...]
+    values: np.ndarray
+    norms: np.ndarray
+
+    @property
+    def nbytes(self):
+        return self.values.nbytes + self.norms.nbytes + sys.getsizeof(self.ids) + sum(map(sys.getsizeof, self.ids))
+
+    def scores(self, query):
+        if not self.ids:
+            return iter(())
+        if self.values.shape[1] != len(query):
+            raise ValueError("embedding dimensions do not match")
+        norm = math.sqrt(sum(value * value for value in query))
+        denominator = self.norms * norm
+        scores = np.zeros(len(self.ids), dtype=np.float64)
+        np.divide(np.einsum('ij,j->i', self.values, query, optimize=False), denominator,
+                  out=scores, where=denominator != 0)
+        return zip(self.ids, map(float, scores))
 
 
 def collection_names(value: str | Sequence[str]) -> tuple[str, ...]:
@@ -202,15 +229,6 @@ def chunk_source(path: str, data: bytes) -> list[Chunk]:
     return chunks
 
 
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right):
-        raise ValueError("embedding dimensions do not match")
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
-
-
 def _normalize(vector: Sequence[float]) -> list[float]:
     if not all(math.isfinite(value) for value in vector):
         raise ValueError("embeddings must contain only finite values")
@@ -232,14 +250,87 @@ class KnowledgeDB:
             raise ValueError("KnowledgeDB requires a file-backed database")
         self.path = path.resolve()
         self.embeddings = embeddings
-        self._manifest_cache = {}
-        self._source_cache = {}
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
+        self._init_caches()
 
     def close(self) -> None:
+        self._vectors.clear()
         self.connection.close()
+
+    def _init_caches(self):
+        self._manifest_cache, self._source_cache = {}, {}
+        self._vectors = OrderedDict()
+        self._vector_bytes = 0
+        self._data_version = self.connection.execute('PRAGMA data_version').fetchone()[0]
+
+    def _refresh(self):
+        version = self.connection.execute('PRAGMA data_version').fetchone()[0]
+        if version != self._data_version:
+            self._manifest_cache.clear()
+            self._source_cache.clear()
+            self._vectors.clear()
+            self._vector_bytes = 0
+            self._data_version = version
+
+    def _invalidate(self, collection):
+        self._manifest_cache.pop(collection, None)
+        self._source_cache.pop(collection, None)
+        old = self._vectors.pop(collection, None)
+        if old is not None:
+            self._vector_bytes -= old.nbytes
+
+    @staticmethod
+    def _matrix(rows):
+        ids, values = [], None
+        for index, row in enumerate(rows):
+            vector = json.loads(row['vector_json'])
+            if values is None:
+                values = np.empty((len(rows), len(vector)), dtype=np.float64)
+            if len(vector) != values.shape[1]:
+                raise ValueError('embedding dimensions do not match')
+            values[index] = vector
+            ids.append(row['chunk_id'])
+        if values is None:
+            values = np.empty((0, 0), dtype=np.float64)
+        norms = np.linalg.norm(values, axis=1)
+        values.flags.writeable = norms.flags.writeable = False
+        return _VectorMatrix(tuple(ids), values, norms)
+
+    def cosine_scores(self, collection, query_vector, check_remaining=None):
+        self.manifest(collection)
+        query = _normalize(query_vector)
+        cached = self._vectors.get(collection)
+        if cached is not None:
+            self._vectors.move_to_end(collection)
+            if check_remaining:
+                check_remaining()
+            return list(cached.scores(query))
+        cursor = self.connection.execute(
+            'SELECT chunk_id,vector_json FROM chunks WHERE collection=? ORDER BY chunk_id', (collection,))
+        matrices, scores, size = [], [], 0
+        while rows := cursor.fetchmany(256):
+            if check_remaining:
+                check_remaining()
+            matrix = self._matrix(rows)
+            scores.extend(matrix.scores(query))
+            size += matrix.nbytes
+            if size <= VECTOR_CACHE_BYTES:
+                matrices.append(matrix)
+            else:
+                matrices.clear()  # Oversized collections stream without retaining their matrix.
+        if matrices:
+            while self._vectors and self._vector_bytes + size > VECTOR_CACHE_BYTES:
+                _, old = self._vectors.popitem(last=False)
+                self._vector_bytes -= old.nbytes
+            values = np.concatenate([m.values for m in matrices])
+            norms = np.concatenate([m.norms for m in matrices])
+            values.flags.writeable = norms.flags.writeable = False
+            cached = _VectorMatrix(tuple(key for m in matrices for key in m.ids), values, norms)
+            self._vectors[collection] = cached
+            self._vector_bytes += cached.nbytes
+        return scores
 
     @classmethod
     def open_read_only(cls, path: Path, embeddings: EmbeddingBackend) -> "KnowledgeDB":
@@ -251,11 +342,10 @@ class KnowledgeDB:
         view = object.__new__(cls)
         view.path = resolved
         view.embeddings = embeddings
-        view._manifest_cache = {}
-        view._source_cache = {}
         view.connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         view.connection.row_factory = sqlite3.Row
         view.connection.execute("PRAGMA query_only = ON")
+        view._init_caches()
         return view
 
     def read_only_view(self) -> "KnowledgeDB":
@@ -401,9 +491,11 @@ class KnowledgeDB:
                 )
         if manifest_path:
             manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+        self._invalidate(collection)
         return manifest
 
     def manifest(self, collection: str) -> CollectionManifest:
+        self._refresh()
         if collection in self._manifest_cache:
             return self._manifest_cache[collection]
         row = self.connection.execute(
@@ -492,17 +584,11 @@ class KnowledgeDB:
         query_vectors = embed_query([query])
         if len(query_vectors) != 1:
             raise ValueError("embedding backend must return one query vector")
-        all_rows = self.connection.execute(
-            "SELECT * FROM chunks WHERE collection = ?", (collection,)
-        ).fetchall()
-        normalized_query = _normalize(query_vectors[0])
-        vector_rows = sorted(
-            all_rows,
-            key=lambda row: (
-                -_cosine(normalized_query, json.loads(row["vector_json"])),
-                row["chunk_id"],
-            ),
-        )[:candidate_limit]
+        vector_ids = [key for key, _ in sorted(
+            self.cosine_scores(collection, query_vectors[0]), key=lambda item: (-item[1], item[0]))[:candidate_limit]]
+        vector_rows = [self.connection.execute(
+            'SELECT chunk_id,path,start_line,end_line,text FROM chunks WHERE collection=? AND chunk_id=?',
+            (collection, key)).fetchone() for key in vector_ids]
         lexical_rank = {row["chunk_id"]: rank for rank, row in enumerate(lexical_rows, 1)}
         lexical_score = {row["chunk_id"]: row["lexical_score"] for row in lexical_rows}
         vector_rank = {row["chunk_id"]: rank for rank, row in enumerate(vector_rows, 1)}
@@ -531,10 +617,10 @@ class KnowledgeDB:
             for score, chunk_id, row in scored[:limit]
         ]
 
-    def ranked_candidates(self, collection: str, query: str, *, limit: int | None = 100,
+    def ranked_candidates(self, collection: str, query: str, *, limit: int | None = None,
                           query_vector: Sequence[float], check_remaining: Callable[[], object] | None = None
-                          ) -> tuple[list[SearchHit], list[SearchHit]]:
-        """Separate cosine and local BM25 lanes; None retains full backfill order."""
+                          ) -> tuple[list[tuple[str, float]], list[sqlite3.Row]]:
+        """Compact full cosine and local BM25 lanes; payloads are fetched after fusion."""
         manifest = self.manifest(collection)
         if (self.embeddings.model, self.embeddings.revision) != (
                 manifest.embedding_model, manifest.embedding_revision):
@@ -553,21 +639,5 @@ class KnowledgeDB:
             "ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?",
             (lexical_query, collection, -1 if limit is None else limit),
         ).fetchall()
-        lexical_rank = {row["chunk_id"]: rank for rank, row in enumerate(lexical, 1)}
-        lexical_score = {row["chunk_id"]: row["lexical_score"] for row in lexical}
-        vector = _normalize(query_vector)
-        hits = []
-        for index, row in enumerate(self.connection.execute(
-                "SELECT * FROM chunks WHERE collection = ?", (collection,))):
-            if check_remaining is not None and index % 256 == 0:
-                check_remaining()
-            hits.append(SearchHit(
-            chunk_id=row["chunk_id"], path=row["path"], start_line=row["start_line"],
-            end_line=row["end_line"], text=row["text"],
-            score=_cosine(vector, json.loads(row["vector_json"])),
-            lexical_rank=lexical_rank.get(row["chunk_id"]),
-            lexical_score=lexical_score.get(row["chunk_id"]), vector_rank=None,
-            ))
-        hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
-        by_id = {hit.chunk_id: hit for hit in hits}
-        return hits if limit is None else hits[:limit], [by_id[row["chunk_id"]] for row in lexical]
+        scores = self.cosine_scores(collection, query_vector, check_remaining)
+        return scores, lexical
