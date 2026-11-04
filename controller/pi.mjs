@@ -84,7 +84,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       execute:async(_id,args,_signal,_onUpdate,ctx)=>result(await workflow.query(args.query,args.kind,ctx))});
     pi.registerTool({name:'rsi_verify',label:'Verify source',description:'Run the frozen independent verifier. Returns controller-local evidence paths and SHA-256 digests for lesson references.',
       parameters:Type.Object({}),execute:async(_id,_args,nativeSignal)=>result(await workflow.validate(nativeSignal))});
-    pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance automatically to the next canonical step. Do not specify a step name. Design and optimisation require reflection.',
+    pi.registerTool({name:'rsi_advance',label:'Advance workflow',description:'Complete the current step and advance. Only accepted:true completes the workflow after the final acceptance gate; entering acceptance is not completion. Design and optimisation require reflection.',
       parameters:Type.Object({reflection:Type.Optional(Type.String())}),
       execute:async(_id,args)=>{
         const response=await workflow.advance({reflection:args.reflection});
@@ -152,8 +152,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
-    if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) accepted=false;
-    if (!accepted) event('rejected',{stage:workflow.stage,diagnostics,remaining:clock.remaining});
+    let reason='actor-ended-without-workflow-acceptance';
+    if (accepted && workflow.validation.fingerprint !== await fingerprint(project.source)) {
+      accepted=false;reason='source-changed-after-workflow-acceptance';
+    }
+    if (!accepted) event('rejected',{stage:workflow.stage,reason,diagnostics,remaining:clock.remaining});
     state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {

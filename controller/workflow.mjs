@@ -71,6 +71,6 @@ export class Workflow {
     this.index = stages.indexOf(destination);
     this.facts = {};
     if (['design','implementation'].includes(destination)) this.validation = null;
-    return {stage:this.stage,history:this.history};
+    return {accepted:false,stage:this.stage,history:this.history};
   }
 }
