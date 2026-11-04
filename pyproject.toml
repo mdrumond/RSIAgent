@@ -7,7 +7,7 @@ name = "ascend-tools"
 version = "0.1.0"
 description = "Ascend knowledge, verification and dashboard helpers for the native Pi controller"
 requires-python = ">=3.11"
-dependencies = ["mcp==1.27.2", "Flask==3.0.3"]
+dependencies = ["mcp==1.27.2", "Flask==3.0.3", "numpy==2.4.2"]
 
 [project.optional-dependencies]
 embeddings = ["torch==2.10.0", "transformers==5.0.0"]

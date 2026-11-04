@@ -1,7 +1,7 @@
 """Current-domain knowledge API over the retained indexed baseline format."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from heapq import nsmallest
 import hashlib
 import json
 from pathlib import Path
@@ -64,33 +64,37 @@ class KDB:
             name = row['name']
             vector, lexical = self.db.ranked_candidates(
                 name, query, limit=None, query_vector=vectors[0])
-            candidates.extend((name, hit) for hit in vector)
-            lexical_ids.update((name, hit.chunk_id) for hit in lexical)
+            candidates.extend((name, chunk_id, score) for chunk_id, score in vector)
+            lexical_ids.update((name, hit['chunk_id']) for hit in lexical)
             metadata[name] = (scoped_kind, row['target'])
         # Retain the global cosine lane from the existing candidate-pool helper.
         # Local BM25 magnitudes and local ranks are not comparable across FTS
         # tables. Order keyword matches by that same corpus-wide cosine lane,
         # then fuse the two GLOBAL ranks before applying the shared result limit.
-        candidates.sort(key=lambda item: (-item[1].score, item[0], item[1].chunk_id))
+        candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
         lexical_rank = {key: rank for rank, key in enumerate(
-            ((name, hit.chunk_id) for name, hit in candidates
-             if (name, hit.chunk_id) in lexical_ids), 1)}
+            ((name, chunk_id) for name, chunk_id, _ in candidates
+             if (name, chunk_id) in lexical_ids), 1)}
+        def fused():
+            for rank, (name, chunk_id, _) in enumerate(candidates, 1):
+                keyword_rank = lexical_rank.get((name, chunk_id))
+                score = 1 / (RRF_K + rank)
+                if keyword_rank is not None:
+                    score += 1 / (RRF_K + keyword_rank)
+                yield (-score, name, chunk_id, rank, keyword_rank)
         hits = []
-        for rank, (name, hit) in enumerate(candidates, 1):
-            keyword_rank = lexical_rank.get((name, hit.chunk_id))
-            score = 1 / (RRF_K + rank)
-            if keyword_rank is not None:
-                score += 1 / (RRF_K + keyword_rank)
+        for negative_score, name, chunk_id, rank, keyword_rank in nsmallest(limit, fused()):
+            hit = self.db.connection.execute('''SELECT chunk_id,path,start_line,end_line,text
+                FROM chunks WHERE collection=? AND chunk_id=?''', (name, chunk_id)).fetchone()
             scoped_kind, scoped_target = metadata[name]
             manifest = self.db.manifest(name)
-            hits.append(dict(asdict(hit), collection=name, kind=scoped_kind,
+            hits.append(dict(hit, collection=name, kind=scoped_kind,
                              target=scoped_target, language=manifest.language,
                              kernel_languages=list(manifest.kernel_languages),
-                             score=score, vector_rank=rank,
+                             score=-negative_score, vector_rank=rank,
                              lexical_rank=keyword_rank, lexical_score=None,
-                             source_sha256=self.db.source_fingerprint(name, hit.path).sha256))
-        return sorted(hits, key=lambda hit: (-hit['score'], hit['collection'],
-                                           hit['chunk_id']))[:limit]
+                             source_sha256=self.db.source_fingerprint(name, hit['path']).sha256))
+        return hits
 
     def read_entry(self, collection: str, entry_id: str):
         """Read indexed evidence without needing its original source checkout."""
