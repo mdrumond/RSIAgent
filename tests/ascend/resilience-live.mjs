@@ -28,7 +28,7 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   }
   const server=createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests.push(body);
-    const index=body.messages.reduce((count,m)=>count+(m.tool_calls?.length??0),0),call=compactCalls===null?calls[index]:compactCalls.shift();
+    const index=body.messages.reduce((count,m)=>count+(m.tool_calls?.length??0),0),call=compactCalls===null?calls[index]:body.tools?.length?compactCalls.shift():null;
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'live-fixture',object:'chat.completion.chunk',created:1,model:'deepseek-flash',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+index,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
@@ -53,7 +53,7 @@ test('safe live preflight makes no request; real native canonical fixture uses a
   assert.ok(requests.length>0);assert.ok(requests[0].tools.some(t=>t.function.name==='mcp__kdb__search'));
   assert.ok(fixture.observations.some(e=>e.tool==='rsi_target'&&!e.error));
   compactCalls=[null,['bash',{command:"printf '42\\n' > proof.txt"}],['mcp__kdb__search',{query:'integer sum',kind:'good'}],null,
-    null,['read',{path:'proof.txt'}],['bash',{command:"python -c \"assert int(open('proof.txt').read()) == sum(6 for _ in range(7))\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
+    ['read',{path:'proof.txt'}],['bash',{command:"python -c \"assert int(open('proof.txt').read()) == sum(6 for _ in range(7))\""}],['mcp__kdb__search',{query:'integer sum',kind:'negative'}],null];
   const compactRoot=join(root,'compaction');await mkdir(compactRoot);
   const compact=await cases.find(c=>c.id==='deepseek-compaction').run({directory:compactRoot,signal:abort.signal,seed:1,profile:'normal',event:async()=>{},onCleanup:fn=>cleanup.push(fn)});
   assert.equal(compact.compacted,true);assert.ok(compact.toolCallsBefore>=2);assert.ok(compact.toolCallsAfter>=3);
