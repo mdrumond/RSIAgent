@@ -86,7 +86,7 @@ export async function summarize({config,job,path,state,bridge,passed,signal}) {
   let findings;
   await curriculumSession({config,path,bridge,signal,state,attemptId:job.attempt.id,role:'summary',accepted:()=>Boolean(findings),prompt:
     `Inspect the native session, verification logs and stage events for this ${job.kind??'original'} attempt. `+
-    `Frozen verifier passed: ${passed}. Summarize actual findings and failures as compact reusable memory. `+
+    `Workflow/project accepted: ${passed}. Summarize actual findings and failures as compact reusable memory. `+
     `For an investigation, useful=true ONLY when new observed evidence addresses the original gap, even if the investigation failed. `+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.attempt.id,30))}\n`+
     `Controller diagnostic snapshot: ${join(path,'diagnostics.json')}. Read the recorded native session when present and diagnostic evidence files. Submit the compact findings with direct evidence paths.`,
