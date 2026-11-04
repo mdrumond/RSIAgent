@@ -26,6 +26,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
   let session,timer,accepted=false,uncertain;
+  const nativeBash=new Map();
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});
   const diagnostics=[];
@@ -137,6 +138,14 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
+      if(e.type==='tool_execution_start' && e.toolName==='bash') {
+        const operation=randomUUID();nativeBash.set(e.toolCallId,operation);
+        event('native-bash-started',{operation,tool_call_id:e.toolCallId,session:manager.getSessionFile()});
+      }
+      if(e.type==='tool_execution_end' && e.toolName==='bash' && nativeBash.has(e.toolCallId)) {
+        event('native-bash-completed',{operation:nativeBash.get(e.toolCallId),tool_call_id:e.toolCallId});
+        nativeBash.delete(e.toolCallId);
+      }
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
       if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
         diagnostics.push(e.message.errorMessage ?? 'Native provider error');
