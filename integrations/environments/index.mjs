@@ -571,7 +571,10 @@ export async function createEnvironment(options, context) {
 export async function createEnvironmentTools(environment, cwd, sdk) {
   sdk ??= await import('@earendil-works/pi-coding-agent');
   const tool=sdk.createBashTool(cwd, { operations: { exec: async (command, cwd, opts) => {
-    const result = await environment.execute(command, cwd, opts);
+    // Bash supplies an implicit full spawn environment, but rsi_target has no env
+    // argument. Keep registered target bindings; direct execute callers retain env.
+    const {env: _inherited, ...executionOptions} = opts;
+    const result = await environment.execute(command, cwd, executionOptions);
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
   } } });

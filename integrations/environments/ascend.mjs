@@ -302,11 +302,8 @@ export async function createEnvironment(options, context) {
         const request = { source, sha256: healthSha256, seconds, devices: [physical], command,
           configuration: { ...options.health, require_idle: timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
-        // Native Bash supplies its full inherited env. Local runtime bindings win;
-        // per-call-only values survive, and the leased masks always win last.
-        const executionEnv = local ? {...opts.env,...options.env} : {...options.env,...opts.env};
         return environment.execute(guarded, cwd, { ...opts, timeout: remaining(), resourceId: physical,
-          env: { ...executionEnv, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
+          env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
       });
     },
   };
