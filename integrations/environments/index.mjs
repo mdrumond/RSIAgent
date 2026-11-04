@@ -11,7 +11,15 @@ const terminal = new Set(['completed', 'failed', 'cancelled']);
 const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ['queued', 'dispatching', 'running', 'retrying', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
+  ...(result.reason == null ? {} : {reason: result.reason}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });
+
+export function closedSetupError(message, {handle, reason, notAdmitted = false} = {}) {
+  return Object.assign(new Error(message + (reason == null ? '' : `; reason=${JSON.stringify(reason)}`)), {
+    code: notAdmitted ? 'CPL_NOT_ADMITTED' : 'SETUP_CLOSED',
+    closure: {closed: true, payloadStarted: false, handles: handle ? [handle] : [], reason: reason ?? null},
+  });
+}
 // Strip SDK-inherited spawn values, retaining explicit deltas and session identity.
 const targetEnvironment = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key,value]) =>
   key !== 'PI_SESSION_FILE' && !(key.toUpperCase() === 'PATH' && ('PI_SESSION_ID' in (env ?? {}))) && process.env[key] !== value));
@@ -261,8 +269,8 @@ export async function createEnvironment(options, context) {
     return { state: 'unknown' };
   }
   async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
-    if (signal?.aborted) throw Object.assign(new Error(`CPL ${args[0]} was not admitted`),
-      {code: 'CPL_NOT_ADMITTED', cause: signal.reason});
+    if (signal?.aborted) throw Object.assign(closedSetupError(`CPL ${args[0]} was not admitted`,
+      {notAdmitted: true}), {cause: signal.reason});
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
@@ -277,7 +285,7 @@ export async function createEnvironment(options, context) {
     }
     if (result?.admitted === false || result?.submitted === false) {
       await event('execution-not-admitted', { submission: operation, closed: true });
-      throw Object.assign(new Error(`CPL ${args[0]} was not admitted`), { code: 'CPL_NOT_ADMITTED' });
+      throw closedSetupError(`CPL ${args[0]} was not admitted`, {notAdmitted: true, reason: result.reason});
     }
     const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
@@ -360,7 +368,7 @@ export async function createEnvironment(options, context) {
         if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
         const state = await observe(receipt.handle, {signal});
         if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
-        if (state.exitCode !== 0) { await rm(cachePath); throw new Error(`Source synchronization failed: ${receipt.handle}`); }
+        if (state.exitCode !== 0) { await rm(cachePath); throw closedSetupError(`Source synchronization failed: ${receipt.handle}`, {handle: receipt.handle, reason: state}); }
         retained.confirmed = true;
         await save(cachePath, retained);
       }
@@ -392,11 +400,13 @@ export async function createEnvironment(options, context) {
       let state;
       do {
         state = await observe(submitted.handle, {signal});
+        if (state.state === 'stopped' && state.exitCode !== 0) {
+          await rm(cachePath); throw closedSetupError(`Copy failed: ${submitted.handle}`, {handle: submitted.handle, reason: state});
+        }
         if (signal?.aborted) { await stop(submitted.handle); signal.throwIfAborted(); }
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
       if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);
-      if (state.exitCode !== 0) { await rm(cachePath); throw new Error(`Copy failed: ${submitted.handle}`); }
       if ((await sourceSnapshot(projectRoot)).fingerprint !== snapshot.fingerprint) {
         await rm(cachePath); throw new Error('Local source changed during staging; wait for edits to settle');
       }

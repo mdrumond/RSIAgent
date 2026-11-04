@@ -1,4 +1,4 @@
-import { createEnvironment as genericEnvironment, createCplClient } from './index.mjs';
+import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
@@ -131,7 +131,7 @@ export async function createEnvironment(options, context) {
           throw error;
         }
         if(!result.settled)throw new Error(`Local probe closure unknown; observe ${localPending.handle}`);
-        if(result.exitCode!==0){await unlink(pendingPath);throw new Error(`Health probe failed: ${localPending.handle}`);}
+        if(result.exitCode!==0){await unlink(pendingPath);throw closedSetupError(`Health probe failed: ${localPending.handle}`,{handle:localPending.handle,reason:result});}
       }else{
         await emit('execution-submitting',{submission:localPending.submission,receiptFile:pendingPath,kind:'run',accountingExcluded:true});
         if(!localPending.handle)throw new Error('Local probe submission identity unknown; do not resubmit');
@@ -143,7 +143,7 @@ export async function createEnvironment(options, context) {
           if(observed.state==='running')await delay(25,undefined,{signal:bounded});
         }while(observed.state==='running');
         if(observed.state!=='stopped')throw new Error(`Local probe unresolved; observe ${localPending.handle}`);
-        if(observed.exitCode!==0){await unlink(pendingPath);throw new Error(`Health probe failed: ${localPending.handle}`);}
+        if(observed.exitCode!==0){await unlink(pendingPath);throw closedSetupError(`Health probe failed: ${localPending.handle}`,{handle:localPending.handle,reason:observed});}
       }
       const result=await readJson(localPending.output),retained={...result,checked_at:Date.now()/1000,
         handle:localPending.handle,healthSha256};
@@ -188,7 +188,7 @@ export async function createEnvironment(options, context) {
         if (submitted?.admitted === false || submitted?.submitted === false) {
           await emit('execution-not-admitted', { submission, closed: true });
           await unlink(pendingPath);
-          throw new Error('Health probe was not admitted');
+          throw closedSetupError('Health probe was not admitted',{notAdmitted:true,reason:submitted.reason});
         }
         if (submitted?.handle) { pending.handle = submitted.handle; await save(pendingPath, pending); }
       } else {
@@ -211,6 +211,7 @@ export async function createEnvironment(options, context) {
         try { observed = await client(['observe',pending.handle],{signal:observationSignal}); }
         catch { observed = {state:'observation-unavailable'}; }
         await context.event('execution-state',{handle:pending.handle,purpose:'resource-health',
+          ...(observed.reason == null ? {} : {reason:observed.reason}),
           state:terminal.has(observed.state)?'stopped':observed.state,
           ...(terminal.has(observed.state)?{executionSeconds:0,accountingExcluded:true}:{})});
         if(terminal.has(observed.state))break;
@@ -225,18 +226,19 @@ export async function createEnvironment(options, context) {
         if(observed.state==='running') {
           try { observed=await client(['observe',pending.handle,'--wait','--timeout',String(Math.max(1,Math.ceil((callDeadline-performance.now())/1000)))],{signal:observationSignal}); }
           catch { observed={state:'observation-unavailable'}; }
-          signal?.throwIfAborted();
           await context.event('execution-state',{handle:pending.handle,purpose:'resource-health',
+            ...(observed.reason == null ? {} : {reason:observed.reason}),
             state:terminal.has(observed.state)?'stopped':observed.state,
             ...(terminal.has(observed.state)?{executionSeconds:0,accountingExcluded:true}:{})});
-          if(!terminal.has(observed.state))throw new Error(`Probe unresolved; observe ${pending.handle}`);
-          break;
+          if(terminal.has(observed.state))break;
+          signal?.throwIfAborted();
+          throw new Error(`Probe unresolved; observe ${pending.handle}`);
         }
         await delay(Math.min(options.pollMs??250,Math.max(0,callDeadline-performance.now())),undefined,{signal:observationSignal});
       }while(true);
       if (observed.state !== 'completed' || observed.exit !== 0) {
         await unlink(pendingPath);
-        throw new Error(`Health probe failed: ${pending.handle}`);
+        throw closedSetupError(`Health probe failed: ${pending.handle}`,{handle:pending.handle,reason:observed});
       }
       // If log retrieval disconnects, retain pending handle and retry the SAME logs next call.
       const logs = await client(['logs', pending.handle, '--stream', 'stdout', '--tail', '1'],{signal:observationSignal});
