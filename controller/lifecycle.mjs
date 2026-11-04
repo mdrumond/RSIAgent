@@ -11,7 +11,7 @@ export async function ownerStopped(owner) {
   try {
     const actual=await processIdentity(expected.pid);
     return actual.start !== expected.start || actual.boot !== expected.boot;
-  } catch(error) { if(error.code==='ENOENT') return true;throw error; }
+  } catch(error) { if(error.code==='ENOENT'||error.code==='ESRCH') return true;throw error; }
 }
 export async function attemptStopped(state,attempt,environment) {
   if (!await ownerStopped(attempt.owner)) return false;
