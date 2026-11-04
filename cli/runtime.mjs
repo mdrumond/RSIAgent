@@ -70,11 +70,27 @@ export async function operate(command,config,options={}) {
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     const wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
     const queue=new RecoveryQueue(state,policy(config));
+    // A prior scheduler may have died before its worker-exit waiter released a lease.
+    for(const attempt of state.db.prepare(`SELECT a.*,l.resource FROM resource_leases l
+      JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
+      schedulerAbort.signal.throwIfAborted();
+      try {
+        if(!await ownerStopped(attempt.owner))continue;
+        const path=join(config.root,'attempts',attempt.id);
+        const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+          async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
+        if(await attemptStopped(state,attempt,previous)) {
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=? AND resource=?').run(attempt.id,attempt.resource);
+          state.event(attempt.id,'resource-lease-reclaimed',{resource:attempt.resource});
+        }
+      }catch(error){state.event(attempt.id,'lease-reconciliation-error',{message:error.message});}
+    }
     if(queue.lessons().length) {
       try {
         const {ensureKnowledgeService}=await import('./knowledge.mjs');
         const {deliverLessons}=await import('./memory.mjs');
-        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:options.signal}),signal:options.signal});
+        await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:schedulerAbort.signal}),signal:schedulerAbort.signal});
       }catch(error){state.event(null,'memory-update-error',{message:error.message});}
     }
     const finalize=pendingOutcomes(state,policy(config));
