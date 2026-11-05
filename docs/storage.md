@@ -12,7 +12,7 @@ Storage uses Git, Python SQLite and [Restic](https://restic.net/). Bootstrap ins
 python -m ascend_tools.restic_install --install
 ```
 
-`RSI_RESTIC` selects an existing executable. Archive operations never download software. Repositories use an empty password and private filesystem permissions: protect them as sensitive unencrypted data. These packages are not suitable for publication without separate review.
+`RSI_RESTIC` selects an existing executable. Restic 0.17.0 or newer is required; setup rejects older versions. Archive operations never download software. Repositories use an empty password and private filesystem permissions: protect them as sensitive unencrypted data. These packages are not suitable for publication without separate review.
 
 ## Commands
 

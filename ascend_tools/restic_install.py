@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -35,13 +36,21 @@ def cache_path():
     return root / 'ascend-rsi' / 'tools' / ('restic-' + VERSION) / 'restic'
 
 
+def check_version(binary):
+    result = subprocess.run([binary, 'version'], check=True, stdout=subprocess.PIPE,
+                            text=True, timeout=15)
+    match = re.match(r'restic (\d+)\.(\d+)\.(\d+)', result.stdout)
+    if not match or tuple(map(int, match.groups())) < (0, 17, 0):
+        raise RuntimeError('Restic >= 0.17.0 is required; choose a newer executable with RSI_RESTIC')
+
+
 def install():
     try:
         binary = resolve_restic()
     except RuntimeError:
         binary = None
     if binary:
-        subprocess.run([binary, 'version'], check=True, stdout=subprocess.DEVNULL, timeout=15)
+        check_version(binary)
         return binary
     arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine())
     if platform.system() != 'Linux' or arch not in HASHES:
@@ -62,7 +71,7 @@ def install():
         with bz2.open(archive, 'rb') as source, unpacked.open('wb') as output:
             shutil.copyfileobj(source, output, length=65536)
         unpacked.chmod(0o700)
-        subprocess.run([str(unpacked), 'version'], check=True, stdout=subprocess.DEVNULL, timeout=15)
+        check_version(str(unpacked))
         os.replace(unpacked, target)
     return str(target)
 

@@ -3,6 +3,7 @@ import bz2
 import hashlib
 import io
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -39,7 +40,7 @@ class ResticInstall(unittest.TestCase):
              patch.object(installer.platform, 'machine', return_value='x86_64'), \
              patch.dict(installer.HASHES, {'amd64': hashlib.sha256(payload).hexdigest()}), \
              patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(payload)), \
-             patch.object(installer.subprocess, 'run') as run:
+             patch.object(installer.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,stdout='restic 0.19.1 compiled with go')) as run:
             self.assertEqual(installer.install(), str(self.target))
         self.assertEqual(self.target.read_bytes(), b'#!/bin/sh\nexit 0\n')
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
@@ -54,6 +55,15 @@ class ResticInstall(unittest.TestCase):
                 installer.install()
         self.assertFalse(self.target.exists())
         self.assertEqual(list(self.target.parent.iterdir()), [])
+
+    def test_existing_unsupported_binary_is_rejected_without_download(self):
+        with patch.dict(os.environ, {'RSI_RESTIC': '/old/restic'}), \
+             patch.object(installer.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,stdout='restic 0.16.5 compiled with go')), \
+             patch.object(installer.urllib.request, 'urlopen') as download:
+            with self.assertRaises(RuntimeError):
+                installer.install()
+            download.assert_not_called()
+
 
 
 if __name__ == '__main__':

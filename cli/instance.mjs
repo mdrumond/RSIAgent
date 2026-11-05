@@ -101,14 +101,14 @@ async function copyMachinery(machinery,release,install=true,python='python') {
     catch(error) {if(error.code!=='ENOENT')throw error;}
   }
   if(install) {
+    try {await stat(join(release,'package.json'));}
+    catch(error){if(error.code==='ENOENT')return;throw error;}
     await new Promise((ok,no)=>{
       const child=spawn(python,['-m','ascend_tools.restic_install','--install'],{
         cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
       child.on('error',no);
       child.on('close',code=>code?no(new Error('Restic installation failed')):ok());
     });
-    try {await stat(join(release,'package.json'));}
-    catch(error){if(error.code==='ENOENT')return;throw error;}
     await new Promise((ok,no)=>{
       const child=spawn('npm',['ci','--ignore-scripts','--prefix',release],{
         env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
