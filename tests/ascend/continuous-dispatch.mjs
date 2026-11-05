@@ -29,3 +29,23 @@ test('continuous campaign completes canonical recovery without restarting and st
   assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
   passed=true;
 });
+
+test('an unavailable performance project does not block an ordinary project',{timeout:15000},async t=>{
+  const {mkdir,writeFile}=await import('node:fs/promises');
+  const {operate}=await import('../../cli/runtime.mjs');
+  const {State}=await import('../../controller/state.mjs');
+  const root=await mkdtemp(join(tmpdir(),'dispatch-admission-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  await mkdir(join(root,'skills','versions','v'),{recursive:true});
+  await writeFile(join(root,'environment.mjs'),`export function createEnvironment(){
+    if(process.argv[2]==='worker')process.exit(0);
+    return {resources:async({purpose})=>purpose==='performance'?[]:[{id:'cpu',available:true}]};
+  }`);
+  const config={format:1,root,mode:'phase1',skills:{activeVersion:'v'},recovery:false,python:join(root,'missing-python'),
+    environment:{module:'environment.mjs'},projects:[
+      {id:'a',goal:'performance',actor_seconds:10,performance_goal:'benchmark',verifier:{files:[],command:'true',performance_command:'true'}},
+      {id:'b',goal:'ordinary',actor_seconds:10}]};
+  await writeFile(join(root,'instance.json'),JSON.stringify(config));
+  const result=await operate('wave',config);
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  assert.equal(result.results.length,1);assert.equal(state.project('a').status,'queued');assert.equal(state.project('b').status,'failed');
+});

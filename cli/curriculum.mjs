@@ -125,8 +125,8 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
     tool:[knowledgeTool,{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
       parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1})}),
       execute:async(_id,args)=>{
-        if(job.failure_pattern&&(!retrieved.has('good')||!retrieved.has('negative')))throw new Error('Retrieve both good and negative KDB evidence before submitting');
         await artifactFile(root,args.verifier,source);
+        if(!retrieved.has('good')||!retrieved.has('negative'))throw new Error('Retrieve both good and negative KDB evidence before submitting');
         await state.event(job.attempt.id,'curriculum-proposal',{proposal:args});
         proposal=args;return reply();
       }}]});

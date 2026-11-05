@@ -22,7 +22,7 @@ export async function until(check,timeout=15000) {
   while (Date.now()<end) {const value=await check();if(value)return value;await delay(50);}
   throw new Error('Timed out waiting for observable driver transition');
 }
-export async function setup(t,scenario,ids,{install=true}={}) {
+export async function setup(t,scenario,ids,{install=false}={}) {
   const root = await mkdtemp(join(process.env.DRIVER_ARTIFACTS ?? tmpdir(),'driver-acceptance-'));
   const instance = join(root,'instance'), server = await provider(scenario,{nativeSession:async()=>
     rows(instance,'SELECT session FROM attempts WHERE session IS NOT NULL ORDER BY rowid DESC LIMIT 1')[0]?.session});

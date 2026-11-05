@@ -47,6 +47,8 @@ export async function provider(scenario, {nativeSession} = {}) {
             's.loader.exec_module(m)\nactual=m.answer(); expected=sum(6 for _ in range(7))\n' +
             'print({"actual":actual,"expected":expected},flush=True)\nassert actual==expected\n';
           plan = [tool('write',{path:'verifier.py',content:verifier}),
+            tool('investigation_knowledge',{query:'independent numeric oracle',kind:'good'}),
+            tool('investigation_knowledge',{query:'numeric mismatch recovery',kind:'negative'}),
             tool('submit_investigation',{goal:'SMALL arithmetic observation',
               question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py'})];
         } else if (prompt.startsWith('Inspect the native')) {
