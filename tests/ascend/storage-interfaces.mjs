@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,writeFile,readFile,rm,access} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFile} from 'node:child_process';
@@ -113,13 +113,45 @@ test('package delegation preserves scoped arguments; standalone unpack opens no 
   const code=`import json,sys,types
 from ascend_tools.storage_cli import execute
 module=types.ModuleType('ascend_tools.storage_package')
-module.pack=lambda root,dest,project=None:dict(root=str(root),dest=str(dest),project=project)
+def pack(root,dest,project=None):
+ assert not dest.is_relative_to(root), 'pack forbids outputs inside campaign'
+ return dict(root=str(root),dest=str(dest),project=project)
+module.pack=pack
 module.unpack=lambda package,dest:dict(package=str(package),dest=str(dest))
 sys.modules[module.__name__]=module
-print(json.dumps([execute(sys.argv[1],dict(action='pack',project='p',destination='package')),
+print(json.dumps([execute(sys.argv[1],dict(action='pack',project='p',destination=sys.argv[1]+'-package')),
  execute('/no-existing-instance',dict(action='unpack',package=sys.argv[1]+'/package',destination=sys.argv[1]+'/restored'))]))`;
   const {stdout}=await exec(python,['-c',code,f.root]);
   const [packed,unpacked]=JSON.parse(stdout);
-  assert.deepEqual(packed,{root:f.root,dest:join(f.root,'package'),project:'p'});
+  assert.deepEqual(packed,{root:f.root,dest:f.root+'-package',project:'p'});
   assert.deepEqual(unpacked,{package:join(f.root,'package'),dest:join(f.root,'restored')});
+});
+
+
+test('compression batches skip missing and directory rows and still archive eligible files',async t=>{
+  const f=await fixture(t);
+  await f.storage.register('not-created.jsonl',{attempt:f.attempt.id,kind:'pi-session'});
+  await mkdir(join(f.root,'directory'));
+  await f.storage.register('directory',{attempt:f.attempt.id,kind:'artifact'});
+  await writeFile(join(f.root,'removed.jsonl'),'closed then missing');
+  const missing=await f.storage.register('removed.jsonl',{attempt:f.attempt.id,kind:'artifact'});
+  await f.storage.seal(missing.id);await rm(join(f.root,'removed.jsonl'));
+  const result=await f.call({action:'compress'});
+  assert.equal(result.find(row=>row.id===f.row.id).source_deleted,false);
+  assert.equal(result.filter(row=>row.skipped).length,3);
+  assert.equal((await f.call({action:'verify',artifact:f.row.id}))[0].verified,true);
+});
+
+test('immutable shared cited text seals during a live campaign without sealing actor sessions',async t=>{
+  const f=await fixture(t,{live:true,finish:false,postprocess:false});
+  await writeFile(join(f.root,'citation.txt'),'immutable retrieved text');
+  const cited=await f.storage.register('citation.txt',{kind:'cited-text'});
+  const ordinary=await f.storage.register('other.jsonl',{kind:'artifact'});
+  assert.deepEqual(await sealClosedArtifacts(f.config,{action:'pack',project:'p'}),[cited.id]);
+  const sealed=f.storage.list().find(row=>row.id===cited.id);
+  assert.equal(sealed.status,'closed');assert.equal(sealed.bytes,24);assert.equal(sealed.sha256.length,64);
+  const result=await f.call({action:'compress'});
+  assert.equal(result.find(row=>row.id===cited.id).source_deleted,false);
+  assert.equal(f.storage.list().find(row=>row.id===f.row.id).status,'open');
+  assert.equal(f.storage.list().find(row=>row.id===ordinary.id).status,'open');
 });

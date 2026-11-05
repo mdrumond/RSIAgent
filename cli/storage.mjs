@@ -21,7 +21,11 @@ export async function sealClosedArtifacts(config,action={}) {
       role:'f.role',kind:'f.kind',phase:'s.phase',outcome:'a.outcome',
       skill_revision:'s.skill_revision',memory_revision:'s.memory_revision'})) {
       const value=action[key]??action[key.replace('_','-')];
-      if(value!==undefined){clauses.push(column+'=?');args.push(value);}
+      if(value!==undefined){
+        clauses.push(key==='project'&&action.action==='pack'
+          ? `(${column}=? OR (f.kind='cited-text' AND f.attempt IS NULL AND f.project IS NULL))` : column+'=?');
+        args.push(value);
+      }
     }
     if(action.stage!==undefined||action.iteration!==undefined) {
       const terms=['i.attempt=f.attempt'];
@@ -35,11 +39,16 @@ export async function sealClosedArtifacts(config,action={}) {
       LEFT JOIN attempts a ON a.id=f.attempt LEFT JOIN storage_attempts s ON s.attempt=f.attempt
       WHERE ${clauses.join(' AND ')} ORDER BY f.id LIMIT ?`).all(...args,limit);
     for(const row of rows) {
-      if(row.status!=='open'||row.external||!row.attempt||row.kind==='source-git')continue;
-      const attempt=state.attempt(row.attempt);
-      if(!attempt?.outcome||!await ownerStopped(attempt.owner)||!failureSettled(state,attempt.id))continue;
-      if(!state.queryEvents(attempt.id,{types:['postprocess-completed'],limit:1}).length)continue;
-      await storage.seal(row.id);sealed.push(row.id);
+      if(row.status!=='open'||row.external||row.kind==='source-git')continue;
+      if(row.attempt) {
+        const attempt=state.attempt(row.attempt);
+        if(!attempt?.outcome||!await ownerStopped(attempt.owner)||!failureSettled(state,attempt.id))continue;
+        if(!state.queryEvents(attempt.id,{types:['postprocess-completed'],limit:1}).length)continue;
+      } else if(row.kind!=='cited-text')continue;
+      try {await storage.seal(row.id);sealed.push(row.id);}
+      catch(error) {
+        if(error.code!=='ENOENT'&&error.message!=='Artifact must be a file')throw error;
+      }
     }
     return sealed;
   }finally{state.close();}
@@ -48,7 +57,7 @@ export async function sealClosedArtifacts(config,action={}) {
 export async function run(config,values={}) {
   const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{...values};
   action.action??=values.action??'inspect';
-  if(action.action==='compress')await sealClosedArtifacts(config,action);
+  if(['compress','pack'].includes(action.action))await sealClosedArtifacts(config,action);
   return invoke(config,action,values.signal);
 }
 

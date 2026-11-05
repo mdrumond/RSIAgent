@@ -123,6 +123,8 @@ class Storage:
                     settled = json.loads(event['data']).get('closed') is True
             if not completed or settled is False:
                 raise ValueError('artifact postprocessing or settlement unresolved')
+        elif row['kind'] == 'cited-text':
+            return  # Immutable cache files are published before registration.
         else:
             # Unowned evidence requires all recorded campaign writers stopped.
             if self.db.execute('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').fetchone():
@@ -135,9 +137,15 @@ class Storage:
     def compress(self, row, delete_source=False):
         if row['external'] or row['status'] != 'closed':
             return dict(id=row['id'], skipped='not closed local evidence')
-        self.quiescent(row)
         if row['encoding'] != 'plain':
             return dict(id=row['id'], skipped='already compressed')
+        path = self.path(row['path'])
+        if not path.is_file():
+            return dict(id=row['id'], skipped='missing or not a file')
+        try:
+            self.quiescent(row)
+        except ValueError as error:
+            return dict(id=row['id'], skipped=str(error))
         self.verify(row)
         manifest = compress_file(self.path(row['path']), self.path('artifacts/compressed'))
         if manifest['sha256'] != row['sha256'] or manifest['source_identity']['size'] != row['bytes']:
@@ -240,10 +248,7 @@ def execute(root, action):
             return storage.plan(action)
         if name == 'pack':
             from .storage_package import pack
-            return pack(storage.root, storage.path(action['destination']), project=action.get('project'))
-        if name == 'unpack':
-            from .storage_package import unpack
-            return unpack(storage.path(action['package']), storage.path(action['destination']))
+            return pack(storage.root, Path(action['destination']).resolve(), project=action.get('project'))
         if name == 'restore':
             row, = storage.rows(action)
             return dict(path=restore_file(storage.manifest(row), storage.path(action['destination'])))
