@@ -21,6 +21,6 @@ export function runtimeStatus(state,{limit=100}={}) {
   const postprocessing=state.db.prepare(`SELECT COUNT(*) n FROM attempts a WHERE outcome IS NOT NULL
     AND NOT EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`).get().n;
   return {leases,actorWaits,queues:{fresh:count('projects',"status='queued' AND frozen=0"),
-    recovery:count('recovery_queue'),memory:count('recovery_lessons','recorded=0'),postprocessing},
+    recovery:count('recovery_queue','attempt IS NULL'),memory:count('recovery_lessons','recorded=0'),postprocessing},
     hostSlots:exists('resource_leases')?state.db.prepare('SELECT resource,attempt FROM resource_leases LIMIT ?').all(limit):[]};
 }

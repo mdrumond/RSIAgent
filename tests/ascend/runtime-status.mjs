@@ -37,6 +37,9 @@ test('pending memory and postprocessing remain visible while status ignores even
   queue.recordOriginal(a.id,{passed:false,findings:'numeric mismatch',evidence:[{collection:'facts',entry_id:'one'}]},0);
   const before=runtimeStatus(state);assert.equal(before.queues.memory,1);assert.equal(before.queues.postprocessing,1);
   queue.acknowledgeLesson(queue.lessons()[0].id);state.event(a.id,'postprocess-completed',{});
+  assert.equal(runtimeStatus(state).queues.recovery,1);
+  queue.claim('a',1);
+  assert.equal(runtimeStatus(state).queues.recovery,0);
   state.db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)').run(a.id,'pi-event','invalid body','now');
   assert.equal(runtimeStatus(state).queues.memory,0);assert.equal(runtimeStatus(state).queues.postprocessing,0);
   for(const limit of [0,1001,Infinity])assert.throws(()=>runtimeStatus(state,{limit}));
