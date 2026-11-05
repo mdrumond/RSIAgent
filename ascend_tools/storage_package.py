@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-from .storage_archive import compress_file, restore_file, iter_artifact_bytes
+from .storage_archive import archive_files, restore_files
 
 MAX_JSON_BYTES = 8 * 1024 * 1024
 
@@ -118,7 +118,7 @@ def _quote(name):
 
 def _snapshot(root, path, project):
     if path.exists():
-        return  # Frozen resume input; archive checkpoints refer to these exact bytes.
+        return  # Reuse only a completed, immutable SQLite business snapshot.
     temporary = path.with_suffix('.tmp')
     temporary.unlink(missing_ok=True)
     with closing(_connect(root / 'state.sqlite')) as source, closing(sqlite3.connect(temporary)) as db:
@@ -172,7 +172,7 @@ def _git_directory(repository):
         ['git', '-C', str(repository), 'rev-parse', '--absolute-git-dir'], text=True).strip()).resolve()
 
 
-def _revision_files(git_dir, revision, kind, dest, collect):
+def _revision_files(git_dir, revision, kind, work, collect):
     if len(revision) not in (40, 64) or any(c not in '0123456789abcdef' for c in revision):
         return False
     # NUL records streamed from Git: memory scales with one tree entry/blob block.
@@ -188,7 +188,7 @@ def _revision_files(git_dir, revision, kind, dest, collect):
                 if object_type != 'blob' or mode == '120000':
                     raise ValueError('Knowledge revision requires regular collected blobs')
                 relative = Path('exported') / revision / _safe(os.fsdecode(name))
-                path = dest / relative
+                path = work / relative
                 if not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     temporary = path.with_suffix(path.suffix + '.tmp')
@@ -204,32 +204,31 @@ def _revision_files(git_dir, revision, kind, dest, collect):
 
 
 def pack(root, dest, project=None, require_complete=True):
-    """Publish package.json only after all collected chunks verify.
+    """Collect an inventory and publish one standard Restic snapshot plus metadata.
 
-    Reusing an unfinished destination resumes completed compression chunks.
-    Missing inputs are recorded; require_complete refuses publication.
+    Restic owns repository retries/deduplication. Missing inputs remain explicit.
     """
     root, dest = Path(root).resolve(), Path(dest).resolve()
     if dest == root or root.is_relative_to(dest) or dest.is_relative_to(root):
         raise ValueError('Package must be separate from campaign')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.package-inputs-', dir=dest.parent) as temporary:
+        return _pack(root, dest, project, require_complete, Path(temporary))
+
+
+def _pack(root, dest, project, require_complete, work):
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     if (dest / 'package.json').exists():
         raise FileExistsError('Package already published')
-    identity = {'root': str(root), 'project': project}
-    progress = dest / 'packing.json'
-    if progress.exists() and json.loads(progress.read_text()) != identity:
-        raise ValueError('Destination belongs to another export')
-    _json(progress, identity)
-    chunks = dest / 'chunks'
-    chunks.mkdir(exist_ok=True)
-    metadata = {'format': 1, 'scope': 'project' if project else 'campaign',
+    metadata = {'format': 2, 'engine': 'restic', 'repository': '.', 'scope': 'project' if project else 'campaign',
                 'project': project, 'files': [], 'missing': [], 'paths': {}, 'repositories': [],
                 'paused': True, 'binding_required': True}
     config = root / 'instance.json'
-    config_path = dest / 'config.json'
+    config_path = work / 'config.json'
     if not config_path.exists():
         _json(config_path, _sanitize(_load_json(config)) if config.exists() else {'format': 1})
-    included = set()
+    included = {}
+    archived = []
 
     def missing(kind, path):
         metadata['missing'].append({'kind': kind, 'path': str(path)})
@@ -240,25 +239,22 @@ def pack(root, dest, project=None, require_complete=True):
             missing(kind, target)
             return
         if target in included:
-            prior = next(f for f in metadata['files'] if f['path'] == target)
-            if expected and prior['archive']['sha256'] != expected:
+            prior = included[target]
+            if expected and prior.get('expected_sha256') not in (None, expected):
                 raise ValueError('Ledger checksum mismatch: ' + target)
+            if expected:
+                prior['expected_sha256'] = expected
             return
         if not path.is_file() or path.is_symlink():
             missing(kind, target)
             return
-        archive = compress_file(path, chunks)
-        if expected and archive['sha256'] != expected:
-            raise ValueError('Ledger checksum mismatch: ' + target)
-        for _ in iter_artifact_bytes(archive):
-            pass
-        portable = {k: archive[k] for k in ('version', 'state', 'chunks', 'sha256')}
-        portable['source_identity'] = {'size': archive['source_identity']['size']}
-        metadata['files'].append({'path': target, 'kind': kind, 'mode': path.stat().st_mode & 0o777, 'archive': portable})
+        item = {'path': target, 'kind': kind, 'source': str(path.resolve()),
+                'mode': path.stat().st_mode & 0o777, 'expected_sha256': expected}
+        metadata['files'].append(item)
         metadata['paths'][str(path)] = target
-        included.add(target)
+        included[target] = item
 
-    ledger_path = dest / 'ledger.sqlite'
+    ledger_path = work / 'ledger.sqlite'
     _snapshot(root, ledger_path, project)
     used = {}
     with closing(_connect(ledger_path)) as db:
@@ -329,11 +325,21 @@ def pack(root, dest, project=None, require_complete=True):
                     if name.is_absolute():
                         name = name.relative_to(root)
                     descriptor = json.loads(_local(root, name).read_text())
-                staged = dest / 'collected' / row['id']
-                staged.parent.mkdir(exist_ok=True)
-                if not staged.exists():
-                    restore_file(descriptor, staged)
-                path = staged
+                staged = work / 'collected' / row['id']
+                archived.append((descriptor, staged, row))
+                continue
+            collect(path, row['path'], row['kind'], row.get('sha256'))
+            metadata['paths'][str(root / row['path'])] = row['path']
+
+    groups = {}
+    for manifest, path, row in archived:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        groups.setdefault((manifest['repository'], manifest['snapshot']), []).append((manifest, path, row))
+    for group in groups.values():
+        destinations = {m['path']: path for m, path, _ in group}
+        restore_files([m for m, _, _ in group], lambda m: destinations[m['path']])
+        for _, path, row in group:
             collect(path, row['path'], row['kind'], row.get('sha256'))
             metadata['paths'][str(root / row['path'])] = row['path']
 
@@ -378,7 +384,7 @@ def pack(root, dest, project=None, require_complete=True):
             raise ValueError('Knowledge Git directory must belong to campaign')
         for kind in covered:
             for revision in sorted(used[kind] - covered[kind]):
-                if _revision_files(git_dir, revision, kind, dest, collect):
+                if _revision_files(git_dir, revision, kind, work, collect):
                     covered[kind].add(revision)
                     kinds.add(kind)
         if not project:
@@ -406,7 +412,7 @@ def pack(root, dest, project=None, require_complete=True):
     required = {'source-history'} if has_attempts else set()
     if not project:
         required |= {'knowledge-history', 'machinery', 'dependencies'}
-        snapshot = dest / 'collected' / 'knowledge.sqlite'
+        snapshot = work / 'collected' / 'knowledge.sqlite'
         if not snapshot.exists() and (root / 'knowledge.sqlite').is_file():
             snapshot.parent.mkdir(exist_ok=True)
             temporary = snapshot.with_suffix('.tmp')
@@ -421,22 +427,22 @@ def pack(root, dest, project=None, require_complete=True):
     collect(config_path, 'instance.json', 'config')
     collect(ledger_path, 'state.sqlite', 'ledger')
     metadata['complete'] = not metadata['missing']
+    if require_complete and not metadata['complete']:
+        _json(dest / 'inspection.json', metadata)
+        raise ValueError('Package incomplete; inspect inspection.json')
+    batch = archive_files(list(dict.fromkeys(item['source'] for item in metadata['files'])), dest)
+    metadata['snapshot'] = batch['snapshot']
+    archived_sources = {item['source']: item for item in batch['files']}
+    for item in metadata['files']:
+        archive = archived_sources[item.pop('source')]
+        expected = item.pop('expected_sha256')
+        if expected and archive['sha256'] != expected:
+            raise ValueError('Ledger checksum mismatch: ' + item['path'])
+        item['archive'] = {k: v for k, v in archive.items() if k not in ('repository', 'manifest_path')}
     _json(dest / 'inspection.json', metadata)
     if (dest / 'inspection.json').stat().st_size > MAX_JSON_BYTES:
         raise ValueError('Package manifest exceeds portable size limit; package.json not published')
-    if require_complete and not metadata['complete']:
-        raise ValueError('Package incomplete; inspect inspection.json')
     _json(dest / 'package.json', metadata)
-    # Sidecars are local resume machinery, not portable package content.
-    for sidecar in chunks.iterdir():
-        if sidecar.suffix != '.gz':
-            sidecar.unlink()
-    for scratch in ('collected', 'exported'):
-        shutil.rmtree(dest / scratch, ignore_errors=True)
-    (dest / 'knowledge.sqlite').unlink(missing_ok=True)
-    ledger_path.unlink()
-    config_path.unlink()
-    progress.unlink()
     return metadata
 
 
@@ -458,23 +464,24 @@ def unpack(package, dest):
     if dest.exists():
         raise FileExistsError(dest)
     metadata = _load_json(package / 'package.json')
-    if metadata.get('format') != 1:
+    if metadata.get('format') != 2 or metadata.get('engine') != 'restic':
         raise ValueError('Unsupported package')
     dest.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix='.unpack-', dir=dest.parent))
     try:
+        manifests = []
+        for item in metadata['files']:
+            relative = _safe(item['path'])
+            if _excluded(relative):
+                raise ValueError('Excluded package input')
+            (stage / relative).parent.mkdir(parents=True, exist_ok=True)
+            manifests.append({**item['archive'], 'repository': str(package), 'logical_path': str(relative)})
+        restore_files(manifests, lambda manifest: stage / manifest['logical_path'])
         for item in metadata['files']:
             path = stage / _safe(item['path'])
-            if _excluded(item['path']):
-                raise ValueError('Excluded package input')
-            path.parent.mkdir(parents=True, exist_ok=True)
-            archive = {**item['archive'], 'directory': str(package / 'chunks')}
-            for chunk in archive['chunks']:
-                _safe(chunk['file'])
-            restore_file(archive, path)
             path.chmod(item.get('mode', 0o600) & 0o777)
             if item['kind'] == 'source-git' and path.name == 'rsi-source.json':
-                _json(path, _rebase(json.loads(path.read_text()), metadata['paths'], dest))
+                _json(path, _rebase(_load_json(path), metadata['paths'], dest))
         for repo in metadata.get('repositories', []):
             directory = stage / _safe(repo['path'])
             directory.mkdir(parents=True, exist_ok=True)

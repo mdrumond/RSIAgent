@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 import tracemalloc
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ascend_tools.storage_package import pack, unpack
 
@@ -94,10 +94,10 @@ class PackageTests(unittest.TestCase):
 
     def test_scripts_execute_and_archived_project_artifact(self):
         from ascend_tools.storage_archive import compress_file
-        archive = compress_file(self.log, self.root / 'archives', chunk_bytes=4)
+        archive = compress_file(self.log, self.root / 'archives')
         descriptor = {'manifest': str(Path(archive['manifest_path']).relative_to(self.root))}
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
-            db.execute("UPDATE storage_artifacts SET attempt=NULL,encoding='gzip-chunks',descriptor=?",
+            db.execute("UPDATE storage_artifacts SET attempt=NULL,encoding='restic',descriptor=?",
                        (json.dumps(descriptor),))
         self.log.unlink()
         scripts = Path(__file__).resolve().parents[2] / 'scripts'
@@ -331,10 +331,23 @@ class PackageTests(unittest.TestCase):
 
     def test_interrupted_campaign_kdb_backup_ignores_partial_scratch(self):
         self.automatic_fixture()
-        self.package.mkdir()
-        (self.package / 'knowledge.sqlite').write_bytes(b'interrupted legacy backup')
-        (self.package / 'collected').mkdir()
-        (self.package / 'collected/knowledge.tmp').write_bytes(b'interrupted temporary backup')
+        from ascend_tools import storage_package
+        connect = storage_package._connect
+        def interrupted_connect(path):
+            source = connect(path)
+            if path != self.root / 'knowledge.sqlite':
+                return source
+            proxy = Mock(wraps=source)
+            def interrupt(out, **kwargs):
+                out.execute('CREATE TABLE partial_backup(id TEXT)')
+                out.commit()
+                raise InterruptedError('during SQLite backup')
+            proxy.backup.side_effect = interrupt
+            return proxy
+        with patch.object(storage_package, '_connect', interrupted_connect):
+            with self.assertRaises(InterruptedError):
+                pack(self.root, self.package)
+        self.assertFalse((self.package / 'package.json').exists())
         pack(self.root, self.package)
         dest = self.base / 'kdb-restored'
         unpack(self.package, dest)
@@ -361,29 +374,37 @@ class PackageTests(unittest.TestCase):
         result = json.loads((self.package / 'inspection.json').read_text())
         self.assertIn({'kind': 'skills-revision', 'path': 's1'}, result['missing'])
 
-    def test_corrupt_chunks_never_publish_restored_destination(self):
+    def test_checksum_failure_never_publishes_restored_destination(self):
         result = pack(self.root, self.package, 'p')
-        chunk = self.package / 'chunks' / result['files'][0]['archive']['chunks'][0]['file']
-        chunk.write_bytes(b'broken')
+        result['files'][0]['archive']['sha256'] = '0' * 64
+        (self.package / 'package.json').write_text(json.dumps(result))
         dest = self.base / 'restored'
-        with self.assertRaises((ValueError, OSError, EOFError)):
+        with self.assertRaises(ValueError):
             unpack(self.package, dest)
         self.assertFalse(dest.exists())
 
-    def test_resume_after_interruption_and_checksum_failure(self):
+    def test_restic_retry_reuses_repository_and_batches_all_files(self):
         from ascend_tools import storage_package
-        real = storage_package.compress_file
-        calls = []
+        real = storage_package.archive_files
         def interrupt(*args, **kwargs):
-            calls.append(args[0])
-            if len(calls) == 2:
-                raise InterruptedError('fixture interruption')
-            return real(*args, **kwargs)
-        with patch.object(storage_package, 'compress_file', interrupt):
+            real(*args, **kwargs)
+            raise InterruptedError('after native backup')
+        with patch.object(storage_package, 'archive_files', interrupt):
             with self.assertRaises(InterruptedError):
                 pack(self.root, self.package, 'p')
-        result = pack(self.root, self.package, 'p')
+        self.assertFalse((self.package / 'package.json').exists())
+        with patch.object(storage_package, 'archive_files', wraps=real) as backup:
+            result = pack(self.root, self.package, 'p')
+            self.assertEqual(backup.call_count, 1)
+            self.assertGreater(len(backup.call_args.args[0]), 10)
         self.assertTrue(result['complete'])
+        self.assertEqual(result['engine'], 'restic')
+        self.assertTrue((self.package / 'config').is_file())
+        self.assertFalse((self.package / 'chunks').exists())
+        restore = storage_package.restore_files
+        with patch.object(storage_package, 'restore_files', wraps=restore) as restored:
+            unpack(self.package, self.base / 'batch-restored')
+            self.assertEqual(restored.call_count, 1)
         self.log.write_text('changed')
         with self.assertRaisesRegex(ValueError, 'checksum'):
             pack(self.root, self.base / 'bad', 'p')
