@@ -89,7 +89,7 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
     assert.equal(status.attempts.filter(a=>a.project==='recover').length,3);
     assert.equal(status.attempts.find(a=>a.id===original.id).outcome,'failed');
     assert.deepEqual(JSON.parse(rows(f.root,"SELECT spec FROM projects WHERE id='recover'")[0].spec),frozen);
-    const kinds=rows(f.root,"SELECT DISTINCT kind FROM knowledge_scopes WHERE collection LIKE 'lesson-%'",'knowledge.sqlite').map(r=>r.kind);
+    const kinds=rows(f.root,"SELECT DISTINCT s.kind FROM knowledge_scopes s JOIN generation_collections g ON g.collection=s.collection JOIN active_generation a ON a.revision=g.generation",'knowledge.sqlite').map(r=>r.kind);
     assert.deepEqual(kinds.sort(),['good','negative']);
     const lessons=rows(f.root,'SELECT * FROM recovery_lessons');
     assert.ok(lessons.every(row=>row.recorded===1));
@@ -102,8 +102,8 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
       assert.ok(verifierFiles.includes(evidence) || evidence===nativeFile);
       assert.ok((await readFile(evidence,'utf8')).length>0);
     }
-    const delivered=rows(f.root,"SELECT * FROM knowledge_events WHERE operation='record_lesson'",'knowledge.sqlite');
-    assert.equal(new Set(delivered.map(e=>e.attempt_id)).size,4);
+    const delivered=rows(f.root,"SELECT DISTINCT json_extract(c.text,'$.delivery_id') AS delivery FROM chunks c JOIN generation_collections g ON g.collection=c.collection JOIN active_generation a ON a.revision=g.generation",'knowledge.sqlite');
+    assert.equal(new Set(delivered.map(e=>e.delivery)).size,lessons.length);
     for(const attempt of status.attempts.filter(a=>a.outcome==='passed')) {
       const events=rows(f.root,`SELECT type,data FROM events WHERE attempt='${attempt.id}'`);
       assert.equal(events.filter(e=>e.type==='stage-completed').length,8);
@@ -159,7 +159,7 @@ test('CLI stop/resume preserves the interrupted attempt, native session and rema
 
 
 test('resource discovery failure waits for an already launched worker before releasing ownership',{timeout:120000},async t=>{
-  const f=await setup(t,'recover',['first','second']);
+  const f=await setup(t,'interrupt',['first','second']);
   const module=join(f.root,'machinery','failing-resources.mjs');
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/index.mjs';
 import {writeFile,readFile} from 'node:fs/promises';
@@ -176,7 +176,14 @@ export async function createEnvironment(options,context){
   const action=join(f.root,'scheduler-input.json');
   await writeFile(action,JSON.stringify({concurrency:2,environment:{module:'machinery/failing-resources.mjs',options:{gate:join(f.root,'worker-ready')}}}));
   await f.run('config','--config',action);
-  await assert.rejects(f.run('wave'));
+  const wave=f.start('wave');
+  await until(()=>{
+    const value=rows(f.root,"SELECT value FROM control WHERE key='wait'")[0]?.value;
+    return value&&JSON.parse(value)?.reason==='resources'&&rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
+  });
+  assert.equal(rows(f.root,'SELECT * FROM attempts').length,1);
+  assert.equal(await ownerStopped(rows(f.root,'SELECT * FROM attempts')[0].owner),false);
+  await f.run('stop');await wave.output;
   const attempts=rows(f.root,'SELECT * FROM attempts');assert.equal(attempts.length,1);
   assert.equal(await ownerStopped(attempts[0].owner),true);
   assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='owner'")[0].value),null);
