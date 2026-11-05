@@ -87,6 +87,7 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
       const plan = plans.get(key);
       if (!plan) throw new Error('Conversation has no frozen script');
       const call = resolveCall ? await resolveCall(plan[count], body) : plan[count];
+      if (call === false) return; // An interruption fixture deliberately withholds this response.
       if (call && !body.tools?.some(t => t.function?.name === call.name)) throw new Error(`Missing native tool ${call.name}`);
       res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache'});
       const frame = (delta,finish_reason=null) => res.write('data: '+JSON.stringify({id:'chatcmpl-fixture',

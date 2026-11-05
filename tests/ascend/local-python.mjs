@@ -42,8 +42,12 @@ function providerOptions(candidate, control) {
       const content = body.messages.find(message => message.role === 'user')?.content;
       const prompt = typeof content === 'string' ? content : (content ?? []).map(block => block.text ?? '').join('');
       if (!prompt.startsWith('Goal:')) return call;
-      control.onActor?.();
       const values = body.messages.filter(message => message.role === 'tool').map(toolData).filter(Boolean);
+      // Interrupt only between completed tools, before emitting another assistant call.
+      // Counting emitted calls cannot recover a deliberately half-delivered tool turn.
+      if (values.at(-1)?.stage === 'preflight' && values.at(-1)?.skill && control.onActor) {
+        control.onActor(); return false;
+      }
       if (values.at(-1)?.passed === false) return undefined;
       if (call?.name !== 'write') return call;
       const guidance = values.findLast(value => value.stage === 'implementation' && value.skill)?.skill ?? '';
@@ -103,7 +107,7 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
       async wave(request) {
         roots.push(request.instanceRoot);
         if (variant === 'repair' && roots.length === 2) f.control.onActor = () => {
-          f.control.onActor = null; setTimeout(() => abort.abort(), 20);
+          f.control.onActor = null; abort.abort();
         };
         return runtime.wave(request);
       },
@@ -119,15 +123,19 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
       interrupted = journal.samples[1].instanceRoot;
       const retained = rows(interrupted, 'SELECT id,session FROM attempts')[0];
       assert.ok(retained.session);
+      assert.equal(rows(interrupted, "SELECT count(*) AS n FROM events WHERE type='skill-read' AND json_extract(data,'$.stage')='preflight'")[0].n, 1);
       await until(async () => (await Promise.all(rows(interrupted, 'SELECT owner FROM attempts')
         .map(row => ownerStopped(JSON.parse(row.owner))))).every(Boolean));
       result = await tune(await readConfig(f.root), { ...grant, runtime: wrapped });
       assert.deepEqual(resumes, [interrupted]); assert.equal(roots.length, 8);
       assert.deepEqual(rows(interrupted, 'SELECT id,session FROM attempts')[0], retained);
     } else result = await tune(await readConfig(f.root), { ...grant, runtime: wrapped });
-    assert.equal(result.evaluationStatus, 'completed'); assert.equal(result.promote, variant === 'repair');
-    assert.equal(result.reason, variant === 'repair' ? 'reliability-improvement' : 'correctness-regression');
     const journal = await load(join(result.evaluationRoot, 'round.json'));
+    const diagnostic = JSON.stringify({ reason: result.reason, status: result.evaluationStatus,
+      samples: journal.samples.map(({ projectId, run, arm, result }) => ({ projectId, run, arm, result })) });
+    assert.equal(result.evaluationStatus, 'completed', diagnostic);
+    assert.equal(result.promote, variant === 'repair', diagnostic);
+    assert.equal(result.reason, variant === 'repair' ? 'reliability-improvement' : 'correctness-regression', diagnostic);
     assert.equal(journal.samples.filter(sample => sample.result).length, 8);
     assert.equal(journal.allocatedSeconds, 120);
     assert.equal(new Set(journal.samples.map(sample => sample.instanceRoot)).size, 8);
