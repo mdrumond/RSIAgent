@@ -1,0 +1,134 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, rm, cp } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { State } from '../../controller/state.mjs';
+import { CampaignStorage } from '../../controller/storage.mjs';
+import { KnowledgeHistory } from '../../controller/knowledge-history.mjs';
+import { stages } from '../../controller/workflow.mjs';
+import { initializeStorageKnowledge, publishStorageMemory, recordStorageSkill } from '../../controller/storage-knowledge.mjs';
+import { deliverLessons } from '../../cli/memory.mjs';
+import { run as edit } from '../../cli/skill-input.mjs';
+
+async function fixture(t) {
+  const root=await mkdtemp(join(tmpdir(),'publication-'));
+  const state=new State(join(root,'state.sqlite')),ledger=new CampaignStorage(state,root);
+  await ledger.initialize();
+  t.after(async()=>{state.close();await rm(root,{recursive:true,force:true});});
+  const config={format:1,root,storage:{format:1},target:'a5',skills:{activeVersion:'initial'}};
+  const directory=join(root,'skills','versions','initial');await mkdir(directory,{recursive:true});
+  const map=Object.fromEntries(['global-kdb',...stages].map(scope=>[scope,`${scope}.md`]));
+  for(const path of Object.values(map))await writeFile(join(directory,path),'baseline guidance');
+  await writeFile(join(directory,'skill-map.json'),JSON.stringify(map));
+  await writeFile(join(root,'instance.json'),JSON.stringify(config));
+  return {config,state,ledger,history:await new KnowledgeHistory(join(root,'knowledge.git')).init()};
+}
+const lesson=id=>({id,attempt_id:'attempt',outcome:'passed',findings:`lesson ${id}`,
+  evidence:[{collection:'repo',entry_id:'entry',sha256:'abc',start_line:1,end_line:2}]});
+
+test('KDB staging failure retains outbox; replay preserves evidence and acknowledges only active ledger',async t=>{
+  const {config,state,history}=await fixture(t),item=lesson(1);let ack=0,fail=true;const calls=[];
+  const queue={lessons:()=>ack?[]:[item],acknowledgeLesson:()=>{
+    assert.equal(state.db.prepare("SELECT generation FROM storage_revisions WHERE name='memory'").get().generation,calls.at(-1).revision);ack++;
+  }};
+  const invoke=async(tool,args)=>{
+    calls.push({tool,...args});
+    if(tool==='stage_memory_revision'&&fail)throw new Error('index failed');
+    return {generation:args.revision};
+  };
+  await assert.rejects(deliverLessons({config,queue,invoke}),/index failed/);assert.equal(ack,0);
+  const committed=await history.ref('refs/heads/memory');
+  fail=false;await deliverLessons({config,queue,invoke});assert.equal(ack,1);
+  assert.equal(await history.ref('refs/heads/memory'),committed);
+  const snapshot=await history.readRevision(committed);
+  assert.deepEqual(snapshot.memory[0].evidence,item.evidence);
+  assert.deepEqual(snapshot.memory[0].evidence_refs,['repo:entry']);
+  assert.deepEqual(calls.map(c=>c.tool),['stage_memory_revision','stage_memory_revision','activate_memory_revision']);
+  const count=calls.length;await publishStorageMemory(config,item,{invoke});assert.equal(calls.length,count);
+});
+test('activation failure and delayed older delivery cannot replace newer memory',async t=>{
+  const {config,state,history}=await fixture(t);let fail=true;
+  const invoke=async(tool,args)=>{
+    if(tool==='activate_memory_revision'&&fail)throw new Error('activation failed');return {generation:args.revision};
+  };
+  await assert.rejects(publishStorageMemory(config,lesson(1),{invoke}),/activation failed/);
+  assert.equal(state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get(),undefined);
+  fail=false;await publishStorageMemory(config,lesson(1),{invoke});
+  const newer=await publishStorageMemory(config,lesson(2),{invoke});
+  await publishStorageMemory(config,lesson(1),{invoke:()=>{throw Error('must not reactivate');}});
+  assert.equal((await history.state('memory')).revision,newer.revision);
+  assert.equal((await history.readRevision(newer.revision)).memory.length,2);
+});
+test('baseline skills, rejected proposals and user edits map to real Git commits without changing memory',async t=>{
+  const {config,state,history}=await fixture(t);
+  await initializeStorageKnowledge(config,state);
+  const initial=await history.state('skills');
+  await cp(join(config.root,'skills','versions','initial'),join(config.root,'skills','versions','candidate'),{recursive:true});
+  await writeFile(join(config.root,'skills','versions','candidate','global-kdb.md'),'rejected guidance');
+  await recordStorageSkill(config,'candidate',{baseVersion:'initial'});
+  const rejected=await recordStorageSkill(config,'candidate',{baseVersion:'initial',promote:false,reason:'correctness-regression'});
+  assert.equal((await history.readRevision(rejected.revision)).event.metadata.reason,'correctness-regression');
+  assert.deepEqual(await history.state('skills'),initial);
+  const result=await edit(config,{scope:'global-kdb',content:'user guidance'});
+  const mapping=state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get(result.version);
+  assert.equal(mapping.base_version,'initial');assert.equal(mapping.decision,'promoted');
+  const snapshot=await history.readRevision(mapping.revision);
+  assert.equal(snapshot.skills['global-kdb.md'],'user guidance');
+  assert.equal(snapshot.event.metadata.reason,'user-edit');
+  assert.equal(JSON.parse(await readFile(join(config.root,'instance.json'))).skills.activeVersion,result.version);
+  assert.equal((await history.readRevision(rejected.revision)).skills['global-kdb.md'],'rejected guidance');
+});
+test('storage helpers are inert on existing instances',async()=>{
+  const config={root:'/not-created'};
+  assert.equal(await initializeStorageKnowledge(config),null);
+  assert.equal(await publishStorageMemory(config,lesson(1)),null);
+});
+test('bootstrap exports only lesson chunks offline; first delivery adopts baseline before indexing full snapshot',async t=>{
+  const {config,state,history}=await fixture(t);
+  const {DatabaseSync}=await import('node:sqlite');const db=new DatabaseSync(join(config.root,'knowledge.sqlite'));
+  db.exec('CREATE TABLE collections(name TEXT,language TEXT); CREATE TABLE chunks(collection TEXT,chunk_id TEXT,path TEXT,start_line INTEGER,end_line INTEGER,text TEXT)');
+  const baseline={delivery_id:'seed',lesson:'retain baseline',outcome:'good',applicability:'a5',evidence:[{path:'evidence',sha256:'abc'}]};
+  const lines=(JSON.stringify(baseline,null,2)+'\n').split(/(?<=\n)/);
+  db.prepare('INSERT INTO collections VALUES (?,?)').run('seed-lessons','lesson');
+  db.prepare('INSERT INTO collections VALUES (?,?)').run('repo','python');
+  const insert=db.prepare('INSERT INTO chunks VALUES (?,?,?,?,?,?)');
+  insert.run('seed-lessons','a','seed.json',1,5,lines.slice(0,5).join(''));
+  insert.run('seed-lessons','b','seed.json',4,lines.length,lines.slice(3).join(''));
+  insert.run('repo','repo','code.py',1,1,'not JSON or lesson');db.close();
+  const initialized=await initializeStorageKnowledge(config,state);
+  assert.equal(initialized.memory,null);assert.deepEqual(initialized.baseline.collections,['seed-lessons']);
+  assert.equal((await history.readRevision(initialized.baseline.revision)).memory[0].lesson,baseline.lesson);
+  assert.deepEqual((await initializeStorageKnowledge(config,state)).baseline,initialized.baseline);
+  const calls=[];
+  await publishStorageMemory(config,lesson(2),{invoke:async(tool,args)=>{
+    calls.push(tool);
+    if(tool==='stage_memory_revision')assert.deepEqual(args.records.map(r=>r.lesson).sort(),['lesson 2','retain baseline']);
+    return {generation:args.revision};
+  }});
+  assert.deepEqual(calls,['adopt_memory_revision','stage_memory_revision','activate_memory_revision']);
+});
+test('independent processes serialize Git writers without losing lessons',async t=>{
+  const {config,history}=await fixture(t);
+  const {execFile}=await import('node:child_process');const {promisify}=await import('node:util');const execute=promisify(execFile);
+  const module=new URL('../../controller/storage-knowledge.mjs',import.meta.url).href;
+  const code=`import {publishStorageMemory} from ${JSON.stringify(module)};
+    const [config,item]=JSON.parse(process.argv[1]);
+    await publishStorageMemory(config,item,{invoke:async(tool,args)=>({generation:args.revision})});`;
+  await Promise.all([1,2].map(id=>execute(process.execPath,['--max-old-space-size=256','--input-type=module','-e',code,JSON.stringify([config,lesson(id)])])));
+  const active=await history.state('memory');
+  assert.deepEqual((await history.readRevision(active.revision)).memory.map(r=>r.lesson).sort(),['lesson 1','lesson 2']);
+});
+test('existing skill writer records tune proposals and evaluation decisions through the new hooks',async t=>{
+  const {config,state}=await fixture(t);
+  config.mode='phase2';config.skills.tuningProjectIds=['one','two'];
+  await writeFile(join(config.root,'instance.json'),JSON.stringify(config));
+  const {run}=await import('../../cli/skills.mjs');
+  const {nativeWriter}=await import('./skill-proposal-fixture.mjs');
+  const knowledge={ensureKnowledgeService:async()=> 'fixture',createKdbBridge:()=>({extension:()=>{}})};
+  const result=await run(config,{manual:true,native:nativeWriter().native,modelRuntime:{},model:{},knowledge,
+    runtime:{bootstrap:async request=>mkdir(request.instanceRoot),wave:async()=>({correct:true,score:1})}});
+  assert.equal(result.promote,false);
+  const row=state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get(result.candidate);
+  assert.equal(row.decision,'rejected');assert.equal(row.reason,'inconclusive');assert.equal(row.base_version,'initial');
+});

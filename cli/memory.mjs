@@ -1,9 +1,16 @@
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
-export async function deliverLessons({config,queue,url,signal}) {
+export async function deliverLessons({config,queue,url,signal,invoke}) {
   for(const item of queue.lessons()) {
     signal?.throwIfAborted();
+    if(config.storage) {
+      const {publishStorageMemory}=await import('../controller/storage-knowledge.mjs');
+      await publishStorageMemory(config,item,{url,signal,invoke});
+      signal?.throwIfAborted();
+      queue.acknowledgeLesson(item.id);
+      continue;
+    }
     const args={lesson:item.findings,outcome:item.outcome==='passed'?'good':'negative',
       applicability:config.target??'general',evidence:item.evidence,attempt_id:item.attempt_id};
     await new Promise((ok,no)=>{
