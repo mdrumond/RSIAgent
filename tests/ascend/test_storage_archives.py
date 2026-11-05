@@ -5,6 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from ascend_tools import log_walk
 import zlib
 
 from ascend_tools.storage_archive import (
@@ -123,7 +126,9 @@ compress_file(sys.argv[1], sys.argv[2], chunk_bytes=100,
         self.assertEqual(b''.join(open_artifact_bytes(archived[0]['metadata']['raw_ref']['artifact'])), data)
         selected = list(walk_records(manifest, cursor=cursor,
                         predicate=lambda record, meta: record['type'] == 'message'))
-        self.assertEqual(selected, archived[1:])
+        self.assertEqual([x['record'] for x in selected], records[1:])
+        self.assertEqual(selected[0]['metadata']['offset'], cursor)
+        self.assertIsNone(selected[0]['metadata']['line'])
         self.assertEqual(b''.join(open_artifact_bytes(manifest)), data)
 
     def test_oversized_and_invalid_records_are_referenced(self):
@@ -137,6 +142,48 @@ compress_file(sys.argv[1], sys.argv[2], chunk_bytes=100,
             stream.seek(ref['offset'])
             self.assertEqual(stream.read(ref['length']), b'x' * 300000 + b'\n')
         self.assertEqual(items[-1]['record'], {'type': 'session'})
+
+    def test_resume_skips_chunks_and_checks_visited_integrity(self):
+        self.source.write_bytes(b'0\n1\n2\n3\n4\n')
+        manifest = compress_file(self.source, self.archive, chunk_bytes=4)
+        reader = log_walk._chunk_bytes
+        with patch.object(log_walk, '_chunk_bytes', wraps=reader) as opened:
+            items = list(walk_records(manifest, cursor=6))
+            self.assertEqual([x['record'] for x in items], [3, 4])
+            self.assertEqual([c.args[1] for c in opened.call_args_list], manifest['chunks'][1:])
+        self.assertEqual(items[0]['metadata']['verification'], 'visited_chunks')
+        with self.assertRaisesRegex(ValueError, 'record boundary'):
+            list(walk_records(manifest, cursor=5))
+        manifest['sha256'] = 'incorrect'
+        self.assertEqual([x['record'] for x in walk_records(manifest, cursor=8)], [4])
+        with self.assertRaisesRegex(ValueError, 'archive integrity'):
+            list(walk_records(manifest))
+        manifest['chunks'][-1]['sha256'] = 'incorrect'
+        with self.assertRaisesRegex(ValueError, 'chunk integrity'):
+            list(walk_records(manifest, cursor=8))
+
+    def test_plain_resume_never_reads_prefix(self):
+        self.source.write_bytes(b'0\n' + b'x' * 50 + b'\ninvalid\n4\n')
+        original_open = Path.open
+        reads = []
+
+        def instrument(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            read = stream.read
+            def counted(size=-1):
+                reads.append(stream.tell())
+                return read(size)
+            stream.read = counted
+            return stream
+
+        with patch.object(Path, 'open', instrument):
+            items = list(walk_records(self.source, cursor=2, record_bytes=8,
+                         predicate=lambda record, meta: meta['status'] != 'invalid'))
+        self.assertTrue(reads)
+        self.assertTrue(all(offset >= 2 for offset in reads))
+        self.assertEqual([x['metadata']['status'] for x in items], ['oversized', 'ok'])
+        self.assertEqual([x['metadata']['offset'] for x in items], [2, 61])
+        self.assertEqual(items[-1]['record'], 4)
 
     def test_streaming_rss_small_fixture(self):
         # A fresh process measures RSS rather than inheriting this runner's peak.

@@ -9,19 +9,36 @@ import argparse
 import json
 from pathlib import Path
 
-from .storage_archive import BLOCK_BYTES, iter_artifact_bytes
+from .storage_archive import BLOCK_BYTES, _chunk_bytes, iter_artifact_bytes
 
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 
 
-def open_artifact_bytes(artifact):
+def open_artifact_bytes(artifact, *, cursor=0):
     """Iterate bytes of a plain path or a complete archive manifest dict."""
     if isinstance(artifact, dict) and 'manifest' in artifact:
         artifact = json.loads(Path(artifact['manifest']).read_text())
     if isinstance(artifact, dict):
-        yield from iter_artifact_bytes(artifact)
+        if not cursor:
+            yield from iter_artifact_bytes(artifact)
+            return
+        if artifact.get('state') != 'complete':
+            raise ValueError('archive is incomplete')
+        offset = 0
+        for chunk in artifact['chunks']:
+            end = offset + chunk['size']
+            if end > cursor:
+                for block in _chunk_bytes(artifact, chunk):
+                    end_block = offset + len(block)
+                    if offset < cursor <= end_block and block[cursor - offset - 1] != 10:
+                        raise ValueError('cursor is not a record boundary')
+                    if end_block > cursor:
+                        yield block[max(0, cursor - offset):]
+                    offset = end_block
+            offset = end
     else:
         with Path(artifact).open('rb') as stream:
+            stream.seek(cursor)
             while block := stream.read(BLOCK_BYTES):
                 yield block
 
@@ -33,6 +50,9 @@ def walk_records(artifact, *, cursor=0, record_bytes=MAX_RECORD_BYTES,
     Oversized/malformed lines yield record=None plus a raw_ref, so data is not
     silently discarded. Oversized lines are never JSON-decoded. Filtering is
     performed after cursor/metadata construction; use next_cursor to resume.
+    Resumed line numbers are unknown. Exhaustion verifies visited archive chunks;
+    only cursor=0 also verifies the full artifact digest. Early exit may leave the
+    current chunk unchecked. A cursor inside a chunk must follow a newline.
     """
     if cursor < 0 or not 0 < record_bytes <= MAX_RECORD_BYTES:
         raise ValueError('invalid cursor or record limit')
@@ -40,12 +60,15 @@ def walk_records(artifact, *, cursor=0, record_bytes=MAX_RECORD_BYTES,
         artifact = json.loads(Path(artifact['manifest']).read_text())
     reference = ({'manifest': artifact['manifest_path']}
                  if isinstance(artifact, dict) else str(artifact))
-    start = offset = line = 0
+    start = offset = cursor
+    line = 0
     buffer = bytearray()
     oversized = False
 
     def emit(end):
-        meta = dict(offset=start, next_cursor=end, line=line + 1,
+        meta = dict(offset=start, next_cursor=end, line=None if cursor else line + 1,
+                    verification=('visited_chunks' if cursor else 'full_artifact')
+                    if isinstance(artifact, dict) else 'unverified_plain',
                     raw_ref=dict(artifact=reference, offset=start, length=end - start))
         record = None
         if oversized:
@@ -58,7 +81,7 @@ def walk_records(artifact, *, cursor=0, record_bytes=MAX_RECORD_BYTES,
                 meta['status'] = 'invalid'
         return dict(record=record, metadata=meta)
 
-    for block in open_artifact_bytes(artifact):
+    for block in open_artifact_bytes(artifact, cursor=cursor):
         position = 0
         while position < len(block):
             newline = block.find(b'\n', position)
