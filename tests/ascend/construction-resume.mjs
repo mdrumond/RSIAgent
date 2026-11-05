@@ -29,7 +29,7 @@ async function fixture(t,plan) {
   const key='CONSTRUCTION_FIXTURE_KEY',old=process.env[key];process.env[key]='fixture-only';
   const options={config:{curriculum_seconds:5,actor:{provider:'construction-fixture',model:'scripted',credential_env:key,
     base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}},
-    path,state,base:state.project('p').spec,job:{attempt,origin_attempt:attempt.id,actor_seconds:30},bridge:{extension:()=>{}}};
+    path,state,base:state.project('p').spec,job:{attempt,origin_attempt:attempt.id,actor_seconds:30},bridge:{extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}}};
   t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));state.close();if(old===undefined)delete process.env[key];else process.env[key]=old;await rm(root,{recursive:true,force:true});});
   return {options,requests,events:()=>state.events(attempt.id)};
 }
@@ -46,7 +46,7 @@ test('constructor resumes the same native session and source; no manifest or act
   const before=f.events().find(e=>e.type==='curriculum-session').data;
   await assert.rejects(stat(join(f.options.path,'project.json')),{code:'ENOENT'});
   const stopped=f.options.state.attempt(f.options.job.attempt.id);assert.equal(stopped.session,null);assert.equal(stopped.elapsed,0);
-  plan.splice(1,1,['read',{path:'source/answer.py'}],['write',{path:'verify.py',content:verifier}],['submit_investigation',proposal]);
+  plan.splice(1,1,['read',{path:'source/answer.py'}],['write',{path:'verify.py',content:verifier}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]);
   const project=await investigate(f.options),sessions=f.events().filter(e=>e.type==='curriculum-session');
   assert.equal(sessions.length,2);assert.equal(sessions[1].data.session,before.session);
   assert.ok(f.requests.at(-1).messages.some(m=>m.role==='tool'&&m.content==='answer=42\n'));
@@ -104,9 +104,9 @@ for(const cause of ['elapsed','external'])test(`resumed constructor ${cause} can
 });
 
 test('validated proposal survives interruption before manifest; resume rechecks artifacts without another provider call',{timeout:15000},async t=>{
-  const plan=[['write',{path:'verify.py',content:verifier}],['submit_investigation',proposal],'wait'],f=await fixture(t,plan);
+  const plan=[['write',{path:'verify.py',content:verifier}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal],'wait'],f=await fixture(t,plan);
   const abort=new AbortController(),pending=investigate({...f.options,signal:abort.signal});
-  await until(()=>f.requests.length===3);abort.abort();await pending;
+  await until(()=>f.requests.length===5);abort.abort();await pending;
   f.options.job.resume=true;const count=f.requests.length;
   const resumed=await investigate(f.options);assert.equal(f.requests.length,count);assert.equal(resumed.goal,proposal.goal+'\nInvestigate: '+proposal.question);
   await rm(resumed.verifier.files[0]);await assert.rejects(investigate(f.options),/Artifact is missing/);assert.equal(f.requests.length,count);
@@ -125,7 +125,7 @@ test('public CLI stop before investigation manifest then resume completes same c
     wires.push(body);const n=body.messages.filter(m=>m.role==='tool').length;
     if(n===1&&!resume)return;
     const calls=[['write',{path:'source/answer.py',content:'def answer(): return 41\n'}],['read',{path:'source/answer.py'}],
-      ['write',{path:'verify.py',content:"import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']()==42\n"}],['submit_investigation',proposal]];
+      ['write',{path:'verify.py',content:"import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']()==42\n"}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]];
     const call=calls[n];res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'constructor',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(call){frame({role:'assistant',tool_calls:[{index:0,id:'construction-'+n,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
