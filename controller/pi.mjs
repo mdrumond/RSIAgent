@@ -20,7 +20,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
   const storage=CampaignStorage.open(state,resolve(attemptPath,'../..'));
-  let artifactWrites=Promise.resolve();
+  let artifactWrites=Promise.resolve(),artifactError;
   const register=(path,kind,external=false)=>storage?.register(path,{attempt:attempt.id,project:attempt.project,kind,external});
   let activeOperation=null;
   const eventData=data=>({...data,
@@ -31,7 +31,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if(storage&&type==='execution-output')artifactWrites=artifactWrites.then(async()=>{
       for(const stream of ['stdout','stderr'])if(data[stream])await register(data[stream],'execution-'+stream);
       if(data.partial&&data.archive)await register(JSON.stringify(data.archive),'execution-output',true);
-    });
+    }).catch(error=>{artifactError??=error;});
   };
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
   const telemetry=createPiTelemetryJournal(join(attemptPath,'pi-events.jsonl'),attempt.id,
@@ -195,6 +195,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if(signal?.aborted)throw new Error('Attempt interrupted');
     await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.`);
     await session.waitForIdle();
+    await artifactWrites;
+    if(artifactError)throw artifactError;
     if(telemetryFailure)throw telemetryFailure;
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
