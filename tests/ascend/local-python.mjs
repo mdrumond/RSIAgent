@@ -39,8 +39,9 @@ function providerOptions(candidate, control) {
       return calls;
     },
     resolveCall(call, body) {
-      const prompt = body.messages.find(message => message.role === 'user')?.content;
-      if (typeof prompt !== 'string' || !prompt.startsWith('Goal:')) return call;
+      const content = body.messages.find(message => message.role === 'user')?.content;
+      const prompt = typeof content === 'string' ? content : (content ?? []).map(block => block.text ?? '').join('');
+      if (!prompt.startsWith('Goal:')) return call;
       control.onActor?.();
       const values = body.messages.filter(message => message.role === 'tool').map(toolData).filter(Boolean);
       if (values.at(-1)?.passed === false) return undefined;
@@ -62,8 +63,11 @@ async function fixture(t, variant) {
       return { id, goal: `Implement ${id} boundary cases in answer.py`, source: sourceRoot, actor_seconds: 60,
         verifier: { files: [oracle], command: `${quote(python)} -B ${quote(oracle)} verify ${id} ${quote(sourceRoot)}` } };
     } });
-  const configure = join(f.root, 'phase2.json');
+  const configure = join(f.root, 'phase2.json'), current = await readConfig(f.root);
+  const credentials = join(f.root, 'fixture.env');
+  await writeFile(credentials, 'DRIVER_FIXTURE_KEY=fixture-only\n');
   await writeFile(configure, JSON.stringify({ mode: 'phase2', tune_every: 2,
+    actor: { ...current.actor, credentials_file: credentials },
     curriculum: { phase2: ['reduction', 'parser'] } }));
   await f.run('config', '--config', configure);
   const cleanupSamples = async () => {

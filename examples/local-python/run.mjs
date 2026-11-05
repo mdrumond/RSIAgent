@@ -36,7 +36,10 @@ for (const kind of ['reduction', 'parser']) {
 await bootstrap(instance, { ...profile, projects, mode: 'phase2', tune_every: 2, target: 'cpu',
   concurrency: 1, curriculum: { phase2: projects.map(project => project.id) },
   environment: { module: 'machinery/integrations/environments/index.mjs', options: { mode: 'local' } } });
-await operate('wave', await readConfig(instance));
+const abort = new AbortController(), stop = () => abort.abort();
+process.on('SIGINT', stop); process.on('SIGTERM', stop);
+try { await operate('wave', await readConfig(instance), { signal: abort.signal }); }
+finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); }
 const status = await main(['status', '--instance', instance]);
 await writeFile(join(root, 'result.json'), JSON.stringify(status, null, 2) + '\n');
 console.log(JSON.stringify({ instance, projects: status.projects.map(({ id, status }) => ({ id, status })),
