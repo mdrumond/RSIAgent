@@ -297,7 +297,12 @@ export async function createEnvironment(options, context) {
           if (physical === undefined) throw new Error('Assigned resource is not enabled for this target/runtime');
           const result = await snapshot([physical], opts.purpose ?? 'ordinary', emit, remaining() ?? seconds,opts.signal);
           const row = result.devices.find(item => item.physical_device === physical);
-          if (row?.admitted !== true || !(await enabled()).includes(physical)) throw new Error('Fresh resource admission refused');
+          const permitted = (await enabled()).includes(physical);
+          if (row?.admitted !== true || !permitted) {
+            const reason = { physicalDevice: physical, row: row ?? null, permitted,
+              policy: !permitted ? 'resource-disabled' : 'health-admission-refused' };
+            throw closedSetupError('Fresh resource admission refused', {handle: result.handle, reason});
+          }
           return physical;
         }); } finally { excludedMs += performance.now() - setupStarted; }
         bindings.ASCEND_PHYSICAL_DEVICE = bindings.ASCEND_RT_VISIBLE_DEVICES = bindings.ASCEND_VISIBLE_DEVICES = String(physical);

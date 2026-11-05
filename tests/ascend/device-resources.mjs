@@ -158,6 +158,52 @@ for (const physical of [0, 1]) test(`lease ${physical}: assigned opaque lease re
   await assert.rejects(bound.execute('work',f.source), /admission refused/);
 });
 
+for (const refusal of ['busy', 'disabled']) test(`closed admission ${refusal}: explicit caller retry only`, async t => {
+  const f = await fixture(t), lease = (await f.environment.resources()).find(row => row.available);
+  let disableAfterProbe = refusal === 'disabled';
+  const bound = await createEnvironment(f.options, {...f.context, resource: lease,
+    client: async (args, settings) => {
+      const result = await f.context.client(args, settings);
+      if (disableAfterProbe && args[0] === 'logs') f.setEnabled([]);
+      return result;
+    }});
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'a'}});
+  if (refusal === 'busy') { f.rows[0].busy = true; await f.update(); }
+  const before = f.calls.length;
+  await assert.rejects(bound.execute('must-not-run', f.source), error => {
+    assert.equal(error.code, 'SETUP_CLOSED');
+    assert.equal(error.closure.closed, true);
+    assert.equal(error.closure.payloadStarted, false);
+    assert.deepEqual(error.closure.handles, [f.lastProbe().handle]);
+    assert.equal(error.closure.reason.physicalDevice, 0);
+    assert.equal(error.closure.reason.permitted, refusal !== 'disabled');
+    assert.equal(error.closure.reason.row.admitted, refusal !== 'busy');
+    assert.equal(error.closure.reason.policy, refusal === 'busy' ? 'health-admission-refused' : 'resource-disabled');
+    return true;
+  });
+  const runs = f.calls.slice(before).filter(args => args[0] === 'run');
+  assert.equal(runs.length, 1);
+  assert.ok(runs[0][runs[0].indexOf('--file')+1].endsWith('probe.sh'));
+  assert.ok(f.events.some(e => e.type === 'execution-state' && e.handle === f.lastProbe().handle && e.state === 'stopped' && e.accountingExcluded));
+  disableAfterProbe = false; f.setEnabled([0]); f.rows[0].busy = false; await f.update();
+  assert.equal((await bound.execute('explicit-next-call', f.source)).settled, true);
+  assert.equal(f.calls.filter(args => args[0] === 'run' && args[args.indexOf('--file')+1].endsWith('command.sh')).length, 1);
+});
+
+test('unknown admission probe holds the same handle without a closed setup claim or payload', async t => {
+  const f = await fixture(t), lease = (await f.environment.resources()).find(row => row.available);
+  const bound = await createEnvironment(f.options, {...f.context, resource: lease});
+  f.disconnect(true);
+  const before = f.calls.length;
+  for (let call = 0; call < 2; call++) await assert.rejects(bound.execute('must-not-run', f.source), error => {
+    assert.equal(error.closure, undefined); assert.match(error.message, /unresolved/); return true;
+  });
+  const runs = f.calls.slice(before).filter(args => args[0] === 'run');
+  assert.equal(runs.length, 1);
+  assert.ok(f.calls.slice(before).filter(args => args[0] === 'observe').every(args => args[1] === f.lastProbe().handle));
+  assert.equal(f.calls.slice(before).some(args => args[0] === 'upload'), false);
+});
+
 test('probe disconnect persists exact handle across restart and never resubmits unknown work', async t => {
   const f = await fixture(t);
   f.disconnect(true);
