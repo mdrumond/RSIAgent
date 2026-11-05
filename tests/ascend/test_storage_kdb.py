@@ -2,8 +2,11 @@
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -127,6 +130,57 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.kdb.search('first')[0]['collection'], 'new')
         self.assertEqual(self.kdb.db.connection.execute('SELECT count(*) FROM chunk_contents').fetchone()[0], 1)
 
+    def record(self, identity, lesson='first lesson', kind='good'):
+        return dict(id=identity, delivery_id='delivery-'+identity, lesson=lesson,
+                    evidence_refs=[{'path':'evidence.log','sha256':'abc'}], kind=kind, target='a3')
+
+    def test_memory_stage_atomic_activation_reuse_and_exact_generation_queries(self):
+        self.add('repository')
+        record = dict(self.record('one'), evidence=[{'verbose':'retained in Git only'}])
+        first = self.kdb.stage_memory_revision('git-one', [record])
+        self.assertEqual({h['collection'] for h in self.kdb.search('first')}, {'repository'})
+        count = len(self.embedding.calls)
+        self.assertEqual(self.kdb.stage_memory_revision('git-one',[record]), first)
+        self.assertEqual(len(self.embedding.calls), count)
+        self.kdb.activate_memory_revision('git-one')
+        second = self.kdb.stage_memory_revision('git-two', [record, self.record('two','second lesson','negative')])
+        self.assertEqual(len(self.embedding.calls), count+1)
+        self.assertTrue(set(first['collections']) < set(second['collections']))
+        self.assertFalse(any(h['kind']=='negative' for h in self.kdb.search('lesson')))
+        self.kdb.activate_memory_revision('git-two')
+        hits = self.kdb.search('lesson', generation='git-one')
+        self.assertEqual({h['generation'] for h in hits}, {'git-one'})
+        self.assertEqual({h['collection'] for h in hits}, {'repository', *first['collections']})
+        current = self.kdb.search('lesson')
+        self.assertEqual({h['generation'] for h in current}, {'git-two'})
+        self.assertTrue(any(h['kind']=='negative' for h in current))
+        negative = next(h for h in current if h['kind']=='negative')
+        with self.assertRaises(ValueError):
+            self.kdb.read_entry(negative['collection'], negative['chunk_id'], generation='git-one')
+        self.assertEqual(self.kdb.read_entry(negative['collection'],negative['chunk_id'],
+                                           generation='git-two')['generation'], 'git-two')
+        self.kdb.stage_memory_revision('git-empty', [])
+        self.kdb.activate_memory_revision('git-empty')
+        self.assertEqual({h['collection'] for h in self.kdb.search('lesson')}, {'repository'})
+        self.assertEqual(self.kdb.read_entry(negative['collection'],negative['chunk_id'])['generation'], 'git-two')
+        self.kdb.release_generation('git-one')
+        with self.assertRaises(KeyError):
+            self.kdb.search('lesson',generation='git-one')
+
+    def test_memory_failed_stage_stays_hidden_and_revision_membership_is_immutable(self):
+        record = self.record('one')
+        with patch.object(self.embedding, 'embed', side_effect=RuntimeError('encoder failed')):
+            with self.assertRaises(RuntimeError):
+                self.kdb.stage_memory_revision('git-one',[record])
+        self.assertEqual(self.kdb.search('first'), [])
+        with self.assertRaises(KeyError):
+            self.kdb.activate_memory_revision('git-one')
+        self.kdb.stage_memory_revision('git-one',[record])
+        with self.assertRaises(ValueError):
+            self.kdb.stage_memory_revision('git-one',[self.record('two')])
+        self.kdb.activate_memory_revision('git-one')
+        self.assertEqual(len(self.kdb.search('first')), 1)
+
     def legacy(self):
         path = self.source('legacy.py', 'first vector\n')
         manifest = build_manifest(self.root,[path],collection='baseline',language='python',
@@ -145,6 +199,11 @@ class StorageTests(unittest.TestCase):
     def test_streaming_legacy_import_new_destination_only(self):
         legacy, chunk, manifest = self.legacy()
         original = legacy.read_bytes()
+        cli_destination = self.root/'cli.sqlite'
+        subprocess.run([sys.executable, '-m', 'ascend_tools.kdb_import', '--source',str(legacy),
+                        '--destination',str(cli_destination)], check=True, capture_output=True)
+        with KnowledgeDB.open_read_only(cli_destination, self.embedding) as view:
+            self.assertEqual(view.manifest('baseline'), manifest)
         with self.assertRaises(ValueError):
             KnowledgeDB(legacy, self.embedding)
         destination = self.root/'import.sqlite'

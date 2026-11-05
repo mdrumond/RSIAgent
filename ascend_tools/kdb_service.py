@@ -80,7 +80,12 @@ def create_server(backend_factory, *, port=8765):
         except Exception as exc:
             backend.event(operation, attempt_id, status='failed', error=type(exc).__name__)
             raise
-        backend.event(operation, attempt_id, status='completed', arguments=args,
+        event_args = dict(args)
+        if operation in ('search', 'read_entry') and hasattr(backend, 'current_memory_revision'):
+            event_args['generation'] = args.get('generation') or backend.current_memory_revision()
+        if operation == 'stage_memory_revision':
+            event_args = {'revision': args['revision'], 'record_count': len(args['records'])}
+        backend.event(operation, attempt_id, status='completed', arguments=event_args,
                       result_count=len(result) if isinstance(result, list) else 1)
         return result
 
@@ -89,14 +94,16 @@ def create_server(backend_factory, *, port=8765):
 
     @server.tool()
     async def search(query: str, ctx: Context, kind: str = 'all',
-                     target: str | None = None, limit: int = 10) -> list[dict]:
+                     target: str | None = None, limit: int = 10,
+                     generation: str | None = None) -> list[dict]:
         """Search positive/negative source knowledge within a target scope."""
-        return await invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit)
+        return await invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit,
+                            generation=generation)
 
     @server.tool()
-    async def read_entry(collection: str, entry_id: str, ctx: Context) -> dict[str, Any]:
+    async def read_entry(collection: str, entry_id: str, ctx: Context, generation: str | None = None) -> dict[str, Any]:
         """Read stored chunk text (up to16KiB UTF-8) and direct validated evidence."""
-        return await invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id)
+        return await invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id, generation=generation)
 
     @server.tool()
     async def add_repo(path: str, collection: str, language: str, ctx: Context,
@@ -115,6 +122,16 @@ def create_server(backend_factory, *, port=8765):
             raise ValueError('attempt_id differs from request correlation')
         return await invoke(ctx, 'record_lesson', lesson=lesson, outcome=outcome,
                       applicability=applicability, evidence=evidence, attempt_id=attempt_id)
+
+    @server.tool()
+    async def stage_memory_revision(revision: str, records: list[dict], ctx: Context) -> dict[str, Any]:
+        """Controller publication: index a memory revision without activating it."""
+        return await invoke(ctx, 'stage_memory_revision', revision=revision, records=records)
+
+    @server.tool()
+    async def activate_memory_revision(revision: str, ctx: Context) -> dict[str, Any]:
+        """Controller publication: atomically activate a staged memory revision."""
+        return await invoke(ctx, 'activate_memory_revision', revision=revision)
 
     @server.resource('kdb://knowledge/skill')
     async def skill() -> str:

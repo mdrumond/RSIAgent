@@ -58,3 +58,18 @@ def import_legacy(source: Path, destination: Path, embeddings, batch_size: int =
         destination.unlink(missing_ok=True)
         raise
     return destination
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--destination', type=Path, required=True)
+    parser.add_argument('--batch-size', type=int, default=128)
+    args = parser.parse_args()
+    # Import reads model identities from manifests and never embeds or loads a model.
+    import_legacy(args.source, args.destination, None, args.batch_size)
+
+
+if __name__ == '__main__':
+    main()

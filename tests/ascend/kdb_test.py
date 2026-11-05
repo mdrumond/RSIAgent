@@ -272,7 +272,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual({tool.name for tool in tools.tools},
-                             {'search', 'read_entry', 'add_repo', 'record_lesson'})
+                             {'search', 'read_entry', 'add_repo', 'record_lesson',
+                              'stage_memory_revision', 'activate_memory_revision'})
             result = await session.call_tool('add_repo', {
                 'path': str(root), 'collection': 'cpu', 'language': 'triton',
                 'target': 'a3', 'paths': ['kernel.py']})
@@ -304,6 +305,19 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 'applicability': 'a3', 'evidence': lesson['references'], 'attempt_id': 'cpu-1'})
             self.assertFalse(chained.isError)
             await session.read_resource('kdb://knowledge/skill')
+            staged = await session.call_tool('stage_memory_revision', {
+                'revision': 'git-one', 'records': [dict(id='one', delivery_id='delivery-one',
+                    lesson='memory vector alignment', evidence_refs=[reference], kind='good', target='a3')]})
+            self.assertFalse(staged.isError)
+            self.assertEqual(staged.structuredContent['generation'], 'git-one')
+            names = set(staged.structuredContent['collections'])
+            hidden = await session.call_tool('search', {'query':'memory', 'limit':50})
+            self.assertTrue(names.isdisjoint(hit['collection'] for hit in hidden.structuredContent['result']))
+            activated = await session.call_tool('activate_memory_revision', {'revision':'git-one'})
+            self.assertEqual(activated.structuredContent['generation'], 'git-one')
+            visible = await session.call_tool('search', {'query':'memory', 'limit':50, 'generation':'git-one'})
+            self.assertTrue(names.issubset(hit['collection'] for hit in visible.structuredContent['result']))
+            self.assertEqual({hit['generation'] for hit in visible.structuredContent['result']}, {'git-one'})
 
     async def test_real_stdio_and_http(self):
         for transport in ('stdio', 'streamable-http'):
@@ -352,8 +366,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     'SELECT attempt_id,operation FROM knowledge_events').fetchall()
                 self.assertEqual([row['operation'] for row in events],
                                  ['add_repo', 'search', 'read_entry', 'read_entry',
-                                  'record_lesson', 'record_lesson', 'skill.read'])
+                                  'record_lesson', 'record_lesson', 'skill.read',
+                                  'stage_memory_revision', 'search', 'activate_memory_revision', 'search'])
                 self.assertTrue(all(row['attempt_id'] == 'cpu-1' for row in events))
+                staged_event = json.loads(db.db.connection.execute(
+                    "SELECT data_json FROM knowledge_events WHERE operation='stage_memory_revision'").fetchone()[0])
+                self.assertEqual(staged_event['arguments'], {'revision':'git-one','record_count':1})
+                last_event = json.loads(db.db.connection.execute(
+                    'SELECT data_json FROM knowledge_events ORDER BY id DESC LIMIT 1').fetchone()[0])
+                self.assertEqual(last_event['arguments']['generation'], 'git-one')
                 db.close()
 
 

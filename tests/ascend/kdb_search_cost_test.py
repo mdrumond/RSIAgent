@@ -61,7 +61,7 @@ def reference(db, query, kind='all', target=None, limit=10):
         score = 1/(RRF_K+rank) + (1/(RRF_K+lexical_rank) if lexical_rank else 0)
         manifest = db.db.manifest(name)
         result.append(dict({key: row[key] for key in ('chunk_id', 'path', 'start_line', 'end_line', 'text')},
-            collection=name, kind=scoped_kind, target=scoped_target, language=manifest.language,
+            collection=name, kind=scoped_kind, generation=None, target=scoped_target, language=manifest.language,
             kernel_languages=list(manifest.kernel_languages), score=score, vector_rank=rank,
             lexical_rank=lexical_rank, lexical_score=None,
             source_sha256=db.db.source_fingerprint(name, row['path']).sha256))

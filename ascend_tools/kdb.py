@@ -34,6 +34,8 @@ class KDB:
             CREATE TABLE IF NOT EXISTS active_generation (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memory_collections (collection TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS memory_revisions (revision TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS retired_snapshots (collection TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS cited_chunks (
                 collection TEXT NOT NULL, chunk_id TEXT NOT NULL,
@@ -56,16 +58,25 @@ class KDB:
             )
 
     def search(self, query: str, kind: str = 'all', target: str | None = None,
-               limit: int = 10):
+               limit: int = 10, generation: str | None = None):
         if kind not in ('good', 'negative', 'all') or not 1 <= limit <= 50:
             raise ValueError('kind must be good/negative/all; limit must be 1..50')
+        if generation is None:
+            active = self.db.connection.execute('SELECT revision FROM active_generation').fetchone()
+            generation = active[0] if active else None
+        elif not self.db.connection.execute(
+                'SELECT 1 FROM memory_revisions WHERE revision=?', (generation,)).fetchone():
+            raise KeyError(generation)
         selected = []
         rows = self.db.connection.execute('''
             SELECT c.name, s.kind, s.target FROM collections c
             LEFT JOIN knowledge_scopes s ON c.name=s.collection
             LEFT JOIN repository_snapshots r ON r.collection=c.name
-            WHERE r.active IS NULL OR r.active=1
-        ''').fetchall()
+            LEFT JOIN memory_collections m ON m.collection=c.name
+            WHERE (r.active IS NULL OR r.active=1) AND
+                (m.collection IS NULL OR EXISTS (SELECT 1 FROM generation_collections g
+                  WHERE g.collection=c.name AND g.generation=?))
+        ''', (generation,)).fetchall()
         for row in rows:
             scoped_kind = row['kind'] or 'good'
             if kind != 'all' and kind != scoped_kind:
@@ -109,7 +120,7 @@ class KDB:
                 FROM chunks WHERE collection=? AND chunk_id=?''', (name, chunk_id)).fetchone()
             scoped_kind, scoped_target = metadata[name]
             manifest = self.db.manifest(name)
-            hits.append(dict(hit, collection=name, kind=scoped_kind,
+            hits.append(dict(hit, collection=name, kind=scoped_kind, generation=generation,
                              target=scoped_target, language=manifest.language,
                              kernel_languages=list(manifest.kernel_languages),
                              score=-negative_score, vector_rank=rank,
@@ -120,15 +131,28 @@ class KDB:
                                            ((hit['collection'], hit['chunk_id']) for hit in hits))
         return hits
 
-    def read_entry(self, collection: str, entry_id: str):
+    def read_entry(self, collection: str, entry_id: str, generation: str | None = None):
         """Read indexed evidence without needing its original source checkout."""
+        explicit_generation = generation is not None
+        is_memory = self.db.connection.execute(
+            'SELECT 1 FROM memory_collections WHERE collection=?', (collection,)).fetchone()
+        if generation is None:
+            active = self.db.connection.execute('SELECT revision FROM active_generation').fetchone()
+            generation = active[0] if active else None
+        if is_memory and collection not in self.generation_collections(generation):
+            if explicit_generation:
+                raise ValueError('entry is not a member of the requested memory generation')
+            member = self.db.connection.execute(
+                'SELECT generation FROM generation_collections WHERE collection=? ORDER BY generation LIMIT 1',
+                (collection,)).fetchone()
+            generation = member[0] if member else None
         citation = self._citation({'collection': collection, 'entry_id': entry_id})
         row = self.db.connection.execute(
             'SELECT text FROM chunks WHERE collection=? AND chunk_id=?',
             (collection, entry_id)).fetchone()
         encoded = row['text'].encode('utf-8')
         text = encoded[:16384].decode('utf-8', errors='ignore')
-        return dict(citation, text=text, total_bytes=len(encoded),
+        return dict(citation, generation=generation, text=text, total_bytes=len(encoded),
                     truncated=len(encoded) > 16384, evidence=[citation])
 
     def add_repo(self, path: str, collection: str, language: str,
@@ -214,6 +238,56 @@ class KDB:
         with self.db.connection:
             self.db.connection.execute('DELETE FROM generation_collections WHERE generation=?', (revision,))
             self.db.connection.execute('DELETE FROM generations WHERE revision=?', (revision,))
+            self.db.connection.execute('DELETE FROM memory_revisions WHERE revision=?', (revision,))
+
+    def current_memory_revision(self):
+        row = self.db.connection.execute('SELECT revision FROM active_generation').fetchone()
+        return row[0] if row else None
+
+    def stage_memory_revision(self, revision: str, records: list[dict]):
+        """Index a complete memory revision invisibly; reuse unchanged records."""
+        if not revision:
+            raise ValueError('memory revision is required')
+        staged, identifiers = [], set()
+        for record in records:
+            identity = record['id']
+            if not identity or identity in identifiers:
+                raise ValueError('memory record ids must be nonempty and unique')
+            identifiers.add(identity)
+            if record['kind'] not in ('good', 'negative') or not record['lesson'].strip():
+                raise ValueError('memory records require a lesson and good/negative kind')
+            # A record is the immutable indexing unit, independent of its Git revision.
+            payload = json.dumps({key: record[key] for key in
+                ('id','delivery_id','lesson','evidence_refs','kind','target')},
+                sort_keys=True, separators=(',', ':'))
+            name = 'memory-' + hashlib.sha256(payload.encode()).hexdigest()
+            staged.append((name, record, payload))
+        names = tuple(sorted(name for name, _, _ in staged))
+        exists = self.db.connection.execute('SELECT 1 FROM generations WHERE revision=?',
+                                             (revision,)).fetchone()
+        if exists and self.generation_collections(revision) != names:
+            raise ValueError('generation membership is immutable')
+        for name, record, payload in staged:
+            # Register before index() commits so no reader can see staged memory.
+            with self.db.connection:
+                self.db.connection.execute('INSERT OR IGNORE INTO memory_collections VALUES(?)', (name,))
+            with tempfile.TemporaryDirectory(prefix='kdb-memory-') as directory:
+                source = Path(directory) / 'record.json'
+                source.write_text(payload, encoding='utf-8')
+                self.add_repo(directory, name, 'lesson', target=record['target'],
+                              kind=record['kind'], paths=[source.name])
+        self.pin_generation(revision, names)
+        with self.db.connection:
+            self.db.connection.execute('INSERT OR IGNORE INTO memory_revisions VALUES(?)', (revision,))
+        return {'generation': revision, 'collections': list(names)}
+
+    def activate_memory_revision(self, revision: str):
+        """One metadata commit switches every memory record; repositories stay active."""
+        if not self.db.connection.execute('SELECT 1 FROM memory_revisions WHERE revision=?',
+                                          (revision,)).fetchone():
+            raise KeyError(revision)
+        self.activate_generation(revision)
+        return {'generation': revision}
 
     def prune_snapshots(self, *, compact: bool = True):
         """Reclaim superseded, unpinned rows, retaining every issued citation.
@@ -226,9 +300,12 @@ class KDB:
         removed = 0
         with conn:
             conn.execute('BEGIN IMMEDIATE')
-            stale = conn.execute("""SELECT r.collection FROM repository_snapshots r
-                WHERE r.active=0 AND NOT EXISTS (SELECT 1 FROM generation_collections g
-                    WHERE g.collection=r.collection)""").fetchall()
+            stale = conn.execute("""SELECT c.name AS collection FROM collections c
+                LEFT JOIN repository_snapshots r ON r.collection=c.name
+                LEFT JOIN memory_collections m ON m.collection=c.name
+                WHERE (r.active=0 OR m.collection IS NOT NULL)
+                  AND NOT EXISTS (SELECT 1 FROM generation_collections g
+                    WHERE g.collection=c.name)""").fetchall()
             for row in stale:
                 name = row['collection']
                 table = self.db._fts_table_name(name)
@@ -238,7 +315,8 @@ class KDB:
                         WHERE c.collection=chunk_provenance.collection
                           AND c.chunk_id=chunk_provenance.chunk_id)""", (name,))
                 removed += cursor.rowcount
-                if cursor.rowcount:
+                if cursor.rowcount and not conn.execute(
+                        'SELECT 1 FROM memory_collections WHERE collection=?', (name,)).fetchone():
                     conn.execute('INSERT OR IGNORE INTO retired_snapshots VALUES(?)', (name,))
                 if conn.execute('SELECT 1 FROM chunk_provenance WHERE collection=? LIMIT 1',
                                 (name,)).fetchone():
@@ -246,7 +324,7 @@ class KDB:
                     conn.execute(f'INSERT INTO {table}(rowid,text) '
                                  'SELECT rowid,text FROM chunks WHERE collection=?', (name,))
                 else:
-                    for metadata in ('repository_snapshots','knowledge_scopes'):
+                    for metadata in ('repository_snapshots','knowledge_scopes','memory_collections'):
                         conn.execute(f'DELETE FROM {metadata} WHERE collection=?', (name,))
                     conn.execute('DELETE FROM collections WHERE name=?', (name,))
             conn.execute("""DELETE FROM chunk_vectors WHERE NOT EXISTS (

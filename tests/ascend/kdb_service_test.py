@@ -74,7 +74,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()
                                 tools = await session.list_tools()
-                                self.assertEqual(len(tools.tools), 4)
+                                self.assertEqual({tool.name for tool in tools.tools},
+                                    {'search', 'read_entry', 'add_repo', 'record_lesson',
+                                     'stage_memory_revision', 'activate_memory_revision'})
                     self.assertFalse(closed.is_set())
                 finally:
                     release.set()
