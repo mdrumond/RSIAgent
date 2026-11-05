@@ -70,7 +70,7 @@ export async function provider(scenario, {nativeSession} = {}) {
           const unrelated = prompt.includes('Goal: unrelated');
           const small = prompt.includes('Goal: SMALL');
           const pass = unrelated || scenario === 'phase2' || scenario === 'interrupt' || (scenario !== 'freeze' && (small || originals++ > 0));
-          plan = workflow({pass,interrupt:scenario === 'interrupt'});
+          plan = workflow({pass,interrupt:scenario === 'interrupt'&&!unrelated});
         } else throw new Error(`Unknown scripted conversation: ${prompt.slice(0,100)}`);
         plans.set(key,plan);
       }
