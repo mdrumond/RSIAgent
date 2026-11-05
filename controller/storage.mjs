@@ -33,6 +33,13 @@ export class CampaignStorage {
       CREATE INDEX IF NOT EXISTS storage_artifacts_owner ON storage_artifacts(attempt,kind,id);
       CREATE TABLE IF NOT EXISTS storage_revisions (
       name TEXT PRIMARY KEY,revision TEXT NOT NULL,generation TEXT,updated TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS storage_sessions (
+      session TEXT PRIMARY KEY,attempt TEXT REFERENCES attempts(id),phase TEXT NOT NULL,
+      role TEXT NOT NULL,created TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS storage_retrievals (
+      id INTEGER PRIMARY KEY,attempt TEXT REFERENCES attempts(id),role TEXT NOT NULL,
+      tool_call TEXT,operation TEXT NOT NULL,arguments TEXT NOT NULL,generation TEXT,
+      citations TEXT NOT NULL,created TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS storage_jobs (
       id TEXT PRIMARY KEY,artifact TEXT REFERENCES storage_artifacts(id),kind TEXT NOT NULL,
       status TEXT NOT NULL,progress TEXT NOT NULL DEFAULT '{}',updated TEXT NOT NULL);`);
@@ -55,6 +62,26 @@ export class CampaignStorage {
   activate(name,revision,generation=null){
     if(!['memory','skills'].includes(name)||!revision)throw new Error('Invalid knowledge revision');
     this.db.prepare('INSERT OR REPLACE INTO storage_revisions VALUES (?,?,?,?)').run(name,revision,generation,now());
+  }
+  async session(path,{attempt=null,phase,role='actor'}={}) {
+    const artifact=await this.register(path,{attempt,kind:'pi-session',role});
+    this.db.prepare('INSERT OR IGNORE INTO storage_sessions VALUES (?,?,?,?,?)').run(artifact.path,attempt,phase,role,now());
+    return artifact;
+  }
+  async retrieval({attempt=null,role='actor',toolCall=null,operation,arguments:args={},generation=null,entries=[]}) {
+    const directory=join(this.root,'artifacts','citations');await mkdir(directory,{recursive:true});
+    const citations=[];
+    for(const entry of entries) {
+      if(typeof entry.text!=='string')continue;
+      const text=entry.text,sha=createHash('sha256').update(text).digest('hex'),path=join(directory,sha+'.txt');
+      try{await writeFile(path,text,{flag:'wx',mode:0o600});}catch(error){if(error.code!=='EEXIST')throw error;}
+      const artifact=await this.register(path,{kind:'cited-text',role:'kdb'});
+      const {text:ignored,...reference}=entry;
+      citations.push({...reference,artifact:artifact.id,text_sha256:sha});
+    }
+    this.db.prepare('INSERT INTO storage_retrievals(attempt,role,tool_call,operation,arguments,generation,citations,created) VALUES (?,?,?,?,?,?,?,?)')
+      .run(attempt,role,toolCall,operation,JSON.stringify(args),generation,JSON.stringify(citations),now());
+    return citations;
   }
   iteration(attempt,{stage,reflection='',sourceHash=null,sourceCommit=null}){
     return this.db.prepare(`INSERT INTO storage_iterations(attempt,stage,ordinal,reflection,source_hash,source_commit)

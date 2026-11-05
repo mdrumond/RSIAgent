@@ -630,7 +630,10 @@ async function worker(root,id) {
     if(interrupted)throw new Error('Worker interrupted');
     url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
-    bridge=createKdbBridge({url,attemptId:id,agentDir:path,target:config.target,event:(type,data)=>state.event(id,type,data)});
+    const storage=CampaignStorage.open(state,config.root);
+    const pinned=storage?.db.prepare('SELECT knowledge_generation FROM storage_attempts WHERE attempt=?').get(id);
+    bridge=createKdbBridge({url,attemptId:id,agentDir:path,target:config.target,generation:pinned?.knowledge_generation,
+      recordRetrieval:storage?entry=>storage.retrieval({...entry,attempt:id}):undefined,event:(type,data)=>state.event(id,type,data)});
     const base=state.project(attempt.project).spec;
     let project={...base,actor_seconds:job.actor_seconds};
     if(!job.finalize && job.kind==='investigation') {

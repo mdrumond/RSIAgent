@@ -3,6 +3,8 @@ import { Type } from 'typebox';
 import { cp, mkdir, readFile, stat } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
+import {State} from '../controller/state.mjs';
 
 // Page telemetry without retaining complete event or native Pi history. The first
 // allocation remains authoritative across resumes; checkpoints never reset it.
@@ -38,6 +40,13 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
   const elapsed=history.elapsed??0;
   if(elapsed>=seconds)throw new Error('Curriculum elapsed allocation exhausted before '+role+' submission');
   const manager=prior?sdk.SessionManager.open(prior.session,join(path,'sessions'),path):sdk.SessionManager.create(path,join(path,'sessions'));
+  if(config.storage) {
+    const ledger=new State(join(config.root,'state.sqlite'));
+    try {
+      const storage=CampaignStorage.open(ledger,config.root),owner=ledger.attempt(attemptId)?attemptId:null;
+      await storage?.session(manager.getSessionFile(),{attempt:owner,phase:config.mode,role:'curriculum-'+role});
+    }finally{ledger.close();}
+  }
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
     thinkingLevel:'off',tools:['read','write','edit','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
   const started=performance.now();

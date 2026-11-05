@@ -15,7 +15,7 @@ function decode(result) {
   return hits;
 }
 
-export function createKdbBridge({url, attemptId, agentDir, target, event = async () => {}}) {
+export function createKdbBridge({url, attemptId, agentDir, target, generation, recordRetrieval, event = async () => {}}) {
   const endpoint = new URL(url);
   if (endpoint.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(endpoint.hostname)) {
     throw new Error('Instance KDB must use loopback HTTP');
@@ -35,6 +35,13 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
         attempt_id: attemptId, tool: result.toolName, tool_call_id: result.toolCallId,
         parent_tool_call_id: result.parentToolCallId, failed: result.isError,
       });
+      if(recordRetrieval&&!result.isError&&['mcp__kdb__search','mcp__kdb__read_entry'].includes(result.toolName)) {
+        const wire=result.result?.structuredContent;
+        const body=wire?.structuredContent??wire;
+        const entries=Array.isArray(body?.result)?body.result:body?.text?[body]:[];
+        await recordRetrieval({toolCall:result.toolCallId,operation:result.toolName,
+          arguments:result.input??{},generation:entries[0]?.generation??generation??null,entries});
+      }
     });
   };
   // The native /mcp commands await discovery and own reconnect behavior. No
@@ -88,6 +95,7 @@ export function createKdbBridge({url, attemptId, agentDir, target, event = async
       }
       const args = {query: request.query, kind: request.kind ?? 'all', limit};
       if (target !== undefined) args.target = target;
+      if (generation !== undefined && generation !== null) args.generation = generation;
       const outcome = await ctx.executeTool(searchTool, args);
       if (outcome.isError) throw new Error('Native KDB search failed or was blocked');
       let remaining = 12000;

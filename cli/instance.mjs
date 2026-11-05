@@ -31,10 +31,18 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (!basestat.isFile()) throw new Error('Baseline KDB must be a SQLite file');
   await mkdir(destination,{recursive:false,mode:0o700});
   const source=new DatabaseSync(baseline,{readOnly:true});
+  let legacy=false;
   try {
+    legacy=source.prepare('PRAGMA table_info(chunks)').all().some(row=>row.name==='vector_json');
     // SQLite VACUUM snapshots WAL-backed source data without copying an inconsistent file.
-    source.prepare('VACUUM INTO ?').run(join(destination,'knowledge.sqlite'));
+    if(!legacy)source.prepare('VACUUM INTO ?').run(join(destination,'knowledge.sqlite'));
   } finally {source.close();}
+  if(legacy)await new Promise((ok,no)=>{
+    const child=spawn(settings.python??'python',['-m','ascend_tools.kdb_import','--source',resolve(baseline),
+      '--destination',join(destination,'knowledge.sqlite')],{env:{...process.env,PYTHONPATH:machinery},stdio:['ignore','ignore','pipe']});
+    let error='';child.stderr.setEncoding('utf8');child.stderr.on('data',data=>{error=(error+data).slice(-65536);});
+    child.on('error',no);child.on('close',code=>code?no(new Error('Baseline KDB import failed: '+error)):ok());
+  });
   await mkdir(join(destination,'skills','versions'),{recursive:true});
   await cp(skills,join(destination,'skills','versions','baseline'),{recursive:true,errorOnExist:true});
   await writeFile(join(destination,'skills','versions','baseline','skill-map.json'),JSON.stringify(skillMap,null,2)+'\n');

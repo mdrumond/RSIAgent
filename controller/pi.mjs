@@ -12,6 +12,8 @@ import { createPiTelemetryJournal } from './pi-telemetry.mjs';
 import {CampaignStorage} from './storage.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
+const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
+  'tool_execution_start','tool_execution_end','auto_compaction_start','auto_compaction_end','auto_retry_start','auto_retry_end']);
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
@@ -184,6 +186,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
       if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
         diagnostics.push(e.message.errorMessage ?? 'Native provider error');
+      // Raw streams remain in provider.jsonl; SQL stores lifecycle labels only.
+      if(storage&&!lifecycleEvents.has(e.type))return;
       try { telemetry(eventData({type:e.type,stage:workflow.stage,elapsed:clock.elapsed})); }
       catch(error) { telemetryFailure??=error; throw error; }
     });

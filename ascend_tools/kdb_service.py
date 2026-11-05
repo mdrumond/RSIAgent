@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,17 @@ def create_server(backend_factory, *, port=8765):
                 else os.environ.get('ASCEND_ATTEMPT_ID'))
 
     def invoke_backend(attempt_id, operation, args):
+        if operation in ('search', 'read_entry') and args.get('generation') is None and attempt_id:
+            # Native Pi MCP calls and workflow wrappers share the same pinned view.
+            state_path = getattr(getattr(backend, 'db', None), 'path', None)
+            if state_path is not None:
+                ledger = Path(state_path).parent / 'state.sqlite'
+                if ledger.is_file():
+                    with sqlite3.connect(ledger.as_uri() + '?mode=ro', uri=True) as connection:
+                        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='storage_attempts'").fetchone():
+                            row = connection.execute('SELECT knowledge_generation FROM storage_attempts WHERE attempt=?', (attempt_id,)).fetchone()
+                            if row and row[0]:
+                                args = dict(args, generation=row[0])
         try:
             result = getattr(backend, operation)(**args)
         except Exception as exc:
