@@ -178,6 +178,7 @@ export async function createEnvironment(options,context){
   await f.run('config','--config',action);
   const wave=f.start('wave');
   await until(()=>{
+    if(!rows(f.root,"SELECT 1 FROM sqlite_master WHERE name='control'").length)return false;
     const value=rows(f.root,"SELECT value FROM control WHERE key='wait'")[0]?.value;
     return value&&JSON.parse(value)?.reason==='resources'&&rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
   });
