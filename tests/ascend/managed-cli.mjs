@@ -9,7 +9,7 @@ import {ownerStopped} from '../../controller/lifecycle.mjs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
-import {campaignFixture,waitFor} from './resilience/campaign-fixture.mjs';
+import {campaignFixture,waitFor,digest} from './resilience/campaign-fixture.mjs';
 import {controllerUnit,knowledgeUnit} from '../../cli/managed-runtime.mjs';
 
 // Explicit local gate; caller holds the shared validation lock. No rsi.slice writes.
@@ -182,7 +182,9 @@ export async function createEnvironment(options,context){const env=await base(op
     assert(fresh.results.some(row=>row.outcome==='passed'));
     assert.equal(f.rows("SELECT status FROM projects WHERE id='after-stop'")[0].status,'passed');
     assert.equal(JSON.parse(f.rows("SELECT value FROM control WHERE key='stop'")[0].value),false);
-    assert.deepEqual(await readFile(heldSettled.session),sessionBytes);
+    const retainedSession=f.rows("SELECT * FROM storage_artifacts WHERE attempt=? AND kind='pi-session'",'state.sqlite',[heldBefore.id])[0];
+    assert.equal(retainedSession.sha256,digest(sessionBytes));
+    assert.equal((await f.run('storage','verify','--artifact',retainedSession.id))[0].verified,true);
     assert.deepEqual(f.rows("SELECT * FROM attempts WHERE id='"+heldBefore.id+"'")[0],heldSettled);
     // A resumed campaign remains continuous and shares the same elapsed cycle after restart.
     await f.config({campaign_seconds:5,completion_target:100});
