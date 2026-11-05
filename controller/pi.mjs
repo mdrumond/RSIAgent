@@ -50,7 +50,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     const key=createHash('sha256').update(attempt.project+'\0'+relative(storage.root,project.source)).digest('hex');
     const gitDir=join(storage.root,'source-history',key);
     const git=await prepareSourceGit({source:project.source,gitDir,attemptId:attempt.id});
-    await register(gitDir,'source-git');return git;
+    await storage.register(gitDir,{project:attempt.project,kind:'source-git'});return git;
   }):null;
   const telemetry=createPiTelemetryJournal(join(attemptPath,'pi-events.jsonl'),attempt.id,
     data=>state.event(attempt.id,'pi-event',data));

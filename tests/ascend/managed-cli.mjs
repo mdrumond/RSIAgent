@@ -17,7 +17,7 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
   {skip:process.env.RSI_MANAGED_CLI_TEST!=='1',timeout:90000},async t=>{
     const directory=await mkdtemp(join(tmpdir(),'managed-cli-')),cleanups=[];
     const parent=process.env.RSI_TEST_SLICE;
-    assert(parent?.startsWith('rsivalidation'),'Use run-managed-gate.mjs to bound all services under the owned 4GiB test slice');
+    assert(parent?.startsWith('rsivalidation'),'Use run-managed-gate-fixture.mjs to bound all services under the owned 4GiB test slice');
     const slice=parent.slice(0,-6)+'-cli'+process.pid+Date.now()+'.slice',cap=768*1024**2;
     const run=promisify(execFile),systemctl=args=>run('systemctl',['--user',...args],{timeout:5000,maxBuffer:65536});
     const unitDir=join(process.env.XDG_RUNTIME_DIR,'systemd/user'),unitFile=join(unitDir,slice);
