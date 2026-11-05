@@ -290,6 +290,67 @@ class PackageTests(unittest.TestCase):
         self.assertTrue((dest / 'machinery/npm-shrinkwrap.json').is_file())
         self.assertFalse((dest / 'machinery/node_modules').exists())
 
+    def test_pending_project_recovery_schedule_survives_export(self):
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('CREATE TABLE recovery_queue(project TEXT PRIMARY KEY,origin TEXT,failed_rounds INTEGER,kind TEXT,eligible_wave INTEGER,attempt TEXT)')
+            db.execute("INSERT INTO recovery_queue VALUES('p','a',2,'investigation',7,NULL)")
+            db.execute("INSERT INTO recovery_queue VALUES('other','other-attempt',1,'investigation',8,NULL)")
+        pack(self.root, self.package, 'p')
+        dest = self.base / 'recovery-restored'
+        unpack(self.package, dest)
+        with closing(sqlite3.connect(dest / 'state.sqlite')) as db:
+            self.assertEqual(db.execute('SELECT * FROM recovery_queue').fetchall(),
+                             [('p', 'a', 2, 'investigation', 7, None)])
+
+    def test_campaign_materialized_skills_work_with_actual_consumers(self):
+        revision = self.automatic_fixture()
+        scopes = ('global-kdb', 'preflight', 'task-construction', 'design', 'implementation',
+                  'test', 'debug', 'optimisation', 'validation', 'acceptance')
+        for version in ('active', 'used'):
+            directory = self.root / 'skills/versions' / version
+            (directory / 'assets').mkdir(parents=True)
+            (directory / 'skill-map.json').write_text(json.dumps(dict.fromkeys(scopes, 'guidance.md')))
+            (directory / 'guidance.md').write_text(version + ' skill; see assets/policy.txt')
+            (directory / 'assets/policy.txt').write_text(version + ' policy')
+        (self.root / 'instance.json').write_text(json.dumps({'format': 1, 'skills': {'activeVersion': 'active'}}))
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('CREATE TABLE storage_skill_versions(version TEXT PRIMARY KEY,revision TEXT)')
+            db.execute('INSERT INTO storage_skill_versions VALUES(?,?)', ('used', revision))
+        pack(self.root, self.package)
+        dest = self.base / 'skills-restored'
+        unpack(self.package, dest)
+        repository = Path(__file__).resolve().parents[2]
+        code = ('import {readConfig} from ' + json.dumps((repository / 'cli/instance.mjs').as_uri()) + ';'
+                'import {run} from ' + json.dumps((repository / 'cli/skill-input.mjs').as_uri()) + ';'
+                'const config=await readConfig(process.argv[1]);'
+                'console.log(JSON.stringify(await run(config,{scope:"design"})));')
+        process = subprocess.run(['node', '--max-old-space-size=256', '--input-type=module', '-e', code, str(dest)],
+                                 check=True, capture_output=True, text=True)
+        self.assertEqual(json.loads(process.stdout)['content'], 'active skill; see assets/policy.txt')
+        self.assertEqual((dest / 'skills/versions/used/assets/policy.txt').read_text(), 'used policy')
+
+    def test_interrupted_campaign_kdb_backup_ignores_partial_scratch(self):
+        self.automatic_fixture()
+        self.package.mkdir()
+        (self.package / 'knowledge.sqlite').write_bytes(b'interrupted legacy backup')
+        (self.package / 'collected').mkdir()
+        (self.package / 'collected/knowledge.tmp').write_bytes(b'interrupted temporary backup')
+        pack(self.root, self.package)
+        dest = self.base / 'kdb-restored'
+        unpack(self.package, dest)
+        with closing(sqlite3.connect(dest / 'knowledge.sqlite')) as db:
+            self.assertEqual(db.execute('PRAGMA quick_check').fetchone()[0], 'ok')
+            self.assertEqual(db.execute('SELECT id FROM entries').fetchall(), [('active-entry',)])
+
+    def test_oversized_manifest_rejected_before_publication(self):
+        with patch('ascend_tools.storage_package.MAX_JSON_BYTES', 4096):
+            with self.assertRaisesRegex(ValueError, 'Package manifest exceeds portable size limit'):
+                pack(self.root, self.package, 'p')
+        self.assertFalse((self.package / 'package.json').exists())
+        self.assertTrue((self.package / 'inspection.json').exists())
+        self.assertTrue(pack(self.root, self.package, 'p')['complete'])
+        unpack(self.package, self.base / 'manifest-restored')
+
     def test_used_revision_must_be_collected(self):
         path = self.root / 'package-inputs.json'
         inputs = json.loads(path.read_text())

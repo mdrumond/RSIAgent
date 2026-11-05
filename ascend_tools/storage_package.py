@@ -18,6 +18,8 @@ import tempfile
 
 from .storage_archive import compress_file, restore_file, iter_artifact_bytes
 
+MAX_JSON_BYTES = 8 * 1024 * 1024
+
 PORTABLE_TABLES = ('storage_campaign', 'projects', 'attempts', 'events',
     'storage_attempts', 'storage_iterations', 'storage_artifacts', 'storage_revisions',
     'storage_deployments', 'storage_jobs', 'recovery_queue', 'recovery_attempts',
@@ -104,9 +106,9 @@ def _sanitize(value):
 def _load_json(path):
     # Extension/config manifests are small control data, never a ledger transport.
     with path.open('rb') as stream:
-        raw = stream.read(8 * 1024 * 1024 + 1)
-    if len(raw) > 8 * 1024 * 1024:
-        raise ValueError('JSON control manifest exceeds 8 MiB; use the SQLite ledger')
+        raw = stream.read(MAX_JSON_BYTES + 1)
+    if len(raw) > MAX_JSON_BYTES:
+        raise ValueError('JSON control manifest exceeds portable size limit')
     return json.loads(raw)
 
 
@@ -141,10 +143,10 @@ def _snapshot(root, path, project):
                 columns = {r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')')}
                 if table in ('control', 'requests', 'generation_drafts', 'generation_events', 'storage_jobs'):
                     db.execute('DELETE FROM ' + _quote(table))
-                elif 'attempt' in columns:
-                    db.execute('DELETE FROM ' + _quote(table) + ' WHERE attempt IS NULL OR attempt NOT IN (SELECT id FROM attempts)')
                 elif 'project' in columns:
                     db.execute('DELETE FROM ' + _quote(table) + ' WHERE project NOT IN (SELECT id FROM projects)')
+                elif 'attempt' in columns:
+                    db.execute('DELETE FROM ' + _quote(table) + ' WHERE attempt IS NULL OR attempt NOT IN (SELECT id FROM attempts)')
             clause = ''
             if 'storage_retrievals' in tables:
                 clause = " AND NOT EXISTS (SELECT 1 FROM storage_retrievals,json_each(citations) j WHERE json_extract(j.value,'$.artifact')=storage_artifacts.id)"
@@ -267,6 +269,19 @@ def pack(root, dest, project=None, require_complete=True):
         tables = _tables(db)
         for kind, field in (('skills', 'skill_revision'), ('memory', 'memory_revision')):
             used[kind] = {r[0] for r in db.execute('SELECT DISTINCT ' + field + ' FROM storage_attempts WHERE ' + field + ' IS NOT NULL')} if 'storage_attempts' in tables else set()
+        active_version = _load_json(config_path).get('skills', {}).get('activeVersion')
+        if active_version:
+            versions = {active_version}
+            if 'storage_skill_versions' in tables:
+                versions.update(r['version'] for r in db.execute('SELECT version,revision FROM storage_skill_versions')
+                                if r['revision'] in used['skills'])
+            for version in sorted(versions):
+                directory = _local(root, Path('skills/versions') / _safe(version))
+                if not (directory / 'skill-map.json').is_file():
+                    missing('skill-version', version)
+                    continue
+                for path in _files(directory):
+                    collect(path, path.relative_to(root), 'skill-version')
         for p in projects:
             spec = json.loads(p['spec'])
             source = Path(spec['source'])
@@ -391,10 +406,14 @@ def pack(root, dest, project=None, require_complete=True):
     required = {'source-history'} if has_attempts else set()
     if not project:
         required |= {'knowledge-history', 'machinery', 'dependencies'}
-        snapshot = dest / 'knowledge.sqlite'
+        snapshot = dest / 'collected' / 'knowledge.sqlite'
         if not snapshot.exists() and (root / 'knowledge.sqlite').is_file():
-            with closing(_connect(root / 'knowledge.sqlite')) as source, closing(sqlite3.connect(snapshot)) as out:
-                source.backup(out)
+            snapshot.parent.mkdir(exist_ok=True)
+            temporary = snapshot.with_suffix('.tmp')
+            temporary.unlink(missing_ok=True)
+            with closing(_connect(root / 'knowledge.sqlite')) as source, closing(sqlite3.connect(temporary)) as out:
+                source.backup(out, pages=256)
+            os.replace(temporary, snapshot)
         collect(snapshot, 'knowledge.sqlite', 'active-kdb')
     for kind in sorted(required - kinds):
         missing(kind, 'package-inputs.json')
@@ -403,6 +422,8 @@ def pack(root, dest, project=None, require_complete=True):
     collect(ledger_path, 'state.sqlite', 'ledger')
     metadata['complete'] = not metadata['missing']
     _json(dest / 'inspection.json', metadata)
+    if (dest / 'inspection.json').stat().st_size > MAX_JSON_BYTES:
+        raise ValueError('Package manifest exceeds portable size limit; package.json not published')
     if require_complete and not metadata['complete']:
         raise ValueError('Package incomplete; inspect inspection.json')
     _json(dest / 'package.json', metadata)
