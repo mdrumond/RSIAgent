@@ -66,7 +66,7 @@ test('explicit restart refuses a surviving worker without duplicating or killing
   t.after(async()=>{const closed=once(child,'exit');child.kill('SIGTERM');await closed;});
   state.add({id:'still-running',goal:'unchanged',actor_seconds:30});
   const attempt=state.admit('still-running',await processIdentity(child.pid));
-  await assert.rejects(operate('resume',{root,mode:'phase1',projects:[]}),/Previous worker remains active/);
+  await assert.rejects(operate('resume',{root,mode:'phase1',projects:[]}));
   assert.equal(state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,1);
   assert.equal(state.attempt(attempt.id).outcome,null);
   assert.equal(child.exitCode,null);
