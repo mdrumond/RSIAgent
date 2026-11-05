@@ -115,9 +115,12 @@ export async function operate(command,config,options={},manager=managedRuntime) 
       const {requests}=await import('./background.mjs');
       requests(state);
       state.db.prepare("UPDATE requests SET status='failed',error='Stopped before execution' WHERE status='queued'").run();
-      for(const request of requests(state).filter(r=>r.status==='running')) {
-        const owner=request.owner;
-        if(owner?.start && owner?.boot && !await ownerStopped(owner))process.kill(owner.pid,'SIGTERM');
+      for(const request of state.db.prepare("SELECT owner FROM requests WHERE status='running'").iterate()) {
+        const owner=JSON.parse(request.owner);
+        if(owner?.start&&owner?.boot&&!await ownerStopped(owner)) {
+          if(owner.unit?.startsWith('rsi-maintenance-'))await (await manager.observeManagedMaintenance(owner)).stop();
+          else process.kill(owner.pid,'SIGTERM');
+        }
       }
       return {stop_requested:true};
     }

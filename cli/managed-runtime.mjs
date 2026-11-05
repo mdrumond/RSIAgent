@@ -24,6 +24,19 @@ export async function startManagedKnowledge(descriptor,options={}) {
   return launch(descriptor,{...options,knowledge:true,controller:false,
     memoryBytes:options.knowledgeMemoryBytes});
 }
+export async function startManagedMaintenance(descriptor,options={}) {
+  return launch(descriptor,{...options,maintenance:true,controller:false});
+}
+export async function managedMaintenanceIdentity(unit,options={}) {
+  if(!/^rsi-maintenance-[a-zA-Z0-9-]+\.service$/.test(unit??''))throw new Error('Owned maintenance unit required');
+  const c=context(options),state=await c.show(unit);
+  return {unit,invocation:state.InvocationID,...await c.membership(integer(state.MainPID),await c.aggregate())};
+}
+export async function observeManagedMaintenance(identity,options={}) {
+  if(!/^rsi-maintenance-[a-zA-Z0-9-]+\.service$/.test(identity?.unit??'')||!identity.invocation||!identity.cgroup)
+    throw new Error('Retained maintenance service identity required');
+  return managedHandle(context(options),identity.unit,identity,undefined,{controller:false});
+}
 export async function managedKnowledgeIdentity(root,options={}) {
   const c=context(options),unit=knowledgeUnit(root),state=await c.show(unit);
   if(['inactive','failed'].includes(state.ActiveState))return null;
@@ -33,7 +46,6 @@ export async function managedKnowledgeIdentity(root,options={}) {
 export async function configureHostMemory(config, options = {}) {
   // Isolated profiles are provisioned externally; only the standard shared slice is installed here.
   if (options.slice && options.slice !== 'rsi.slice') {
-    if (await options.verifyInstanceStopped?.() !== true) throw new Error('Stopped instance required');
     await context({...options,hostMemory:config}).aggregate();
     return;
   }
@@ -159,7 +171,7 @@ async function launchLocked(descriptor, options) {
   let aggregate;
   try {aggregate=await c.aggregate();}
   catch(error){error.code='RSI_MEMORY_ENFORCEMENT';throw error;}
-  if (!options.controller) await c.membership(process.pid, aggregate);
+  if (!options.controller&&!options.maintenance) await c.membership(process.pid, aggregate);
   for (const pid of options.requiredPids ?? []) await c.membership(pid, aggregate);
   const memory = options.memoryBytes;
   const controllerMemory = options.controllerMemoryBytes ?? Math.floor(c.max_bytes / 2);
@@ -174,7 +186,7 @@ async function launchLocked(descriptor, options) {
       throw Object.assign(new Error('Insufficient measured aggregate headroom for worker admission'),{code:'RSI_MEMORY_CAPACITY'});
   }
   const units = await c.run(['list-units','--type=service','--all','--plain','--no-legend','--no-pager',
-    'rsi-controller-*.service','rsi-worker-*.service','rsi-kdb-*.service']);
+    'rsi-controller-*.service','rsi-worker-*.service','rsi-kdb-*.service','rsi-maintenance-*.service']);
   let reserved = 0;
   for (const row of units.trim().split('\n').filter(Boolean)) {
     const existing = await c.show(row.trim().split(/\s+/)[0]);
@@ -185,8 +197,8 @@ async function launchLocked(descriptor, options) {
   }
   if (reserved + (options.controller ? controllerMemory : memory) > c.max_bytes)
     throw Object.assign(new Error('Active managed service reservations exhaust aggregate memory capacity'),{code:'RSI_MEMORY_CAPACITY'});
-  const unit = options.unit ?? 'rsi-' + (options.controller ? 'controller-' : options.knowledge?'kdb-':'worker-') + randomUUID() + '.service';
-  if (!/^rsi-(controller|worker|kdb)-[a-zA-Z0-9-]+\.service$/.test(unit))throw new Error('Invalid owned service name');
+  const unit = options.unit ?? 'rsi-' + (options.controller ? 'controller-' : options.knowledge?'kdb-':options.maintenance?'maintenance-':'worker-') + randomUUID() + '.service';
+  if (!/^rsi-(controller|worker|kdb|maintenance)-[a-zA-Z0-9-]+\.service$/.test(unit))throw new Error('Invalid owned service name');
   // The scheduler may admit/write a job only after enforcement and reservations pass.
   const command=descriptorArgs(typeof descriptor==='function'?await descriptor():descriptor);
   const args = ['--user', '--quiet', '--no-ask-password', '--service-type=exec', '--expand-environment=no',
@@ -194,7 +206,7 @@ async function launchLocked(descriptor, options) {
     '--property=MemorySwapMax=0', '--property=OOMPolicy=kill', '--property=KillMode=control-group',
     '--property=TimeoutStopSec=5s', '--property=Restart=' + (options.controller||options.knowledge ? 'on-failure' : 'no'),
     '--property=MemoryMax=' + (options.controller ? controllerMemory : memory),
-    ...(options.controller||options.knowledge ? ['--property=RestartSec=1s'] : ['--remain-after-exit']), ...command];
+    ...(options.controller||options.knowledge ? ['--property=RestartSec=1s'] : options.maintenance?[]:['--remain-after-exit']), ...command];
   const child = (options.spawn ?? spawn)('systemd-run', args, {stdio:['ignore','pipe','pipe']});
   // Drain diagnostics with a hard retention bound. Never buffer worker logs here.
   let diagnostic = '';

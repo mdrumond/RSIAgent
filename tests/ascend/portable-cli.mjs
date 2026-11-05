@@ -27,10 +27,11 @@ import {parseArgs} from 'node:util';
 const argv=process.argv.slice(2),command=argv[0],abort=new AbortController();
 const stop=()=>abort.abort();process.on('SIGTERM',stop);process.on('SIGINT',stop);
 async function run(){
- if(!['wave','campaign','resume','pause','stop'].includes(command))return main(argv,{signal:abort.signal});
+ if(!['wave','campaign','resume','pause','stop','kdb','tune'].includes(command))return main(argv,{signal:abort.signal});
  const {values}=parseArgs({args:argv.slice(1),options:{instance:{type:'string'},mode:{type:'string'},
- concurrency:{type:'string'},'no-recovery':{type:'boolean'}}});
+ config:{type:'string'},concurrency:{type:'string'},'no-recovery':{type:'boolean'}}});
  const config=await readConfig(values.instance),options={...values,signal:abort.signal};
+ if(command==='kdb'||command==='tune')return (await import(command==='kdb'?${JSON.stringify(new URL('./knowledge.mjs',pathToFileURL(mainPath)).href)}:${JSON.stringify(new URL('./skills.mjs',pathToFileURL(mainPath)).href)})).run(config,options);
  return command==='campaign'?campaign(config,options):operate(command,config,options);
 }
 run().then(result=>console.log(JSON.stringify(result))).catch(error=>{

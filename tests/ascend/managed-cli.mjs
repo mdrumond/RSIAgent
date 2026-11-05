@@ -32,6 +32,44 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
     await systemctl(['daemon-reload']);await systemctl(['start',slice]);
     const f=await campaignFixture({directory,signal:abort.signal,onCleanup:fn=>cleanups.push(fn)},'recover',['recover','unrelated'],{managed:true});
     await f.config({completion_target:3,host_memory:{max_bytes:cap},managed_runtime:{slice,control_memory_bytes:384*1024**2,controller_service_bytes:192*1024**2}});
+    // Dashboard Add Repo precedes any campaign; both public maintenance paths are managed.
+    const repo=join(directory,'knowledge-input');await mkdir(repo);
+    await writeFile(join(repo,'reference.py'),'def before_campaign_oracle(): return 42\n');
+    const actionFile=join(directory,'maintenance.json'),collection='before-campaign-'+process.pid;
+    await writeFile(actionFile,JSON.stringify({tool:'add_repo',arguments:{path:repo,collection,language:'python',target:'cpu',paths:['reference.py']}}));
+    const submitted=await f.run('kdb','--config',actionFile,'--detach');
+    assert(submitted.unit.startsWith('rsi-maintenance-'));
+    const requestRow=id=>f.rows("SELECT * FROM requests WHERE id='"+id+"'")[0];
+    await waitFor(async()=>{
+      const row=requestRow(submitted.request);
+      if(row.status==='failed')throw new Error(row.error);
+      return row.status==='passed'&&await ownerStopped(row.owner);
+    },undefined,15);
+    const maintenanceKdb=JSON.parse(await readFile(join(f.instance,'knowledge-service.json'),'utf8'));
+    await writeFile(actionFile,JSON.stringify({tool:'search',arguments:{query:'before campaign oracle',kind:'good',target:'cpu',limit:20}}));
+    const query=await f.run('kdb','--config',actionFile);
+    assert.equal(query.isError,false);assert(JSON.stringify(query).includes(collection));
+    await writeFile(actionFile,JSON.stringify({}));
+    assert.deepEqual(await f.run('tune','--config',actionFile),{analyse:false,evaluate:false});
+    const maintenanceRows=f.rows('SELECT kind,status,owner FROM requests');
+    assert.equal(maintenanceRows.length,3);
+    assert(maintenanceRows.every(row=>row.status==='passed'&&JSON.parse(row.owner).unit.startsWith('rsi-maintenance-')));
+    assert(maintenanceRows.some(row=>row.kind==='tune'));
+    // Kill only a live, blocked maintenance owner; status records factual failure after service closure.
+    process.kill(maintenanceKdb.owner.pid,'SIGSTOP');
+    let killedRequest;
+    try {
+      await writeFile(actionFile,JSON.stringify({tool:'search',arguments:{query:'blocked-read-only'}}));
+      killedRequest=await f.run('kdb','--config',actionFile,'--detach');
+      await waitFor(()=>requestRow(killedRequest.request).status==='running',undefined,5);
+      const requestOwner=JSON.parse(requestRow(killedRequest.request).owner);
+      process.kill(requestOwner.pid,'SIGKILL');
+      await waitFor(async()=>{
+        const status=await f.run('status');
+        return status.requests.find(row=>row.id===killedRequest.request)?.status==='failed';
+      },undefined,10);
+      assert.equal(f.rows('SELECT COUNT(*) AS n FROM requests')[0].n,4);
+    } finally {process.kill(maintenanceKdb.owner.pid,'SIGCONT');}
     const running=f.start('campaign');
     await waitFor(async()=>{
       if(running.child.exitCode!==null)await running.output;
@@ -43,6 +81,7 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
     assert(memory.some(row=>row.closed&&row.peak_bytes>0&&row.events?.oom_kill===0));
     const receipt=JSON.parse(await readFile(join(f.instance,'knowledge-service.json'),'utf8'));
     const owner=JSON.parse(f.rows("SELECT value FROM control WHERE key='owner'")[0].value);
+    assert.equal(receipt.owner.pid,maintenanceKdb.owner.pid);assert.equal(receipt.url,maintenanceKdb.url);
     const ownGroup=await readFile('/proc/'+owner.pid+'/cgroup','utf8');
     assert(ownGroup.includes('/'+slice+'/'+controllerUnit(f.instance)));
     assert((await readFile('/proc/'+receipt.owner.pid+'/cgroup','utf8')).includes('/'+slice+'/'+knowledgeUnit(f.instance)));
@@ -148,7 +187,8 @@ export async function createEnvironment(options,context){const env=await base(op
     if(process.env.RSI_MANAGED_PROOF)await writeFile(process.env.RSI_MANAGED_PROOF,JSON.stringify({
       passed:true,aggregate_bytes:cap,controller_unit:controllerUnit(f.instance),kdb_unit:knowledgeUnit(f.instance),
       kdb_pid:receipt.owner.pid,kdb_url:receipt.url,retained_attempt:heldBefore.id,
-      fresh_finished_before_retained:true,post_crash_native_searches:postCrashSearches.filter(event=>!event.failed).length,
+      maintenance_before_campaign:true,maintenance_requests:maintenanceRows.map(row=>({kind:row.kind,status:row.status,unit:JSON.parse(row.owner).unit})),
+      killed_maintenance_failed_without_replay:true,fresh_finished_before_retained:true,post_crash_native_searches:postCrashSearches.filter(event=>!event.failed).length,
       session_preserved:true,lease_reclaimed_once:true,budget_before:budgetBefore,budget_after:budgetAfter},null,2));
     passed=true;
   });

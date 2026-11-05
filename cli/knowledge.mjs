@@ -17,9 +17,11 @@ async function healthy(url) {
   catch{return false;}
 }
 export async function ensureKnowledgeService(config,{signal,managed=process.env.RSI_MANAGED_ROOT===config.root}={}) {
+  const inheritedRoot=!managed?process.env.RSI_MANAGED_ROOT:null;
+  const inherited=inheritedRoot?await (await import('./instance.mjs')).readConfig(inheritedRoot):null;
   const membership=async pid=>{
-    if(!managed)return;
-    try{return await verifyProcessMembership(pid,managedOptions(config));}
+    if(!managed&&!inherited)return;
+    try{return await verifyProcessMembership(pid,managedOptions(inherited??config));}
     catch(error){throw new Error('KDB must inherit the managed aggregate; stop its recorded owned process before upgrading: '+error.message);}
   };
   await membership(process.pid);

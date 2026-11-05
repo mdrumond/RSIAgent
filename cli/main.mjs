@@ -46,9 +46,10 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
     };
     return (await import('./host-memory.mjs')).configureHostMemory(config.host_memory,{verifyInstanceStopped});
   }
-  if(values.detach && ['tune','kdb'].includes(command)) {
-    const action=JSON.parse(await readFile(values.config,'utf8'));
-    return (await import('./background.mjs')).startBackground(root,command,action);
+  if(!values.managed && ['tune','kdb'].includes(command)) {
+    if(command==='kdb'&&!values.config)throw new Error('KDB action JSON required');
+    const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
+    return (await import('./background.mjs')).startBackground(root,command,action,{detach:Boolean(values.detach),signal,manager});
   }
   if(command==='upgrade') {
     const input=JSON.parse(await readFile(values.config,'utf8'));
@@ -128,7 +129,8 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
   if(command==='status') {
     const state=new State(join(root,'state.sqlite'));
     try {
-      const {requests}=await import('./background.mjs');
+      const {requests,reconcileRequests}=await import('./background.mjs');
+      await reconcileRequests(root,{state,manager});
       let controller={state:'stopped',wave:0,stopRequested:false};
       if(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
         const rows=Object.fromEntries(state.db.prepare('SELECT key,value FROM control').all().map(row=>[row.key,row.value]));
