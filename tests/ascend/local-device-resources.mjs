@@ -114,6 +114,29 @@ test('local pre-execution admission rechecks health and rejects raw physical IDs
   assert.equal(bound.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
 });
 
+test('local terminal health refusal retains closure and permits a later explicit healthy call', async t => {
+  const f = await fixture(t), inventory = await f.bind();
+  const lease = (await inventory.environment.resources())[0], bound = await f.bind(lease);
+  f.rows[0].busy = true; await f.update();
+  await assert.rejects(bound.environment.execute('touch forbidden-payload', f.source), error => {
+    assert.equal(error.code, 'SETUP_CLOSED');
+    assert.equal(error.closure.closed, true); assert.equal(error.closure.payloadStarted, false);
+    const probe = bound.events.find(e => e.type === 'resource-probe-completed');
+    assert.deepEqual(error.closure.handles, [probe.data.handle]);
+    assert.equal(error.closure.reason.row.admitted, false);
+    assert.equal(error.closure.reason.physicalDevice, 0);
+    assert.equal(error.closure.reason.policy, 'health-admission-refused');
+    return true;
+  });
+  assert.equal(await exists(join(f.source,'forbidden-payload')), false);
+  assert.equal(bound.events.some(e => e.type === 'execution-handle' && !e.data.purpose), false);
+  for (const handle of bound.handles) assert.equal((await bound.environment.observe(handle)).state, 'stopped');
+  f.rows[0].busy = false; await f.update();
+  const result = await bound.environment.execute('touch explicit-payload', f.source, {timeout:5});
+  assert.equal(result.exitCode, 0); assert.equal(result.settled, true);
+  assert.equal(await exists(join(f.source,'explicit-payload')), true);
+});
+
 test('STOP closes native local work; fresh binding observes the same handle without replay',{timeout:20000},async t=>{
   const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0],abort=new AbortController();
   const bound=await f.bind(row,{signal:abort.signal});let handle;
