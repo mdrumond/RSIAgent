@@ -33,7 +33,7 @@ class Storage:
         if action.get('action') == 'compress':
             clauses.extend(["f.encoding='plain'", "f.kind!='source-git'"])
         fields = {'artifact': 'f.id', 'project': 'COALESCE(f.project,a.project)',
-                  'role': 'f.role', 'phase': 's.phase', 'kind': 'f.kind',
+                  'role': 'f.role', 'phase': 'COALESCE(s.phase,ss.phase)', 'kind': 'f.kind',
                   'outcome': 'a.outcome', 'skill_revision': 's.skill_revision',
                   'memory_revision': 's.memory_revision'}
         for key, column in fields.items():
@@ -49,9 +49,10 @@ class Storage:
                     args.append(action[key])
             clauses.append('EXISTS(SELECT 1 FROM storage_iterations i WHERE ' + ' AND '.join(extra) + ')')
         return [dict(row) for row in self.db.execute('''SELECT f.*,a.outcome,
-            COALESCE(f.project,a.project) AS project_id,s.phase,s.memory_revision,s.skill_revision
+            COALESCE(f.project,a.project) AS project_id,COALESCE(s.phase,ss.phase) AS phase,s.memory_revision,s.skill_revision
             FROM storage_artifacts f LEFT JOIN attempts a ON a.id=f.attempt
-            LEFT JOIN storage_attempts s ON s.attempt=f.attempt WHERE ''' +
+            LEFT JOIN storage_attempts s ON s.attempt=f.attempt
+            LEFT JOIN storage_sessions ss ON ss.session=f.path OR ss.provider=f.path WHERE ''' +
             ' AND '.join(clauses) + ' ORDER BY f.id LIMIT ?', [*args, limit])]
 
     def inspect(self, action):

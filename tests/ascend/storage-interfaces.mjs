@@ -168,3 +168,20 @@ test('sealing advances beyond an ineligible page instead of starving later evide
  assert.deepEqual(await sealClosedArtifacts(f.config,{limit:1}),[last.id]);
  assert.equal(f.storage.list().find(r=>r.id===last.id).status,'closed');
 });
+
+
+test('standalone role sessions retain phase filters and seal only after writer closure',async t=>{
+  const f=await fixture(t);
+  const session=join(f.root,'curriculum.jsonl'),provider=join(f.root,'curriculum-provider.jsonl');
+  await writeFile(session,'{"type":"session","id":"curriculum"}\n');
+  await writeFile(provider,'{"type":"provider"}\n');
+  const row=await f.storage.session(session,{phase:'phase2',role:'curriculum',provider});
+  let inventory=await f.call({action:'inspect',phase:'phase2',role:'curriculum'});
+  assert.equal(inventory.artifacts.length,2);
+  assert.ok(inventory.artifacts.every(r=>r.phase==='phase2'));
+  assert.deepEqual(await sealClosedArtifacts(f.config,{phase:'phase2'}),[]);
+  f.storage.closeSession(session);
+  const sealed=await sealClosedArtifacts(f.config,{phase:'phase2'});
+  assert.ok(sealed.includes(row.id));assert.equal(sealed.length,2);
+  assert.equal((await f.call({action:'inspect',phase:'phase1',role:'curriculum'})).artifacts.length,0);
+});

@@ -21,7 +21,7 @@ export async function sealClosedArtifacts(config,action={}) {
     const cursor=action.after??(globalScan?JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='storage-seal-cursor'").get()?.value??'""'):'');
     const sealed=[],clauses=["f.id>?","f.status='open'","f.kind!='source-git'"],args=[cursor];
     for(const [key,column] of Object.entries({artifact:'f.id',project:'COALESCE(f.project,a.project)',
-      role:'f.role',kind:'f.kind',phase:'s.phase',outcome:'a.outcome',
+      role:'f.role',kind:'f.kind',phase:'COALESCE(s.phase,ss.phase)',outcome:'a.outcome',
       skill_revision:'s.skill_revision',memory_revision:'s.memory_revision'})) {
       const value=action[key]??action[key.replace('_','-')];
       if(value!==undefined){
@@ -40,6 +40,7 @@ export async function sealClosedArtifacts(config,action={}) {
     if(!Number.isInteger(limit)||limit<1||limit>1000)throw new Error('limit must be 1..1000');
     const rows=state.db.prepare(`SELECT f.* FROM storage_artifacts f
       LEFT JOIN attempts a ON a.id=f.attempt LEFT JOIN storage_attempts s ON s.attempt=f.attempt
+      LEFT JOIN storage_sessions ss ON ss.session=f.path OR ss.provider=f.path
       WHERE ${clauses.join(' AND ')} ORDER BY f.id LIMIT ?`).all(...args,limit);
     if(action.after===undefined&&globalScan)state.db.prepare("INSERT OR REPLACE INTO control(key,value) VALUES ('storage-seal-cursor',?)")
       .run(JSON.stringify(rows.at(-1)?.id??''));
