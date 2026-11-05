@@ -325,6 +325,12 @@ export async function createEnvironment(options, context) {
     await controlEnvironment.prepare({project:{source:sourcePath},attempt:{id:'lease-control'}});
     return controlEnvironment;
   }
+  async function releaseLease(lease) {
+    await lease.release();
+    await unlink(leasePath);
+    await context.event('device-lease-released', {pool:lease.record.pool,
+      physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
+  }
   let reconciling;
   function reconcileLease(){
     if(!reconciling)reconciling=reconcileCurrent().finally(()=>{reconciling=null;});
@@ -367,7 +373,7 @@ export async function createEnvironment(options, context) {
         await lease.update({controlStarted:false,controlHandle:null});return false;
       }
       if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
-      await lease.release();await unlink(leasePath);return true;
+      await releaseLease(lease);return true;
     } finally {activeLease=null;}
   }
   return {
@@ -396,6 +402,12 @@ export async function createEnvironment(options, context) {
         try { return await context.exclude(label, fn); }
         finally { excludedMs += performance.now() - before; }
       };
+      let waiting = false;
+      async function waitForDevice() {
+        if (waiting) return;
+        waiting = true;
+        await context.event('device-wait', {pool, waiting:true, reason:'idle-devices'});
+      }
       activeExclude=exclude;
       return await serial(async () => {
         if(!await reconcileLease())throw new Error('Device lease unresolved; observe retained handles before retry');
@@ -415,13 +427,16 @@ export async function createEnvironment(options, context) {
               if (lease) { physical = row.physical_device; break; }
             }
             if (lease) break;
+            await waitForDevice();
             await exclude('queue-wait', () => delay(options.leasePollMs ?? 250, undefined, {signal}));
           }
         });
         activeLease = lease;
         // Persist before any transfer or submission; a missing handle is not closure.
         await save(leasePath, {receipt:lease.receipt, token:lease.token, pool, physicalDevice:physical});
-        await context.event('device-lease-acquired', {pool, physicalDevice:physical, receipt:lease.receipt});
+        await context.event('device-lease-acquired', {pool, physicalDevice:physical, receipt:lease.receipt, token:lease.token});
+        waiting = false;
+        await context.event('device-wait', {pool, waiting:false});
         const request = { ...memoryRequest(), source, sha256: healthSha256, seconds, devices: [physical], command, hostLease,
           lease:{pool,token:lease.token,receipt:lease.receipt},
           configuration: { ...options.health, allow_busy:false, require_idle:timing(opts.purpose) || options.health.require_idle === true } };
@@ -442,7 +457,7 @@ export async function createEnvironment(options, context) {
             await context.event('execution-state',{handle:result.handle,state:'stopped',executionSeconds:0,accountingExcluded:true});
           }
           if(['contended','health-refused','memory-refused'].includes(admission.decision)){
-            await lease.release();await unlink(leasePath);
+            await releaseLease(lease);
           } else {
             activeLease=null;
             if(!await reconcileLease())return {...result,settled:false,admissionUnknown:true};
@@ -453,6 +468,7 @@ export async function createEnvironment(options, context) {
             throw error;
           }
           if(admission.decision==='contended'){
+            await waitForDevice();
             await exclude('queue-wait',()=>delay(options.leasePollMs??250,undefined,{signal}));
             continue;
           }

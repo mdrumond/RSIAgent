@@ -14,6 +14,7 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
+import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -443,9 +444,11 @@ test('unknown payload holds pool/device and exact handle across binding restart'
   assert.equal((await bound.execute('unknown-payload',f.source,{timeout:3})).settled,false);
   const held=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
   assert.equal(held.physicalDevice,0);
+  assert.equal(f.events.some(e=>e.type==='device-lease-released'&&e.token===held.token),false);
   assert.ok(JSON.parse(await readFile(held.receipt,'utf8')).handles.includes(payloadHandle));
   const restarted=await createEnvironment(f.options,{...f.context,client:recoveryClient});
   await assert.rejects(restarted.execute('no-replay',f.source),/lease unresolved/);
+  assert.equal(f.events.some(e=>e.type==='device-lease-released'&&e.token===held.token),false);
   const other=await createEnvironment({...f.options,runtime:'other-runtime'},
     {...f.context,instancePath:join(f.context.instancePath,'other-controller')});
   await other.prepare({project:{id:'p',source:f.source},attempt:{id:'other'}});
@@ -453,6 +456,7 @@ test('unknown payload holds pool/device and exact handle across binding restart'
   assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').at(-1).physicalDevice,1);
   resolved=true;assert.equal((await restarted.observe(payloadHandle)).state,'stopped');
   await assert.rejects(readFile(held.receipt),{code:'ENOENT'});
+  assert.equal(f.events.filter(e=>e.type==='device-lease-released'&&e.token===held.token).length,1);
   assert.equal(await restarted.reconcileLease(),true);
 });
 
@@ -499,4 +503,34 @@ test('payload guard refuses lost aggregate cap after sync without running Bash',
   await assert.rejects(environment.execute(`touch '${marker}'`,f.source,{timeout:10}),{code:'MEMORY_ENFORCEMENT_UNAVAILABLE'});
   await assert.rejects(readFile(marker),{code:'ENOENT'});
   assert.equal(await environment.reconcileLease(),true);
+});
+
+test('lease telemetry pairs actual release with ownership and emits one wait transition across polls',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  t.after(async()=>{try{await held.release();}catch(error){if(error.code!=='ENOENT')throw error;}});
+  let polls=0;
+  const environment=await createEnvironment({...f.options,leasePollMs:1},{...f.context,client:async(args,settings)=>{
+    const result=await f.context.client(args,settings);
+    if(args[0]==='logs'&&++polls===3)await held.release();
+    return result;
+  },event:async(type,data)=>{
+    if(type==='device-lease-released') {
+      await assert.rejects(readFile(data.receipt),{code:'ENOENT'});
+      await assert.rejects(readFile(join(f.context.instancePath,'.ascend-command-lease.json')),{code:'ENOENT'});
+    }
+    await f.context.event(type,data);
+  }});
+  await environment.prepare({project:{source:f.source},attempt:{id:'lease-events'}});
+  assert.equal((await environment.execute('one-payload',f.source,{timeout:3})).settled,true);
+  const acquired=f.events.filter(e=>e.type==='device-lease-acquired');
+  const released=f.events.filter(e=>e.type==='device-lease-released');
+  assert.equal(acquired.length,1);assert.equal(released.length,1);
+  assert.ok(acquired[0].token);
+  assert.deepEqual(released[0],{...acquired[0],type:'device-lease-released'});
+  assert.deepEqual(f.events.filter(e=>e.type==='device-wait'),[
+    {type:'device-wait',pool:f.context.instancePath,waiting:true,reason:'idle-devices'},
+    {type:'device-wait',pool:f.context.instancePath,waiting:false},
+  ]);
+  assert.ok(polls>=3);
 });
