@@ -36,3 +36,23 @@ for(const mode of ['absolute','relative'])test(`performance project import: ${mo
     }
   }finally{await rm(root,{recursive:true,force:true});}
 });
+
+test('import preserves validated verifier identity across relocation and rejects changed evidence',async()=>{
+  const {createHash}=await import('node:crypto');
+  const {readFile}=await import('node:fs/promises');
+  const {freezeFiles}=await import('../../controller/evidence.mjs');
+  const root=await mkdtemp(join(tmpdir(),'frozen-import-'));
+  try{
+    const source=join(root,'source');await mkdir(source);
+    const file=join(root,'verify.py');await writeFile(file,'assert 6*7==42\n');
+    const digest=createHash('sha256').update(await readFile(file)).digest('hex');
+    const spec={id:'generated',goal:'independent check',source,actor_seconds:30,
+      verifier:{files:[file],command:'python ../verify.py',hashes:{[file]:digest}}};
+    const imported=await importProject(join(root,'instance'),spec);
+    assert.deepEqual(Object.keys(imported.verifier.hashes),imported.verifier.files);
+    assert.equal(Object.values(imported.verifier.hashes)[0],digest);
+    const intact=await freezeFiles(imported.verifier.files,imported.source,imported.verifier.hashes);await intact();
+    await writeFile(file,'assert True\n');
+    await assert.rejects(importProject(join(root,'other'),spec),/Frozen verifier changed/);
+  }finally{await rm(root,{recursive:true,force:true});}
+});

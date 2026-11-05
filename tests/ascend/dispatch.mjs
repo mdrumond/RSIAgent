@@ -33,3 +33,9 @@ test('unknown worker peaks permit learning serially, measured peaks bound parall
   assert.equal(memoryAdmission({...cap,currentBytes:16*1024**3}).admit,false);
   assert.equal(memoryAdmission({...cap,activeActors:4,workerPeakBytes:2*1024**3}).reason,'actor-capacity');
 });
+
+test('recovery retains its bounded share when actual capacity is below requested concurrency',()=>{
+  const jobs=[fresh('next'),retry('r')];
+  assert.equal(selectAdmission(jobs,{concurrency:8,freshSinceRecovery:3}).kind,'retry');
+  assert.equal(selectAdmission(jobs,{concurrency:8,freshSinceRecovery:2}).kind,'original');
+});
