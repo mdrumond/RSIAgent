@@ -17,7 +17,7 @@ export function lessonRecord(config, item) {
       (item.outcome === 'passed' || item.outcome === 'good' ? 'good' : 'negative'),
     target: item.target ?? item.applicability ?? config.target ?? 'general',
     evidence_refs: (item.evidence_refs ?? item.evidence ?? []).map(reference),
-    evidence: item.evidence ?? [], attempt_id: item.attempt_id };
+    evidence: item.evidence ?? [], attempt_id: item.attempt_id ?? null };
 }
 function python(config, args, input, signal) {
   return new Promise((ok, fail) => {
