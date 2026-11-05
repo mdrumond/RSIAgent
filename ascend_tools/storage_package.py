@@ -21,7 +21,8 @@ from .storage_archive import compress_file, restore_file, iter_artifact_bytes
 PORTABLE_TABLES = ('storage_campaign', 'projects', 'attempts', 'events',
     'storage_attempts', 'storage_iterations', 'storage_artifacts', 'storage_revisions',
     'storage_deployments', 'storage_jobs', 'recovery_queue', 'recovery_attempts',
-    'recovery_lessons', 'generation_drafts', 'generation_events', 'requests', 'control')
+    'recovery_lessons', 'generation_drafts', 'generation_events', 'requests', 'control',
+    'storage_sessions', 'storage_retrievals', 'storage_skill_versions')
 
 
 def _json(path, value):
@@ -100,6 +101,70 @@ def _sanitize(value):
     return value
 
 
+def _load_json(path):
+    # Extension/config manifests are small control data, never a ledger transport.
+    with path.open('rb') as stream:
+        raw = stream.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError('JSON control manifest exceeds 8 MiB; use the SQLite ledger')
+    return json.loads(raw)
+
+
+def _quote(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _snapshot(root, path, project):
+    if path.exists():
+        return  # Frozen resume input; archive checkpoints refer to these exact bytes.
+    temporary = path.with_suffix('.tmp')
+    temporary.unlink(missing_ok=True)
+    with closing(_connect(root / 'state.sqlite')) as source, closing(sqlite3.connect(temporary)) as db:
+        source.backup(db, pages=256)
+        db.execute('PRAGMA cache_size=-2048')
+        db.execute('PRAGMA temp_store=FILE')
+        # Keep table constraints/indexes; discard executable triggers and live services.
+        for kind, name in db.execute("SELECT type,name FROM sqlite_master WHERE type IN ('trigger','view')").fetchall():
+            db.execute('DROP ' + kind + ' ' + _quote(name))
+        for table in _tables(db) - set(PORTABLE_TABLES):
+            if not table.startswith('sqlite_'):
+                db.execute('DROP TABLE ' + _quote(table))
+        tables = _tables(db)
+        if 'storage_campaign' not in tables:
+            raise ValueError('Campaign storage ledger required')
+        if project:
+            if not db.execute('SELECT 1 FROM projects WHERE id=?', (project,)).fetchone():
+                raise ValueError('Unknown project')
+            db.execute('DELETE FROM projects WHERE id!=?', (project,))
+            db.execute('DELETE FROM attempts WHERE project NOT IN (SELECT id FROM projects)')
+            for table in tables & set(PORTABLE_TABLES) - {'projects', 'attempts', 'storage_artifacts'}:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')')}
+                if table in ('control', 'requests', 'generation_drafts', 'generation_events', 'storage_jobs'):
+                    db.execute('DELETE FROM ' + _quote(table))
+                elif 'attempt' in columns:
+                    db.execute('DELETE FROM ' + _quote(table) + ' WHERE attempt IS NULL OR attempt NOT IN (SELECT id FROM attempts)')
+                elif 'project' in columns:
+                    db.execute('DELETE FROM ' + _quote(table) + ' WHERE project NOT IN (SELECT id FROM projects)')
+            clause = ''
+            if 'storage_retrievals' in tables:
+                clause = " AND NOT EXISTS (SELECT 1 FROM storage_retrievals,json_each(citations) j WHERE json_extract(j.value,'$.artifact')=storage_artifacts.id)"
+            db.execute("DELETE FROM storage_artifacts WHERE COALESCE(project IN (SELECT id FROM projects),0)=0 AND COALESCE(attempt IN (SELECT id FROM attempts),0)=0" + clause)
+        if 'control' in tables:
+            db.execute("DELETE FROM control WHERE key NOT IN ('campaign-budget','wave','fresh-since-recovery')")
+        db.create_function('portable_text', 1, _sanitize)
+        for table in tables & set(PORTABLE_TABLES):
+            columns = [r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')') if r[2].upper() == 'TEXT']
+            if columns:
+                db.execute('UPDATE ' + _quote(table) + ' SET ' + ','.join(_quote(c) + '=portable_text(' + _quote(c) + ')' for c in columns))
+        db.execute('UPDATE attempts SET owner=NULL,session=NULL')
+        db.execute('UPDATE projects SET frozen=1')
+        if 'requests' in tables:
+            db.execute("UPDATE requests SET owner=NULL,status=CASE WHEN status IN ('queued','running') THEN 'failed' ELSE status END")
+        db.commit()
+        db.execute('VACUUM')  # Remove deleted projects and credentials from free pages.
+    os.replace(temporary, path)
+
+
 def pack(root, dest, project=None, require_complete=True):
     """Publish package.json only after all collected chunks verify.
 
@@ -123,7 +188,9 @@ def pack(root, dest, project=None, require_complete=True):
                 'project': project, 'files': [], 'missing': [], 'paths': {}, 'repositories': [],
                 'paused': True, 'binding_required': True}
     config = root / 'instance.json'
-    metadata['config'] = _sanitize(json.loads(config.read_text())) if config.exists() else {'format': 1}
+    config_path = dest / 'config.json'
+    if not config_path.exists():
+        _json(config_path, _sanitize(_load_json(config)) if config.exists() else {'format': 1})
     included = set()
 
     def missing(kind, path):
@@ -153,44 +220,17 @@ def pack(root, dest, project=None, require_complete=True):
         metadata['paths'][str(path)] = target
         included.add(target)
 
-    with closing(_connect(root / 'state.sqlite')) as db:
-        db.execute('BEGIN')
+    ledger_path = dest / 'ledger.sqlite'
+    _snapshot(root, ledger_path, project)
+    used = {}
+    with closing(_connect(ledger_path)) as db:
+        metadata['campaign'] = [dict(r) for r in db.execute('SELECT * FROM storage_campaign')]
+        projects = [dict(r) for r in db.execute('SELECT * FROM projects')]
+        metadata['projects'] = [p['id'] for p in projects]
         tables = _tables(db)
-        if 'storage_campaign' not in tables:
-            raise ValueError('Campaign storage ledger required')
-        projects = [dict(r) for r in db.execute('SELECT * FROM projects WHERE (? IS NULL OR id=?)', (project, project))]
-        if project and not projects:
-            raise ValueError('Unknown project')
-        ids = {p['id'] for p in projects}
-        attempts = [dict(r) for r in db.execute('SELECT * FROM attempts') if r['project'] in ids]
-        aids = {a['id'] for a in attempts}
-        metadata['ledger'] = {}
-        metadata['schema'] = {}
-        for table in PORTABLE_TABLES:
-            if table not in tables or (project and table in ('control', 'requests', 'generation_drafts', 'generation_events', 'storage_jobs')):
-                continue
-            metadata['schema'][table] = [dict(r) for r in db.execute('PRAGMA table_info(' + table + ')')]
-            rows = []
-            for row in db.execute('SELECT * FROM ' + table):
-                r = dict(row)
-                if table == 'control' and r['key'] not in ('campaign-budget', 'wave', 'fresh-since-recovery'):
-                    continue
-                if 'project' in r and r['project'] is not None and r['project'] not in ids:
-                    continue
-                if table == 'projects' and r['id'] not in ids:
-                    continue
-                if table == 'attempts' and r['id'] not in aids:
-                    continue
-                if table != 'storage_artifacts' and 'attempt' in r and r['attempt'] not in aids:
-                    if r['attempt'] is not None or project:
-                        continue
-                if table == 'storage_artifacts' and r['project'] not in ids and r['attempt'] not in aids and project:
-                    continue
-                if table == 'events':
-                    r['data'] = json.dumps(_sanitize(json.loads(r['data'])))
-                rows.append(_sanitize(r))
-            metadata['ledger'][table] = rows
-        for p in metadata['ledger']['projects']:
+        for kind, field in (('skills', 'skill_revision'), ('memory', 'memory_revision')):
+            used[kind] = {r[0] for r in db.execute('SELECT DISTINCT ' + field + ' FROM storage_attempts WHERE ' + field + ' IS NOT NULL')} if 'storage_attempts' in tables else set()
+        for p in projects:
             spec = json.loads(p['spec'])
             source = Path(spec['source'])
             if not source.is_absolute():
@@ -210,7 +250,8 @@ def pack(root, dest, project=None, require_complete=True):
                 else:
                     missing('verifier', name)
             p['spec'] = json.dumps(_sanitize(spec))
-        for row in metadata['ledger'].get('storage_artifacts', []):
+        for record in db.execute('SELECT * FROM storage_artifacts'):
+            row = dict(record)
             if row['kind'] == 'source-git' and not row['external']:
                 repository = _local(root, row['path'])
                 if not repository.is_dir() or not (repository / 'objects').is_dir():
@@ -242,11 +283,9 @@ def pack(root, dest, project=None, require_complete=True):
             metadata['paths'][str(root / row['path'])] = row['path']
 
     manifest = root / 'package-inputs.json'
-    inputs = json.loads(manifest.read_text()) if manifest.exists() else {}
+    inputs = _load_json(manifest) if manifest.exists() else {}
     kinds = {'source-history' if f['kind'] == 'source-git' else f['kind'] for f in metadata['files']}
     covered = {'skills': set(), 'memory': set()}
-    used = {kind: {r[field] for r in metadata['ledger'].get('storage_attempts', []) if r.get(field)}
-            for kind, field in (('skills', 'skill_revision'), ('memory', 'memory_revision'))}
     for item in inputs.get('files', []):
         if project and (item.get('project') not in (None, project) or
                         item['kind'] in ('knowledge-history', 'machinery', 'dependencies', 'active-kdb')):
@@ -290,6 +329,8 @@ def pack(root, dest, project=None, require_complete=True):
         collect(snapshot, 'knowledge.sqlite', 'active-kdb')
     for kind in sorted(required - kinds):
         missing(kind, 'package-inputs.json')
+    collect(config_path, 'instance.json', 'config')
+    collect(ledger_path, 'state.sqlite', 'ledger')
     metadata['complete'] = not metadata['missing']
     _json(dest / 'inspection.json', metadata)
     if require_complete and not metadata['complete']:
@@ -302,6 +343,8 @@ def pack(root, dest, project=None, require_complete=True):
     for scratch in ('collected',):
         shutil.rmtree(dest / scratch, ignore_errors=True)
     (dest / 'knowledge.sqlite').unlink(missing_ok=True)
+    ledger_path.unlink()
+    config_path.unlink()
     progress.unlink()
     return metadata
 
@@ -323,7 +366,7 @@ def unpack(package, dest):
     package, dest = Path(package).resolve(), Path(dest).absolute()
     if dest.exists():
         raise FileExistsError(dest)
-    metadata = json.loads((package / 'package.json').read_text())
+    metadata = _load_json(package / 'package.json')
     if metadata.get('format') != 1:
         raise ValueError('Unsupported package')
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -348,54 +391,24 @@ def unpack(package, dest):
             (directory / 'refs').mkdir(exist_ok=True)
             bare = 'false' if repo['kind'] == 'source-git' else 'true'
             (directory / 'config').write_text('[core]\n\tbare = ' + bare + '\n\tlogAllRefUpdates = true\n')
-        # Construct only portable tables; execution leases/control/services never migrate.
+        # Snapshot already preserves the original schema, indexes and stable IDs.
         with closing(sqlite3.connect(stage / 'state.sqlite')) as db, db:
-            allowed = set(PORTABLE_TABLES)
-            for table, rows in metadata['ledger'].items():
-                if table not in allowed:
-                    raise ValueError('Unsupported ledger table')
-                columns = metadata['schema'][table]
-                def identifier(name):
-                    if not name.replace('_', '').isalnum():
-                        raise ValueError('Invalid column')
-                    return '"' + name + '"'
-                definitions = []
-                for c in columns:
-                    kind = c['type'].upper()
-                    if kind not in ('TEXT', 'INTEGER', 'REAL', ''):
-                        raise ValueError('Unsupported column type')
-                    definitions.append(identifier(c['name']) + ' ' + kind +
-                                       (' PRIMARY KEY' if c['pk'] else '') +
-                                       (' NOT NULL' if c['notnull'] else '') +
-                                       (' DEFAULT ' + str(c['dflt_value']) if c['dflt_value'] is not None else ''))
-                db.execute('CREATE TABLE "' + table + '" (' + ','.join(definitions) + ')')
-                for original in rows:
-                    row = _rebase(dict(original), metadata['paths'], dest)
-                    if table == 'attempts':
-                        row.update(owner=None, session=None)
-                    if table == 'requests':
-                        row['owner'] = None
-                        if row['status'] in ('queued', 'running'):
-                            row['status'] = 'paused'
-                    if table == 'storage_jobs' and row['status'] != 'complete':
-                        row['status'] = 'paused'
-                    if table == 'projects':
-                        row['spec'] = json.dumps(_rebase(json.loads(row['spec']), metadata['paths'], dest))
-                        row['frozen'] = 1
-                    if table == 'storage_artifacts':
-                        row['encoding'], row['descriptor'] = 'plain', None
-                    columns = list(row)
-                    db.execute('INSERT INTO "' + table + '" (' + ','.join('"' + k + '"' for k in columns) + ') VALUES (' + ','.join('?' for _ in columns) + ')', list(row.values()))
-            db.execute('CREATE UNIQUE INDEX active_attempt ON attempts(project) WHERE outcome IS NULL')
-            db.execute('PRAGMA user_version=1')
+            db.execute('PRAGMA cache_size=-2048')
+            db.execute('PRAGMA temp_store=FILE')
+            db.create_function('rebase_text', 1, lambda value: _rebase(value, metadata['paths'], dest))
+            for table in _tables(db) & set(PORTABLE_TABLES):
+                columns = [r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')') if r[2].upper() == 'TEXT']
+                if columns:
+                    db.execute('UPDATE ' + _quote(table) + ' SET ' + ','.join(_quote(c) + '=rebase_text(' + _quote(c) + ')' for c in columns))
+            db.execute("UPDATE storage_artifacts SET encoding='plain',descriptor=NULL")
+            projects = [json.loads(r[0]) for r in db.execute('SELECT spec FROM projects')]
         result = {'format': 1, 'paused': True, 'binding_required': True,
-                  'storage': metadata['ledger'].get('storage_campaign', []),
+                  'storage': metadata['campaign'],
                   'complete': metadata['complete'], 'missing': metadata['missing']}
         _json(stage / 'restore.json', result)
-        config = _rebase(metadata['config'], metadata['paths'], dest)
+        config = _rebase(_load_json(stage / 'instance.json'), metadata['paths'], dest)
         config.update(format=1, paused=True, binding_required=True, environment=None,
-                      projects=[_rebase(json.loads(p['spec']), metadata['paths'], dest)
-                                for p in metadata['ledger']['projects']])
+                      projects=projects)
         _json(stage / 'instance.json', config)
         # Exclusive reservation refuses even an empty destination created during restore.
         dest.mkdir()

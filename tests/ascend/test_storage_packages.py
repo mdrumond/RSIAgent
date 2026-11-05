@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import tracemalloc
 from unittest.mock import patch
 
 from ascend_tools.storage_package import pack, unpack
@@ -162,6 +163,43 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output(['git', '--git-dir', str(restored), 'cat-file', '-t', ref], text=True).strip(), 'tree')
         self.assertEqual(json.loads((restored / 'rsi-source.json').read_text())['source'], str(dest / 'projects/p/source'))
         self.assertEqual(subprocess.check_output(['git', '--git-dir', str(restored), 'rev-parse', ref], text=True).strip(), tree)
+
+    def test_sqlite_ledger_many_events_is_bounded_and_preserves_schema(self):
+        count = 12000
+        payload = json.dumps({'text': 'x' * 2048, 'owner': 'private-owner',
+                              'executed_source': str(self.source / 'kernel.py')})
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.executemany('INSERT INTO events VALUES(?,?,?,?,?)',
+                           ((i, 'a', 'meaningful-edit', payload, 'now') for i in range(count)))
+            db.execute('CREATE UNIQUE INDEX fixture_event_order ON events(attempt,sequence)')
+            db.executescript('CREATE TABLE storage_sessions(session TEXT PRIMARY KEY,attempt TEXT);'
+                             'CREATE TABLE storage_retrievals(id INTEGER PRIMARY KEY,attempt TEXT,citations TEXT);'
+                             'CREATE TABLE storage_skill_versions(version TEXT PRIMARY KEY,revision TEXT);')
+            db.execute("INSERT INTO storage_sessions VALUES('sessions/native.jsonl','a')")
+            db.execute("INSERT INTO storage_retrievals VALUES(1,'a','[]')")
+            db.execute("INSERT INTO storage_skill_versions VALUES('baseline','s1')")
+        tracemalloc.start()
+        try:
+            result = pack(self.root, self.package, 'p')
+            dest = self.base / 'many-restored'
+            unpack(self.package, dest)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12 * 1024 * 1024)
+        self.assertNotIn('ledger', result)
+        self.assertLess((self.package / 'package.json').stat().st_size, 128 * 1024)
+        with closing(sqlite3.connect(dest / 'state.sqlite')) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM events').fetchone()[0], count)
+            value = json.loads(db.execute('SELECT data FROM events LIMIT 1').fetchone()[0])
+            self.assertNotIn('owner', value)
+            self.assertEqual(value['executed_source'], str(dest / 'projects/p/source/kernel.py'))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='fixture_event_order'").fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT session FROM storage_sessions').fetchone()[0], 'sessions/native.jsonl')
+            self.assertEqual(db.execute('SELECT version FROM storage_skill_versions').fetchone()[0], 'baseline')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 1)
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 2)
 
     def test_used_revision_must_be_collected(self):
         path = self.root / 'package-inputs.json'
