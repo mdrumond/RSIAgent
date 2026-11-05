@@ -1,4 +1,3 @@
-import {hostMemorySource} from './host-memory-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
@@ -41,7 +40,7 @@ print(text[q])
     health:{product:'a5',chip:null,query_timeout_seconds:.5}};
   async function bind(resource,extra={},path=join(root,'instance-'+sequence++)){
     const events=[],handles=new Set();let depth=0;
-    const context={hostMemorySource,instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
+    const context={instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
         return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
       exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
@@ -183,7 +182,7 @@ test('public CLI auto scheduler overlaps two masks and admits third only after f
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/ascend.mjs';
 import {createBashTool} from '@earendil-works/pi-coding-agent';
 export async function createEnvironment(options,context){
- const environment=await base(options,{...context,hostMemorySource:${JSON.stringify(hostMemorySource)},leaseDirectory:${JSON.stringify(join(gate,'leases'))},client:async args=>{
+ const environment=await base(options,{...context,leaseDirectory:${JSON.stringify(join(gate,'leases'))},client:async args=>{
   if(args[0]!=='npu')throw Error('Unexpected local transport operation');
   return {state:'completed',profiles:[{target:options.target,pool:${JSON.stringify(gate)},devices:[0,1].map(id=>({id,enabled:true}))}]};
  }});
