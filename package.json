@@ -31,6 +31,7 @@
     "examples/ascend-targets",
     "docs/ascend-controller.md",
     "pyproject.toml",
-    "npm-shrinkwrap.json"
+    "npm-shrinkwrap.json",
+    "docs/storage.md"
   ]
 }

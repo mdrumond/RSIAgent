@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import resource
 import sys
 
 from .log_walk import walk_records
@@ -72,10 +71,8 @@ class Storage:
     def manifest(self, row):
         descriptor = json.loads(row['descriptor'])
         manifest = json.loads(self.path(descriptor['manifest']).read_text())
-        self.path(manifest['directory'])
+        self.path(manifest['repository'])
         self.path(manifest['source'])
-        for chunk in manifest['chunks']:
-            self.path(Path(manifest['directory']) / chunk['file'])
         return manifest
 
     def content(self, row):
@@ -158,7 +155,7 @@ class Storage:
         descriptor = json.dumps({'manifest': str(Path(manifest['manifest_path']).relative_to(self.root))})
         # Durable ledger publication must precede optional source finalization.
         with self.db:
-            changed = self.db.execute('''UPDATE storage_artifacts SET encoding='gzip-chunks',descriptor=?
+            changed = self.db.execute('''UPDATE storage_artifacts SET encoding='restic',descriptor=?
                 WHERE id=? AND status='closed' AND encoding='plain' AND sha256=?''',
                 [descriptor, row['id'], row['sha256']]).rowcount
             if not changed:
@@ -273,8 +270,8 @@ def execute(root, action):
 
 
 def main(argv=None):
-    cap = 256 * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    # The managed cgroup bounds resident memory for Python and Restic together.
+    # RLIMIT_AS prevents Go from reserving its virtual address arena.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True)
     parser.add_argument('--action-json')

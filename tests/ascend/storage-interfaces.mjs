@@ -58,7 +58,7 @@ test('closed compression publishes reference, verifies and explicitly cleans red
   const f=await fixture(t);
   const result=await f.call({action:'compress',artifact:f.row.id});
   assert.equal(result[0].source_deleted,false);await access(join(f.root,'session.jsonl'));
-  assert.equal(f.storage.list()[0].encoding,'gzip-chunks');
+  assert.equal(f.storage.list()[0].encoding,'restic');
   assert.equal((await f.call({action:'verify'}))[0].verified,true);
   const inventory=await f.call({action:'prune',project:'p'});
   assert.equal(inventory.entries.length,1);
@@ -102,7 +102,8 @@ test('out-of-root artifact and corrupt archive are never read or deleted',async 
   const f=await fixture(t);await f.call({action:'compress'});
   const inventory=await f.call({action:'prune',artifact:f.row.id});
   const descriptor=JSON.parse(f.storage.list()[0].descriptor),manifest=JSON.parse(await readFile(join(f.root,descriptor.manifest),'utf8'));
-  await writeFile(join(manifest.directory,manifest.chunks[0].file),'corrupt');
+  manifest.sha256='0'.repeat(64);
+  await writeFile(join(f.root,descriptor.manifest),JSON.stringify(manifest));
   await assert.rejects(f.call({action:'prune',apply:true,inventory}));await access(join(f.root,'session.jsonl'));
   f.state.db.prepare("UPDATE storage_artifacts SET path='../outside' WHERE id=?").run(f.row.id);
   await assert.rejects(f.call({action:'inspect'}),/escapes/);

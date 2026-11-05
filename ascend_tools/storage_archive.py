@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from .restic_install import resolve_restic
 
 BLOCK_BYTES = 64 * 1024
 
@@ -70,9 +71,7 @@ def _request(repository):
 
 
 def _command(repository, *args):
-    binary = os.environ.get('RSI_RESTIC') or shutil.which('restic')
-    if not binary:
-        raise FileNotFoundError('Restic required; set RSI_RESTIC or install restic on PATH')
+    binary = resolve_restic()
     env = {k: v for k, v in os.environ.items() if not k.startswith('RESTIC_')}
     env.setdefault('GOMAXPROCS', '1')
     env.setdefault('GOMEMLIMIT', '96MiB')

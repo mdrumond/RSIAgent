@@ -50,7 +50,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
   projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
-  await copyMachinery(machinery,join(destination,'machinery'),install);
+  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python);
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,host_memory,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
@@ -88,7 +88,7 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   } finally {ledger.close();if(staged)await rm(staged,{force:true});}
 }
 
-async function copyMachinery(machinery,release,install=true) {
+async function copyMachinery(machinery,release,install=true,python='python') {
   await mkdir(release);
   for (const item of ['controller','cli','ascend_tools','web','templates','scripts','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
     const from=join(machinery,item);
@@ -101,6 +101,12 @@ async function copyMachinery(machinery,release,install=true) {
     catch(error) {if(error.code!=='ENOENT')throw error;}
   }
   if(install) {
+    await new Promise((ok,no)=>{
+      const child=spawn(python,['-m','ascend_tools.restic_install','--install'],{
+        cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
+      child.on('error',no);
+      child.on('close',code=>code?no(new Error('Restic installation failed')):ok());
+    });
     try {await stat(join(release,'package.json'));}
     catch(error){if(error.code==='ENOENT')return;throw error;}
     await new Promise((ok,no)=>{
@@ -135,7 +141,7 @@ export async function upgrade(root,machinery) {
   }
   try {
     await stoppedOwners();
-    await copyMachinery(machinery,staged);
+    await copyMachinery(machinery,staged,true,config.python);
     const pending=ledger.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all();
     const installed=resolve(root,'machinery'),configured=resolve(root,config.environment.module);
     // Inspect with the installed dependencies of the exact staged replacement.
