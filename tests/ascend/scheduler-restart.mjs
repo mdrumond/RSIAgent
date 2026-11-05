@@ -71,11 +71,15 @@ test('pending finalization retains its lease until worker exit before concurrent
   release=join(f.root,'release-finalization');
   const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
   await writeFile(wrapper,`#!${stdout.trim()}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and sys.argv[sys.argv.index('--attempt')+1]==${JSON.stringify(original.id)}:
- Path(${JSON.stringify(entered)}).write_text(str(os.getpid()))
- while not Path(${JSON.stringify(release)}).exists(): time.sleep(.01)
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and request.get('attempt')==${JSON.stringify(original.id)}:
+  Path(${JSON.stringify(entered)}).write_text(str(os.getpid()))
+  while not Path(${JSON.stringify(release)}).exists(): time.sleep(.01)
+ sys.exit(subprocess.run([${JSON.stringify(stdout.trim())},*sys.argv[1:]],input=data).returncode)
 os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
 `,{mode:0o700});
   await configure(f,{python:wrapper,concurrency:2,curriculum:{phase1:['unrelated']}});
@@ -106,13 +110,16 @@ test('public STOP aborts pending outbox delivery; later resume ACKs once without
   const python=current.python,identity=join(f.root,'waiting-client.pid'),wrapper=join(f.root,'pending-python');
   const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
   await writeFile(wrapper,`#!${stdout.trim()}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client']:
- Path(${JSON.stringify(identity)}).write_text(str(os.getpid()))
- time.sleep(30)
-else:
- os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and request.get('attempt')==${JSON.stringify(settled.id)}:
+  Path(${JSON.stringify(identity)}).write_text(str(os.getpid()))
+  time.sleep(30)
+ sys.exit(subprocess.run([${JSON.stringify(stdout.trim())},*sys.argv[1:]],input=data).returncode)
+os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
 `,{mode:0o700});
   await configure(f,{python:wrapper});
   const wave=f.start('wave');
