@@ -27,6 +27,8 @@ export class State {
       CREATE TABLE IF NOT EXISTS events (
       sequence INTEGER PRIMARY KEY, attempt TEXT REFERENCES attempts(id), type TEXT NOT NULL,
       data TEXT NOT NULL, created TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS events_attempt_sequence ON events(attempt,sequence);
+      CREATE INDEX IF NOT EXISTS events_attempt_type_sequence ON events(attempt,type,sequence);
       PRAGMA user_version=1;`);
   }
   add(spec) {
@@ -66,6 +68,56 @@ export class State {
   events(id) {
     return this.db.prepare('SELECT type,data FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
       .map(row=>({type:row.type,data:JSON.parse(row.data)}));
+  }
+  // Sequence cursors are exclusive. Descending queries return newest first;
+  // reverse their result when displaying a chronological diagnostic tail.
+  // Legacy events() deliberately remains complete for replay and settlement.
+  queryEvents(id, {types, excludeTypes, limit=100, order='asc', after, before}={}) {
+    if (!Number.isSafeInteger(limit) || limit<1 || limit>1000)
+      throw new Error('Event limit must be an integer between 1 and 1000');
+    if (!['asc','desc'].includes(order)) throw new Error('Invalid event order');
+    const clauses=['attempt IS ?'],parameters=[id];
+    for (const [name,values,operator] of [['types',types,'IN'],['excludeTypes',excludeTypes,'NOT IN']]) {
+      if (values===undefined) continue;
+      if (!Array.isArray(values) || values.some(value=>typeof value!=='string' || !value))
+        throw new Error('Invalid event '+name);
+      if (!values.length) {
+        if (name==='types') clauses.push('0');
+        continue;
+      }
+      clauses.push(`type ${operator} (${values.map(()=>'?').join(',')})`);
+      parameters.push(...values);
+    }
+    for (const [value,operator] of [[after,'>'],[before,'<']]) {
+      if (value===undefined) continue;
+      if (!Number.isSafeInteger(value) || value<0) throw new Error('Invalid event cursor');
+      clauses.push(`sequence ${operator} ?`);parameters.push(value);
+    }
+    return this.db.prepare(`SELECT sequence,type,data,created FROM events
+      WHERE ${clauses.join(' AND ')} ORDER BY sequence ${order} LIMIT ?`).all(...parameters,limit)
+      .map(row=>({...row,data:JSON.parse(row.data)}));
+  }
+  // Factual observations only: recording a failure never settles an attempt,
+  // proves execution stopped, changes elapsed accounting, or promotes memory.
+  recordFailure(id, {phase,kind,message,evidence=[],operation}={}) {
+    for (const [name,value] of Object.entries({phase,kind,message})) {
+      if (typeof value!=='string' || !value.trim()) throw new Error('Invalid failure '+name);
+    }
+    if (!Array.isArray(evidence) || evidence.some(item=>
+      !item || typeof item.path!=='string' || !item.path.trim() ||
+      (item.sha256!==undefined && !/^[a-f0-9]{64}$/.test(item.sha256))))
+      throw new Error('Invalid failure evidence');
+    if (operation!==undefined && (typeof operation!=='string' || !operation.trim()))
+      throw new Error('Invalid failure operation');
+    if (!this.attempt(id)) throw new Error('Unknown failure attempt');
+    const data={phase,kind,message,evidence:evidence.map(({path,sha256})=>
+      ({path,...(sha256===undefined?{}:{sha256})})),...(operation===undefined?{}:{operation})};
+    const result=this.db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)')
+      .run(id,'failure-recorded',JSON.stringify(data),new Date().toISOString());
+    return Number(result.lastInsertRowid);
+  }
+  failures(id, options={}) {
+    return this.queryEvents(id,{...options,types:['failure-recorded']});
   }
   finish(id, outcome, {settleProject=true}={}) {
     if (!['passed','failed'].includes(outcome)) throw new Error('Invalid outcome');
