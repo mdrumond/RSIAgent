@@ -295,7 +295,8 @@ test('simultaneous calls cannot exclude the active command interval from shared 
   const first=other.execute('one',f.source,{timeout:3});await Promise.race([executing,first.then(result=>{throw new Error('Unexpected early result '+JSON.stringify(result));})]);
   now+=1000;
   await assert.rejects(other.execute('two',f.source),error=>error.code==='CONCURRENT_DEVICE_COMMAND');
-  now+=1000;assert.equal(clock.elapsed,2);release();assert.equal((await first).exitCode,0);
+  now+=1000;assert.equal(clock.elapsed,0);release();assert.equal((await first).exitCode,0);
+  assert.equal(clock.elapsed,2,'active payload is charged on settlement');
 });
 
 test('workload guard after sync refuses changed health before arbitrary Bash', async t => {

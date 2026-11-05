@@ -60,7 +60,7 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   assert.equal(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')).decision,'admitted');
 });
 
-test('admission remains charged unless positive nonadmission refunds only charged time',async()=>{
+test('admission holds unpublished time then charges only nonqueue work',async()=>{
   let now=0;const clock=new ActorClock(30,0,()=>now);
   await clock.exclude('admission',async()=>{now+=1000;return {queueWait:false};});
   assert.equal(clock.elapsed,1);
