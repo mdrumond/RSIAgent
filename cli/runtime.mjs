@@ -80,6 +80,10 @@ export async function operate(command,config,options={}) {
       return {stop_requested:true};
     }
     if(command!=='resume'&&ctl.get('pause'))return {reason:'paused'};
+    for(const attempt of state.db.prepare('SELECT id,owner FROM attempts WHERE outcome IS NULL AND owner IS NOT NULL').iterate()) {
+      const identity=JSON.parse(attempt.owner);
+      if(identity?.pid&&identity.start&&identity.boot&&!await ownerStopped(identity))throw new Error('Previous worker remains active; observe or stop it before starting another controller: '+attempt.id);
+    }
     const active=ctl.get('owner');
     if(active && !await ownerStopped(active))throw new Error('Instance controller is already running');
     const owner=await processIdentity();

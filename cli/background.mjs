@@ -38,13 +38,13 @@ export async function startBackground(root,command,action,{detach=true,signal}={
   const state=new State(join(root,'state.sqlite'));requests(state);
   state.db.prepare("INSERT INTO requests(id,kind,status) VALUES (?,?,'queued')").run(id,command);
   const log=await open(join(directory,'output.log'),'a',0o600);
-  let child;
+  let child,exited;
   try {
     const argv=[fileURLToPath(new URL('./main.mjs',import.meta.url)),command,'--instance',root,'--config',file,'--request',id];
     for(const key of ['mode','concurrency'])if(action[key]!==undefined)argv.push('--'+key,String(action[key]));
     if(action['no-recovery'])argv.push('--no-recovery');
     child=spawn(process.execPath,argv,{cwd:root,detached:true,env:process.env,stdio:['ignore',log.fd,log.fd]});
-    const exited=new Promise(resolve=>child.once('exit',resolve));
+    exited=new Promise(resolve=>child.once('exit',resolve));
     await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
     const owner=await processIdentity(child.pid);
     state.db.prepare("UPDATE requests SET owner=? WHERE id=? AND status='queued' AND owner IS NULL")
@@ -56,6 +56,12 @@ export async function startBackground(root,command,action,{detach=true,signal}={
     if(row.status!=='passed')throw new Error(row.error??'Request did not complete');
     return JSON.parse(row.result);
   }catch(error){
+    if(child?.pid&&['ENOENT','ESRCH'].includes(error.code))await exited;
+    const row=state.db.prepare('SELECT status,owner,result FROM requests WHERE id=?').get(id);
+    if(row?.status==='passed')return detach?{request:id,...JSON.parse(row.owner),submitted:true}:JSON.parse(row.result);
+    if(child?.pid&&(child.exitCode!==null||child.signalCode!==null))
+      state.db.prepare("UPDATE requests SET status='failed',error=? WHERE id=? AND status='queued' AND owner IS NULL")
+        .run('Request process exited before recording ownership',id);
     if(!child?.pid)state.db.prepare("UPDATE requests SET status='failed',error=? WHERE id=?").run(error.message,id);
     throw error;
   }finally{await log.close();state.close();}
