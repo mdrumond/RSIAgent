@@ -118,12 +118,26 @@ export async function operate(command,config,options={}) {
     const requested=options.concurrency??config.concurrency??1;
     const concurrency=requested==='auto'?Math.max(1,jobs.length):Number(requested);
     if(!Number.isSafeInteger(concurrency)||concurrency<1)throw new Error('Invalid concurrency');
-    const contain=async(attempt,resource,kind,message)=>{
+    const contain=async(attempt,resource,kind,message,unclaimed=false)=>{
+      const current=state.attempt(attempt.id);
+      let stopped=unclaimed && current.owner===JSON.stringify(owner);
+      if(!stopped) {
+        try {stopped=await ownerStopped(current.owner);}
+        catch(error){state.event(attempt.id,'owner-observation-error',{message:error.message});}
+      }
+      if(!stopped) {
+        state.event(attempt.id,'worker-containment-blocked',{reason:'Current owner is not confirmed stopped'});
+        return false;
+      }
       let previous;
       try {
         previous=await environment(config,join(config.root,'attempts',attempt.id),
           (type,data)=>state.event(attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal);
       }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+      if(state.attempt(attempt.id).owner!==current.owner) {
+        state.event(attempt.id,'worker-containment-blocked',{reason:'Owner changed during closure observation'});
+        return false;
+      }
       // A recovery investigation does not settle the original project as passed.
       return settleFailure(state,attempt.id,previous,{phase:'controller',kind,message});
     };
@@ -160,7 +174,9 @@ export async function operate(command,config,options={}) {
       state.event(attempt.id,'worker-exited',exit);
       // Intentional stop preserves resumability and the lease.
       if(!ctl.get('stop') && !state.attempt(attempt.id).outcome) {
-        await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit));
+        const closed=await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit),!job.resume &&
+          (!child.pid || child.exitCode!==null || child.signalCode!==null));
+        if(closed)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
       }
       // Even an outcome is not proof that detached execution has stopped.
       if(state.attempt(attempt.id).outcome) {
@@ -175,7 +191,8 @@ export async function operate(command,config,options={}) {
           state.event(null,'job-error',{project:job.projectId,message:error.message});
           return {project:job.projectId,error:error.message};
         }
-        const closed=await contain(attempt,assignedResource,'worker-boundary',error.message);
+        const childStopped=!child || !child.pid || child.exitCode!==null || child.signalCode!==null;
+        const closed=await contain(attempt,assignedResource,'worker-boundary',error.message,!job.resume && childStopped);
         if(closed && (!child || !child.pid || child.exitCode!==null || child.signalCode!==null))
           state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
         return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,error:error.message};
@@ -325,7 +342,7 @@ async function worker(root,id) {
         skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension]});
     }
     if(!interrupted) {
-      if(state.attempt(id).outcome==='failed' && !state.queryEvents(id,{types:['failure-settlement'],limit:1}).length)
+      if(state.attempt(id).outcome==='failed')
         await settleFailure(state,id,env,{phase:'actor',kind:'failed-outcome',
           message:'Actor completed without acceptance',settleProject:job.kind!=='investigation'});
       await finish();
@@ -333,8 +350,7 @@ async function worker(root,id) {
   }catch(error) {
     state.event(id,'attempt-error',{message:error.message,stage:'worker'});
     if(!interrupted && claimed) {
-      if(!state.attempt(id).outcome || (state.attempt(id).outcome==='failed' &&
-          !state.queryEvents(id,{types:['failure-settlement'],limit:1}).length)) {
+      if(!state.attempt(id).outcome || (state.attempt(id).outcome==='failed' && !failureSettled(state,id))) {
         await settleFailure(state,id,env,{message:error.message,settleProject:job.kind!=='investigation'});
       }else state.recordFailure(id,{phase:'postprocess',kind:'exception',message:error.message});
       if(failureSettled(state,id)) {
