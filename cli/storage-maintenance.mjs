@@ -5,11 +5,11 @@ import {sealClosedArtifacts} from './storage.mjs';
 import {stat} from 'node:fs/promises';
 
 // Submission only; the existing managed request owns compression and its receipts.
-export async function queueCompression(config,{manager}={}) {
+export async function queueCompression(config) {
   if(!config.storage||config.storage.compress===false)return null;
   const state=new State(join(config.root,'state.sqlite'));
   try {
-    await reconcileRequests(config.root,{state,...(manager?{manager}:{})});
+    await reconcileRequests(config.root,{state});
     const pending=requests(state).find(r=>r.kind==='storage'&&['queued','running'].includes(r.status));
     if(pending)return {request:pending.id,retained:true};
     await sealClosedArtifacts(config,{limit:1000});
@@ -21,6 +21,6 @@ export async function queueCompression(config,{manager}={}) {
     }
     if(!ready)return null;
     return await startBackground(config.root,'storage',{action:'compress',limit:1000},
-      {detach:true,...(manager?{manager}:{})});
+      {detach:true});
   }finally{state.close();}
 }
