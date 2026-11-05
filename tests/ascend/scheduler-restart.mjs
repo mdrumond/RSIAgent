@@ -8,6 +8,7 @@ import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
 import {setup,rows,until} from './driver_setup.mjs';
 import {State} from '../../controller/state.mjs';
+import {KnowledgeHistory} from '../../controller/knowledge-history.mjs';
 import {RecoveryQueue,recordOutcome} from '../../controller/recovery.mjs';
 import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 
@@ -104,8 +105,13 @@ test('public STOP aborts pending outbox delivery; later resume ACKs once without
   const f=await setup(t,'phase2',['unrelated'],{install:false});await f.run('wave');
   const settled=rows(f.root,'SELECT * FROM attempts')[0],requestCount=f.server.requests.length;
   const state=new State(join(f.root,'state.sqlite'));
-  const lesson=state.db.prepare('SELECT id FROM recovery_lessons').get();
-  state.db.prepare('UPDATE recovery_lessons SET recorded=0 WHERE id=?').run(lesson.id);state.close();
+  const lesson=state.db.prepare('SELECT id,data FROM recovery_lessons').get();
+  // A published delivery is idempotently ACKed without a KDB request. Seed a
+  // distinct follow-up publication, retaining the settled attempt and its evidence.
+  const pending={...JSON.parse(lesson.data),delivery_id:`stop-followup-${settled.id}`,
+    findings:'Follow-up findings awaiting publication before STOP.'};
+  state.db.prepare('UPDATE recovery_lessons SET data=?,recorded=0 WHERE id=?')
+    .run(JSON.stringify(pending),lesson.id);state.close();
   const current=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
   const python=current.python,identity=join(f.root,'waiting-client.pid'),wrapper=join(f.root,'pending-python');
   const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
@@ -130,7 +136,13 @@ os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys
   await Promise.race([wave.output,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(Error('STOP did not cancel pending outbox')),5000);timer.unref();})]);
   assert.ok(performance.now()-stopped<5000);assert.equal(await ownerStopped(owner),true);
   assert.equal(rows(f.root,'SELECT recorded FROM recovery_lessons')[0].recorded,0);
-  await configure(f,{python});await f.run('resume');await f.run('resume');
+  await configure(f,{python});await f.run('resume');
+  const history=new KnowledgeHistory(join(f.root,'knowledge.git')),published=await history.state('memory');
+  const snapshot=await history.readRevision(published.revision);
+  const delivered=snapshot.memory.filter(record=>record.delivery_id===pending.delivery_id);
+  assert.equal(delivered.length,1);assert.equal(delivered[0].lesson,pending.findings);
+  assert.ok(snapshot.memory.some(record=>record.attempt_id===settled.id&&record.delivery_id!==pending.delivery_id));
+  await f.run('resume');assert.deepEqual(await history.state('memory'),published);
   assert.equal(rows(f.root,'SELECT recorded FROM recovery_lessons')[0].recorded,1);
   assert.deepEqual(rows(f.root,'SELECT * FROM attempts'),[settled]);assert.equal(f.server.requests.length,requestCount);
   f.pass();
