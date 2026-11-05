@@ -22,7 +22,8 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   await mkdir(directory, { recursive: true });
   await save(join(directory, 'current-guidance.json'), input.entries ?? []);
   await save(join(directory, 'current-usage.json'), { context: input.context, userinfo: input.userinfo,
-    actualEvents: input.actualEvents, originals: input.originalCount ?? 0, pruneAfterTasks: input.pruneAfterTasks ?? 24 });
+    actualEvents: input.actualEvents, evidence: input.evidence,
+    originals: input.originalCount ?? 0, pruneAfterTasks: input.pruneAfterTasks ?? 24 });
   await writeFile(join(directory, 'usage-history.jsonl'), (input.history ?? []).map(x => JSON.stringify(x)).join('\n'));
   const agentDir = join(directory, 'agent');
   await mkdir(agentDir, { recursive: true });
@@ -70,6 +71,9 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
     await session.prompt(`Read current-guidance.json and current-usage.json with native read tools.
 Use usage-history.jsonl only for relevant prior usage. Resolve cited collection/entry_id with mcp__kdb__read_entry
 and search positive/negative evidence with mcp__kdb__search; indexed source files may be absent.
+The evidence field contains the current outcome and references, with optional matching historical success/failure.
+Learn from available evidence even when no successful comparison exists. Do not acquire additional benchmark runs.
+Limit claims to what the referenced execution establishes; a failure observation does not prove an alternative fixes it.
 Propose English guidance prioritizing error avoidance, detection and recovery before performance. Retain negatives.
 Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning must meet the original-task threshold in current-usage.json.
 Submit via submit_changes; correct any rejection. A final text response does not publish changes.`);

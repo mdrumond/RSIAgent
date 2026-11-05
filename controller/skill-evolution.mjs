@@ -3,6 +3,7 @@ import { join, resolve, relative, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { stages } from './workflow.mjs';
 import { generateCandidate } from './skill-proposal.mjs';
+import { selectSkillEvidence } from './skill-evidence.mjs';
 export { generateCandidate };
 
 const scopes = ['global-kdb', ...stages];
@@ -17,9 +18,9 @@ const completed = task => task?.completed === true && task.id && task.projectId 
   ['phase2', 'inference'].includes(task.phase);
 const originals = history => history.filter(task => completed(task) && task.kind === 'original');
 const usageTypes = new Set(['skill-read', 'knowledge-retrieved', 'guidance-contradicted',
-  'verification', 'stage-completed', 'attempt-error', 'rejected', 'accepted']);
+  'failure-recorded', 'verification', 'stage-completed', 'attempt-error', 'rejected', 'accepted']);
 const compactTask = task => ({ id: task.id, projectId: task.projectId, kind: task.kind,
-  phase: task.phase, completed: task.completed, outcome: task.outcome,
+  phase: task.phase, completed: task.completed, outcome: task.outcome, comparisonIdentity: task.comparisonIdentity,
   events: (task.events ?? []).filter(event => usageTypes.has(event.type)) });
 
 export function cadenceDecision(history, task, lastEvaluated = 0, every = 8, pruneAfterTasks = 24) {
@@ -178,11 +179,13 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const proposalRoot = join(directory, 'proposals', randomUUID());
     await mkdir(proposalRoot, { recursive: true });
     await save(join(proposalRoot, 'evidence.json'), rawEntry);
+    const evidence = selectSkillEvidence(entry, state.history);
+    await save(join(proposalRoot, 'comparison-evidence.json'), evidence);
     const validate = changes => applyProposal(entries, changes, {
       allowPruning: new Set(counted.map(x => x.id)).size >= pruneAfterTasks,
       history: manual ? [...history, entry] : history });
     signal?.throwIfAborted();
-    const changes = await generate({ directory: proposalRoot, input: { entries, history, pruneAfterTasks, originalCount: new Set(counted.map(x => x.id)).size, userinfo, context: { ...entry, userinfo },
+    const changes = await generate({ directory: proposalRoot, input: { entries, history, evidence, pruneAfterTasks, originalCount: new Set(counted.map(x => x.id)).size, userinfo, context: { ...entry, userinfo },
       actualEvents: events.filter(e => ['skill-read', 'knowledge-retrieved'].includes(e.type)) },
       validate, native, modelRuntime, model, signal, seconds: current.skill_writer_seconds ?? 240 });
     signal?.throwIfAborted();

@@ -60,10 +60,13 @@ for(const scenario of ['cancel-verifier','unknown-submission','supervised-shell'
         },{once:true}));
       }};
     await assert.rejects(runAttempt({state,attempt,project:state.project('p').spec,attemptPath:join(root,'attempt'),
+      environmentIdentity:{target:'local-test',runtime:'scripted'},
       signal:abort.signal,environmentFactory:async()=>environment,skillMap,
       knowledge:{search:async()=>({content:[],evidence:[]})},modelRuntime:runtime,
       model:runtime.getModel('lifecycle-fixture','scripted'),extensions:[pi=>pi.on('session_shutdown',async()=>{shutdown++;})]}));
     assert.ok(requests>0);assert.equal(shutdown,1);assert.equal(state.attempt(attempt.id).outcome,null);
+    const context=state.events(attempt.id).find(event=>event.type==='skill-evidence-context');
+    assert.ok(context && Object.values(context.data).every(value=>/^[a-f0-9]{64}$/.test(value)));
     const stopped=await attemptStopped(state,state.attempt(attempt.id),environment);
     if(scenario!=='unknown-submission') {
       assert.equal(sawCancellation,true);assert.equal(stopped,true);

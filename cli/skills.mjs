@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { tune } from '../controller/skill-evolution.mjs';
 import {State} from '../controller/state.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
+import { tuningTask, skillEvents } from '../controller/skill-evidence.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
 // and wave({instanceRoot,config,projectIds:[id],evaluation:true}). bootstrap must copy
@@ -39,9 +40,18 @@ export async function run(config, values = {}) {
         try {
           if (context.projectId && !state.project(context.projectId)) throw new Error('Unknown tuning project');
           const attempts = context.projectId
-            ? state.db.prepare('SELECT id FROM attempts WHERE project=? ORDER BY created').all(context.projectId)
-            : state.db.prepare('SELECT id FROM attempts ORDER BY created').all();
-          context.events = attempts.flatMap(attempt => state.events(attempt.id));
+            ? state.db.prepare('SELECT id FROM attempts WHERE project=? ORDER BY created DESC,rowid DESC LIMIT 1000').all(context.projectId)
+            : state.db.prepare('SELECT id FROM attempts ORDER BY created DESC,rowid DESC LIMIT 1000').all();
+          let remaining = 1000;
+          for (const attempt of attempts) {
+            if (!remaining) break;
+            const events = skillEvents(state, attempt.id, remaining);
+            context.events.unshift(...events); remaining -= events.length;
+          }
+          if (context.projectId && attempts.length) {
+            const latest = attempts[0];
+            Object.assign(context, tuningTask({ state, attemptId: latest.id, phase: config.mode }));
+          }
         } finally { state.close(); }
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }

@@ -227,6 +227,18 @@ original freezes. Investigation success never substitutes for original-goal
 acceptance. All findings enter the durable memory outbox; acknowledge delivery
 only after the KDB write succeeds.
 
+Skill proposals receive the current attempt's outcome and execution references.
+When available, they also receive the most recent successful and failed attempts
+with matching goal, initial source fingerprint, frozen verifier, and selected
+target/runtime binding. Different skill versions may be compared; transient
+health measurements do not define the binding. The binding identifies the
+configured environment, not an independent audit of installed dependency versions.
+Incomplete or historical identities omit comparisons. A failed attempt alone
+can support a proposal; the tuner never runs a benchmark to obtain a successful
+counterpart. Proposal directories retain `comparison-evidence.json` alongside
+the original evidence. Observed failures support scoped lessons, not an untested
+claim that a proposed alternative fixes the original project.
+
 One MCP service owns the instance KDB and lazy production BGE backend. Native
 Pi tool calls carry the attempt correlation header. Compact lessons reference
 source/citation IDs or direct evidence hashes rather than recursively copying
