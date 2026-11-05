@@ -7,6 +7,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
 import {createEnvironmentTools} from '../../integrations/environments/index.mjs';
 import {State} from '../../controller/state.mjs';
+import {ActorClock} from '../../controller/budget.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {setup,rows,until as driverUntil} from './driver_setup.mjs';
 import {execFile} from 'node:child_process';
@@ -42,12 +43,12 @@ print(text[q])
     const context={instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
         return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
-      exclude:async(_label,fn)=>{depth++;try{return await fn();}finally{depth--;}},
+      exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
       event:async(type,data)=>{
         events.push({type,data});
         if(type==='execution-handle'){
           handles.add(data.handle);assert.match(data.handle,/^local:exec-/);
-          assert.equal(depth>0,data.purpose==='resource-health');
+          assert.equal(depth>0,['resource-health','device-lease-control'].includes(data.purpose));
         }
       }};
     const environment=await createEnvironment({...options,...extra,health:{...options.health,...extra.health}},context);
@@ -59,6 +60,10 @@ print(text[q])
     finally{try{for(const close of closers)await close();}finally{await rm(root,{recursive:true,force:true});}}
   });
   return {root,source,rows,options,calls,update,bind,onClose:fn=>closers.push(fn),setEnabled:ids=>{enabled=ids;}};
+}
+
+async function dead(pid){
+  await until(async()=>{try{const stat=await readFile('/proc/'+pid+'/stat','utf8');return ['Z','X'].includes(stat.slice(stat.lastIndexOf(')')+2).split(' ')[0]);}catch(error){if(error.code==='ENOENT')return true;throw error;}});
 }
 
 test('two native local devices overlap with distinct masks and a third waits for the existing lease',{timeout:30000},async t=>{
@@ -136,10 +141,13 @@ test('local command selects a new idle device after earlier attempt assignment',
 test('STOP closes native local work; fresh binding observes the same handle without replay',{timeout:20000},async t=>{
   const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0],abort=new AbortController();
   const bound=await f.bind(row,{signal:abort.signal});let handle;
-  const run=bound.environment.execute('python3 -c '+quote("from pathlib import Path; import time; Path('started').touch(); time.sleep(30)"),f.source,{signal:abort.signal,timeout:10});
+  const run=bound.environment.execute('python3 -c '+quote("from pathlib import Path; import time; Path('started').write_text(str(__import__('os').getpid())); time.sleep(30)"),f.source,{signal:abort.signal,timeout:10});
   void run.catch(()=>{});await until(()=>exists(join(f.source,'started')));
   handle=bound.events.find(e=>e.type==='execution-handle'&&!e.data.purpose).data.handle;abort.abort();
   assert.equal((await run).settled,true);
+  const pid=Number(await readFile(join(f.source,'started'),'utf8'));await dead(pid);
+  const reused=await f.bind(row,{},bound.path);
+  assert.equal((await reused.environment.execute('true',f.source,{timeout:5})).settled,true);
   const resumed=await f.bind(row,{},bound.path);assert.equal((await resumed.environment.observe(handle)).state,'stopped');
   assert.equal(resumed.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
   assert.ok(bound.events.some(e=>e.type==='resource-probe-completed'&&e.data.accountingExcluded&&e.data.executionSeconds===0));
@@ -250,4 +258,28 @@ test('native target tool filters inherited env but retains session identity and 
   assert.equal(explicit.exitCode,0);const direct=JSON.parse(output.trim().split('\n').at(-1));
   assert.equal(direct.CANN_HOME,'explicit-cann');assert.equal(direct.UNIQUE_CALL,'explicit');assert.equal(direct.PI_SESSION_ID,'direct-session');
   assert.equal(direct.PATH,runtime.PATH);assert.equal(direct.ASCEND_PHYSICAL_DEVICE,'0');
+});
+
+for(const mode of ['timeout','ordinary-background'])test(`native ${mode} proves actual payload PID death before device reuse`,{timeout:20000},async t=>{
+  const f=await fixture(t);f.setEnabled([0]);const bound=await f.bind();
+  const command=mode==='timeout'?'python3 -c '+quote("import os,time; from pathlib import Path; Path('pid').write_text(str(os.getpid())); time.sleep(30)"):'sleep 30 & echo $! > pid';
+  const result=await bound.environment.execute(command,f.source,{timeout:mode==='timeout'?1:5});
+  assert.equal(result.settled,true);await dead(Number(await readFile(join(f.source,'pid'),'utf8')));
+  assert.equal((await bound.environment.execute('true',f.source,{timeout:5})).settled,true);
+});
+
+test('target contention retries only structured nonadmission; payload exit 126 executes once',{timeout:20000},async t=>{
+  const f=await fixture(t);f.setEnabled([0]);const first=await f.bind(),second=await f.bind();
+  let now=0;const clock=new ActorClock(30,0,()=>now);
+  second.environment=await createEnvironment(f.options,{...second.context,leaseDirectory:join(f.root,'different-controller'),
+    exclude:(label,fn)=>clock.exclude(label,()=>second.context.exclude(label,async()=>{if(label==='admission')now+=1000;return fn();}))});
+  const holding=first.environment.execute('touch started; while [ ! -f release ]; do sleep .01; done',f.source,{timeout:10});
+  void holding.catch(()=>{});await until(()=>exists(join(f.source,'started')));
+  const next=second.environment.execute('echo ran >> invocations; exit 126',f.source,{timeout:5});void next.catch(()=>{});
+  await until(()=>second.events.filter(e=>e.type==='device-lease-acquired').length>=2);
+  assert.equal(await exists(join(f.source,'invocations')),false);
+  await writeFile(join(f.source,'release'),'go');assert.equal((await holding).settled,true);
+  const result=await next;assert.equal(result.exitCode,126);assert.equal(result.admission.decision,'admitted');
+  assert.equal(await readFile(join(f.source,'invocations'),'utf8'),'ran\n');
+  assert.equal(clock.elapsed,1,'confirmed contention refunded; genuine payload 126 charged');
 });

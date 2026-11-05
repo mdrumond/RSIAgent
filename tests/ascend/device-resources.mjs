@@ -37,7 +37,7 @@ outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
 'current-fault-event':'Fault Event Count: 0'}
 print(outputs[query])
 `, { mode: 0o700 });
-  const calls = [], events = [], jobs = new Map();
+  const calls = [], events = [], jobs = new Map(), admissions=new Map();
   let runWorkload = false, onSync = async () => {}, running = false, queued = 0;
   let waitSignal;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
@@ -47,7 +47,7 @@ print(outputs[query])
     if (args[0] === 'capabilities') return { state: 'available' };
     if (args[0] === 'preflight') return { state: 'completed' };
     if (args[0] === 'upload') return { state: 'completed' };
-    if (args[0] === 'download') { await writeFile(args[3], ''); return { state: 'completed' }; }
+    if (args[0] === 'download') { await writeFile(args[3], admissions.get(args[2]) ?? [...admissions].find(([key])=>key.endsWith('/'+args[2]))?.[1] ?? ''); return { state: 'completed' }; }
     if (args[0] === 'run') {
       const handle = `remote:fixture:job:${++sequence}`, file = args[args.indexOf('--file')+1];
       let content = '';
@@ -58,11 +58,18 @@ print(outputs[query])
       }
       if (file.endsWith('sync.sh')) await onSync();
       let exit = 0;
-      if (file.endsWith('command.sh') && runWorkload) {
+      if (file.endsWith('command.sh')) {
         const script = await readFile(file,'utf8');
         const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
-        try { await promisify(execFile)('bash',['-c',config.command],{env:{...process.env,...config.env,PATH:bin+':'+process.env.PATH,ASCEND_TEST_TELEMETRY:telemetry}}); }
-        catch(error) { exit = error.code; }
+        const inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
+        let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled'};
+        if(runWorkload){
+          const receipt=join(instancePath,'host-admission-'+sequence);
+          try { await promisify(execFile)('bash',['-c',config.command],{env:{...process.env,...config.env,RSI_LEASE_RECEIPT:receipt,PATH:bin+':'+process.env.PATH,ASCEND_TEST_TELEMETRY:telemetry}}); }
+          catch(error) { exit=error.code; }
+          try{admission=JSON.parse(await readFile(receipt,'utf8'));}catch{admission=null;}
+        }
+        if(admission)admissions.set(config.env.RSI_LEASE_RECEIPT,JSON.stringify(admission));
       }
       jobs.set(handle, {content,exit});
       if (file.endsWith('probe.sh')) lastProbe = { handle, receipt:args[args.indexOf('--receipt-file')+1] };
@@ -148,7 +155,7 @@ test('scheduler slots carry no mask; every command freshly selects and fixes its
     const result = await bound.execute('kernel-command',f.source,{timeout:3,resourceId:slots[0].id,
       env:{ASCEND_PHYSICAL_DEVICE:'7',ASCEND_RT_VISIBLE_DEVICES:'7'}});
     assert.equal(result.settled,true);
-    const run = f.calls.filter(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')).at(-1);
+    const run = f.calls.filter(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')&&args.includes('--npu')).at(-1);
     assert.equal(run[run.indexOf('--npu')+1],String(physical));
     const script=await readFile(run[run.indexOf('--file')+1],'utf8');
     const config=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
@@ -234,7 +241,7 @@ for (const failure of ['policy','unknown']) test(`core probe-only reconciliation
   state.event(attempt.id,'execution-starting',{operation:'probe-only',startElapsed:2});
   const clock=new ActorClock(30,2,()=>now);
   const context={...f.context,resource:lease,
-    exclude:(label,fn)=>clock.exclude(label,async()=>{
+    exclude:(label,fn)=>label==='admission'?clock.exclude(label,fn):clock.exclude(label,async()=>{
       depth++;exclusions++;now+=10000;
       assert.equal(clock.elapsed,2);
       try{return await fn();}finally{
@@ -271,13 +278,24 @@ for (const failure of ['policy','unknown']) test(`core probe-only reconciliation
   assert.equal(reconciliation.data.executionSeconds,0);
 });
 
-test('pure serialized wait is excluded from caller timeout',async t=>{
-  const f=await fixture(t),bound=f.environment;
+test('simultaneous calls cannot exclude the active command interval from shared ActorClock',async t=>{
+  const f=await fixture(t);let now=0;const clock=new ActorClock(30,0,()=>now);
+  const bound=await createEnvironment(f.options,{...f.context,exclude:(label,fn)=>clock.exclude(label,fn)});
   await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'queue'}});
-  f.onSync(()=>delay(1000));
-  const first=bound.execute('one',f.source,{timeout:3});
-  const second=bound.execute('two',f.source,{timeout:.5});
-  assert.equal((await first).exitCode,0);assert.equal((await second).exitCode,0);
+  let release,started;const executing=new Promise(resolve=>{started=resolve;});
+  const wait=new Promise(resolve=>{release=resolve;});
+  const client=f.context.client;
+  const other=await createEnvironment(f.options,{...f.context,exclude:(label,fn)=>clock.exclude(label,fn),client:async(args,settings)=>{
+    if(args[0]==='observe'&&args[1]===payload){started();await wait;}
+    const result=await client(args,settings);
+    if(args[0]==='run'&&args.includes('--npu'))payload=result.handle;
+    return result;
+  }});let payload;
+  await other.prepare({project:{id:'p',source:f.source},attempt:{id:'clock'}});
+  const first=other.execute('one',f.source,{timeout:3});await Promise.race([executing,first.then(result=>{throw new Error('Unexpected early result '+JSON.stringify(result));})]);
+  now+=1000;
+  await assert.rejects(other.execute('two',f.source),error=>error.code==='CONCURRENT_DEVICE_COMMAND');
+  now+=1000;assert.equal(clock.elapsed,2);release();assert.equal((await first).exitCode,0);
 });
 
 test('workload guard after sync refuses changed health before arbitrary Bash', async t => {
@@ -327,7 +345,7 @@ test('native SDK stale pending closure retains evidence then one fresh probe adm
   const f=await fixture(t),lease=(await f.environment.inspectDevices()).find(row=>row.available);
   let depth=0,now=0,exclusions=0;const clock=new ActorClock(30,2,()=>now);
   const bound=await createEnvironment(f.options,{...f.context,resource:lease,
-    exclude:(label,fn)=>clock.exclude(label,async()=>{
+    exclude:(label,fn)=>label==='admission'?clock.exclude(label,fn):clock.exclude(label,async()=>{
       depth++;exclusions++;now+=10000;
       try{return await fn();}finally{now+=10000;depth--;}
     })});
@@ -341,7 +359,8 @@ test('native SDK stale pending closure retains evidence then one fresh probe adm
   const [tool]=await createEnvironmentTools(bound,f.source);
   const result=await tool.execute('cpu',{command:`touch '${marker}'`,timeout:3});
   assert.notEqual(result.isError,true);assert.equal(await readFile(marker,'utf8'),'');
-  assert.equal(f.calls.filter(a=>a[0]==='run').length,runs+3);
+  assert.equal(f.calls.filter(a=>a[0]==='run'&&a.includes('--npu')).length,1);
+  await assert.rejects(readFile(join(f.context.instancePath,'.ascend-command-lease.json')),{code:'ENOENT'});
   assert.equal(f.calls.filter(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('probe.sh')).length,3);
   const completed=f.events.find(e=>e.type==='resource-probe-completed'&&e.handle===old);
   assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]===old&&a.includes('--wait')));
@@ -407,7 +426,11 @@ time.sleep(10)
 });
 
 test('unknown payload holds pool/device and exact handle across binding restart',async t=>{
-  const f=await fixture(t,{allow_alarm:true});let payloadHandle;
+  const f=await fixture(t,{allow_alarm:true});let payloadHandle,resolved=false;
+  const recoveryClient=async(args,settings)=>{
+    if(!resolved&&args[0]==='observe'&&args[1]===payloadHandle)return {state:'observation-unavailable'};
+    return f.context.client(args,settings);
+  };
   const bound=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>{
     if(args[0]==='observe'&&args[1]===payloadHandle)return {state:'observation-unavailable'};
     const result=await f.context.client(args,settings);
@@ -419,17 +442,43 @@ test('unknown payload holds pool/device and exact handle across binding restart'
   const held=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
   assert.equal(held.physicalDevice,0);
   assert.ok(JSON.parse(await readFile(held.receipt,'utf8')).handles.includes(payloadHandle));
-  const restarted=await createEnvironment(f.options,f.context);
+  const restarted=await createEnvironment(f.options,{...f.context,client:recoveryClient});
   await assert.rejects(restarted.execute('no-replay',f.source),/lease unresolved/);
   const other=await createEnvironment({...f.options,runtime:'other-runtime'},
     {...f.context,instancePath:join(f.context.instancePath,'other-controller')});
   await other.prepare({project:{id:'p',source:f.source},attempt:{id:'other'}});
   assert.equal((await other.execute('other-device',f.source,{timeout:3})).settled,true);
   assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').at(-1).physicalDevice,1);
+  resolved=true;assert.equal((await restarted.observe(payloadHandle)).state,'stopped');
+  await assert.rejects(readFile(held.receipt),{code:'ENOENT'});
+  assert.equal(await restarted.reconcileLease(),true);
 });
 
 test('production CPL profile without canonical pool fails closed',async t=>{
   const f=await fixture(t);
   const bound=await createEnvironment(f.options,{...f.context,client:async()=>({state:'completed',profiles:[{target:'fixture',devices:[{id:0,enabled:true}]}]})});
   await assert.rejects(bound.resources(),/actual alias-group pool/);
+});
+
+for(const failure of ['unknown-observe','lost-handle-event'])test(`target reconciliation ${failure} resumes same control handle without replay`,async t=>{
+  const f=await fixture(t);let controlHandle,broken=true;
+  const client=async(args,settings)=>{
+    if(broken&&failure==='unknown-observe'&&args[0]==='observe'&&args[1]===controlHandle)return {state:'observation-unavailable'};
+    const result=await f.context.client(args,settings);
+    if(args[0]==='run'&&!args.includes('--npu')&&args[args.indexOf('--file')+1].endsWith('command.sh'))controlHandle=result.handle;
+    return result;
+  };
+  const bound=await createEnvironment(f.options,{...f.context,client,event:async(type,data)=>{
+    await f.context.event(type,data);
+    if(broken&&failure==='lost-handle-event'&&type==='execution-handle'&&data.handle===controlHandle)throw new Error('lost control handle event');
+  }});
+  await bound.prepare({project:{id:'p',source:f.source},attempt:{id:'control'}});
+  if(failure==='lost-handle-event')await assert.rejects(bound.execute('payload-once',f.source,{timeout:3}),/lost control/);
+  else assert.equal((await bound.execute('payload-once',f.source,{timeout:3})).settled,false);
+  const runs=f.calls.filter(a=>a[0]==='run').length;
+  broken=false;const restarted=await createEnvironment(f.options,{...f.context,client});
+  assert.deepEqual(await Promise.all([restarted.reconcileLease(),restarted.reconcileLease()]),[true,true]);
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]===controlHandle));
+  await assert.rejects(readFile(join(f.context.instancePath,'.ascend-command-lease.json')),{code:'ENOENT'});
 });

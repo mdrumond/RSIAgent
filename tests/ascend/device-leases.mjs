@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {setTimeout as delay} from 'node:timers/promises';
-import {reserveDevice,hostLease} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,hostLease,hostReconcile} from '../../integrations/environments/device-leases.mjs';
 import {ActorClock} from '../../controller/budget.mjs';
 
 async function root(t){const path=await mkdtemp(join(tmpdir(),'command-leases-'));t.after(()=>rm(path,{recursive:true,force:true}));return path;}
@@ -39,9 +39,9 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   const preamble=`import os,sys,json,hashlib,time\nc=json.loads(sys.argv[1]); deadline=time.monotonic()+10\nns={'local_probe':lambda **kw:{'admitted':True,'measurements':{'idle':True}}}\n`;
   const code=preamble+hostLease,children=[];
   t.after(()=>{for(const child of children)child.kill('SIGKILL');});
-  function run(command){
-    const child=spawn('python3',['-c',code,JSON.stringify({devices:[0],configuration:{},lease:{pool:'aliases'},command})],
-      {env:{...process.env,HOME:directory},stdio:['ignore','pipe','pipe']});
+  function run(command,action=hostLease,token='owner'){
+    const child=spawn('python3',['-c',preamble+action,JSON.stringify({devices:[0],configuration:{},lease:{pool:'aliases',token},command})],
+      {env:{...process.env,HOME:directory,RSI_LEASE_RECEIPT:join(directory,'receipt-'+children.length)},stdio:['ignore','pipe','pipe']});
     children.push(child);let error='';child.stderr.on('data',d=>error+=d);
     return {child,done:new Promise(resolve=>child.on('close',(status,signal)=>resolve({status,signal,error})))};
   }
@@ -54,4 +54,20 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   const killed=run('exec sleep 0.2');await delay(80);killed.child.kill('SIGKILL');
   await killed.done;await delay(220);
   assert.equal((await run('exit 0').done).status,126,'PID disappearance cannot reclaim the fence');
+  assert.equal((await run('',hostReconcile,'wrong-owner').done).status,125);
+  assert.equal((await run('',hostReconcile).done).status,0);
+  assert.equal((await run('exit 126').done).status,126);
+  assert.equal(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')).decision,'admitted');
+});
+
+test('admission remains charged unless positive nonadmission refunds only charged time',async()=>{
+  let now=0;const clock=new ActorClock(30,0,()=>now);
+  await clock.exclude('admission',async()=>{now+=1000;return {queueWait:false};});
+  assert.equal(clock.elapsed,1);
+  await clock.exclude('admission',async()=>{
+    now+=2000;await clock.exclude('transfer',async()=>{now+=4000;});return {queueWait:true};
+  });
+  assert.equal(clock.elapsed,1);
+  await assert.rejects(clock.exclude('admission',async()=>{now+=1000;throw new Error('unknown');}));
+  assert.equal(clock.elapsed,2);
 });

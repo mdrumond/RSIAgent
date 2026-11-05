@@ -1,7 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, hostLease } from './device-leases.mjs';
+import { reserveDevice, openDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -53,10 +53,13 @@ export async function createEnvironment(options, context) {
     signal?.throwIfAborted();
     return nativeClient(args, {signal});
   };
-  let activeLease;
+  let activeLease, activeExclude;
   const leasePath = join(context.instancePath, '.ascend-command-lease.json');
-  const commandContext = {...context, client, event: async (type, data) => {
-    if (activeLease && type === 'execution-handle') await activeLease.retain(data.handle);
+  const commandContext = {...context, client, exclude:(label,fn)=>activeExclude?activeExclude(label,fn):context.exclude(label,fn), event: async (type, data) => {
+    if (activeLease && ['execution-submitting','execution-submitted','execution-not-admitted','execution-handle'].includes(type)) {
+      await activeLease.event(type,data);
+      if(type==='execution-handle'&&!data.purpose)await activeLease.update({[activeLease.record.controlStarted?'controlHandle':'payloadHandle']:data.handle});
+    }
     await context.event(type, data);
   }};
   const idFor = physical => 'ascend-' + digest(JSON.stringify(local
@@ -291,10 +294,80 @@ export async function createEnvironment(options, context) {
     return devices.map((_, slot) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
       available: true, metadata: {kind:'host-slot', pool, target:options.target} }));
   }
+  let commandActive=false, controlEnvironment;
+  async function control() {
+    if(controlEnvironment)return controlEnvironment;
+    const path=join(root,'lease-control'),sourcePath=join(path,'source');
+    await mkdir(sourcePath,{recursive:true});
+    controlEnvironment=await genericEnvironment(options,{...commandContext,signal:undefined,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
+      await commandContext.event(type,{...data,...(type==='execution-submitting'&&data.kind==='run'&&data.accountingExcluded===false?{controlPayload:true}:{}),purpose:'device-lease-control',accountingExcluded:true});
+      if(activeLease&&type==='execution-handle'&&!data.purpose)await activeLease.update({controlHandle:data.handle});
+    }});
+    await controlEnvironment.prepare({project:{source:sourcePath},attempt:{id:'lease-control'}});
+    return controlEnvironment;
+  }
+  let reconciling;
+  function reconcileLease(){
+    if(!reconciling)reconciling=reconcileCurrent().finally(()=>{reconciling=null;});
+    return reconciling;
+  }
+  async function reconcileCurrent() {
+    let retained;
+    try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return true;throw error;}
+    const lease=await openDeviceLease(retained.receipt,retained.token);
+    if(lease.record.version!==2)return false;
+    activeLease=lease;
+    try {
+      const handles=new Set(lease.record.handles);
+      for(const row of lease.record.submissions){
+        if(row.closed===true)continue;
+        let handle=row.handle;
+        if(!handle&&row.receiptFile)try{handle=(await readJson(row.receiptFile)).handle;}catch{}
+        if(!handle)return false;
+        if(row.controlPayload&&!lease.record.controlHandle)await lease.update({controlHandle:handle});
+        handles.add(handle);
+      }
+      // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
+      for(const handle of handles)if((await environment.observe(handle,{signal:AbortSignal.timeout(observationSeconds*1000)})).state!=='stopped')return false;
+      const cleanup=await control();
+      // A positively refused control submission may be retried. Unknown submissions
+      // returned above; a recovered payload handle is always observed, never replayed.
+      if(lease.record.controlStarted&&!lease.record.controlHandle)await lease.update({controlStarted:false});
+      if(!lease.record.controlStarted){
+        await lease.update({controlStarted:true});
+        const request={devices:[retained.physicalDevice],lease:{pool:retained.pool,token:lease.token}};
+        const code="import os,sys,json,hashlib,time\nc=json.loads(sys.argv[1])\n"+hostReconcile;
+        const result=await context.exclude('setup',()=>cleanup.execute(`${quote(options.python??'python3')} -c ${quote(code)} ${quote(JSON.stringify(request))}`,
+          join(root,'lease-control','source'),{timeout:seconds,leaseReceipt:true}));
+        if(!result.settled)return false;
+      }
+      if(!lease.record.controlHandle)return false;
+      if((await cleanup.observe(lease.record.controlHandle)).state!=='stopped')return false;
+      const receipt=await cleanup.readAdmission(lease.record.controlHandle);
+      if(receipt?.token===lease.token&&receipt.decision==='contended'){
+        await lease.update({controlStarted:false,controlHandle:null});return false;
+      }
+      if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
+      await lease.release();await unlink(leasePath);return true;
+    } finally {activeLease=null;}
+  }
   return {
-    ...environment, resources, inspectDevices, shellOnTarget:local,
+    ...environment, resources, inspectDevices,
+    reconcileLease:()=>commandActive?Promise.resolve(false):reconcileLease(), shellOnTarget:local,
+    async observe(handle,settings){
+      const result=await environment.observe(handle,settings);
+      if(result.state==='stopped'&&!commandActive)await reconcileLease();
+      return result;
+    },
+    async reconcileOperation(operation){
+      const result=await environment.reconcileOperation(operation);
+      return {...result,closed:result.closed && await reconcileLease()};
+    },
     instructions:environment.instructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),
     async execute(command, cwd, opts = {}) {
+      if(commandActive)throw Object.assign(new Error('Concurrent device commands on one actor are unsupported'),{code:'CONCURRENT_DEVICE_COMMAND'});
+      commandActive=true;
+      try {
       const signal = context.signal && opts.signal ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal;
       const started = performance.now();
       let excludedMs = 0;
@@ -304,13 +377,10 @@ export async function createEnvironment(options, context) {
         try { return await context.exclude(label, fn); }
         finally { excludedMs += performance.now() - before; }
       };
-      return serial(async () => {
-        // Unknown execution is fenced across restart. Observation is allowed;
-        // submitting another command is not evidence that the old one stopped.
-        try {
-          const retained = await readJson(leasePath);
-          throw new Error(`Device lease unresolved; reconcile ${JSON.stringify(retained)}`);
-        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      activeExclude=exclude;
+      return await serial(async () => {
+        if(!await reconcileLease())throw new Error('Device lease unresolved; observe retained handles before retry');
+        for(;;){
         let physical, lease;
         await preflight(async emit => {
           for (;;) {
@@ -338,15 +408,39 @@ export async function createEnvironment(options, context) {
           configuration: { ...options.health, allow_busy:false, require_idle:timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
         try {
-          const result = await environment.execute(guarded, cwd, { ...opts, signal, timeout: remaining(), resourceId: physical,
-            env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
-          if (result.settled) { await lease.release(); await unlink(leasePath); }
-          return result;
+          const attemptStarted=performance.now(),attemptExcluded=excludedMs;
+          const measured=await context.exclude('admission',async()=>{
+            const result = await environment.execute(guarded, cwd, { ...opts, signal, timeout: remaining(), resourceId: physical, leaseReceipt:true,admissionToken:lease.token,
+              env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
+            const admission=result.settled?await environment.readAdmission(result.handle,{signal:AbortSignal.timeout(observationSeconds*1000)}):null;
+            return {result,admission,queueWait:admission?.token===lease.token && admission.decision==='contended'};
+          });
+          const {result,admission}=measured;
+          if(!result.settled)return result;
+          if(admission?.token!==lease.token)return {...result,settled:false,admissionUnknown:true};
+          if(measured.queueWait){
+            excludedMs+=performance.now()-attemptStarted-(excludedMs-attemptExcluded);
+            await context.event('execution-state',{handle:result.handle,state:'stopped',executionSeconds:0,accountingExcluded:true});
+          }
+          if(['contended','health-refused'].includes(admission.decision)){
+            await lease.release();await unlink(leasePath);
+          } else {
+            activeLease=null;
+            if(!await reconcileLease())return {...result,settled:false,admissionUnknown:true};
+          }
+          if(admission.decision==='contended'){
+            await exclude('queue-wait',()=>delay(options.leasePollMs??250,undefined,{signal}));
+            continue;
+          }
+          return {...result,admission};
         } catch (error) {
-          if (error.closure?.closed) { await lease.release(); await unlink(leasePath); }
+          // Even known native closure requires target-fence reconciliation.
+          if(error.closure?.closed){activeLease=null;await reconcileLease();}
           throw error;
         } finally { activeLease = null; }
-      }, operation => exclude('queue-wait', operation));
+        }
+      });
+      } finally {commandActive=false;activeExclude=null;}
     },
   };
 }

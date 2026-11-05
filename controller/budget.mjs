@@ -14,6 +14,13 @@ export class ActorClock {
   get remaining() { return Math.max(0, this.limit / 1000 - this.elapsed); }
   check() { if (!this.remaining) throw Object.assign(new Error('Actor elapsed allocation exhausted'),{code:'ACTOR_ELAPSED_EXHAUSTED'}); }
   async exclude(label, operation) {
+    // Admission is charged until a token-verified nonadmission result proves pure wait.
+    if(label==='admission'){
+      const before=this.elapsed;
+      const result=await operation();
+      if(result?.queueWait===true)this.saved-=(this.elapsed-before)*1000;
+      return result;
+    }
     if (!['setup', 'transfer', 'queue-wait'].includes(label)) throw new Error('Unsupported clock exclusion');
     if (!this.depth++) this.saved += this.now() - this.started;
     try { return await operation(); }
