@@ -63,5 +63,10 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
     await f.config({host_memory:{max_bytes:cap}});
     await f.run('resume');
     assert.equal(JSON.parse(f.rows("SELECT value FROM control WHERE key='pause'")[0].value),false);
+    await f.run('stop');
+    const fresh=await f.run('wave');
+    assert(fresh.results.some(row=>row.outcome==='passed'));
+    assert.equal(f.rows("SELECT status FROM projects WHERE id='after-ceiling-change'")[0].status,'passed');
+    assert.equal(JSON.parse(f.rows("SELECT value FROM control WHERE key='stop'")[0].value),false);
     passed=true;
   });

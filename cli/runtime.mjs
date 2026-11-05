@@ -51,7 +51,7 @@ export async function dispatchManaged(command,config,options={},manager=managedR
   options.signal?.addEventListener('abort',stop,{once:true});
   try {
     if(!await instanceStopped(config))throw new Error('Instance is running or draining; wait for its owned workers before starting');
-    if(command!=='resume'&&(ctl.get('pause')||ctl.get('stop')))return {reason:ctl.get('pause')?'paused':'stopped'};
+    if(command!=='resume'&&ctl.get('pause'))return {reason:'paused'};
     try {await manager.configureHostMemory(config.host_memory,{...profile,verifyInstanceStopped:()=>instanceStopped(config)});}
     catch(error){ctl.set('wait',{reason:'memory-enforcement',message:error.message});throw error;}
     let receipt;
@@ -61,7 +61,11 @@ export async function dispatchManaged(command,config,options={},manager=managedR
       try {await manager.verifyProcessMembership(receipt.owner.pid,profile);}
       catch(error){throw new Error('Existing owned KDB is outside the managed aggregate. Stop its recorded owner before upgrading: '+error.message);}
     }
-    if(command==='resume'){ctl.set('pause',false);ctl.set('stop',false);}
+    options.signal?.throwIfAborted();
+    if(command==='resume')ctl.set('pause',false);
+    ctl.set('stop',false); // Explicit external start; restarted --managed entries never clear it.
+    ctl.set('managed-excluded',command==='resume'?[]:
+      state.db.prepare('SELECT id FROM attempts WHERE outcome IS NULL').all().map(attempt=>attempt.id));
     await mkdir(join(config.root,'logs'),{recursive:true});
     const resultFile=join(config.root,'logs','managed-'+randomUUID()+'.json');
     const args=[fileURLToPath(new URL('./main.mjs',import.meta.url)),command,'--instance',config.root,'--managed','--managed-result',resultFile];
@@ -80,7 +84,7 @@ export async function dispatchManaged(command,config,options={},manager=managedR
   } finally {options.signal?.removeEventListener('abort',stop);state.close();}
 }
 
-export async function operate(command,config,options={}) {
+export async function operate(command,config,options={},manager=managedRuntime) {
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
     recovery:options['no-recovery']?false:config.recovery};
@@ -120,7 +124,7 @@ export async function operate(command,config,options={}) {
     }
     if(options.managed&&(ctl.get('pause')||ctl.get('stop')))return {reason:ctl.get('pause')?'paused':'stopped'};
     if(options.managed) {
-      await managedRuntime.verifyProcessMembership(process.pid,managedRuntime.managedOptions(config));
+      await manager.verifyProcessMembership(process.pid,managedRuntime.managedOptions(config));
     }
     const active=ctl.get('owner');
     if(active && !await ownerStopped(active))throw new Error('Instance controller is already running');
@@ -139,24 +143,23 @@ export async function operate(command,config,options={}) {
     if((await readConfig(config.root)).mode!==config.mode)await updateConfig(config.root,current=>({...current,mode:config.mode}));
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     let wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
-    const queue=new RecoveryQueue(state,policy(config));
+    const queue=new RecoveryQueue(state,policy(config)),retainedWorkers=[];
     if(options.managed) {
       if(ctl.get('pause')||ctl.get('stop'))return {reason:ctl.get('pause')?'paused':'stopped'};
-      await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal,managed:true});
+      await (manager.ensureKnowledgeService??(await import('./knowledge.mjs')).ensureKnowledgeService)(config,{signal:schedulerAbort.signal,managed:true});
       // A controller restart observes its retained services instead of resubmitting live workers.
       for(const attempt of state.db.prepare('SELECT * FROM attempts').all()) {
         const started=state.queryEvents(attempt.id,{types:['managed-worker-started'],order:'desc',limit:1})[0];
         if(!started||state.queryEvents(attempt.id,{types:['worker-memory'],order:'desc',limit:1})
           .some(event=>event.sequence>started.sequence&&event.data.closed))continue;
-        const retained=await managedRuntime.observeManagedWorker(started.data,managedRuntime.managedOptions(config));
-        const exit=await retained.wait({timeoutMs:86400000});
-        state.event(attempt.id,'worker-memory',{...exit.metrics,closed:exit.closed,unit:started.data.unit,reconciled:true});
-        if(exit.metrics?.peak_bytes>0)ctl.set('worker-peak',Math.max(ctl.get('worker-peak')??0,exit.metrics.peak_bytes));
+        const manifest=JSON.parse(await readFile(join(config.root,'attempts',attempt.id,'job.json'),'utf8'));
+        retainedWorkers.push({identity:started.data,job:{...manifest,attempt,projectId:attempt.project,resume:true,
+          memoryBytes:started.data.memory_bytes??config.host_memory.max_bytes}});
       }
     }
     // Unknown failed execution is reconciled, never replayed through the actor.
     for(const attempt of state.db.prepare('SELECT * FROM attempts WHERE outcome IS NOT NULL').all()) {
-      if(failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
+      if(retainedWorkers.some(worker=>worker.job.attempt.id===attempt.id)||failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
       try {
         const path=join(config.root,'attempts',attempt.id);
         const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
@@ -170,7 +173,7 @@ export async function operate(command,config,options={}) {
       JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
       schedulerAbort.signal.throwIfAborted();
       try {
-        if(!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
+        if(retainedWorkers.some(worker=>worker.job.attempt.id===attempt.id)||!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
         const path=join(config.root,'attempts',attempt.id);
         const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
         const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
@@ -193,7 +196,8 @@ export async function operate(command,config,options={}) {
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
     jobs.push(...(command==='resume'||options.managed
-      ? state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all().map(attempt=>({attempt,projectId:attempt.project,resume:true}))
+      ? state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all()
+          .filter(attempt=>command==='resume'||!(ctl.get('managed-excluded')??[]).includes(attempt.id)).map(attempt=>({attempt,projectId:attempt.project,resume:true}))
       : nextWave(state,{wave,...policy(config)}).filter(job=>{
           const selected=config.curriculum?.[config.mode];
           return Array.isArray(selected)?selected.includes(job.projectId):(!job.project.spec.phase || job.project.spec.phase===config.mode);
@@ -273,7 +277,7 @@ export async function operate(command,config,options={}) {
       };
       let exit;
       if(options.managed) {
-        managedWorker=await managedRuntime.spawnManagedWorker(prepare,
+        managedWorker=await manager.spawnManagedWorker(prepare,
           {...managedRuntime.managedOptions(config),memoryBytes:job.memoryBytes});
         state.event(attempt.id,'managed-worker-started',{...managedWorker.identity,memory_bytes:job.memoryBytes});
         exit=await managedWorker.wait({timeoutMs:86400000});serviceClosed=exit.closed;
@@ -330,6 +334,32 @@ export async function operate(command,config,options={}) {
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
     let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot;
     let freshSinceRecovery=ctl.get('fresh-since-recovery')??0;
+    const track=(job,operation)=>{
+      const key=keyFor(job);startedJobs.add(key);
+      const pending=Promise.resolve().then(operation).then(value=>{
+        if(value.deferred)startedJobs.delete(key);else results.push(value);
+      });
+      running.add(pending);activeJobs.set(pending,job);
+      pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
+        if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
+    };
+    for(const {identity,job} of retainedWorkers)track(job,async()=>{
+      try {
+        const retained=await manager.observeManagedWorker(identity,managedRuntime.managedOptions(config));
+        const exit=await retained.wait({timeoutMs:86400000});
+        state.event(job.attempt.id,'worker-memory',{...exit.metrics,closed:exit.closed,unit:identity.unit,reconciled:true});
+        if(exit.metrics?.peak_bytes>0)ctl.set('worker-peak',Math.max(ctl.get('worker-peak')??0,exit.metrics.peak_bytes));
+        const attempt=state.attempt(job.attempt.id);
+        if(!ctl.get('stop')&&!ctl.get('pause')&&!attempt.outcome)
+          await contain(attempt,job.resource,'worker-exit',JSON.stringify(exit));
+        const previous=await environment(config,join(config.root,'attempts',attempt.id),
+          (type,data)=>state.event(attempt.id,type,data),async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
+        if(exit.closed&&await attemptStopped(state,state.attempt(attempt.id),previous)&&failureSettled(state,attempt.id))
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+        return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,reconciled:true};
+      }catch(error){state.event(job.attempt.id,'managed-worker-unresolved',{...identity,message:error.message});
+        return {attempt:job.attempt.id,error:error.message};}
+    });
     const start=async(job,resource)=>{
       if(options.managed) {
         const profile=managedRuntime.managedOptions(config),cap=config.host_memory.max_bytes;
@@ -339,21 +369,14 @@ export async function operate(command,config,options={}) {
         const memoryBytes=peak?Math.ceil(peak*1.25):cap-reserve;
         const reserved=[...activeJobs.values()].reduce((sum,active)=>sum+(active.memoryBytes??0),0);
         let measured;
-        try {measured=await managedRuntime.measureManagedMemory(profile);}
+        try {measured=await manager.measureManagedMemory(profile);}
         catch(error){ctl.set('wait',{reason:'memory-enforcement',message:error.message});return false;}
         ctl.set('memory',{...measured,worker_peak_bytes:peak,control_bytes:reserve,reserved_worker_bytes:reserved});
         if(memoryBytes<=0||reserved+memoryBytes+reserve>cap||measured.current_bytes+Math.ceil(memoryBytes*1.25)>cap){ctl.set('wait',{reason:'memory-capacity'});return false;}
-        await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal,managed:true});
+        await (manager.ensureKnowledgeService??(await import('./knowledge.mjs')).ensureKnowledgeService)(config,{signal:schedulerAbort.signal,managed:true});
         job={...job,memoryBytes};
       }
-      const key=keyFor(job);
-      startedJobs.add(key);
-      const pending=launch(job,resource).then(value=>{
-        if(value.deferred)startedJobs.delete(key);else results.push(value);
-      });
-      running.add(pending);activeJobs.set(pending,job);
-      pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
-        if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
+      track(job,()=>launch(job,resource));
       if(!job.finalize) {
         freshSinceRecovery=job.kind==='original'?freshSinceRecovery+1:0;
         ctl.set('fresh-since-recovery',freshSinceRecovery);
@@ -433,6 +456,7 @@ export async function operate(command,config,options={}) {
         job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
+        if(job.attempt&&[...activeJobs.values()].some(active=>active.attempt?.id===job.attempt.id))return false;
         if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
         if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
         if(job.finalize&&state.queryEvents(job.attempt.id,{types:['postprocess-completed'],limit:1}).length)return false;
