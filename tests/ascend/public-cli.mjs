@@ -99,5 +99,13 @@ test('public CLI preserves recovery, maintenance, pause and explicit controller 
     for(const [path,bytes] of sessionBytes) {
       assert.equal(digest(await readFile(path)),digest(bytes));
     }
+    // Consume the remaining elapsed allocation after restart, without new work.
+    const allocation=budgetAfter.elapsed+1;
+    await f.config({campaign_seconds:allocation});
+    const expired=await f.run('resume');
+    assert.equal(expired.reason,'elapsed');
+    assert(control('campaign-budget').elapsed>=allocation);
+    assert.equal(control('campaign-budget').cycle,budgetBefore.cycle);
+    assert.deepEqual(f.rows('SELECT * FROM attempts'),settled);
     passed=true;
   });

@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {operate} from '../../cli/runtime.mjs';
 import {State} from '../../controller/state.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 import {requests,reconcileRequests,trackRequest} from '../../cli/background.mjs';
@@ -53,4 +56,18 @@ test('request execution publishes success or failure once and refuses replay',as
   assert.equal(rows.find(row=>row.id==='failure').status,'failed');
   assert.equal(rows.find(row=>row.id==='success').status,'passed');
   assert.deepEqual(rows.find(row=>row.id==='success').result,{indexed:2});
+});
+
+
+test('explicit restart refuses a surviving worker without duplicating or killing it',async t=>{
+  const {root,state}=await fixture(t);
+  const child=spawn(process.execPath,['--max-old-space-size=32','-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+  await once(child,'spawn');
+  t.after(async()=>{const closed=once(child,'exit');child.kill('SIGTERM');await closed;});
+  state.add({id:'still-running',goal:'unchanged',actor_seconds:30});
+  const attempt=state.admit('still-running',await processIdentity(child.pid));
+  await assert.rejects(operate('resume',{root,mode:'phase1',projects:[]}),/Previous worker remains active/);
+  assert.equal(state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,1);
+  assert.equal(state.attempt(attempt.id).outcome,null);
+  assert.equal(child.exitCode,null);
 });
