@@ -23,7 +23,7 @@ export function curriculumRoleHistory(state,attemptId,role) {
   return {prior,seconds,elapsed};
 }
 
-async function curriculumSession({config,path,bridge,prompt,tool,signal,state,attemptId,role,accepted,resume=false}) {
+export async function curriculumSession({config,path,bridge,prompt,tool,signal,state,attemptId,role,accepted,resume=false}) {
   const agentDir=join(path,'agent');await mkdir(agentDir,{recursive:true});
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
