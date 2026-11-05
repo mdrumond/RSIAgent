@@ -142,3 +142,9 @@ test('repository with a remote is rejected without contacting it', async t => {
   await history.git(['remote', 'add', 'origin', '/nonexistent/local-only-test']);
   await assert.rejects(new KnowledgeHistory(history.directory).init(), /remoteless/);
 });
+
+test('Git skill blobs preserve Unicode and trailing whitespace exactly',async t=>{
+ const history=await fixture(t),text='# Skill\n'+('中文 café 🧪 '.repeat(3000))+'\n\n';
+ const proposed=await history.proposeSkill({id:'unicode',skills:{debug:text}});
+ assert.equal((await history.readRevision(proposed.revision)).skills.debug,text);
+});

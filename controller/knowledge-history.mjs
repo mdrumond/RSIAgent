@@ -23,7 +23,7 @@ export class KnowledgeHistory {
     this.pending = Promise.resolve();
   }
 
-  git(args, { input = '', env = {} } = {}) {
+  git(args, { input = '', env = {}, raw = false } = {}) {
     return new Promise((ok, fail) => {
       const child = spawn('git', ['-C', this.directory, ...args], {
         env: { ...process.env, GIT_AUTHOR_NAME: 'Knowledge history', GIT_AUTHOR_EMAIL: 'knowledge@localhost',
@@ -31,11 +31,12 @@ export class KnowledgeHistory {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let stdout = '', stderr = '';
+      child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
       child.stdout.on('data', chunk => { stdout += chunk; });
       child.stderr.on('data', chunk => { stderr += chunk; });
       child.on('error', fail);
       child.stdin.on('error', error => { if (error.code !== 'EPIPE') fail(error); });
-      child.on('close', code => code === 0 ? ok(stdout.trimEnd()) :
+      child.on('close', code => code === 0 ? ok(raw ? stdout : stdout.trimEnd()) :
         fail(Object.assign(new Error(`git ${args[0]}: ${stderr}`), { code })));
       child.stdin.end(input);
     });
@@ -97,7 +98,7 @@ export class KnowledgeHistory {
     const paths = (await this.git(['ls-tree', '-r', '--name-only', commit])).split('\n');
     const memory = [], skills = {};
     for (const path of paths.filter(path => path && !path.endsWith('/.gitkeep'))) {
-      const content = await this.git(['show', `${commit}:${path}`]);
+      const content = await this.git(['show', `${commit}:${path}`],{raw:true});
       if (path.startsWith('memory/')) memory.push(JSON.parse(content));
       if (path.startsWith('skills/')) skills[path.slice(7)] = content;
     }
