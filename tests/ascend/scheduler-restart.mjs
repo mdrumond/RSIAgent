@@ -34,7 +34,7 @@ async function seededLease(f,owner,{terminal=true,unknown=false,held=false,recor
       const findings={findings:'Retained outcome',useful:false,evidence:[{path:log,sha256}]};
       await writeFile(join(path,'findings.json'),JSON.stringify(findings));
       state.finish(id,'failed');
-      if(recorded){recordOutcome(state,{attemptId:id,wave:0,passed:false,...findings});
+      if(recorded&&!unknown&&!held){recordOutcome(state,{attemptId:id,wave:0,passed:false,...findings});
         for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);}
     }
     return state.attempt(id);
