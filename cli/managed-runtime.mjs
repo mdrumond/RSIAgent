@@ -206,6 +206,7 @@ async function launchLocked(descriptor, options) {
     '--property=MemorySwapMax=0', '--property=OOMPolicy=kill', '--property=KillMode=control-group',
     '--property=TimeoutStopSec=5s', '--property=Restart=' + (options.controller||options.knowledge ? 'on-failure' : 'no'),
     '--property=MemoryMax=' + (options.controller ? controllerMemory : memory),
+    ...(options.backgroundCompression?['--property=CPUQuota=100%','--property=Nice=10']:[]),
     ...(options.controller||options.knowledge ? ['--property=RestartSec=1s'] : options.maintenance?[]:['--remain-after-exit']), ...command];
   const child = (options.spawn ?? spawn)('systemd-run', args, {stdio:['ignore','pipe','pipe']});
   // Drain diagnostics with a hard retention bound. Never buffer worker logs here.

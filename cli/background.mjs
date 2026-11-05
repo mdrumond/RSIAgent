@@ -31,7 +31,7 @@ export async function reconcileRequests(root,{state,manager=managed}={}) {
 }
 
 export async function startBackground(root,command,action,{detach=true,signal,manager=managed}={}) {
-  if(!['kdb','tune'].includes(command))throw new Error('Managed maintenance command required');
+  if(!['kdb','tune','storage'].includes(command))throw new Error('Managed maintenance command required');
   const config=await readConfig(root);root=config.root;
   const profile=managed.managedOptions(config);
   const {instanceStopped}=await import('./runtime.mjs');
@@ -46,11 +46,11 @@ export async function startBackground(root,command,action,{detach=true,signal,ma
   signal?.addEventListener('abort',stop,{once:true});
   try {
     signal?.throwIfAborted();
-    handle=await manager.startManagedMaintenance({argv:[process.execPath,fileURLToPath(new URL('./main.mjs',import.meta.url)),
+    handle=await manager.startManagedMaintenance({argv:[process.execPath,...(command==='storage'?['--max-old-space-size=256']:[]),fileURLToPath(new URL('./main.mjs',import.meta.url)),
       command,'--instance',root,'--config',file,'--request',id,'--managed'],cwd:root,
       env:{...process.env,RSI_MANAGED_ROOT:root,RSI_MANAGED_ROLE:'maintenance',RSI_MANAGED_UNIT:unit},
       stdout:join(directory,'output.log'),stderr:join(directory,'output.log')},
-      {...profile,unit,memoryBytes:config.host_memory.max_bytes-profile.controlMemoryBytes});
+      {...profile,unit,backgroundCompression:command==='storage',memoryBytes:command==='storage'?Math.min(512*1024*1024,config.host_memory.max_bytes-profile.controlMemoryBytes):config.host_memory.max_bytes-profile.controlMemoryBytes});
     state.db.prepare("UPDATE requests SET owner=? WHERE id=? AND status='queued' AND owner IS NULL")
       .run(JSON.stringify(handle.identity),id);
     if(signal?.aborted)await handle.stop();

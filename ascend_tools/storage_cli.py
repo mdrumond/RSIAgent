@@ -31,6 +31,8 @@ class Storage:
         if not 1 <= limit <= 1000:
             raise ValueError('limit must be 1..1000')
         clauses, args = ['f.id > ?'], [action.get('after', '')]
+        if action.get('action') == 'compress':
+            clauses.extend(["f.encoding='plain'", "f.kind!='source-git'"])
         fields = {'artifact': 'f.id', 'project': 'COALESCE(f.project,a.project)',
                   'role': 'f.role', 'phase': 's.phase', 'kind': 'f.kind',
                   'outcome': 'a.outcome', 'skill_revision': 's.skill_revision',

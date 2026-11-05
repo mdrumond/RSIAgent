@@ -59,6 +59,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     const storage=new CampaignStorage(ledger,destination);
     const campaign=await storage.initialize({target:config.target??null});
     config.storage={format:1,campaign_id:campaign.id};
+    await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(
+      {...config,root:destination},ledger,{serialized:true});
   }finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
@@ -88,7 +90,7 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
 
 async function copyMachinery(machinery,release,install=true) {
   await mkdir(release);
-  for (const item of ['controller','cli','ascend_tools','web','templates','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
+  for (const item of ['controller','cli','ascend_tools','web','templates','scripts','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
     const from=join(machinery,item);
     try {await stat(from);} catch(error) {if(error.code==='ENOENT')continue;throw error;}
     await cp(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))});

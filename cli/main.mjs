@@ -6,23 +6,32 @@ import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
+import {schemaOptions as storageOptions} from './storage.mjs';
 
 export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
-    instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
+    ...storageOptions,instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
     managed:{type:'boolean'},'managed-result':{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
-  const root=resolve(values.instance??arg??'.');
+  const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','host-memory']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','host-memory','storage']};
+  const storageAction=command==='storage'?(values.config?JSON.parse(await readFile(values.config,'utf8')):{...values,action:values.action??arg??'inspect'}):null;
+  if(storageAction?.action==='unpack')return (await import('./storage.mjs')).runStandalone({...storageAction,signal});
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
       skills:values.skills??config.skills,repository:values.repository??config.repository});
   }
   const config=await readConfig(root);
+  if(command==='storage') {
+    if(!config.storage)throw new Error('Storage ledger required; existing campaigns are unchanged');
+    if(!values.managed&&['compress','pack','prune','restore'].includes(storageAction.action))
+      return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{detach:values.detach??false,signal,manager});
+    return (await import('./storage.mjs')).run(config,{...storageAction,signal});
+  }
   if(command==='host-memory') {
     const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'status'};
     if(action.action==='status')return (await import('../controller/host-memory.mjs'))
@@ -180,7 +189,7 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
 if(import.meta.main) {
   const abort=new AbortController();
   const stop=()=>abort.abort();process.on('SIGTERM',stop);process.on('SIGINT',stop);
-  main(undefined,{signal:abort.signal}).then(value=>console.log(JSON.stringify(value))).catch(error=>{
+  main(undefined,{signal:abort.signal}).then(value=>{if(value!==undefined)console.log(JSON.stringify(value));}).catch(error=>{
     console.error(JSON.stringify({error:error.message}));process.exitCode=1;
   }).finally(()=>{process.off('SIGTERM',stop);process.off('SIGINT',stop);});
 }

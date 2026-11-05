@@ -4,10 +4,10 @@ import { State } from '../controller/state.mjs';
 import { processIdentity,ownerStopped } from '../controller/lifecycle.mjs';
 
 // A short SQLite claim protects files across processes; no transaction spans model work.
-export async function withSkillLock(config,operation,{signal}={}) {
+export async function withSkillLock(config,operation,{signal,key='skill-writer'}={}) {
   const state=new State(join(config.root,'state.sqlite'));
   state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
-  const me=JSON.stringify(await processIdentity()),key='skill-writer';let owned=false;
+  const me=JSON.stringify(await processIdentity());let owned=false;
   const end=performance.now()+(config.skill_queue_seconds??3600)*1000;
   try {
     while(performance.now()<end) {

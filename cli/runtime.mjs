@@ -160,6 +160,10 @@ export async function operate(command,config,options={},manager=managedRuntime) 
     if(options.managed) {
       if(ctl.get('pause')||ctl.get('stop'))return {reason:ctl.get('pause')?'paused':'stopped'};
       await (manager.ensureKnowledgeService??(await import('./knowledge.mjs')).ensureKnowledgeService)(config,{signal:schedulerAbort.signal,managed:true});
+      if(config.storage) {
+        const url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal});
+        await (await import('../controller/storage-knowledge.mjs')).activateStorageBaseline(config,{state,url,signal:schedulerAbort.signal});
+      }
       // A controller restart observes its retained services instead of resubmitting live workers.
       for(const attempt of state.db.prepare('SELECT * FROM attempts').all()) {
         const started=state.queryEvents(attempt.id,{types:['managed-worker-started'],order:'desc',limit:1})[0];
@@ -285,7 +289,8 @@ export async function operate(command,config,options={},manager=managedRuntime) 
       const storage=CampaignStorage.open(state,config.root);
       if(storage) {
         storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
-          parent:job.origin_attempt??null,wave:admitted.wave??wave,skillRevision:skillVersion});
+          parent:job.origin_attempt??null,wave:admitted.wave??wave,
+          skillRevision:storage.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get()?.revision??skillVersion});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
@@ -351,7 +356,12 @@ export async function operate(command,config,options={},manager=managedRuntime) 
     const unavailable=new Set();let resourceWait;
     const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
-    let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot;
+    let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot,storageLaunch;
+    const compress=()=>{
+      if(!config.storage||!options.managed||storageLaunch)return;
+      storageLaunch=import('./storage-maintenance.mjs').then(({queueCompression})=>queueCompression(config,{manager}))
+        .catch(error=>state.event(null,'storage-maintenance-error',{message:error.message})).finally(()=>{storageLaunch=null;});
+    };
     let freshSinceRecovery=ctl.get('fresh-since-recovery')??0;
     const track=(job,operation)=>{
       const key=keyFor(job);startedJobs.add(key);
@@ -360,6 +370,7 @@ export async function operate(command,config,options={},manager=managedRuntime) 
       });
       running.add(pending);activeJobs.set(pending,job);
       pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
+        compress();
         if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
     };
     for(const {identity,job} of retainedWorkers)track(job,async()=>{
@@ -543,6 +554,7 @@ export async function operate(command,config,options={},manager=managedRuntime) 
     await Promise.all(running);
     if(maintenance)await maintenance;
     if(generation)await generation;
+    compress();if(storageLaunch)await storageLaunch;
     }catch(error){
       const interrupted=schedulerAbort.signal.aborted;
       if(!interrupted)state.event(null,'scheduler-error',{message:error.message});

@@ -16,7 +16,7 @@ export async function sealClosedArtifacts(config,action={}) {
   const state=new State(join(config.root,'state.sqlite'));
   try {
     const storage=CampaignStorage.open(state,config.root);if(!storage)return [];
-    const sealed=[],clauses=['f.id>?'],args=[action.after??''];
+    const sealed=[],clauses=["f.id>?","f.status='open'","f.kind!='source-git'"],args=[action.after??''];
     for(const [key,column] of Object.entries({artifact:'f.id',project:'COALESCE(f.project,a.project)',
       role:'f.role',kind:'f.kind',phase:'s.phase',outcome:'a.outcome',
       skill_revision:'s.skill_revision',memory_revision:'s.memory_revision'})) {
@@ -57,8 +57,13 @@ export async function sealClosedArtifacts(config,action={}) {
 export async function run(config,values={}) {
   const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{...values};
   action.action??=values.action??'inspect';
-  if(['compress','pack'].includes(action.action))await sealClosedArtifacts(config,action);
-  return invoke(config,action,values.signal);
+  const operation=async()=>{
+    if(['compress','pack'].includes(action.action))await sealClosedArtifacts(config,action);
+    return invoke(config,action,values.signal);
+  };
+  if(['compress','pack','prune','restore'].includes(action.action))
+    return (await import('./evolution-lock.mjs')).withSkillLock(config,operation,{signal:values.signal,key:'storage-maintenance'});
+  return operation();
 }
 
 export async function runStandalone(values={}) {

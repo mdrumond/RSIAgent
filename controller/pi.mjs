@@ -1,7 +1,7 @@
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { mkdir, appendFile, readFile } from 'node:fs/promises';
-import { join,resolve } from 'node:path';
+import { join,resolve,relative } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
@@ -10,6 +10,7 @@ import { fingerprint, freezeFiles } from './evidence.mjs';
 import { createEnvironmentTools } from '../integrations/environments/index.mjs';
 import { createPiTelemetryJournal } from './pi-telemetry.mjs';
 import {CampaignStorage} from './storage.mjs';
+import {prepareSourceGit} from './source-git.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
@@ -29,13 +30,28 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     operation:activeOperation??data.operation??data.submission,actor_elapsed:clock.elapsed});
   const event=(type,data)=>{
     state.event(attempt.id,type,eventData(data));
-    if(storage&&type==='stage-completed')storage.iteration(attempt.id,{stage:data.stage,reflection:data.reflection});
+    if(storage&&type==='stage-completed'&&data.stage!=='validation') {
+      artifactWrites=artifactWrites.then(async()=>{
+        const snapshot=sourceGit&&['implementation','optimisation'].includes(data.stage)
+          ?await sourceGit.captureTree({signal,timeout:Math.min(30000,clock.remaining*1000)}):null;
+        storage.iteration(attempt.id,{stage:data.stage,reflection:data.reflection,
+          sourceHash:snapshot?.tree_oid??null,sourceCommit:snapshot?.head??null});
+        if(snapshot)state.event(attempt.id,'source-snapshot',{stage:data.stage,...snapshot});
+      }).catch(error=>{artifactError??=error;});
+      return artifactWrites.then(()=>{if(artifactError)throw artifactError;});
+    }
     if(storage&&type==='execution-output')artifactWrites=artifactWrites.then(async()=>{
       for(const stream of ['stdout','stderr'])if(data[stream])await register(data[stream],'execution-'+stream);
       if(data.partial&&data.archive)await register(JSON.stringify(data.archive),'execution-output',true);
     }).catch(error=>{artifactError??=error;});
   };
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
+  const sourceGit=storage?await clock.exclude('setup',async()=>{
+    const key=createHash('sha256').update(attempt.project+'\0'+relative(storage.root,project.source)).digest('hex');
+    const gitDir=join(storage.root,'source-history',key);
+    const git=await prepareSourceGit({source:project.source,gitDir,attemptId:attempt.id});
+    await register(gitDir,'source-git');return git;
+  }):null;
   const telemetry=createPiTelemetryJournal(join(attemptPath,'pi-events.jsonl'),attempt.id,
     data=>state.event(attempt.id,'pi-event',data));
   const environment=await environmentFactory({instancePath:attemptPath,event,signal,
@@ -84,6 +100,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       return {content:guidance+'\n\n'+content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
     },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
     verify:async(verifySignal)=>{
+      if(sourceGit) {
+        const snapshot=await sourceGit.captureTree({signal:verifySignal??signal,timeout:Math.min(30000,clock.remaining*1000)});
+        storage.iteration(attempt.id,{stage:'validation',reflection:JSON.stringify(snapshot),
+          sourceHash:snapshot.tree_oid,sourceCommit:snapshot.head});
+      }
       const check=async(command,purpose)=>{
         clock.check();
         await checkVerifier();
@@ -156,14 +177,15 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     await environment.prepare({project,attempt});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
-    await register(manager.getSessionFile(),'pi-session');
+    if(storage)await storage.session(manager.getSessionFile(),{attempt:attempt.id,
+      phase:storage.db.prepare('SELECT phase FROM storage_attempts WHERE attempt=?').get(attempt.id)?.phase??'phase1'});
     await register(join(attemptPath,'provider.jsonl'),'provider-telemetry');
     await clock.exclude('setup',async()=>{
     const agentDir=join(attemptPath,'agent');
     await mkdir(agentDir,{recursive:true});
     const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
     const loader=new sdk.DefaultResourceLoader({cwd:project.source,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
-      extensionFactories:[extension,...extensions]});
+      extensionFactories:[extension,...(sourceGit?[sourceGit.extension]:[]),...extensions]});
     await loader.reload();
     ({session}=await sdk.createAgentSession({cwd:project.source,agentDir,settingsManager,modelRuntime,model,thinkingLevel,
       sessionManager:manager,resourceLoader:loader}));
@@ -197,7 +219,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       if (!clock.remaining) void session.abort();
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');
-    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.`);
+    const gitGuidance=sourceGit?await readFile(new URL('../templates/skills/source-git.md',import.meta.url),'utf8'):'';
+    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.\n${gitGuidance}`);
     await session.waitForIdle();
     await artifactWrites;
     if(artifactError)throw artifactError;
