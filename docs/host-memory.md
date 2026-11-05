@@ -6,25 +6,26 @@ configuration defaults to 16 GiB. All instances of the same OS user share
 need an administrator-managed common parent limit to establish a machine-wide
 ceiling. The module does not claim cross-user enforcement.
 
-Before launching a controller, provision the user slice once while RSI is
-stopped. Install `rsi.slice` in the standard systemd user unit configuration:
+Bootstrap integration calls `configureHostMemory(config.host_memory, deps)` from
+`cli/host-memory.mjs`. An active matching slice is verified against systemd and
+kernel limits without changing configuration. A conflicting active ceiling fails.
+For an inactive slice, `deps.verifyInstanceStopped` must be an async callback
+returning exactly `true` after checking the caller's instance is stopped. The API
+rechecks that proof under a user provisioning lock, rejects active services,
+scopes or nested slices in the RSI aggregate (including other instances), then
+atomically installs a standard `rsi.slice` user unit with `MemoryAccounting=yes`,
+`MemoryMax=<max_bytes>` and `MemorySwapMax=0`, reloads the manager, starts the slice
+and verifies the kernel limits. This API does not stop running units or change a
+live cap. All systemctl calls have a five-second bound.
 
-```ini
-[Unit]
-Description=RSI aggregate host memory
-
-[Slice]
-MemoryAccounting=yes
-MemoryMax=17179869184
-MemorySwapMax=0
-```
-
-Run `systemctl --user daemon-reload` and `systemctl --user start rsi.slice`.
-Use the configured byte limit instead of the example when overriding the cap.
-Changing a live shared limit is deliberately not automated. An unavailable
-user manager, unsupported cgroup v2 memory controller, missing slice, mismatched
-cap, or controller outside the slice blocks admission. Standard systemd user
-manager delegation must expose the memory controller.
+The unit location follows `XDG_CONFIG_HOME` or the standard user configuration
+directory; machine paths do not belong in tracked instance configuration. A
+concurrent provisioning caller fails closed on the shared lock. Runtime startup
+must be serialized against provisioning across instances; external systemctl
+changes are outside this lock. On an interrupted provisioning call, inspect the
+slice and stopped-instance state before removing a stale provisioning lock.
+Unavailable user managers or cgroup v2 memory delegation cause failure. CLI
+command wiring remains a separate integration step.
 
 Runtime integration uses `createHostMemorySupervisor(config.host_memory)`.
 `controllerCommand(executable, args)` verifies the shared slice and returns
