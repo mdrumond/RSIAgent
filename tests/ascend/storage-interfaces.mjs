@@ -155,3 +155,14 @@ test('immutable shared cited text seals during a live campaign without sealing a
   assert.equal(f.storage.list().find(row=>row.id===f.row.id).status,'open');
   assert.equal(f.storage.list().find(row=>row.id===ordinary.id).status,'open');
 });
+
+test('sealing advances beyond an ineligible page instead of starving later evidence',async t=>{
+ const f=await fixture(t);const second=await f.storage.register('later.jsonl',{attempt:f.attempt.id,kind:'provider-telemetry'});
+ await writeFile(join(f.root,'later.jsonl'),'{}\n');
+ const rows=f.storage.list().sort((a,b)=>a.id.localeCompare(b.id));
+ const first=rows[0],last=rows[1];
+ f.state.db.prepare('UPDATE storage_artifacts SET external=1 WHERE id=?').run(first.id);
+ assert.deepEqual(await sealClosedArtifacts(f.config,{limit:1}),[]);
+ assert.deepEqual(await sealClosedArtifacts(f.config,{limit:1}),[last.id]);
+ assert.equal(f.storage.list().find(r=>r.id===last.id).status,'closed');
+});

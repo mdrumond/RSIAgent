@@ -88,7 +88,7 @@ def _tables(db):
 def _sanitize(value):
     # Runtime routes and process ownership are intentionally not portable.
     blocked = {'owner', 'environment', 'runtime', 'route', 'services',
-               'token', 'api_key', 'password', 'credentials', 'baselineKDB'}
+               'token', 'api_key', 'password', 'credentials', 'credentials_file', 'credential_env', 'baselineKDB'}
     if isinstance(value, dict):
         return {k: _sanitize(v) for k, v in value.items() if k not in blocked}
     if isinstance(value, list):
@@ -210,7 +210,7 @@ def pack(root, dest, project=None, require_complete=True):
     root, dest = Path(root).resolve(), Path(dest).resolve()
     if dest == root or root.is_relative_to(dest) or dest.is_relative_to(root):
         raise ValueError('Package must be separate from campaign')
-    dest.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     if (dest / 'package.json').exists():
         raise FileExistsError('Package already published')
     identity = {'root': str(root), 'project': project}

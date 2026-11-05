@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm,copyFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -610,6 +610,16 @@ export async function createEnvironment(options, context) {
       if (!remote) return readdir(path, { withFileTypes: true }).then(entries => entries.map(entry => ({ name: entry.name, directory: entry.isDirectory() })));
       const dir = await mkdtemp(join(root, 'download-'));
       return exclude('transfer', () => transfer(['download', options.target, path, join(dir, 'content')], dir));
+    },
+    async collectArtifact(source,destination) {
+      return exclude('transfer',async()=>{
+        if(!remote)await copyFile(source,destination);
+        else {
+          const directory=await mkdtemp(join(root,'collect-'));
+          await transfer(['download',options.target,source,destination],directory,context.signal);
+        }
+        return destination;
+      });
     },
   };
 }

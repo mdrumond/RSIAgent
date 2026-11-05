@@ -16,7 +16,10 @@ export async function sealClosedArtifacts(config,action={}) {
   const state=new State(join(config.root,'state.sqlite'));
   try {
     const storage=CampaignStorage.open(state,config.root);if(!storage)return [];
-    const sealed=[],clauses=["f.id>?","f.status='open'","f.kind!='source-git'"],args=[action.after??''];
+    state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+    const globalScan=['artifact','project','phase','role','kind','outcome','stage','iteration','skill-revision','memory-revision','skill_revision','memory_revision'].every(key=>action[key]===undefined);
+    const cursor=action.after??(globalScan?JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='storage-seal-cursor'").get()?.value??'""'):'');
+    const sealed=[],clauses=["f.id>?","f.status='open'","f.kind!='source-git'"],args=[cursor];
     for(const [key,column] of Object.entries({artifact:'f.id',project:'COALESCE(f.project,a.project)',
       role:'f.role',kind:'f.kind',phase:'s.phase',outcome:'a.outcome',
       skill_revision:'s.skill_revision',memory_revision:'s.memory_revision'})) {
@@ -38,13 +41,15 @@ export async function sealClosedArtifacts(config,action={}) {
     const rows=state.db.prepare(`SELECT f.* FROM storage_artifacts f
       LEFT JOIN attempts a ON a.id=f.attempt LEFT JOIN storage_attempts s ON s.attempt=f.attempt
       WHERE ${clauses.join(' AND ')} ORDER BY f.id LIMIT ?`).all(...args,limit);
+    if(action.after===undefined&&globalScan)state.db.prepare("INSERT OR REPLACE INTO control(key,value) VALUES ('storage-seal-cursor',?)")
+      .run(JSON.stringify(rows.at(-1)?.id??''));
     for(const row of rows) {
       if(row.status!=='open'||row.external||row.kind==='source-git')continue;
       if(row.attempt) {
         const attempt=state.attempt(row.attempt);
         if(!attempt?.outcome||!await ownerStopped(attempt.owner)||!failureSettled(state,attempt.id))continue;
         if(!state.queryEvents(attempt.id,{types:['postprocess-completed'],limit:1}).length)continue;
-      } else if(row.kind!=='cited-text')continue;
+      } else if(row.kind!=='cited-text'&&!state.db.prepare('SELECT 1 FROM storage_sessions WHERE (session=? OR provider=?) AND closed=1').get(row.path,row.path))continue;
       try {await storage.seal(row.id);sealed.push(row.id);}
       catch(error) {
         if(error.code!=='ENOENT'&&error.message!=='Artifact must be a file')throw error;

@@ -3,6 +3,8 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { tune } from '../controller/skill-evolution.mjs';
+import {State} from '../controller/state.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
 // and wave({instanceRoot,config,projectIds:[id],evaluation:true}). bootstrap must copy
@@ -61,7 +63,18 @@ export async function run(config, values = {}) {
       const bridge = createKdbBridge({ url, attemptId: task?.id ?? `manual-${randomUUID()}`,
         agentDir: join(options.directory, 'agent'), event: async (type, data) =>
           appendFile(join(options.directory, 'knowledge-events.jsonl'), JSON.stringify({ type, data }) + '\n') });
-      return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension] });
+      const roleStorage=config.storage?{
+        onSession:async(path,provider)=>{
+          const state=new State(join(instanceRoot,'state.sqlite'));
+          try{await CampaignStorage.open(state,instanceRoot)?.session(path,{provider,
+            attempt:task?.id&&state.attempt(task.id)?task.id:null,phase:executedMode,role:'skill-writer'});}finally{state.close();}
+        },
+        onSessionClosed:async(path)=>{
+          const state=new State(join(instanceRoot,'state.sqlite'));
+          try{CampaignStorage.open(state,instanceRoot)?.closeSession(path);}finally{state.close();}
+        }
+      }:{};
+      return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension],...roleStorage });
     };
     const evaluate = async request => {
       request.resource = values.resource;

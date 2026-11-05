@@ -27,7 +27,10 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
   }
   const config=await readConfig(root);
   if(command==='storage') {
-    if(!config.storage)throw new Error('Storage ledger required; existing campaigns are unchanged');
+    if(!config.storage) {
+      if(storageAction.action==='inspect')return {available:false};
+      throw new Error('Storage ledger required; existing campaigns are unchanged');
+    }
     if(!values.managed&&['compress','pack','prune','restore'].includes(storageAction.action))
       return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{detach:values.detach??false,signal,manager});
     return (await import('./storage.mjs')).run(config,{...storageAction,signal});

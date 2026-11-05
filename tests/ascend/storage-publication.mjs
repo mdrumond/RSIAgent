@@ -132,3 +132,38 @@ test('existing skill writer records tune proposals and evaluation decisions thro
   const row=state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get(result.candidate);
   assert.equal(row.decision,'rejected');assert.equal(row.reason,'inconclusive');assert.equal(row.base_version,'initial');
 });
+
+test('restart reconciles a config-selected skill proposal and records rollback history',async t=>{
+ const {config,state,history}=await fixture(t);await initializeStorageKnowledge(config,state);
+ const original=await history.state('skills');
+ const {copyVersion}=await import('../../cli/skill-input.mjs');
+ const map=JSON.parse(await readFile(join(config.root,'skills/versions/initial/skill-map.json')));
+ const version=await copyVersion(config,map,{scope:'debug',content:'new debugging guidance'});
+ await recordStorageSkill(config,version,{baseVersion:'initial'});
+ const next={...config,skills:{...config.skills,activeVersion:version}};
+ await writeFile(join(config.root,'instance.json'),JSON.stringify(next));
+ await initializeStorageKnowledge(next,state);
+ const updated=await history.state('skills');assert.notEqual(updated.revision,original.revision);
+ assert.equal(state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get().revision,updated.revision);
+ await initializeStorageKnowledge(config,state);
+ const rollback=await history.state('skills');assert.notEqual(rollback.revision,updated.revision);
+ assert.equal((await history.readRevision(rollback.revision)).skills['debug.md'],'baseline guidance');
+});
+
+test('baseline export includes active memory only, excluding staged and superseded records',async t=>{
+ const {config,state,history}=await fixture(t);const {DatabaseSync}=await import('node:sqlite');
+ const db=new DatabaseSync(join(config.root,'knowledge.sqlite'));
+ db.exec(`CREATE TABLE collections(name TEXT,language TEXT);
+ CREATE TABLE chunks(collection TEXT,chunk_id TEXT,path TEXT,start_line INTEGER,end_line INTEGER,text TEXT);
+ CREATE TABLE memory_collections(collection TEXT);CREATE TABLE active_generation(singleton INTEGER,revision TEXT);
+ CREATE TABLE generation_collections(generation TEXT,collection TEXT);
+ INSERT INTO active_generation VALUES (1,'active');`);
+ for(const name of ['active','old','staged']){
+  db.prepare('INSERT INTO collections VALUES (?,?)').run(name,'lesson');db.prepare('INSERT INTO memory_collections VALUES (?)').run(name);
+  db.prepare('INSERT INTO chunks VALUES (?,?,?,?,?,?)').run(name,name,'lesson.json',1,1,JSON.stringify({delivery_id:name,lesson:name,outcome:'good',applicability:'a5',evidence:[{path:'e',sha256:'x'}]}));
+  db.prepare('INSERT INTO generation_collections VALUES (?,?)').run(name,name);
+ }
+ db.close();const initialized=await initializeStorageKnowledge(config,state);
+ assert.deepEqual(initialized.baseline.collections,['active']);
+ assert.deepEqual((await history.readRevision(initialized.baseline.revision)).memory.map(r=>r.lesson),['active']);
+});

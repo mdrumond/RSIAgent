@@ -127,6 +127,8 @@ class Storage:
                 raise ValueError('artifact postprocessing or settlement unresolved')
         elif row['kind'] == 'cited-text':
             return  # Immutable cache files are published before registration.
+        elif self.db.execute('SELECT 1 FROM storage_sessions WHERE (session=? OR provider=?) AND closed=1', [row['path'], row['path']]).fetchone():
+            return  # The role session disposed its writer before marking closure.
         else:
             # Unowned evidence requires all recorded campaign writers stopped.
             if self.db.execute('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').fetchone():
@@ -242,15 +244,26 @@ def execute(root, action):
         if name == 'verify':
             return [storage.verify(row) for row in storage.rows(action)]
         if name == 'compress':
-            return [storage.compress(row, bool(action.get('delete_source', action.get('delete-source', False))))
-                    for row in storage.rows(action)]
+            storage.db.execute('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            explicit = 'after' in action or any(key in action for key in ('artifact','project','phase','role','kind','outcome','stage','iteration','skill-revision','memory-revision','skill_revision','memory_revision'))
+            if not explicit:
+                row = storage.db.execute("SELECT value FROM control WHERE key='storage-compress-cursor'").fetchone()
+                action = dict(action, after=json.loads(row[0]) if row else '')
+            rows = storage.rows(action)
+            result = [storage.compress(row, bool(action.get('delete_source', action.get('delete-source', False)))) for row in rows]
+            if not explicit:
+                with storage.db:
+                    storage.db.execute("INSERT OR REPLACE INTO control VALUES ('storage-compress-cursor',?)", [json.dumps(rows[-1]['id'] if rows else '')])
+            return result
         if name == 'prune':
             if action.get('apply'):
                 return storage.apply(action['inventory'])
             return storage.plan(action)
         if name == 'pack':
             from .storage_package import pack
-            return pack(storage.root, Path(action['destination']).resolve(), project=action.get('project'))
+            result = pack(storage.root, Path(action['destination']).resolve(), project=action.get('project'))
+            return dict(package=str(Path(action['destination']).resolve()), complete=result['complete'],
+                        scope=result['scope'], files=len(result['files']), missing=result['missing'])
         if name == 'restore':
             row, = storage.rows(action)
             return dict(path=restore_file(storage.manifest(row), storage.path(action['destination'])))

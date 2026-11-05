@@ -66,9 +66,18 @@ p=pathlib.Path(sys.argv[1])
 if not p.exists(): print('{"records":[],"collections":[]}'); sys.exit()
 c=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True)
 if not c.execute("SELECT 1 FROM sqlite_master WHERE name='collections'").fetchone(): print('{"records":[],"collections":[]}'); sys.exit()
-records=[]
+records={}
 collections=[]
-for (name,) in c.execute("SELECT name FROM collections WHERE language='lesson' ORDER BY name"):
+tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+query="SELECT name FROM collections WHERE language='lesson' ORDER BY name"
+if {'memory_collections','active_generation','generation_collections'} <= tables:
+    query="""SELECT c.name FROM collections c
+    LEFT JOIN memory_collections m ON m.collection=c.name
+    LEFT JOIN generation_collections g ON g.collection=c.name
+      AND g.generation=(SELECT revision FROM active_generation WHERE singleton=1)
+    WHERE c.language='lesson' AND (m.collection IS NULL OR g.collection IS NOT NULL)
+    ORDER BY c.name"""
+for (name,) in c.execute(query):
     collections.append(name)
     files={}
     for path,start,end,text in c.execute('SELECT path,start_line,end_line,text FROM chunks WHERE collection=? ORDER BY path,start_line,chunk_id',(name,)):
@@ -76,8 +85,10 @@ for (name,) in c.execute("SELECT name FROM collections WHERE language='lesson' O
         for i,line in enumerate(text.splitlines(keepends=True),start): lines[i]=line
     for path,lines in files.items():
         record=json.loads(''.join(lines[i] for i in sorted(lines)))
-        records.append(record)
-print(json.dumps(dict(records=records,collections=collections)))
+        key=record.get('delivery_id',name+':'+path)
+        if key in records and records[key]!=record: raise ValueError('Conflicting baseline delivery')
+        records[key]=record
+print(json.dumps(dict(records=list(records.values()),collections=collections)))
 `, join(config.root, 'knowledge.sqlite')], '', undefined);
 }
 export async function initializeStorageKnowledge(config, state, options = {}) {
@@ -94,8 +105,13 @@ export async function initializeStorageKnowledge(config, state, options = {}) {
       const blob=await history.git(['hash-object','-w','--stdin'],{input:JSON.stringify({revision,collections:baseline.collections})});
       await history.git(['update-ref','refs/knowledge/baseline',blob]);
     }
-    if (config.skills?.activeVersion && !(await history.state('skills'))) await recordSkill(context, config, config.skills.activeVersion,
-      { promote: true, reason: 'baseline' });
+    if (config.skills?.activeVersion) {
+      const active=await history.state('skills');
+      const mapped=context.state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='storage_skill_versions'").get()
+        ?context.state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get(config.skills.activeVersion):null;
+      if(!mapped||mapped.decision!=='promoted'||mapped.revision!==active?.revision)
+        await recordSkill(context,config,config.skills.activeVersion,{promote:true,reason:active?'configuration-reconciliation':'baseline'});
+    }
     return { baseline:await readBaseline(history),
       memory:context.state.db.prepare("SELECT * FROM storage_revisions WHERE name='memory'").get()??null,
       skills:await history.state('skills') };
@@ -149,7 +165,9 @@ async function recordSkill({ state, ledger, history }, config, version, options)
   const map = await validateSkillMap(directory, JSON.parse(await readFile(join(directory, 'skill-map.json'), 'utf8')));
   const skills = Object.fromEntries(await Promise.all(Object.entries(map).map(async ([scope, path]) =>
     [scope, await readFile(join(directory, path), 'utf8')])));
-  const proposal = `version-${version}`;
+  const active=await history.state('skills');
+  const reactivation=options.promote===true&&existing?.decision==='promoted'&&existing.revision!==active?.revision;
+  const proposal = `version-${version}`+(reactivation?`-reactivate-${active.revision.slice(0,12)}`:'');
   let candidate = await history.ref(`refs/heads/skills/${proposal}`);
   if (!candidate) ({ revision: candidate } = await history.proposeSkill({ id: proposal, skills,
     metadata: { version, baseVersion: options.baseVersion ?? null, map } }));

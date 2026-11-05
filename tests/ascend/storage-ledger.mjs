@@ -48,3 +48,21 @@ test('old state has no storage side effects until explicitly initialized',async 
  const {root,state}=await fixture(t);state.db.exec('DROP TABLE storage_campaign');
  assert.equal(CampaignStorage.open(state,root),null);
 });
+
+test('collection preserves artifact identity and remote provenance before sealing',async t=>{
+ const {root,ledger}=await fixture(t);
+ const external=await ledger.register('/target/profile.raw',{kind:'profiler',external:true});
+ await writeFile(join(root,'artifacts','profile.raw'),'profile bytes');
+ const collected=await ledger.collected(external.id,join(root,'artifacts','profile.raw'));
+ assert.equal(collected.id,external.id);assert.equal(collected.external,0);assert.equal(collected.status,'closed');
+ assert.equal(collected.bytes,13);assert.equal(JSON.parse(collected.descriptor).collected_from,'/target/profile.raw');
+});
+
+test('non-actor role closure is explicit and keeps its provider stream linked',async t=>{
+ const {root,state,ledger}=await fixture(t);await mkdir(join(root,'writer'));
+ const session=join(root,'writer/session.jsonl'),provider=join(root,'writer/provider.jsonl');
+ await ledger.session(session,{phase:'phase2',role:'skill-writer',provider});
+ assert.equal(state.db.prepare('SELECT closed FROM storage_sessions').get().closed,0);
+ ledger.closeSession(session);assert.equal(state.db.prepare('SELECT closed FROM storage_sessions').get().closed,1);
+ assert.equal(ledger.list({kind:'provider-telemetry'})[0].role,'skill-writer');
+});

@@ -61,7 +61,8 @@ function environment() {
 }
 
 // No shell, pager, global configuration, transport, or user-installed hooks.
-function command(source,gitDir,argv,{timeout=30000,signal,indexFile}={}) {
+function command(source,gitDir,argv,{timeout=30000,signal,indexFile,deadline}={}) {
+  if(deadline!==undefined)timeout=Math.min(timeout,deadline-performance.now());
   if(!Number.isFinite(timeout)||timeout<=0)throw new Error('Git deadline expired');
   signal?.throwIfAborted();
   return new Promise((resolveResult,reject)=>{
@@ -157,6 +158,7 @@ export async function prepareSourceGit({source,gitDir,attemptId}) {
   // Boundary evidence is a tree object, not an actor commit. A fresh index
   // captures current source even when the actor's own index is partially staged.
   const captureTree=async(options={})=>{
+    options={...options,deadline:options.deadline??performance.now()+(options.timeout??30000)};
     const temporary=await mkdtemp(join(gitDir,'capture-'));
     try {
       const captureOptions={...options,indexFile:join(temporary,'index')};

@@ -277,6 +277,12 @@ export async function operate(command,config,options={},manager=managedRuntime) 
         skillVersion:admitted.skillVersion??config.skills.activeVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
       const latest=await readConfig(config.root);
+      if(latest.storage) {
+        const mapped=state.db.prepare("SELECT revision,decision FROM storage_skill_versions WHERE version=?").get(latest.skills.activeVersion);
+        const active=state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get();
+        if(!mapped||mapped.decision!=='promoted'||mapped.revision!==active?.revision)
+          await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(latest,state);
+      }
       let skillVersion=admitted.skillVersion??latest.skills.activeVersion;
       if(!job.resume && admitted.kind!=='original') {
         try{

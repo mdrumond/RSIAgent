@@ -202,3 +202,13 @@ test('immutable tree refs retain uncommitted snapshots through Git GC',async t=>
   assert.equal((await repo.readState()).branch,state.branch);
   assert.deepEqual(await readFile(join(paths.gitDir,'index')),index);
 });
+
+test('source snapshot subprocesses share one elapsed deadline',async t=>{
+ const paths=await fixture(t),repo=await prepareSourceGit({...paths,attemptId:'deadline'});
+ const real=(await promisify(execFile)('sh',['-c','command -v git'])).stdout.trim();
+ const bin=join(paths.root,'bin');await mkdir(bin);const wrapper=join(bin,'git');
+ await writeFile(wrapper,'#!/bin/sh\nsleep 0.04\nexec '+real+' "$@"\n',{mode:0o700});
+ const previous=process.env.PATH;process.env.PATH=bin+':'+previous;t.after(()=>{process.env.PATH=previous;});
+ const started=performance.now();await assert.rejects(repo.captureTree({timeout:100}));
+ assert.ok(performance.now()-started<300,'snapshot stops at its total deadline');
+});

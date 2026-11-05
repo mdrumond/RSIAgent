@@ -35,7 +35,7 @@ export class CampaignStorage {
       name TEXT PRIMARY KEY,revision TEXT NOT NULL,generation TEXT,updated TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS storage_sessions (
       session TEXT PRIMARY KEY,attempt TEXT REFERENCES attempts(id),phase TEXT NOT NULL,
-      role TEXT NOT NULL,created TEXT NOT NULL);
+      role TEXT NOT NULL,created TEXT NOT NULL,provider TEXT,closed INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS storage_retrievals (
       id INTEGER PRIMARY KEY,attempt TEXT REFERENCES attempts(id),role TEXT NOT NULL,
       tool_call TEXT,operation TEXT NOT NULL,arguments TEXT NOT NULL,generation TEXT,
@@ -63,11 +63,13 @@ export class CampaignStorage {
     if(!['memory','skills'].includes(name)||!revision)throw new Error('Invalid knowledge revision');
     this.db.prepare('INSERT OR REPLACE INTO storage_revisions VALUES (?,?,?,?)').run(name,revision,generation,now());
   }
-  async session(path,{attempt=null,phase,role='actor'}={}) {
+  async session(path,{attempt=null,phase,role='actor',provider=null}={}) {
     const artifact=await this.register(path,{attempt,kind:'pi-session',role});
-    this.db.prepare('INSERT OR IGNORE INTO storage_sessions VALUES (?,?,?,?,?)').run(artifact.path,attempt,phase,role,now());
+    const raw=provider?await this.register(provider,{attempt,kind:'provider-telemetry',role}):null;
+    this.db.prepare('INSERT OR IGNORE INTO storage_sessions VALUES (?,?,?,?,?,?,0)').run(artifact.path,attempt,phase,role,now(),raw?.path??null);
     return artifact;
   }
+  closeSession(path){this.db.prepare('UPDATE storage_sessions SET closed=1 WHERE session=?').run(relative(this.root,resolve(path)));}
   async retrieval({attempt=null,role='actor',toolCall=null,operation,arguments:args={},generation=null,entries=[]}) {
     const directory=join(this.root,'artifacts','citations');await mkdir(directory,{recursive:true});
     const citations=[];
@@ -113,6 +115,15 @@ export class CampaignStorage {
     const after=await stat(actual);if(before.size!==after.size||before.mtimeMs!==after.mtimeMs||before.ino!==after.ino)throw new Error('Artifact changed while closing');
     this.db.prepare("UPDATE storage_artifacts SET status='closed',bytes=?,sha256=? WHERE id=?").run(after.size,hash.digest('hex'),id);
     return this.db.prepare('SELECT * FROM storage_artifacts WHERE id=?').get(id);
+  }
+  async collected(id,path) {
+    const row=this.db.prepare('SELECT * FROM storage_artifacts WHERE id=?').get(id);
+    if(!row?.external)throw new Error('Expected uncollected evidence');
+    const actual=await realpath(path),root=await realpath(this.root);
+    if(!inside(root,actual))throw new Error('Collected artifact escaped campaign');
+    this.db.prepare("UPDATE storage_artifacts SET path=?,external=0,status='open',descriptor=? WHERE id=?")
+      .run(relative(root,actual),JSON.stringify({collected_from:row.path}),id);
+    return this.seal(id);
   }
   async manifest(){
     const value={format:1,campaign:this.db.prepare('SELECT * FROM storage_campaign').get(),

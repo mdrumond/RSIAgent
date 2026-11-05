@@ -1,7 +1,7 @@
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { mkdir, appendFile, readFile } from 'node:fs/promises';
-import { join,resolve,relative } from 'node:path';
+import { join,resolve,relative,basename } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
@@ -129,8 +129,18 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const extension=async pi=>{
     if(storage)pi.registerTool({name:'rsi_artifact',label:'Register retained evidence',
       description:'Register an evidence file outside editable source. Use external=true for an uncollected remote path; it remains explicitly missing until collected.',
-      parameters:Type.Object({path:Type.String(),kind:Type.String(),external:Type.Optional(Type.Boolean())}),
-      execute:async(_id,args)=>result(await register(args.path,args.kind,args.external))});
+      parameters:Type.Object({path:Type.String(),kind:Type.String(),external:Type.Optional(Type.Boolean()),collect:Type.Optional(Type.Boolean())}),
+      execute:async(_id,args)=>{
+        const artifact=await register(args.external?args.path:resolve(project.source,args.path),args.kind,args.external);
+        if(args.collect) {
+          if(!args.external||!environment.collectArtifact)throw new Error('Collection requires an external file and configured environment');
+          const directory=join(attemptPath,'artifacts');await mkdir(directory,{recursive:true});
+          const destination=join(directory,randomUUID()+'-'+basename(args.path));
+          await environment.collectArtifact(args.path,destination);
+          return result(await storage.collected(artifact.id,destination));
+        }
+        return result(artifact);
+      }});
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
       parameters:Type.Object({}),execute:async()=>result({stage:workflow.stage,skill:await workflow.skill(),history:workflow.history})});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',

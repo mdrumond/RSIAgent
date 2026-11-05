@@ -1,6 +1,6 @@
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { cp, mkdir, readFile, stat } from 'node:fs/promises';
+import { cp, mkdir, readFile, stat,appendFile } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
@@ -28,8 +28,11 @@ export function curriculumRoleHistory(state,attemptId,role) {
 export async function curriculumSession({config,path,bridge,prompt,tool,signal,state,attemptId,role,accepted,resume=false}) {
   const agentDir=join(path,'agent');await mkdir(agentDir,{recursive:true});
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
+  const providerPath=join(path,'provider-'+role+'.jsonl');
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
     extensionFactories:[bridge.extension,pi=>{
+      if(config.storage)for(const type of ['before_provider_request','provider_stream_event'])
+        pi.on(type,payload=>appendFile(providerPath,JSON.stringify(payload)+'\n'));
       pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
       for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);
     }]});
@@ -44,7 +47,7 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
     const ledger=new State(join(config.root,'state.sqlite'));
     try {
       const storage=CampaignStorage.open(ledger,config.root),owner=ledger.attempt(attemptId)?attemptId:null;
-      await storage?.session(manager.getSessionFile(),{attempt:owner,phase:config.mode,role:'curriculum-'+role});
+      await storage?.session(manager.getSessionFile(),{attempt:owner,phase:config.mode,role:'curriculum-'+role,provider:providerPath});
     }finally{ledger.close();}
   }
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
@@ -86,6 +89,10 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
         elapsed_seconds:spent(),accepted:accepted(),session:session.sessionManager.getSessionFile()});
     }finally{
       try{await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}finally{session.dispose();}
+      if(config.storage&&accepted()) {
+        const ledger=new State(join(config.root,'state.sqlite'));
+        try{CampaignStorage.open(ledger,config.root)?.closeSession(manager.getSessionFile());}finally{ledger.close();}
+      }
     }
   }
 }
