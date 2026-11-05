@@ -30,12 +30,14 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
       if(storageAction.action==='inspect')return {available:false};
       throw new Error('Storage ledger required; existing campaigns are unchanged');
     }
-    if(values.detach)return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{signal});
+    if(!values.request&&['compress','pack','prune','restore'].includes(storageAction.action))
+      return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{detach:Boolean(values.detach),signal});
     return (await import('./storage.mjs')).run(config,{...storageAction,signal});
   }
-  if(values.detach&&['tune','kdb'].includes(command)) {
+  if(!values.request&&['tune','kdb'].includes(command)) {
+    if(command==='kdb'&&!values.config)throw new Error('KDB action JSON required');
     const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
-    return (await import('./background.mjs')).startBackground(root,command,action,{signal});
+    return (await import('./background.mjs')).startBackground(root,command,action,{detach:Boolean(values.detach),signal});
   }
   if(command==='upgrade') {
     const input=JSON.parse(await readFile(values.config,'utf8'));

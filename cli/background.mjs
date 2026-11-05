@@ -28,6 +28,14 @@ export async function reconcileRequests(root,{state}={}) {
   }finally{if(own)state.close();}
 }
 
+function terminateGroup(pid) {
+  try{process.kill(-pid,'SIGTERM');}
+  catch(error){if(error.code!=='ESRCH')throw error;try{process.kill(pid,'SIGTERM');}catch(e){if(e.code!=='ESRCH')throw e;}}
+}
+export async function stopRequest(owner) {
+  if(owner?.pid&&owner.start&&owner.boot&&!await ownerStopped(owner))terminateGroup(owner.pid);
+}
+
 export async function startBackground(root,command,action,{detach=true,signal}={}) {
   if(!['kdb','tune','storage','wave','campaign','resume'].includes(command))throw new Error('Unknown background command');
   signal?.throwIfAborted();
@@ -39,6 +47,8 @@ export async function startBackground(root,command,action,{detach=true,signal}={
   state.db.prepare("INSERT INTO requests(id,kind,status) VALUES (?,?,'queued')").run(id,command);
   const log=await open(join(directory,'output.log'),'a',0o600);
   let child,exited;
+  const cancel=()=>{if(child?.pid&&child.exitCode===null&&child.signalCode===null)terminateGroup(child.pid);};
+  signal?.addEventListener('abort',cancel,{once:true});
   try {
     const argv=[fileURLToPath(new URL('./main.mjs',import.meta.url)),command,'--instance',root,'--config',file,'--request',id];
     for(const key of ['mode','concurrency'])if(action[key]!==undefined)argv.push('--'+key,String(action[key]));
@@ -46,6 +56,7 @@ export async function startBackground(root,command,action,{detach=true,signal}={
     child=spawn(process.execPath,argv,{cwd:root,detached:true,env:process.env,stdio:['ignore',log.fd,log.fd]});
     exited=new Promise(resolve=>child.once('exit',resolve));
     await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
+    if(signal?.aborted)cancel();
     const owner=await processIdentity(child.pid);
     state.db.prepare("UPDATE requests SET owner=? WHERE id=? AND status='queued' AND owner IS NULL")
       .run(JSON.stringify(owner),id);
@@ -64,7 +75,7 @@ export async function startBackground(root,command,action,{detach=true,signal}={
         .run('Request process exited before recording ownership',id);
     if(!child?.pid)state.db.prepare("UPDATE requests SET status='failed',error=? WHERE id=?").run(error.message,id);
     throw error;
-  }finally{await log.close();state.close();}
+  }finally{signal?.removeEventListener('abort',cancel);await log.close();state.close();}
 }
 
 export async function trackRequest(root,id,operation) {

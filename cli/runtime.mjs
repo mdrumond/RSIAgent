@@ -74,7 +74,7 @@ export async function operate(command,config,options={}) {
       for(const request of state.db.prepare("SELECT owner FROM requests WHERE status='running'").iterate()) {
         const owner=JSON.parse(request.owner);
         if(owner?.start&&owner?.boot&&!await ownerStopped(owner)) {
-          process.kill(owner.pid,'SIGTERM');
+          await (await import('./background.mjs')).stopRequest(owner);
         }
       }
       return {stop_requested:true};
