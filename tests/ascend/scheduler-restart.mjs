@@ -91,12 +91,15 @@ for(const scenario of ['active','live-owner','unknown-native','held-receipt'])te
   const f=await setup(t,'interrupt',['holder','unrelated'],{install:false});
   await configure(f,{curriculum:{phase1:['unrelated']}});
   const owner=scenario==='live-owner'?await processIdentity():await deadOwner(t);
-  const before=await seededLease(f,owner,{terminal:scenario!=='active',unknown:scenario==='unknown-native',held:scenario==='held-receipt'});
+  const unsettled=['unknown-native','held-receipt'].includes(scenario);
+  const before=await seededLease(f,owner,{terminal:scenario!=='active',unknown:scenario==='unknown-native',
+    held:scenario==='held-receipt',recorded:!unsettled});
   await f.run('wave');
   assert.equal(rows(f.root,'SELECT attempt FROM resource_leases')[0].attempt,before.id);
   assert.deepEqual(rows(f.root,`SELECT * FROM attempts WHERE id='${before.id}'`)[0],before);
   assert.equal(rows(f.root,'SELECT * FROM attempts').length,1);
   assert.equal(f.server.requests.length,0);
+  if(unsettled)assert.equal(rows(f.root,'SELECT * FROM recovery_lessons').length,0);
   f.pass();
 });
 
