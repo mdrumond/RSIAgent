@@ -1,3 +1,4 @@
+import {hostMemorySource} from './host-memory-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -83,7 +84,7 @@ print(outputs[query])
     if (args[0] === 'logs') return { state: 'completed', content: jobs.get(args[1])?.content };
     throw new Error('unexpected CPL operation '+args[0]);
   };
-  const context = { instancePath, leaseDirectory: join(instancePath,'leases'), client, sdk: { createLocalBashOperations: () => ({}) },
+  const context = { hostMemorySource, instancePath, leaseDirectory: join(instancePath,'leases'), client, sdk: { createLocalBashOperations: () => ({}) },
     event: async (type,data) => events.push({ type,...data }), exclude: async (_,fn) => fn() };
   const options = { mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
     workspacePath: '/registry/workspace', remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
@@ -482,4 +483,20 @@ for(const failure of ['unknown-observe','lost-handle-event'])test(`target reconc
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
   assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]===controlHandle));
   await assert.rejects(readFile(join(f.context.instancePath,'.ascend-command-lease.json')),{code:'ENOENT'});
+});
+
+test('payload guard refuses lost aggregate cap after sync without running Bash',async t=>{
+  const f=await fixture(t),proofFile=join(f.context.instancePath,'memory.json');
+  const proof={available:true,kind:'rsi.slice',scope:'/fixture/rsi.slice',fingerprint:'a'.repeat(64),max_bytes:4096,current_bytes:123};
+  await writeFile(proofFile,JSON.stringify(proof));
+  const context={...f.context,hostMemorySource:`def host_memory_proof(configuration):\n return json.load(open(${JSON.stringify(proofFile)}))\n`};
+  const environment=await createEnvironment(f.options,context);
+  await environment.resources();
+  await environment.prepare({project:{source:f.source},attempt:{id:'memory-guard'}});
+  f.runWorkload();
+  f.onSync(()=>writeFile(proofFile,JSON.stringify({available:false,code:'MEMORY_ENFORCEMENT_UNAVAILABLE',detail:'Aggregate memory.max is now max'})));
+  const marker=join(f.source,'payload-ran');
+  await assert.rejects(environment.execute(`touch '${marker}'`,f.source,{timeout:10}),{code:'MEMORY_ENFORCEMENT_UNAVAILABLE'});
+  await assert.rejects(readFile(marker),{code:'ENOENT'});
+  assert.equal(await environment.reconcileLease(),true);
 });

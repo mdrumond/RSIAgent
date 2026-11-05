@@ -1,3 +1,4 @@
+import {hostMemorySource, hostMemoryConfiguration, requireHostMemory} from './host-memory.mjs';
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -20,11 +21,18 @@ const probe = `import hashlib,json,os,sys,time
 c=json.loads(sys.argv[1]); source=c['source']
 if hashlib.sha256(source.encode()).hexdigest()!=c['sha256']: raise ValueError('health helper identity mismatch')
 ns={'__name__':'_ascend_health'}; exec(compile(source,'trusted-ascend-health.py','exec'),ns)
+exec(compile(c['memorySource'],'host-memory.py','exec'),ns)
+memory=ns['host_memory_proof'](c['host_memory'])
+if 'command' in c and not memory['available']:
+ path=os.environ['RSI_LEASE_RECEIPT']
+ with open(path+'.tmp','w') as output: json.dump({'token':c['lease']['token'],'decision':'memory-refused','host_memory':memory},output)
+ os.replace(path+'.tmp',path)
+ raise SystemExit(125)
 deadline=time.monotonic()+c['seconds']; rows=[]
-for device in ([] if 'command' in c else c['devices']):
+for device in ([] if 'command' in c or not memory['available'] else c['devices']):
  rows.append(ns['local_probe'](physical_device=device,configuration=c['configuration'],remaining=lambda:max(0.,deadline-time.monotonic())))
  if time.monotonic()>=deadline: break
-report=json.dumps({'observed_at':time.time(),'devices':rows},allow_nan=False)
+report=json.dumps({'observed_at':time.time(),'devices':rows,'host_memory':memory},allow_nan=False)
 if 'command' not in c: print(report,flush=True)
 if 'command' in c:
  exec(c['hostLease'])
@@ -36,6 +44,15 @@ if 'command' in c:
  */
 export async function createEnvironment(options, context) {
   const local = options.mode === 'local';
+  const memoryConfiguration = hostMemoryConfiguration(options.host_memory ?? (local ? context.hostMemory : undefined));
+  if (context.resource?.metadata?.host_memory?.fingerprint)
+    memoryConfiguration.fingerprint = context.resource.metadata.host_memory.fingerprint;
+  const memoryRequest = () => ({memorySource:context.hostMemorySource ?? hostMemorySource, host_memory:memoryConfiguration});
+  function verifyMemory(result) {
+    const proof = requireHostMemory(result.host_memory, memoryConfiguration);
+    memoryConfiguration.fingerprint = proof.fingerprint;
+    return result;
+  }
   if ((!local && options.mode !== 'cpl') || !options.target || !options.runtime || !options.instructionFile)
     throw new Error('Ascend binding requires target, registered runtime, and instructionFile');
   if (!['a3', 'a5'].includes(options.health?.product)) throw new Error('Explicit A3/A5 health profile required');
@@ -126,7 +143,7 @@ export async function createEnvironment(options, context) {
         const dir=await mkdtemp(join(root,'probe-')),submission=randomUUID();
         localPending={submission,startedMonotonic:process.hrtime.bigint().toString(),devices,configuration,
           seconds:Math.min(seconds,budget),output:join(dir,'stdout.json'),handle:null};
-        const request={source,sha256:healthSha256,seconds:localPending.seconds,devices,configuration};
+        const request={...memoryRequest(),source,sha256:healthSha256,seconds:localPending.seconds,devices,configuration};
         await save(pendingPath,localPending);
         if(bounded.aborted){await unlink(pendingPath);bounded.throwIfAborted();}
         await emit('execution-submitting',{submission,receiptFile:pendingPath,kind:'run',accountingExcluded:true});
@@ -166,7 +183,7 @@ export async function createEnvironment(options, context) {
           JSON.stringify(configuration)!==JSON.stringify(localPending.configuration)){
         await context.event('resource-probe-stale',{handle:localPending.handle,age});continue;
       }
-      return retained;
+      return verifyMemory(retained);
     }}finally{localPending=null;}
   }
   async function snapshot(devices, purpose, emit, budget = seconds, signal = context.signal) {
@@ -185,7 +202,7 @@ export async function createEnvironment(options, context) {
       if (!pending) {
         const dir = await mkdtemp(join(root, 'probe-'));
         const file = join(dir, 'probe.sh'), receipt = join(dir, 'native-submission.json');
-        const request = { source, sha256: healthSha256, seconds: Math.min(seconds, budget), devices, configuration };
+        const request = { ...memoryRequest(), source, sha256: healthSha256, seconds: Math.min(seconds, budget), devices, configuration };
         await writeFile(file, `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}\n`, { mode: 0o600 });
         pending = { started: Date.now(), startedMonotonic: process.hrtime.bigint().toString(), seconds: request.seconds, devices, configuration, receipt, handle: null };
         // Persist ambiguous submission BEFORE calling transport; never infer no work from no ID.
@@ -265,7 +282,7 @@ export async function createEnvironment(options, context) {
         await context.event('resource-probe-stale',{handle:pending.handle,age,submission_elapsed:elapsed()});
         continue; // Only a KNOWN terminal probe is replaced with fresh measurements.
       }
-      return retained;
+      return verifyMemory(retained);
     }
   }
   async function inspectDevices({ purpose = 'ordinary', target } = {}) {
@@ -291,8 +308,10 @@ export async function createEnvironment(options, context) {
   async function resources({target} = {}) {
     if (target && target !== options.target && target !== options.profile) return [];
     const devices = await enabled();
+    if (!devices.length) return [];
+    const result = await serial(() => preflight(async emit => snapshot([], 'ordinary', emit)));
     return devices.map((_, slot) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
-      available: true, metadata: {kind:'host-slot', pool, target:options.target} }));
+      available: true, metadata: {kind:'host-slot', pool, target:options.target, host_memory:result.host_memory} }));
   }
   let commandActive=false, controlEnvironment;
   async function control() {
@@ -403,7 +422,7 @@ export async function createEnvironment(options, context) {
         // Persist before any transfer or submission; a missing handle is not closure.
         await save(leasePath, {receipt:lease.receipt, token:lease.token, pool, physicalDevice:physical});
         await context.event('device-lease-acquired', {pool, physicalDevice:physical, receipt:lease.receipt});
-        const request = { source, sha256: healthSha256, seconds, devices: [physical], command, hostLease,
+        const request = { ...memoryRequest(), source, sha256: healthSha256, seconds, devices: [physical], command, hostLease,
           lease:{pool,token:lease.token,receipt:lease.receipt},
           configuration: { ...options.health, allow_busy:false, require_idle:timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
@@ -422,11 +441,16 @@ export async function createEnvironment(options, context) {
             excludedMs+=performance.now()-attemptStarted-(excludedMs-attemptExcluded);
             await context.event('execution-state',{handle:result.handle,state:'stopped',executionSeconds:0,accountingExcluded:true});
           }
-          if(['contended','health-refused'].includes(admission.decision)){
+          if(['contended','health-refused','memory-refused'].includes(admission.decision)){
             await lease.release();await unlink(leasePath);
           } else {
             activeLease=null;
             if(!await reconcileLease())return {...result,settled:false,admissionUnknown:true};
+          }
+          if(admission.decision==='memory-refused') {
+            const error = closedSetupError('Target aggregate memory enforcement unavailable', {handle:result.handle});
+            Object.assign(error, {code:'MEMORY_ENFORCEMENT_UNAVAILABLE', host_memory:admission.host_memory});
+            throw error;
           }
           if(admission.decision==='contended'){
             await exclude('queue-wait',()=>delay(options.leasePollMs??250,undefined,{signal}));
