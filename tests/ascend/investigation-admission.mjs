@@ -35,7 +35,7 @@ async function fixture(t,plan) {
   t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});
   const config={root,curriculum_seconds:15,actor:{provider:'admission-fixture',model:'scripted',credential_env:key,
     base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
-  const state={events:()=>[],attempt:()=>({session:null}),event:()=>{}},bridge={extension:()=>{}};
+  const state={events:()=>[],queryEvents:()=>[],attempt:()=>({session:null}),event:()=>{}},bridge={extension:()=>{}};
   const options={config,path,state,bridge,job:{origin_attempt:'old',attempt:{id:'new'},actor_seconds:120},base:{source,goal:'numeric'}};
   return {root,path,source,options,results:()=>received.at(-1)};
 }
@@ -83,7 +83,7 @@ test('pre-actor failure has readable diagnostics before native summary repairs d
   const record={findings:'Missing verifier prevented actor startup; no experiment ran.',useful:false,paths:['.']};
   const f=await fixture(t,[['record_findings',record],['read',{path:'diagnostics.json'}],['record_findings',{...record,paths:['diagnostics.json']}]]);
   const failure={type:'attempt-error',data:{message:'ENOENT missing verifier',stage:'worker'}};
-  f.options.state={events:()=>[failure],attempt:()=>({session:null}),event:()=>{}};
+  f.options.state={events:()=>[failure],queryEvents:(_id,{types})=>!types||types.includes(failure.type)?[failure]:[],attempt:()=>({session:null}),event:()=>{}};
   const result=await findingsFor({...f.options,passed:false});
   assert.match(f.results()[0].content,/regular file/);
   assert.deepEqual(JSON.parse(f.results()[1].content),[failure]);
