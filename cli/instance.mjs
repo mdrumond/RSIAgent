@@ -8,6 +8,7 @@ import { createReadStream } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import {normalizeHostMemory} from '../controller/host-memory.mjs';
 import { State, validateAcceptance } from '../controller/state.mjs';
+import { CampaignStorage } from '../controller/storage.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -45,7 +46,12 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,host_memory,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
-  try {for(const project of projects)ledger.add(project);}finally {ledger.close();}
+  try {
+    for(const project of projects)ledger.add(project);
+    const storage=new CampaignStorage(ledger,destination);
+    const campaign=await storage.initialize({target:config.target??null});
+    config.storage={format:1,campaign_id:campaign.id};
+  }finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
   return config;

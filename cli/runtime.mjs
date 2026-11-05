@@ -12,6 +12,7 @@ import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcile
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
 import { readConfig,updateConfig,importProject } from './instance.mjs';
 import * as managedRuntime from './managed-runtime.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -278,6 +279,12 @@ export async function operate(command,config,options={},manager=managedRuntime) 
         catch(error){if(error.code!=='ENOENT')throw error;}
       }
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
+      const storage=CampaignStorage.open(state,config.root);
+      if(storage) {
+        storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
+          parent:job.origin_attempt??null,wave:admitted.wave??wave,skillRevision:skillVersion});
+        await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
+      }
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
       return {argv:[process.execPath,self,'worker',config.root,attempt.id],cwd:config.root,
