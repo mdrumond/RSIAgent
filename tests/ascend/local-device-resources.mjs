@@ -283,7 +283,11 @@ test('target contention retries only structured nonadmission; payload exit 126 e
   const next=second.environment.execute('echo ran >> invocations; exit 126',f.source,{timeout:5});void next.catch(()=>{});
   await until(()=>second.events.filter(e=>e.type==='device-lease-acquired').length>=2);
   assert.equal(await exists(join(f.source,'invocations')),false);
-  await writeFile(join(f.source,'release'),'go');assert.equal((await holding).settled,true);
+  await writeFile(join(f.source,'release'),'go');const held=await holding;
+  // A competing controller may briefly hold the target cleanup lock.
+  // Reconcile the same completed handle before releasing its controller lease.
+  await until(()=>first.environment.reconcileLease());
+  assert.equal((await first.environment.observe(held.handle)).state,'stopped');
   const result=await next;assert.equal(result.exitCode,126);assert.equal(result.admission.decision,'admitted');
   assert.equal(await readFile(join(f.source,'invocations'),'utf8'),'ran\n');
   assert.equal(clock.elapsed,1,'confirmed contention refunded; genuine payload 126 charged');
