@@ -8,6 +8,7 @@ import { Workflow } from './workflow.mjs';
 import { validateAcceptance } from './state.mjs';
 import { fingerprint, freezeFiles } from './evidence.mjs';
 import { createEnvironmentTools } from '../integrations/environments/index.mjs';
+import { createPiTelemetryJournal } from './pi-telemetry.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 
@@ -17,15 +18,18 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
   let activeOperation=null;
-  const event=(type,data)=>state.event(attempt.id,type,{...data,
+  const eventData=data=>({...data,
     operation:activeOperation??data.operation??data.submission,actor_elapsed:clock.elapsed});
+  const event=(type,data)=>state.event(attempt.id,type,eventData(data));
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
+  const telemetry=createPiTelemetryJournal(join(attemptPath,'pi-events.jsonl'),attempt.id,
+    data=>state.event(attempt.id,'pi-event',data));
   const environment=await environmentFactory({instancePath:attemptPath,event,signal,
     exclude:(label,fn)=>clock.exclude(label,fn)});
   const previous=state.events(attempt.id).find(e=>e.type==='verifier-frozen');
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
-  let session,timer,accepted=false,uncertain;
+  let session,timer,accepted=false,uncertain,telemetryFailure;
   const nativeBash=new Map();
   const abort=()=>{void session?.abort();};
   signal?.addEventListener('abort',abort,{once:true});
@@ -160,7 +164,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
       if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
         diagnostics.push(e.message.errorMessage ?? 'Native provider error');
-      event('pi-event',{type:e.type,stage:workflow.stage,elapsed:clock.elapsed});
+      try { telemetry(eventData({type:e.type,stage:workflow.stage,elapsed:clock.elapsed})); }
+      catch(error) { telemetryFailure??=error; throw error; }
     });
     timer=setInterval(()=>{
       state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
@@ -169,6 +174,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if(signal?.aborted)throw new Error('Attempt interrupted');
     await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.`);
     await session.waitForIdle();
+    if(telemetryFailure)throw telemetryFailure;
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
