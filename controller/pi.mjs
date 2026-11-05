@@ -153,7 +153,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
-      if(e.type==='tool_execution_start' && e.toolName==='bash') {
+      if(e.type==='tool_execution_start' && e.toolName==='bash' && !environment.shellOnTarget) {
         const operation=randomUUID();nativeBash.set(e.toolCallId,operation);
         event('native-bash-started',{operation,tool_call_id:e.toolCallId,session:manager.getSessionFile()});
       }
