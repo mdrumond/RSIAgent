@@ -139,3 +139,42 @@ test('source repository metadata is left untouched and inherited Git overrides a
     if(original===undefined)delete process.env.GIT_DIR;else process.env.GIT_DIR=original;
   }
 });
+
+test('boundary trees retain actual edits without changing actor HEAD, branch or index',async t=>{
+  const paths=await fixture(t),repo=await prepareSourceGit({...paths,attemptId:'capture'});
+  const unborn=await repo.captureTree();
+  assert.equal(unborn.head,null);assert.equal(unborn.dirty,true);
+  assert.equal(await ok(repo,['show',unborn.tree_oid+':kernel.py']),'answer = 42\n');
+  await assert.rejects(readFile(join(paths.gitDir,'index')),{code:'ENOENT'});
+  await ok(repo,['add','.']);await ok(repo,['commit','-m','Actor implementation']);
+  await writeFile(join(paths.source,'kernel.py'),'staged = True\n');
+  await ok(repo,['add','kernel.py']);
+  await writeFile(join(paths.source,'kernel.py'),'failed_optimisation = True\n');
+  await writeFile(join(paths.source,'new.py'),'untracked = True\n');
+  await mkdir(join(paths.source,'build'));
+  await writeFile(join(paths.source,'build','generated.py'),'excluded');
+  const index=await readFile(join(paths.gitDir,'index')),state=await repo.readState();
+  const fingerprintBefore=await fingerprint(paths.source);
+  const first=await repo.captureTree();
+  assert.equal(first.head,state.head);assert.equal(first.dirty,true);
+  assert.notEqual(first.tree_oid,unborn.tree_oid);
+  assert.equal(await ok(repo,['show',first.tree_oid+':kernel.py']),'failed_optimisation = True\n');
+  assert.equal(await ok(repo,['show',first.tree_oid+':new.py']),'untracked = True\n');
+  assert.notEqual((await repo.execute(['show',first.tree_oid+':build/generated.py'])).exitCode,0);
+  assert.deepEqual(await readFile(join(paths.gitDir,'index')),index);
+  assert.deepEqual(await repo.readState(),state);
+  assert.equal(await fingerprint(paths.source),fingerprintBefore);
+  await rm(join(paths.source,'new.py'));
+  await writeFile(join(paths.source,'kernel.py'),'next_optimisation = True\n');
+  const second=await repo.captureTree();
+  assert.notEqual(second.tree_oid,first.tree_oid);
+  assert.equal(second.head,state.head);
+  assert.equal(await ok(repo,['show',second.tree_oid+':kernel.py']),'next_optimisation = True\n');
+  assert.notEqual((await repo.execute(['show',second.tree_oid+':new.py'])).exitCode,0);
+  assert.deepEqual(await readFile(join(paths.gitDir,'index')),index);
+  assert.equal((await repo.readState()).branch,state.branch);
+  assert.equal((await repo.readState()).head,state.head);
+  assert.equal((await readdir(paths.gitDir)).some(name=>name.startsWith('capture-')),false);
+  await assert.rejects(repo.captureTree({timeout:0}),/deadline/);
+  assert.equal((await readdir(paths.gitDir)).some(name=>name.startsWith('capture-')),false);
+});

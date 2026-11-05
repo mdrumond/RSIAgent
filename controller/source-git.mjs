@@ -1,5 +1,5 @@
 import {spawn} from 'node:child_process';
-import {mkdir,readFile,writeFile,realpath} from 'node:fs/promises';
+import {mkdir,mkdtemp,readFile,writeFile,realpath,rm} from 'node:fs/promises';
 import {resolve,relative,isAbsolute,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {Type} from 'typebox';
@@ -61,7 +61,7 @@ function environment() {
 }
 
 // No shell, pager, global configuration, transport, or user-installed hooks.
-function command(source,gitDir,argv,{timeout=30000,signal}={}) {
+function command(source,gitDir,argv,{timeout=30000,signal,indexFile}={}) {
   if(!Number.isFinite(timeout)||timeout<=0)throw new Error('Git deadline expired');
   signal?.throwIfAborted();
   return new Promise((resolveResult,reject)=>{
@@ -71,7 +71,7 @@ function command(source,gitDir,argv,{timeout=30000,signal}={}) {
       '-c','core.attributesFile=/dev/null','-c','diff.external=',
       '-c','protocol.allow=never','-c','commit.gpgSign=false','-c','tag.gpgSign=false',
       '-c','user.name=RSI Actor','-c','user.email=actor@rsi.local',...argv],
-    {cwd:source,env:environment(),stdio:['ignore','pipe','pipe']});
+    {cwd:source,env:{...environment(),...(indexFile?{GIT_INDEX_FILE:indexFile}:{})},stdio:['ignore','pipe','pipe']});
     let size=0,truncated=false,timedOut=false,aborted=false;
     const stdout=[],stderr=[];
     const collect=target=>chunk=>{
@@ -154,6 +154,23 @@ export async function prepareSourceGit({source,gitDir,attemptId}) {
       branch:ref.exitCode===0?ref.stdout.trim():null,dirty:Boolean(status.stdout),
       status:status.stdout,statusTruncated:status.truncated};
   };
+  // Boundary evidence is a tree object, not an actor commit. A fresh index
+  // captures current source even when the actor's own index is partially staged.
+  const captureTree=async(options={})=>{
+    const temporary=await mkdtemp(join(gitDir,'capture-'));
+    try {
+      const captureOptions={...options,indexFile:join(temporary,'index')};
+      for(const argv of [['add','-A'],['write-tree']]) {
+        const response=await run(argv,captureOptions);
+        if(response.exitCode!==0||response.timedOut||response.aborted)
+          throw new Error(`Source Git capture failed: ${response.stderr}`);
+        if(argv[0]==='write-tree') {
+          const {head,dirty}=await readState(options);
+          return {tree_oid:response.stdout.trim(),head,dirty};
+        }
+      }
+    } finally {await rm(temporary,{recursive:true,force:true});}
+  };
   const extension=async pi=>pi.registerTool({name:'rsi_git',label:'Local source Git',
     description:'Run local Git argv in authoritative controller-local source. Advisory history: inspect status/diff and commit meaningful changes. No remotes. Remote Bash is a different filesystem.',
     parameters:Type.Object({argv:Type.Array(Type.String(),{minItems:1})}),
@@ -162,5 +179,5 @@ export async function prepareSourceGit({source,gitDir,attemptId}) {
       return {content:[{type:'text',text:JSON.stringify(response)}],details:response,
         isError:response.exitCode!==0};
     }});
-  return {extension,readState,execute,source,gitDir,attemptBranch:branch};
+  return {extension,readState,captureTree,execute,source,gitDir,attemptBranch:branch};
 }
