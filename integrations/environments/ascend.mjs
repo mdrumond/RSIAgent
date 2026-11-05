@@ -1,6 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
+import { reserveDevice, hostLease } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -20,21 +21,18 @@ c=json.loads(sys.argv[1]); source=c['source']
 if hashlib.sha256(source.encode()).hexdigest()!=c['sha256']: raise ValueError('health helper identity mismatch')
 ns={'__name__':'_ascend_health'}; exec(compile(source,'trusted-ascend-health.py','exec'),ns)
 deadline=time.monotonic()+c['seconds']; rows=[]
-for device in c['devices']:
+for device in ([] if 'command' in c else c['devices']):
  rows.append(ns['local_probe'](physical_device=device,configuration=c['configuration'],remaining=lambda:max(0.,deadline-time.monotonic())))
  if time.monotonic()>=deadline: break
 report=json.dumps({'observed_at':time.time(),'devices':rows},allow_nan=False)
-print(report,file=sys.stderr if 'command' in c else sys.stdout,flush=True)
+if 'command' not in c: print(report,flush=True)
 if 'command' in c:
- if len(rows)!=1 or rows[0]['admitted'] is not True: raise SystemExit(125)
- os.execvp('bash',['bash','-c',c['command']])
+ exec(c['hostLease'])
 `;
 
-/** CPL options plus health:{product,chip,allow_alarm?,allow_busy?}, instructionFile,
- * profile?, deviceAffinity?:physicalIDs[], probeSeconds? (query/freshness, default60),
- * probeObservationSeconds? (completion wait, default300, maximum600). context.resource/options.resource is the
- * leased row or opaque id returned by resources(); no caller-selected raw NPU ID.
- * Idle-only availability keeps the core's parallel leases independent of health policy.
+/** Scheduler resources are host slots. Each execute selects an idle physical
+ * device from fresh CPL permission/health evidence and holds one command lease.
+ * inspectDevices is diagnostic inventory, never an attempt reservation API.
  */
 export async function createEnvironment(options, context) {
   const local = options.mode === 'local';
@@ -55,17 +53,21 @@ export async function createEnvironment(options, context) {
     signal?.throwIfAborted();
     return nativeClient(args, {signal});
   };
-  const assigned = context.resource ?? options.resource;
-  const assignedId = typeof assigned === 'string' ? assigned : assigned?.id;
+  let activeLease;
+  const leasePath = join(context.instancePath, '.ascend-command-lease.json');
+  const commandContext = {...context, client, event: async (type, data) => {
+    if (activeLease && type === 'execution-handle') await activeLease.retain(data.handle);
+    await context.event(type, data);
+  }};
   const idFor = physical => 'ascend-' + digest(JSON.stringify(local
     ? ['local', options.target, options.runtime, physical] : [options.target, options.runtime, physical]));
-  const root = join(context.instancePath, '.ascend-resources', digest(JSON.stringify([options.target, options.runtime, assignedId ?? 'inventory'])));
+  const root = join(context.instancePath, '.ascend-resources', digest(JSON.stringify([options.target, options.runtime, 'inventory'])));
   await mkdir(root, { recursive: true, mode: 0o700 });
   const pendingPath = join(root, 'pending.json');
   const source = await readFile(new URL('../../ascend_tools/targets/health.py', import.meta.url), 'utf8');
   const healthSha256 = digest(source);
   const bindings = { ...options.env };
-  const environment = await genericEnvironment({ ...options, env: bindings }, { ...context, client });
+  const environment = await genericEnvironment({ ...options, env: bindings }, commandContext);
   let localPending;
   const localProbe = local ? await genericEnvironment(options, {...context,event:async(type,data)=>{
     if(type==='execution-handle'&&localPending){
@@ -77,8 +79,9 @@ export async function createEnvironment(options, context) {
       ...(type==='execution-state'&&data.state==='stopped'?{executionSeconds:0,accountingExcluded:true}:{})});
   }}) : null;
   let queue = Promise.resolve();
-  function serial(fn) {
-    const result = queue.then(fn);
+  function serial(fn, wait = operation => operation()) {
+    const previous = queue;
+    const result = (async () => { await wait(() => previous); return fn(); })();
     queue = result.catch(() => {});
     return result;
   }
@@ -100,11 +103,14 @@ export async function createEnvironment(options, context) {
       }
     });
   }
+  let pool;
   async function enabled() {
     const policy = await client(['npu', 'list', options.target]);
     if (policy.state !== 'completed') throw new Error('NPU permission inventory unavailable');
     const profile = policy.profiles?.find(row => row.target === options.target);
     if (!profile) throw new Error('NPU permission profile missing');
+    if (!local && (typeof profile.pool !== 'string' || !profile.pool.trim())) throw new Error('CPL NPU profile requires an actual alias-group pool');
+    pool = profile.pool ?? 'local:' + options.target;
     return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !affinity || affinity.includes(id));
   }
   async function localSnapshot(devices,purpose,emit,budget,signal) {
@@ -259,7 +265,7 @@ export async function createEnvironment(options, context) {
       return retained;
     }
   }
-  async function resources({ purpose = 'ordinary', target } = {}) {
+  async function inspectDevices({ purpose = 'ordinary', target } = {}) {
     if (target && target !== options.target && target !== options.profile) return [];
     return serial(() => preflight(async emit => {
       const devices = await enabled();
@@ -278,42 +284,69 @@ export async function createEnvironment(options, context) {
       }));
     }));
   }
+  // Scheduler leases represent host concurrency slots, never physical reservations.
+  async function resources({target} = {}) {
+    if (target && target !== options.target && target !== options.profile) return [];
+    const devices = await enabled();
+    return devices.map((_, slot) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
+      available: true, metadata: {kind:'host-slot', pool, target:options.target} }));
+  }
   return {
-    ...environment, resources, shellOnTarget:local,
+    ...environment, resources, inspectDevices, shellOnTarget:local,
     instructions:environment.instructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),
     async execute(command, cwd, opts = {}) {
+      const signal = context.signal && opts.signal ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal;
       const started = performance.now();
       let excludedMs = 0;
       const remaining = () => opts.timeout === undefined ? undefined : Math.max(0, opts.timeout - (performance.now() - started - excludedMs) / 1000);
+      const exclude = async (label, fn) => {
+        const before = performance.now();
+        try { return await context.exclude(label, fn); }
+        finally { excludedMs += performance.now() - before; }
+      };
       return serial(async () => {
-        const setupStarted = performance.now();
-        let physical;
-        try { physical = await preflight(async emit => {
-          if (opts.signal?.aborted || remaining() === 0) throw new Error('Execution cancelled or elapsed budget exhausted');
-          const requested = opts.resourceId ?? assignedId;
-          if (!requested || assignedId && requested !== assignedId) throw new Error('Assigned opaque Ascend resource required');
-          const devices = await enabled();
-          const physical = devices.find(device => idFor(device) === requested);
-          if (physical === undefined) throw new Error('Assigned resource is not enabled for this target/runtime');
-          const result = await snapshot([physical], opts.purpose ?? 'ordinary', emit, remaining() ?? seconds,opts.signal);
-          const row = result.devices.find(item => item.physical_device === physical);
-          const permitted = (await enabled()).includes(physical);
-          if (row?.admitted !== true || !permitted) {
-            const reason = { physicalDevice: physical, row: row ?? null, permitted,
-              policy: !permitted ? 'resource-disabled' : 'health-admission-refused' };
-            throw closedSetupError('Fresh resource admission refused', {handle: result.handle, reason});
+        // Unknown execution is fenced across restart. Observation is allowed;
+        // submitting another command is not evidence that the old one stopped.
+        try {
+          const retained = await readJson(leasePath);
+          throw new Error(`Device lease unresolved; reconcile ${JSON.stringify(retained)}`);
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        let physical, lease;
+        await preflight(async emit => {
+          for (;;) {
+            signal?.throwIfAborted();
+            if (remaining() === 0) throw new Error('Execution elapsed budget exhausted');
+            const devices = await enabled();
+            if (!devices.length) throw closedSetupError('No enabled devices in pool');
+            const result = await exclude('setup', () => snapshot(devices, opts.purpose ?? 'ordinary', emit, seconds, signal));
+            const permitted = new Set(await enabled());
+            for (const row of result.devices) {
+              if (!devices.includes(row.physical_device) || !permitted.has(row.physical_device) || row.admitted !== true || row.measurements?.idle !== true) continue;
+              lease = await reserveDevice(pool, row.physical_device, context.leaseDirectory);
+              if (lease) { physical = row.physical_device; break; }
+            }
+            if (lease) break;
+            await exclude('queue-wait', () => delay(options.leasePollMs ?? 250, undefined, {signal}));
           }
-          return physical;
-        }); } finally { excludedMs += performance.now() - setupStarted; }
-        bindings.ASCEND_PHYSICAL_DEVICE = bindings.ASCEND_RT_VISIBLE_DEVICES = bindings.ASCEND_VISIBLE_DEVICES = String(physical);
-        // Generic sync completes before this payload runs. Probe and exec share the
-        // same declared native workload, masks, supervisor, receipt and elapsed budget.
-        const request = { source, sha256: healthSha256, seconds, devices: [physical], command,
-          configuration: { ...options.health, require_idle: timing(opts.purpose) || options.health.require_idle === true } };
+        });
+        activeLease = lease;
+        // Persist before any transfer or submission; a missing handle is not closure.
+        await save(leasePath, {receipt:lease.receipt, token:lease.token, pool, physicalDevice:physical});
+        await context.event('device-lease-acquired', {pool, physicalDevice:physical, receipt:lease.receipt});
+        const request = { source, sha256: healthSha256, seconds, devices: [physical], command, hostLease,
+          lease:{pool,token:lease.token,receipt:lease.receipt},
+          configuration: { ...options.health, allow_busy:false, require_idle:timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
-        return environment.execute(guarded, cwd, { ...opts, timeout: remaining(), resourceId: physical,
-          env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
-      });
+        try {
+          const result = await environment.execute(guarded, cwd, { ...opts, signal, timeout: remaining(), resourceId: physical,
+            env: { ...options.env, ...opts.env, ASCEND_PHYSICAL_DEVICE: String(physical), ASCEND_RT_VISIBLE_DEVICES: String(physical), ASCEND_VISIBLE_DEVICES: String(physical) } });
+          if (result.settled) { await lease.release(); await unlink(leasePath); }
+          return result;
+        } catch (error) {
+          if (error.closure?.closed) { await lease.release(); await unlink(leasePath); }
+          throw error;
+        } finally { activeLease = null; }
+      }, operation => exclude('queue-wait', operation));
     },
   };
 }
