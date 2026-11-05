@@ -120,7 +120,9 @@ test('controller receives durable startup flags with restart policy',async () =>
 test('isolated real user services preserve descriptors, metrics, identity and descendant cleanup',
   {skip:process.env.RSI_MANAGED_SYSTEMD_TEST !== '1',timeout:45000},async () => {
     const run = promisify(execFile), dir = await mkdtemp(join(tmpdir(),'rsi-managed-'));
-    const id = 'rsitest' + process.pid + Date.now(), slice = id + '.slice';
+    const parent=process.env.RSI_TEST_SLICE;
+    assert(parent?.startsWith('rsivalidation'),'Owned 4GiB validation slice required');
+    const id=parent.slice(0,-6)+'-helper'+process.pid+Date.now(),slice=id+'.slice';
     const unitDir = join(process.env.XDG_RUNTIME_DIR,'systemd/user');
     const unitFile = join(unitDir,slice), log = join(dir,'worker%log'), report = join(dir,'report.json');
     const systemctl = args => run('systemctl',['--user',...args],{timeout:5000,maxBuffer:65536});
@@ -134,7 +136,7 @@ test('isolated real user services preserve descriptors, metrics, identity and de
       await writeFile(harness,`
 import {spawnManagedWorker} from ${JSON.stringify(module)};
 import {writeFile,readFile} from 'node:fs/promises';
-const options = ${JSON.stringify({slice,hostMemory:{max_bytes:cap},memoryBytes:16*1024**2,controllerMemoryBytes:48*1024**2})};
+const options = ${JSON.stringify({slice,hostMemory:{max_bytes:cap},memoryBytes:24*1024**2,controllerMemoryBytes:40*1024**2})};
 const worker = await spawnManagedWorker({argv:['/usr/bin/python3','-c',
   'import os,sys,time,json; print(json.dumps([sys.argv[1:],os.getenv("LITERAL"),os.getcwd(),os.getpid()]),flush=True); time.sleep(0.3)',
   '$LITERAL','space " quote','%h'],cwd:${JSON.stringify(dir)},env:{LITERAL:'$HOME %h'},stdout:${JSON.stringify(log)},stderr:${JSON.stringify(log)}},options);
@@ -158,7 +160,7 @@ try {
 await writeFile(${JSON.stringify(report)},JSON.stringify({identity:worker.identity,launcher:worker.child.pid,metrics,done,output,closed}));
 `);
       controller = await startManagedController({argv:[process.execPath,harness],cwd:dir,
-        stdout:join(dir,'controller.log'),stderr:join(dir,'controller.log')},{slice,hostMemory:{max_bytes:cap},controllerMemoryBytes:48*1024**2});
+        stdout:join(dir,'controller.log'),stderr:join(dir,'controller.log')},{slice,hostMemory:{max_bytes:cap},controllerMemoryBytes:40*1024**2});
       const deadline = Date.now()+20000; let result;
       while (Date.now()<deadline) {
         try {result=JSON.parse(await readFile(report,'utf8'));break;} catch (error) {if(error.code!=='ENOENT')throw error;}

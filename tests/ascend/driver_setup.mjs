@@ -1,3 +1,4 @@
+import {portableCli} from './portable-cli.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -82,7 +83,7 @@ export async function setup(t,scenario,ids,{install=false}={}) {
   const input=join(root,'bootstrap.json');await writeFile(input,JSON.stringify(config));
   const boot=execute(process.execPath,[cli,'bootstrap',instance,'--config',input]);await boot.output;
   if(!install)await symlink(resolve('node_modules'),join(instance,'machinery','node_modules'),'dir');
-  cli=join(instance,'machinery','cli','main.mjs');
+  cli=await portableCli(join(instance,'machinery','cli','main.mjs'),root);
   // Install only the configurable test embedding module, never replace runtime code.
   await cp(fixture,join(instance,'machinery','ascend_tools','fixture_embeddings.py'));
   const settings=join(root,'settings.json');await writeFile(settings,JSON.stringify({python,

@@ -77,3 +77,17 @@ test('explicit fresh start clears stop after preflight and never resumes interru
   assert.equal((await operate('wave',f.config,{managed:true},f.manager)).reason,'stopped');
   assert.equal(f.get('stop'),true);
 });
+
+for(const code of ['MEMORY_ENFORCEMENT_UNAVAILABLE','EIO'])test(`resource preflight ${code} waits before admission and recovers without phase restart`,async t=>{
+  const f=await fixture(t);f.set('managed-excluded',[f.attempt.id]);
+  await writeFile(join(f.root,'environment.mjs'),`let calls=0;export function createEnvironment(){return {
+    resources:async()=>{if(!calls++)throw Object.assign(new Error('inventory temporarily unavailable'),{code:${JSON.stringify(code)}});
+    return [{id:'fresh-slot',available:true}];}};}`);
+  const running=operate('wave',f.config,{managed:true},f.manager);
+  await waitFor(()=>f.get('wait')?.reason===(code==='EIO'?'resources':'memory-enforcement'),undefined,3);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n,1);
+  assert.equal(f.get('stop'),null);
+  await running;
+  assert.equal(f.state.project('fresh').status,'passed');
+  assert.equal(f.state.queryEvents(null,{types:['scheduler-error']}).length,0);
+});

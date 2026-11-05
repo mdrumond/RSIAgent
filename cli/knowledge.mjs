@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process';
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdir, open, readFile, writeFile, access } from 'node:fs/promises';
+import { join, resolve, isAbsolute, delimiter } from 'node:path';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processIdentity, ownerStopped } from '../controller/lifecycle.mjs';
-import {managedOptions,verifyProcessMembership} from './managed-runtime.mjs';
+import {managedOptions,verifyProcessMembership,startManagedKnowledge,managedKnowledgeIdentity,knowledgeUnit} from './managed-runtime.mjs';
 import { State } from '../controller/state.mjs';
 
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
@@ -34,6 +34,12 @@ export async function ensureKnowledgeService(config,{signal,managed=process.env.
       if(error.code==='ENOENT')return {};
       if(error instanceof SyntaxError)return {pending:true};
       throw error;
+    }
+    if(managed&&previous.service===knowledgeUnit(config.root)) {
+      const actual=await managedKnowledgeIdentity(config.root,managedOptions(config));
+      if(actual?.pending)return {pending:true};
+      if(actual) {previous={...previous,owner:actual};await writeFile(receipt,JSON.stringify(previous),{mode:0o600});}
+      else if(!previous.owner)return {};
     }
     if(await ownerStopped(previous.owner))return {};
     await membership(previous.owner.pid);
@@ -66,19 +72,37 @@ export async function ensureKnowledgeService(config,{signal,managed=process.env.
         if(managed&&process.env.RSI_MANAGED_ROLE==='worker')throw new Error('Managed controller must start KDB before worker admission');
         const port=await freePort(),url=`http://127.0.0.1:${port}/mcp`;
         await mkdir(join(config.root,'logs'),{recursive:true});
-        const log=await open(join(config.root,'logs','knowledge.log'),'a',0o600);
-        let child;
-        try {
-          const args=['-m','ascend_tools.kdb_service','--db',join(config.root,'knowledge.sqlite'),'--port',String(port)];
-          if(config.embedding_factory)args.push('--embedding-factory',config.embedding_factory);
-          if(config.embeddings?.cache_dir)args.push('--embedding-cache',config.embeddings.cache_dir);
-          child=spawn(config.python??'python',args,{cwd:config.root,detached:true,
-            stdio:['ignore',log.fd,log.fd],env:{...process.env,PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)}});
-          await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
-        }finally{await log.close();}
-        const owner=await processIdentity(child.pid);child.unref();
+        const logPath=join(config.root,'logs','knowledge.log');
+        const args=['-m','ascend_tools.kdb_service','--db',join(config.root,'knowledge.sqlite'),'--port',String(port)];
+        if(config.embedding_factory)args.push('--embedding-factory',config.embedding_factory);
+        if(config.embeddings?.cache_dir)args.push('--embedding-cache',config.embeddings.cache_dir);
+        const env={...process.env,PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)};
+        let owner,service;
+        if(managed) {
+          let executable=config.python??'python';
+          if(!isAbsolute(executable)) {
+            let found;
+            for(const directory of (env.PATH??'').split(delimiter)) {
+              const candidate=resolve(directory,executable);
+              try {await access(candidate,1);found=candidate;break;}catch(error){if(!['ENOENT','EACCES'].includes(error.code))throw error;}
+            }
+            if(!found)throw new Error('KDB Python executable unavailable');executable=found;
+          }
+          service=knowledgeUnit(config.root);
+          await writeFile(receipt,JSON.stringify({url,service,owner:null}),{mode:0o600});
+          const handle=await startManagedKnowledge({argv:[executable,...args],cwd:config.root,env,
+            stdout:logPath,stderr:logPath},{...managedOptions(config),unit:service});
+          owner=handle.identity;
+        } else {
+          const log=await open(logPath,'a',0o600);let child;
+          try {
+            child=spawn(config.python??'python',args,{cwd:config.root,detached:true,stdio:['ignore',log.fd,log.fd],env});
+            await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
+          }finally{await log.close();}
+          owner=await processIdentity(child.pid);child.unref();
+        }
         await membership(owner.pid);
-        await writeFile(receipt,JSON.stringify({url,owner}),{mode:0o600});
+        await writeFile(receipt,JSON.stringify({url,owner,...(service?{service}:{})}),{mode:0o600});
         while(performance.now()<deadline) {
           signal?.throwIfAborted();
           if(await healthy(url))return url;

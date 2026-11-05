@@ -115,13 +115,13 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
 
 test('CLI freezes at the configured unsuccessful recovery-round limit', {timeout:120000},async t=>{
   const f=await setup(t,'freeze',['freeze']);
-  const campaign=await f.run('campaign','--detach');
-  assert.equal(campaign.submitted,true);
+  const campaign=f.start('campaign');
   await until(async()=>(await f.run('status')).projects.find(p=>p.id==='freeze')?.frozen===1);
   await until(()=>{
     const owner=rows(f.root,"SELECT value FROM control WHERE key='owner'")[0];
     return owner && JSON.parse(owner.value)===null;
   });
+  await campaign.output;
   const status=await f.run('status');
   assert.equal(status.projects[0].status,'failed');assert.equal(status.projects[0].frozen,1);
   assert.equal(status.attempts.length,3);
