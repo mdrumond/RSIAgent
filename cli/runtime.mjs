@@ -2,9 +2,8 @@ import { spawn } from 'node:child_process';
 import { open, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { setTimeout as delay } from 'node:timers/promises';
 import { State } from '../controller/state.mjs';
-import { processIdentity, ownerStopped, attemptStopped } from '../controller/lifecycle.mjs';
+import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
 import { readConfig,updateConfig } from './instance.mjs';
 
@@ -70,12 +69,23 @@ export async function operate(command,config,options={}) {
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     const wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
     const queue=new RecoveryQueue(state,policy(config));
+    // Unknown failed execution is reconciled, never replayed through the actor.
+    for(const attempt of state.db.prepare('SELECT * FROM attempts WHERE outcome IS NOT NULL').all()) {
+      if(failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
+      try {
+        const path=join(config.root,'attempts',attempt.id);
+        const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+          async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
+        await reconcileFailure(state,attempt.id,previous);
+      }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+    }
     // A prior scheduler may have died before its worker-exit waiter released a lease.
     for(const attempt of state.db.prepare(`SELECT a.*,l.resource FROM resource_leases l
       JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
       schedulerAbort.signal.throwIfAborted();
       try {
-        if(!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
+        if(!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
         const path=join(config.root,'attempts',attempt.id);
         const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
         const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
@@ -108,10 +118,26 @@ export async function operate(command,config,options={}) {
     const requested=options.concurrency??config.concurrency??1;
     const concurrency=requested==='auto'?Math.max(1,jobs.length):Number(requested);
     if(!Number.isSafeInteger(concurrency)||concurrency<1)throw new Error('Invalid concurrency');
+    const contain=async(attempt,resource,kind,message)=>{
+      let previous;
+      try {
+        previous=await environment(config,join(config.root,'attempts',attempt.id),
+          (type,data)=>state.event(attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal);
+      }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+      // A recovery investigation does not settle the original project as passed.
+      return settleFailure(state,attempt.id,previous,{phase:'controller',kind,message});
+    };
     const launch=async(job,resource)=>{
+      let attempt,assignedResource,child;
+      try {
       const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy(config)});
-      const attempt=admitted.attempt;
-      const assignedResource=resource??admitted.resource;
+      attempt=admitted.attempt;
+      assignedResource=resource??admitted.resource;
+      const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
+      // Retain a finalization manifest even if subsequent launch preparation fails.
+      await writeFile(join(path,'job.json'),JSON.stringify({...admitted,wave:admitted.wave??wave,
+        options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,
+        skillVersion:admitted.skillVersion??config.skills.activeVersion,resource:assignedResource}),{mode:0o600});
       const latest=await readConfig(config.root);
       let skillVersion=admitted.skillVersion??latest.skills.activeVersion;
       if(!job.resume && admitted.kind!=='original') {
@@ -122,18 +148,39 @@ export async function operate(command,config,options={}) {
         catch(error){if(error.code!=='ENOENT')throw error;}
       }
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
-      const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
       await writeFile(join(path,'job.json'),JSON.stringify({...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource}),{mode:0o600});
       const log=await open(join(path,'worker.log'),'a',0o600);
-      const child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
-      let complete=false;
-      child.once('exit',()=>{complete=true;});
-      child.once('error',error=>{state.event(attempt.id,'worker-spawn-error',{message:error.message});complete=true;});
+      child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
+      const exited=new Promise(resolve=>{
+        child.once('exit',(code,signal)=>resolve({code,signal}));
+        child.once('error',error=>resolve({message:error.message}));
+      });
       await log.close();
-      while(!complete)await delay(50);
-      const outcome=state.attempt(attempt.id).outcome;
-      if(outcome)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
-      return {attempt:attempt.id,outcome};
+      const exit=await exited;
+      state.event(attempt.id,'worker-exited',exit);
+      // Intentional stop preserves resumability and the lease.
+      if(!ctl.get('stop') && !state.attempt(attempt.id).outcome) {
+        await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit));
+      }
+      // Even an outcome is not proof that detached execution has stopped.
+      if(state.attempt(attempt.id).outcome) {
+        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+          async(_label,fn)=>fn(),assignedResource,schedulerAbort.signal);
+        if(await attemptStopped(state,state.attempt(attempt.id),previous) && failureSettled(state,attempt.id))
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+      }
+      return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome};
+      }catch(error) {
+        if(!attempt) {
+          state.event(null,'job-error',{project:job.projectId,message:error.message});
+          return {project:job.projectId,error:error.message};
+        }
+        const closed=await contain(attempt,assignedResource,'worker-boundary',error.message);
+        if(closed && (!child || !child.pid || child.exitCode!==null || child.signalCode!==null))
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+        return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,error:error.message};
+      }
+
     };
     const results=[];
     try {
@@ -215,6 +262,9 @@ async function worker(root,id) {
   const watcher=setInterval(()=>{if(ctl.get('stop'))signal();},100);
   async function finish() {
     const current=state.attempt(id);
+    if(!failureSettled(state,id))return;
+    if(current.outcome==='failed' && !state.failures(id,{limit:1}).length)
+      state.recordFailure(id,{phase:'actor',kind:'failed-outcome',message:'Actor completed without acceptance'});
     if(!outcomeRecorded(state,id,policy(config))) {
       const {findingsFor}=await import('./findings.mjs');
       const findings=await findingsFor({config,job:{...job,attempt},path,state,bridge,
@@ -274,13 +324,20 @@ async function worker(root,id) {
         ...await (await import('../controller/model.mjs')).modelFromProfile(config.actor),
         skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension]});
     }
-    if(!interrupted)await finish();
+    if(!interrupted) {
+      if(state.attempt(id).outcome==='failed' && !state.queryEvents(id,{types:['failure-settlement'],limit:1}).length)
+        await settleFailure(state,id,env,{phase:'actor',kind:'failed-outcome',
+          message:'Actor completed without acceptance',settleProject:job.kind!=='investigation'});
+      await finish();
+    }
   }catch(error) {
     state.event(id,'attempt-error',{message:error.message,stage:'worker'});
-    if(!interrupted && claimed && !state.attempt(id).outcome) {
-      const {operationsStopped}=await import('../controller/lifecycle.mjs');
-      if(await operationsStopped(state,state.attempt(id),env??{})) {
-        state.finish(id,'failed',{settleProject:job.kind!=='investigation'});
+    if(!interrupted && claimed) {
+      if(!state.attempt(id).outcome || (state.attempt(id).outcome==='failed' &&
+          !state.queryEvents(id,{types:['failure-settlement'],limit:1}).length)) {
+        await settleFailure(state,id,env,{message:error.message,settleProject:job.kind!=='investigation'});
+      }else state.recordFailure(id,{phase:'postprocess',kind:'exception',message:error.message});
+      if(failureSettled(state,id)) {
         try{await finish();}catch(failure){state.event(id,'postprocess-error',{message:failure.message});}
       }
     }
