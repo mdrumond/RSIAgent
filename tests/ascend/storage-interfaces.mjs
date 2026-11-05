@@ -194,6 +194,9 @@ test('automatic maintenance submits no empty jobs and reuses a pending request',
   const f=await fixture(t,{finish:false});
   const {queueCompression}=await import('../../cli/storage-maintenance.mjs');
   const config={...f.config,storage:{enabled:true}};
+  await writeFile(join(f.root,'vanished.log'),'retained then removed');
+  const vanished=await f.storage.register('vanished.log',{kind:'cited-text'});
+  await f.storage.seal(vanished.id);await rm(join(f.root,'vanished.log'));
   assert.equal(await queueCompression(config,{manager:{}}),null);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,0);
   f.state.db.prepare("INSERT INTO requests(id,kind,status) VALUES ('pending','storage','queued')").run();
