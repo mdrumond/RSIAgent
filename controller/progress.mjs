@@ -19,7 +19,8 @@ export function campaignProgress(state, config) {
     throw new Error('Invalid completion target');
   const target = config.phase_targets?.[mode] ?? config.completion_target ?? null;
   const lists = Object.fromEntries(phases.map(phase => [phase,
-    Array.isArray(config.curriculum?.[phase]) ? [...new Set(config.curriculum[phase])] : []]));
+    Array.isArray(config.curriculum?.[phase]) ? [...new Set(config.curriculum[phase])] :
+      [...new Set((config.projects??[]).filter(project=>project.phase===phase||(!project.phase&&phase===mode)).map(project=>project.id))]]));
   // Only project IDs from configuration enter SQL; histories stay in SQLite.
   const membership = phases.flatMap(phase => lists[phase].map(id => ({id, phase})));
   const hasRecovery = state.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_attempts'").get();

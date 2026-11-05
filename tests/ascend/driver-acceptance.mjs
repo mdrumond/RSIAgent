@@ -37,10 +37,11 @@ export async function createEnvironment(options,context){
     await writeFile(settings,JSON.stringify({curriculum:{phase1:['interrupt','unrelated']}}));
     await f.run('config','--config',settings);
     const requests=f.server.requests.length;
-    const result=await f.run('campaign');
-    assert.equal(result.reason,'requires-resume');
-    assert.equal(result.waves[0].results.length,1);
-    assert.equal(result.waves.at(-1).results.length,0);
+    const continuation=f.start('campaign');
+    await until(()=>rows(f.root,"SELECT 1 FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project='unrelated' AND e.type='postprocess-completed'").length);
+    await f.run('pause');
+    const result=await continuation.output;
+    assert.equal(result.reason,'paused');
     const attempts=rows(f.root,'SELECT * FROM attempts');
     assert.equal(attempts.length,2);
     assert.deepEqual(attempts.find(row=>row.id===interrupted.id),interrupted);
