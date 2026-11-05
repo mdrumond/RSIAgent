@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { run } from '../../cli/skills.mjs';
+import { main } from '../../cli/main.mjs';
+import { State } from '../../controller/state.mjs';
 import { tune } from '../../controller/skill-evolution.mjs';
 import { evaluateRound, tuningStatus } from '../../controller/evaluation-round.mjs';
 
@@ -13,7 +16,7 @@ async function fixture(t, seconds) {
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'skills', 'versions', 'baseline'), { recursive: true });
   await save(join(root, 'skills', 'versions', 'baseline', 'guidance.json'), []);
-  const config = { root, mode: 'phase2', tune_every: 2,
+  const config = { format: 1, root, mode: 'phase2', tune_every: 2,
     skills: { activeVersion: 'baseline', tuningProjectIds: ['a', 'b'], ...(seconds ? { evaluationSeconds: seconds } : {}) } };
   await save(join(root, 'instance.json'), config);
   return { root, config, run: values => tune({ instanceRoot: root, config, generate: async () => [], ...values }) };
@@ -69,7 +72,8 @@ test('interrupted sample retains identity, completed sample is skipped, and paus
   await assert.rejects(f.run({ task: task(1), signal: controller.signal, clock, evaluate: async request => {
     calls++; milliseconds += 100;
     if (calls === 1) { firstRoot = request.instanceRoot; return score(request); }
-    interruptedRoot = request.instanceRoot; controller.abort(); request.signal.throwIfAborted();
+    interruptedRoot = request.instanceRoot; controller.abort();
+    throw Object.assign(request.signal.reason, { evaluationStopped: true });
   } }), { name: 'AbortError' });
   assert.equal((await tuningStatus(f.root)).status, 'interrupted');
   milliseconds += 100000;
@@ -100,4 +104,66 @@ test('real elapsed deadline cancels nested execution and never promotes partial 
   }) });
   assert.equal(cancelled, true); assert.equal(result.evaluationStatus, 'exhausted');
   assert.equal((await load(join(f.root, 'instance.json'))).skills.activeVersion, 'baseline');
+});
+
+
+test('unknown execution keeps charging across observation gaps and unsuccessful reconciliation', async t => {
+  const f = await fixture(t, 10);
+  let milliseconds = 0;
+  const clock = { now: () => milliseconds, wallNow: () => milliseconds };
+  await f.run({ task: task(0) });
+  const unknown = async () => { milliseconds += 100; throw new Error('execution unresolved'); };
+  await assert.rejects(f.run({ task: task(1), clock, evaluate: unknown }), /unresolved/);
+  milliseconds += 3000;
+  await assert.rejects(f.run({ clock, evaluate: unknown }), /unresolved/);
+  const state = await load(join(f.root, 'skills', 'evolution.json'));
+  const round = await load(join(state.pending.evaluationRoot, 'round.json'));
+  assert.equal(round.elapsedSeconds, 3.2); assert.equal(round.runningAt, milliseconds);
+  milliseconds += 8000;
+  const exhausted = await f.run({ clock, evaluate: () => assert.fail('unknown work refunded time') });
+  assert.equal(exhausted.evaluationStatus, 'exhausted');
+  const charged = await load(join(state.pending.evaluationRoot, 'round.json'));
+  assert.equal(charged.elapsedSeconds, 11.2); assert.equal(charged.runningAt, milliseconds);
+});
+
+test('public status describes a new deferred candidate instead of the preceding completed round', async t => {
+  const f = await fixture(t, 20); new State(join(f.root, 'state.sqlite')).close();
+  await f.run({ task: task(0) });
+  assert.equal((await f.run({ task: task(1), evaluate: score })).promote, true);
+  const current = await load(join(f.root, 'instance.json'));
+  const candidate = await tune({ instanceRoot: f.root, config: current, task: task(2), generate: async () => [] });
+  const status = await main(['status', '--instance', f.root]);
+  assert.equal(status.tuning.candidate, candidate.candidate);
+  assert.equal(status.tuning.status, 'deferred');
+  assert.equal(status.tuning.evaluationRoot, undefined); assert.equal(status.tuning.completedSamples, undefined);
+});
+
+test('CLI resumes with the frozen evaluator module after live configuration changes', async t => {
+  const f = await fixture(t, 20), calls = join(f.root, 'calls.jsonl'), marker = join(f.root, 'interrupted');
+  f.config.skills.runtimeModule = 'original.mjs'; await save(join(f.root, 'instance.json'), f.config);
+  await writeFile(join(f.root, 'original.mjs'), `
+    import { mkdir, appendFile, writeFile, access } from 'node:fs/promises';
+    const log = request => appendFile(${JSON.stringify(calls)}, JSON.stringify({root:request.instanceRoot,kind:request.kind})+'\\n');
+    const result = request => ({correct:true,score:request.config.skills.activeVersion==='baseline'?1:2});
+    export async function bootstrap(request) { await mkdir(request.instanceRoot); await log({...request,kind:'bootstrap'}); }
+    export async function wave(request) {
+      await log({...request,kind:'wave'});
+      try { await access(${JSON.stringify(marker)}); }
+      catch { await writeFile(${JSON.stringify(marker)},'interrupted'); throw Object.assign(new Error('stopped'),{evaluationStopped:true}); }
+      return result(request);
+    }
+    export async function resume(request) { await log({...request,kind:'resume'}); return result(request); }
+  `);
+  await writeFile(join(f.root, 'replacement.mjs'), `throw new Error('replacement evaluator selected');`);
+  await f.run({ task: task(0) });
+  await assert.rejects(f.run({ task: task(1), evaluate: () => { throw Object.assign(new Error('prepare'), {evaluationStopped:true}); } }), /prepare/);
+  const dependencies = { lock: async (_config, operation) => operation(), readConfig: async () => load(join(f.root, 'instance.json')) };
+  await assert.rejects(run(f.config, dependencies), /stopped/);
+  const edited = {...f.config,skills:{...f.config.skills,runtimeModule:'replacement.mjs'}};
+  await save(join(f.root, 'instance.json'), edited);
+  const result = await run(edited, dependencies); assert.equal(result.promote, true);
+  const history = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(history.filter(call => call.kind==='bootstrap').length, 8);
+  assert.equal(history.filter(call => call.kind==='resume').length, 1);
+  assert.equal(history[0].root, history.find(call=>call.kind==='resume').root);
 });

@@ -154,6 +154,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   let recoveredPromotion;
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
+    state.evaluationStatus = 'completed';
+    state.lastEvaluationRoot = state.pending.evaluationRoot;
     state.pending = null;
     state.candidateBase = current.skills.activeVersion;
     await save(statePath, state, signal);
@@ -162,6 +164,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if ((state.candidate && state.candidateBase !== current.skills.activeVersion) ||
       (state.pending && state.pending.active !== current.skills.activeVersion)) {
     state.candidate = null; state.pending = null; state.candidateBase = current.skills.activeVersion;
+    state.evaluationStatus = 'deferred';
     await save(statePath, state, signal);
   }
   const every = current.tune_every ?? 8, pruneAfterTasks = current.skills?.pruneAfterTasks ?? 24;

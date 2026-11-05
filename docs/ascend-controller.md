@@ -290,8 +290,11 @@ the partial directory is retained and is never automatically recreated.
 
 The deadline covers bootstrap, dependency installation and execution, with
 cancellation propagated to nested work. Graceful interruption checkpoints elapsed
-time and excludes subsequent paused time. After process loss, uncheckpointed
-elapsed time is conservatively charged until observation resumes. Exhaustion
+time and excludes subsequent paused time only when stopped owners and operations
+are positively proved. Unknown execution keeps charging across observation gaps
+and failed reconciliation. Custom evaluator modules may export `settled(request)`
+to provide this proof; missing or failed proof remains unknown. After process
+loss, uncheckpointed elapsed time is conservatively charged until observation resumes. Exhaustion
 keeps the candidate unpromoted until an explicit additional grant arrives.
 Completed task evidence arriving while a round is blocked remains in history.
 `status` includes `tuning` with its evaluation state, allocation, elapsed time,

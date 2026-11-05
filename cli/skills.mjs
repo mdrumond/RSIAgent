@@ -89,23 +89,32 @@ export async function run(config, values = {}) {
     };
     const evaluate = async request => {
       request.resource = values.resource;
-      const runtime = values.runtime ?? await import(config.skills?.runtimeModule
-        ? pathToFileURL(resolve(instanceRoot, config.skills.runtimeModule)).href
+      const runtime = values.runtime ?? await import(request.config.skills?.runtimeModule
+        ? pathToFileURL(resolve(instanceRoot, request.config.skills.runtimeModule)).href
         : new URL('./evaluation.mjs', import.meta.url).href);
       if (typeof runtime?.bootstrap !== 'function' || typeof runtime?.wave !== 'function')
         throw new Error('Provide runtime bootstrap and wave');
-      let exists = false;
-      try { await access(request.instanceRoot); exists = true; }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
-      if (exists) {
-        if (typeof runtime.resume !== 'function') throw new Error('Existing evaluation requires runtime.resume');
-        return runtime.resume(request);
+      try {
+        let exists = false;
+        try { await access(request.instanceRoot); exists = true; }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (exists) {
+          if (typeof runtime.resume !== 'function') throw new Error('Existing evaluation requires runtime.resume');
+          return await runtime.resume(request);
+        }
+        request.signal?.throwIfAborted();
+        await runtime.bootstrap(request);
+        request.signal?.throwIfAborted();
+        return await runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
+          projectIds: [request.projectId], evaluation: true, remainingSeconds: request.remainingSeconds, signal: request.signal });
+      } catch (error) {
+        // Only a positive lifecycle/operation proof permits paused elapsed accounting.
+        if (runtime.settled) {
+          try { error.evaluationStopped = await runtime.settled(request); }
+          catch { error.evaluationStopped = false; }
+        }
+        throw error;
       }
-      request.signal?.throwIfAborted();
-      await runtime.bootstrap(request);
-      request.signal?.throwIfAborted();
-      return runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
-        projectIds: [request.projectId], evaluation: true, remainingSeconds: request.remainingSeconds, signal: request.signal });
     };
     const storage = config.storage ? await import('../controller/storage-knowledge.mjs') : null;
     if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true});

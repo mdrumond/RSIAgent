@@ -29,7 +29,7 @@ export async function evaluateRound({ pending, config, evaluate, signal,
   }
   if (round.runningAt !== undefined) {
     round.elapsedSeconds += Math.max(0, wallNow() - round.runningAt) / 1000;
-    delete round.runningAt;
+    round.runningAt = wallNow(); // Work may still be live until settlement is proved.
   }
   round.allocatedSeconds = (pending.evaluationSeconds ?? 0) +
     (pending.allocations ?? []).reduce((sum, allocation) => sum + allocation.seconds, 0);
@@ -88,14 +88,14 @@ export async function evaluateRound({ pending, config, evaluate, signal,
   } catch (error) {
     charge();
     round.status = expired || !remaining() ? 'exhausted' : 'interrupted';
-    delete round.runningAt;
+    if (error.evaluationStopped === true || round.runningAt === undefined) delete round.runningAt;
+    else round.runningAt = wallNow(); // Rebase after charge; retain unknown work across observation gaps.
     await persist();
     if (signal?.aborted || remaining() > 0) throw error;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
   }
-  delete round.runningAt;
   await persist();
   return { ...round, evaluationRoot: root };
 }
@@ -105,7 +105,8 @@ export async function tuningStatus(root) {
   try { state = await read(join(root, 'skills', 'evolution.json')); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   let round;
-  const evaluationRoot = state.pending?.evaluationRoot ?? state.lastEvaluationRoot;
+  const evaluationRoot = state.pending?.evaluationRoot ??
+    (state.evaluationStatus === 'completed' ? state.lastEvaluationRoot : undefined);
   if (evaluationRoot) {
     try { round = await read(join(evaluationRoot, 'round.json')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }

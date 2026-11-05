@@ -15,7 +15,7 @@ export async function bootstrap(request) {
     if(!request.resource) {
       const row=ledger.db.prepare("SELECT name FROM sqlite_master WHERE name='control'").get();
       const owner=row && ledger.db.prepare("SELECT value FROM control WHERE key='owner'").get();
-      if(owner && !await ownerStopped(JSON.parse(owner.value)))
+      if(owner && JSON.parse(owner.value) && !await ownerStopped(JSON.parse(owner.value)))
         throw new Error('Stop the campaign before manual isolated evaluation');
     }
     for(const event of ledger.events(null).filter(event=>event.type==='evaluation-started')) {
@@ -94,15 +94,22 @@ export async function resume(request) {
   const state = new State(join(request.instanceRoot, 'state.sqlite'));
   let attempts;
   try {
+    attempts = await stoppedAttempts(config, state, request.signal);
+  } finally { state.close(); }
+  if (attempts.length && attempts[0].outcome !== null) return result(request.instanceRoot);
+  return wave({ ...request, config, resuming: attempts.length > 0 });
+}
+
+async function stoppedAttempts(config, state, signal, allOperations = false) {
     const control = state.db.prepare("SELECT name FROM sqlite_master WHERE name='control'").get();
     const owner = control && state.db.prepare("SELECT value FROM control WHERE key='owner'").get();
     if (owner && JSON.parse(owner.value) && !await ownerStopped(JSON.parse(owner.value)))
       throw new Error('Evaluation controller remains live; observe it before resuming');
-    attempts = state.db.prepare('SELECT * FROM attempts').all();
+    const attempts = state.db.prepare('SELECT * FROM attempts').all();
     if (attempts.length > 1) throw new Error('Evaluation instance has multiple attempts');
     for (const attempt of attempts) {
       if (!await ownerStopped(attempt.owner)) throw new Error('Evaluation worker remains live; observe it before resuming');
-      if (attempt.outcome !== null) {
+      if (allOperations || attempt.outcome !== null) {
         const path = join(config.root, 'attempts', attempt.id);
         let environment = {};
         if (state.events(attempt.id).some(event => event.type.startsWith('execution-'))) {
@@ -110,12 +117,19 @@ export async function resume(request) {
           const module = await import(pathToFileURL(resolve(config.root, config.environment.module)));
           environment = await module.createEnvironment(config.environment.options, { instancePath: path,
             event: (type, data) => state.event(attempt.id, type, data), exclude: async (_label, fn) => fn(),
-            resource: job.resource, signal: request.signal });
+            resource: job.resource, signal });
         }
         if (!await operationsStopped(state, attempt, environment)) throw new Error('Evaluation execution remains unresolved; observe it before resuming');
       }
     }
-  } finally { state.close(); }
-  if (attempts.length && attempts[0].outcome !== null) return result(request.instanceRoot);
-  return wave({ ...request, config, resuming: attempts.length > 0 });
+    return attempts;
+}
+
+export async function settled(request) {
+  try {
+    const config = await readConfig(request.instanceRoot);
+    const state = new State(join(config.root, 'state.sqlite'));
+    try { await stoppedAttempts(config, state, AbortSignal.timeout(5000), true); return true; }
+    finally { state.close(); }
+  } catch { return false; }
 }
