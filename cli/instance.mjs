@@ -3,7 +3,8 @@ import { join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { dirname, delimiter } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID,createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import {normalizeHostMemory} from '../controller/host-memory.mjs';
 import { State, validateAcceptance } from '../controller/state.mjs';
@@ -165,9 +166,16 @@ export async function importProject(root,spec) {
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
   const source=await realpath(spec.source),files=spec.verifier.files;
+  const hash=async path=>{const digest=createHash('sha256');for await(const chunk of createReadStream(path))digest.update(chunk);return digest.digest('hex');};
+  const expected={};
+  for(const file of files) {
+    const absolute=resolve(file),actual=await hash(absolute);
+    if(spec.verifier.hashes&&spec.verifier.hashes[absolute]!==actual)throw new Error('Frozen verifier changed before import');
+    expected[absolute]=actual;
+  }
   if(!(await stat(source)).isDirectory())throw new Error('Project source must be a directory');
   const own=join(resolve(root),'projects',spec.id);
-  if(within(own,source) && files.every(path=>within(own,resolve(path))))return spec;
+  if(within(own,source) && files.every(path=>within(own,resolve(path))))return {...spec,verifier:{...spec.verifier,hashes:expected}};
   let common=source;
   for(const path of files)while(!within(common,resolve(path)))common=dirname(common);
   const tree=join(own,'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
@@ -175,14 +183,16 @@ export async function importProject(root,spec) {
   const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
   await cp(source,destination,{recursive:true,verbatimSymlinks:true,filter});
   const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
-  const copied=[];
+  const copied=[],hashes={};
   for(const path of files) {
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
     await mkdir(dirname(target),{recursive:true});await cp(absolute,target);copied.push(target);
+    if(await hash(target)!==expected[absolute])throw new Error('Frozen verifier changed during import');
+    hashes[target]=expected[absolute];
     for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
   }
   for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(source).join('.');
   const result={...spec,source:destination};
-  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied};
+  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied,hashes};
   return result;
 }

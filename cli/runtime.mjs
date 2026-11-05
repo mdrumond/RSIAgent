@@ -46,7 +46,8 @@ export async function operate(command,config,options={}) {
   const state=stateFor(config.root), ctl=control(state);
   let owned=false,watcher;
   const schedulerAbort=new AbortController();
-  const abort=()=>{ctl.set('stop',true);schedulerAbort.abort(new Error('Wave interrupted'));};
+  const backgroundAbort=new AbortController();
+  const abort=()=>{ctl.set('stop',true);schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();};
   options.signal?.addEventListener('abort',abort,{once:true});
   try {
     if(command==='pause') {
@@ -76,7 +77,10 @@ export async function operate(command,config,options={}) {
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
       ctl.set('owner',owner);ctl.set('stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
-    watcher=setInterval(()=>{if(ctl.get('stop'))schedulerAbort.abort(new Error('Wave interrupted'));},100);
+    watcher=setInterval(()=>{
+      if(ctl.get('stop')){schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();}
+      if(ctl.get('pause'))backgroundAbort.abort(new Error('Instance paused'));
+    },100);
     if(options.signal?.aborted)abort();
     if((await readConfig(config.root)).mode!==config.mode)await updateConfig(config.root,current=>({...current,mode:config.mode}));
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
@@ -204,7 +208,7 @@ export async function operate(command,config,options={}) {
       const exit=await exited;
       state.event(attempt.id,'worker-exited',exit);
       // Intentional stop preserves resumability and the lease.
-      if(!ctl.get('stop') && !state.attempt(attempt.id).outcome) {
+      if(!ctl.get('stop') && !ctl.get('pause') && !state.attempt(attempt.id).outcome) {
         const closed=await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit),!job.resume &&
           (!child.pid || child.exitCode!==null || child.signalCode!==null));
         if(closed)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
@@ -231,6 +235,7 @@ export async function operate(command,config,options={}) {
 
     };
     const results=[],activeJobs=new Map(),startedJobs=new Set();
+    const unavailable=new Set();
     const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
     let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot;
@@ -267,13 +272,13 @@ export async function operate(command,config,options={}) {
             const {ensureKnowledgeService}=await import('./knowledge.mjs');
             const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
             const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
-            const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:schedulerAbort.signal}),agentDir:path,target:generationConfig.target,
+            const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),agentDir:path,target:generationConfig.target,
               event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
             const requested=options.concurrency??generationConfig.concurrency??1;
             const specs=await (await import('./project-generation.mjs')).refillPhase1({config:generationConfig,state,bridge,
-              concurrency:requested==='auto'?1:Number(requested),path,signal:schedulerAbort.signal});
+              concurrency:requested==='auto'?1:Number(requested),path,signal:backgroundAbort.signal});
             for(const spec of specs) {
-              schedulerAbort.signal.throwIfAborted();
+              backgroundAbort.signal.throwIfAborted();
               if(state.project(spec.id))continue;
               const imported=await importProject(config.root,spec);
               await updateConfig(config.root,(current,ledger)=>{
@@ -282,7 +287,7 @@ export async function operate(command,config,options={}) {
                   curriculum:{...current.curriculum,phase1:[...new Set([...(current.curriculum?.phase1??[]),imported.id])]}};
               });
             }
-          }catch(error){if(!schedulerAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
+          }catch(error){if(!backgroundAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
           finally{nextGeneration=Date.now()+5000;generation=null;}
         })();
       }
@@ -291,7 +296,7 @@ export async function operate(command,config,options={}) {
           try {
             const {ensureKnowledgeService}=await import('./knowledge.mjs');
             const {deliverLessons}=await import('./memory.mjs');
-            await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:schedulerAbort.signal}),signal:schedulerAbort.signal});
+            await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:backgroundAbort.signal}),signal:backgroundAbort.signal});
           }catch(error){state.event(null,'memory-update-error',{message:error.message});}
           finally{nextMaintenance=Date.now()+5000;maintenance=null;}
         })();
@@ -316,8 +321,11 @@ export async function operate(command,config,options={}) {
       }
       const candidates=command==='resume' && !options.continuous?jobs:
         [...maintenanceJobs,...jobs.filter(job=>job.resume),...nextWave(state,{wave:options.continuous?wave+1:wave,...policy({...config,mode:'phase1'})})];
+      for(const job of candidates)if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt)
+        job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
+        if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
         if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
         if(job.finalize&&state.queryEvents(job.attempt.id,{types:['postprocess-completed'],limit:1}).length)return false;
         if(['investigation','retry'].includes(job.kind)&&config.mode!=='phase1'&&!config.skills?.tuningDisabled&&
@@ -331,13 +339,13 @@ export async function operate(command,config,options={}) {
         start(finalizer);continue;
       }
       const activeActors=[...activeJobs.values()].filter(job=>!job.finalize);
-      const job=selectAdmission(eligible.filter(job=>!job.finalize),{running:activeActors,concurrency:limit,freshSinceRecovery});
+      const job=selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{running:activeActors,concurrency:limit,freshSinceRecovery});
       if(!job) {
         if(!running.size&&!options.continuous)break;
         if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
-          !eligible.some(job=>job.finalize)&&!state.db.prepare('SELECT 1 FROM recovery_queue LIMIT 1').get())break;
+          !eligible.some(job=>job.finalize||['investigation','retry'].includes(job.kind)))break;
         ctl.set('wait',{reason:running.size?'actor-capacity':'inputs-or-recovery',at:new Date().toISOString()});
-        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);continue;
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);unavailable.clear();continue;
       }
       if(job.kind==='investigation') {
         const {failureInvestigations}=await import('../controller/failure-patterns.mjs');
@@ -355,9 +363,9 @@ export async function operate(command,config,options={}) {
         !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)));
       const resource=choose();
       if(!resource) {
-        if(!running.size&&!options.continuous)break;
-        ctl.set('wait',{reason:'resources',at:new Date().toISOString()});
-        await Promise.race([...running,delay(1000,undefined,{signal:schedulerAbort.signal})]);continue;
+        unavailable.add(keyFor(job));
+        ctl.set('wait',{reason:'resources',project:job.projectId,at:new Date().toISOString()});
+        continue;
       }
       if(ctl.get('stop'))break;
       if(options.continuous && job.kind!=='original' && job.eligible_wave>wave){wave=job.eligible_wave;ctl.set('wave',wave);}
