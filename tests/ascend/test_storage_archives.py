@@ -1,207 +1,184 @@
-"""Small synthetic artifacts only; no campaign fixtures or dependencies."""
+"""Behavioral tests using actual Restic and synthetic, task-owned files only."""
+import hashlib
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
-import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
-from ascend_tools import log_walk
-import zlib
-
-from ascend_tools.storage_archive import (
-    compress_file, finalize_source, iter_artifact_bytes, restore_file,
-)
-from ascend_tools.log_walk import open_artifact_bytes, walk_records
-
-
-class ArchivesTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.source = self.root / 'source.jsonl'
-        self.archive = self.root / 'archive'
-        self.source.write_bytes(b''.join(bytes([i]) * 100 for i in range(5)))
-
-    def test_interrupt_resume_reuses_verified_chunks(self):
-        # Exit the interpreter between checkpoints, not a mocked compressor.
-        code = '''
-import os, sys
-from ascend_tools.storage_archive import compress_file
-compress_file(sys.argv[1], sys.argv[2], chunk_bytes=100,
-              on_chunk=lambda manifest: os._exit(23))
-'''
-        result = subprocess.run([sys.executable, '-c', code, str(self.source), str(self.archive)])
-        self.assertEqual(result.returncode, 23)
-        progress = json.loads(next(self.archive.glob('*.progress.json')).read_text())
-        self.assertEqual(len(progress['chunks']), 1)
-        chunk = self.archive / progress['chunks'][0]['file']
-        before = chunk.stat().st_mtime_ns
-        # An interrupted temporary write is ignored, not considered completed.
-        (self.archive / '.chunk-interrupted').write_bytes(b'partial')
-        manifest = compress_file(self.source, self.archive, chunk_bytes=100)
-        self.assertEqual(chunk.stat().st_mtime_ns, before)
-        self.assertEqual(b''.join(iter_artifact_bytes(manifest)), self.source.read_bytes())
-        restored = self.root / 'restored'
-        restore_file(manifest, restored)
-        self.assertEqual(restored.read_bytes(), self.source.read_bytes())
-        with self.assertRaises(FileExistsError):
-            restore_file(manifest, restored)
-        self.assertTrue(self.source.exists())
-        finalize_source(manifest)
-        self.assertFalse(self.source.exists())
-
-    def test_corrupt_completed_chunk_is_repaired_on_resume(self):
-        manifest = compress_file(self.source, self.archive, chunk_bytes=80)
-        chunk = self.archive / manifest['chunks'][0]['file']
-        chunk.write_bytes(b'broken')
-        destination = self.root / 'destination'
-        with self.assertRaises((OSError, ValueError, EOFError)):
-            restore_file(manifest, destination)
-        self.assertFalse(destination.exists())
-        repaired = compress_file(self.source, self.archive, chunk_bytes=80)
-        self.assertEqual(b''.join(iter_artifact_bytes(repaired)), self.source.read_bytes())
-
-    def test_damaged_deflate_payload_is_retried(self):
-        manifest = compress_file(self.source, self.archive, chunk_bytes=100)
-        chunk = self.archive / manifest['chunks'][0]['file']
-        payload = bytearray(chunk.read_bytes())
-        payload[10] = 0xff  # invalid deflate block after the gzip header
-        chunk.write_bytes(payload)
-        with self.assertRaises((OSError, EOFError, ValueError, zlib.error)):
-            list(iter_artifact_bytes(manifest))
-        repaired = compress_file(self.source, self.archive, chunk_bytes=100)
-        self.assertEqual(b''.join(iter_artifact_bytes(repaired)), self.source.read_bytes())
-
-    def test_changed_source_is_not_removed_or_resumed(self):
-        manifest = compress_file(self.source, self.archive, chunk_bytes=100)
-        self.source.write_bytes(b'changed')
-        with self.assertRaises(ValueError):
-            finalize_source(manifest)
-        with self.assertRaises(ValueError):
-            compress_file(self.source, self.archive, chunk_bytes=100)
-        self.assertEqual(self.source.read_bytes(), b'changed')
-
-    def test_source_changed_between_chunks_aborts(self):
-        def mutate(manifest):
-            with self.source.open('ab') as out:
-                out.write(b'new')
-        with self.assertRaises(ValueError):
-            compress_file(self.source, self.archive, chunk_bytes=100, on_chunk=mutate)
-        self.assertFalse(list(self.archive.glob('*.manifest.json')))
-        self.assertTrue(self.source.exists())
-
-    def test_finalize_requires_intact_archive_and_chunk_limit(self):
-        with self.assertRaises(ValueError):
-            compress_file(self.source, self.archive, chunk_bytes=32 * 1024 * 1024 + 1)
-        manifest = compress_file(self.source, self.archive, chunk_bytes=100)
-        (self.archive / manifest['chunks'][-1]['file']).write_bytes(b'truncated')
-        with self.assertRaises((OSError, EOFError, ValueError)):
-            finalize_source(manifest)
-        self.assertTrue(self.source.exists())
-
-    def test_empty_and_expected_identity(self):
-        self.source.write_bytes(b'')
-        with self.assertRaises(ValueError):
-            compress_file(self.source, self.archive, expected_identity={})
-        manifest = compress_file(self.source, self.archive)
-        self.assertEqual(b''.join(iter_artifact_bytes(manifest)), b'')
-        restore_file(manifest, self.root / 'empty')
-        self.assertEqual((self.root / 'empty').stat().st_size, 0)
-
-    def test_native_records_filter_cursors_and_raw_references(self):
-        records = [dict(type='session', id='abc', version=3),
-                   dict(type='message', message=dict(role='assistant', content=[
-                       dict(type='text', text='hello')]))]
-        data = b'\n'.join(json.dumps(x).encode() for x in records)
-        self.source.write_bytes(data)
-        plain = list(walk_records(self.source))
-        self.assertEqual([x['record'] for x in plain], records)
-        cursor = plain[0]['metadata']['next_cursor']
-        manifest = compress_file(self.source, self.archive, chunk_bytes=7)
-        archived = list(walk_records(manifest))
-        self.assertEqual([x['record'] for x in archived], records)
-        self.assertEqual(b''.join(open_artifact_bytes(archived[0]['metadata']['raw_ref']['artifact'])), data)
-        selected = list(walk_records(manifest, cursor=cursor,
-                        predicate=lambda record, meta: record['type'] == 'message'))
-        self.assertEqual([x['record'] for x in selected], records[1:])
-        self.assertEqual(selected[0]['metadata']['offset'], cursor)
-        self.assertIsNone(selected[0]['metadata']['line'])
-        self.assertEqual(b''.join(open_artifact_bytes(manifest)), data)
-
-    def test_oversized_and_invalid_records_are_referenced(self):
-        self.source.write_bytes(b'x' * 300000 + b'\nnot json\n{"type":"session"}\n')
-        items = list(walk_records(self.source, record_bytes=32))
-        self.assertEqual([x['metadata']['status'] for x in items],
-                         ['oversized', 'invalid', 'ok'])
-        self.assertIsNone(items[0]['record'])
-        ref = items[0]['metadata']['raw_ref']
-        with open(ref['artifact'], 'rb') as stream:
-            stream.seek(ref['offset'])
-            self.assertEqual(stream.read(ref['length']), b'x' * 300000 + b'\n')
-        self.assertEqual(items[-1]['record'], {'type': 'session'})
-
-    def test_resume_skips_chunks_and_checks_visited_integrity(self):
-        self.source.write_bytes(b'0\n1\n2\n3\n4\n')
-        manifest = compress_file(self.source, self.archive, chunk_bytes=4)
-        reader = log_walk._chunk_bytes
-        with patch.object(log_walk, '_chunk_bytes', wraps=reader) as opened:
-            items = list(walk_records(manifest, cursor=6))
-            self.assertEqual([x['record'] for x in items], [3, 4])
-            self.assertEqual([c.args[1] for c in opened.call_args_list], manifest['chunks'][1:])
-        self.assertEqual(items[0]['metadata']['verification'], 'visited_chunks')
-        with self.assertRaisesRegex(ValueError, 'record boundary'):
-            list(walk_records(manifest, cursor=5))
-        manifest['sha256'] = 'incorrect'
-        self.assertEqual([x['record'] for x in walk_records(manifest, cursor=8)], [4])
-        with self.assertRaisesRegex(ValueError, 'archive integrity'):
-            list(walk_records(manifest))
-        manifest['chunks'][-1]['sha256'] = 'incorrect'
-        with self.assertRaisesRegex(ValueError, 'chunk integrity'):
-            list(walk_records(manifest, cursor=8))
-
-    def test_plain_resume_never_reads_prefix(self):
-        self.source.write_bytes(b'0\n' + b'x' * 50 + b'\ninvalid\n4\n')
-        original_open = Path.open
-        reads = []
-
-        def instrument(path, *args, **kwargs):
-            stream = original_open(path, *args, **kwargs)
-            read = stream.read
-            def counted(size=-1):
-                reads.append(stream.tell())
-                return read(size)
-            stream.read = counted
-            return stream
-
-        with patch.object(Path, 'open', instrument):
-            items = list(walk_records(self.source, cursor=2, record_bytes=8,
-                         predicate=lambda record, meta: meta['status'] != 'invalid'))
-        self.assertTrue(reads)
-        self.assertTrue(all(offset >= 2 for offset in reads))
-        self.assertEqual([x['metadata']['status'] for x in items], ['oversized', 'ok'])
-        self.assertEqual([x['metadata']['offset'] for x in items], [2, 61])
-        self.assertEqual(items[-1]['record'], 4)
-
-    def test_streaming_rss_small_fixture(self):
-        # A fresh process measures RSS rather than inheriting this runner's peak.
-        code = '''
-import resource, sys
-from pathlib import Path
-from ascend_tools.storage_archive import compress_file, iter_artifact_bytes
+from ascend_tools import storage_archive as archive
 from ascend_tools.log_walk import walk_records
-p = Path(sys.argv[1])
-with p.open('wb') as out:
-    for _ in range(256): out.write(b'x' * 65536)
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-m = compress_file(p, sys.argv[2], chunk_bytes=262144)
-assert sum(map(len, iter_artifact_bytes(m))) == 16 * 1024 * 1024
-assert list(walk_records(m, record_bytes=1024))[0]['metadata']['status'] == 'oversized'
-assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before < 12 * 1024
-'''
-        subprocess.run([sys.executable, '-c', code, str(self.source), str(self.archive)], check=True)
+
+
+class ResticArchives(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / 'repository'
+        self.source = self.root / 'native.jsonl'
+        self.records = [dict(type='session', id='native-session', version=3),
+                        dict(type='message', id='native-message', parentId=None,
+                             message=dict(role='assistant', content=[dict(type='text', text='hello')])),
+                        dict(type='custom', customType='opaque', data={'preserved': [1, False, None]})]
+        self.source.write_bytes(b''.join(json.dumps(x).encode() + b'\n' for x in self.records))
+
+    def test_batch_backup_restore_dedup_and_no_overwrite(self):
+        paths = [self.source]
+        for i in range(80):
+            path = self.root / (f'file-{i}.txt' if i else 'file-[literal]\nname')
+            path.write_bytes(self.source.read_bytes())
+            paths.append(path)
+        with patch.object(archive, '_run', wraps=archive._run) as run:
+            batch = archive.archive_files(paths, self.repo)
+            self.assertEqual(sum(c.args[1] == 'backup' for c in run.call_args_list), 1)
+        self.assertEqual(len(batch['files']), len(paths))
+        first = json.loads(archive._run(self.repo, 'stats', batch['snapshot'], '--mode', 'raw-data', '--json'))
+        summaries = []
+        real = archive._run
+        def capture(repository, *args):
+            result = real(repository, *args)
+            if args[0] == 'backup':
+                summaries.extend(json.loads(line) for line in result.splitlines())
+            return result
+        with patch.object(archive, '_run', side_effect=capture):
+            archive.archive_files(paths, self.repo)
+        self.assertGreater(first['total_size'], 0)
+        self.assertEqual(summaries[-1]['data_blobs'], 0)
+        archive._run(self.repo, 'check', '--read-data')
+        output = self.root / 'out'
+        output.mkdir()
+        selected = [dict(m, logical_path=f'renamed-{i}') for i, m in enumerate(batch['files'][:5])]
+        selected.append(dict(selected[0], logical_path='duplicate-source-alias'))
+        with patch.object(archive, '_run', wraps=archive._run) as run:
+            restored = archive.restore_files(selected, lambda m: output / m['logical_path'])
+            self.assertEqual(sum(c.args[1] == 'restore' for c in run.call_args_list), 1)
+        for name, original in zip(restored, paths[:5] + [paths[0]]):
+            self.assertEqual(Path(name).read_bytes(), original.read_bytes())
+        self.assertEqual(len(list(output.iterdir())), 6)
+        with self.assertRaises(FileExistsError):
+            archive.restore_files(selected, lambda m: output / m['logical_path'])
+        self.assertEqual(len(list(output.iterdir())), 6)
+        self.assertEqual(self.repo.stat().st_mode & 0o777, 0o700)
+
+    def test_verified_atomic_restore_and_explicit_finalize(self):
+        manifest = archive.compress_file(self.source, self.repo)
+        self.assertEqual(json.loads(Path(manifest['manifest_path']).read_text()), manifest)
+        self.assertTrue(self.source.exists())
+        destination = self.root / 'restored'
+        broken = dict(manifest, sha256='0' * 64)
+        with self.assertRaises(ValueError):
+            archive.restore_file(broken, destination)
+        self.assertFalse(destination.exists())
+        with self.assertRaises(ValueError):
+            archive.finalize_source(broken)
+        self.assertTrue(self.source.exists())
+        self.assertFalse(list(self.root.glob('.restore-*')))
+        archive.restore_file(manifest, destination)
+        self.assertEqual(destination.read_bytes(), self.source.read_bytes())
+        archive.finalize_source(manifest)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(b''.join(archive.iter_artifact_bytes(manifest)), destination.read_bytes())
+
+    def test_source_changed_during_backup_and_before_finalize(self):
+        real = archive._run
+        def change(repository, *args):
+            result = real(repository, *args)
+            if args[0] == 'backup':
+                self.source.write_text('changed after backup')
+            return result
+        with patch.object(archive, '_run', side_effect=change):
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                archive.archive_files([self.source], self.repo)
+        manifest = archive.compress_file(self.source, self.repo)
+        self.source.write_text('changed before publication')
+        with self.assertRaisesRegex(ValueError, 'source changed'):
+            archive.finalize_source(manifest)
+        self.assertEqual(self.source.read_text(), 'changed before publication')
+
+    def test_native_pi_records_plain_and_restic_with_cursors(self):
+        manifest = archive.compress_file(self.source, self.repo)
+        for artifact in [self.source, manifest, {'manifest': manifest['manifest_path']}]:
+            records = list(walk_records(artifact))
+            self.assertEqual([x['record'] for x in records], self.records)
+            cursor = records[0]['metadata']['next_cursor']
+            resumed = list(walk_records(artifact, cursor=cursor))
+            self.assertEqual([x['record'] for x in resumed], self.records[1:])
+            filtered = list(walk_records(artifact, predicate=lambda r, m: r['type'] == 'custom'))
+            self.assertEqual([x['record'] for x in filtered], self.records[2:])
+        with self.assertRaisesRegex(ValueError, 'boundary'):
+            list(walk_records(manifest, cursor=2))
+        broken = dict(manifest, sha256='0' * 64)
+        with self.assertRaisesRegex(ValueError, 'integrity'):
+            list(walk_records(broken, cursor=cursor))
+        self.source.write_bytes(b'not JSON\n' + b'x' * 40 + b'\n{}\n')
+        statuses = list(walk_records(self.source, record_bytes=16))
+        self.assertEqual([r['metadata']['status'] for r in statuses], ['invalid', 'oversized', 'ok'])
+        self.assertEqual(statuses[1]['metadata']['raw_ref']['length'], 41)
+
+    def test_dump_size_digest_and_early_close(self):
+        self.source.write_bytes(os.urandom(256 * 1024))
+        manifest = archive.compress_file(self.source, self.repo)
+        iterator = archive.iter_artifact_bytes(manifest)
+        self.assertLessEqual(len(next(iterator)), 64 * 1024)
+        iterator.close()
+        # Closing a partially consumed dump must release both process and lock.
+        self.assertEqual(hashlib.sha256(b''.join(archive.iter_artifact_bytes(manifest))).hexdigest(), manifest['sha256'])
+        with self.assertRaisesRegex(ValueError, 'integrity'):
+            list(archive.iter_artifact_bytes(dict(manifest, size=1)))
+
+    def test_interrupted_actual_backup_reruns_and_checks(self):
+        # Kill the actual backup subprocess after it acquires its native lock.
+        # The Python caller reaps it, leaving a genuinely stale Restic lock.
+        with self.source.open('wb') as out:
+            for _ in range(32):
+                out.write(os.urandom(1024 * 1024))
+        original = archive._run
+        interrupted = []
+        def interrupt(repository, *args):
+            if args[0] != 'backup':
+                return original(repository, *args)
+            command, env = archive._command(repository, *args)
+            with subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL) as process:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if any((repository / 'locks').iterdir()):
+                        # Allow real backup work before abrupt death.
+                        time.sleep(.05)
+                        process.kill()
+                        break
+                    if process.poll() is not None:
+                        self.fail('backup completed before interruption')
+                    time.sleep(.005)
+                else:
+                    process.kill()
+                    self.fail('backup did not acquire lock')
+                interrupted.append(process.wait(timeout=10))
+            raise subprocess.CalledProcessError(interrupted[-1], command)
+        with patch.object(archive, '_run', side_effect=interrupt):
+            with self.assertRaises(subprocess.CalledProcessError):
+                archive.archive_files([self.source], self.repo)
+        self.assertEqual(interrupted, [-signal.SIGKILL])
+        self.assertTrue(list((self.repo / 'locks').iterdir()))
+        manifest = archive.archive_files([self.source], self.repo)['files'][0]
+        archive._run(self.repo, 'check', '--read-data')
+        restored = self.root / 'resumed'
+        archive.restore_file(manifest, restored)
+        self.assertEqual(archive._sha(restored), archive._sha(self.source))
+        self.assertFalse(list((self.repo / 'locks').iterdir()))
+
+    def test_only_local_repository_and_regular_inputs(self):
+        with self.assertRaises(ValueError):
+            archive.archive_files([self.source], 'rest:http://localhost/repository')
+        with self.assertRaises(ValueError):
+            archive.archive_files([self.root], self.repo)
+        with self.assertRaises(ValueError):
+            archive.archive_files([], self.repo)
 
 
 if __name__ == '__main__':
