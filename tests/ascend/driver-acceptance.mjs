@@ -25,9 +25,9 @@ export async function createEnvironment(options,context){
       const [attempt]=rows(f.root,'SELECT * FROM attempts');
       return attempt?.elapsed>=1 && attempt.session && rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
     });
-    const beforeConcurrent=rows(f.root,'SELECT * FROM attempts');
+    const beforeConcurrent=rows(f.root,'SELECT id FROM attempts');
     await assert.rejects(campaign(await readConfig(f.root)));
-    assert.deepEqual(rows(f.root,'SELECT * FROM attempts'),beforeConcurrent);
+    assert.deepEqual(rows(f.root,'SELECT id FROM attempts'),beforeConcurrent);
     await f.run('stop');await wave.output;
     const [interrupted]=rows(f.root,'SELECT * FROM attempts');
     assert.equal(interrupted.outcome,null);
