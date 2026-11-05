@@ -1,5 +1,5 @@
 """Small CPU fixtures for binary storage, provenance and snapshot selection."""
-import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -85,12 +85,54 @@ class StorageTests(unittest.TestCase):
             self.kdb.replace_repo('repo', str(self.root), 'new', 'python', paths=['missing'])
         self.assertEqual({h['collection'] for h in self.kdb.search('second')}, {'new'})
 
+    def test_prune_keeps_cited_chunks_and_live_generation_then_reclaims_space(self):
+        # Multiple distinct chunks allow partial citation retention in one snapshot.
+        self.source('a.py', ''.join(f'first unique line {i}\n' for i in range(250)))
+        self.kdb.replace_repo('repo', str(self.root), 'old', 'python', paths=['a.py'])
+        rows = self.kdb.db.connection.execute(
+            'SELECT chunk_id FROM chunks WHERE collection="old" ORDER BY start_line').fetchall()
+        cited = rows[0][0]
+        self.kdb.read_entry('old', cited)
+        self.kdb.pin_generation('live', ['old'])
+        self.source('a.py','second vector\n')
+        self.kdb.replace_repo('repo', str(self.root), 'new', 'python', paths=['a.py'])
+        self.assertEqual(self.kdb.prune_snapshots()['removed_chunks'], 0)
+        self.assertEqual(self.kdb.db.connection.execute(
+            'SELECT count(*) FROM chunks WHERE collection="old"').fetchone()[0], len(rows))
+        self.kdb.release_generation('live')
+        self.assertEqual(self.kdb.prune_snapshots()['removed_chunks'], len(rows)-1)
+        with self.assertRaises(ValueError):
+            self.kdb.pin_generation('too-late', ['old'])
+        with self.assertRaises(ValueError):
+            self.kdb.replace_repo('repo',str(self.root),'old','python',paths=['a.py'])
+        retained = self.kdb.read_entry('old', cited)
+        self.assertTrue(retained['text'].startswith('first unique line 0'))
+        with self.assertRaises(ValueError):
+            self.kdb.read_entry('old',rows[-1][0])
+        self.assertEqual({h['collection'] for h in self.kdb.search('first')}, {'new'})
+        self.assertEqual(self.kdb.db.connection.execute('SELECT count(*) FROM chunk_contents').fetchone()[0], 2)
+        self.assertEqual(self.kdb.db.connection.execute('SELECT count(*) FROM chunk_vectors').fetchone()[0], 2)
+        self.assertEqual(self.kdb.db.connection.execute('PRAGMA freelist_count').fetchone()[0], 0)
+        self.assertEqual(self.kdb.prune_snapshots()['removed_chunks'], 0)
+
+    def test_prune_removes_unreferenced_snapshot_and_retains_shared_content(self):
+        self.source('a.py','first vector\n')
+        for name in ('old','new'):
+            self.kdb.replace_repo('repo',str(self.root),name,'python',paths=['a.py'])
+        before = self.kdb.db.path.stat().st_size
+        self.assertEqual(self.kdb.prune_snapshots()['removed_chunks'], 1)
+        self.assertLess(self.kdb.db.path.stat().st_size, before)
+        with self.assertRaises(KeyError):
+            self.kdb.db.manifest('old')
+        self.assertEqual(self.kdb.search('first')[0]['collection'], 'new')
+        self.assertEqual(self.kdb.db.connection.execute('SELECT count(*) FROM chunk_contents').fetchone()[0], 1)
+
     def legacy(self):
         path = self.source('legacy.py', 'first vector\n')
         manifest = build_manifest(self.root,[path],collection='baseline',language='python',
                                   embedding_model='fixture',embedding_revision='1')
         legacy = self.root/'old.sqlite'
-        with sqlite3.connect(legacy) as conn:
+        with closing(sqlite3.connect(legacy)) as conn, conn:
             conn.executescript('''CREATE TABLE collections(name,language,fingerprint,manifest_json,fts_table);
                 CREATE TABLE chunks(collection,chunk_id,path,start_line,end_line,text,vector_json);''')
             conn.execute('INSERT INTO collections VALUES(?,?,?,?,?)',
@@ -120,7 +162,7 @@ class StorageTests(unittest.TestCase):
 
     def test_bad_import_removes_partial_destination(self):
         legacy, _, _ = self.legacy()
-        with sqlite3.connect(legacy) as conn:
+        with closing(sqlite3.connect(legacy)) as conn, conn:
             conn.execute('UPDATE chunks SET vector_json=?', ('[NaN]',))
         destination = self.root/'partial.sqlite'
         with self.assertRaises(ValueError):

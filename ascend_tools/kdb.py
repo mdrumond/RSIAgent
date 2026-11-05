@@ -34,6 +34,7 @@ class KDB:
             CREATE TABLE IF NOT EXISTS active_generation (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS retired_snapshots (collection TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS cited_chunks (
                 collection TEXT NOT NULL, chunk_id TEXT NOT NULL,
                 PRIMARY KEY(collection,chunk_id)
@@ -135,6 +136,9 @@ class KDB:
                  paths: list[str] | None = None):
         if kind not in ('good', 'negative'):
             raise ValueError('kind must be good or negative')
+        if self.db.connection.execute('SELECT 1 FROM retired_snapshots WHERE collection=?',
+                                      (collection,)).fetchone():
+            raise ValueError('snapshot was pruned; use a new collection')
         root = Path(path).resolve()
         # Explicit paths are preferred; default excludes VCS and binary artifacts.
         sources = [root / name for name in paths] if paths is not None else [
@@ -175,6 +179,9 @@ class KDB:
         """Freeze membership under an immutable memory Git revision."""
         names = tuple(sorted(set(collections)))
         for name in names:
+            if self.db.connection.execute('SELECT 1 FROM retired_snapshots WHERE collection=?',
+                                          (name,)).fetchone():
+                raise ValueError('cannot pin a pruned snapshot')
             self.db.manifest(name)
         exists = self.db.connection.execute(
             'SELECT 1 FROM generations WHERE revision=?', (revision,)).fetchone()
@@ -207,6 +214,53 @@ class KDB:
         with self.db.connection:
             self.db.connection.execute('DELETE FROM generation_collections WHERE generation=?', (revision,))
             self.db.connection.execute('DELETE FROM generations WHERE revision=?', (revision,))
+
+    def prune_snapshots(self, *, compact: bool = True):
+        """Reclaim superseded, unpinned rows, retaining every issued citation.
+
+        Only explicit snapshot members are eligible. Live generation pins retain
+        entire collections; citations retain their exact content and provenance.
+        VACUUM returns free pages to the filesystem when compact is true.
+        """
+        conn = self.db.connection
+        removed = 0
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            stale = conn.execute("""SELECT r.collection FROM repository_snapshots r
+                WHERE r.active=0 AND NOT EXISTS (SELECT 1 FROM generation_collections g
+                    WHERE g.collection=r.collection)""").fetchall()
+            for row in stale:
+                name = row['collection']
+                table = self.db._fts_table_name(name)
+                conn.execute(f'DROP TABLE {table}')
+                cursor = conn.execute("""DELETE FROM chunk_provenance
+                    WHERE collection=? AND NOT EXISTS (SELECT 1 FROM cited_chunks c
+                        WHERE c.collection=chunk_provenance.collection
+                          AND c.chunk_id=chunk_provenance.chunk_id)""", (name,))
+                removed += cursor.rowcount
+                if cursor.rowcount:
+                    conn.execute('INSERT OR IGNORE INTO retired_snapshots VALUES(?)', (name,))
+                if conn.execute('SELECT 1 FROM chunk_provenance WHERE collection=? LIMIT 1',
+                                (name,)).fetchone():
+                    self.db._ensure_fts_table(table)
+                    conn.execute(f'INSERT INTO {table}(rowid,text) '
+                                 'SELECT rowid,text FROM chunks WHERE collection=?', (name,))
+                else:
+                    for metadata in ('repository_snapshots','knowledge_scopes'):
+                        conn.execute(f'DELETE FROM {metadata} WHERE collection=?', (name,))
+                    conn.execute('DELETE FROM collections WHERE name=?', (name,))
+            conn.execute("""DELETE FROM chunk_vectors WHERE NOT EXISTS (
+                SELECT 1 FROM chunk_provenance p JOIN collections c ON c.name=p.collection
+                WHERE p.content_id=chunk_vectors.content_id
+                  AND json_extract(c.manifest_json,'$.embedding_model')=chunk_vectors.model
+                  AND json_extract(c.manifest_json,'$.embedding_revision')=chunk_vectors.revision)""")
+            conn.execute('DELETE FROM chunk_contents WHERE NOT EXISTS ('
+                         'SELECT 1 FROM chunk_provenance p WHERE p.content_id=chunk_contents.content_id)')
+        for row in stale:
+            self.db._invalidate(row['collection'])
+        if compact:
+            conn.execute('VACUUM')
+        return {'removed_chunks': removed}
 
     def record_lesson(self, lesson: str, outcome: str, applicability: str,
                       evidence: list[dict], attempt_id: str):
