@@ -71,6 +71,7 @@ class PackageTests(unittest.TestCase):
         result = pack(self.root, self.package, 'p')
         self.assertTrue(result['complete'])
         self.assertFalse(any(f['path'] == 'knowledge.sqlite' for f in result['files']))
+        self.assertFalse({'knowledge-history', 'machinery', 'dependencies'} & {f['kind'] for f in result['files']})
         portable = self.base / 'moved-package'
         shutil.move(self.package, portable)
         restored = self.base / 'restored'
@@ -111,16 +112,19 @@ class PackageTests(unittest.TestCase):
         with closing(sqlite3.connect(dest / 'state.sqlite')) as db:
             self.assertEqual(db.execute('SELECT encoding,descriptor FROM storage_artifacts').fetchone(), ('plain', None))
 
-    def test_campaign_has_active_kdb_and_full_bundle(self):
+    def test_campaign_has_active_kdb_and_full_git_history(self):
+        subprocess.run(['git', '-C', str(self.root / 'history-repo'), 'config', 'remote.origin.url',
+                        'https://credential-fixture@example.invalid/repo'], check=True)
         result = pack(self.root, self.package)
         restored = self.base / 'restored'
         unpack(self.package, restored)
         with closing(sqlite3.connect(restored / 'knowledge.sqlite')) as db:
             self.assertEqual(db.execute('SELECT id FROM entries').fetchone(), ('active-entry',))
-        bundles = [f for f in result['files'] if f['kind'] == 'knowledge-history']
-        clone = self.base / 'clone'
-        subprocess.run(['git', 'clone', '-q', str(restored / bundles[0]['path']), str(clone)], check=True)
-        self.assertEqual((clone / 'code.py').read_text(), 'old = True\n')
+        history = next(r for r in result['repositories'] if r['kind'] == 'knowledge-history')
+        actual = subprocess.check_output(['git', '--git-dir', str(restored / history['path']),
+                                          'show', 'HEAD:code.py'], text=True)
+        self.assertEqual(actual, 'old = True\n')
+        self.assertNotIn('credential-fixture', (restored / history['path'] / 'config').read_text())
 
     def test_missing_refuses_publish_but_is_inspectable(self):
         self.log.unlink()
@@ -130,6 +134,34 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(json.loads((self.package / 'inspection.json').read_text())['missing'][0]['kind'], 'log')
         result = pack(self.root, self.package, 'p', require_complete=False)
         self.assertFalse(result['complete'])
+
+    def test_source_git_preserves_noncommit_refs_and_rebases_binding(self):
+        repo = self.root / 'source-history/fixture'
+        repo.parent.mkdir()
+        subprocess.run(['git', 'clone', '--bare', '-q', str(self.root / 'history-repo'), str(repo)], check=True)
+        tree = subprocess.check_output(['git', '--git-dir', str(repo), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+        ref = 'refs/rsi/snapshots/attempt/' + tree
+        subprocess.run(['git', '--git-dir', str(repo), 'update-ref', ref, tree], check=True)
+        branch = subprocess.check_output(['git', '--git-dir', str(repo), 'symbolic-ref', 'HEAD'], text=True).strip()
+        subprocess.run(['git', '--git-dir', str(repo), 'update-ref', '-d', branch], check=True)
+        subprocess.run(['git', '--git-dir', str(repo), 'config', 'core.bare', 'false'], check=True)
+        (repo / 'rsi-source.json').write_text(json.dumps({'source': str(self.source)}))
+        subprocess.run(['git', '--git-dir', str(repo), 'gc', '--prune=now'], check=True, capture_output=True)
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('INSERT INTO storage_artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('source-history-id', 'a', 'p', 'source-git', 'actor',
+                        str(repo.relative_to(self.root)), 0, 'open', None, None, 'plain', None, 'now'))
+        inputs = self.root / 'package-inputs.json'
+        value = json.loads(inputs.read_text())
+        value['git'] = []
+        inputs.write_text(json.dumps(value))
+        self.assertTrue(pack(self.root, self.package, 'p')['complete'])
+        dest = self.base / 'tree-restored'
+        unpack(self.package, dest)
+        restored = dest / repo.relative_to(self.root)
+        self.assertEqual(subprocess.check_output(['git', '--git-dir', str(restored), 'cat-file', '-t', ref], text=True).strip(), 'tree')
+        self.assertEqual(json.loads((restored / 'rsi-source.json').read_text())['source'], str(dest / 'projects/p/source'))
+        self.assertEqual(subprocess.check_output(['git', '--git-dir', str(restored), 'rev-parse', ref], text=True).strip(), tree)
 
     def test_used_revision_must_be_collected(self):
         path = self.root / 'package-inputs.json'

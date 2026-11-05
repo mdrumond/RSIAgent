@@ -1,7 +1,7 @@
 """Portable, inert campaign/project exports from ledger and explicit manifests.
 
 Optional package-inputs.json: files [{path, kind, project?, revision?}], git [{path,
-kind, project?, revisions?: [ref]}]. Kinds: source-history, skills, memory,
+kind, project?}]. Kinds: source-history, skills, memory,
 cited-entry, knowledge-history, machinery, dependencies. Campaigns additionally
 snapshot knowledge.sqlite. No directory discovery outside project sources.
 Writers must be stopped before packing; runtime bindings must be supplied anew.
@@ -67,6 +67,13 @@ def _files(directory):
                 yield Path(entry.path)
 
 
+def _repository_files(directory):
+    for path in _files(directory):
+        # Local transport/credential config and executable hooks are not history.
+        if path.relative_to(directory).parts[0] not in ('config', 'hooks') and not path.name.endswith('.lock'):
+            yield path
+
+
 def _connect(path):
     db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
     db.row_factory = sqlite3.Row
@@ -113,7 +120,7 @@ def pack(root, dest, project=None, require_complete=True):
     chunks = dest / 'chunks'
     chunks.mkdir(exist_ok=True)
     metadata = {'format': 1, 'scope': 'project' if project else 'campaign',
-                'project': project, 'files': [], 'missing': [], 'paths': {},
+                'project': project, 'files': [], 'missing': [], 'paths': {}, 'repositories': [],
                 'paused': True, 'binding_required': True}
     config = root / 'instance.json'
     metadata['config'] = _sanitize(json.loads(config.read_text())) if config.exists() else {'format': 1}
@@ -204,6 +211,15 @@ def pack(root, dest, project=None, require_complete=True):
                     missing('verifier', name)
             p['spec'] = json.dumps(_sanitize(spec))
         for row in metadata['ledger'].get('storage_artifacts', []):
+            if row['kind'] == 'source-git' and not row['external']:
+                repository = _local(root, row['path'])
+                if not repository.is_dir() or not (repository / 'objects').is_dir():
+                    missing('source-git', row['path'])
+                    continue
+                metadata['repositories'].append({'path': row['path'], 'kind': 'source-git'})
+                for path in _repository_files(repository):
+                    collect(path, path.relative_to(root), 'source-git')
+                continue
             if row['external'] or row['status'] not in ('closed', 'archived'):
                 missing(row['kind'], row['id'])
                 continue
@@ -227,11 +243,13 @@ def pack(root, dest, project=None, require_complete=True):
 
     manifest = root / 'package-inputs.json'
     inputs = json.loads(manifest.read_text()) if manifest.exists() else {}
-    kinds, covered = set(), {'skills': set(), 'memory': set()}
+    kinds = {'source-history' if f['kind'] == 'source-git' else f['kind'] for f in metadata['files']}
+    covered = {'skills': set(), 'memory': set()}
     used = {kind: {r[field] for r in metadata['ledger'].get('storage_attempts', []) if r.get(field)}
             for kind, field in (('skills', 'skill_revision'), ('memory', 'memory_revision'))}
     for item in inputs.get('files', []):
-        if project and item.get('project') not in (None, project):
+        if project and (item.get('project') not in (None, project) or
+                        item['kind'] in ('knowledge-history', 'machinery', 'dependencies', 'active-kdb')):
             continue
         path = _local(root, item['path'])
         collect(path, item['path'], item['kind'], item.get('sha256'))
@@ -240,19 +258,22 @@ def pack(root, dest, project=None, require_complete=True):
             if item['kind'] in covered and item.get('revision'):
                 covered[item['kind']].add(item['revision'])
     for item in inputs.get('git', []):
-        if project and item.get('project') not in (None, project):
+        if project and (item.get('project') not in (None, project) or
+                        item['kind'] in ('knowledge-history', 'machinery', 'dependencies', 'active-kdb')):
             continue
         repo = _local(root, item['path'])
         if not repo.is_dir():
             missing(item['kind'], item['path'])
             continue
-        name = 'history/' + hashlib.sha256(str(item).encode()).hexdigest() + '.bundle'
-        bundle = dest / name
-        bundle.parent.mkdir(exist_ok=True)
-        if not bundle.exists():
-            refs = ['--all'] if not project else item.get('revisions') or ['--all']
-            subprocess.run(['git', '-C', str(repo), 'bundle', 'create', str(bundle), *refs], check=True, capture_output=True)
-        collect(bundle, name, item['kind'])
+        git_dir = Path(subprocess.check_output(
+            ['git', '-C', str(repo), 'rev-parse', '--absolute-git-dir'], text=True).strip()).resolve()
+        if not git_dir.is_relative_to(root):
+            missing(item['kind'], item['path'])
+            continue
+        name = 'history/' + hashlib.sha256(str(item).encode()).hexdigest()
+        metadata['repositories'].append({'path': name, 'kind': item['kind']})
+        for path in _repository_files(git_dir):
+            collect(path, str(Path(name) / path.relative_to(git_dir)), item['kind'])
         kinds.add(item['kind'])
         if item['kind'] in covered and item.get('revision'):
             covered[item['kind']].add(item['revision'])
@@ -278,7 +299,7 @@ def pack(root, dest, project=None, require_complete=True):
     for sidecar in chunks.iterdir():
         if sidecar.suffix != '.gz':
             sidecar.unlink()
-    for scratch in ('collected', 'history'):
+    for scratch in ('collected',):
         shutil.rmtree(dest / scratch, ignore_errors=True)
     (dest / 'knowledge.sqlite').unlink(missing_ok=True)
     progress.unlink()
@@ -318,6 +339,15 @@ def unpack(package, dest):
                 _safe(chunk['file'])
             restore_file(archive, path)
             path.chmod(item.get('mode', 0o600) & 0o777)
+            if item['kind'] == 'source-git' and path.name == 'rsi-source.json':
+                _json(path, _rebase(json.loads(path.read_text()), metadata['paths'], dest))
+        for repo in metadata.get('repositories', []):
+            directory = stage / _safe(repo['path'])
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'objects').mkdir(exist_ok=True)
+            (directory / 'refs').mkdir(exist_ok=True)
+            bare = 'false' if repo['kind'] == 'source-git' else 'true'
+            (directory / 'config').write_text('[core]\n\tbare = ' + bare + '\n\tlogAllRefUpdates = true\n')
         # Construct only portable tables; execution leases/control/services never migrate.
         with closing(sqlite3.connect(stage / 'state.sqlite')) as db, db:
             allowed = set(PORTABLE_TABLES)
