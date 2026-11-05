@@ -8,6 +8,7 @@ import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
 import {setup,rows,until} from './driver_setup.mjs';
 import {State} from '../../controller/state.mjs';
+import {KnowledgeHistory} from '../../controller/knowledge-history.mjs';
 import {RecoveryQueue,recordOutcome} from '../../controller/recovery.mjs';
 import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 
@@ -41,8 +42,8 @@ async function seededLease(f,owner,{terminal=true,unknown=false,held=false,recor
   }finally{state.close();}
 }
 
-// Managed scheduler crash, retained session/lease and native KDB continuity are
-// exercised by managed-cli.mjs using the actual service owner PID.
+// Public CLI interruption, explicit restart and native KDB continuity are also
+// exercised by public-cli.mjs. Lease reconciliation cases remain below.
 
 for(const scenario of ['active','live-owner','unknown-native','held-receipt'])test(`public wave retains ${scenario} lease`,
   {timeout:60000},async t=>{
@@ -71,11 +72,15 @@ test('pending finalization retains its lease until worker exit before concurrent
   release=join(f.root,'release-finalization');
   const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
   await writeFile(wrapper,`#!${stdout.trim()}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and sys.argv[sys.argv.index('--attempt')+1]==${JSON.stringify(original.id)}:
- Path(${JSON.stringify(entered)}).write_text(str(os.getpid()))
- while not Path(${JSON.stringify(release)}).exists(): time.sleep(.01)
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and request.get('attempt')==${JSON.stringify(original.id)}:
+  Path(${JSON.stringify(entered)}).write_text(str(os.getpid()))
+  while not Path(${JSON.stringify(release)}).exists(): time.sleep(.01)
+ sys.exit(subprocess.run([${JSON.stringify(stdout.trim())},*sys.argv[1:]],input=data).returncode)
 os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
 `,{mode:0o700});
   await configure(f,{python:wrapper,concurrency:2,curriculum:{phase1:['unrelated']}});
@@ -100,19 +105,27 @@ test('public STOP aborts pending outbox delivery; later resume ACKs once without
   const f=await setup(t,'phase2',['unrelated'],{install:false});await f.run('wave');
   const settled=rows(f.root,'SELECT * FROM attempts')[0],requestCount=f.server.requests.length;
   const state=new State(join(f.root,'state.sqlite'));
-  const lesson=state.db.prepare('SELECT id FROM recovery_lessons').get();
-  state.db.prepare('UPDATE recovery_lessons SET recorded=0 WHERE id=?').run(lesson.id);state.close();
+  const lesson=state.db.prepare('SELECT id,data FROM recovery_lessons').get();
+  // A published delivery is idempotently ACKed without a KDB request. Seed a
+  // distinct follow-up publication, retaining the settled attempt and its evidence.
+  const pending={...JSON.parse(lesson.data),delivery_id:`stop-followup-${settled.id}`,
+    findings:'Follow-up findings awaiting publication before STOP.'};
+  state.db.prepare('UPDATE recovery_lessons SET data=?,recorded=0 WHERE id=?')
+    .run(JSON.stringify(pending),lesson.id);state.close();
   const current=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
   const python=current.python,identity=join(f.root,'waiting-client.pid'),wrapper=join(f.root,'pending-python');
   const {stdout}=await promisify(execFile)(python,['-c','import sys;print(sys.executable)']);
   await writeFile(wrapper,`#!${stdout.trim()}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client']:
- Path(${JSON.stringify(identity)}).write_text(str(os.getpid()))
- time.sleep(30)
-else:
- os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and request.get('attempt')==${JSON.stringify(settled.id)}:
+  Path(${JSON.stringify(identity)}).write_text(str(os.getpid()))
+  time.sleep(30)
+ sys.exit(subprocess.run([${JSON.stringify(stdout.trim())},*sys.argv[1:]],input=data).returncode)
+os.execv(${JSON.stringify(stdout.trim())},[${JSON.stringify(stdout.trim())},*sys.argv[1:]])
 `,{mode:0o700});
   await configure(f,{python:wrapper});
   const wave=f.start('wave');
@@ -123,7 +136,13 @@ else:
   await Promise.race([wave.output,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(Error('STOP did not cancel pending outbox')),5000);timer.unref();})]);
   assert.ok(performance.now()-stopped<5000);assert.equal(await ownerStopped(owner),true);
   assert.equal(rows(f.root,'SELECT recorded FROM recovery_lessons')[0].recorded,0);
-  await configure(f,{python});await f.run('resume');await f.run('resume');
+  await configure(f,{python});await f.run('resume');
+  const history=new KnowledgeHistory(join(f.root,'knowledge.git')),published=await history.state('memory');
+  const snapshot=await history.readRevision(published.revision);
+  const delivered=snapshot.memory.filter(record=>record.delivery_id===pending.delivery_id);
+  assert.equal(delivered.length,1);assert.equal(delivered[0].lesson,pending.findings);
+  assert.ok(snapshot.memory.some(record=>record.attempt_id===settled.id&&record.delivery_id!==pending.delivery_id));
+  await f.run('resume');assert.deepEqual(await history.state('memory'),published);
   assert.equal(rows(f.root,'SELECT recorded FROM recovery_lessons')[0].recorded,1);
   assert.deepEqual(rows(f.root,'SELECT * FROM attempts'),[settled]);assert.equal(f.server.requests.length,requestCount);
   f.pass();

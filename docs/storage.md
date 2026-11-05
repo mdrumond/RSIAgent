@@ -34,7 +34,7 @@ Walk filters include phase, role, project, outcome, stage and revision. `--curso
 
 ## Retention and memory
 
-Managed maintenance runs serially with a 512 MiB aggregate memory ceiling and one CPU. Restic handles compression, deduplication, indexes and interrupted backups. It uses one reader and a bounded Go heap target. No custom archive/chunk engine is maintained.
+Storage maintenance serializes mutations for each instance. Restic handles compression, deduplication, indexes and interrupted backups. It uses one reader and a bounded Go heap target. These settings do not enforce an aggregate process memory ceiling or CPU quota. No custom archive/chunk engine is maintained.
 
 Automatic backups retain plain working logs so Pi and curriculum agents can continue reading their paths. Removing redundant source files is explicit. Only sealed artifacts whose writers have stopped may be archived. Source deletion requires a published ledger reference, unchanged source identity and verified archive contents. Explicit prune first returns an inventory; apply requires that same inventory. No campaign history is automatically discarded.
 

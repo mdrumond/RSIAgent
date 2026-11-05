@@ -1,4 +1,3 @@
-import {hostMemorySource} from './host-memory-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
@@ -41,7 +40,7 @@ print(text[q])
     health:{product:'a5',chip:null,query_timeout_seconds:.5}};
   async function bind(resource,extra={},path=join(root,'instance-'+sequence++)){
     const events=[],handles=new Set();let depth=0;
-    const context={hostMemorySource,instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
+    const context={instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
         return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
       exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
@@ -183,7 +182,7 @@ test('public CLI auto scheduler overlaps two masks and admits third only after f
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/ascend.mjs';
 import {createBashTool} from '@earendil-works/pi-coding-agent';
 export async function createEnvironment(options,context){
- const environment=await base(options,{...context,hostMemorySource:${JSON.stringify(hostMemorySource)},leaseDirectory:${JSON.stringify(join(gate,'leases'))},client:async args=>{
+ const environment=await base(options,{...context,leaseDirectory:${JSON.stringify(join(gate,'leases'))},client:async args=>{
   if(args[0]!=='npu')throw Error('Unexpected local transport operation');
   return {state:'completed',profiles:[{target:options.target,pool:${JSON.stringify(gate)},devices:[0,1].map(id=>({id,enabled:true}))}]};
  }});
@@ -195,12 +194,17 @@ export async function createEnvironment(options,context){
   const {stdout}=await promisify(execFile)(config.python,['-c','import sys;print(sys.executable)']);
   const python=stdout.trim(),wrapper=join(driver.root,'hold-finalizer');
   await writeFile(wrapper,`#!${python}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
 root=Path(${JSON.stringify(gate)})
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and (root/'hold-attempt').exists() and sys.argv[sys.argv.index('--attempt')+1]==(root/'hold-attempt').read_text():
- (root/'finalizer-entered').touch()
- while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+# Storage memory publication passes the actual MCP request on stdin.
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and (root/'hold-attempt').exists() and request.get('attempt')==(root/'hold-attempt').read_text():
+  (root/'finalizer-entered').touch()
+  while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+ sys.exit(subprocess.run([${JSON.stringify(python)},*sys.argv[1:]],input=data).returncode)
 os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
 `,{mode:0o700});
   const patch=join(driver.root,'local-config.json');
@@ -279,7 +283,11 @@ test('target contention retries only structured nonadmission; payload exit 126 e
   const next=second.environment.execute('echo ran >> invocations; exit 126',f.source,{timeout:5});void next.catch(()=>{});
   await until(()=>second.events.filter(e=>e.type==='device-lease-acquired').length>=2);
   assert.equal(await exists(join(f.source,'invocations')),false);
-  await writeFile(join(f.source,'release'),'go');assert.equal((await holding).settled,true);
+  await writeFile(join(f.source,'release'),'go');const held=await holding;
+  // A competing controller may briefly hold the target cleanup lock.
+  // Reconcile the same completed handle before releasing its controller lease.
+  await until(()=>first.environment.reconcileLease());
+  assert.equal((await first.environment.observe(held.handle)).state,'stopped');
   const result=await next;assert.equal(result.exitCode,126);assert.equal(result.admission.decision,'admitted');
   assert.equal(await readFile(join(f.source,'invocations'),'utf8'),'ran\n');
   assert.equal(clock.elapsed,1,'confirmed contention refunded; genuine payload 126 charged');

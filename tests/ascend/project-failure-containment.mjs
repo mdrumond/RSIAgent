@@ -159,14 +159,11 @@ test('rejected resume claim cannot fail a live original owner or release its lea
   await writeFile(join(path,'job.json'),JSON.stringify({...job,wave:1,mode:'phase1',
     options:{},skillVersion:'v',resource:{id:'cpu'}}));
   const before=state.attempt(id);
-  const output=await operate('resume',config);
-  assert.equal(output.results.length,1);
-  assert.equal(output.results[0].outcome,null);
+  await assert.rejects(operate('resume',config));
   assert.deepEqual(state.attempt(id),before);
   assert.equal(state.project('a').status,'running');
   assert.equal(state.failures(id).length,0);
   assert.equal(state.queryEvents(id,{types:['failure-settlement']}).length,0);
-  assert.equal(state.queryEvents(id,{types:['worker-containment-blocked']}).length,1);
   assert.equal(state.db.prepare('SELECT attempt FROM resource_leases WHERE resource=?').get('cpu').attempt,id);
 });
 

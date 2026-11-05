@@ -8,16 +8,15 @@ import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './i
 import { State } from '../controller/state.mjs';
 import {schemaOptions as storageOptions} from './storage.mjs';
 
-export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
+export async function main(argv=process.argv.slice(2),{signal}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     ...storageOptions,instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
-    managed:{type:'boolean'},'managed-result':{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
   const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','host-memory','storage']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage']};
   const storageAction=command==='storage'?(values.config?JSON.parse(await readFile(values.config,'utf8')):{...values,action:values.action??arg??'inspect'}):null;
   if(storageAction?.action==='unpack')return (await import('./storage.mjs')).runStandalone({...storageAction,signal});
   if (command==='bootstrap') {
@@ -31,37 +30,14 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
       if(storageAction.action==='inspect')return {available:false};
       throw new Error('Storage ledger required; existing campaigns are unchanged');
     }
-    if(!values.managed&&['compress','pack','prune','restore'].includes(storageAction.action))
-      return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{detach:values.detach??false,signal,manager});
+    if(!values.request&&['compress','pack','prune','restore'].includes(storageAction.action))
+      return (await import('./background.mjs')).startBackground(root,'storage',storageAction,{detach:Boolean(values.detach),signal});
     return (await import('./storage.mjs')).run(config,{...storageAction,signal});
   }
-  if(command==='host-memory') {
-    const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'status'};
-    if(action.action==='status')return (await import('../controller/host-memory.mjs'))
-      .createHostMemorySupervisor(config.host_memory).measure();
-    if(action.action!=='configure')throw new Error('Unknown host memory action');
-    const verifyInstanceStopped=async()=>{
-      const {ownerStopped}=await import('../controller/lifecycle.mjs');
-      const ledger=new State(join(root,'state.sqlite'));
-      try {
-        if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
-          const rows=ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer')").all();
-          for(const row of rows) {
-            const owner=JSON.parse(row.value);
-            if(owner&&!await ownerStopped(owner))return false;
-          }
-        }
-        for(const row of ledger.db.prepare('SELECT owner FROM attempts').all())
-          if(!await ownerStopped(row.owner))return false;
-        return true;
-      }finally{ledger.close();}
-    };
-    return (await import('./host-memory.mjs')).configureHostMemory(config.host_memory,{verifyInstanceStopped});
-  }
-  if(!values.managed && ['tune','kdb'].includes(command)) {
+  if(!values.request&&['tune','kdb'].includes(command)) {
     if(command==='kdb'&&!values.config)throw new Error('KDB action JSON required');
     const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
-    return (await import('./background.mjs')).startBackground(root,command,action,{detach:Boolean(values.detach),signal,manager});
+    return (await import('./background.mjs')).startBackground(root,command,action,{detach:Boolean(values.detach),signal});
   }
   if(command==='upgrade') {
     const input=JSON.parse(await readFile(values.config,'utf8'));
@@ -142,7 +118,7 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
     const state=new State(join(root,'state.sqlite'));
     try {
       const {requests,reconcileRequests}=await import('./background.mjs');
-      await reconcileRequests(root,{state,manager});
+      await reconcileRequests(root,{state});
       let controller={state:'stopped',wave:0,stopRequested:false};
       if(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
         const rows=Object.fromEntries(state.db.prepare('SELECT key,value FROM control').all().map(row=>[row.key,row.value]));
@@ -165,9 +141,10 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
     } finally {state.close();}
   }
   if (['wave','campaign','resume','pause','stop'].includes(command)) {
-    const {operate,campaign,dispatchManaged}=await import('./runtime.mjs');
-    if(['wave','campaign','resume'].includes(command)&&!values.managed)
-      return dispatchManaged(command,config,{...values,signal},manager);
+    const {operate,campaign,resume}=await import('./runtime.mjs');
+    if(values.detach&&['wave','campaign','resume'].includes(command))
+      return (await import('./background.mjs')).startBackground(root,command,values,{signal});
+    if(command==='resume')return resume(config,{...values,signal});
     if(command==='campaign' && !values.detach)return campaign(config,{...values,signal,mode:values.mode??config.mode});
     return operate(command,config,{...values,signal,mode:values.mode??config.mode});
   }
@@ -186,7 +163,6 @@ export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
   };
   if(values.request)return (await import('./background.mjs')).trackRequest(root,values.request,operation);
   const result=await operation();
-  if(values.managed&&values['managed-result'])await writeFile(values['managed-result'],JSON.stringify(result),{mode:0o600});
   return result;
 }
 if(import.meta.main) {

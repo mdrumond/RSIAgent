@@ -153,3 +153,67 @@ test('abort during delayed native session_start binding is handled before the co
   const result=await promisify(execFile)(process.execPath,['--input-type=module','-e',script],{cwd:new URL('../..',import.meta.url).pathname});
   assert.deepEqual(JSON.parse(result.stdout.trim()),{cancelled:true,shutdown:true,providerRequests:0});
 });
+
+
+test('detached KDB starts once and reuses its healthy owned process without a host manager',{timeout:10000},async t=>{
+  const {readFile,writeFile}=await import('node:fs/promises');
+  const {execFile}=await import('node:child_process');
+  const {promisify}=await import('node:util');
+  const {ensureKnowledgeService}=await import('../../cli/knowledge.mjs');
+  const {ownerStopped}=await import('../../controller/lifecycle.mjs');
+  const root=await mkdtemp(join(tmpdir(),'detached-kdb-')),bin=join(root,'bin');await mkdir(bin);
+  const {stdout}=await promisify(execFile)(process.env.PYTHON??'python3',['-c','import sys;print(sys.executable)']);
+  const launcher=join(root,'python'),launches=join(root,'launches.jsonl');
+  await writeFile(launcher,`#!${stdout.trim()}
+import json,os,sys
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler,HTTPServer
+with Path(${JSON.stringify(launches)}).open('a') as output:
+ output.write(json.dumps({'pid':os.getpid(),'argv':sys.argv[1:]})+'\\n')
+class Health(BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(b'{}')
+ def log_message(self,*args): pass
+HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),Health).serve_forever()
+`,{mode:0o700});
+  const names=['PATH','RSI_MANAGED_ROOT','RSI_MANAGED_ROLE'],previous=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+  let owner;
+  t.after(async()=>{
+    for(const name of names)if(previous[name]===undefined)delete process.env[name];else process.env[name]=previous[name];
+    try {
+      if(!owner)try{owner=JSON.parse(await readFile(join(root,'knowledge-service.json'),'utf8')).owner;}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(owner&&!await ownerStopped(owner)) {
+        process.kill(owner.pid,'SIGTERM');
+        const deadline=performance.now()+2000;
+        while(!await ownerStopped(owner)&&performance.now()<deadline)await delay(20);
+        if(!await ownerStopped(owner))process.kill(owner.pid,'SIGKILL');
+      }
+    }finally{await rm(root,{recursive:true,force:true});}
+  });
+  process.env.PATH=bin;
+  process.env.RSI_MANAGED_ROOT=join(root,'absent-parent');process.env.RSI_MANAGED_ROLE='worker';
+  const config={root,python:launcher};
+  const urls=await Promise.all([ensureKnowledgeService(config),ensureKnowledgeService(config)]);
+  assert.equal(new Set(urls).size,1);
+  const receipt=JSON.parse(await readFile(join(root,'knowledge-service.json'),'utf8'));owner=receipt.owner;
+  assert.equal(await ownerStopped(owner),false);
+  assert.equal(await ensureKnowledgeService(config),urls[0]);
+  const records=(await readFile(launches,'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(records.length,1);assert.equal(records[0].pid,owner.pid);
+  assert.deepEqual(records[0].argv.slice(0,4),['-m','ascend_tools.kdb_service','--db',join(root,'knowledge.sqlite')]);
+});
+
+
+test('healthy legacy KDB receipt reuses process ownership without consulting a service manager',async t=>{
+  const {readFile,writeFile}=await import('node:fs/promises');
+  const {ensureKnowledgeService}=await import('../../cli/knowledge.mjs');
+  const {processIdentity}=await import('../../controller/lifecycle.mjs');
+  const root=await mkdtemp(join(tmpdir(),'legacy-kdb-'));
+  const server=createServer((_req,res)=>{res.writeHead(200);res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));await rm(root,{recursive:true,force:true});});
+  const receipt={url:`http://127.0.0.1:${server.address().port}/mcp`,owner:await processIdentity(),service:'old-knowledge.service'};
+  const path=join(root,'knowledge-service.json');await writeFile(path,JSON.stringify(receipt));
+  assert.equal(await ensureKnowledgeService({root,python:'missing-unused-python'}),receipt.url);
+  assert.deepEqual(JSON.parse(await readFile(path,'utf8')),receipt);
+});

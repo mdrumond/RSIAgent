@@ -26,10 +26,9 @@ export async function waitFor(check,signal,seconds=20) {
   }
 }
 
-// Portable cases call the installed canonical runtime through the test OS shim.
-// managed=true exercises the actual public CLI; both use native Pi and the real KDB.
+// All cases call the installed public CLI with native Pi and the real KDB.
 // The SDK is reused from the source installation; packaging is another case's remit.
-export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false,managed=false}={}) {
+export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false}={}) {
   const directory=join(ctx.directory,scenario),instance=join(directory,'instance');
   await mkdir(directory,{recursive:true});
   const rel=relative(repository,instance);
@@ -135,7 +134,7 @@ export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false,manag
   await execute(process.execPath,[cli,'bootstrap',instance,'--config',input]).output;
   await symlink(join(repository,'node_modules'),join(instance,'machinery/node_modules'),'dir');
   cli=join(instance,'machinery/cli/main.mjs');
-  if(!managed)cli=await portableCli(cli,directory);
+  cli=await portableCli(cli);
   await cp(oracle,join(instance,'machinery/ascend_tools/fixture_embeddings.py'));
   // Fault at the real durable sink boundary, not a fake outbox/state transition.
   if(loseDelivery)await writeFile(join(instance,'machinery/ascend_tools/campaign_delivery.py'),`

@@ -6,7 +6,6 @@ import { dirname, delimiter } from 'node:path';
 import { randomUUID,createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import {normalizeHostMemory} from '../controller/host-memory.mjs';
 import { State, validateAcceptance } from '../controller/state.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
 
@@ -14,13 +13,12 @@ export async function readConfig(root) {
   root=await realpath(root);
   const config=JSON.parse(await readFile(join(root,'instance.json'),'utf8'));
   if (config.format !== 1) throw new Error('Unsupported instance; bootstrap a fresh instance');
-  return {...config,host_memory:normalizeHostMemory(config.host_memory),root};
+  return {...config,root};
 }
 const within=(parent,child)=>{const rel=relative(parent,child);return rel==='' || (!rel.startsWith('..'+sep) && rel!=='..');};
 
 export async function bootstrap(destination,{baseline,skills,environment,projects=[],repository,
   machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,...settings}={}) {
-  const host_memory=normalizeHostMemory(settings.host_memory);
   destination=resolve(destination);machinery=await realpath(machinery);
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
@@ -52,7 +50,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
   await copyMachinery(machinery,join(destination,'machinery'),install,settings.python);
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
-    concurrency,tune_every,host_memory,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
+    concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
   try {
     for(const project of projects)ledger.add(project);
@@ -74,7 +72,6 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
     ledger.db.exec('BEGIN IMMEDIATE');
     const current=await readConfig(root),next=await change(current,ledger);
     if(next.format!==1)throw new Error('Current format required');
-    next.host_memory=normalizeHostMemory(next.host_memory);
     next.revision=(current.revision??0)+1;delete next.root;
     const path=join(current.root,'instance.json');staged=path+'.'+randomUUID()+'.tmp';
     await writeFile(staged,JSON.stringify(next,null,2)+'\n',{mode:0o600});

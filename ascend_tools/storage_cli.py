@@ -286,8 +286,8 @@ def execute(root, action):
 
 
 def main(argv=None):
-    # The managed cgroup bounds resident memory for Python and Restic together.
-    # RLIMIT_AS prevents Go from reserving its virtual address arena.
+    # File IO is streamed; Restic owns its bounded-concurrency archive work.
+    # Do not cap virtual address space: Go reserves a large virtual arena.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True)
     parser.add_argument('--action-json')
