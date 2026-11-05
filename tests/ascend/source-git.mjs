@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {prepareSourceGit} from '../../controller/source-git.mjs';
 import {fingerprint} from '../../controller/evidence.mjs';
 
@@ -177,4 +179,26 @@ test('boundary trees retain actual edits without changing actor HEAD, branch or 
   assert.equal((await readdir(paths.gitDir)).some(name=>name.startsWith('capture-')),false);
   await assert.rejects(repo.captureTree({timeout:0}),/deadline/);
   assert.equal((await readdir(paths.gitDir)).some(name=>name.startsWith('capture-')),false);
+});
+
+
+test('immutable tree refs retain uncommitted snapshots through Git GC',async t=>{
+  const paths=await fixture(t),repo=await prepareSourceGit({...paths,attemptId:'gc'});
+  await ok(repo,['add','.']);await ok(repo,['commit','-m','Actor baseline']);
+  const state=await repo.readState(),index=await readFile(join(paths.gitDir,'index'));
+  await writeFile(join(paths.source,'kernel.py'),'uncommitted_snapshot = True\n');
+  const captured=await repo.captureTree();
+  assert.match(captured.ref,/^refs\/rsi\/snapshots\/[a-f0-9]{24}\/[a-f0-9]{40,64}$/);
+  assert.equal(await ok(repo,['rev-parse',captured.ref]),captured.tree_oid+'\n');
+  assert.deepEqual(await repo.captureTree(),captured);
+  await writeFile(join(paths.source,'kernel.py'),'a later failed optimisation\n');
+  const later=await repo.captureTree();
+  assert.notEqual(later.ref,captured.ref);
+  await promisify(execFile)('git',['--git-dir='+paths.gitDir,'gc','--prune=now'],
+    {env:{...process.env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
+  assert.equal(await ok(repo,['show',captured.ref+':kernel.py']),'uncommitted_snapshot = True\n');
+  assert.equal(await ok(repo,['show',later.ref+':kernel.py']),'a later failed optimisation\n');
+  assert.equal((await repo.readState()).head,state.head);
+  assert.equal((await repo.readState()).branch,state.branch);
+  assert.deepEqual(await readFile(join(paths.gitDir,'index')),index);
 });

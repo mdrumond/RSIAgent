@@ -165,8 +165,20 @@ export async function prepareSourceGit({source,gitDir,attemptId}) {
         if(response.exitCode!==0||response.timedOut||response.aborted)
           throw new Error(`Source Git capture failed: ${response.stderr}`);
         if(argv[0]==='write-tree') {
+          const tree_oid=response.stdout.trim();
+          const ref=`refs/rsi/snapshots/${branch.slice('attempt/'.length)}/${tree_oid}`;
+          // The content-addressed ref is immutable: a repeat is idempotent, and
+          // the compare-and-swap cannot overwrite a different retained object.
+          const previous=await run(['rev-parse','--verify',ref],options);
+          if(previous.timedOut||previous.aborted||
+              (previous.exitCode===0&&previous.stdout.trim()!==tree_oid))
+            throw new Error('Source Git snapshot ref is not immutable');
+          const old=previous.exitCode===0?tree_oid:'0'.repeat(tree_oid.length);
+          const retained=await run(['update-ref',ref,tree_oid,old],options);
+          if(retained.exitCode!==0||retained.timedOut||retained.aborted)
+            throw new Error(`Source Git snapshot retention failed: ${retained.stderr}`);
           const {head,dirty}=await readState(options);
-          return {tree_oid:response.stdout.trim(),head,dirty};
+          return {tree_oid,ref,head,dirty};
         }
       }
     } finally {await rm(temporary,{recursive:true,force:true});}
