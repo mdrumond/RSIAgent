@@ -36,6 +36,6 @@ Walk filters include phase, role, project, outcome, stage and revision. `--curso
 
 Managed maintenance runs serially with a 512 MiB aggregate memory ceiling and one CPU. Restic handles compression, deduplication, indexes and interrupted backups. It uses one reader and a bounded Go heap target. No custom archive/chunk engine is maintained.
 
-Only sealed artifacts whose writers have stopped may be archived. Source deletion requires a published ledger reference, unchanged source identity and verified archive contents. Explicit prune first returns an inventory; apply requires that same inventory. No campaign history is automatically discarded.
+Automatic backups retain plain working logs so Pi and curriculum agents can continue reading their paths. Removing redundant source files is explicit. Only sealed artifacts whose writers have stopped may be archived. Source deletion requires a published ledger reference, unchanged source identity and verified archive contents. Explicit prune first returns an inventory; apply requires that same inventory. No campaign history is automatically discarded.
 
 Memory and skills share a local Git history without remotes. Memory is staged in KDB at its Git revision before activation. Attempts query their pinned generation; rejected skill proposals and negative findings remain evidence. Binary vectors and deduplicated chunk contents reduce KDB size. Pruning is explicit and preserves pinned or cited evidence.

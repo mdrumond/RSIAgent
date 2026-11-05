@@ -14,7 +14,7 @@ export async function queueCompression(config,{manager}={}) {
     await sealClosedArtifacts(config,{limit:1000});
     if(!state.db.prepare(`SELECT 1 FROM storage_artifacts WHERE status='closed'
       AND encoding='plain' AND external=0 AND kind!='source-git' LIMIT 1`).get())return null;
-    return await startBackground(config.root,'storage',{action:'compress',limit:1000,'delete-source':true},
+    return await startBackground(config.root,'storage',{action:'compress',limit:1000},
       {detach:true,...(manager?{manager}:{})});
   }finally{state.close();}
 }
