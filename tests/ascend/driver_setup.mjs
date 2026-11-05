@@ -23,9 +23,9 @@ export async function until(check,timeout=15000) {
   while (Date.now()<end) {const value=await check();if(value)return value;await delay(50);}
   throw new Error('Timed out waiting for observable driver transition');
 }
-export async function setup(t,scenario,ids,{install=false}={}) {
+export async function setup(t,scenario,ids,{install=false,projectFactory,providerOptions={}}={}) {
   const root = await mkdtemp(join(process.env.DRIVER_ARTIFACTS ?? tmpdir(),'driver-acceptance-'));
-  const instance = join(root,'instance'), server = await provider(scenario,{nativeSession:async()=>
+  const instance = join(root,'instance'), server = await provider(scenario,{...providerOptions,nativeSession:async()=>
     rows(instance,'SELECT session FROM attempts WHERE session IS NOT NULL ORDER BY rowid DESC LIMIT 1')[0]?.session});
   const env = {...process.env,DRIVER_FIXTURE_KEY:'fixture-only',
     PATH:dirname(python)+':'+process.env.PATH,PYTHONPATH:resolve('.')};
@@ -86,6 +86,7 @@ export async function setup(t,scenario,ids,{install=false}={}) {
   await writeFile(join(skills,'skill-map.json'),JSON.stringify(map));
   const projects=[];
   for(const id of ids) {
+    if(projectFactory) {projects.push(await projectFactory({id,root,python,quote}));continue;}
     const source=join(root,id,'source');await mkdir(source,{recursive:true});
     await writeFile(join(source,'answer.py'),'def answer(): return 0\n');
     projects.push({id,goal:id,source,actor_seconds:120,
