@@ -116,7 +116,8 @@ from ascend_tools.storage_cli import execute
 module=types.ModuleType('ascend_tools.storage_package')
 def pack(root,dest,project=None):
  assert not dest.is_relative_to(root), 'pack forbids outputs inside campaign'
- return dict(root=str(root),dest=str(dest),project=project)
+ assert project == 'p'
+ return dict(complete=True,scope=project,files=[{}],missing=[])
 module.pack=pack
 module.unpack=lambda package,dest:dict(package=str(package),dest=str(dest))
 sys.modules[module.__name__]=module
@@ -124,7 +125,7 @@ print(json.dumps([execute(sys.argv[1],dict(action='pack',project='p',destination
  execute('/no-existing-instance',dict(action='unpack',package=sys.argv[1]+'/package',destination=sys.argv[1]+'/restored'))]))`;
   const {stdout}=await exec(python,['-c',code,f.root]);
   const [packed,unpacked]=JSON.parse(stdout);
-  assert.deepEqual(packed,{root:f.root,dest:f.root+'-package',project:'p'});
+  assert.deepEqual(packed,{package:f.root+'-package',complete:true,scope:'p',files:1,missing:[]});
   assert.deepEqual(unpacked,{package:join(f.root,'package'),dest:join(f.root,'restored')});
 });
 
