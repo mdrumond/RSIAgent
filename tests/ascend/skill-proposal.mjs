@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateCandidate } from '../../controller/skill-proposal.mjs';
@@ -10,6 +10,8 @@ const guidance = { id: 'failure', scope: 'debug', text: 'Check the failing case.
 const task = n => ({ id: `original-${n}`, projectId: `project-${n}`, kind: 'original',
   phase: 'phase2', completed: true, events: [{ type: 'knowledge-retrieved', data: { kind: 'negative', evidence: 'failure.json' } }] });
 const load = async path => JSON.parse(await readFile(path, 'utf8'));
+const transcript = async directory => (await readFile(join(directory, 'session.native.jsonl'), 'utf8'))
+  .trim().split('\n').map(line => JSON.parse(line));
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'skill-proposal-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -24,7 +26,9 @@ test('native publisher injection reads saved evidence and disposes its session',
     input: { entries: [guidance], actualEvents: task(0).events }, native }), []);
   assert.equal(observed.actualEvents.length, 1);
   assert.ok(flags.disposed);
-  assert.equal((await load(join(root, 'proposal', 'responses.json'))).length, 1);
+  assert.equal((await transcript(join(root, 'proposal')))[0].type, 'session');
+  const files = await readdir(join(root, 'proposal'));
+  assert.ok(!files.includes('responses.json') && !files.includes('sft.native.jsonl'));
 });
 
 test('actual Pi readonly KDB lookup and validated publisher repair a rejected proposal', { timeout: 20000 }, async t => {
@@ -108,12 +112,13 @@ test('actual Pi readonly KDB lookup and validated publisher repair a rejected pr
     validate: changes => { if (changes.some(change => change.action === 'remove')) throw new Error('Protected guidance'); } });
   assert.deepEqual(submitted, proposal);
   assert.equal(requests, 6);
-  const messages = await load(join(directory, 'responses.json'));
+  const entries = await transcript(directory);
+  assert.equal(entries[0].type, 'session');
+  const messages = entries.filter(entry => entry.type === 'message').map(entry => entry.message);
   const toolResults = messages.filter(message => message.role === 'toolResult');
   assert.ok(toolResults.some(message => message.toolName === 'submit_changes' && message.isError));
   const lookup = toolResults.find(message => message.toolName === 'mcp__kdb__read_entry');
   assert.equal(JSON.parse(lookup.content[0].text).text, evidenceText);
-  assert.ok((await readFile(join(directory, 'sft.native.jsonl'), 'utf8')).length > 0);
   assert.ok((await readFile(join(directory, 'provider.jsonl'), 'utf8')).length > 0);
   const count = execFileSync(python, ['-c',
     "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);print(c.execute(\"SELECT count(*) FROM knowledge_events WHERE operation='read_entry' AND attempt_id='writer'\").fetchone()[0])",
@@ -121,13 +126,13 @@ test('actual Pi readonly KDB lookup and validated publisher repair a rejected pr
   assert.equal(count.trim(), '1');
 });
 
-test('native writer elapsed allocation aborts and retains response evidence', async t => {
+test('native writer elapsed allocation aborts and exports its native session', async t => {
   const root = await fixture(t);
   const { native, flags } = nativeWriter(() => {}, true);
   await assert.rejects(generateCandidate({ directory: join(root, 'timed'), input: {}, native,
     seconds: 0.02 }), /elapsed allocation/);
   assert.ok(flags.aborted && flags.disposed);
-  assert.equal((await load(join(root, 'timed', 'responses.json'))).length, 1);
+  assert.equal((await transcript(join(root, 'timed'))).length, 1);
 });
 
 test('writer deadline during input read is latched before the pending wait', { timeout: 2000 }, async t => {
@@ -155,18 +160,18 @@ test('writer deadline during input read is latched before the pending wait', { t
         validate: () => { submitted++; } }), { name: 'AbortError' });
       assert.ok(readStarted && flags.aborted && flags.disposed);
       assert.equal(submitted, 0); assert.equal(shutdown, 1);
-      assert.equal((await load(join(directory, 'responses.json'))).length, 1);
+      assert.equal((await transcript(directory)).length, 1);
     } finally { clearTimeout(timer); }
   }
 });
 
-test('external stop aborts native session, rejects submission and preserves partial messages', async t => {
+test('external stop aborts native session, rejects submission and exports its native session', async t => {
   const root = await fixture(t), controller = new AbortController();
   const { native, flags } = nativeWriter(() => setTimeout(() => controller.abort(), 0), true);
   await assert.rejects(generateCandidate({ directory: join(root, 'stopped'), input: {}, native,
     signal: controller.signal }), { name: 'AbortError' });
   assert.ok(flags.aborted && flags.disposed);
-  assert.equal((await load(join(root, 'stopped', 'responses.json'))).length, 1);
+  assert.equal((await transcript(join(root, 'stopped'))).length, 1);
   await assert.rejects(generateCandidate({ directory: join(root, 'never-started'), input: {}, native,
     signal: controller.signal }), { name: 'AbortError' });
 });
@@ -185,21 +190,27 @@ test('elapsed expiry during extension binding cannot start a later prompt', asyn
   assert.equal(prompts, 0); assert.ok(flags.aborted && flags.disposed);
 });
 
-test('archive failures still shut down and dispose, preserving the earliest error', async t => {
+test('native export failures still close writers and preserve the earliest error', async t => {
   for (const promptFails of [false, true]) {
     const root = await fixture(t), directory = join(root, 'archive'), events = [];
-    const { native } = nativeWriter(), create = native.createAgentSession, first = new Error('provider failed');
+    const { native } = nativeWriter(), create = native.createAgentSession;
+    const first = new Error('provider failed'), exportError = new Error('export failed');
+    native.SessionManager.create = () => ({ getSessionFile: () => join(directory, 'native.jsonl') });
     native.createAgentSession = async options => {
       const result = await create(options), { session } = result, prompt = session.prompt;
-      session.prompt = async () => { await prompt(); await mkdir(join(directory, 'responses.json'));
-        if (promptFails) throw first; };
+      session.prompt = async () => { await prompt(); if (promptFails) throw first; };
+      session.exportToJsonl = path => {
+        assert.equal(path, join(directory, 'session.native.jsonl'));
+        events.push('export'); throw exportError;
+      };
       session.extensionRunner = { async emit() { events.push('shutdown'); throw new Error('cleanup failed'); } };
-      session.dispose = () => events.push('dispose');
+      session.dispose = async () => { await Promise.resolve(); events.push('dispose'); };
       return result;
     };
-    await assert.rejects(generateCandidate({ directory, input: {}, native }),
-      error => promptFails ? error === first : error.code === 'EISDIR');
-    assert.deepEqual(events, ['shutdown', 'dispose']);
-    assert.equal((await readFile(join(directory, 'sft.native.jsonl'), 'utf8')).length > 0, true);
+    await assert.rejects(generateCandidate({ directory, input: {}, native,
+      onSessionClosed: path => {
+        assert.equal(path, join(directory, 'native.jsonl')); events.push('closed');
+      } }), error => error === (promptFails ? first : exportError));
+    assert.deepEqual(events, ['export', 'shutdown', 'dispose', 'closed']);
   }
 });
