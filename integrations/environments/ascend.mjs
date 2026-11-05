@@ -279,8 +279,8 @@ export async function createEnvironment(options, context) {
     }));
   }
   return {
-    ...environment, resources,
-    instructions:environment.instructions+(local?'\nUse rsi_target for device execution, compilation and profiling: it applies the leased physical-device masks. Native local bash inherits the same worker-assigned device masks; rsi_target additionally performs fresh device admission.':''),
+    ...environment, resources, shellOnTarget:local,
+    instructions:environment.instructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),
     async execute(command, cwd, opts = {}) {
       const started = performance.now();
       let excludedMs = 0;
