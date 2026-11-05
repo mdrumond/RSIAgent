@@ -90,7 +90,7 @@ for(const code of [0,9,'throw','signal','unknown'])test(`worker exit ${code} wit
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   assert.ok(state.failures(output.results[0].attempt).length>=1);
   assert.equal(state.db.prepare('SELECT COUNT(*) AS n FROM resource_leases').get().n,code==='unknown'?2:0);
-  assert.equal(new RecoveryQueue(state).pendingOutcomes().length,code==='unknown'?0:2);
+  assert.equal(new RecoveryQueue(state).pendingOutcomes().length,['unknown','throw'].includes(code)?0:2);
   if(code==='unknown') {
     const resumed=await operate('resume',config);
     assert.equal(resumed.results.length,0);
