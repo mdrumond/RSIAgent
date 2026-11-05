@@ -24,7 +24,7 @@ export async function operationsStopped(state,attempt,environment) {
   // Worker death cannot prove its detached native SDK shell has stopped.
   if(events.some(e=>e.type==='native-bash-started' && !closedBash.has(e.data.operation)))return false;
   const nativeElapsed=Math.max(attempt.elapsed,...completedBash.map(e=>e.data.actor_elapsed).filter(Number.isFinite));
-  if(nativeElapsed>attempt.elapsed)state.checkpoint(attempt.id,nativeElapsed);
+  if(nativeElapsed>attempt.elapsed)checkpointExecution(state,attempt.id,nativeElapsed);
   const finished=new Set(events.filter(e=>['execution-settled','execution-reconciled'].includes(e.type) &&
     (e.type==='execution-settled'||e.data.closed===true)).map(e=>e.data.operation));
   const pending=new Map();
@@ -42,7 +42,7 @@ export async function operationsStopped(state,attempt,environment) {
     if(!proof.closed || !Number.isFinite(proof.executionSeconds))return false;
     if(Number.isFinite(data.startElapsed)) {
       elapsed=Math.max(elapsed,data.startElapsed+proof.executionSeconds);
-      state.checkpoint(attempt.id,elapsed);
+      checkpointExecution(state,attempt.id,elapsed);
     }else {
       const submissions=events.filter(e=>e.type==='execution-submitting' &&
         (e.data.operation??e.data.submission)===operation);
@@ -64,4 +64,40 @@ export async function operationsStopped(state,attempt,environment) {
     if (!handle || (await environment.observe(handle)).state !== 'stopped') return false;
   }
   return true;
+}
+
+// Outcome is factual; closure is a separate, conservative execution proof.
+export function failureSettled(state,id) {
+  const event=state.queryEvents(id,{types:['failure-settlement'],order:'desc',limit:1})[0];
+  return !event || event.data.closed===true;
+}
+export async function settleFailure(state,id,environment,{phase='worker',kind='exception',
+  message='Worker failed',settleProject=true}={}) {
+  state.db.exec('BEGIN IMMEDIATE');
+  try {
+    state.recordFailure(id,{phase,kind,message});
+    if(!state.attempt(id).outcome) {
+      state.db.prepare("UPDATE attempts SET outcome='failed' WHERE id=?").run(id);
+      if(settleProject)state.db.prepare("UPDATE projects SET status='failed' WHERE id=?")
+        .run(state.attempt(id).project);
+    }
+    // Outcome and fence become visible together, including across worker death.
+    state.event(id,'failure-settlement',{closed:false});
+    state.db.exec('COMMIT');
+  }catch(error){state.db.exec('ROLLBACK');throw error;}
+  return reconcileFailure(state,id,environment);
+}
+export async function reconcileFailure(state,id,environment) {
+  let closed=false;
+  try {closed=await operationsStopped(state,state.attempt(id),environment??{});}
+  catch(error){state.event(id,'settlement-error',{message:error.message});}
+  state.event(id,'failure-settlement',{closed});
+  return closed;
+}
+
+function checkpointExecution(state,id,elapsed) {
+  // Factual failure may precede the final detached-operation duration.
+  const result=state.db.prepare('UPDATE attempts SET elapsed=? WHERE id=? AND elapsed<=?')
+    .run(elapsed,id,elapsed);
+  if(!result.changes)throw new Error('Invalid execution checkpoint');
 }
