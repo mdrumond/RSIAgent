@@ -5,8 +5,10 @@ import {once} from 'node:events';
 import {mkdtemp,writeFile,mkdir,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
+import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {State} from '../../controller/state.mjs';
-import {refillPhase1} from '../../cli/project-generation.mjs';
+import {refillPhase1,generationEventState} from '../../cli/project-generation.mjs';
 
 async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -51,6 +53,9 @@ test('native Pi constructs projects; real Python controls gate staged specs with
   const again=await refillPhase1(f.options);assert.deepEqual(again.map(s=>s.id),specs.map(s=>s.id));
   for(const s of specs)f.state.add(s);
   assert.deepEqual(await refillPhase1(f.options),[]);
+  const imported=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+  assert.deepEqual(imported.map(d=>d.status),['imported','imported']);
+  assert.ok(imported.every(d=>Object.keys(d).length===2));
 });
 
 test('a verifier accepting negative controls never enters original ledger',async t=>{
@@ -105,4 +110,26 @@ test('the trusted positive must pass the independent verifier',async t=>{
   assert.deepEqual(await refillPhase1(f.options),[]);
   const rows=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
   assert.ok(rows.every(d=>d.status==='invalid'&&d.error==='CPU construction check failed: reference'));
+});
+
+
+test('generation telemetry pages exclusive cursors without original event tables',t=>{
+  const db=new DatabaseSync(':memory:');t.after(()=>db.close());
+  db.exec('CREATE TABLE generation_events(sequence INTEGER PRIMARY KEY,draft TEXT,type TEXT,data TEXT)');
+  const state=generationEventState(db);
+  state.event('draft','curriculum-session',{role:'generation',session:'first',allocation_seconds:30});
+  for(let i=1;i<=205;i++)state.event('draft','curriculum-checkpoint',{role:'generation',elapsed_seconds:i/10});
+  state.event('other','curriculum-checkpoint',{role:'generation',elapsed_seconds:999});
+  state.event('draft','curriculum-session',{role:'generation',session:'latest',allocation_seconds:300});
+  const page=state.queryEvents('draft',{types:['curriculum-checkpoint'],order:'desc',limit:100});
+  assert.equal(page.length,100);assert.equal(page[0].data.elapsed_seconds,20.5);
+  const next=state.queryEvents('draft',{types:['curriculum-checkpoint'],order:'desc',limit:100,before:page.at(-1).sequence});
+  assert.equal(next.length,100);assert.ok(next[0].sequence<page.at(-1).sequence);
+  const forward=state.queryEvents('draft',{order:'asc',limit:2,after:page.at(-1).sequence,before:page[0].sequence});
+  assert.equal(forward.length,2);assert.equal(forward[0].sequence,page.at(-1).sequence+1);
+  assert.deepEqual(state.queryEvents('draft',{types:[]}),[]);
+  assert.deepEqual(curriculumRoleHistory(state,'draft','generation'),{
+    prior:{role:'generation',session:'latest',allocation_seconds:300},seconds:30,elapsed:20.5});
+  for(const options of [{limit:0},{limit:1001},{order:'bad'},{before:-1},{after:1.2},{types:'x'}])
+    assert.throws(()=>state.queryEvents('draft',options));
 });

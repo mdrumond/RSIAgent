@@ -11,6 +11,30 @@ const schema=Type.Object({goal:Type.String({minLength:1}),source:Type.String({mi
   verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:Type.String({minLength:1})}),
   reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
 
+// Same bounded event contract as State, scoped exclusively to generation telemetry.
+export function generationEventState(db) {
+  return {
+    queryEvents(id,{types,order='asc',limit=100,before,after}={}) {
+      if(!Number.isSafeInteger(limit)||limit<1||limit>1000)throw new Error('Invalid event limit');
+      if(!['asc','desc'].includes(order))throw new Error('Invalid event order');
+      const clauses=['draft=?'],args=[id];
+      if(types!==undefined) {
+        if(!Array.isArray(types)||types.some(t=>typeof t!=='string'||!t))throw new Error('Invalid event types');
+        clauses.push(types.length?`type IN (${types.map(()=>'?').join(',')})`:'0');args.push(...types);
+      }
+      for(const [cursor,operator] of [[before,'<'],[after,'>']]) {
+        if(cursor===undefined)continue;
+        if(!Number.isSafeInteger(cursor)||cursor<0)throw new Error('Invalid event cursor');
+        clauses.push(`sequence ${operator} ?`);args.push(cursor);
+      }
+      return db.prepare(`SELECT sequence,type,data FROM generation_events WHERE ${clauses.join(' AND ')}
+        ORDER BY sequence ${order} LIMIT ?`).all(...args,limit).map(e=>({...e,data:JSON.parse(e.data)}));
+    },
+    event:(id,type,data)=>db.prepare('INSERT INTO generation_events(draft,type,data) VALUES (?,?,?)')
+      .run(id,type,JSON.stringify(data))
+  };
+}
+
 function drafts(state) {
   state.db.exec(`CREATE TABLE IF NOT EXISTS generation_drafts (
     id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -18,13 +42,12 @@ function drafts(state) {
     sequence INTEGER PRIMARY KEY, draft TEXT NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS generation_role_events ON generation_events(draft,type,sequence)`);
   const save=d=>state.db.prepare('INSERT OR REPLACE INTO generation_drafts VALUES (?,?)').run(d.id,JSON.stringify(d));
-  const events=id=>state.db.prepare(`SELECT type,data FROM generation_events WHERE sequence IN (
-    SELECT MAX(sequence) FROM generation_events WHERE draft=? AND type IN
-    ('curriculum-session','curriculum-checkpoint','curriculum-interrupted') GROUP BY type) ORDER BY sequence`).all(id)
-    .map(e=>({...e,data:JSON.parse(e.data)}));
-  return {save,all:()=>state.db.prepare('SELECT data FROM generation_drafts ORDER BY rowid').all().map(r=>JSON.parse(r.data)),
-    adapter:{events,event:(id,type,data)=>state.db.prepare('INSERT INTO generation_events(draft,type,data) VALUES (?,?,?)')
-      .run(id,type,JSON.stringify(data))}};
+  return {save,count:()=>state.db.prepare('SELECT COUNT(*) AS n FROM generation_drafts').get().n,
+    pending:limit=>state.db.prepare(`SELECT data FROM generation_drafts
+      WHERE json_extract(data,'$.status') IN ('draft','ready') ORDER BY rowid LIMIT ?`).all(limit).map(r=>JSON.parse(r.data)),
+    reconcile:()=>state.db.prepare(`UPDATE generation_drafts SET data=json_object('id',id,'status','imported')
+      WHERE json_extract(data,'$.status') IN ('draft','ready') AND EXISTS (SELECT 1 FROM projects WHERE projects.id=generation_drafts.id)`).run(),
+    adapter:generationEventState(state.db)};
 }
 
 async function artifact(root,name,directory=false) {
@@ -56,17 +79,18 @@ export async function refillPhase1({config,state,bridge,concurrency,path,signal}
   if(!(config.actor_seconds>0))throw new Error('Generation requires actor elapsed allocation');
   const seconds=config.curriculum_seconds??240;
   if(!(seconds>0)||!Number.isFinite(seconds))throw new Error('Invalid curriculum elapsed allocation');
-  const store=drafts(state),rows=store.all();
+  const store=drafts(state);
   const selected=config.curriculum?.phase1;
   const backlog=state.db.prepare("SELECT id,spec FROM projects WHERE status IN ('queued','running') AND frozen=0").all()
     .filter(r=>{const spec=JSON.parse(r.spec);return (!spec.phase||spec.phase==='phase1')&&
       (!Array.isArray(selected)||selected.includes(r.id)||spec.generation);}).length;
   const wanted=Math.min(8,Math.max(0,2*concurrency-backlog));
+  store.reconcile();
   if(!wanted)return [];
   const result=[],batch=randomUUID();
   let processed=0;
-  for(const d of rows)if(state.project(d.id)){d.status='imported';store.save(d);}
-  const pending=rows.filter(d=>!['imported','invalid','exhausted'].includes(d.status)&&!state.project(d.id));
+  const pending=store.pending(wanted);
+  let topicIndex=store.count();
   while(result.length<wanted && processed<wanted) {
     processed++;
     signal?.throwIfAborted();
@@ -74,8 +98,8 @@ export async function refillPhase1({config,state,bridge,concurrency,path,signal}
     if(!d){
       // One bounded batch per call; rejected proposals cannot spin a provider loop.
       d={id:'generated-'+randomUUID(),batch,status:'draft',seconds,elapsed:0,
-        topic:generation.topics[rows.length%generation.topics.length]};
-      rows.push(d);store.save(d);
+        topic:generation.topics[topicIndex++%generation.topics.length]};
+      store.save(d);
     }
     if(d.status==='ready'){result.push(d.spec);continue;}
     const root=join(resolve(path),d.id);await mkdir(root,{recursive:true});
