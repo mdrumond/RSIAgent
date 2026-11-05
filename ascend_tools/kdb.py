@@ -281,6 +281,32 @@ class KDB:
             self.db.connection.execute('INSERT OR IGNORE INTO memory_revisions VALUES(?)', (revision,))
         return {'generation': revision, 'collections': list(names)}
 
+    def adopt_memory_revision(self, revision: str, collections):
+        """Adopt an indexed lesson baseline atomically, without embedding work."""
+        if not revision:
+            raise ValueError('memory revision is required')
+        names = tuple(sorted(set(collections)))
+        conn = self.db.connection
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            for name in names:
+                row = conn.execute('SELECT language FROM collections WHERE name=?', (name,)).fetchone()
+                if row is None or row['language'] != 'lesson':
+                    raise ValueError('baseline memory collections must be indexed lessons')
+                if conn.execute('SELECT 1 FROM retired_snapshots WHERE collection=?', (name,)).fetchone():
+                    raise ValueError('cannot adopt a pruned snapshot')
+            exists = conn.execute('SELECT 1 FROM generations WHERE revision=?', (revision,)).fetchone()
+            if exists and self.generation_collections(revision) != names:
+                raise ValueError('generation membership is immutable')
+            conn.execute('INSERT OR IGNORE INTO generations VALUES(?)', (revision,))
+            conn.executemany('INSERT OR IGNORE INTO memory_collections VALUES(?)', ((name,) for name in names))
+            conn.executemany('INSERT OR IGNORE INTO generation_collections VALUES(?,?)',
+                             ((revision,name) for name in names))
+            conn.execute('INSERT OR IGNORE INTO memory_revisions VALUES(?)', (revision,))
+            conn.execute('INSERT INTO active_generation VALUES(1,?) '
+                         'ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision', (revision,))
+        return {'generation': revision, 'collections': list(names)}
+
     def activate_memory_revision(self, revision: str):
         """One metadata commit switches every memory record; repositories stay active."""
         if not self.db.connection.execute('SELECT 1 FROM memory_revisions WHERE revision=?',

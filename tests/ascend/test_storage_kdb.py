@@ -181,6 +181,23 @@ class StorageTests(unittest.TestCase):
         self.kdb.activate_memory_revision('git-one')
         self.assertEqual(len(self.kdb.search('first')), 1)
 
+    def test_baseline_adoption_is_atomic_reuses_vectors_and_retires_after_publication(self):
+        self.source('lesson.json','first baseline lesson')
+        self.kdb.add_repo(str(self.root),'baseline','lesson',target='a3',paths=['lesson.json'])
+        self.add('repository')
+        with patch.object(self.embedding, 'embed', side_effect=AssertionError('must not embed')):
+            with self.assertRaises(ValueError):
+                self.kdb.adopt_memory_revision('bad',['baseline','repository'])
+            self.assertIsNone(self.kdb.current_memory_revision())
+            adopted = self.kdb.adopt_memory_revision('git-baseline',['baseline'])
+            self.assertEqual(self.kdb.adopt_memory_revision('git-baseline',['baseline']), adopted)
+        self.kdb.stage_memory_revision('git-new',[])
+        self.kdb.activate_memory_revision('git-new')
+        self.assertEqual({h['collection'] for h in self.kdb.search('first')}, {'repository'})
+        old = self.kdb.search('first',generation='git-baseline')
+        self.assertEqual({h['collection'] for h in old}, {'repository','baseline'})
+        self.assertEqual({h['generation'] for h in old}, {'git-baseline'})
+
     def legacy(self):
         path = self.source('legacy.py', 'first vector\n')
         manifest = build_manifest(self.root,[path],collection='baseline',language='python',

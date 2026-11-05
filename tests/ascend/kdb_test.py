@@ -273,7 +273,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             tools = await session.list_tools()
             self.assertEqual({tool.name for tool in tools.tools},
                              {'search', 'read_entry', 'add_repo', 'record_lesson',
-                              'stage_memory_revision', 'activate_memory_revision'})
+                              'stage_memory_revision', 'activate_memory_revision', 'adopt_memory_revision'})
             result = await session.call_tool('add_repo', {
                 'path': str(root), 'collection': 'cpu', 'language': 'triton',
                 'target': 'a3', 'paths': ['kernel.py']})
@@ -305,6 +305,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 'applicability': 'a3', 'evidence': lesson['references'], 'attempt_id': 'cpu-1'})
             self.assertFalse(chained.isError)
             await session.read_resource('kdb://knowledge/skill')
+            adopted = await session.call_tool('adopt_memory_revision', {'revision':'baseline','collections':[]})
+            self.assertEqual(adopted.structuredContent['generation'], 'baseline')
             staged = await session.call_tool('stage_memory_revision', {
                 'revision': 'git-one', 'records': [dict(id='one', delivery_id='delivery-one',
                     lesson='memory vector alignment', evidence_refs=[reference], kind='good', target='a3')]})
@@ -367,7 +369,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([row['operation'] for row in events],
                                  ['add_repo', 'search', 'read_entry', 'read_entry',
                                   'record_lesson', 'record_lesson', 'skill.read',
-                                  'stage_memory_revision', 'search', 'activate_memory_revision', 'search'])
+                                  'adopt_memory_revision', 'stage_memory_revision', 'search', 'activate_memory_revision', 'search'])
                 self.assertTrue(all(row['attempt_id'] == 'cpu-1' for row in events))
                 staged_event = json.loads(db.db.connection.execute(
                     "SELECT data_json FROM knowledge_events WHERE operation='stage_memory_revision'").fetchone()[0])

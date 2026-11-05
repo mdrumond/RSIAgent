@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--url', required=True)
     parser.add_argument('--attempt')
     parser.add_argument('--tool', required=True, choices=['search', 'read_entry', 'add_repo', 'record_lesson',
-        'stage_memory_revision', 'activate_memory_revision'])
+        'stage_memory_revision', 'activate_memory_revision', 'adopt_memory_revision'])
     parser.add_argument('--arguments', default='{}')
     args = parser.parse_args()
     print(json.dumps(asyncio.run(invoke(args.url, args.tool, json.loads(args.arguments), args.attempt))))

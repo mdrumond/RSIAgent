@@ -83,6 +83,8 @@ def create_server(backend_factory, *, port=8765):
         event_args = dict(args)
         if operation in ('search', 'read_entry') and hasattr(backend, 'current_memory_revision'):
             event_args['generation'] = args.get('generation') or backend.current_memory_revision()
+        if operation == 'adopt_memory_revision':
+            event_args = {'revision': args['revision'], 'collection_count': len(args['collections'])}
         if operation == 'stage_memory_revision':
             event_args = {'revision': args['revision'], 'record_count': len(args['records'])}
         backend.event(operation, attempt_id, status='completed', arguments=event_args,
@@ -132,6 +134,11 @@ def create_server(backend_factory, *, port=8765):
     async def activate_memory_revision(revision: str, ctx: Context) -> dict[str, Any]:
         """Controller publication: atomically activate a staged memory revision."""
         return await invoke(ctx, 'activate_memory_revision', revision=revision)
+
+    @server.tool()
+    async def adopt_memory_revision(revision: str, collections: list[str], ctx: Context) -> dict[str, Any]:
+        """Controller baseline: activate existing indexed lessons without embedding."""
+        return await invoke(ctx, 'adopt_memory_revision', revision=revision, collections=collections)
 
     @server.resource('kdb://knowledge/skill')
     async def skill() -> str:
