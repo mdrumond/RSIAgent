@@ -27,7 +27,10 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
   const agentDir=join(path,'agent');await mkdir(agentDir,{recursive:true});
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
-    extensionFactories:[bridge.extension,pi=>{for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);}]});
+    extensionFactories:[bridge.extension,pi=>{
+      pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
+      for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);
+    }]});
   await loader.reload();
   const history=resume?curriculumRoleHistory(state,attemptId,role):{};
   const prior=history.prior;

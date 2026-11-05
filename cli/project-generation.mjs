@@ -1,6 +1,7 @@
 import { Type } from 'typebox';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdir, readFile, realpath, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
+import { writeSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { curriculumSession } from './curriculum.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
@@ -9,6 +10,7 @@ const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
 const schema=Type.Object({goal:Type.String({minLength:1}),source:Type.String({minLength:1}),
   verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:Type.String({minLength:1})}),
+  construction_command:Type.Optional(Type.String({minLength:1})),
   reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
 
 // Same bounded event contract as State, scoped exclusively to generation telemetry.
@@ -111,38 +113,56 @@ export async function refillPhase1({config,state,bridge,concurrency,path,signal}
     const active=signal?AbortSignal.any([signal,bounded]):bounded;
     const timer=setInterval(checkpoint,250);
     try {
-      if(!d.proposal)await curriculumSession({config:{...config,curriculum_seconds:d.seconds},state:store.adapter,
-        attemptId:d.id,role:'generation',path:root,bridge,signal:active,resume:true,accepted:()=>Boolean(d.proposal),
+      await curriculumSession({config:{...config,curriculum_seconds:d.seconds},state:store.adapter,
+        attemptId:d.id,role:'generation',path:root,bridge,signal:active,resume:true,accepted:()=>d.status==='ready',
         prompt:`Construct ONE fresh original Python project for topic ${JSON.stringify(d.topic)}.\n`+
           `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
           `Use the existing KDB tools and baseline skills at ${join(config.root,'skills','versions',config.skills?.activeVersion??'baseline')}.\n`+
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
-          `Create an independent verifier outside those trees. Its command runs from each tree, accepting reference with exit 0 and rejecting every negative with exit 1. `+
+          `Create an independent verifier outside those trees. Its command runs from editable source for actual target acceptance. `+
+          `When target acceptance needs a device, provide a separate construction_command for CPU proof against the reference and controls. `+
+          `The construction command (or verifier command when omitted) must accept reference with exit 0 and reject every negative with exit 1. `+
           `CPU construction checks must require no device. The source is the actor starting point, not the trusted solution. `+
           `Submit relative artifact paths and the project goal via submit_project. Do not assign project IDs or lineage.`,
         tool:{name:'submit_project',label:'Submit project',description:'Submit constructed source, independent verifier and CPU controls.',parameters:schema,
-          execute:async(_id,p)=>{await checkProposal(root,p);d.proposal=p;store.save(d);return reply('Draft recorded for controller validation');}}});
-      active.throwIfAborted();
-      if(!d.proposal)throw new Error('No project proposal submitted');
-      const p=d.proposal,artifacts=await checkProposal(root,p);
-      const env=await createEnvironment({mode:'local'},{instancePath:root,signal:active,
-        exclude:async(_label,fn)=>fn(),event:(type,data)=>store.adapter.event(d.id,type,data)});
-      const hashFiles=async()=>Object.fromEntries(await Promise.all(artifacts.files.map(async f=>[f,createHash('sha256').update(await readFile(f)).digest('hex')])));
-      const hashes=await hashFiles(),checks=[];
-      for(const [index,cwd] of [artifacts.reference,...artifacts.negatives].entries()) {
-        active.throwIfAborted();
-        // Preserve submitted source-relative verifier commands across sibling fixtures.
-        const command=p.verifier.command;
-        const execution=await env.execute(command,cwd,{signal:active,timeout:Math.max(.001,d.seconds-spent())});
-        checks.push({kind:index?'negative':'reference',cwd,...execution});
-        if(JSON.stringify(await hashFiles())!==JSON.stringify(hashes))throw new Error('Verifier changed during CPU checks');
-        if(!execution.settled||execution.exitCode!==(index?1:0))throw new Error('CPU construction check failed: '+checks.at(-1).kind);
-      }
-      active.throwIfAborted();
-      d.spec={id:d.id,phase:'phase1',goal:p.goal,source:artifacts.source,actor_seconds:config.actor_seconds,
-        target:config.target,verifier:{files:artifacts.files,command:p.verifier.command,hashes},
-        generation:{draft:d.id,topic:d.topic,checks}};
-      d.status='ready';checkpoint();
+          execute:async(_id,p)=>{
+            const checks=[];
+            try {
+              const artifacts=await checkProposal(root,p);
+              const env=await createEnvironment({mode:'local'},{instancePath:root,signal:active,
+                exclude:async(_label,fn)=>fn(),event:(type,data)=>store.adapter.event(d.id,type,data)});
+              const hashFiles=async()=>Object.fromEntries(await Promise.all(artifacts.files.map(async f=>[f,createHash('sha256').update(await readFile(f)).digest('hex')])));
+              const hashes=await hashFiles();
+              await mkdir(join(root,'construction'),{recursive:true});
+              for(const [index,cwd] of [artifacts.reference,...artifacts.negatives].entries()) {
+                active.throwIfAborted();
+                // Preserve submitted source-relative verifier commands across sibling fixtures.
+                const command=p.construction_command??p.verifier.command;
+                let output='',execution;
+                const logPath=join(root,'construction',randomUUID()+'.log'),log=await open(logPath,'wx',0o600);
+                try {
+                  execution=await env.execute(command,cwd,{signal:active,timeout:Math.max(.001,d.seconds-spent()),
+                    onData:chunk=>{writeSync(log.fd,chunk);output=(output+chunk.toString()).slice(-4000);}});
+                }catch(error){execution={settled:false,exitCode:null,error:error.message};}
+                finally{await log.close();}
+                const check={kind:index?'negative':'reference',cwd,command,expected_exit:index?1:0,...execution,log:logPath,output};
+                checks.push(check);store.adapter.event(d.id,'generation-construction-check',check);
+                if(JSON.stringify(await hashFiles())!==JSON.stringify(hashes))throw new Error('Verifier changed during CPU checks');
+                if(!execution.settled||execution.exitCode!==(index?1:0))throw new Error('CPU construction check failed: '+JSON.stringify(check));
+              }
+              active.throwIfAborted();
+              d.spec={id:d.id,phase:'phase1',goal:p.goal,source:artifacts.source,actor_seconds:config.actor_seconds,
+                target:config.target,verifier:{files:artifacts.files,command:p.verifier.command,hashes},
+                generation:{draft:d.id,topic:d.topic,checks}};
+              d.proposal=p;d.status='ready';delete d.error;checkpoint();
+              return reply('Project validated and accepted; finish without further tool calls.');
+            }catch(error){
+              d.error=error.message;
+              store.adapter.event(d.id,'generation-rejected',{proposal:p,checks,error:error.message,elapsed_seconds:spent()});
+              checkpoint();throw error;
+            }
+          }}});
+      if(d.status!=='ready')throw new Error(d.error??'No project proposal submitted');
       result.push(d.spec);
     }catch(error){
       if(signal?.aborted){checkpoint();throw error;}

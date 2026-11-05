@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
-import {mkdtemp,writeFile,mkdir,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -10,21 +10,27 @@ import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {State} from '../../controller/state.mjs';
 import {refillPhase1,generationEventState} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  const verifierContent=badVerifier?'pass\n':`from answer import answer\nimport sys\n${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+  const requests=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
     let raw='';for await(const b of req)raw+=b;
-    const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;
-    if(pause){waiting();await new Promise(ok=>res.once('close',ok));return;}
+    const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;requests.push(body);
+    if(pause || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
     const plan=[
       ['write',{path:'source/answer.py',content:'answer=0\n'}],
       ['write',{path:'reference/answer.py',content:`answer=${positive}\n`}],
       ['write',{path:'negative/answer.py',content:`answer=${negative}\n`}],
-      ['write',{path:'verify.py',content:badVerifier?'pass\n':'from answer import answer\nimport sys\nsys.exit(0 if answer == 42 else 1)\n'}],
+      ['write',{path:'verify.py',content:verifierContent}],
       ['submit_project',{goal:'Compute answer',source:'source',reference:'reference',negative_controls:['negative'],
-        verifier:{files:['verify.py'],command:"PYTHONPATH=. python3 ../verify.py"}}]];
+        verifier:{files:['verify.py'],command:separateCommand?'requires-device-runtime':"PYTHONPATH=. python3 ../verify.py"},
+        ...(separateCommand?{construction_command:"PYTHONPATH=. python3 ../verify.py"}:{})}]];
+    if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
+    if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
+      ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
     res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'generation',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     const call=plan[n];
@@ -40,7 +46,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false}=
     actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
       metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
   const options={config,state,path:join(root,'drafts'),bridge:{extension:()=>{}},concurrency:1};
-  return {options,state,config,waitStarted,unpause:()=>{pause=false;}};
+  return {options,state,config,requests,verifierContent,waitStarted,unpause:()=>{pause=false;pauseAfterRejection=false;}};
 }
 
 test('native Pi constructs projects; real Python controls gate staged specs without original quota',async t=>{
@@ -109,7 +115,9 @@ test('the trusted positive must pass the independent verifier',async t=>{
   const f=await fixture(t,{positive:41});
   assert.deepEqual(await refillPhase1(f.options),[]);
   const rows=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
-  assert.ok(rows.every(d=>d.status==='invalid'&&d.error==='CPU construction check failed: reference'));
+  assert.ok(rows.every(d=>d.status==='invalid'));
+  const rejections=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected'").all().map(r=>JSON.parse(r.data));
+  assert.ok(rejections.every(e=>e.checks.length===1&&e.checks[0].kind==='reference'&&e.checks[0].exitCode===1));
 });
 
 
@@ -132,4 +140,59 @@ test('generation telemetry pages exclusive cursors without original event tables
     prior:{role:'generation',session:'latest',allocation_seconds:300},seconds:30,elapsed:20.5});
   for(const options of [{limit:0},{limit:1001},{order:'bad'},{before:-1},{after:1.2},{types:'x'}])
     assert.throws(()=>state.queryEvents('draft',options));
+});
+
+
+test('native Pi repairs a rejected negative and resubmits in the same draft session',async t=>{
+  const f=await fixture(t,{negative:42,repair:true,afterAccepted:true,verbose:true});
+  const specs=await refillPhase1(f.options);assert.equal(specs.length,2);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM generation_drafts').get().n,2);
+  for(const spec of specs) {
+    const events=generationEventState(f.state.db).queryEvents(spec.id,{limit:1000});
+    const sessions=events.filter(e=>e.type==='curriculum-session');assert.equal(sessions.length,1);
+    const [failure]=events.filter(e=>e.type==='generation-rejected');assert.ok(failure);
+    const check=failure.data.checks.at(-1);
+    assert.equal(check.kind,'negative');assert.equal(check.exitCode,0);assert.equal(check.expected_exit,1);
+    assert.equal(check.cwd,join(f.options.path,spec.id,'negative'));
+    assert.ok((await readFile(check.log,'utf8')).length>6000);assert.equal(check.output.length,4000);
+    assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+    assert.equal(await readFile(join(spec.source,'answer.py'),'utf8'),'answer=0\n');
+    assert.equal(await readFile(spec.verifier.files[0],'utf8'),f.verifierContent);
+  }
+  const replies=f.requests.flatMap(r=>r.messages.filter(m=>m.role==='tool'));
+  const error=replies.find(m=>m.tool_call_id==='call-4');
+  assert.ok(error); // The model receives the controller's actual negative-check observation.
+  const observed=JSON.parse(error.content.slice(error.content.indexOf('{')));
+  assert.equal(observed.expected_exit,1);assert.equal(observed.exitCode,0);
+  assert.ok(observed.log.endsWith('.log'));
+});
+
+test('separate CPU construction command preserves the actual target verifier',async t=>{
+  const f=await fixture(t,{separateCommand:true}),specs=await refillPhase1(f.options);
+  assert.equal(specs.length,2);
+  assert.ok(specs.every(s=>s.verifier.command==='requires-device-runtime'));
+  assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
+});
+
+
+test('a rejected submission resumes with its evidence and remaining budget in the same session',async t=>{
+  const f=await fixture(t,{negative:42,repair:true,pauseAfterRejection:true}),abort=new AbortController();
+  const pending=refillPhase1({...f.options,signal:abort.signal});
+  await f.waitStarted;
+  const before=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.equal(before.status,'draft');assert.equal(before.proposal,undefined);assert.equal(before.spec,undefined);
+  const failure=generationEventState(f.state.db).queryEvents(before.id,{types:['generation-rejected']})[0];
+  assert.equal(failure.data.checks.at(-1).exitCode,0);
+  abort.abort(new Error('stop after rejection'));await assert.rejects(pending);
+  const stopped=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.ok(stopped.elapsed>0);assert.equal(stopped.status,'draft');
+  f.unpause();const specs=await refillPhase1(f.options);
+  assert.equal(specs[0].id,before.id);
+  const events=generationEventState(f.state.db).queryEvents(before.id,{limit:1000});
+  const sessions=events.filter(e=>e.type==='curriculum-session');
+  assert.equal(sessions.length,2);assert.equal(sessions[0].data.session,sessions[1].data.session);
+  assert.equal(sessions[0].data.allocation_seconds,sessions[1].data.allocation_seconds);
+  assert.ok(sessions[1].data.elapsed_seconds>0);
+  assert.equal(events.filter(e=>e.type==='generation-rejected').length,1);
+  assert.equal(await readFile(failure.data.checks.at(-1).log,'utf8'),'cpu-check: 42\n');
 });
