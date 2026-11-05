@@ -194,12 +194,17 @@ export async function createEnvironment(options,context){
   const {stdout}=await promisify(execFile)(config.python,['-c','import sys;print(sys.executable)']);
   const python=stdout.trim(),wrapper=join(driver.root,'hold-finalizer');
   await writeFile(wrapper,`#!${python}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
 root=Path(${JSON.stringify(gate)})
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and (root/'hold-attempt').exists() and sys.argv[sys.argv.index('--attempt')+1]==(root/'hold-attempt').read_text():
- (root/'finalizer-entered').touch()
- while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+# Storage memory publication passes the actual MCP request on stdin.
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and (root/'hold-attempt').exists() and request.get('attempt')==(root/'hold-attempt').read_text():
+  (root/'finalizer-entered').touch()
+  while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+ sys.exit(subprocess.run([${JSON.stringify(python)},*sys.argv[1:]],input=data).returncode)
 os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
 `,{mode:0o700});
   const patch=join(driver.root,'local-config.json');
