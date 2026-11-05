@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile, rename, rm } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 
-export async function main(argv=process.argv.slice(2),{signal}={}) {
+export async function main(argv=process.argv.slice(2),{signal,manager}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
+    managed:{type:'boolean'},'managed-result':{type:'string'},
     concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
   const root=resolve(values.instance??arg??'.');
@@ -150,7 +151,9 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
     } finally {state.close();}
   }
   if (['wave','campaign','resume','pause','stop'].includes(command)) {
-    const {operate,campaign}=await import('./runtime.mjs');
+    const {operate,campaign,dispatchManaged}=await import('./runtime.mjs');
+    if(['wave','campaign','resume'].includes(command)&&!values.managed)
+      return dispatchManaged(command,config,{...values,signal},manager);
     if(command==='campaign' && !values.detach)return campaign(config,{...values,signal,mode:values.mode??config.mode});
     return operate(command,config,{...values,signal,mode:values.mode??config.mode});
   }
@@ -168,7 +171,9 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   throw new Error(`Unknown command ${command}`);
   };
   if(values.request)return (await import('./background.mjs')).trackRequest(root,values.request,operation);
-  return operation();
+  const result=await operation();
+  if(values.managed&&values['managed-result'])await writeFile(values['managed-result'],JSON.stringify(result),{mode:0o600});
+  return result;
 }
 if(import.meta.main) {
   const abort=new AbortController();

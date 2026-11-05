@@ -7,26 +7,28 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {spawnManagedWorker,startManagedController,verifyProcessMembership} from '../../cli/managed-runtime.mjs';
+import {spawnManagedWorker,startManagedController,verifyProcessMembership,observeManagedWorker} from '../../cli/managed-runtime.mjs';
 
 const cap = 64 * 1024 ** 2;
 function fixture() {
-  let phase = 'running', populated = '0', outside = false;
+  let phase = 'running', populated = '0', outside = false, reservation = 0;
   const commands = [], launches = [];
   const aggregate = '/user.slice/rsi.slice', group = aggregate + '/worker.service';
   const options = {
+    withLock:operation=>operation(),
     hostMemory:{max_bytes:cap}, memoryBytes:24 * 1024 ** 2, controllerMemoryBytes:32 * 1024 ** 2,
     identify:async pid => ({pid,start:'17',boot:'boot'}),
     execFile:async (file,args,limits) => {
       assert.equal(file,'systemctl'); assert.equal(limits.timeout,5000); assert.equal(limits.maxBuffer,65536);
       commands.push(args);
+      if (args.includes('list-units'))return {stdout:reservation?'rsi-worker-existing.service loaded active running':''};
       if (args.includes('stop')) {phase = 'inactive'; return {stdout:''};}
       const slice = args.includes('rsi.slice');
       return {stdout:Object.entries(slice ? {
         ActiveState:'active',MemoryAccounting:'yes',MemoryMax:cap,MemorySwapMax:0,ControlGroup:aggregate,
       } : {ActiveState:phase === 'inactive' ? 'inactive' : 'active',SubState:phase === 'exited' ? 'exited' : phase,
         MainPID:phase === 'running' ? 123 : 0,ExecMainPID:123,InvocationID:'invocation',ControlGroup:group,
-        MemoryCurrent:4096,MemoryPeak:8192,ExecMainCode:1,ExecMainStatus:0,Result:'success',
+        MemoryMax:reservation,MemoryCurrent:4096,MemoryPeak:8192,ExecMainCode:1,ExecMainStatus:0,Result:'success',
       }).map(([key,value]) => key + '=' + value).join('\n')};
     },
     read:async path => {
@@ -46,7 +48,7 @@ function fixture() {
     },
   };
   return {options,commands,launches,setPhase:value => phase=value,setOutside:value => outside=value,
-    setPopulated:value => populated=value};
+    setPopulated:value => populated=value,setReservation:value=>reservation=value};
 }
 const descriptor = {argv:['/bin/echo','$VALUE','space and "quote"','%h'],cwd:'/tmp',env:{VALUE:'literal $x %h'}};
 test('worker admission, real PID identity, measured memory, and whole-service closure',async () => {
@@ -71,6 +73,13 @@ test('outside existing KDB refuses admission before spawn',async () => {
   await assert.rejects(startManagedController(descriptor,{...f.options,requiredPids:[44]}),/outside/);
   assert.equal(f.launches.length,0);
 });
+test('retained worker is observed after controller restart without spawning again',async () => {
+  const f=fixture(),first=await spawnManagedWorker(descriptor,f.options);
+  const retained=await observeManagedWorker(first.identity,f.options);
+  f.setPhase('exited');
+  assert.equal((await retained.wait({timeoutMs:500})).closed,true);
+  assert.equal(f.launches.length,1);
+});
 test('nonempty descendant group never produces a closure claim',async () => {
   const f = fixture(), worker = await spawnManagedWorker(descriptor,f.options);
   f.setPopulated('1');
@@ -88,6 +97,17 @@ test('measured aggregate pressure refuses workers before launch',async () => {
   f.options.read = path => path === '/sys/fs/cgroup/user.slice/rsi.slice/memory.current' ? Promise.resolve(String(cap)) : read(path);
   await assert.rejects(spawnManagedWorker(descriptor,f.options),/measured aggregate headroom/);
   assert.equal(f.launches.length,0);
+});
+test('existing service caps prevent aggregate overcommit before spawn',async () => {
+  const f=fixture();f.setReservation(cap);
+  await assert.rejects(spawnManagedWorker(descriptor,f.options),/reservations exhaust/);
+  assert.equal(f.launches.length,0);
+});
+test('failed final enforcement never invokes scheduler admission callback',async () => {
+  const f=fixture();let admitted=false;
+  const read=f.options.read;f.options.read=path=>path.endsWith('/memory.max')?Promise.resolve('1'):read(path);
+  await assert.rejects(spawnManagedWorker(async()=>{admitted=true;return descriptor;},f.options),{code:'RSI_MEMORY_ENFORCEMENT'});
+  assert.equal(admitted,false);assert.equal(f.launches.length,0);
 });
 test('controller receives durable startup flags with restart policy',async () => {
   const f = fixture(); let called = false;

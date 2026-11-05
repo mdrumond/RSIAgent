@@ -1,11 +1,50 @@
 import {spawn, execFile as nativeExecFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {readFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {isAbsolute} from 'node:path';
-import {randomUUID} from 'node:crypto';
+import {randomUUID, createHash} from 'node:crypto';
 import {processIdentity} from '../controller/lifecycle.mjs';
 import {normalizeHostMemory} from '../controller/host-memory.mjs';
-export {configureHostMemory} from './host-memory.mjs';
+import {configureHostMemory as configureDefaultHostMemory} from './host-memory.mjs';
+
+export const controllerUnit = root => 'rsi-controller-' + createHash('sha256').update(root).digest('hex').slice(0,24) + '.service';
+export function managedOptions(config) {
+  return {hostMemory:config.host_memory, slice:config.managed_runtime?.slice ?? 'rsi.slice',
+    controllerMemoryBytes:config.managed_runtime?.controller_memory_bytes};
+}
+export async function configureHostMemory(config, options = {}) {
+  // Isolated profiles are provisioned externally; only the standard shared slice is installed here.
+  if (options.slice && options.slice !== 'rsi.slice') {
+    if (await options.verifyInstanceStopped?.() !== true) throw new Error('Stopped instance required');
+    await context({...options,hostMemory:config}).aggregate();
+    return;
+  }
+  return configureDefaultHostMemory(config, options);
+}
+
+async function admissionLock(operation, options) {
+  if (options.withLock) return options.withLock(operation);
+  const file = join(process.env.XDG_RUNTIME_DIR ?? tmpdir(), 'rsi-managed-admission-' + process.getuid() + '.lock');
+  // flock releases automatically if the controller dies: stdin closes, cat exits.
+  const lock = spawn('flock',['-w','10',file,'cat'],{stdio:['pipe','pipe','ignore']});
+  let timer;
+  const exited = new Promise(resolve=>lock.once('close',resolve));
+  try {
+    await new Promise((resolve,reject)=>{
+      lock.once('error',reject);
+      lock.once('close',()=>reject(new Error('Managed admission lock unavailable')));
+      lock.stdout.once('data',resolve);
+      lock.stdin.on('error',reject);
+      timer=setTimeout(()=>reject(new Error('Managed admission lock timed out')),12000);
+      lock.stdin.write('locked\n');
+    });
+    return await operation();
+  } finally {
+    clearTimeout(timer);lock.stdin.end();lock.kill('SIGTERM');await exited;
+  }
+}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const integer = value => /^\d+$/.test(String(value)) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
@@ -53,6 +92,14 @@ export async function verifyProcessMembership(pid, options = {}) {
   return c.membership(pid, await c.aggregate());
 }
 
+export async function measureManagedMemory(options = {}) {
+  const c=context(options),group=await c.aggregate(),base=c.groupPath(group);
+  const current_bytes=integer((await c.read(base+'/memory.current','utf8')).trim());
+  const peak_bytes=integer((await c.read(base+'/memory.peak','utf8')).trim());
+  if(current_bytes===null||peak_bytes===null)throw new Error('Measured aggregate cgroup memory required');
+  return {current_bytes,peak_bytes,max_bytes:c.max_bytes,observed_at:Date.now()};
+}
+
 function descriptorArgs(descriptor) {
   const {argv, cwd, env = {}, stdout, stderr} = descriptor;
   if (!Array.isArray(argv) || !argv.length || argv.some(arg => typeof arg !== 'string' || arg.includes('\0')) ||
@@ -89,12 +136,17 @@ export async function spawnManagedWorker(descriptor, options = {}) {
 }
 
 async function launch(descriptor, options) {
-  const command = descriptorArgs(descriptor), c = context(options);
-  const aggregate = await c.aggregate();
+  return admissionLock(() => launchLocked(descriptor,options), options);
+}
+async function launchLocked(descriptor, options) {
+  const c = context(options);
+  let aggregate;
+  try {aggregate=await c.aggregate();}
+  catch(error){error.code='RSI_MEMORY_ENFORCEMENT';throw error;}
   if (!options.controller) await c.membership(process.pid, aggregate);
   for (const pid of options.requiredPids ?? []) await c.membership(pid, aggregate);
   const memory = options.memoryBytes;
-  const controllerMemory = options.controllerMemoryBytes ?? Math.min(c.max_bytes, 4 * 1024 ** 3);
+  const controllerMemory = options.controllerMemoryBytes ?? Math.floor(c.max_bytes / 2);
   if (!Number.isSafeInteger(controllerMemory) || controllerMemory <= 0 || controllerMemory > c.max_bytes)
     throw new Error('Controller memory cap must fit aggregate');
   if (!options.controller) {
@@ -102,9 +154,24 @@ async function launch(descriptor, options) {
       throw new Error('Worker memoryBytes must reserve aggregate controller/KDB headroom');
     const current = integer((await c.read(c.groupPath(aggregate) + '/memory.current','utf8')).trim());
     if (current === null || current + Math.ceil(memory * 1.25) > c.max_bytes)
-      throw new Error('Insufficient measured aggregate headroom for worker admission');
+      throw Object.assign(new Error('Insufficient measured aggregate headroom for worker admission'),{code:'RSI_MEMORY_CAPACITY'});
   }
-  const unit = 'rsi-' + (options.controller ? 'controller-' : 'worker-') + randomUUID() + '.service';
+  const units = await c.run(['list-units','--type=service','--all','--plain','--no-legend','--no-pager',
+    'rsi-controller-*.service','rsi-worker-*.service']);
+  let reserved = 0;
+  for (const row of units.trim().split('\n').filter(Boolean)) {
+    const existing = await c.show(row.trim().split(/\s+/)[0]);
+    if (['inactive','failed'].includes(existing.ActiveState) || !existing.ControlGroup?.startsWith(aggregate + '/'))continue;
+    const bytes = integer(existing.MemoryMax);
+    if (bytes === null)throw new Error('Unbounded existing RSI service prevents admission');
+    reserved += bytes;
+  }
+  if (reserved + (options.controller ? controllerMemory : memory) > c.max_bytes)
+    throw Object.assign(new Error('Active managed service reservations exhaust aggregate memory capacity'),{code:'RSI_MEMORY_CAPACITY'});
+  const unit = options.unit ?? 'rsi-' + (options.controller ? 'controller-' : 'worker-') + randomUUID() + '.service';
+  if (!/^rsi-(controller|worker)-[a-zA-Z0-9-]+\.service$/.test(unit))throw new Error('Invalid owned service name');
+  // The scheduler may admit/write a job only after enforcement and reservations pass.
+  const command=descriptorArgs(typeof descriptor==='function'?await descriptor():descriptor);
   const args = ['--user', '--quiet', '--no-ask-password', '--service-type=exec', '--expand-environment=no',
     '--unit=' + unit, '--slice=' + c.slice, '--property=MemoryAccounting=yes',
     '--property=MemorySwapMax=0', '--property=OOMPolicy=kill', '--property=KillMode=control-group',
@@ -138,6 +205,19 @@ async function launch(descriptor, options) {
     identity = {unit, invocation:initial.InvocationID, pid, cgroup:initial.ControlGroup || aggregate + '/' + unit};
     if (integer(initial.MainPID)) Object.assign(identity, await c.membership(pid, aggregate));
   } catch (error) {await c.run(['stop',unit]).catch(() => {}); throw error;}
+  return managedHandle(c,unit,identity,child,options);
+}
+
+/** Reattach to a retained worker after a controller crash; never resubmit it. */
+export async function observeManagedWorker(identity, options = {}) {
+  if(!/^rsi-worker-[a-zA-Z0-9-]+\.service$/.test(identity?.unit??'') || !identity.invocation || !identity.cgroup)
+    throw new Error('Retained worker service identity required');
+  const c=context(options);
+  await c.membership(process.pid,await c.aggregate());
+  return managedHandle(c,identity.unit,identity,undefined,{...options,controller:false});
+}
+
+function managedHandle(c,unit,identity,child,options) {
   let lastMetrics = null, stopped = false;
   const same = (state, afterStop = false) => {
     if (options.controller) return; // Restarts belong to this uniquely named service.
@@ -187,10 +267,11 @@ async function launch(descriptor, options) {
     stopped = true;
     return {closed:true, identity, metrics:lastMetrics};
   }
-  async function wait({timeoutMs = 30000} = {}) {
+  async function wait({timeoutMs = 30000, signal} = {}) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 86400000) throw new Error('Bounded timeoutMs required');
     const deadline = performance.now() + timeoutMs;
     while (performance.now() < deadline) {
+      signal?.throwIfAborted();
       const state = await c.show(unit); same(state);
       await metrics();
       if (['inactive','failed'].includes(state.ActiveState) || state.SubState === 'exited') {

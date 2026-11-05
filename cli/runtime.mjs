@@ -10,6 +10,7 @@ import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
 import { readConfig,updateConfig,importProject } from './instance.mjs';
+import * as managedRuntime from './managed-runtime.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -31,12 +32,60 @@ async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
   return module.createEnvironment(config.environment.options,{instancePath:path,event,exclude,resource,signal});
 }
+export async function instanceStopped(config) {
+  const state=stateFor(config.root),ctl=control(state);
+  try {
+    for(const key of ['owner','skill-writer']) {
+      const owner=ctl.get(key);if(owner&&!await ownerStopped(owner))return false;
+    }
+    for(const row of state.db.prepare('SELECT owner FROM attempts').all())
+      if(!await ownerStopped(row.owner))return false;
+    return true;
+  } finally {state.close();}
+}
+
+export async function dispatchManaged(command,config,options={},manager=managedRuntime) {
+  const profile=managedRuntime.managedOptions(config),state=stateFor(config.root),ctl=control(state);
+  let handle;
+  const stop=()=>ctl.set('stop',true);
+  options.signal?.addEventListener('abort',stop,{once:true});
+  try {
+    if(!await instanceStopped(config))throw new Error('Instance is running or draining; wait for its owned workers before starting');
+    if(command!=='resume'&&(ctl.get('pause')||ctl.get('stop')))return {reason:ctl.get('pause')?'paused':'stopped'};
+    try {await manager.configureHostMemory(config.host_memory,{...profile,verifyInstanceStopped:()=>instanceStopped(config)});}
+    catch(error){ctl.set('wait',{reason:'memory-enforcement',message:error.message});throw error;}
+    let receipt;
+    try {receipt=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    if(receipt&&!await ownerStopped(receipt.owner)) {
+      try {await manager.verifyProcessMembership(receipt.owner.pid,profile);}
+      catch(error){throw new Error('Existing owned KDB is outside the managed aggregate. Stop its recorded owner before upgrading: '+error.message);}
+    }
+    if(command==='resume'){ctl.set('pause',false);ctl.set('stop',false);}
+    await mkdir(join(config.root,'logs'),{recursive:true});
+    const resultFile=join(config.root,'logs','managed-'+randomUUID()+'.json');
+    const args=[fileURLToPath(new URL('./main.mjs',import.meta.url)),command,'--instance',config.root,'--managed','--managed-result',resultFile];
+    for(const key of ['mode','concurrency'])if(options[key]!==undefined)args.push('--'+key,String(options[key]));
+    if(options['no-recovery'])args.push('--no-recovery');
+    const log=join(config.root,'logs','controller.log');
+    handle=await manager.startManagedController({argv:[process.execPath,...args],cwd:config.root,
+      env:{...process.env,RSI_MANAGED_ROOT:config.root,RSI_MANAGED_ROLE:'controller'},stdout:log,stderr:log},
+      {...profile,unit:managedRuntime.controllerUnit(config.root)});
+    ctl.set('managed-service',handle.identity);
+    if(options.detach)return {...handle.identity,submitted:true};
+    if(options.signal?.aborted)stop();
+    const exit=await handle.wait({timeoutMs:86400000});
+    if(!exit.closed)throw new Error('Managed controller closure unresolved');
+    return JSON.parse(await readFile(resultFile,'utf8'));
+  } finally {options.signal?.removeEventListener('abort',stop);state.close();}
+}
+
 export async function operate(command,config,options={}) {
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
     recovery:options['no-recovery']?false:config.recovery};
   if(!['phase1','phase2','inference'].includes(config.mode))throw new Error('Unknown execution mode');
-  if(options.detach && !['stop','pause'].includes(command)) {
+  if(options.detach && !options.managed && !['stop','pause'].includes(command)) {
     await mkdir(join(config.root,'logs'),{recursive:true});
     const log=await open(join(config.root,'logs','controller.log'),'a',0o600);
     const child=spawn(process.execPath,[self,command,config.root,JSON.stringify({...options,detach:false,signal:undefined})],
@@ -69,13 +118,18 @@ export async function operate(command,config,options={}) {
       }
       return {stop_requested:true};
     }
+    if(options.managed&&(ctl.get('pause')||ctl.get('stop')))return {reason:ctl.get('pause')?'paused':'stopped'};
+    if(options.managed) {
+      await managedRuntime.verifyProcessMembership(process.pid,managedRuntime.managedOptions(config));
+    }
     const active=ctl.get('owner');
     if(active && !await ownerStopped(active))throw new Error('Instance controller is already running');
     const owner=await processIdentity();
     state.db.exec('BEGIN IMMEDIATE');
     try {
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
-      ctl.set('owner',owner);ctl.set('stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
+      ctl.set('owner',owner);
+      if(!options.managed){ctl.set('stop',false);ctl.set('pause',false);}state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
     watcher=setInterval(()=>{
       if(ctl.get('stop')){schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();}
@@ -86,6 +140,20 @@ export async function operate(command,config,options={}) {
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     let wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
     const queue=new RecoveryQueue(state,policy(config));
+    if(options.managed) {
+      if(ctl.get('pause')||ctl.get('stop'))return {reason:ctl.get('pause')?'paused':'stopped'};
+      await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal,managed:true});
+      // A controller restart observes its retained services instead of resubmitting live workers.
+      for(const attempt of state.db.prepare('SELECT * FROM attempts').all()) {
+        const started=state.queryEvents(attempt.id,{types:['managed-worker-started'],order:'desc',limit:1})[0];
+        if(!started||state.queryEvents(attempt.id,{types:['worker-memory'],order:'desc',limit:1})
+          .some(event=>event.sequence>started.sequence&&event.data.closed))continue;
+        const retained=await managedRuntime.observeManagedWorker(started.data,managedRuntime.managedOptions(config));
+        const exit=await retained.wait({timeoutMs:86400000});
+        state.event(attempt.id,'worker-memory',{...exit.metrics,closed:exit.closed,unit:started.data.unit,reconciled:true});
+        if(exit.metrics?.peak_bytes>0)ctl.set('worker-peak',Math.max(ctl.get('worker-peak')??0,exit.metrics.peak_bytes));
+      }
+    }
     // Unknown failed execution is reconciled, never replayed through the actor.
     for(const attempt of state.db.prepare('SELECT * FROM attempts WHERE outcome IS NOT NULL').all()) {
       if(failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
@@ -124,7 +192,7 @@ export async function operate(command,config,options={}) {
     const jobs=[];
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
-    jobs.push(...(command==='resume'
+    jobs.push(...(command==='resume'||options.managed
       ? state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all().map(attempt=>({attempt,projectId:attempt.project,resume:true}))
       : nextWave(state,{wave,...policy(config)}).filter(job=>{
           const selected=config.curriculum?.[config.mode];
@@ -164,8 +232,9 @@ export async function operate(command,config,options={}) {
       return settleFailure(state,attempt.id,previous,{phase:'controller',kind,message});
     };
     const launch=async(job,resource)=>{
-      let attempt,assignedResource,child;
+      let attempt,assignedResource,child,managedWorker,path,serviceClosed=false;
       try {
+      const prepare=async()=>{
       let pinnedMode=job.mode??config.mode;
       if(job.origin_attempt&&!job.resume)pinnedMode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
@@ -180,7 +249,7 @@ export async function operate(command,config,options={}) {
         const {claimFailureInvestigation}=await import('../controller/failure-patterns.mjs');
         if(claimFailureInvestigation(state,job.failure_pattern))admitted.failure_pattern=job.failure_pattern;
       }
-      const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
+      path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
       // Retain a finalization manifest even if subsequent launch preparation fails.
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,
         options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,
@@ -198,19 +267,33 @@ export async function operate(command,config,options={}) {
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
-      const log=await open(join(path,'worker.log'),'a',0o600);
-      child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
-      const exited=new Promise(resolve=>{
-        child.once('exit',(code,signal)=>resolve({code,signal}));
-        child.once('error',error=>resolve({message:error.message}));
-      });
-      await log.close();
-      const exit=await exited;
+      return {argv:[process.execPath,self,'worker',config.root,attempt.id],cwd:config.root,
+        env:{...process.env,...assignedResource?.env,RSI_MANAGED_ROOT:config.root,RSI_MANAGED_ROLE:'worker'},
+        stdout:join(path,'worker.log'),stderr:join(path,'worker.log')};
+      };
+      let exit;
+      if(options.managed) {
+        managedWorker=await managedRuntime.spawnManagedWorker(prepare,
+          {...managedRuntime.managedOptions(config),memoryBytes:job.memoryBytes});
+        state.event(attempt.id,'managed-worker-started',{...managedWorker.identity,memory_bytes:job.memoryBytes});
+        exit=await managedWorker.wait({timeoutMs:86400000});serviceClosed=exit.closed;
+        state.event(attempt.id,'worker-memory',{...exit.metrics,closed:serviceClosed,unit:managedWorker.identity.unit});
+        if(exit.metrics?.peak_bytes>0)ctl.set('worker-peak',Math.max(ctl.get('worker-peak')??0,exit.metrics.peak_bytes));
+      } else {
+        await prepare();
+        const log=await open(join(path,'worker.log'),'a',0o600);
+        child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
+        const exited=new Promise(resolve=>{
+          child.once('exit',(code,signal)=>resolve({code,signal}));
+          child.once('error',error=>resolve({message:error.message}));
+        });
+        await log.close();exit=await exited;
+      }
       state.event(attempt.id,'worker-exited',exit);
       // Intentional stop preserves resumability and the lease.
       if(!ctl.get('stop') && !ctl.get('pause') && !state.attempt(attempt.id).outcome) {
         const closed=await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit),!job.resume &&
-          (!child.pid || child.exitCode!==null || child.signalCode!==null));
+          (serviceClosed || (!options.managed&&(!child.pid || child.exitCode!==null || child.signalCode!==null))));
         if(closed)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
       }
       // Even an outcome is not proof that detached execution has stopped.
@@ -222,13 +305,20 @@ export async function operate(command,config,options={}) {
       }
       return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome};
       }catch(error) {
+        if(!attempt&&options.managed&&['RSI_MEMORY_ENFORCEMENT','RSI_MEMORY_CAPACITY'].includes(error.code)) {
+          ctl.set('wait',{reason:error.code==='RSI_MEMORY_ENFORCEMENT'?'memory-enforcement':'memory-capacity',message:error.message});
+          await delay(250);return {deferred:true};
+        }
         if(!attempt) {
           state.event(null,'job-error',{project:job.projectId,message:error.message});
           return {project:job.projectId,error:error.message};
         }
-        const childStopped=!child || !child.pid || child.exitCode!==null || child.signalCode!==null;
+        if(managedWorker&&!serviceClosed) {
+          try{serviceClosed=(await managedWorker.stop()).closed;}catch(stopError){state.event(attempt.id,'managed-worker-unresolved',{...managedWorker.identity,message:stopError.message});}
+        }
+        const childStopped=options.managed?serviceClosed||!managedWorker:!child || !child.pid || child.exitCode!==null || child.signalCode!==null;
         const closed=await contain(attempt,assignedResource,'worker-boundary',error.message,!job.resume && childStopped);
-        if(closed && (!child || !child.pid || child.exitCode!==null || child.signalCode!==null))
+        if(closed && childStopped)
           state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
         return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,error:error.message};
       }
@@ -240,10 +330,27 @@ export async function operate(command,config,options={}) {
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
     let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot;
     let freshSinceRecovery=ctl.get('fresh-since-recovery')??0;
-    const start=(job,resource)=>{
+    const start=async(job,resource)=>{
+      if(options.managed) {
+        const profile=managedRuntime.managedOptions(config),cap=config.host_memory.max_bytes;
+        const reserve=profile.controllerMemoryBytes??Math.floor(cap/2);
+        const peak=ctl.get('worker-peak');
+        if(!peak&&running.size){ctl.set('wait',{reason:'memory-measurement'});return false;}
+        const memoryBytes=peak?Math.ceil(peak*1.25):cap-reserve;
+        const reserved=[...activeJobs.values()].reduce((sum,active)=>sum+(active.memoryBytes??0),0);
+        let measured;
+        try {measured=await managedRuntime.measureManagedMemory(profile);}
+        catch(error){ctl.set('wait',{reason:'memory-enforcement',message:error.message});return false;}
+        ctl.set('memory',{...measured,worker_peak_bytes:peak,control_bytes:reserve,reserved_worker_bytes:reserved});
+        if(memoryBytes<=0||reserved+memoryBytes+reserve>cap||measured.current_bytes+Math.ceil(memoryBytes*1.25)>cap){ctl.set('wait',{reason:'memory-capacity'});return false;}
+        await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal,managed:true});
+        job={...job,memoryBytes};
+      }
       const key=keyFor(job);
       startedJobs.add(key);
-      const pending=launch(job,resource).then(value=>results.push(value));
+      const pending=launch(job,resource).then(value=>{
+        if(value.deferred)startedJobs.delete(key);else results.push(value);
+      });
       running.add(pending);activeJobs.set(pending,job);
       pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
         if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
@@ -251,6 +358,7 @@ export async function operate(command,config,options={}) {
         freshSinceRecovery=job.kind==='original'?freshSinceRecovery+1:0;
         ctl.set('fresh-since-recovery',freshSinceRecovery);
       }
+      return true;
     };
     try {
     for(;;) {
@@ -336,7 +444,8 @@ export async function operate(command,config,options={}) {
       });
       const finalizer=eligible.find(job=>job.finalize);
       if(finalizer && ![...activeJobs.values()].some(job=>job.finalize)) {
-        start(finalizer);continue;
+        if(await start(finalizer))continue;
+        await Promise.race([...running,delay(250)]);continue;
       }
       const activeActors=[...activeJobs.values()].filter(job=>!job.finalize);
       const job=selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{running:activeActors,concurrency:limit,freshSinceRecovery});
@@ -369,7 +478,8 @@ export async function operate(command,config,options={}) {
       }
       if(ctl.get('stop'))break;
       if(options.continuous && job.kind!=='original' && job.eligible_wave>wave){wave=job.eligible_wave;ctl.set('wave',wave);}
-      ctl.set('wait',null);start(job,resource);
+      ctl.set('wait',null);
+      if(!await start(job,resource))await Promise.race([...running,delay(250)]);
     }
     await Promise.all(running);
     if(maintenance)await maintenance;

@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processIdentity, ownerStopped } from '../controller/lifecycle.mjs';
+import {managedOptions,verifyProcessMembership} from './managed-runtime.mjs';
 import { State } from '../controller/state.mjs';
 
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
@@ -15,7 +16,13 @@ async function healthy(url) {
   try {return (await fetch(url.replace('/mcp','/health'),{signal:AbortSignal.timeout(1000)})).ok;}
   catch{return false;}
 }
-export async function ensureKnowledgeService(config,{signal}={}) {
+export async function ensureKnowledgeService(config,{signal,managed=process.env.RSI_MANAGED_ROOT===config.root}={}) {
+  const membership=async pid=>{
+    if(!managed)return;
+    try{return await verifyProcessMembership(pid,managedOptions(config));}
+    catch(error){throw new Error('KDB must inherit the managed aggregate; stop its recorded owned process before upgrading: '+error.message);}
+  };
+  await membership(process.pid);
   const receipt=join(config.root,'knowledge-service.json');
   const deadline=performance.now()+60000,key='knowledge-startup';
   const state=new State(join(config.root,'state.sqlite')),me=JSON.stringify(await processIdentity());
@@ -29,6 +36,7 @@ export async function ensureKnowledgeService(config,{signal}={}) {
       throw error;
     }
     if(await ownerStopped(previous.owner))return {};
+    await membership(previous.owner.pid);
     return await healthy(previous.url)?{url:previous.url}:{pending:true};
   };
   try {
@@ -55,6 +63,7 @@ export async function ensureKnowledgeService(config,{signal}={}) {
         if(latest.url)return latest.url;
         if(latest.pending){await wait();continue;}
         signal?.throwIfAborted();
+        if(managed&&process.env.RSI_MANAGED_ROLE==='worker')throw new Error('Managed controller must start KDB before worker admission');
         const port=await freePort(),url=`http://127.0.0.1:${port}/mcp`;
         await mkdir(join(config.root,'logs'),{recursive:true});
         const log=await open(join(config.root,'logs','knowledge.log'),'a',0o600);
@@ -68,6 +77,7 @@ export async function ensureKnowledgeService(config,{signal}={}) {
           await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
         }finally{await log.close();}
         const owner=await processIdentity(child.pid);child.unref();
+        await membership(owner.pid);
         await writeFile(receipt,JSON.stringify({url,owner}),{mode:0o600});
         while(performance.now()<deadline) {
           signal?.throwIfAborted();
@@ -92,7 +102,7 @@ export async function run(config,values) {
   return new Promise((ok,no)=>{
     const child=spawn(config.python??'python',args,{env:{...process.env,
       PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)},signal:values.signal,stdio:['ignore','pipe','pipe']});
-    let output='',error='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>error+=d);
+    let output='',error='';child.stdout.on('data',d=>{output+=d;if(output.length>1024*1024){child.kill('SIGTERM');no(new Error('KDB response exceeded output limit'));}});child.stderr.on('data',d=>error=(error+d).slice(-65536));
     child.on('error',no);child.on('close',code=>{if(code)no(new Error(error));else{try{ok(JSON.parse(output));}catch(e){no(e);}}});
   });
 }
