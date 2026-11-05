@@ -14,7 +14,8 @@ const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true,
+  shouldPause=()=>false,onPause=()=>{}}) {
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
   let activeOperation=null;
@@ -125,6 +126,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       await appendFile(join(attemptPath,'provider.jsonl'),JSON.stringify({type:payload.type,status:payload.status})+'\n');
     });
     pi.on('tool_call',async()=>{
+      if(shouldPause()){onPause();return {block:true,reason:'Instance paused at execution boundary'};}
       clock.check();
       if (uncertain) return {block:true,reason:'Execution closure is unknown; resume only after observation'};
       if (accepted) return {block:true,reason:'Project already accepted'};
@@ -169,6 +171,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     timer=setInterval(()=>{
       state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
+      if(shouldPause()&&!activeOperation&&!nativeBash.size)onPause();
       if (!clock.remaining) void session.abort();
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');

@@ -15,13 +15,36 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const [command,arg]=positionals;
   const root=resolve(values.instance??arg??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','stop','dashboard','kdb','tune']};
+  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','host-memory']};
   if (command==='bootstrap') {
     const config=values.config?JSON.parse(await readFile(values.config,'utf8')):{};
     return bootstrap(arg,{...config,baseline:values.baseline??config.baseline,
       skills:values.skills??config.skills,repository:values.repository??config.repository});
   }
   const config=await readConfig(root);
+  if(command==='host-memory') {
+    const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'status'};
+    if(action.action==='status')return (await import('../controller/host-memory.mjs'))
+      .createHostMemorySupervisor(config.host_memory).measure();
+    if(action.action!=='configure')throw new Error('Unknown host memory action');
+    const verifyInstanceStopped=async()=>{
+      const {ownerStopped}=await import('../controller/lifecycle.mjs');
+      const ledger=new State(join(root,'state.sqlite'));
+      try {
+        if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
+          const rows=ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer')").all();
+          for(const row of rows) {
+            const owner=JSON.parse(row.value);
+            if(owner&&!await ownerStopped(owner))return false;
+          }
+        }
+        for(const row of ledger.db.prepare('SELECT owner FROM attempts').all())
+          if(!await ownerStopped(row.owner))return false;
+        return true;
+      }finally{ledger.close();}
+    };
+    return (await import('./host-memory.mjs')).configureHostMemory(config.host_memory,{verifyInstanceStopped});
+  }
   if(values.detach && ['tune','kdb'].includes(command)) {
     const action=JSON.parse(await readFile(values.config,'utf8'));
     return (await import('./background.mjs')).startBackground(root,command,action);
@@ -119,11 +142,14 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
           }
         }catch{controller.state='unknown';}
       }
-      return {controller,mode:config.mode,requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
+      const progress=(await import('../controller/progress.mjs')).campaignProgress(state,config);
+      const controlValue=key=>state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()
+        ?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
+      return {controller,mode:config.mode,progress,wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
-  if (['wave','campaign','resume','stop'].includes(command)) {
+  if (['wave','campaign','resume','pause','stop'].includes(command)) {
     const {operate,campaign}=await import('./runtime.mjs');
     if(command==='campaign' && !values.detach)return campaign(config,{...values,signal,mode:values.mode??config.mode});
     return operate(command,config,{...values,signal,mode:values.mode??config.mode});

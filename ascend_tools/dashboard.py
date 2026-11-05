@@ -118,9 +118,10 @@ def create_app(instance, machinery=None, node="node"):
             return jsonify(driver.call(request.path.rsplit("/", 1)[-1], detach=True, mode=mode))
 
     @app.post("/api/stop")
+    @app.post("/api/pause")
     def stop():
         with lock:
-            return jsonify(driver.call("stop"))
+            return jsonify(driver.call(request.path.rsplit("/", 1)[-1]))
 
     @app.post("/api/resume")
     def resume():

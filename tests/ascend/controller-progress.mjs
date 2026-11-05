@@ -13,6 +13,8 @@ function fixture(t) {
     const job = queue.claim(id, 0);
     if (mode !== undefined) state.db.prepare("UPDATE events SET data=json_set(data,'$.mode',?) WHERE attempt=? AND type='job-admitted'")
       .run(mode, job.attempt.id);
+    else state.db.prepare("UPDATE events SET data=json_remove(data,'$.mode') WHERE attempt=? AND type='job-admitted'")
+      .run(job.attempt.id); // Historical admissions exercise spec/list fallback.
     return job.attempt.id;
   }
   function finish(id, passed = true, ack = true, post = true) {

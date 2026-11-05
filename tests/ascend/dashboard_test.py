@@ -82,6 +82,8 @@ def test_wave_detaches_and_passes_mode(harness, mode, command):
 def test_stop_resume_and_status(harness):
     client, calls, _, _, state = harness
     assert client.get("/api/status").json == state
+    assert client.post("/api/pause").status_code == 200
+    assert calls[-1][0][2] == "pause"
     assert client.post("/api/stop").status_code == 200
     assert calls[-1][0][2] == "stop"
     assert "--detach" not in calls[-1][0]

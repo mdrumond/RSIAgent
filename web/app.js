@@ -76,6 +76,9 @@ async function refresh() {
   const state = await api('status');
   el('status').replaceChildren();
   table('Controller / wave', state.controller);
+  table('Phase progress', state.progress);
+  table('Waiting for', state.wait);
+  table('Host memory', state.memory);
   table('Projects', state.projects);
   table('Attempts', state.attempts);
   table('Background operations', state.requests);
@@ -117,7 +120,7 @@ for (const action of ['load', 'save']) {
     el('skill-content').value = result.content;
   });
 }
-for (const action of ['wave', 'campaign', 'stop', 'resume']) {
+for (const action of ['wave', 'campaign', 'pause', 'stop', 'resume']) {
   el(action).onclick = () => perform(async () => {
     if (dirty && ['wave', 'campaign'].includes(action)) throw new Error('Save settings before starting');
     const value = await api(action, 'POST', ['wave', 'campaign'].includes(action) ? {mode: el('mode').value} : {});

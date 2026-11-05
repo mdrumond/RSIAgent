@@ -99,7 +99,7 @@ export class RecoveryQueue {
       }
       this.db.prepare("UPDATE projects SET status='running' WHERE id=?").run(projectId);
       const actorSeconds = kind === 'investigation' ? this.investigationSeconds : project.spec.actor_seconds;
-      this.state.event(id, 'job-admitted', { kind, wave, actor_seconds: actorSeconds });
+      this.state.event(id, 'job-admitted', { kind, wave, actor_seconds: actorSeconds, mode:this.policy.mode });
       return { attempt: this.db.prepare('SELECT * FROM attempts WHERE id=?').get(id),
         project: this.state.project(projectId), kind, actor_seconds: actorSeconds,
         origin_attempt: queue?.origin ?? null, failed_rounds: queue?.failed_rounds ?? 0, policy: this.policy };
