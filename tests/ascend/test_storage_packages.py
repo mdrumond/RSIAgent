@@ -84,7 +84,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(row[1], 1)
             self.assertEqual(spec['source'], str(restored / 'projects/p/source'))
             self.assertEqual(spec['verifier']['files'], [str(restored / 'projects/p/verify.py')])
-            self.assertEqual(db.execute('SELECT owner,session,elapsed FROM attempts').fetchone(), (None, None, 0.5))
+            self.assertEqual(db.execute('SELECT owner,session,elapsed FROM attempts').fetchone(), (None, 'session-secret', 0.5))
             self.assertEqual(db.execute('SELECT attempt FROM storage_iterations').fetchone(), ('a',))
         self.assertEqual((restored / 'attempt.log').read_text(), self.log.read_text())
         self.assertFalse((restored / 'projects/p/source/.env').exists())
@@ -200,6 +200,95 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 1)
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 2)
+
+    def automatic_fixture(self):
+        (self.root / 'package-inputs.json').unlink()
+        knowledge = self.root / 'knowledge.git'
+        subprocess.run(['git', 'init', '-q', str(knowledge)], check=True)
+        for kind in ('memory', 'skills'):
+            (knowledge / kind).mkdir()
+            (knowledge / kind / 'exact.txt').write_text(kind + ' exact snapshot')
+        subprocess.run(['git', '-C', str(knowledge), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(knowledge), '-c', 'user.name=Fixture', '-c',
+                        'user.email=fixture@example.invalid', 'commit', '-qm', 'knowledge'], check=True)
+        revision = subprocess.check_output(['git', '-C', str(knowledge), 'rev-parse', 'HEAD'], text=True).strip()
+        history = self.root / 'source-history/project'
+        history.parent.mkdir()
+        subprocess.run(['git', 'clone', '--bare', '-q', str(self.root / 'history-repo'), str(history)], check=True)
+        machinery = self.root / 'machinery'
+        (machinery / 'controller').mkdir(parents=True)
+        (machinery / 'controller/core.mjs').write_text('export const fixture = true;')
+        (machinery / 'package.json').write_text('{}')
+        (machinery / 'npm-shrinkwrap.json').write_text('{}')
+        (machinery / 'node_modules').mkdir()
+        (machinery / 'node_modules/private').write_text('excluded')
+        native = self.root / 'sessions/native.jsonl'
+        native.parent.mkdir()
+        native.write_text('{"session":"stable-native-id"}\n')
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('CREATE TABLE storage_sessions(session TEXT PRIMARY KEY,attempt TEXT,role TEXT,phase TEXT,created TEXT)')
+            db.execute('INSERT INTO storage_sessions VALUES(?,?,?,?,?)', (str(native), 'a', 'actor', 'phase1', 'now'))
+            db.execute('UPDATE attempts SET session=?', (str(native),))
+            db.execute('INSERT INTO storage_artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('native-session', 'a', 'p', 'pi-session', 'actor', str(native.relative_to(self.root)),
+                        0, 'open', None, None, 'plain', None, 'now'))
+            db.execute('UPDATE storage_attempts SET memory_revision=?,skill_revision=?', (revision, revision))
+            db.execute('INSERT INTO storage_artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('git-id', 'a', 'p', 'source-git', 'actor', str(history.relative_to(self.root)),
+                        0, 'open', None, None, 'plain', None, 'now'))
+            db.execute('CREATE TABLE storage_retrievals(id INTEGER PRIMARY KEY,attempt TEXT,citations TEXT)')
+            (self.root / 'artifacts/citations').mkdir(parents=True)
+            for name in ('used', 'unused'):
+                path = self.root / 'artifacts/citations' / (name + '.txt')
+                path.write_text(name + ' citation')
+                db.execute('INSERT INTO storage_artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (name, None, None, 'cited-text', 'kdb', str(path.relative_to(self.root)),
+                            0, 'open', path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest(), 'plain', None, 'now'))
+            db.execute('INSERT INTO storage_retrievals VALUES(?,?,?)', (1, 'a', json.dumps([{'artifact': 'used'}])))
+        return revision
+
+    def test_automatic_project_uses_exact_revisions_and_only_shared_citations(self):
+        revision = self.automatic_fixture()
+        result = pack(self.root, self.package, 'p')
+        self.assertTrue(result['complete'])
+        self.assertFalse(any(f['kind'] == 'knowledge-history' for f in result['files']))
+        dest = self.base / 'automatic-restored'
+        unpack(self.package, dest)
+        for kind in ('memory', 'skills'):
+            self.assertEqual((dest / 'exported' / revision / kind / 'exact.txt').read_text(), kind + ' exact snapshot')
+        self.assertTrue((dest / 'artifacts/citations/used.txt').is_file())
+        self.assertFalse((dest / 'artifacts/citations/unused.txt').exists())
+        with closing(sqlite3.connect(dest / 'state.sqlite')) as db:
+            self.assertEqual(db.execute('SELECT citations FROM storage_retrievals').fetchone()[0], '[{"artifact": "used"}]')
+            session = str(dest / 'sessions/native.jsonl')
+            self.assertEqual(db.execute('SELECT session FROM storage_sessions').fetchone()[0], session)
+            self.assertEqual(db.execute('SELECT session FROM attempts').fetchone()[0], session)
+            self.assertEqual(json.loads(Path(session).read_text())['session'], 'stable-native-id')
+
+    def test_automatic_project_without_retrievals_needs_no_citation_input(self):
+        self.automatic_fixture()
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('DELETE FROM storage_retrievals')
+        result = pack(self.root, self.package, 'p')
+        self.assertTrue(result['complete'])
+        self.assertFalse(any('citations/' in f['path'] for f in result['files']))
+
+    def test_automatic_campaign_and_empty_attempt_baseline(self):
+        self.automatic_fixture()
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            for table in ('storage_attempts', 'storage_iterations', 'storage_retrievals', 'storage_sessions', 'attempts'):
+                db.execute('DELETE FROM ' + table)
+            db.execute('DELETE FROM storage_artifacts')
+        result = pack(self.root, self.package)
+        self.assertTrue(result['complete'])
+        dest = self.base / 'baseline-restored'
+        unpack(self.package, dest)
+        actual = subprocess.check_output(['git', '--git-dir', str(dest / 'knowledge.git'),
+                                          'show', 'HEAD:memory/exact.txt'], text=True)
+        self.assertEqual(actual, 'memory exact snapshot')
+        self.assertTrue((dest / 'machinery/controller/core.mjs').is_file())
+        self.assertTrue((dest / 'machinery/npm-shrinkwrap.json').is_file())
+        self.assertFalse((dest / 'machinery/node_modules').exists())
 
     def test_used_revision_must_be_collected(self):
         path = self.root / 'package-inputs.json'

@@ -87,7 +87,7 @@ def _tables(db):
 
 def _sanitize(value):
     # Runtime routes and process ownership are intentionally not portable.
-    blocked = {'owner', 'session', 'environment', 'runtime', 'route', 'services',
+    blocked = {'owner', 'environment', 'runtime', 'route', 'services',
                'token', 'api_key', 'password', 'credentials', 'baselineKDB'}
     if isinstance(value, dict):
         return {k: _sanitize(v) for k, v in value.items() if k not in blocked}
@@ -156,13 +156,49 @@ def _snapshot(root, path, project):
             columns = [r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')') if r[2].upper() == 'TEXT']
             if columns:
                 db.execute('UPDATE ' + _quote(table) + ' SET ' + ','.join(_quote(c) + '=portable_text(' + _quote(c) + ')' for c in columns))
-        db.execute('UPDATE attempts SET owner=NULL,session=NULL')
+        db.execute('UPDATE attempts SET owner=NULL')
         db.execute('UPDATE projects SET frozen=1')
         if 'requests' in tables:
             db.execute("UPDATE requests SET owner=NULL,status=CASE WHEN status IN ('queued','running') THEN 'failed' ELSE status END")
         db.commit()
         db.execute('VACUUM')  # Remove deleted projects and credentials from free pages.
     os.replace(temporary, path)
+
+
+def _git_directory(repository):
+    return Path(subprocess.check_output(
+        ['git', '-C', str(repository), 'rev-parse', '--absolute-git-dir'], text=True).strip()).resolve()
+
+
+def _revision_files(git_dir, revision, kind, dest, collect):
+    if len(revision) not in (40, 64) or any(c not in '0123456789abcdef' for c in revision):
+        return False
+    # NUL records streamed from Git: memory scales with one tree entry/blob block.
+    with subprocess.Popen(['git', '--git-dir', str(git_dir), 'ls-tree', '-rz', revision, '--', kind + '/'],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        pending = b''
+        while block := process.stdout.read(65536):
+            pending += block
+            while b'\0' in pending:
+                record, pending = pending.split(b'\0', 1)
+                header, name = record.split(b'\t', 1)
+                mode, object_type, oid = header.decode('ascii').split()
+                if object_type != 'blob' or mode == '120000':
+                    raise ValueError('Knowledge revision requires regular collected blobs')
+                relative = Path('exported') / revision / _safe(os.fsdecode(name))
+                path = dest / relative
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_suffix(path.suffix + '.tmp')
+                    with temporary.open('wb') as out:
+                        subprocess.run(['git', '--git-dir', str(git_dir), 'cat-file', 'blob', oid],
+                                       stdout=out, stderr=subprocess.DEVNULL, check=True)
+                    os.replace(temporary, path)
+                collect(path, relative, kind)
+            if len(pending) > 1024 * 1024:
+                process.kill()
+                raise ValueError('Oversized Git tree entry')
+        return process.wait() == 0 and not pending
 
 
 def pack(root, dest, project=None, require_complete=True):
@@ -226,6 +262,7 @@ def pack(root, dest, project=None, require_complete=True):
     with closing(_connect(ledger_path)) as db:
         metadata['campaign'] = [dict(r) for r in db.execute('SELECT * FROM storage_campaign')]
         projects = [dict(r) for r in db.execute('SELECT * FROM projects')]
+        has_attempts = db.execute('SELECT 1 FROM attempts LIMIT 1').fetchone() is not None
         metadata['projects'] = [p['id'] for p in projects]
         tables = _tables(db)
         for kind, field in (('skills', 'skill_revision'), ('memory', 'memory_revision')):
@@ -250,6 +287,9 @@ def pack(root, dest, project=None, require_complete=True):
                 else:
                     missing('verifier', name)
             p['spec'] = json.dumps(_sanitize(spec))
+        if 'storage_retrievals' in tables:
+            for row in db.execute("SELECT DISTINCT json_extract(j.value,'$.artifact') FROM storage_retrievals,json_each(citations) j LEFT JOIN storage_artifacts a ON a.id=json_extract(j.value,'$.artifact') WHERE a.id IS NULL AND json_extract(j.value,'$.artifact') IS NOT NULL"):
+                missing('cited-entry', row[0])
         for record in db.execute('SELECT * FROM storage_artifacts'):
             row = dict(record)
             if row['kind'] == 'source-git' and not row['external']:
@@ -261,7 +301,7 @@ def pack(root, dest, project=None, require_complete=True):
                 for path in _repository_files(repository):
                     collect(path, path.relative_to(root), 'source-git')
                 continue
-            if row['external'] or row['status'] not in ('closed', 'archived'):
+            if row['external'] or row['status'] not in ('closed', 'archived', 'open'):
                 missing(row['kind'], row['id'])
                 continue
             path = _local(root, row['path'])
@@ -284,7 +324,7 @@ def pack(root, dest, project=None, require_complete=True):
 
     manifest = root / 'package-inputs.json'
     inputs = _load_json(manifest) if manifest.exists() else {}
-    kinds = {'source-history' if f['kind'] == 'source-git' else f['kind'] for f in metadata['files']}
+    kinds = {{'source-git': 'source-history', 'cited-text': 'cited-entry'}.get(f['kind'], f['kind']) for f in metadata['files']}
     covered = {'skills': set(), 'memory': set()}
     for item in inputs.get('files', []):
         if project and (item.get('project') not in (None, project) or
@@ -316,10 +356,39 @@ def pack(root, dest, project=None, require_complete=True):
         kinds.add(item['kind'])
         if item['kind'] in covered and item.get('revision'):
             covered[item['kind']].add(item['revision'])
+    knowledge = root / 'knowledge.git'
+    if knowledge.is_dir():
+        git_dir = _git_directory(knowledge)
+        if not git_dir.is_relative_to(root):
+            raise ValueError('Knowledge Git directory must belong to campaign')
+        for kind in covered:
+            for revision in sorted(used[kind] - covered[kind]):
+                if _revision_files(git_dir, revision, kind, dest, collect):
+                    covered[kind].add(revision)
+                    kinds.add(kind)
+        if not project:
+            metadata['repositories'].append({'path': 'knowledge.git', 'kind': 'knowledge-history'})
+            for path in _repository_files(git_dir):
+                collect(path, Path('knowledge.git') / path.relative_to(git_dir), 'knowledge-history')
+            kinds.add('knowledge-history')
+    if not project:
+        machinery = root / 'machinery'
+        for name in ('controller', 'cli', 'ascend_tools', 'web', 'templates', 'integrations'):
+            directory = machinery / name
+            if directory.is_dir():
+                for path in _files(directory):
+                    collect(path, path.relative_to(root), 'machinery')
+                    kinds.add('machinery')
+        for name in ('package.json', 'npm-shrinkwrap.json', 'package-lock.json', 'pyproject.toml',
+                     'ascend_tools/requirements.txt', 'ascend_tools/requirements-embeddings.txt'):
+            path = machinery / name
+            if path.is_file():
+                collect(path, path.relative_to(root), 'dependencies')
+                kinds.add('dependencies')
     for kind in covered:
         for revision in sorted(used[kind] - covered[kind]):
             missing(kind + '-revision', revision)
-    required = {'source-history', 'skills', 'memory', 'cited-entry'}
+    required = {'source-history'} if has_attempts else set()
     if not project:
         required |= {'knowledge-history', 'machinery', 'dependencies'}
         snapshot = dest / 'knowledge.sqlite'
@@ -329,6 +398,7 @@ def pack(root, dest, project=None, require_complete=True):
         collect(snapshot, 'knowledge.sqlite', 'active-kdb')
     for kind in sorted(required - kinds):
         missing(kind, 'package-inputs.json')
+    metadata['knowledge_revisions'] = {kind: sorted(revisions) for kind, revisions in covered.items()}
     collect(config_path, 'instance.json', 'config')
     collect(ledger_path, 'state.sqlite', 'ledger')
     metadata['complete'] = not metadata['missing']
@@ -340,7 +410,7 @@ def pack(root, dest, project=None, require_complete=True):
     for sidecar in chunks.iterdir():
         if sidecar.suffix != '.gz':
             sidecar.unlink()
-    for scratch in ('collected',):
+    for scratch in ('collected', 'exported'):
         shutil.rmtree(dest / scratch, ignore_errors=True)
     (dest / 'knowledge.sqlite').unlink(missing_ok=True)
     ledger_path.unlink()
