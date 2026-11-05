@@ -114,7 +114,7 @@ test('curriculum uses the same required native discovery before its first provid
   t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});
   const model=f.modelRuntime.getModel('ready-fixture','scripted');
   await assert.rejects(summarize({path:f.root,bridge:f.bridge,passed:false,job:{attempt:{id:'readiness'}},
-    state:{events:()=>[],attempt:()=>({session:null}),event:()=>{}},
+    state:{events:()=>[],queryEvents:()=>[],attempt:()=>({session:null}),event:()=>{}},
     config:{curriculum_seconds:10,actor:{provider:'ready-fixture',model:'scripted',credential_env:key,base_url:f.base+'/provider/v1',metadata:model}}}),/Required native KDB/);
   assert.equal(f.requests.length,0);assert.equal(f.queries.length,0);
 });

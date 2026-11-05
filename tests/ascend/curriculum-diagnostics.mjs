@@ -124,3 +124,27 @@ for(const type of ['curriculum-session','curriculum-interrupted'])
     assert.equal(shutdown,1);assert.equal(dispose.mock.callCount(),1);
     assert.equal(f.options.state.attempt(f.options.job.attempt.id).session,null);
   });
+
+test('summary diagnostics use bounded tails without reading complete history',{timeout:15000},async t=>{
+  const f=await fixture(t,[['record_findings',{findings:'Retained numeric observations.',useful:false,paths:['evidence.log']}],'wait']);
+  const {state,job}=f.options;
+  await writeFile(join(f.path,'evidence.log'),'numeric observation\n');
+  for(let n=0;n<40;n++) {
+    state.event(job.attempt.id,'curriculum-session',{role:'investigation',session:`session-${n}`});
+    state.event(job.attempt.id,'verification',{passed:false,n});
+    state.event(job.attempt.id,'pi-event',{n});
+  }
+  state.recordFailure(job.attempt.id,{phase:'execution',kind:'transport',message:'Observation unavailable'});
+  state.events=()=>{throw new Error('Complete history must not be read for diagnostics');};
+  const result=await findingsFor({...f.options,passed:false});
+  assert.equal(result.useful,false);
+  const snapshot=JSON.parse(await readFile(join(f.path,'diagnostics.json'),'utf8'));
+  assert.equal(snapshot.length,12);
+  assert.equal(snapshot.at(-1).type,'failure-recorded');
+  assert.ok(snapshot.every(event=>event.type!=='pi-event'));
+  const wire=JSON.parse(f.prompts[0].split('Attempt diagnostics: ')[1].split('\n')[0]);
+  assert.equal(wire.events.length,30);
+  assert.equal(wire.curriculum_sessions.length,30);
+  assert.equal(wire.curriculum_sessions[0].session,'session-10');
+  assert.deepEqual(wire.diagnostics.map(event=>event.data.n),[30,31,32,33,34,35,36,37,38,39]);
+});

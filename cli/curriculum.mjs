@@ -74,11 +74,11 @@ async function artifactFile(root,name,source) {
 }
 const reply=()=>({content:[{type:'text',text:'Recorded'}],details:{}});
 function diagnosticContext(state,id,limit) {
-  const events=state.events(id).filter(event=>event.type!=='pi-event');
-  const sessions=events.filter(event=>event.type==='curriculum-session').map(event=>event.data);
+  const tail=options=>state.queryEvents(id,{...options,order:'desc'}).reverse();
+  const events=tail({excludeTypes:['pi-event'],limit}).map(({type,data})=>({type,data}));
+  const sessions=tail({types:['curriculum-session'],limit}).map(event=>event.data);
   return {session:state.attempt(id)?.session??sessions.at(-1)?.session??null,curriculum_sessions:sessions,
-    diagnostics:events.filter(event=>event.type==='verification'||event.type==='rejected').slice(-10),
-    events:events.slice(-limit)};
+    diagnostics:tail({types:['verification','rejected'],limit:10}).map(({type,data})=>({type,data})),events};
 }
 export async function investigate({config,job,base,path,state,bridge,signal}) {
   if(!job.attempt?.id)throw new Error('Investigation requires its current attempt');
@@ -86,7 +86,7 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
   const source=join(root,'source');
   const prior=job.resume && state.events(job.attempt.id).some(e=>e.type==='curriculum-session'&&e.data.role==='investigation');
   if(!prior)await cp(base.source,source,{recursive:true,verbatimSymlinks:true});
-  let proposal=job.resume?state.events(job.attempt.id).findLast(e=>e.type==='curriculum-proposal')?.data.proposal:undefined;
+  let proposal=job.resume?state.queryEvents(job.attempt.id,{types:['curriculum-proposal'],order:'desc',limit:1})[0]?.data.proposal:undefined;
   if(!proposal)await curriculumSession({config,path:root,bridge,signal,state,attemptId:job.attempt.id,role:'investigation',resume:job.resume,accepted:()=>Boolean(proposal),prompt:
     `Read the failed project's diagnostics and existing KDB memory. Original goal: ${base.goal}.\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.origin_attempt,20))}\n`+
