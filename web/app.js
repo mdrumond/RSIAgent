@@ -82,6 +82,7 @@ async function refresh() {
   table('Projects', state.projects);
   table('Attempts', state.attempts);
   table('Background operations', state.requests);
+  await refreshStorage();
 }
 
 el('settings').addEventListener('input', () => { dirty = true; });
@@ -166,4 +167,28 @@ for (const action of ['tune', 'kdb']) {
     });
   };
 }
+
+
+async function refreshStorage() {
+  const state = await api('storage');
+  el('storage-summary').textContent = format({campaign: state.campaign, usage: state.usage, revisions: state.revisions});
+  el('storage-inventory').replaceChildren();
+  for (const row of state.artifacts ?? []) {
+    const link = document.createElement('button');
+    link.textContent = `${row.id} · ${row.project_id ?? ''} · ${row.attempt ?? ''} · ${row.kind} · ${row.missing ? 'missing evidence' : row.status}`;
+    link.onclick = () => {
+      el('storage-action').value = format({action: 'inspect', artifact: row.id});
+      el('storage-result').textContent = format(row);
+    };
+    el('storage-inventory').append(link);
+  }
+}
+el('storage-form').onsubmit = event => {
+  event.preventDefault();
+  perform(async () => {
+    el('storage-result').textContent = format(await api('storage', 'POST', parse('storage-action')));
+    await refreshStorage();
+  });
+};
+
 perform(async () => { await reloadSettings(); await refresh(); });

@@ -1,0 +1,77 @@
+import {spawn} from 'node:child_process';
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {State} from '../controller/state.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
+import {ownerStopped,failureSettled} from '../controller/lifecycle.mjs';
+
+export const schemaOptions=Object.fromEntries([
+  'action','artifact','project','role','phase','kind','outcome','stage','iteration',
+  'skill-revision','memory-revision','cursor','after','limit','destination','inventory','package'
+].map(key=>[key,{type:'string'}]));
+Object.assign(schemaOptions,{'raw-provider':{type:'boolean'},'delete-source':{type:'boolean'},apply:{type:'boolean'}});
+
+export async function sealClosedArtifacts(config,action={}) {
+  const state=new State(join(config.root,'state.sqlite'));
+  try {
+    const storage=CampaignStorage.open(state,config.root);if(!storage)return [];
+    const sealed=[],clauses=['f.id>?'],args=[action.after??''];
+    for(const [key,column] of Object.entries({artifact:'f.id',project:'COALESCE(f.project,a.project)',
+      role:'f.role',kind:'f.kind',phase:'s.phase',outcome:'a.outcome',
+      skill_revision:'s.skill_revision',memory_revision:'s.memory_revision'})) {
+      const value=action[key]??action[key.replace('_','-')];
+      if(value!==undefined){clauses.push(column+'=?');args.push(value);}
+    }
+    if(action.stage!==undefined||action.iteration!==undefined) {
+      const terms=['i.attempt=f.attempt'];
+      for(const [key,column] of [['stage','stage'],['iteration','ordinal']])
+        if(action[key]!==undefined){terms.push('i.'+column+'=?');args.push(action[key]);}
+      clauses.push('EXISTS(SELECT 1 FROM storage_iterations i WHERE '+terms.join(' AND ')+')');
+    }
+    const limit=Number(action.limit??100);
+    if(!Number.isInteger(limit)||limit<1||limit>1000)throw new Error('limit must be 1..1000');
+    const rows=state.db.prepare(`SELECT f.* FROM storage_artifacts f
+      LEFT JOIN attempts a ON a.id=f.attempt LEFT JOIN storage_attempts s ON s.attempt=f.attempt
+      WHERE ${clauses.join(' AND ')} ORDER BY f.id LIMIT ?`).all(...args,limit);
+    for(const row of rows) {
+      if(row.status!=='open'||row.external||!row.attempt||row.kind==='source-git')continue;
+      const attempt=state.attempt(row.attempt);
+      if(!attempt?.outcome||!await ownerStopped(attempt.owner)||!failureSettled(state,attempt.id))continue;
+      if(!state.queryEvents(attempt.id,{types:['postprocess-completed'],limit:1}).length)continue;
+      await storage.seal(row.id);sealed.push(row.id);
+    }
+    return sealed;
+  }finally{state.close();}
+}
+
+export async function run(config,values={}) {
+  const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{...values};
+  action.action??=values.action??'inspect';
+  if(action.action==='compress')await sealClosedArtifacts(config,action);
+  return invoke(config,action,values.signal);
+}
+
+export async function runStandalone(values={}) {
+  const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{...values};
+  action.action='unpack';
+  return invoke({python:values.python??'python',root:process.cwd()},action,values.signal);
+}
+
+function invoke(config,action,signal) {
+  return new Promise((ok,no)=>{
+    const child=spawn(config.python??'python',['-m','ascend_tools.storage_cli','--root',config.root,
+      '--action-json','-'],{cwd:config.root,signal,
+      env:{...process.env,PYTHONPATH:fileURLToPath(new URL('..',import.meta.url))},
+      stdio:['pipe',action.action==='walk'?'inherit':'pipe','pipe']});
+    child.stdin.on('error',no);child.stdin.end(JSON.stringify(action));
+    let output='',error='';
+    child.stdout?.on('data',chunk=>{output+=chunk;if(output.length>2*1024*1024){child.kill();no(new Error('Storage response exceeded limit'));}});
+    child.stderr.on('data',chunk=>{error=(error+chunk).slice(-65536);});
+    child.on('error',no);child.on('close',code=>{
+      if(code)return no(new Error(error||`Storage exited ${code}`));
+      if(action.action==='walk')return ok(undefined);
+      try{ok(JSON.parse(output));}catch(e){no(e);}
+    });
+  });
+}

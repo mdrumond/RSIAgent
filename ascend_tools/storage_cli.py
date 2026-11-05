@@ -1,0 +1,298 @@
+"""Ledger-backed storage maintenance. Walk writes JSONL; inventory reads metadata only."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import resource
+import sys
+
+from .log_walk import walk_records
+from .storage_archive import compress_file, finalize_source, iter_artifact_bytes, restore_file
+
+
+class Storage:
+    def __init__(self, root):
+        self.root = Path(root).resolve(strict=True)
+        self.db = sqlite3.connect(f'file:{self.root / "state.sqlite"}?mode=rw', uri=True)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA busy_timeout=5000')
+
+    def path(self, name):
+        path = (self.root / name).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError('path escapes campaign root')
+        return path
+
+    def rows(self, action):
+        limit = int(action.get('limit', 100))
+        if not 1 <= limit <= 1000:
+            raise ValueError('limit must be 1..1000')
+        clauses, args = ['f.id > ?'], [action.get('after', '')]
+        fields = {'artifact': 'f.id', 'project': 'COALESCE(f.project,a.project)',
+                  'role': 'f.role', 'phase': 's.phase', 'kind': 'f.kind',
+                  'outcome': 'a.outcome', 'skill_revision': 's.skill_revision',
+                  'memory_revision': 's.memory_revision'}
+        for key, column in fields.items():
+            value = action.get(key, action.get(key.replace('_', '-')))
+            if value is not None:
+                clauses.append(column + '=?')
+                args.append(value)
+        if 'stage' in action or 'iteration' in action:
+            extra = ['i.attempt=f.attempt']
+            for key, column in [('stage', 'stage'), ('iteration', 'ordinal')]:
+                if key in action:
+                    extra.append('i.' + column + '=?')
+                    args.append(action[key])
+            clauses.append('EXISTS(SELECT 1 FROM storage_iterations i WHERE ' + ' AND '.join(extra) + ')')
+        return [dict(row) for row in self.db.execute('''SELECT f.*,a.outcome,
+            COALESCE(f.project,a.project) AS project_id,s.phase,s.memory_revision,s.skill_revision
+            FROM storage_artifacts f LEFT JOIN attempts a ON a.id=f.attempt
+            LEFT JOIN storage_attempts s ON s.attempt=f.attempt WHERE ''' +
+            ' AND '.join(clauses) + ' ORDER BY f.id LIMIT ?', [*args, limit])]
+
+    def inspect(self, action):
+        rows = self.rows(action)
+        for row in rows:
+            if not row['external']:
+                self.path(row['path'])
+            row['missing'] = bool(row['external']) or not (
+                self.path(row['path']).exists() if row['encoding'] == 'plain' else
+                self.path(json.loads(row['descriptor'])['manifest']).exists())
+        return dict(campaign=dict(self.db.execute('SELECT * FROM storage_campaign').fetchone()),
+                    usage=[dict(r) for r in self.db.execute('''SELECT status,encoding,COUNT(*) AS artifacts,
+                        SUM(bytes) AS logical_bytes FROM storage_artifacts GROUP BY status,encoding''')],
+                    revisions=[dict(r) for r in self.db.execute('SELECT * FROM storage_revisions')],
+                    artifacts=rows, next_after=rows[-1]['id'] if rows else None)
+
+    def manifest(self, row):
+        descriptor = json.loads(row['descriptor'])
+        manifest = json.loads(self.path(descriptor['manifest']).read_text())
+        self.path(manifest['directory'])
+        self.path(manifest['source'])
+        for chunk in manifest['chunks']:
+            self.path(Path(manifest['directory']) / chunk['file'])
+        return manifest
+
+    def content(self, row):
+        if row['external']:
+            raise ValueError('external evidence is not collected')
+        if row['encoding'] != 'plain':
+            yield from iter_artifact_bytes(self.manifest(row))
+        else:
+            with self.path(row['path']).open('rb') as stream:
+                while block := stream.read(65536):
+                    yield block
+
+    def verify(self, row):
+        digest, size = hashlib.sha256(), 0
+        for block in self.content(row):
+            digest.update(block)
+            size += len(block)
+        if size != row['bytes'] or digest.hexdigest() != row['sha256']:
+            raise ValueError('ledger digest mismatch: ' + row['id'])
+        return dict(id=row['id'], verified=True, bytes=size)
+
+    @staticmethod
+    def stopped(owner):
+        owner = json.loads(owner) if isinstance(owner, str) else owner
+        if not owner or not all(owner.get(k) for k in ('pid', 'start', 'boot')):
+            return False
+        try:
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            stat = Path(f'/proc/{int(owner["pid"])}/stat').read_text()
+            start = stat[stat.rfind(')') + 2:].split()[19]
+            return boot != owner['boot'] or start != str(owner['start'])
+        except FileNotFoundError:
+            return True
+
+    def quiescent(self, row):
+        if row['attempt']:
+            attempt = self.db.execute('SELECT * FROM attempts WHERE id=?', [row['attempt']]).fetchone()
+            if not attempt or attempt['outcome'] is None or not self.stopped(attempt['owner']):
+                raise ValueError('artifact owner is live or unresolved')
+            events = self.db.execute('''SELECT type,data FROM events WHERE attempt=? AND
+                type IN ('postprocess-completed','failure-settlement') ORDER BY sequence DESC''', [row['attempt']])
+            completed, settled = False, None
+            for event in events:
+                if event['type'] == 'postprocess-completed':
+                    completed = True
+                elif settled is None:
+                    settled = json.loads(event['data']).get('closed') is True
+            if not completed or settled is False:
+                raise ValueError('artifact postprocessing or settlement unresolved')
+        else:
+            # Unowned evidence requires all recorded campaign writers stopped.
+            if self.db.execute('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').fetchone():
+                raise ValueError('campaign has active attempts')
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='control'").fetchone():
+                for item in self.db.execute("SELECT value FROM control WHERE key IN ('owner','skill-writer')"):
+                    if not self.stopped(item['value']):
+                        raise ValueError('campaign owner is live or unresolved')
+
+    def compress(self, row, delete_source=False):
+        if row['external'] or row['status'] != 'closed':
+            return dict(id=row['id'], skipped='not closed local evidence')
+        self.quiescent(row)
+        if row['encoding'] != 'plain':
+            return dict(id=row['id'], skipped='already compressed')
+        self.verify(row)
+        manifest = compress_file(self.path(row['path']), self.path('artifacts/compressed'))
+        if manifest['sha256'] != row['sha256'] or manifest['source_identity']['size'] != row['bytes']:
+            raise ValueError('source changed since ledger seal')
+        self.quiescent(row)
+        descriptor = json.dumps({'manifest': str(Path(manifest['manifest_path']).relative_to(self.root))})
+        # Durable ledger publication must precede optional source finalization.
+        with self.db:
+            changed = self.db.execute('''UPDATE storage_artifacts SET encoding='gzip-chunks',descriptor=?
+                WHERE id=? AND status='closed' AND encoding='plain' AND sha256=?''',
+                [descriptor, row['id'], row['sha256']]).rowcount
+            if not changed:
+                raise ValueError('ledger changed during compression')
+        if delete_source:
+            self.quiescent(row)
+            finalize_source(manifest)
+        return dict(id=row['id'], manifest=json.loads(descriptor), source_deleted=delete_source)
+
+    def walk(self, action):
+        action = dict(action)
+        action.setdefault('kind', 'provider-telemetry' if action.get('raw_provider', action.get('raw-provider')) else 'pi-session')
+        for row in self.rows(action):
+            if row['external']:
+                continue
+            artifact = self.manifest(row) if row['encoding'] != 'plain' else self.path(row['path'])
+            for item in walk_records(artifact, cursor=int(action.get('cursor', 0))):
+                item['metadata']['artifact_id'] = row['id']
+                print(json.dumps(item), flush=True)
+
+    def plan(self, action):
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='control'").fetchone():
+            for item in self.db.execute("SELECT value FROM control WHERE key IN ('owner','skill-writer')"):
+                if not self.stopped(item['value']):
+                    raise ValueError('campaign owner is live or unresolved')
+        query, args = 'SELECT outcome,owner FROM attempts', []
+        if action.get('project'):
+            query += ' WHERE project=?'
+            args.append(action['project'])
+        for attempt in self.db.execute(query, args):
+            if attempt['outcome'] is None or not self.stopped(attempt['owner']):
+                raise ValueError('cleanup scope has live or unresolved owners')
+        entries = []
+        for row in self.rows(action):
+            if row['external'] or row['encoding'] == 'plain':
+                continue
+            if not self.path(row['path']).exists():
+                continue
+            self.quiescent(row)
+            self.verify(row)
+            manifest = self.manifest(row)
+            source = self.path(row['path'])
+            identity = {key: getattr(source.stat(), 'st_' + key) for key in
+                        ('dev', 'ino', 'size', 'mtime_ns', 'ctime_ns')}
+            if identity != manifest['source_identity']:
+                raise ValueError('source changed since compression')
+            entries.append(dict(row=row, identity={key: str(value) for key, value in identity.items()}))
+        return dict(campaign=self.db.execute('SELECT id FROM storage_campaign').fetchone()['id'],
+                    project=action.get('project'), entries=entries)
+
+    def apply(self, inventory):
+        if inventory['campaign'] != self.db.execute('SELECT id FROM storage_campaign').fetchone()['id']:
+            raise ValueError('inventory belongs to another campaign')
+        checked = []
+        for entry in inventory['entries']:
+            rows = self.rows({'artifact': entry['row']['id']})
+            if len(rows) != 1 or rows[0] != entry['row']:
+                raise ValueError('inventory ledger entry changed')
+            row = rows[0]
+            current = self.plan({'artifact': row['id'], 'project': inventory.get('project')})
+            if not current['entries'] or current['entries'][0]['identity'] != entry['identity']:
+                raise ValueError('inventory source changed')
+            checked.append(row)
+        # Validate every entry before the first deletion.
+        for row in checked:
+            self.quiescent(row)
+            finalize_source(self.manifest(row))
+        return dict(removed=[row['id'] for row in checked])
+
+
+def execute(root, action):
+    if action.get('action') == 'unpack':
+        from .storage_package import unpack
+        return unpack(Path(action['package']).resolve(), Path(action['destination']).resolve())
+    storage = Storage(root)
+    try:
+        name = action.get('action', 'inspect')
+        if name == 'inspect':
+            return storage.inspect(action)
+        if name == 'walk':
+            storage.walk(action)
+            return None
+        if name == 'verify':
+            return [storage.verify(row) for row in storage.rows(action)]
+        if name == 'compress':
+            return [storage.compress(row, bool(action.get('delete_source', action.get('delete-source', False))))
+                    for row in storage.rows(action)]
+        if name == 'prune':
+            if action.get('apply'):
+                return storage.apply(action['inventory'])
+            return storage.plan(action)
+        if name == 'pack':
+            from .storage_package import pack
+            return pack(storage.root, storage.path(action['destination']), project=action.get('project'))
+        if name == 'unpack':
+            from .storage_package import unpack
+            return unpack(storage.path(action['package']), storage.path(action['destination']))
+        if name == 'restore':
+            row, = storage.rows(action)
+            return dict(path=restore_file(storage.manifest(row), storage.path(action['destination'])))
+        raise ValueError('unknown storage action')
+    finally:
+        storage.db.close()
+
+
+def main(argv=None):
+    cap = 256 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', required=True)
+    parser.add_argument('--action-json')
+    parser.add_argument('action', nargs='?', default='inspect',
+                        choices=['inspect', 'verify', 'walk', 'compress', 'pack', 'unpack', 'prune', 'restore'])
+    parser.add_argument('--artifact')
+    parser.add_argument('--project')
+    parser.add_argument('--destination')
+    parser.add_argument('--package')
+    parser.add_argument('--raw-provider', action='store_true')
+    parser.add_argument('--delete-source', action='store_true')
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--inventory')
+    for key in ('role', 'phase', 'kind', 'outcome', 'stage', 'iteration', 'skill-revision',
+                'memory-revision', 'cursor', 'after', 'limit'):
+        parser.add_argument('--' + key)
+    args = parser.parse_args(argv)
+    action = json.load(sys.stdin) if args.action_json == '-' else json.loads(args.action_json) if args.action_json else {k: v for k, v in vars(args).items() if v is not None}
+    if isinstance(action.get('inventory'), str):
+        storage = Storage(args.root)
+        try:
+            action['inventory'] = json.loads(storage.path(action['inventory']).read_text())
+        finally:
+            storage.db.close()
+    mutating = action.get('action') in ('compress', 'pack', 'unpack', 'prune', 'restore')
+    if action.get('action') == 'unpack':
+        os.nice(10)
+        result = execute(args.root, action)
+    elif mutating:
+        os.nice(10)
+        with (Path(args.root) / '.storage-maintenance.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = execute(args.root, action)
+    else:
+        result = execute(args.root, action)
+    if action.get('action') != 'walk':
+        print(json.dumps(result))
+
+
+if __name__ == '__main__':
+    main()

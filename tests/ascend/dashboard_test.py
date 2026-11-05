@@ -280,7 +280,8 @@ const fetch = async (url, options) => {
     assert result["reloaded"]["revision"] == 5
     assert result["reloaded"]["projects"][0]["id"] == "new-project"
     assert result["scopes"] == ["design"]
-    assert result["statusRows"] == [state["controller"], state["projects"], state["attempts"], state["requests"]]
+    assert result["statusRows"] == [state["controller"], state.get("progress", []),
+        state.get("wait", []), state.get("memory", []), state["projects"], state["attempts"], state["requests"]]
     for req in result["requests"]:
         if req["method"] == "GET":
             continue
@@ -344,3 +345,16 @@ def test_default_instance_machinery_serves_assets_and_drives_cli(monkeypatch, tm
     assert client.get("/api/status").json == state
     assert calls == [["node-test", str(machinery / "cli/main.mjs"), "status",
                       "--instance", str(instance)]]
+
+
+def test_storage_uses_cli_and_detaches_mutations(harness):
+    client, calls, *_ = harness
+    assert client.get('/api/storage').status_code == 200
+    assert calls[-1][0][2] == 'storage'
+    assert calls[-1][1] == {'action': 'inspect', 'limit': 100}
+    for action in ('pack', 'compress', 'prune'):
+        payload = {'action': action, 'project': 'p'}
+        assert client.post('/api/storage', json=payload).status_code == 200
+        assert calls[-1][1] == payload
+        assert '--detach' in calls[-1][0]
+    assert client.post('/api/storage', json={'action': 'walk'}).status_code == 400

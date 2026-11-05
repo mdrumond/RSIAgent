@@ -134,6 +134,19 @@ def create_app(instance, machinery=None, node="node"):
         with lock:
             return jsonify(driver.call("kdb", value, detach=True))
 
+    @app.get("/api/storage")
+    def storage_status():
+        return jsonify(driver.call("storage", {"action": "inspect", "limit": 100}))
+
+    @app.post("/api/storage")
+    def storage_action():
+        value = body()
+        if value.get("action") not in ("inspect", "verify", "compress", "pack", "prune"):
+            raise BadRequest("Unknown dashboard storage action")
+        with lock:
+            return jsonify(driver.call("storage", value,
+                                      detach=value["action"] in ("compress", "pack", "prune")))
+
     @app.post("/api/tune")
     def tune():
         value = body()
