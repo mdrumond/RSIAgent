@@ -4,7 +4,7 @@ import {startBackground,requests,reconcileRequests} from './background.mjs';
 import {sealClosedArtifacts} from './storage.mjs';
 import {stat} from 'node:fs/promises';
 
-// Submission only; the existing managed request owns compression and its receipts.
+// Submission only; the existing background request owns compression and its receipts.
 export async function queueCompression(config) {
   if(!config.storage||config.storage.compress===false)return null;
   const state=new State(join(config.root,'state.sqlite'));

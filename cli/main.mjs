@@ -139,9 +139,10 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
     } finally {state.close();}
   }
   if (['wave','campaign','resume','pause','stop'].includes(command)) {
-    const {operate,campaign}=await import('./runtime.mjs');
+    const {operate,campaign,resume}=await import('./runtime.mjs');
     if(values.detach&&['wave','campaign','resume'].includes(command))
       return (await import('./background.mjs')).startBackground(root,command,values,{signal});
+    if(command==='resume')return resume(config,{...values,signal});
     if(command==='campaign' && !values.detach)return campaign(config,{...values,signal,mode:values.mode??config.mode});
     return operate(command,config,{...values,signal,mode:values.mode??config.mode});
   }

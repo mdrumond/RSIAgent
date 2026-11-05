@@ -79,6 +79,7 @@ export async function operate(command,config,options={}) {
       }
       return {stop_requested:true};
     }
+    if(command!=='resume'&&ctl.get('pause'))return {reason:'paused'};
     const active=ctl.get('owner');
     if(active && !await ownerStopped(active))throw new Error('Instance controller is already running');
     const owner=await processIdentity();
@@ -466,7 +467,7 @@ export async function campaign(config,options={}) {
   options.signal?.addEventListener('abort',stop,{once:true});
   if(options.signal?.aborted)abort.abort();
   try {
-    const result=await operate('wave',await readConfig(config.root),{...options,continuous:true,detach:false,signal:abort.signal});
+    const result=await operate(options.resume?'resume':'wave',await readConfig(config.root),{...options,continuous:true,detach:false,signal:abort.signal});
     waves.push(result);
     const ledger=stateFor(config.root);
     let stopped,paused,elapsed;
@@ -474,6 +475,13 @@ export async function campaign(config,options={}) {
     return {waves,reason:seconds!==undefined&&elapsed>=seconds?'elapsed':
       paused?'paused':abort.signal.aborted||stopped?'stopped':'complete'};
   }finally{options.signal?.removeEventListener('abort',stop);}
+}
+
+export async function resume(config,options={}) {
+  const state=stateFor(config.root);
+  let continuous;
+  try{continuous=control(state).get('operation')==='campaign';}finally{state.close();}
+  return continuous?campaign(config,{...options,resume:true}):operate('resume',config,options);
 }
 
 async function worker(root,id) {
