@@ -12,7 +12,7 @@ const task = (n, extra = {}) => ({ id: `original-${n}`, projectId: `project-${n}
   events: [{ type: 'knowledge-retrieved', data: { kind: 'negative', evidence: 'failure.json' } }], ...extra });
 const history = n => Array.from({ length: n }, (_, i) => task(i));
 const guidance = { id: 'failure', scope: 'debug', text: 'Check the failing case.', critical: false, negative: true };
-const config = { root: tmpdir(), mode: 'phase2', skills: { activeVersion: 'baseline', tuningProjectIds: ['reg-a', 'reg-b'] } };
+const config = { root: tmpdir(), mode: 'phase2', skills: { activeVersion: 'baseline', evaluationSeconds: 300, tuningProjectIds: ['reg-a', 'reg-b'] } };
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'skills-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -140,13 +140,13 @@ test('CLI uses instance.json and invokes bootstrap then canonical wave for each 
   await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify(pending));
   const calls = [], controller = new AbortController(), resource = { id: 'opaque-lease' };
   const runtime = {
-    async bootstrap(request) { assert.equal(request.signal, controller.signal); assert.equal(request.resource, resource);
+    async bootstrap(request) { assert.ok(request.signal instanceof AbortSignal); assert.equal(request.signal.aborted, controller.signal.aborted); assert.equal(request.resource, resource);
       assert.deepEqual(request.projectIds, config.skills.tuningProjectIds); calls.push(['bootstrap', request.instanceRoot]); await mkdir(request.instanceRoot); },
     async wave(request) {
       calls.push(['wave', request.instanceRoot]);
       assert.deepEqual(request.projectIds.length, 1);
       assert.equal(request.evaluation, true);
-      assert.equal(request.signal, controller.signal);
+      assert.ok(request.signal instanceof AbortSignal); assert.equal(request.signal.aborted, controller.signal.aborted);
       assert.equal(request.config.root, request.instanceRoot);
       return { correct: true, score: 1 };
     }
@@ -177,7 +177,7 @@ const knowledgeStub = { async ensureKnowledgeService() { return 'http://127.0.0.
   createKdbBridge() { return { extension: () => {} }; } };
 test('first CLI update needs no A/B configuration; cadence defaults to two stable originals', async t => {
   const root = await fixture(t);
-  const current = { ...config, root, skills: { activeVersion: 'baseline' } };
+  const current = { ...config, root, skills: { activeVersion: 'baseline', evaluationSeconds: 300 } };
   await writeFile(join(root, 'instance.json'), JSON.stringify(current));
   const { native } = nativeWriter();
   const first = await lockedRun(current, { task: task(0), native, knowledge: knowledgeStub, modelRuntime: {}, model: {} });
@@ -215,7 +215,7 @@ test('manual CLI uses selected State events without increasing original cadence'
   assert.equal(saved.history.length, 0);
   assert.equal(saved.lastEvaluated, 0);
   assert.ok(saved.candidate);
-  const noIds = { ...config, root, skills: { activeVersion: 'baseline' } };
+  const noIds = { ...config, root, skills: { activeVersion: 'baseline', evaluationSeconds: 300 } };
   await writeFile(join(root, 'instance.json'), JSON.stringify(noIds));
   await writeFile(action, JSON.stringify({ userinfo: 'recover' }));
   assert.equal((await lockedRun(noIds, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} })).analyse, true);
@@ -347,11 +347,11 @@ test('stopped canonical bootstrap/wave retains partial A/B and never promotes or
     let waves = 0;
     const runtime = {
       async bootstrap(request) {
-        assert.equal(request.signal, controller.signal);
+        assert.ok(request.signal instanceof AbortSignal); assert.equal(request.signal.aborted, controller.signal.aborted);
         await mkdir(request.instanceRoot); await writeFile(join(request.instanceRoot, 'partial.log'), 'retained');
         if (stopAt === 'bootstrap') controller.abort();
       },
-      async wave(request) { waves++; assert.equal(request.signal, controller.signal);
+      async wave(request) { waves++; assert.ok(request.signal instanceof AbortSignal); assert.equal(request.signal.aborted, controller.signal.aborted);
         controller.abort(); return { correct: true, score: 2 }; }
     };
     await assert.rejects(lockedRun({ ...config, root }, { runtime, signal: controller.signal }), { name: 'AbortError' });
@@ -396,7 +396,7 @@ test('configured two-original cadence evaluates earlier than default eight with 
   assert.equal(cadenceDecision(history(1), task(1), 0, 2, 2).allowPruning, true);
   for (const invalid of [0, -1, 1.5, '2']) assert.throws(() => cadenceDecision([], task(0), 0, invalid));
   const root = await fixture(t), current = { ...config, tune_every: 2,
-    skills: { activeVersion: 'baseline', pruneAfterTasks: 4 } };
+    skills: { activeVersion: 'baseline', evaluationSeconds: 300, pruneAfterTasks: 4 } };
   await writeFile(join(root, 'instance.json'), JSON.stringify(current));
   let arms = 0;
   for (let i = 0; i < 2; i++) {

@@ -20,7 +20,8 @@ export async function readConfig(root) {
 const within=(parent,child)=>{const rel=relative(parent,child);return rel==='' || (!rel.startsWith('..'+sep) && rel!=='..');};
 
 export async function bootstrap(destination,{baseline,skills,environment,projects=[],repository,
-  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,...settings}={}) {
+  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,signal,...settings}={}) {
+  signal?.throwIfAborted();
   destination=resolve(destination);machinery=await realpath(machinery);
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
@@ -50,7 +51,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
   projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
-  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python);
+  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python,signal);
+  signal?.throwIfAborted();
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
@@ -90,9 +92,11 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   } finally {ledger.close();if(staged)await rm(staged,{force:true});}
 }
 
-async function copyMachinery(machinery,release,install=true,python='python') {
+async function copyMachinery(machinery,release,install=true,python='python',signal) {
+  signal?.throwIfAborted();
   await mkdir(release);
   for (const item of ['controller','cli','ascend_tools','web','templates','scripts','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
+    signal?.throwIfAborted();
     const from=join(machinery,item);
     try {await stat(from);} catch(error) {if(error.code==='ENOENT')continue;throw error;}
     await cp(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))});
@@ -113,7 +117,7 @@ async function copyMachinery(machinery,release,install=true,python='python') {
     });
     await new Promise((ok,no)=>{
       const child=spawn('npm',['ci','--ignore-scripts','--prefix',release],{
-        env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
+        signal,env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
       let error='';child.stderr.on('data',data=>error+=data);child.on('error',no);
       child.on('close',code=>code?no(new Error('Instance dependency installation failed: '+error)):ok());
     });

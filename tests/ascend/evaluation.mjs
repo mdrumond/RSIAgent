@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { bootstrap as instance,readConfig } from '../../cli/instance.mjs';
-import { bootstrap as sample } from '../../cli/evaluation.mjs';
+import { bootstrap as sample, resume } from '../../cli/evaluation.mjs';
 import { stages } from '../../controller/workflow.mjs';
 import { State } from '../../controller/state.mjs';
 
@@ -53,4 +53,31 @@ test('A/B samples freeze memory and source once, relocate both checks and block 
     assert.ok(state.project('p'));state.admit('p',{});state.close();
     await assert.rejects(sample(request('c')),/unresolved evaluation instance/);
   }finally{await rm(root,{recursive:true,force:true});}
+});
+
+
+test('resume recovers completed results without a new attempt, blocks live owners and preserves partial bootstrap', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'evaluation-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'instance.json'), JSON.stringify({ format: 1, mode: 'phase2' }));
+  const state = new State(join(root, 'state.sqlite'));
+  state.add({ id: 'p', goal: 'python correctness', actor_seconds: 5 });
+  const stopped = { pid: 2147483647, start: '0', boot: 'old-boot' };
+  const attempt = state.admit('p', stopped);
+  state.event(attempt.id, 'accepted', {}); state.finish(attempt.id, 'passed');
+  try {
+    const result = await resume({ instanceRoot: root });
+    assert.equal(result.correct, true); assert.deepEqual(result.attempts, [attempt.id]);
+    const { processIdentity } = await import('../../controller/lifecycle.mjs');
+    state.db.prepare('UPDATE attempts SET owner=? WHERE id=?').run(JSON.stringify(await processIdentity()), attempt.id);
+    await assert.rejects(resume({ instanceRoot: root }), /worker remains live/);
+    state.db.prepare('UPDATE attempts SET owner=? WHERE id=?').run(JSON.stringify(stopped), attempt.id);
+    state.event(attempt.id, 'native-bash-started', { operation: 'unclosed' });
+    await assert.rejects(resume({ instanceRoot: root }), /execution remains unresolved/);
+    assert.equal(state.db.prepare('SELECT count(*) AS n FROM attempts').get().n, 1);
+    const partial = join(root, 'partial'); await mkdir(partial);
+    await writeFile(join(partial, 'retained.log'), 'partial setup');
+    await assert.rejects(resume({ instanceRoot: partial }), { code: 'ENOENT' });
+    assert.equal(await readFile(join(partial, 'retained.log'), 'utf8'), 'partial setup');
+  } finally { state.close(); }
 });

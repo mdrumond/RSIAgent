@@ -265,6 +265,39 @@ projects, excluding diagnostic/retry attempts, and evaluates candidates through
 the shared scheduler. Action JSON is interpreted by the corresponding CLI
 module, not by a separate Python orchestration engine.
 
+### Evaluation allocations and resume
+
+Skill proposals accumulate without running benchmark projects unless
+`skills.evaluationSeconds` supplies a positive elapsed allocation for a full
+candidate evaluation round. This setting initializes each new round once;
+resuming a round never refills it. Existing instances without this setting now
+prepare candidates and report `deferred`, including manual tuning requests.
+Promotion still requires two distinct projects and at least two runs per arm.
+
+To evaluate an already prepared candidate or add time to its pending round,
+pass a tuning action such as
+`{"evaluationSeconds":600,"allocationId":"user-extension-1"}`.
+The seconds are an additional grant; use a new allocation ID for a new grant.
+Replaying the same ID and seconds never adds time again, even after completion.
+A grant-only action uses the existing candidate without invoking the writer.
+
+The round snapshots settings and inputs, records stable sample paths and saves
+completed results. Resume the same `tune` request to skip completed samples and
+resume an interrupted sample through its existing canonical instance and
+session. Unresolved owners or execution handles block replacement work.
+Interrupting bootstrap before a complete instance exists requires inspection;
+the partial directory is retained and is never automatically recreated.
+
+The deadline covers bootstrap, dependency installation and execution, with
+cancellation propagated to nested work. Graceful interruption checkpoints elapsed
+time and excludes subsequent paused time. After process loss, uncheckpointed
+elapsed time is conservatively charged until observation resumes. Exhaustion
+keeps the candidate unpromoted until an explicit additional grant arrives.
+Completed task evidence arriving while a round is blocked remains in history.
+`status` includes `tuning` with its evaluation state, allocation, elapsed time,
+remaining time and number of completed samples. States are `deferred`, `running`,
+`interrupted`, `exhausted` and `completed`.
+
 ## Dashboard and browsing
 
 ```bash
