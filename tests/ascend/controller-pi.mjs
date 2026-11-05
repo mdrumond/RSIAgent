@@ -12,7 +12,7 @@ import { runAttempt } from '../../controller/pi.mjs';
 import { stages } from '../../controller/workflow.mjs';
 import { processIdentity,attemptStopped } from '../../controller/lifecycle.mjs';
 
-for(const scenario of ['cancel-verifier','unknown-submission'])test(scenario,{timeout:15000},async()=>{
+for(const scenario of ['cancel-verifier','unknown-submission','supervised-shell'])test(scenario,{timeout:15000},async()=>{
   const root=await mkdtemp(join(tmpdir(),'ascend-native-lifecycle-'));
   const state=new State(join(root,'state.sqlite')),calls=[];
   for(const stage of stages) {
@@ -21,6 +21,7 @@ for(const scenario of ['cancel-verifier','unknown-submission'])test(scenario,{ti
     if(stage==='validation')calls.push(['rsi_verify',{}]);
     calls.push(['rsi_advance',{reflection:'Previous evidence supports an independent numeric check.'}]);
   }
+  if(scenario==='supervised-shell')calls.unshift(['bash',{command:'python program.py'}]);
   let shutdown=0,sawCancellation=false,requests=0;
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;
@@ -48,7 +49,7 @@ for(const scenario of ['cancel-verifier','unknown-submission'])test(scenario,{ti
       contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
     await runtime.setRuntimeApiKey('lifecycle-fixture','fixture-only');
     const abort=new AbortController();
-    const environment={instructions:'Local CPU fixture',prepare:async()=>{},observe:async()=>({state:'stopped'}),
+    const environment={instructions:'Local CPU fixture',shellOnTarget:scenario==='supervised-shell',prepare:async()=>{},observe:async()=>({state:'stopped'}),
       execute:async(_command,_cwd,options)=>{
         if(scenario==='unknown-submission')throw new Error('Submission response lost');
         state.event(attempt.id,'execution-handle',{handle:'fixture:verifier'});
@@ -64,7 +65,13 @@ for(const scenario of ['cancel-verifier','unknown-submission'])test(scenario,{ti
       model:runtime.getModel('lifecycle-fixture','scripted'),extensions:[pi=>pi.on('session_shutdown',async()=>{shutdown++;})]}));
     assert.ok(requests>0);assert.equal(shutdown,1);assert.equal(state.attempt(attempt.id).outcome,null);
     const stopped=await attemptStopped(state,state.attempt(attempt.id),environment);
-    if(scenario==='cancel-verifier') {assert.equal(sawCancellation,true);assert.equal(stopped,true);}
+    if(scenario!=='unknown-submission') {
+      assert.equal(sawCancellation,true);assert.equal(stopped,true);
+      if(scenario==='supervised-shell') {
+        assert.equal(state.events(attempt.id).some(e=>e.type==='native-bash-started'),false);
+        assert.ok(state.events(attempt.id).some(e=>e.type==='execution-settled'));
+      }
+    }
     else {assert.equal(stopped,false);assert.ok(state.events(attempt.id).some(e=>e.type==='execution-unresolved' && e.data.handle===null));}
   }finally {
     server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
