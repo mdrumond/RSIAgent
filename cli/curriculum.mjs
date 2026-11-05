@@ -4,20 +4,39 @@ import { cp, mkdir, readFile, stat } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
 
+// Page telemetry without retaining complete event or native Pi history. The first
+// allocation remains authoritative across resumes; checkpoints never reset it.
+export function curriculumRoleHistory(state,attemptId,role) {
+  let before,prior,seconds,elapsed=0;
+  for(;;) {
+    const page=state.queryEvents(attemptId,{types:['curriculum-session','curriculum-checkpoint','curriculum-interrupted'],order:'desc',limit:100,before});
+    for(const event of page) {
+      if(event.data.role!==role)continue;
+      if(event.type==='curriculum-session') {
+        prior??=event.data;
+        seconds=event.data.allocation_seconds;
+      }else if(Number.isFinite(event.data.elapsed_seconds))elapsed=Math.max(elapsed,event.data.elapsed_seconds);
+    }
+    if(page.length<100)break;
+    before=page.at(-1).sequence;
+  }
+  return {prior,seconds,elapsed};
+}
+
 async function curriculumSession({config,path,bridge,prompt,tool,signal,state,attemptId,role,accepted,resume=false}) {
   const agentDir=join(path,'agent');await mkdir(agentDir,{recursive:true});
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
-    extensionFactories:[bridge.extension,pi=>pi.registerTool(tool)]});
+    extensionFactories:[bridge.extension,pi=>{for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);}]});
   await loader.reload();
-  const history=resume?state.events(attemptId).filter(e=>e.data.role===role):[];
-  const prior=history.findLast(e=>e.type==='curriculum-session')?.data;
-  const seconds=history.find(e=>e.type==='curriculum-session')?.data.allocation_seconds??config.curriculum_seconds??240;
-  const elapsed=Math.max(0,...history.filter(e=>['curriculum-checkpoint','curriculum-interrupted'].includes(e.type)).map(e=>e.data.elapsed_seconds));
+  const history=resume?curriculumRoleHistory(state,attemptId,role):{};
+  const prior=history.prior;
+  const seconds=history.seconds??config.curriculum_seconds??240;
+  const elapsed=history.elapsed??0;
   if(elapsed>=seconds)throw new Error('Curriculum elapsed allocation exhausted before '+role+' submission');
   const manager=prior?sdk.SessionManager.open(prior.session,join(path,'sessions'),path):sdk.SessionManager.create(path,join(path,'sessions'));
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
-    thinkingLevel:'off',tools:['read','write','edit','mcp__kdb__*',tool.name],resourceLoader:loader,sessionManager:manager});
+    thinkingLevel:'off',tools:['read','write','edit','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
   const started=performance.now();
   const spent=()=>elapsed+(performance.now()-started)/1000;
   const checkpoint=()=>state.event(attemptId,'curriculum-checkpoint',{role,session:manager.getSessionFile(),allocation_seconds:seconds,elapsed_seconds:spent()});
@@ -78,27 +97,39 @@ function diagnosticContext(state,id,limit) {
   const events=tail({excludeTypes:['pi-event'],limit}).map(({type,data})=>({type,data}));
   const sessions=tail({types:['curriculum-session'],limit}).map(event=>event.data);
   return {session:state.attempt(id)?.session??sessions.at(-1)?.session??null,curriculum_sessions:sessions,
-    diagnostics:tail({types:['verification','rejected'],limit:10}).map(({type,data})=>({type,data})),events};
+    diagnostics:tail({types:['verification','rejected','failure-recorded','attempt-error'],limit:10}).map(({type,data})=>({type,data})),events};
 }
 export async function investigate({config,job,base,path,state,bridge,signal}) {
   if(!job.attempt?.id)throw new Error('Investigation requires its current attempt');
   const root=join(path,'investigation');await mkdir(root,{recursive:true});
   const source=join(root,'source');
-  const prior=job.resume && state.events(job.attempt.id).some(e=>e.type==='curriculum-session'&&e.data.role==='investigation');
+  const prior=job.resume && curriculumRoleHistory(state,job.attempt.id,'investigation').prior;
   if(!prior)await cp(base.source,source,{recursive:true,verbatimSymlinks:true});
   let proposal=job.resume?state.queryEvents(job.attempt.id,{types:['curriculum-proposal'],order:'desc',limit:1})[0]?.data.proposal:undefined;
+  const retrieved=new Set(job.resume?state.queryEvents(job.attempt.id,{types:['investigation-knowledge'],limit:100}).map(e=>e.data.kind):[]);
+  const knowledgeTool={reachesTools:()=>['mcp__kdb__search'],name:'investigation_knowledge',label:'Investigation evidence',description:'Retrieve positive or negative KDB observations for this investigation.',
+    parameters:Type.Object({query:Type.String({minLength:1}),kind:Type.Union([Type.Literal('good'),Type.Literal('negative')])}),
+    execute:async(_id,args,_signal,_update,ctx)=>{
+      if(!bridge.knowledge)throw new Error('Investigation requires native KDB retrieval');
+      const result=await bridge.knowledge.search(args,ctx);
+      await state.event(job.attempt.id,'investigation-knowledge',{kind:args.kind,evidence:result.evidence});
+      retrieved.add(args.kind);
+      return {content:[{type:'text',text:JSON.stringify(result)}],details:{}};
+    }};
   if(!proposal)await curriculumSession({config,path:root,bridge,signal,state,attemptId:job.attempt.id,role:'investigation',resume:job.resume,accepted:()=>Boolean(proposal),prompt:
-    `Read the failed project's diagnostics and existing KDB memory. Original goal: ${base.goal}.\n`+
+    `Read the failed project's diagnostics and existing KDB memory. Original goal: ${base.goal}. Treat diagnostics as observations, not proof of infrastructure failure. Consider actor API/tool misuse, project defects, environment/device faults and controller bookkeeping. Shared infrastructure repairs require an operator; repair only this project locally.\n`+
+    `Repeated failure evidence: ${JSON.stringify(job.failure_pattern??null)}\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.origin_attempt,20))}\n`+
     `Read the recorded native session and diagnostic evidence files before proposing an investigation.\n`+
-    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation using tools/KDB. Preserve the original project and verifier. Submit only the investigation goal, question and verifier filename. Negative results are useful; do not promise the original target will pass.`,
-    tool:{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
+    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation and both positive (good) and negative KDB evidence with investigation_knowledge before submitting. Choose a discriminating control and observable outcome that separates competing explanations, rather than retrying the full goal. Preserve the original project and verifier. Submit only the investigation goal, question and verifier filename. Negative results are useful; do not promise the original target will pass.`,
+    tool:[knowledgeTool,{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
       parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1})}),
       execute:async(_id,args)=>{
+        if(job.failure_pattern&&(!retrieved.has('good')||!retrieved.has('negative')))throw new Error('Retrieve both good and negative KDB evidence before submitting');
         await artifactFile(root,args.verifier,source);
         await state.event(job.attempt.id,'curriculum-proposal',{proposal:args});
         proposal=args;return reply();
-      }}});
+      }}]});
   if(!proposal)throw new Error('Curriculum did not submit an investigation');
   const verifier=await artifactFile(root,proposal.verifier,source);
   const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
