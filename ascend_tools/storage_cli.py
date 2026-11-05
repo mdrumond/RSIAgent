@@ -9,7 +9,7 @@ import sqlite3
 import sys
 
 from .log_walk import walk_records
-from .storage_archive import compress_file, finalize_source, iter_artifact_bytes, restore_file
+from .storage_archive import compress_file, compress_files, finalize_source, iter_artifact_bytes, restore_file
 
 
 class Storage:
@@ -136,7 +136,7 @@ class Storage:
                     if not self.stopped(item['value']):
                         raise ValueError('campaign owner is live or unresolved')
 
-    def compress(self, row, delete_source=False):
+    def compression_candidate(self, row):
         if row['external'] or row['status'] != 'closed':
             return dict(id=row['id'], skipped='not closed local evidence')
         if row['encoding'] != 'plain':
@@ -148,8 +148,23 @@ class Storage:
             self.quiescent(row)
         except ValueError as error:
             return dict(id=row['id'], skipped=str(error))
+        return None
+
+    def compress_batch(self, rows, delete_source=False):
+        eligible = [row for row in rows if self.compression_candidate(row) is None]
+        for row in eligible:
+            self.verify(row)
+        manifests = compress_files([self.path(row['path']) for row in eligible],
+                                   self.path('artifacts/compressed')) if eligible else []
+        by_id = dict(zip((row['id'] for row in eligible), manifests))
+        return [self.compress(row, delete_source, by_id.get(row['id'])) for row in rows]
+
+    def compress(self, row, delete_source=False, manifest=None):
+        skipped = self.compression_candidate(row)
+        if skipped is not None:
+            return skipped
         self.verify(row)
-        manifest = compress_file(self.path(row['path']), self.path('artifacts/compressed'))
+        manifest = manifest or compress_file(self.path(row['path']), self.path('artifacts/compressed'))
         if manifest['sha256'] != row['sha256'] or manifest['source_identity']['size'] != row['bytes']:
             raise ValueError('source changed since ledger seal')
         self.quiescent(row)
@@ -248,7 +263,7 @@ def execute(root, action):
                 row = storage.db.execute("SELECT value FROM control WHERE key='storage-compress-cursor'").fetchone()
                 action = dict(action, after=json.loads(row[0]) if row else '')
             rows = storage.rows(action)
-            result = [storage.compress(row, bool(action.get('delete_source', action.get('delete-source', False)))) for row in rows]
+            result = storage.compress_batch(rows, bool(action.get('delete_source', action.get('delete-source', False))))
             if not explicit:
                 with storage.db:
                     storage.db.execute("INSERT OR REPLACE INTO control VALUES ('storage-compress-cursor',?)", [json.dumps(rows[-1]['id'] if rows else '')])

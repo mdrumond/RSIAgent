@@ -7,6 +7,8 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {ownerStopped} from '../../controller/lifecycle.mjs';
 import {DatabaseSync} from 'node:sqlite';
+import {State} from '../../controller/state.mjs';
+import {CampaignStorage} from '../../controller/storage.mjs';
 import {campaignFixture,waitFor} from './resilience/campaign-fixture.mjs';
 import {controllerUnit,knowledgeUnit} from '../../cli/managed-runtime.mjs';
 
@@ -51,8 +53,21 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
     assert.equal(query.isError,false);assert(JSON.stringify(query).includes(collection));
     await writeFile(actionFile,JSON.stringify({}));
     assert.deepEqual(await f.run('tune','--config',actionFile),{analyse:false,evaluate:false});
+    // Exercise real Restic through the public managed maintenance path.
+    const evidence=join(f.instance,'artifacts','managed-evidence.jsonl');
+    await mkdir(join(f.instance,'artifacts'),{recursive:true});
+    await writeFile(evidence,'{"type":"fixture","value":42}\n');
+    const ledgerState=new State(join(f.instance,'state.sqlite'));
+    let artifact;
+    try {artifact=await CampaignStorage.open(ledgerState,f.instance).register(evidence,{kind:'cited-text'});}
+    finally {ledgerState.close();}
+    const archived=await f.run('storage','compress','--artifact',artifact.id,'--delete-source');
+    assert.equal(archived[0].source_deleted,true);
+    assert.equal(f.rows('SELECT encoding FROM storage_artifacts WHERE id=?','state.sqlite',[artifact.id])[0].encoding,'restic');
+    const verified=await f.run('storage','verify','--artifact',artifact.id);
+    assert.equal(verified[0].verified,true);
     const maintenanceRows=f.rows('SELECT kind,status,owner FROM requests');
-    assert.equal(maintenanceRows.length,3);
+    assert.equal(maintenanceRows.length,4);
     assert(maintenanceRows.every(row=>row.status==='passed'&&JSON.parse(row.owner).unit.startsWith('rsi-maintenance-')));
     assert(maintenanceRows.some(row=>row.kind==='tune'));
     // Kill only a live, blocked maintenance owner; status records factual failure after service closure.
@@ -68,7 +83,7 @@ test('public CPU CLI uses managed workers/KDB and preserves pause through contro
         const status=await f.run('status');
         return status.requests.find(row=>row.id===killedRequest.request)?.status==='failed';
       },undefined,10);
-      assert.equal(f.rows('SELECT COUNT(*) AS n FROM requests')[0].n,4);
+      assert.equal(f.rows('SELECT COUNT(*) AS n FROM requests')[0].n,5);
     } finally {process.kill(maintenanceKdb.owner.pid,'SIGCONT');}
     const running=f.start('campaign');
     await waitFor(async()=>{

@@ -373,10 +373,10 @@ export async function operate(command,config,options={},manager=managedRuntime) 
       const key=keyFor(job);startedJobs.add(key);
       const pending=Promise.resolve().then(operation).then(value=>{
         if(value.deferred)startedJobs.delete(key);else results.push(value);
+        if(!value.deferred)compress();
       });
       running.add(pending);activeJobs.set(pending,job);
       pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
-        compress();
         if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
     };
     for(const {identity,job} of retainedWorkers)track(job,async()=>{

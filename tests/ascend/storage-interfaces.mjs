@@ -138,7 +138,11 @@ test('compression batches skip missing and directory rows and still archive elig
   await writeFile(join(f.root,'removed.jsonl'),'closed then missing');
   const missing=await f.storage.register('removed.jsonl',{attempt:f.attempt.id,kind:'artifact'});
   await f.storage.seal(missing.id);await rm(join(f.root,'removed.jsonl'));
+  await writeFile(join(f.root,'second.jsonl'),'second durable evidence');
+  const second=await f.storage.register('second.jsonl',{attempt:f.attempt.id,kind:'artifact'});
   const result=await f.call({action:'compress'});
+  const archived=await Promise.all([f.row.id,second.id].map(async id=>{const row=f.storage.list().find(r=>r.id===id);return JSON.parse(await readFile(join(f.root,JSON.parse(row.descriptor).manifest),'utf8'));}));
+  assert.equal(archived[0].snapshot,archived[1].snapshot);
   assert.equal(result.find(row=>row.id===f.row.id).source_deleted,false);
   assert.equal(result.filter(row=>row.skipped).length,3);
   assert.equal((await f.call({action:'verify',artifact:f.row.id}))[0].verified,true);
@@ -184,4 +188,17 @@ test('standalone role sessions retain phase filters and seal only after writer c
   const sealed=await sealClosedArtifacts(f.config,{phase:'phase2'});
   assert.ok(sealed.includes(row.id));assert.equal(sealed.length,2);
   assert.equal((await f.call({action:'inspect',phase:'phase1',role:'curriculum'})).artifacts.length,0);
+});
+
+test('automatic maintenance submits no empty jobs and reuses a pending request',async t=>{
+  const f=await fixture(t,{finish:false});
+  const {queueCompression}=await import('../../cli/storage-maintenance.mjs');
+  const config={...f.config,storage:{enabled:true}};
+  assert.equal(await queueCompression(config,{manager:{}}),null);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,0);
+  f.state.db.prepare("INSERT INTO requests(id,kind,status) VALUES ('pending','storage','queued')").run();
+  assert.deepEqual(await queueCompression(config,{manager:{}}),{request:'pending',retained:true});
+  f.state.db.prepare("UPDATE requests SET status='passed' WHERE id='pending'").run();
+  assert.equal(await queueCompression(config,{manager:{}}),null);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,1);
 });

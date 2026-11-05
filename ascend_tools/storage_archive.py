@@ -120,14 +120,19 @@ def archive_files(paths, destination_directory):
     return dict(repository=str(repository), snapshot=snapshot, files=files)
 
 
+def compress_files(paths, destination_directory):
+    """Archive a batch once and publish durable per-file ledger references."""
+    manifests = archive_files(paths, destination_directory)['files']
+    for manifest in manifests:
+        key = hashlib.sha256(os.fsencode(manifest['source'])).hexdigest()
+        path = Path(manifest['repository']) / (key + '.manifest.json')
+        manifest['manifest_path'] = str(path)
+        _publish_json(path, manifest)
+    return manifests
+
+
 def compress_file(source, destination_directory):
-    """Single-artifact wrapper with a durable JSON reference, never custom chunks."""
-    manifest = archive_files([source], destination_directory)['files'][0]
-    key = hashlib.sha256(os.fsencode(manifest['source'])).hexdigest()
-    path = Path(manifest['repository']) / (key + '.manifest.json')
-    manifest['manifest_path'] = str(path)
-    _publish_json(path, manifest)
-    return manifest
+    return compress_files([source], destination_directory)[0]
 
 
 def iter_artifact_bytes(manifest):
