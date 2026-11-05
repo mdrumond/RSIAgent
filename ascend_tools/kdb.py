@@ -1,4 +1,4 @@
-"""Current-domain knowledge API over the retained indexed baseline format."""
+"""Current-domain knowledge API over the content-deduplicated binary index."""
 from __future__ import annotations
 
 from heapq import nsmallest
@@ -19,6 +19,24 @@ class KDB:
         self.db.connection.executescript("""
             CREATE TABLE IF NOT EXISTS knowledge_scopes (
                 collection TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT
+            );
+            CREATE TABLE IF NOT EXISTS repository_snapshots (
+                snapshot_key TEXT NOT NULL, collection TEXT NOT NULL UNIQUE,
+                active INTEGER NOT NULL, PRIMARY KEY(snapshot_key,collection)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS active_snapshot
+                ON repository_snapshots(snapshot_key) WHERE active=1;
+            CREATE TABLE IF NOT EXISTS generation_collections (
+                generation TEXT NOT NULL, collection TEXT NOT NULL,
+                PRIMARY KEY(generation,collection)
+            );
+            CREATE TABLE IF NOT EXISTS generations (revision TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS active_generation (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cited_chunks (
+                collection TEXT NOT NULL, chunk_id TEXT NOT NULL,
+                PRIMARY KEY(collection,chunk_id)
             );
             CREATE TABLE IF NOT EXISTS knowledge_events (
                 id INTEGER PRIMARY KEY, timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -44,6 +62,8 @@ class KDB:
         rows = self.db.connection.execute('''
             SELECT c.name, s.kind, s.target FROM collections c
             LEFT JOIN knowledge_scopes s ON c.name=s.collection
+            LEFT JOIN repository_snapshots r ON r.collection=c.name
+            WHERE r.active IS NULL OR r.active=1
         ''').fetchall()
         for row in rows:
             scoped_kind = row['kind'] or 'good'
@@ -94,6 +114,9 @@ class KDB:
                              score=-negative_score, vector_rank=rank,
                              lexical_rank=keyword_rank, lexical_score=None,
                              source_sha256=self.db.source_fingerprint(name, hit['path']).sha256))
+        with self.db.connection:
+            self.db.connection.executemany('INSERT OR IGNORE INTO cited_chunks VALUES(?,?)',
+                                           ((hit['collection'], hit['chunk_id']) for hit in hits))
         return hits
 
     def read_entry(self, collection: str, entry_id: str):
@@ -129,6 +152,61 @@ class KDB:
                 'INSERT OR IGNORE INTO knowledge_scopes VALUES(?,?,?)',
                 (collection, kind, target))
         return json.loads(manifest.to_json())
+
+    def replace_repo(self, snapshot_key: str, path: str, collection: str,
+                     language: str, target=None, kind='good', paths=None):
+        """Index before switching an active snapshot; old citations stay readable."""
+        existing = self.db.connection.execute(
+            'SELECT snapshot_key FROM repository_snapshots WHERE collection=?',
+            (collection,)).fetchone()
+        if existing and existing[0] != snapshot_key:
+            raise ValueError('collection belongs to a different snapshot key')
+        manifest = self.add_repo(path, collection, language, target, kind, paths)
+        with self.db.connection:
+            self.db.connection.execute(
+                'UPDATE repository_snapshots SET active=0 WHERE snapshot_key=?', (snapshot_key,))
+            self.db.connection.execute(
+                'INSERT INTO repository_snapshots VALUES(?,?,1) '
+                'ON CONFLICT(snapshot_key,collection) DO UPDATE SET active=1',
+                (snapshot_key, collection))
+        return manifest
+
+    def pin_generation(self, revision: str, collections):
+        """Freeze membership under an immutable memory Git revision."""
+        names = tuple(sorted(set(collections)))
+        for name in names:
+            self.db.manifest(name)
+        exists = self.db.connection.execute(
+            'SELECT 1 FROM generations WHERE revision=?', (revision,)).fetchone()
+        if exists and self.generation_collections(revision) != names:
+            raise ValueError('generation membership is immutable')
+        with self.db.connection:
+            self.db.connection.execute('INSERT OR IGNORE INTO generations VALUES(?)', (revision,))
+            self.db.connection.executemany(
+                'INSERT OR IGNORE INTO generation_collections VALUES(?,?)',
+                ((revision, name) for name in names))
+
+    def generation_collections(self, revision: str):
+        return tuple(row[0] for row in self.db.connection.execute(
+            'SELECT collection FROM generation_collections WHERE generation=? ORDER BY collection',
+            (revision,)))
+
+    def activate_generation(self, revision: str):
+        if not self.db.connection.execute(
+                'SELECT 1 FROM generations WHERE revision=?', (revision,)).fetchone():
+            raise KeyError(revision)
+        with self.db.connection:
+            self.db.connection.execute(
+                'INSERT INTO active_generation VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision', (revision,))
+
+    def release_generation(self, revision: str):
+        if self.db.connection.execute(
+                'SELECT 1 FROM active_generation WHERE revision=?', (revision,)).fetchone():
+            raise ValueError('cannot release the active generation')
+        with self.db.connection:
+            self.db.connection.execute('DELETE FROM generation_collections WHERE generation=?', (revision,))
+            self.db.connection.execute('DELETE FROM generations WHERE revision=?', (revision,))
 
     def record_lesson(self, lesson: str, outcome: str, applicability: str,
                       evidence: list[dict], attempt_id: str):
@@ -207,4 +285,7 @@ class KDB:
         digest = self.db.source_fingerprint(collection, row['path']).sha256
         if ref.get('sha256', digest) != digest:
             raise ValueError('evidence hash mismatch')
+        with self.db.connection:
+            self.db.connection.execute('INSERT OR IGNORE INTO cited_chunks VALUES(?,?)',
+                                       (collection, entry_id))
         return dict(collection=collection, entry_id=entry_id, **location, sha256=digest)
