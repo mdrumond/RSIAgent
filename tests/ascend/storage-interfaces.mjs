@@ -197,11 +197,11 @@ test('automatic maintenance submits no empty jobs and reuses a pending request',
   await writeFile(join(f.root,'vanished.log'),'retained then removed');
   const vanished=await f.storage.register('vanished.log',{kind:'cited-text'});
   await f.storage.seal(vanished.id);await rm(join(f.root,'vanished.log'));
-  assert.equal(await queueCompression(config,{manager:{}}),null);
+  assert.equal(await queueCompression(config),null);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,0);
   f.state.db.prepare("INSERT INTO requests(id,kind,status) VALUES ('pending','storage','queued')").run();
-  assert.deepEqual(await queueCompression(config,{manager:{}}),{request:'pending',retained:true});
+  assert.deepEqual(await queueCompression(config),{request:'pending',retained:true});
   f.state.db.prepare("UPDATE requests SET status='passed' WHERE id='pending'").run();
-  assert.equal(await queueCompression(config,{manager:{}}),null);
+  assert.equal(await queueCompression(config),null);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,1);
 });

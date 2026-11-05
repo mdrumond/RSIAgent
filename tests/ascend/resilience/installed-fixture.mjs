@@ -87,8 +87,6 @@ export async function runInstalledPackagingCase({
   remoteProfile = process.env.INSTALLED_REMOTE_PROFILE,
   signal, onCleanup, event = async () => {},
 } = {}) {
-  if(process.env.RSI_INSTALLED_MANAGED_TEST!=='1'||!process.env.RSI_TEST_SLICE?.startsWith('rsivalidation'))
-    throw new InstalledPrerequisiteError('Installed public CLI acceptance belongs to the explicit owned managed service test tier');
   assert.equal(typeof onCleanup, 'function', 'Runner cleanup context required');
   signal?.throwIfAborted();
   await installedPrerequisites(python, signal);
@@ -297,7 +295,6 @@ export async function runInstalledPackagingCase({
     fixture = await provider('interrupt', {nativeSession: async () =>
       rows(instance, 'SELECT session FROM attempts WHERE session IS NOT NULL LIMIT 1')[0]?.session});
     const settings = {
-      host_memory:{max_bytes:4*1024**3},managed_runtime:{slice:process.env.RSI_TEST_SLICE},
       baseline, skills, target: 'cpu', python, embedding_factory: 'installed_fixture:Embeddings',
       actor_seconds: 120, investigation_seconds: 120, curriculum_seconds: 30,
       concurrency: 1,

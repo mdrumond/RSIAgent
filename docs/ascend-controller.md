@@ -7,7 +7,7 @@ The supported implementation consists of:
 | Path | Responsibility |
 | --- | --- |
 | `controller/` | SQLite current state, admission, elapsed budgets, canonical Pi worker and recovery queue |
-| `cli/` | Bootstrap, configuration, continuous admission, managed services, pause/resume, KDB and tuning actions |
+| `cli/` | Bootstrap, configuration, continuous admission, process lifecycle, pause/resume, KDB and tuning actions |
 | `integrations/environments/` | User-configured local or CPL execution, source synchronization and durable execution handles |
 | `integrations/kdb-extension.mjs` | Native Pi MCP registration, correlated retrieval and bounded evidence |
 | `ascend_tools/` | Python KDB/BGE, shared MCP service, trusted target leaves and thin Flask dashboard |
@@ -43,7 +43,6 @@ Merge these portable policy settings into the private bootstrap profile:
 
 ```json
 {
-  "host_memory": {"max_bytes": 17179869184},
   "concurrency": "auto",
   "failed_recovery_rounds": 5,
   "pause_grace_seconds": 30,
@@ -82,14 +81,12 @@ Pure device-queue waiting, actor setup and data transfer are excluded from actor
 time; thinking, compilation, execution and profiling are charged. A configured
 campaign elapsed allocation also survives controller restarts.
 
-Public execution uses standard systemd user services and cgroup-v2 limits. The
-aggregate default is 16 GiB per host, configurable through `host_memory.max_bytes`.
-Controllers, KDB, workers and their compiler/test descendants share the aggregate;
-worker OOM does not terminate the controller. Concurrency starts at one until
-measured peaks justify expansion. See [host memory setup](host-memory.md).
-Remote execution contexts must independently prove their aggregate quota through
-the Pi/CPL extension; controller-host limits do not cover remote compiler memory.
-Unavailable enforcement blocks admission with a visible reason.
+Public commands run as ordinary Node and Python processes. The CLI starts workers
+and the instance KDB directly; no service-manager provisioning is required.
+After a controller interruption, explicitly invoke `resume` to continue from
+retained state. Native Pi sessions and elapsed allocations remain authoritative.
+Choose an explicit concurrency appropriate to the host and target resources.
+RSI does not install or enforce a shared host memory quota.
 
 A private bootstrap JSON file has this shape; replace the example paths with
 actual private paths before running it:

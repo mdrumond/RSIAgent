@@ -41,8 +41,8 @@ async function seededLease(f,owner,{terminal=true,unknown=false,held=false,recor
   }finally{state.close();}
 }
 
-// Managed scheduler crash, retained session/lease and native KDB continuity are
-// exercised by managed-cli.mjs using the actual service owner PID.
+// Public CLI interruption, explicit restart and native KDB continuity are also
+// exercised by public-cli.mjs. Lease reconciliation cases remain below.
 
 for(const scenario of ['active','live-owner','unknown-native','held-receipt'])test(`public wave retains ${scenario} lease`,
   {timeout:60000},async t=>{
