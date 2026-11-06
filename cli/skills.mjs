@@ -50,7 +50,8 @@ export async function run(config, values = {}) {
           }
           if (context.projectId && attempts.length) {
             const latest = attempts[0];
-            Object.assign(context, tuningTask({ state, attemptId: latest.id, phase: config.mode }));
+            const { events: _events, ...latestContext } = tuningTask({ state, attemptId: latest.id, phase: config.mode });
+            Object.assign(context, latestContext);
           }
         } finally { state.close(); }
       } catch (error) { if (error.code !== 'ENOENT') throw error; }

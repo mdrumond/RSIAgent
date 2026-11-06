@@ -222,6 +222,39 @@ test('manual CLI uses selected State events without increasing original cadence'
   assert.equal((await load(join(root, 'skills', 'evolution.json'))).history.length, 0);
 });
 
+test('manual CLI retains bounded project history when its latest attempt has just started', async t => {
+  const { State } = await import('../../controller/state.mjs');
+  const root = await fixture(t), current = { ...config, root, skills: { activeVersion: 'baseline' } };
+  await writeFile(join(root, 'instance.json'), JSON.stringify(current));
+  const state = new State(join(root, 'state.sqlite'));
+  state.add({ id: 'selected', goal: 'numeric', actor_seconds: 20 });
+  const old = state.admit('selected', { pid: 1 });
+  state.event(old.id, 'knowledge-retrieved', { kind: 'negative', evidence: 'retained-negative-case' });
+  state.event(old.id, 'skill-read', { stage: 'debug', evidence: 'used-guidance' });
+  state.recordFailure(old.id, { phase: 'implementation', kind: 'compile', message: 'observed unsupported operation',
+    evidence: [{ path: 'retained-compile.log' }] });
+  state.finish(old.id, 'failed');
+  state.db.prepare("UPDATE projects SET status='queued' WHERE id='selected'").run();
+  const latest = state.admit('selected', { pid: 1 });
+  const identity = { goal: '1'.repeat(64), startingSource: '2'.repeat(64),
+    verifier: '3'.repeat(64), targetRuntime: '4'.repeat(64) };
+  state.event(latest.id, 'skill-evidence-context', identity); state.close();
+  const action = join(root, 'manual-history.json');
+  await writeFile(action, JSON.stringify({ userinfo: 'repair', projectId: 'selected' }));
+  let input;
+  const { native } = nativeWriter(value => { input = value; });
+  const result = await lockedRun(current, { config: action, native, knowledge: knowledgeStub, modelRuntime: {}, model: {} });
+  assert.equal(result.evaluate, false);
+  assert.equal(input.context.id, latest.id); assert.equal(input.context.outcome, null);
+  assert.equal(input.context.completed, false); assert.deepEqual(input.context.comparisonIdentity, identity);
+  assert.ok(input.actualEvents.some(event => event.type === 'knowledge-retrieved' && event.data.evidence === 'retained-negative-case'));
+  assert.ok(input.actualEvents.some(event => event.type === 'skill-read' && event.data.stage === 'debug'));
+  assert.deepEqual(input.context.events.find(event => event.type === 'failure-recorded').data.evidence,
+    [{ path: 'retained-compile.log' }]);
+  assert.equal(input.context.events.length, 3);
+  assert.equal((await load(join(root, 'skills', 'evolution.json'))).history.length, 0);
+});
+
 test('Markdown baseline seeds protected entries and preserves original relative assets in candidate', async t => {
   const { stages } = await import('../../controller/workflow.mjs');
   const root = await fixture(t);

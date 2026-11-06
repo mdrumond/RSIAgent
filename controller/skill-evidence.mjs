@@ -19,6 +19,7 @@ export function environmentBinding(config, project, resource) {
   return { module: config.environment.module, mode: options.mode,
     target: metadata.target ?? options.target ?? 'local', runtime: metadata.runtime ?? options.runtime ?? null,
     product: metadata.product ?? null, profile: project.profile ?? null,
+    environmentHash: digest(Object.entries(options.env ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)),
     localHost: options.mode === 'local' ? [process.platform, process.arch, process.version] : null };
 }
 

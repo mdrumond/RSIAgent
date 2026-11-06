@@ -118,6 +118,32 @@ test('runtime binding ignores transient health but distinguishes named runtimes 
   assert.equal(environmentBinding({ environment: { options: { mode: 'cpl' } } }, {}), undefined);
 });
 
+test('execution environment overrides are ordered and hashed into the captured runtime identity', async t => {
+  const root = await fixture(t), source = join(root, 'source'), verifier = join(root, 'verify.py');
+  await mkdir(source); await writeFile(join(source, 'answer.py'), 'answer=42\n');
+  await writeFile(verifier, 'assert answer == 42\n');
+  const state = new State(join(root, 'state.sqlite')); t.after(() => state.close());
+  state.add({ id: 'p', goal: 'runtime identity', actor_seconds: 20, source,
+    verifier: { command: 'python ../verify.py', files: [verifier] } });
+  const project = state.project('p').spec, hashes = (await freezeFiles([verifier], source)).manifest;
+  const binding = env => environmentBinding({ environment: { module: 'binding.mjs', options: {
+    mode: 'cpl', target: 'target', runtime: 'named', env } } }, project);
+  const env = { LD_LIBRARY_PATH: '/runtime/one', SYNTHETIC_PRIVATE: 'fixture-only-private' };
+  const original = binding(env), reordered = binding({ SYNTHETIC_PRIVATE: env.SYNTHETIC_PRIVATE, LD_LIBRARY_PATH: env.LD_LIBRARY_PATH });
+  assert.deepEqual(original, reordered); assert.match(original.environmentHash, /^[a-f0-9]{64}$/);
+  assert.equal(Object.values(original).includes(env.SYNTHETIC_PRIVATE), false);
+  const identities = [];
+  for (const environmentIdentity of [original, binding({ ...env, LD_LIBRARY_PATH: '/runtime/two' })]) {
+    const attempt = state.admit('p', {});
+    identities.push(await recordSkillContext({ state, attemptId: attempt.id, project, verifierHashes: hashes, environmentIdentity }));
+    state.finish(attempt.id, 'failed');
+    state.db.prepare("UPDATE projects SET status='queued' WHERE id='p'").run();
+  }
+  assert.notEqual(identities[0].targetRuntime, identities[1].targetRuntime);
+  assert.deepEqual(selectSkillEvidence(task('new', 'failed', { comparisonIdentity: identities[1] }),
+    [task('old', 'passed', { comparisonIdentity: identities[0] })]).comparisons, {});
+});
+
 test('writer receives outcome and historical references; proposals retain them without evaluating', async t => {
   const root = await fixture(t), config = { mode: 'phase2', skills: { activeVersion: 'baseline' } };
   await mkdir(join(root, 'skills', 'versions', 'baseline'), { recursive: true });
