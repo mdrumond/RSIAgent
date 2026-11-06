@@ -216,3 +216,15 @@ test('actual machinery revision mismatch prevents instance creation',async()=>{
     {create:async()=>{creates++;}}),/Actual machinery must be clean/);
   assert.equal(creates,0);
 });
+
+test('external environment modules cannot bypass copied machinery validation',async()=>{
+  let creates=0;
+  for(const module of ['/old-instance/machinery/integrations/environments/ascend.mjs',
+    '../old-instance/machinery/integrations/environments/ascend.mjs']) {
+    const native={...profile,environment:{module,options:{target:'private-route',runtime:'private-runtime'}}};
+    await assert.rejects(bootstrapFreshCampaign({destination:'/not-created',campaignId:'fixture',target:'a3',
+      profile:native,phase2Projects,qualification:qualification()},
+      {create:async()=>{creates++;}}),/copied native Ascend environment/);
+  }
+  assert.equal(creates,0);
+});

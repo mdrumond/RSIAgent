@@ -2,6 +2,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
+import {isAbsolute,normalize} from 'node:path';
 import {bootstrap} from './instance.mjs';
 
 export const workloads=['fa','gdn','bsa','kimi_delta_attention','lact_ttt_chunk',
@@ -90,8 +91,9 @@ export function qualificationGate({localValidation,receipts,expected}) {
 
 const execute=promisify(execFile);
 export async function inspectCampaignLaunch(input) {
-  if(!input.profile.environment.module.endsWith('integrations/environments/ascend.mjs'))
-    throw new Error('Qualification requires the native Ascend environment');
+  const module=input.profile.environment.module;
+  if(typeof module!=='string'||isAbsolute(module)||normalize(module)!=='machinery/integrations/environments/ascend.mjs')
+    throw new Error('Qualification requires the copied native Ascend environment');
   const machinery=await realpath(input.profile.machinery??fileURLToPath(new URL('..',import.meta.url)));
   const git=async args=>(await execute('git',['-C',machinery,...args])).stdout.trim();
   if(await realpath(await git(['rev-parse','--show-toplevel']))!==machinery||
