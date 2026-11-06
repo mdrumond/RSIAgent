@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, rename, cp } from 'node:fs/promises';
 import { join, resolve, relative, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { stages } from './workflow.mjs';
+import { evaluateRound, positiveSeconds } from './evaluation-round.mjs';
 import { generateCandidate } from './skill-proposal.mjs';
 import { selectSkillEvidence } from './skill-evidence.mjs';
 export { generateCandidate };
@@ -38,8 +39,8 @@ export const candidateVersion = (state, active) => state.candidateBase === activ
 
 // Correctness improvements precede timing; every candidate correctness result must pass.
 export function evaluateDecision(results, projectIds, runs = 2) {
-  if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 2)
-    throw new Error('Require two distinct regression projects and at least two runs');
+  if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 1)
+    throw new Error('Require two distinct regression projects and a positive run count');
   const expected = projectIds.flatMap(projectId => Array.from({ length: runs }, (_, run) =>
     ['active', 'candidate'].map(arm => ({ projectId, run, arm })))).flat();
   if (results.length !== expected.length) return { promote: false, reason: 'inconclusive' };
@@ -54,6 +55,7 @@ export function evaluateDecision(results, projectIds, runs = 2) {
       return { promote: false, reason: 'inconclusive' };
     paired.push(result);
   }
+  if (runs < 2) return { promote: false, reason: 'insufficient-repetitions' };
   if (paired.some(r => r.arm === 'active' && r.correct === false))
     return { promote: true, reason: 'reliability-improvement' };
   if (paired.some(r => !Number.isFinite(r.score)))
@@ -129,10 +131,15 @@ async function writeVersion(root, entries, source) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock }) {
   signal?.throwIfAborted();
   const current = await json(configPath);
   const mode = task?.phase ?? config?.mode ?? current.mode;
+  if (current.skills?.evaluationSeconds !== undefined) positiveSeconds(current.skills.evaluationSeconds);
+  if (evaluationSeconds !== undefined) {
+    positiveSeconds(evaluationSeconds);
+    if (typeof allocationId !== 'string' || !allocationId.trim()) throw new Error('Additional allocation requires allocationId');
+  }
   if (current.skills?.tuningDisabled || mode === 'phase1') return { analyse: false, evaluate: false };
   if (config?.skills?.activeVersion !== current.skills?.activeVersion)
     throw new Error('Stale instance configuration');
@@ -148,6 +155,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   let recoveredPromotion;
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
+    state.evaluationStatus = 'completed';
+    state.lastEvaluationRoot = state.pending.evaluationRoot;
     state.pending = null;
     state.candidateBase = current.skills.activeVersion;
     await save(statePath, state, signal);
@@ -156,11 +165,29 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if ((state.candidate && state.candidateBase !== current.skills.activeVersion) ||
       (state.pending && state.pending.active !== current.skills.activeVersion)) {
     state.candidate = null; state.pending = null; state.candidateBase = current.skills.activeVersion;
+    state.evaluationStatus = 'deferred';
     await save(statePath, state, signal);
   }
   const every = current.tune_every ?? 8, pruneAfterTasks = current.skills?.pruneAfterTasks ?? 24;
   const decision = cadenceDecision(state.history, task, state.lastEvaluated, every, pruneAfterTasks);
-  if (!decision.analyse && !manual && !state.pending) return recoveredPromotion ?? decision;
+  const grant = evaluationSeconds !== undefined;
+  state.allocations ??= {};
+  if (grant && state.allocations[allocationId]) {
+    if (state.allocations[allocationId].seconds !== evaluationSeconds) throw new Error('Allocation ID already has different seconds');
+    if (!state.pending || state.allocations[allocationId].evaluationRoot !== state.pending.evaluationRoot)
+      return { ...decision, evaluate: false, evaluationStatus: state.evaluationStatus ?? 'completed', candidate: state.candidate };
+  }
+  if (!decision.analyse && !manual && !state.pending && !grant) return recoveredPromotion ?? decision;
+  const preparePending = (candidate, projectIds, fields = {}) => ({ active: current.skills.activeVersion, candidate,
+    projects: new Set(originals(state.history).map(x => x.projectId)).size, projectIds,
+    runs: current.skills?.runsPerArm ?? 2, evaluationSeconds: current.skills?.evaluationSeconds,
+    evaluationRoot: join(directory, 'evaluations', randomUUID()), sourceInstanceRoot: root,
+    config: { ...structuredClone(current), mode }, allocations: [], ...fields });
+  if (grant && !state.pending) {
+    if (!state.candidate) throw new Error('Prepare a skill candidate before allocating evaluation time');
+    const ids = current.skills?.tuningProjectIds ?? [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2);
+    state.pending = preparePending(state.candidate, ids);
+  }
   if (task?.phase === 'phase1') return { analyse: false, evaluate: false };
   const resumeIncoming = Boolean(state.pending) && (decision.analyse || manual);
   if (!state.pending) {
@@ -194,41 +221,52 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const candidate = await writeVersion(root, updated, source);
     signal?.throwIfAborted();
     state.history = history;
-    state.pending = shouldEvaluate ? { active, candidate, projects: new Set(counted.map(x => x.projectId)).size,
-      projectIds, proposalRoot, manual } : null;
+    state.pending = shouldEvaluate && current.skills?.evaluationSeconds !== undefined
+      ? preparePending(candidate, projectIds, { projects: new Set(counted.map(x => x.projectId)).size, proposalRoot, manual }) : null;
     state.candidate = candidate;
     state.candidateBase = active;
     await save(statePath, state, signal);
-    if (!shouldEvaluate) return { ...decision, analyse: true, evaluate: false, candidate };
-  }
-  if (typeof evaluate !== 'function') throw new Error('Canonical evaluator required');
-  const ids = state.pending.projectIds ?? current.skills?.tuningProjectIds ??
-    [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2);
-  const runs = current.skills?.runsPerArm ?? 2;
-  evaluateDecision([], ids, runs); // Validate design before executing any wave.
-  const pending = state.pending;
-  if (current.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
-  const results = [];
-  const evaluationRoot = join(directory, 'evaluations', randomUUID());
-  signal?.throwIfAborted();
-  await mkdir(evaluationRoot, { recursive: true });
-  await save(join(evaluationRoot, 'results.json'), results);
-  for (const projectId of ids) for (let run = 0; run < runs; run++) {
-    for (const arm of run % 2 ? ['candidate', 'active'] : ['active', 'candidate']) {
-      signal?.throwIfAborted();
-      const isolatedRoot = join(evaluationRoot, randomUUID());
-      const skillVersion = pending[arm];
-      const isolatedConfig = structuredClone(current);
-      isolatedConfig.root = isolatedRoot;
-      isolatedConfig.mode = mode;
-      isolatedConfig.skills = { ...isolatedConfig.skills, activeVersion: skillVersion, tuningDisabled: true };
-      const result = await evaluate({ instanceRoot: isolatedRoot, config: isolatedConfig,
-        sourceInstanceRoot: root, projectId, projectIds: ids, run, arm, skillVersion, signal });
-      results.push({ ...result, projectId, run, arm, instanceRoot: isolatedRoot });
-      await save(join(evaluationRoot, 'results.json'), results);
+    if (!state.pending) {
+      state.evaluationStatus = 'deferred';
+      await save(statePath, state, signal);
+      return { ...decision, analyse: true, evaluate: false, evaluationStatus: 'deferred', candidate };
     }
   }
-  signal?.throwIfAborted();
+  if (typeof evaluate !== 'function') throw new Error('Canonical evaluator required');
+  const pending = state.pending;
+  // Older pending records have no round journal; initialize them once, without adopting old results.
+  if (!pending.evaluationRoot) Object.assign(pending, preparePending(pending.candidate,
+    pending.projectIds ?? current.skills?.tuningProjectIds ??
+      [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2), pending));
+  const ids = pending.projectIds, runs = pending.runs;
+  evaluateDecision([], ids, runs);
+  if (current.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
+  if (grant && !state.allocations[allocationId]) {
+    const allocation = { id: allocationId, seconds: evaluationSeconds };
+    pending.allocations.push(allocation);
+    state.allocations[allocationId] = { seconds: evaluationSeconds, evaluationRoot: pending.evaluationRoot };
+  }
+  await save(statePath, state, signal);
+  const retainIncoming = async () => {
+    if (decision.analyse && !state.history.some(x => x.id === task?.id)) state.history.push(compactTask(task));
+    await save(statePath, state);
+  };
+  let round;
+  try {
+    round = await evaluateRound({ pending, config: pending.config, evaluate, signal, ...clock });
+  } catch (error) {
+    await retainIncoming();
+    throw error;
+  }
+  state.evaluationStatus = round.status;
+  state.lastEvaluationRoot = pending.evaluationRoot;
+  if (round.status !== 'completed') {
+    await retainIncoming();
+    return { promote: false, evaluate: false, evaluationStatus: round.status,
+      candidate: pending.candidate, evaluationRoot: pending.evaluationRoot };
+  }
+  const evaluationRoot = pending.evaluationRoot;
+  const results = round.samples.map(sample => ({ ...sample.result, ...sample, result: undefined }));
   const verdict = evaluateDecision(results, ids, runs);
   await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   if (verdict.promote) {
@@ -245,5 +283,5 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   await save(statePath, state, signal);
   if (resumeIncoming) return tune({ instanceRoot, config: await json(configPath), configPath,
     task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal });
-  return { ...verdict, candidate: pending.candidate, evaluationRoot };
+  return { ...verdict, evaluationStatus: 'completed', candidate: pending.candidate, evaluationRoot };
 }

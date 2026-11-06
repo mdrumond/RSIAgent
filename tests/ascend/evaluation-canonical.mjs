@@ -40,10 +40,10 @@ test('isolated evaluation runs its requested canonical project outside the produ
 });
 
 
-test('phase2 completed tasks write skills and run a real eight-arm canonical A/B round',{timeout:120000},async t=>{
+test('phase2 completed tasks write skills and run a real eight-arm canonical A/B round',{timeout:360000},async t=>{
   const f=await setup(t,'phase2',['unrelated','second']);
   const input=join(f.root,'phase2.json');
-  await writeFile(input,JSON.stringify({mode:'phase2',tune_every:2,curriculum:{phase2:['unrelated','second']}}));
+  await writeFile(input,JSON.stringify({mode:'phase2',tune_every:2,skills:{...(await readConfig(f.root)).skills,evaluationSeconds:300},curriculum:{phase2:['unrelated','second']}}));
   await f.run('config','--config',input);await f.run('wave','--mode','phase2');
   const status=await f.run('status');assert.ok(status.projects.every(p=>p.status==='passed'));
   const evolution=JSON.parse(await readFile(join(f.root,'skills','evolution.json'),'utf8'));

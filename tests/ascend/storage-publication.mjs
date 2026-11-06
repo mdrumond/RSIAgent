@@ -121,7 +121,7 @@ test('independent processes serialize Git writers without losing lessons',async 
 });
 test('existing skill writer records tune proposals and evaluation decisions through the new hooks',async t=>{
   const {config,state}=await fixture(t);
-  config.mode='phase2';config.skills.tuningProjectIds=['one','two'];
+  config.mode='phase2';config.skills.tuningProjectIds=['one','two'];config.skills.evaluationSeconds=30;
   await writeFile(join(config.root,'instance.json'),JSON.stringify(config));
   const {run}=await import('../../cli/skills.mjs');
   const {nativeWriter}=await import('./skill-proposal-fixture.mjs');

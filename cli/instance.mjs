@@ -20,7 +20,8 @@ export async function readConfig(root) {
 const within=(parent,child)=>{const rel=relative(parent,child);return rel==='' || (!rel.startsWith('..'+sep) && rel!=='..');};
 
 export async function bootstrap(destination,{baseline,skills,environment,projects=[],repository,
-  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,...settings}={}) {
+  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,signal,...settings}={}) {
+  signal?.throwIfAborted();
   destination=resolve(destination);machinery=await realpath(machinery);
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
   if (!['phase1','phase2','inference'].includes(mode)) throw new Error('Unknown mode');
@@ -39,7 +40,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   } finally {source.close();}
   if(legacy)await new Promise((ok,no)=>{
     const child=spawn(settings.python??'python',['-m','ascend_tools.kdb_import','--source',resolve(baseline),
-      '--destination',join(destination,'knowledge.sqlite')],{env:{...process.env,PYTHONPATH:machinery},stdio:['ignore','ignore','pipe']});
+      '--destination',join(destination,'knowledge.sqlite')],{signal,env:{...process.env,PYTHONPATH:machinery},stdio:['ignore','ignore','pipe']});
     let error='';child.stderr.setEncoding('utf8');child.stderr.on('data',data=>{error=(error+data).slice(-65536);});
     child.on('error',no);child.on('close',code=>code?no(new Error('Baseline KDB import failed: '+error)):ok());
   });
@@ -50,7 +51,8 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
   projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
-  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python);
+  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python,signal);
+  signal?.throwIfAborted();
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
@@ -61,7 +63,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     const campaign=await storage.initialize({target:config.target??null});
     config.storage={format:1,campaign_id:campaign.id};
     await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(
-      {...config,root:destination},ledger,{serialized:true});
+      {...config,root:destination},ledger,{serialized:true,signal});
   }finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
@@ -90,9 +92,11 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   } finally {ledger.close();if(staged)await rm(staged,{force:true});}
 }
 
-async function copyMachinery(machinery,release,install=true,python='python') {
+async function copyMachinery(machinery,release,install=true,python='python',signal) {
+  signal?.throwIfAborted();
   await mkdir(release);
   for (const item of ['controller','cli','ascend_tools','web','templates','scripts','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
+    signal?.throwIfAborted();
     const from=join(machinery,item);
     try {await stat(from);} catch(error) {if(error.code==='ENOENT')continue;throw error;}
     await cp(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))});
@@ -107,13 +111,13 @@ async function copyMachinery(machinery,release,install=true,python='python') {
     catch(error){if(error.code==='ENOENT')return;throw error;}
     await new Promise((ok,no)=>{
       const child=spawn(python,['-m','ascend_tools.restic_install','--install'],{
-        cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
+        signal,cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
       child.on('error',no);
       child.on('close',code=>code?no(new Error('Restic installation failed')):ok());
     });
     await new Promise((ok,no)=>{
       const child=spawn('npm',['ci','--ignore-scripts','--prefix',release],{
-        env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
+        signal,env:{...process.env,PATH:dirname(process.execPath)+delimiter+process.env.PATH},stdio:['ignore','ignore','pipe']});
       let error='';child.stderr.on('data',data=>error+=data);child.on('error',no);
       child.on('close',code=>code?no(new Error('Instance dependency installation failed: '+error)):ok());
     });

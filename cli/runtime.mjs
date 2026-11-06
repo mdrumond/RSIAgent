@@ -631,6 +631,12 @@ async function worker(root,id) {
 
 if(process.argv[1]===self) {
   const [command,root,arg]=process.argv.slice(2);
-  const operation=command==='worker'?worker(root,arg):readConfig(root).then(c=>(command==='campaign'?campaign:operate)(...(command==='campaign'?[c,JSON.parse(arg)]:[command,c,JSON.parse(arg)])));
-  operation.then(value=>console.log(JSON.stringify(value))).catch(error=>{console.error(error.stack);process.exitCode=1;});
+  // Internal evaluation dispatch stays within its caller's service cap. Forward
+  // termination cooperatively so operate sets stop and waits for its workers.
+  const controller=new AbortController(),stop=()=>controller.abort();
+  if(command!=='worker'){process.on('SIGTERM',stop);process.on('SIGINT',stop);}
+  const options=()=>({...JSON.parse(arg),signal:controller.signal});
+  const operation=command==='worker'?worker(root,arg):readConfig(root).then(c=>(command==='campaign'?campaign:operate)(...(command==='campaign'?[c,options()]:[command,c,options()])));
+  operation.then(value=>console.log(JSON.stringify(value))).catch(error=>{console.error(error.stack);process.exitCode=1;})
+    .finally(()=>{if(command!=='worker'){process.off('SIGTERM',stop);process.off('SIGINT',stop);}});
 }
