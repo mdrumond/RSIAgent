@@ -12,6 +12,7 @@ import time
 import torch
 from . import describe, digest, pack, validate_receipt
 from .inputs import call, inputs, tensors
+from .comparison import finite_comparison, native_reference
 
 
 def tensor_hash(values):
@@ -25,10 +26,12 @@ def atomic(path, value):
     temp.replace(path)
 
 
-def check(workload, actual, expected):
+def check(workload, actual, expected, native=None):
     spec, _, _ = pack(workload)
     if len(actual) != len(expected):
         raise ValueError('Output count changed')
+    if native is not None and len(native) != len(expected):
+        raise ValueError('Native reference output count changed')
     maximum = 0.
     for i, (a, e) in enumerate(zip(actual, expected)):
         if a.shape != e.shape or not torch.isfinite(a).all() or not torch.isfinite(e).all():
@@ -44,10 +47,12 @@ def check(workload, actual, expected):
         elif workload in ('fa','gdn','bsa'):
             passed = torch.allclose(a,e,atol=spec.get('atols',{}).get(dtype,threshold),rtol=threshold)
         else:
-            relative = error / (e.abs() + 1e-7)
-            passed = not relative.numel() or (relative.mean() < threshold and relative.max() < 10*threshold)
+            comparison = finite_comparison(actual[i], expected[i], threshold,
+                                           None if native is None else native[i])
+            passed = comparison['passed']
         if not passed:
-            raise ValueError(f'Numerical mismatch output {i}, max absolute error {maximum}')
+            detail = f'; comparison={comparison}' if workload not in ('fa','gdn','bsa','kimi_delta_attention') else ''
+            raise ValueError(f'Numerical mismatch output {i}, max absolute error {maximum}{detail}')
     return maximum
 
 
@@ -60,6 +65,7 @@ def execute_case(workload, case_id, device, warmup=5, repeats=20):
         expected_args = args # Their original reference explicitly computes FP32; independent small checks are separate.
     reference_before=tensor_hash([a for a in args if isinstance(a,torch.Tensor)])
     expected = tensors(call(workload,module,expected_args,kwargs,oracle=workload not in ('gdn','bsa')))
+    native = native_reference(workload,module,args,kwargs)
     if reference_before != tensor_hash([a for a in args if isinstance(a,torch.Tensor)]):
         raise ValueError('CPU reference mutated input')
     actual_args = [a.to(device) if isinstance(a,torch.Tensor) else a for a in args]
@@ -70,7 +76,7 @@ def execute_case(workload, case_id, device, warmup=5, repeats=20):
         raise ValueError('Target baseline returned CPU output')
     if before != tensor_hash([a for a in actual_args if isinstance(a,torch.Tensor)]):
         raise ValueError('Baseline mutated input')
-    maximum = check(workload,actual,expected)
+    maximum = check(workload,actual,expected,native)
     for _ in range(warmup):
         call(workload,module,actual_args,kwargs)
     synchronize(); samples=[]
