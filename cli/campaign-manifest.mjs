@@ -20,6 +20,8 @@ export function buildCampaignManifest({campaignId,target,profile,phase2Projects}
     projects:_projects,curriculum:_curriculum,storage:_storage,root:_root,revision:_revision,
     baselineKDB:_baseline,skillSettings,...settings}=structuredClone(profile);
   const {evaluationSeconds:_evaluation,...skillPolicy}=skillSettings??{};
+  if(/(?:^|\/)integrations\/environments\/ascend\.mjs$/.test(settings.environment.module??''))
+    settings.environment.options={...settings.environment.options,profile:target};
   const plan=[],projects=[];
   for(let round=1;round<=16;round++) {
     const prefix=`${campaignId}-${target}-r${String(round).padStart(2,'0')}`;
@@ -35,7 +37,7 @@ export function buildCampaignManifest({campaignId,target,profile,phase2Projects}
   return {...settings,mode:'phase1',target,campaign_cohort:campaignId,
     kernel_language:target==='a3'?'triton':'catlass-dsl',actor_seconds:7200,curriculum_seconds:1800,
     campaign_seconds:seconds,recovery:false,concurrency:8,tune_every:1,campaign_plan:plan,projects,
-    skillSettings:{...skillPolicy,activeVersion:'baseline',tuningDisabled:false,background:true,runsPerArm:2,
+    skillSettings:{...skillPolicy,activeVersion:'baseline',tuningDisabled:false,background:true,archiveEvaluations:true,runsPerArm:2,
       tuningProjectIds:projects.slice(0,2).map(project=>project.id)},
     curriculum:{phase1:[],phase2:projects.map(project=>project.id),generation:{enabled:true,topics,
       by_phase:{phase1:{enabled:true},phase2:{enabled:false}}}}};
