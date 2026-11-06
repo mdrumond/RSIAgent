@@ -13,6 +13,7 @@ import torch
 from . import describe, digest, file_hash, pack, validate_receipt
 from .inputs import call, inputs, tensors
 from .qualification import atomic, check, tensor_hash
+from .comparison import native_reference
 
 
 def load_candidate(path):
@@ -32,7 +33,7 @@ def structure(value):
     raise ValueError('Output must contain only tensors and optional None states')
 
 
-def output_check(workload,result,reference,args,device):
+def output_check(workload,result,reference,args,device,native=None):
     if structure(result)!=structure(reference):raise ValueError('Output/state structure differs')
     actual=tensors(result);expected=tensors(reference)
     if any(t.device.type!=device.split(':')[0] for t in actual):raise ValueError('Candidate returned output on the wrong device')
@@ -42,7 +43,7 @@ def output_check(workload,result,reference,args,device):
     elif workload=='sparse_lightning_indexer_grad_kl_loss_enhance':dtypes=[torch.float32]*4
     else:dtypes=[args[0].dtype]*len(actual)
     if [a.dtype for a in actual]!=dtypes:raise ValueError('Candidate output dtype differs from contract')
-    return check(workload,actual,expected)
+    return check(workload,actual,expected,native)
 
 
 def evaluate(workload,candidate,*,device='cpu',performance=False,case_ids=None,build=inputs,
@@ -63,13 +64,14 @@ def evaluate(workload,candidate,*,device='cpu',performance=False,case_ids=None,b
         ref_args=[a.double() if isinstance(a,torch.Tensor) and a.is_floating_point() else a for a in args]
         if workload in ('gdn','bsa','sparse_lightning_indexer_grad_kl_loss_enhance'):ref_args=args
         reference=call(workload,module,ref_args,kwargs,oracle=workload not in ('gdn','bsa'))
+        native=native_reference(workload,module,args,kwargs)
         if original!=tensor_hash([a for a in args if isinstance(a,torch.Tensor)]):raise ValueError('Reference mutated input')
         placed=[a.to(device) if isinstance(a,torch.Tensor) else a for a in args]
         before=tensor_hash([a for a in placed if isinstance(a,torch.Tensor)])
         operation=lambda:candidate(*placed,**kwargs)
         result=operation();sync()
         if before!=tensor_hash([a for a in placed if isinstance(a,torch.Tensor)]):raise ValueError('Candidate mutated input')
-        error=output_check(workload,result,reference,placed,device)
+        error=output_check(workload,result,reference,placed,device,native)
         baseline=lambda:call(workload,module,placed,kwargs)
         row={'id':case['case_id'],'passed':True,'maxAbsError':error,'inputHash':before,
              'referenceHash':tensor_hash(tensors(reference)),'outputHash':tensor_hash(tensors(result))}
@@ -83,7 +85,7 @@ def evaluate(workload,candidate,*,device='cpu',performance=False,case_ids=None,b
                     output,duration=measure(label,function)
                     if not math.isfinite(duration) or duration<=0:raise ValueError('Nonpositive or nonfinite timing')
                     (baseline_times if label=='baseline' else candidate_times).append(duration)
-                    if label=='candidate':output_check(workload,output,reference,placed,device)
+                    if label=='candidate':output_check(workload,output,reference,placed,device,native)
             row.update(baselineSeconds=baseline_times,candidateSeconds=candidate_times,
                        speedup=statistics.median(baseline_times)/statistics.median(candidate_times))
         if before!=tensor_hash([a for a in placed if isinstance(a,torch.Tensor)]):raise ValueError('Candidate or baseline mutated input')
