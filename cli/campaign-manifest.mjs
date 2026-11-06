@@ -23,11 +23,11 @@ export function buildCampaignManifest({campaignId,target,profile,phase2Projects}
   const plan=[],projects=[];
   for(let round=1;round<=16;round++) {
     const prefix=`${campaignId}-${target}-r${String(round).padStart(2,'0')}`;
-    plan.push({id:prefix+'-p1',phase:'phase1',new_projects:8,generation:{
+    plan.push({id:prefix+'-p1',phase:'phase1',new_projects:8,actor_seconds:7200,generation:{
       topics:[simt,...topics.filter((_topic,index)=>index!==Math.floor((round-1)/2))],
       requirements:{[simt]:{performance:true,capabilityEvidence:true,comparison:'non-simt-or-vector'}}}});
     const selected=round<=7?[round-1]:repeats[round-8];
-    const entry={id:prefix+'-p2',phase:'phase2',new_projects:selected.length};plan.push(entry);
+    const entry={id:prefix+'-p2',phase:'phase2',new_projects:selected.length,actor_seconds:28800};plan.push(entry);
     for(const index of selected)projects.push({...structuredClone(phase2Projects[workloads[index]]),
       id:entry.id+'-'+workloads[index],phase:'phase2',campaign_entry:entry.id,
       campaign_workload:workloads[index],actor_seconds:28800});
@@ -44,8 +44,11 @@ export function buildCampaignManifest({campaignId,target,profile,phase2Projects}
 export function campaignEntryConfig(config,entryId) {
   const entry=config.campaign_plan.find(item=>item.id===entryId);
   if(!entry)throw new Error('Unknown campaign entry');
-  return {...config,mode:entry.phase,actor_seconds:entry.phase==='phase1'?7200:28800,
-    curriculum:{...config.curriculum,generation:{...config.curriculum.generation,...entry.generation}}};
+  const generation={...config.curriculum?.generation,...entry.generation};
+  if(entry.generation)generation.by_phase={...generation.by_phase,
+    [entry.phase]:{...generation.by_phase?.[entry.phase],...entry.generation}};
+  return {...config,mode:entry.phase,actor_seconds:entry.actor_seconds??config.actor_seconds,
+    curriculum:{...config.curriculum,generation}};
 }
 
 export function qualificationGate({localValidation,receipts,expected}) {
@@ -60,6 +63,9 @@ export function qualificationGate({localValidation,receipts,expected}) {
       ['sourceHash','caseHash','verifierHash'].some(key=>!contract[key]||receipt[key]!==contract[key])||
       !contract.runtimeFingerprint||receipt.runtime?.fingerprint!==contract.runtimeFingerprint)
       throw new Error(`Qualification binding mismatch: ${target}/${workload}`);
+    if(!contract.independentCheckHash||receipt.independentChecks?.passed!==true||
+      receipt.independentChecks.workload!==workload||receipt.independentChecks.checkerHash!==contract.independentCheckHash)
+      throw new Error(`Independent reference qualification missing: ${target}/${workload}`);
     const ids=contract.caseIds;
     if(!Array.isArray(ids)||!ids.length||new Set(ids).size!==ids.length||
       !Array.isArray(receipt.cases)||receipt.cases.length!==ids.length||

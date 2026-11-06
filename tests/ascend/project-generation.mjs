@@ -48,8 +48,51 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
       metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
   const options={config,state,path:join(root,'drafts'),bridge:{extension:()=>{}},concurrency:1};
-  return {options,state,config,requests,verifierContent,waitStarted,unpause:()=>{pause=false;pauseAfterRejection=false;}};
+  return {options,state,config,requests,verifierContent,waitStarted,unpause:()=>{pause=false;pauseAfterRejection=false;},
+    setPerformance:(goal,command)=>{performanceGoal=goal;performanceCommand=command;separateCommand=true;}};
 }
+
+function topicQuota(f,topics) {
+  f.config.campaign_plan=[{id:'batch',phase:'phase1',new_projects:topics.length,actor_seconds:7200,
+    generation:{topics,requirements:{SIMT:{performance:true,capabilityEvidence:true,comparison:'non-simt-or-vector'}}}}];
+  f.config.kernel_language='triton';
+}
+
+test('entry topic quotas stage one SIMT benchmark and seven distinct projects without running device timing',async t=>{
+  const performanceGoal={comparison:'vector baseline'},performanceCommand='isolated-target-timing';
+  const f=await fixture(t,{performanceGoal,performanceCommand,separateCommand:true});
+  const topics=['SIMT','layout','fusion','reduction','softmax','matmul','pipeline','sparse'];topicQuota(f,topics);
+  f.config.curriculum.generation.by_phase={phase1:{topics:['stale'],requirements:{SIMT:{performance:false}}}};
+  const specs=await refillProjects({...f.options,concurrency:8});
+  assert.deepEqual(specs.map(spec=>spec.generation.topic),topics);
+  assert.ok(specs.every(spec=>spec.actor_seconds===7200&&spec.campaign_entry==='batch'));
+  assert.deepEqual(specs[0].performance_goal,performanceGoal);
+  assert.equal(specs[0].verifier.performance_command,performanceCommand);
+  assert.equal(specs[0].generation.requirements.capabilityEvidence,true);
+  assert.ok(specs[0].generation.checks.every(check=>check.command!==performanceCommand));
+  const before=f.requests.length;
+  assert.deepEqual((await refillProjects({...f.options,concurrency:8})).map(spec=>spec.id),specs.map(spec=>spec.id));
+  assert.equal(f.requests.length,before);
+  for(const spec of specs)f.state.add(spec);
+  assert.deepEqual(await refillProjects({...f.options,concurrency:8}),[]);
+});
+
+test('missing SIMT acceptance is rejected; invalid and exhausted drafts do not consume its topic',async t=>{
+  const f=await fixture(t);topicQuota(f,['SIMT','reduction']);
+  assert.deepEqual(await refillProjects(f.options),[]);
+  const failed=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(row=>JSON.parse(row.data));
+  assert.equal(failed.length,2);assert.ok(failed.every(draft=>draft.status==='invalid'&&draft.topic==='SIMT'));
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
+  const prior={...failed[0],status:'draft',seconds:1,elapsed:1};
+  f.state.db.prepare('UPDATE generation_drafts SET data=? WHERE id=?').run(JSON.stringify(prior),prior.id);
+  f.setPerformance('compare supported SIMT mapping','target-benchmark');
+  const [replacement]=await refillProjects(f.options);
+  assert.equal(replacement.generation.topic,'SIMT');assert.notEqual(replacement.id,prior.id);
+  f.state.add(replacement);
+  const [last]=await refillProjects(f.options);assert.equal(last.generation.topic,'reduction');
+  const retained=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(prior.id).data);
+  assert.equal(retained.status,'exhausted');assert.equal(retained.seconds,1);assert.equal(retained.elapsed,1);
+});
 
 test('native Pi constructs projects; real Python controls gate staged specs without original quota',async t=>{
   const f=await fixture(t),specs=await refillPhase1(f.options);
