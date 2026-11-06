@@ -131,10 +131,10 @@ async function writeVersion(root, entries, source) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock, background = false, evidenceTasks = [], backgroundSeconds, backgroundResource }) {
   signal?.throwIfAborted();
   const current = await json(configPath);
-  const mode = task?.phase ?? config?.mode ?? current.mode;
+  const mode = background ? 'phase2' : task?.phase ?? config?.mode ?? current.mode;
   if (current.skills?.evaluationSeconds !== undefined) positiveSeconds(current.skills.evaluationSeconds);
   if (evaluationSeconds !== undefined) {
     positiveSeconds(evaluationSeconds);
@@ -168,6 +168,11 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     state.evaluationStatus = 'deferred';
     await save(statePath, state, signal);
   }
+  if (background && !state.pending) {
+    for (const prior of evidenceTasks)
+      if (completed(prior) && prior.id !== task?.id && !state.history.some(item => item.id === prior.id))
+        state.history.push(compactTask(prior));
+  }
   const every = current.tune_every ?? 8, pruneAfterTasks = current.skills?.pruneAfterTasks ?? 24;
   const decision = cadenceDecision(state.history, task, state.lastEvaluated, every, pruneAfterTasks);
   const grant = evaluationSeconds !== undefined;
@@ -180,9 +185,9 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   if (!decision.analyse && !manual && !state.pending && !grant) return recoveredPromotion ?? decision;
   const preparePending = (candidate, projectIds, fields = {}) => ({ active: current.skills.activeVersion, candidate,
     projects: new Set(originals(state.history).map(x => x.projectId)).size, projectIds,
-    runs: current.skills?.runsPerArm ?? 2, evaluationSeconds: current.skills?.evaluationSeconds,
+    runs: current.skills?.runsPerArm ?? 2, evaluationSeconds: background ? positiveSeconds(backgroundSeconds) : current.skills?.evaluationSeconds,
     evaluationRoot: join(directory, 'evaluations', randomUUID()), sourceInstanceRoot: root,
-    config: { ...structuredClone(current), mode }, allocations: [], ...fields });
+    config: { ...structuredClone(current), mode }, ...(background ? { resource: backgroundResource } : {}), allocations: [], ...fields });
   if (grant && !state.pending) {
     if (!state.candidate) throw new Error('Prepare a skill candidate before allocating evaluation time');
     const ids = current.skills?.tuningProjectIds ?? [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2);
@@ -201,7 +206,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       (current.skills?.tuningProjectIds !== undefined || projectIds.length >= 2));
     const active = current.skills?.activeVersion;
     if (!/^[a-zA-Z0-9-]+$/.test(active ?? '')) throw new Error('Instance requires an active skill version');
-    const source = join(directory, 'versions', state.candidate ?? active);
+    const source = join(directory, 'versions', background ? active : state.candidate ?? active);
     const entries = await readEntries(source);
     const proposalRoot = join(directory, 'proposals', randomUUID());
     await mkdir(proposalRoot, { recursive: true });
@@ -221,7 +226,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     const candidate = await writeVersion(root, updated, source);
     signal?.throwIfAborted();
     state.history = history;
-    state.pending = shouldEvaluate && current.skills?.evaluationSeconds !== undefined
+    state.pending = shouldEvaluate && (background || current.skills?.evaluationSeconds !== undefined)
       ? preparePending(candidate, projectIds, { projects: new Set(counted.map(x => x.projectId)).size, proposalRoot, manual }) : null;
     state.candidate = candidate;
     state.candidateBase = active;
@@ -267,21 +272,27 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   }
   const evaluationRoot = pending.evaluationRoot;
   const results = round.samples.map(sample => ({ ...sample.result, ...sample, result: undefined }));
-  const verdict = evaluateDecision(results, ids, runs);
+  let verdict = evaluateDecision(results, ids, runs);
   await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   if (verdict.promote) {
     const latest = await json(configPath);
-    if (latest.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
-    latest.skills.activeVersion = pending.candidate;
-    latest.revision = (latest.revision ?? 0) + 1;
-    await save(configPath, latest, signal);
-    state.candidateBase = latest.skills.activeVersion;
+    if (latest.skills.activeVersion !== pending.active) {
+      if (!background) throw new Error('Active skills changed during evaluation');
+      verdict = { promote: false, reason: 'superseded' };
+    } else {
+      latest.skills.activeVersion = pending.candidate;
+      latest.revision = (latest.revision ?? 0) + 1;
+      await save(configPath, latest, signal);
+      state.candidateBase = latest.skills.activeVersion;
+    }
   }
   signal?.throwIfAborted();
   if (!pending.manual) state.lastEvaluated = pending.projects;
   state.pending = null;
   await save(statePath, state, signal);
-  if (resumeIncoming) return tune({ instanceRoot, config: await json(configPath), configPath,
+  if (resumeIncoming && !background) return tune({ instanceRoot, config: await json(configPath), configPath,
     task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal });
+  if (background && verdict.reason === 'superseded')
+    await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   return { ...verdict, evaluationStatus: 'completed', candidate: pending.candidate, evaluationRoot };
 }
