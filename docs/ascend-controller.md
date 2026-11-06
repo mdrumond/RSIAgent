@@ -342,3 +342,11 @@ the extracted target guide for the exact supported ABI and failure reports.
 
 Historical documents elsewhere in `docs/` remain research records and may refer
 to removed entrypoints. This guide and the README describe the supported source.
+
+## Small local Python acceptance
+
+`examples/local-python/README.md` describes a CPU-only acceptance path for skill
+evolution using tiny Python workloads, the production native controller and
+isolated evaluator, and independent frozen verifiers. Its deterministic provider
+is local and free of API charges. An explicitly opted-in real-provider experiment
+uses the same workloads with private configuration and separate retained evidence.

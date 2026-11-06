@@ -25,7 +25,7 @@ function workflow({pass, interrupt}) {
   }
   return calls;
 }
-export async function provider(scenario, {nativeSession} = {}) {
+export async function provider(scenario, {nativeSession, workflowForGoal, resolveCall, writerChanges} = {}) {
   const requests = [], failures = [], plans = new Map();
   let originals = 0, writers = 0;
   const server = createServer(async (req,res) => {
@@ -74,19 +74,20 @@ export async function provider(scenario, {nativeSession} = {}) {
         } else if (prompt.startsWith('Read current-guidance.json')) {
           plan=[tool('read',{path:'current-guidance.json'}),tool('read',{path:'current-usage.json'}),
             tool('mcp__kdb__search',{query:'independent numeric oracle',kind:'good',limit:1}),
-            tool('submit_changes',{changes:writers++===0?[{action:'upsert',id:'numeric-oracle',scope:'debug',
+            tool('submit_changes',{changes:writerChanges ? writerChanges(writers++) : writers++===0?[{action:'upsert',id:'numeric-oracle',scope:'debug',
               text:'Use the independent numeric oracle before accepting a candidate.',critical:false,negative:false}]:[]})];
         } else if (prompt.startsWith('Goal:')) {
           const unrelated = prompt.includes('Goal: unrelated');
           const small = prompt.includes('Goal: SMALL');
           const pass = unrelated || scenario === 'phase2' || scenario === 'interrupt' || (scenario !== 'freeze' && (small || originals++ > 0));
-          plan = workflow({pass,interrupt:scenario === 'interrupt'&&!unrelated});
+          plan = workflowForGoal ? workflowForGoal(prompt) : workflow({pass,interrupt:scenario === 'interrupt'&&!unrelated});
         } else throw new Error(`Unknown scripted conversation: ${prompt.slice(0,100)}`);
         plans.set(key,plan);
       }
       const plan = plans.get(key);
       if (!plan) throw new Error('Conversation has no frozen script');
-      const call = plan[count];
+      const call = resolveCall ? await resolveCall(plan[count], body) : plan[count];
+      if (call === false) return; // An interruption fixture deliberately withholds this response.
       if (call && !body.tools?.some(t => t.function?.name === call.name)) throw new Error(`Missing native tool ${call.name}`);
       res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache'});
       const frame = (delta,finish_reason=null) => res.write('data: '+JSON.stringify({id:'chatcmpl-fixture',

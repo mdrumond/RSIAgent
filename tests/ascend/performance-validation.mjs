@@ -14,6 +14,9 @@ import { State,validateAcceptance } from '../../controller/state.mjs';
 import { runAttempt } from '../../controller/pi.mjs';
 import { stages } from '../../controller/workflow.mjs';
 
+const python = process.env.PYTHON ?? process.env.DRIVER_PYTHON ?? 'python3.12';
+const quote = text => "'" + text.replaceAll("'", "'\\''") + "'";
+
 test('performance goals require a frozen command before project or actor admission',async()=>{
   const state=new State(':memory:');
   const project={id:'p',goal:'numeric',actor_seconds:30,performance_goal:'meet the frozen speed criterion',
@@ -36,7 +39,7 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
     calls.push(['rsi_skill',{}]);
     if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])
       calls.push(['rsi_knowledge',{query:'prior facts',kind}]);
-    if(stage==='implementation')calls.push(['rsi_target',{command:'python3.12 -c "print(42)"'}]);
+    if(stage==='implementation')calls.push(['rsi_target',{command:`${quote(python)} -c "print(42)"`}]);
     if(stage==='validation') {calls.push(['rsi_verify',{}]);if(!accepted)break;}
     calls.push(['rsi_advance',{reflection:'Use independent numeric and performance criteria.'}]);
   }
@@ -66,7 +69,7 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
     }
     state.add({id:'p',goal:'Return the correct number',actor_seconds:30,source,
       performance_goal:'meet the frozen speed criterion',verifier:{files:[numeric,performance],
-        command:'PYTHONDONTWRITEBYTECODE=1 python3.12 ../numeric.py',performance_command:'python3.12 ../performance.py'}});
+        command:`PYTHONDONTWRITEBYTECODE=1 ${quote(python)} ../numeric.py`,performance_command:`${quote(python)} ../performance.py`}});
     const attempt=state.admit('p',{pid:process.pid});
     const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
     runtime.registerProvider('performance-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{
@@ -93,7 +96,7 @@ for(const scenario of ['perf-miss','numeric-fail','perf-pass'])test(scenario,{ti
     assert.deepEqual(returnedVerification.performance,verdict.performance);
     const checks=[returnedVerification.correctness,returnedVerification.performance].filter(check=>check?.evidence);
     for(const check of checks)assert.equal(check.evidence_sha256,createHash('sha256').update(await readFile(check.evidence)).digest('hex'));
-    const recorded=await promisify(execFile)(process.env.PYTHON??'python3.12',['-c',`
+    const recorded=await promisify(execFile)(python,['-c',`
 import asyncio,json,os,sys
 from mcp import ClientSession,StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -121,7 +124,7 @@ asyncio.run(main())
 for(const reason of ['elapsed','external'])test(`default native bash stops on ${reason} abort without target dispatch`,{timeout:10000},async()=>{
   const root=await mkdtemp(join(tmpdir(),'native-bash-abort-')),source=join(root,'source');await mkdir(source);
   const state=new State(join(root,'state.sqlite')),abort=new AbortController();let dispatches=0;
-  const command=`python3 -c "import os,time;open('local.pid','w').write(str(os.getpid()));time.sleep(30)"`;
+  const command=`${quote(python)} -c "import os,time;open('local.pid','w').write(str(os.getpid()));time.sleep(30)"`;
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
     const called=body.messages.some(m=>m.role==='tool');res.writeHead(200,{'Content-Type':'text/event-stream'});
@@ -133,7 +136,7 @@ for(const reason of ['elapsed','external'])test(`default native bash stops on ${
     const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
     runtime.registerProvider('abort-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
     await runtime.setRuntimeApiKey('abort-fixture','fixture-only');
-    state.add({id:'p',source,goal:'Bounded local operation',actor_seconds:reason==='elapsed'?.2:10,verifier:{files:[],command:'true'}});
+    state.add({id:'p',source,goal:'Bounded local operation',actor_seconds:reason==='elapsed'?2:10,verifier:{files:[],command:'true'}});
     const attempt=state.admit('p',{});
     const running=runAttempt({state,attempt,project:state.project('p').spec,attemptPath:join(root,'attempt'),signal:abort.signal,
       environmentFactory:async()=>({prepare:async()=>{},execute:async()=>{dispatches++;throw Error('unexpected target dispatch');}}),
