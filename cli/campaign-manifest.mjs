@@ -1,3 +1,8 @@
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {realpath} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import {isAbsolute,normalize,resolve} from 'node:path';
 import {bootstrap} from './instance.mjs';
 
 export const workloads=['fa','gdn','bsa','kimi_delta_attention','lact_ttt_chunk',
@@ -84,8 +89,30 @@ export function qualificationGate({localValidation,receipts,expected}) {
   return {sourceRevision:localValidation.sourceRevision,qualified:14};
 }
 
-// All callers use the same fresh-instance copying/storage contract as the normal CLI.
-export async function bootstrapFreshCampaign({destination,qualification,...input},{create=bootstrap}={}) {
+const execute=promisify(execFile);
+export async function inspectCampaignLaunch(input) {
+  const module=input.profile.environment.module;
+  if(typeof module!=='string'||isAbsolute(module)||normalize(module)!=='machinery/integrations/environments/ascend.mjs')
+    throw new Error('Qualification requires the copied native Ascend environment');
+  const machinery=await realpath(input.profile.machinery??fileURLToPath(new URL('..',import.meta.url)));
+  const git=async args=>(await execute('git',['-C',machinery,...args])).stdout.trim();
+  if(await realpath(await git(['rev-parse','--show-toplevel']))!==machinery||
+    await git(['rev-parse','HEAD'])!==input.qualification.localValidation.sourceRevision||
+    await git(['status','--porcelain','--untracked-files=all']))
+    throw new Error('Actual machinery must be clean and match the locally validated revision');
+  const inspection={...input,phase2Projects:Object.fromEntries(Object.entries(input.phase2Projects).map(([id,project])=>
+    [id,{...project,source:resolve(project.source),verifier:{...project.verifier,files:project.verifier.files.map(file=>resolve(file))}}]))};
+  const child=execFile(input.profile.python??'python3',['-m','ascend_tools.campaign_launch'],
+    {cwd:machinery,env:{...process.env,PYTHONPATH:machinery},maxBuffer:1024*1024});
+  child.stdin.end(JSON.stringify(inspection));
+  await new Promise((resolve,reject)=>{child.on('error',reject);child.on('close',code=>
+    code===0?resolve():reject(new Error('Actual frozen campaign inputs failed qualification inspection')));});
+}
+
+// Inspect actual copied machinery and verifier files before creating any destination.
+export async function bootstrapFreshCampaign({destination,qualification,...input},{create=bootstrap,inspect=inspectCampaignLaunch}={}) {
   qualificationGate(qualification);
-  return create(destination,buildCampaignManifest(input));
+  const manifest=buildCampaignManifest(input);
+  await inspect({...input,qualification});
+  return create(destination,manifest);
 }

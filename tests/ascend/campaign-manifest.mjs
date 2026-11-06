@@ -125,7 +125,7 @@ test('launch gate rejects stale local checks and missing, mismatched, failed or 
   const inputs=[];
   for(const target of ['a3','a5'])await bootstrapFreshCampaign({destination:'/new/'+target,
     campaignId:'fresh-study',target,profile,phase2Projects,qualification:qualification()},
-  {create:async(destination,config)=>inputs.push({destination,config})});
+  {inspect:async()=>{},create:async(destination,config)=>inputs.push({destination,config})});
   assert.deepEqual(inputs.map(input=>input.destination),['/new/a3','/new/a5']);
   assert.notEqual(inputs[0].config,inputs[1].config);
   assert.equal(inputs.every(input=>input.config.baseline===profile.baseline&&input.config.skills===profile.skills),true);
@@ -191,4 +191,40 @@ test('catalog reads immutable prior source from both fresh targets, withholding 
   await tool.execute('call',{action:'select',starter:'baseline'});assert.deepEqual(events.at(-1).data,{starter:'baseline'});
   assert.equal(await readFile(join(campaigns[0].root,'instance.json'),'utf8'),before);
   await assert.rejects(buildProjectCatalog({...options,cohort:'historical'}),/outside/);
+});
+
+
+test('actual launch inspection failure prevents every create call',async()=>{
+  let creates=0, inspections=0;
+  for(const target of ['a3','a5']) {
+    await assert.rejects(bootstrapFreshCampaign({destination:'/not-created',campaignId:'fixture',target,
+      profile,phase2Projects,qualification:qualification()},{
+      inspect:async input=>{inspections++;assert.equal(input.phase2Projects,phase2Projects);
+        assert.equal(input.profile,profile);throw new Error('actual bundle mismatch');},
+      create:async()=>{creates++;}}),/actual bundle mismatch/);
+  }
+  assert.equal(inspections,2);assert.equal(creates,0);
+});
+
+
+test('actual machinery revision mismatch prevents instance creation',async()=>{
+  let creates=0;
+  const native={...profile,environment:{module:'machinery/integrations/environments/ascend.mjs',
+    options:{target:'private-route',runtime:'private-runtime'}}};
+  await assert.rejects(bootstrapFreshCampaign({destination:'/not-created',campaignId:'fixture',target:'a3',
+    profile:native,phase2Projects,qualification:qualification()},
+    {create:async()=>{creates++;}}),/Actual machinery must be clean/);
+  assert.equal(creates,0);
+});
+
+test('external environment modules cannot bypass copied machinery validation',async()=>{
+  let creates=0;
+  for(const module of ['/old-instance/machinery/integrations/environments/ascend.mjs',
+    '../old-instance/machinery/integrations/environments/ascend.mjs']) {
+    const native={...profile,environment:{module,options:{target:'private-route',runtime:'private-runtime'}}};
+    await assert.rejects(bootstrapFreshCampaign({destination:'/not-created',campaignId:'fixture',target:'a3',
+      profile:native,phase2Projects,qualification:qualification()},
+      {create:async()=>{creates++;}}),/copied native Ascend environment/);
+  }
+  assert.equal(creates,0);
 });
