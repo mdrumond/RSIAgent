@@ -65,7 +65,8 @@ class LaunchTests(unittest.TestCase):
                           "catch(error){console.log(JSON.stringify({failure:error.cause}));process.exitCode=1;}") % json.dumps((checkout / 'cli/campaign-manifest.mjs').as_uri())
                 def inspect(payload):
                     return subprocess.run([node, '--max-old-space-size=768', '--input-type=module', '-e', script],
-                        input=json.dumps(payload), text=True, cwd=root, capture_output=True, timeout=30)
+                        input=json.dumps(payload), text=True, cwd=root, capture_output=True, timeout=30,
+                        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
                 result = inspect(request)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 # Node rewrites 0.0/1.0 as 0/1 without changing JSON numeric values.
