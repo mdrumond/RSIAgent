@@ -43,7 +43,10 @@ RSI_LOCAL_PYTHON_LIVE=1 node examples/local-python/run.mjs /private/bootstrap.js
 ```
 
 The runner forces local CPU execution, concurrency one, and a two-original tuning
-cadence. It retains the instance and a `result.json` status report. Actor time
+cadence. Inherited campaign plans, completion targets and resource masks are
+ignored, and evaluation controls are pinned to the generated reduction/parser
+projects. The private input profile is unchanged. The runner retains the instance
+and a `result.json` status report. Actor time
 defaults to 60 seconds per project; the evaluation allocation must be explicit.
 Do not interpret an inconclusive evaluation as an improvement. This is a separate
 provider experiment, not part of required automated integration tests.

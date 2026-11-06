@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { bootstrap, readConfig } from '../../cli/instance.mjs';
 import { operate } from '../../cli/runtime.mjs';
 import { main } from '../../cli/main.mjs';
+import { localPythonConfig } from './config.mjs';
 
 if (process.env.RSI_LOCAL_PYTHON_LIVE !== '1')
   throw new Error('Set RSI_LOCAL_PYTHON_LIVE=1 to authorize this provider experiment');
@@ -33,9 +34,7 @@ for (const kind of ['reduction', 'parser']) {
       : 'Implement parse_ints(text) in answer.py: parse comma-separated signed integers, allow whitespace/empty input, and reject malformed nonempty fields.',
     verifier: { files: [oracle], command: `${quote(python)} -B ${quote(oracle)} verify ${kind} ${quote(source)}` } });
 }
-await bootstrap(instance, { ...profile, projects, mode: 'phase2', tune_every: 2, target: 'cpu',
-  concurrency: 1, curriculum: { phase2: projects.map(project => project.id) },
-  environment: { module: 'machinery/integrations/environments/index.mjs', options: { mode: 'local' } } });
+await bootstrap(instance, localPythonConfig(profile, projects));
 const abort = new AbortController(), stop = () => abort.abort();
 process.on('SIGINT', stop); process.on('SIGTERM', stop);
 try { await operate('wave', await readConfig(instance), { signal: abort.signal }); }
