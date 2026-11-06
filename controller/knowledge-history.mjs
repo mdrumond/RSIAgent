@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, access } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -55,7 +55,14 @@ export class KnowledgeHistory {
 
   async init() {
     await mkdir(this.directory, { recursive: true });
-    await this.git(['init', '--initial-branch=memory']);
+    try {
+      await access(join(this.directory,'.git'));
+      if(resolve(await this.git(['rev-parse','--show-toplevel']))!==this.directory)
+        throw new Error('Knowledge history is not its own repository');
+    } catch(error) {
+      if(error.code!=='ENOENT')throw error;
+      await this.git(['init', '--initial-branch=memory']);
+    }
     if (await this.git(['remote'])) throw new Error('Knowledge history must be remoteless');
     if (!(await this.ref('refs/heads/memory'))) {
       if (await this.git(['rev-list', '--all'])) throw new Error('Not an empty knowledge repository');

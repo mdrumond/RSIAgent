@@ -39,7 +39,7 @@ async function environment(config,path,event,exclude,resource,signal) {
 export async function instanceStopped(config) {
   const state=stateFor(config.root),ctl=control(state);
   try {
-    for(const key of ['owner','skill-writer']) {
+    for(const key of ['owner','skill-writer','memory-writer']) {
       const owner=ctl.get(key);if(owner&&!await ownerStopped(owner))return false;
     }
     for(const row of state.db.prepare('SELECT owner FROM attempts').all())
@@ -105,10 +105,10 @@ export async function operate(command,config,options={}) {
       campaignClock=campaignBudget(state,{seconds:config.campaign_seconds,cycle,boot:owner.boot});
       if(campaignClock.remaining<=0)return {reason:'elapsed'};
       const expire=()=>{
-        if(campaignClock.remaining>0)budgetTimer=setTimeout(expire,Math.max(1,Math.ceil(campaignClock.remaining*1000)));
+        if(campaignClock.remaining>0)budgetTimer=setTimeout(expire,Math.min(2147483647,Math.max(1,Math.ceil(campaignClock.remaining*1000))));
         else {campaignClock.stop();abort();}
       };
-      budgetTimer=setTimeout(expire,Math.ceil(campaignClock.remaining*1000));
+      budgetTimer=setTimeout(expire,Math.min(2147483647,Math.max(1,Math.ceil(campaignClock.remaining*1000))));
       budgetWatcher=setInterval(()=>campaignClock.checkpoint(),1000);
     }
     if(options.continuous&&config.skills?.background&&!campaignClock)
@@ -251,7 +251,8 @@ export async function operate(command,config,options={}) {
       if(storage) {
         storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
           parent:job.origin_attempt??null,wave:admitted.wave??wave,
-          skillRevision:(await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
+          skillRevision:state.db.prepare('SELECT revision FROM storage_skill_versions WHERE version=?').get(skillVersion)?.revision??
+            (await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
@@ -444,10 +445,16 @@ export async function operate(command,config,options={}) {
       }
       const activeActors=[...activeJobs.values()].filter(job=>!job.finalize);
       if(tuning) {
-        try{await tuning.poll(await access.resources({purpose:'ordinary',target:config.target}),activeActors.length,limit);}
+        let slots=[];
+        try{slots=await access.resources({purpose:'ordinary',target:config.target});}
+        catch(error){state.event(null,'skill-background-error',{message:error.message});}
+        try{await tuning.poll(slots,activeActors.length,limit);}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
       }
-      const foregroundLimit=limit-(tuning?.resource?1:0);
+      const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
+      if(tuning && foregroundLimit<1)resourceWait={reason:tuning.capacity?'skill-background-reserved':'resources',
+        capacityLimited:true,available:tuning.capacity,at:new Date().toISOString()};
+      else if(resourceWait?.capacityLimited)resourceWait=null;
       const job=foregroundLimit>0?selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{
         running:activeActors,concurrency:foregroundLimit,freshSinceRecovery}):null;
       if(!job) {
@@ -495,6 +502,7 @@ export async function operate(command,config,options={}) {
     await Promise.all(running);
     if(maintenance)await maintenance;
     if(generation)await generation;
+    await tuning?.stop(ctl.get('pause')?'Campaign paused':'Campaign stopped');
     compress();if(storageLaunch)await storageLaunch;
     }catch(error){
       const interrupted=schedulerAbort.signal.aborted;

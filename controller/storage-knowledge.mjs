@@ -54,7 +54,7 @@ async function access(config, options, operation) {
       return await operation({ state, ledger, history });
     } finally { if (owned) state.close(); }
   };
-  return options.serialized ? run() : withSkillLock(config, run, { signal: options.signal });
+  return options.serialized ? run() : withSkillLock(config, run, { signal: options.signal, key: options.lockKey??'skill-writer' });
 }
 
 // Export only lesson text, never repository corpora or vectors. Overlapping chunks
@@ -164,7 +164,7 @@ export async function activateStorageBaseline(config,options={}) {
     ((tool,args)=>invokeStorageKdb(config,options.url,tool,args,{signal:options.signal}))));
 }
 export async function publishStorageMemory(config, item, options = {}) {
-  return access(config, options, async context => {
+  return access(config, {...options,lockKey:'memory-writer'}, async context => {
     const {history,ledger}=context;
     const invoke = options.invoke ?? ((tool, args) => invokeStorageKdb(config, options.url, tool, args,
       { signal: options.signal, attempt: item.attempt_id }));

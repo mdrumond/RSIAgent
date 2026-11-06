@@ -131,7 +131,7 @@ async function writeVersion(root, entries, source) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock, background = false, evidenceTasks = [], backgroundSeconds, backgroundResource }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock, background = false, evidenceTasks = [], backgroundSeconds, backgroundResource, publish }) {
   signal?.throwIfAborted();
   const current = await json(configPath);
   const mode = background ? 'phase2' : task?.phase ?? config?.mode ?? current.mode;
@@ -275,14 +275,16 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   let verdict = evaluateDecision(results, ids, runs);
   await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   if (verdict.promote) {
-    const latest = await json(configPath);
-    if (latest.skills.activeVersion !== pending.active) {
+    const latest = publish ? await publish({active:pending.active,candidate:pending.candidate,signal}) : await json(configPath);
+    if (!latest || latest.skills.activeVersion !== (publish ? pending.candidate : pending.active)) {
       if (!background) throw new Error('Active skills changed during evaluation');
       verdict = { promote: false, reason: 'superseded' };
     } else {
-      latest.skills.activeVersion = pending.candidate;
-      latest.revision = (latest.revision ?? 0) + 1;
-      await save(configPath, latest, signal);
+      if (!publish) {
+        latest.skills.activeVersion = pending.candidate;
+        latest.revision = (latest.revision ?? 0) + 1;
+        await save(configPath, latest, signal);
+      }
       state.candidateBase = latest.skills.activeVersion;
     }
   }
@@ -291,7 +293,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   state.pending = null;
   await save(statePath, state, signal);
   if (resumeIncoming && !background) return tune({ instanceRoot, config: await json(configPath), configPath,
-    task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal });
+    task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal, publish });
   if (background && verdict.reason === 'superseded')
     await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   return { ...verdict, evaluationStatus: 'completed', candidate: pending.candidate, evaluationRoot };
