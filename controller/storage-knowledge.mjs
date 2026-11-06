@@ -24,12 +24,14 @@ function python(config, args, input, signal) {
     const child = spawn(config.python ?? 'python', args, { signal,
       env: { ...process.env, PYTHONPATH: resolve(new URL('..', import.meta.url).pathname) },
       stdio: ['pipe', 'pipe', 'pipe'] });
-    let output = '', error = '';
+    let output = '', error = '', failure;
     child.stdout.on('data', data => { output += data; });
     child.stderr.on('data', data => { error = (error + data).slice(-65536); });
-    child.on('error', fail);child.stdin.on('error', e => { if (e.code !== 'EPIPE') fail(e); });
+    child.on('error', e => { failure=e;if(!child.pid)fail(e); });
+    child.stdin.on('error', e => { if(e.code!=='EPIPE'){failure=e;child.kill('SIGTERM');} });
     child.on('close', code => {
-      if (code) fail(new Error(error || `Python exited ${code}`));
+      if(failure)fail(failure);
+      else if (code) fail(new Error(error || `Python exited ${code}`));
       else { try { ok(JSON.parse(output)); } catch (e) { fail(e); } }
     });
     child.stdin.end(input);

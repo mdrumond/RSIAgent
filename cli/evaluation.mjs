@@ -1,3 +1,5 @@
+import { managedBootstrap, bootstrapSettled } from './evaluation-bootstrap.mjs';
+import { fingerprint } from '../controller/evidence.mjs';
 import { join, resolve, dirname } from 'node:path';
 import { ownerStopped, operationsStopped, processIdentity } from '../controller/lifecycle.mjs';
 import { bootstrap as createInstance, readConfig } from './instance.mjs';
@@ -11,6 +13,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 export async function bootstrap(request) {
   request.signal?.throwIfAborted();
   const original=await readConfig(request.sourceInstanceRoot);
+  const machinery=join(original.root,'machinery');
+  const binding={source:original.root,projectId:request.projectId,projectIds:request.projectIds,
+    skillVersion:request.skillVersion,config:request.config,resource:request.resource,
+    machinery:await fingerprint(machinery),skills:await fingerprint(join(original.root,'skills','versions',request.skillVersion))};
+  return managedBootstrap(request.instanceRoot,{binding,signal:request.signal,remainingSeconds:request.remainingSeconds},async initialization=>{
   const ledger=new State(join(original.root,'state.sqlite'));
   try {
     if(!request.resource) {
@@ -43,9 +50,11 @@ export async function bootstrap(request) {
       if(!project)throw new Error('Unknown frozen regression project');
       return project;
     });
-    await createInstance(inputs,{python:request.config.python??original.python,baseline:join(original.root,'knowledge.sqlite'),
+    await managedBootstrap(inputs,{binding:{source:original.root,projectIds:ids,machinery:binding.machinery,skills:binding.skills,
+      projects:await Promise.all(projects.map(async project=>({...project,sourceHash:await fingerprint(project.source)})))},signal:request.signal,
+      remainingSeconds:request.remainingSeconds},async initialization=>createInstance(inputs,{initialization,python:request.config.python??original.python,baseline:join(original.root,'knowledge.sqlite'),
       skills:join(original.root,'skills','versions',request.skillVersion),
-      environment:original.environment,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')});
+      environment:original.environment,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')}));
     frozen=await readConfig(inputs);
   }
   const project=frozen.projects.find(project=>project.id===request.projectId);
@@ -54,10 +63,11 @@ export async function bootstrap(request) {
     campaign_plan:_plan,phase_sequence:_sequence,phase_targets:_targets,completion_target:_target,...settings}=request.config;
   const environment=structuredClone(frozen.environment);
   request.signal?.throwIfAborted();
-  await createInstance(request.instanceRoot,{...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
+  await createInstance(request.instanceRoot,{initialization,...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
     skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
     signal:request.signal,machinery:join(original.root,'machinery')});
+  });
 }
 export async function wave({instanceRoot,config,signal,resuming=false,remainingSeconds}) {
   const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);
@@ -87,11 +97,18 @@ function result(instanceRoot) {
   }finally{state.close();}
 }
 
-// Existing samples are never bootstrapped again. Canonical resume owns session and
-// external-operation reconciliation; completed results recover without another wave.
+// Ready samples keep canonical sessions and execution reconciliation. Managed
+// preactor partials finish their original initialization before dispatch.
 export async function resume(request) {
   request.signal?.throwIfAborted();
-  const config = await readConfig(request.instanceRoot);
+  let config;
+  try{config=await readConfig(request.instanceRoot);}
+  catch(error){
+    if(error.code!=='ENOENT')throw error;
+    // Missing legacy receipts keep the original missing-config failure contract.
+    await readFile(request.instanceRoot+'.bootstrap.json');
+    await bootstrap(request);config=await readConfig(request.instanceRoot);
+  }
   const state = new State(join(request.instanceRoot, 'state.sqlite'));
   let attempts;
   try {
@@ -132,7 +149,10 @@ export async function settled(request) {
     const state = new State(join(config.root, 'state.sqlite'));
     try { await stoppedAttempts(config, state, AbortSignal.timeout(5000), true); return true; }
     finally { state.close(); }
-  } catch { return false; }
+  } catch {
+    return await bootstrapSettled(request.instanceRoot) &&
+      await bootstrapSettled(join(dirname(request.instanceRoot),'inputs'));
+  }
 }
 
 

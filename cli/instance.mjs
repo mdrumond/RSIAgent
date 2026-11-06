@@ -17,10 +17,27 @@ export async function readConfig(root) {
   if (config.format !== 1) throw new Error('Unsupported instance; bootstrap a fresh instance');
   return {...config,root};
 }
+async function fileDigest(path) {
+  const digest=createHash('sha256');for await(const chunk of createReadStream(path))digest.update(chunk);return digest.digest('hex');
+}
+async function initializationCopy(from,to,options={},retain=false) {
+  const filter=options.filter;
+  await cp(from,to,{...options,force:!retain,filter:async path=>{
+    if(filter && !await filter(path))return false;
+    if(retain && (await stat(path)).isFile()) {
+      const target=join(to,relative(from,path));
+      try {
+        if(await fileDigest(path)!==await fileDigest(target))
+          throw new Error('Retained initialization file differs: '+target);
+      }catch(error){if(error.code!=='ENOENT')throw error;}
+    }
+    return true;
+  }});
+}
 const within=(parent,child)=>{const rel=relative(parent,child);return rel==='' || (!rel.startsWith('..'+sep) && rel!=='..');};
 
 export async function bootstrap(destination,{baseline,skills,environment,projects=[],repository,
-  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,signal,...settings}={}) {
+  machinery=fileURLToPath(new URL('..',import.meta.url)),mode='phase1',actor_seconds=28800,skillSettings={},install=true,failed_recovery_rounds=5,recovery=true,concurrency=1,tune_every=8,signal,initialization,...settings}={}) {
   signal?.throwIfAborted();
   destination=resolve(destination);machinery=await realpath(machinery);
   if (within(machinery,destination)) throw new Error('Instance must be outside its source machinery');
@@ -30,13 +47,33 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   const skillMap=await validateSkillMap(resolve(skills),JSON.parse(await readFile(join(skills,'skill-map.json'),'utf8')));
   const basestat=await stat(baseline);
   if (!basestat.isFile()) throw new Error('Baseline KDB must be a SQLite file');
-  await mkdir(destination,{recursive:false,mode:0o700});
+  const continuing=initialization?.resume===true;
+  if(initialization && typeof initialization.setup!=='function')throw new Error('Managed initialization requires setup supervision');
+  if(continuing) {
+    try {await readConfig(destination);throw new Error('Cannot initialize a ready instance');}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    let hasState=false;try{await stat(join(destination,'state.sqlite'));hasState=true;}catch(error){if(error.code!=='ENOENT')throw error;}
+    if(hasState) {
+      const existing=new DatabaseSync(join(destination,'state.sqlite'),{readOnly:true});
+      try{if(existing.prepare('SELECT 1 FROM attempts LIMIT 1').get())throw new Error('Cannot initialize existing actor work');}finally{existing.close();}
+    }
+  }
+  await mkdir(destination,{recursive:continuing,mode:0o700});
   const source=new DatabaseSync(baseline,{readOnly:true});
   let legacy=false;
   try {
     legacy=source.prepare('PRAGMA table_info(chunks)').all().some(row=>row.name==='vector_json');
     // SQLite VACUUM snapshots WAL-backed source data without copying an inconsistent file.
-    if(!legacy)source.prepare('VACUUM INTO ?').run(join(destination,'knowledge.sqlite'));
+    if(!legacy) {
+      let retained=false;
+      if(continuing)try{await stat(join(destination,'knowledge.sqlite'));retained=true;}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(!retained) {
+        const temporary=join(destination,'knowledge-'+randomUUID()+'.tmp');
+        source.prepare('VACUUM INTO ?').run(temporary);
+        await rename(temporary,join(destination,'knowledge.sqlite'));
+      }
+    }
+    if(legacy && initialization)throw new Error('Managed evaluation requires a modern KDB snapshot');
   } finally {source.close();}
   if(legacy)await new Promise((ok,no)=>{
     const child=spawn(settings.python??'python',['-m','ascend_tools.kdb_import','--source',resolve(baseline),
@@ -45,25 +82,32 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     child.on('error',no);child.on('close',code=>code?no(new Error('Baseline KDB import failed: '+error)):ok());
   });
   await mkdir(join(destination,'skills','versions'),{recursive:true});
-  await cp(skills,join(destination,'skills','versions','baseline'),{recursive:true,errorOnExist:true});
-  await writeFile(join(destination,'skills','versions','baseline','skill-map.json'),JSON.stringify(skillMap,null,2)+'\n');
-  await mkdir(join(destination,'projects'));
+  await initializationCopy(skills,join(destination,'skills','versions','baseline'),{recursive:true,errorOnExist:!continuing,
+    filter:path=>!initialization || path!==join(skills,'skill-map.json')},continuing);
+  const mapPath=join(destination,'skills','versions','baseline','skill-map.json'),mapContent=JSON.stringify(skillMap,null,2)+'\n';
+  if(continuing)try {
+    if(await readFile(mapPath,'utf8')!==mapContent)throw new Error('Retained initialization skill map differs');
+  }catch(error){if(error.code!=='ENOENT')throw error;}
+  await writeFile(mapPath,mapContent);
+  await mkdir(join(destination,'projects'),{recursive:continuing});
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
-  projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project})));
-  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python,signal);
+  projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project},{continuing:!!initialization})));
+  await copyMachinery(machinery,join(destination,'machinery'),install,settings.python,signal,initialization);
   signal?.throwIfAborted();
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
   try {
     syncCampaignPlan(ledger,config);
-    for(const project of projects)ledger.add(project);
+    for(const project of projects)if(!ledger.project(project.id))ledger.add(project);
     const storage=new CampaignStorage(ledger,destination);
     const campaign=await storage.initialize({target:config.target??null});
     config.storage={format:1,campaign_id:campaign.id};
+    await initialization?.phase?.('storage');
     await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(
       {...config,root:destination},ledger,{serialized:true,signal});
+    await initialization?.phase?.('initialized');
   }finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
@@ -92,23 +136,29 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   } finally {ledger.close();if(staged)await rm(staged,{force:true});}
 }
 
-async function copyMachinery(machinery,release,install=true,python='python',signal) {
+async function copyMachinery(machinery,release,install=true,python='python',signal,initialization) {
   signal?.throwIfAborted();
-  await mkdir(release);
+  await mkdir(release,{recursive:initialization?.resume===true});
   for (const item of ['controller','cli','ascend_tools','web','templates','scripts','package.json','package-lock.json','npm-shrinkwrap.json','pyproject.toml']) {
     signal?.throwIfAborted();
     const from=join(machinery,item);
     try {await stat(from);} catch(error) {if(error.code==='ENOENT')continue;throw error;}
-    await cp(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))});
+    await initializationCopy(from,join(release,item),{recursive:true,filter:path=>!['node_modules','__pycache__'].includes(path.split(sep).at(-1))},initialization?.resume);
   }
-  await mkdir(join(release,'integrations'));
+  await mkdir(join(release,'integrations'),{recursive:initialization?.resume===true});
   for (const item of ['environments','kdb-extension.mjs']) {
-    try {await cp(join(machinery,'integrations',item),join(release,'integrations',item),{recursive:true});}
+    try {await initializationCopy(join(machinery,'integrations',item),join(release,'integrations',item),{recursive:true},initialization?.resume);}
     catch(error) {if(error.code!=='ENOENT')throw error;}
   }
   if(install) {
     try {await stat(join(release,'package.json'));}
     catch(error){if(error.code==='ENOENT')return;throw error;}
+    if(initialization) {
+      await initialization.setup('restic',python,['-m','ascend_tools.restic_install','--install'],release,{PYTHONPATH:release});
+      await initialization.setup('dependencies','npm',['ci','--ignore-scripts','--prefix',release],release,
+        {PATH:dirname(process.execPath)+delimiter+process.env.PATH});
+      return;
+    }
     await new Promise((ok,no)=>{
       const child=spawn(python,['-m','ascend_tools.restic_install','--install'],{
         signal,cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
@@ -189,13 +239,13 @@ export async function upgrade(root,machinery) {
   }
 }
 
-export async function importProject(root,spec) {
+export async function importProject(root,spec,{continuing=false}={}) {
   validateAcceptance(spec);
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
   const source=await realpath(spec.source),files=spec.verifier.files;
-  const hash=async path=>{const digest=createHash('sha256');for await(const chunk of createReadStream(path))digest.update(chunk);return digest.digest('hex');};
+  const hash=fileDigest;
   const expected={};
   for(const file of files) {
     const absolute=resolve(file),actual=await hash(absolute);
@@ -207,15 +257,15 @@ export async function importProject(root,spec) {
   if(within(own,source) && files.every(path=>within(own,resolve(path))))return {...spec,verifier:{...spec.verifier,hashes:expected}};
   let common=source;
   for(const path of files)while(!within(common,resolve(path)))common=dirname(common);
-  const tree=join(own,'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
+  const tree=join(own,continuing?'inputs-managed':'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
   const destination=join(tree,relative(common,source));
   const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
-  await cp(source,destination,{recursive:true,verbatimSymlinks:true,filter});
+  await initializationCopy(source,destination,{recursive:true,verbatimSymlinks:true,filter},continuing);
   const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
   const copied=[],hashes={};
   for(const path of files) {
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
-    await mkdir(dirname(target),{recursive:true});await cp(absolute,target);copied.push(target);
+    await mkdir(dirname(target),{recursive:true});await cp(absolute,target,{force:!continuing});copied.push(target);
     if(await hash(target)!==expected[absolute])throw new Error('Frozen verifier changed during import');
     hashes[target]=expected[absolute];
     for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
