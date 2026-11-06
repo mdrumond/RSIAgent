@@ -84,6 +84,7 @@ export function validateCampaignPlan(config) {
       new Set(plan.map(entry => entry.id)).size !== plan.length)
     throw new Error('Invalid campaign plan');
   for (const project of config.projects ?? []) {
+    if (project.campaign_entry === undefined) continue;
     const entry = plan.find(entry => entry.id === project.campaign_entry);
     if (!entry || (project.phase !== undefined && project.phase !== entry.phase))
       throw new Error('Project requires a matching campaign_entry: ' + project.id);
@@ -129,7 +130,7 @@ function reconcilePlan(state, config) {
     const admission = admitted && state.db.prepare(`SELECT json_extract(e.data,'$.campaign_entry') entry
       FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project=? AND e.type='job-admitted'
       ORDER BY e.sequence LIMIT 1`).get(project.id);
-    if (admitted && (admission?.entry ?? state.project(project.id)?.spec.campaign_entry) !== project.campaign_entry)
+    if (admitted && (admission ? admission.entry ?? undefined : state.project(project.id)?.spec.campaign_entry) !== project.campaign_entry)
       throw new Error('Cannot change campaign_entry of an admitted project');
   }
   const value = {plan: config.campaign_plan, index: cursor, started: previous?.started ?? -1};

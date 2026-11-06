@@ -63,3 +63,10 @@ is a read-only `{entries, lockedPrefix, currentIndex}` status. Entries include
 `index` and `state` (`pending`, `started`, or `completed`). `lockedPrefix` is a
 count: disable editing entries with `index < lockedPrefix`. No status read
 starts an entry or advances the cursor.
+
+Projects may omit `campaign_entry` when continuing an existing instance. Their
+history is not attributed to the new plan; pending recovery remains eligible
+with its original phase, while unassigned queued originals remain visible and
+are not admitted until explicitly assigned. Historical admitted projects with
+no assignment cannot be relabeled into a new batch. Provided assignments must
+match an entry and its phase.
