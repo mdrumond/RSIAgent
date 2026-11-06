@@ -29,6 +29,8 @@ jobs:
           cache: npm
           cache-dependency-path: npm-shrinkwrap.json
       - run: python -m pip install -e '.[dev]'
+      - name: Install CPU Torch for baseline contracts
+        run: python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
       - run: npm ci
       - name: Install verified Restic release
         run: python -m ascend_tools.restic_install --install
