@@ -146,3 +146,26 @@ def test_focused_launcher_relocates_without_checkout_dependencies(tmp_path):
     assert Path(report['evidence']).is_file()
     with tarfile.open(relocated / 'frozen/verifier.tar.gz') as tar:
         assert json.load(tar.extractfile('focus.json')) == focus
+
+
+@pytest.mark.parametrize('missing_version', [False, True])
+def test_wrong_torch_runtime_rejected_before_npu_import_or_query(tmp_path, monkeypatch, missing_version):
+    import builtins
+    import types
+    from ascend_tools.baselines import project_verifier
+    from ascend_tools.phase2_focus import verify_focused
+    project, contract, focus = contract_for(tmp_path)
+    if missing_version:
+        contract['identity'].pop('torch')
+        contract['qualification']['runtime'].pop('torch')
+        focus = select_focus(contract['qualification'])
+    original_import = builtins.__import__
+    def guarded_import(name, *args, **kwargs):
+        if name == 'torch_npu': pytest.fail('Wrong runtime must not import Torch-NPU')
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded_import)
+    monkeypatch.setattr(project_verifier.torch, 'npu', types.SimpleNamespace(
+        get_device_name=lambda _: pytest.fail('Wrong runtime must not access an NPU')), raising=False)
+    with pytest.raises(ValueError, match='runtime differs'):
+        verify_focused(contract, focus, Path(project['source']) / 'kernel.py',
+                       tmp_path / 'evidence', 'correctness')

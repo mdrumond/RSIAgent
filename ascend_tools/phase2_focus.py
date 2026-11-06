@@ -95,8 +95,10 @@ def evaluate_focused(contract, focus, function, *, device='cpu', performance=Fal
 def verify_focused(contract, focus, candidate, artifacts, mode):
     from .baselines import project_verifier as verifier
     validate_focus(contract, focus)
-    import torch_npu
     torch = verifier.torch
+    if contract['identity'].get('torch') != torch.__version__:
+        raise ValueError('Observed NPU runtime differs')
+    import torch_npu
     observed = {'torch': torch.__version__, 'torchNpu': torch_npu.__version__,
                 'deviceName': torch.npu.get_device_name(0)}
     if any(contract['identity'].get(key) != value for key, value in observed.items()):
