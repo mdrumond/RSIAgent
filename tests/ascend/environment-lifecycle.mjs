@@ -378,6 +378,7 @@ test('SIGKILL after native receipt recovers the same operation and completed dur
     events.push({ type, data: { ...data, operation: 'crash-op' } });
     await appendFile(join(root, 'events.jsonl'), JSON.stringify(events.at(-1)) + '\n');
   }, client: async args => {
+    if (args[0] === 'capabilities') return { state: 'available', backend: 'remote-agent' };
     if (['run','upload'].includes(args[0])) { submissions++; throw new Error('must not resubmit'); }
     if (args[0] === 'observe') return args[1].endsWith(':sync') ? { state: 'completed', exit: 0 } : { state: terminal ? 'completed' : 'running', exit: 0 };
     if (args[0] === 'download') {
