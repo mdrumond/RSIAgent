@@ -13,6 +13,7 @@ import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from
 import { readConfig,updateConfig,importProject } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
+import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -551,8 +552,7 @@ async function worker(root,id) {
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
         await (await import('./skills.mjs')).run(config,{signal:abort.signal,resource:job.resource,
-          task:{id,projectId:attempt.project,kind:job.kind,completed:true,phase:config.mode,events:state.queryEvents(id,{types:['skill-read','knowledge-retrieved','guidance-contradicted','failure-recorded',
-            'verification','rejected','stage-completed'],limit:1000,order:'desc'}).reverse()}});
+          task:tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode})});
         state.event(id,'skills-updated',{});
       }catch(error){state.event(id,'skill-update-error',{message:error.message});throw error;}
     }
@@ -598,6 +598,7 @@ async function worker(root,id) {
       state.event(id,'task-constructed',{goal:project.goal,kind:job.kind,actor_seconds:project.actor_seconds});
       actorRunning=true;
       try {await (await import('../controller/pi.mjs')).runAttempt({state,attempt:state.attempt(id),project,attemptPath:path,
+        environmentIdentity:environmentBinding(config,project,job.resource),
         signal:abort.signal,settleProject:job.kind!=='investigation',
         shouldPause:()=>Boolean(ctl.get('pause')),onPause:signal,
         environmentFactory:ctx=>environment(config,path,ctx.event,ctx.exclude,job.resource,ctx.signal),

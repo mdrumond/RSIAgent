@@ -11,6 +11,7 @@ import { createEnvironmentTools } from '../integrations/environments/index.mjs';
 import { createPiTelemetryJournal } from './pi-telemetry.mjs';
 import {CampaignStorage} from './storage.mjs';
 import {prepareSourceGit} from './source-git.mjs';
+import { recordSkillContext } from './skill-evidence.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
@@ -19,7 +20,7 @@ const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end'
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
   knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true,
-  shouldPause=()=>false,onPause=()=>{}}) {
+  shouldPause=()=>false,onPause=()=>{},environmentIdentity}) {
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
   const storage=CampaignStorage.open(state,resolve(attemptPath,'../..'));
@@ -59,6 +60,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
   const previous=state.events(attempt.id).find(e=>e.type==='verifier-frozen');
   const checkVerifier=await freezeFiles(project.verifier.files,project.source,project.verifier.hashes??previous?.data.hashes);
   if(!previous)event('verifier-frozen',{hashes:checkVerifier.manifest});
+  await recordSkillContext({state,attemptId:attempt.id,project,verifierHashes:checkVerifier.manifest,environmentIdentity});
   let session,timer,accepted=false,uncertain,telemetryFailure;
   const nativeBash=new Map();
   const abort=()=>{void session?.abort();};
