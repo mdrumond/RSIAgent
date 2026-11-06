@@ -2,7 +2,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {realpath} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
-import {isAbsolute,normalize} from 'node:path';
+import {isAbsolute,normalize,resolve} from 'node:path';
 import {bootstrap} from './instance.mjs';
 
 export const workloads=['fa','gdn','bsa','kimi_delta_attention','lact_ttt_chunk',
@@ -100,9 +100,11 @@ export async function inspectCampaignLaunch(input) {
     await git(['rev-parse','HEAD'])!==input.qualification.localValidation.sourceRevision||
     await git(['status','--porcelain','--untracked-files=all']))
     throw new Error('Actual machinery must be clean and match the locally validated revision');
+  const inspection={...input,phase2Projects:Object.fromEntries(Object.entries(input.phase2Projects).map(([id,project])=>
+    [id,{...project,source:resolve(project.source),verifier:{...project.verifier,files:project.verifier.files.map(file=>resolve(file))}}]))};
   const child=execFile(input.profile.python??'python3',['-m','ascend_tools.campaign_launch'],
     {cwd:machinery,env:{...process.env,PYTHONPATH:machinery},maxBuffer:1024*1024});
-  child.stdin.end(JSON.stringify(input));
+  child.stdin.end(JSON.stringify(inspection));
   await new Promise((resolve,reject)=>{child.on('error',reject);child.on('close',code=>
     code===0?resolve():reject(new Error('Actual frozen campaign inputs failed qualification inspection')));});
 }
