@@ -79,6 +79,16 @@ async function fixture(t, variant) {
     try { await access(join(f.root, 'state.sqlite')); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
     for (const event of rows(f.root, "SELECT data FROM events WHERE type='evaluation-started'")) {
       const root = JSON.parse(event.data).instanceRoot;
+      // Sample controllers submit detached compression just like their parent.
+      // Keep their files until terminal requests and actual owners are stopped.
+      await until(async () => {
+        if (!rows(root, "SELECT 1 FROM sqlite_master WHERE name='requests'").length) return true;
+        for (const request of rows(root, "SELECT status,owner FROM requests WHERE kind='storage'")) {
+          if (['queued', 'running'].includes(request.status)) return false;
+          if (request.owner && !await ownerStopped(request.owner)) return false;
+        }
+        return true;
+      });
       try {
         const receipt = await load(join(root, 'knowledge-service.json'));
         if (!await ownerStopped(receipt.owner)) process.kill(receipt.owner.pid, 'SIGTERM');
@@ -104,10 +114,13 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
   { timeout: 180000 }, async t => {
     const f = await fixture(t, variant), abort = new AbortController();
     const roots = [], resumes = [];
+    let interruptedController;
     const wrapped = { ...runtime,
       async wave(request) {
         roots.push(request.instanceRoot);
         if (variant === 'repair' && roots.length === 2) f.control.onActor = () => {
+          interruptedController = JSON.parse(rows(request.instanceRoot,
+            "SELECT value FROM control WHERE key='owner'")[0].value);
           f.control.onActor = null; abort.abort();
         };
         return runtime.wave(request);
@@ -125,8 +138,14 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
       const retained = rows(interrupted, 'SELECT id,session FROM attempts')[0];
       assert.ok(retained.session);
       assert.equal(rows(interrupted, "SELECT count(*) AS n FROM events WHERE type='skill-read' AND json_extract(data,'$.stage')='preflight'")[0].n, 1);
-      await until(async () => (await Promise.all(rows(interrupted, 'SELECT owner FROM attempts')
-        .map(row => ownerStopped(JSON.parse(row.owner))))).every(Boolean));
+      assert.ok(interruptedController?.pid);
+      await until(async () => {
+        const controller = JSON.parse(rows(interrupted, "SELECT value FROM control WHERE key='owner'")[0].value);
+        const workers = await Promise.all(rows(interrupted, 'SELECT owner FROM attempts')
+          .map(row => ownerStopped(JSON.parse(row.owner))));
+        return (!controller || await ownerStopped(controller)) && workers.every(Boolean);
+      });
+      assert.equal(await ownerStopped(interruptedController), true);
       result = await tune(await readConfig(f.root), { ...grant, runtime: wrapped });
       assert.deepEqual(resumes, [interrupted]); assert.equal(roots.length, 4);
       assert.deepEqual(rows(interrupted, 'SELECT id,session FROM attempts')[0], retained);

@@ -133,7 +133,7 @@ for(const reason of ['elapsed','external'])test(`default native bash stops on ${
     const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
     runtime.registerProvider('abort-fixture',{baseUrl:`http://127.0.0.1:${server.address().port}/v1`,models:[{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
     await runtime.setRuntimeApiKey('abort-fixture','fixture-only');
-    state.add({id:'p',source,goal:'Bounded local operation',actor_seconds:reason==='elapsed'?.2:10,verifier:{files:[],command:'true'}});
+    state.add({id:'p',source,goal:'Bounded local operation',actor_seconds:reason==='elapsed'?2:10,verifier:{files:[],command:'true'}});
     const attempt=state.admit('p',{});
     const running=runAttempt({state,attempt,project:state.project('p').spec,attemptPath:join(root,'attempt'),signal:abort.signal,
       environmentFactory:async()=>({prepare:async()=>{},execute:async()=>{dispatches++;throw Error('unexpected target dispatch');}}),
