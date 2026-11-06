@@ -1,0 +1,46 @@
+{
+  "name": "TensorProgramVm",
+  "category": "FusedComposite",
+  "difficulty": "L5",
+  "formula": "\u5bf9 t = 0..P-1 \u987a\u5e8f\u6267\u884c\u3002\u8bd1\u7801: op = program[t,0] mod 8, dst = program[t,1] mod R,\n                              a = program[t,2] mod R,  b = program[t,3] mod R\nISA\uff08\u64cd\u4f5c\u6570\u4e3a\u5bc4\u5b58\u5668\u5806\u884c\u5411\u91cf [W]\uff0cfp32 \u8ba1\u7b97\uff0csat(x) = clamp(x, -10000, 10000)\uff09:\n  0 ADD    regs[dst] = sat(regs[a] + regs[b])\n  1 MUL    regs[dst] = sat(regs[a] * regs[b])\n  2 RELU   regs[dst] = max(regs[a], 0)\n  3 MEANB  regs[dst] = broadcast(mean(regs[a]))        # \u6cbf W \u6c42\u5747\u503c\u540e\u5e7f\u64ad\n  4 MAX    regs[dst] = elementwise_max(regs[a], regs[b])\n  5 ROLL   regs[dst][j] = regs[a][(j-1+W) mod W]       # \u5411\u53f3\u5faa\u73af\u79fb 1 \u4f4d\n  6 MULADD regs[dst] = sat(regs[dst] + regs[a] * regs[b])   # \u8bfb dst\uff0c\u5199 dst\n  7 COPY   regs[dst] = regs[a]\nfinal_regs = \u5168\u90e8 P \u6761\u6307\u4ee4\u6267\u884c\u5b8c\u540e\u7684\u5bc4\u5b58\u5668\u5806\n",
+  "description": "\u5f20\u91cf\u7a0b\u5e8f\u865a\u62df\u673a\u2014\u2014kernel \u5373\u89e3\u91ca\u5668\uff0c\u7a0b\u5e8f\u5373\u6570\u636e\uff1b\u6307\u4ee4\u5e8f\u5217\u5b58\u5728\u771f\u4f9d\u8d56\uff0c\u9010\u6761\u9a71\u52a8\u5bc4\u5b58\u5668\u5806\u7684\u884c\u5411\u91cf\u8fd0\u7b97",
+  "shape_support": "program [P, 4] int32\uff08\u4efb\u610f\u975e\u8d1f\u6574\u6570\u5408\u6cd5\uff09\uff0cinit_regs [R, W] float32/float16/bfloat16\uff0c\u8f93\u51fa final_regs [R, W] \u540c init_regs dtype",
+  "precision_thresholds": {
+    "float32": 0.0001,
+    "float16": 0.001,
+    "bfloat16": 0.008
+  },
+  "inputs": [
+    {
+      "name": "program",
+      "description": "\u6307\u4ee4\u5e8f\u5217\uff0c\u6bcf\u884c\u7ecf mod \u8bd1\u7801\u4e3a (op, dst, a, b)\uff0c\u4efb\u610f\u975e\u8d1f\u6574\u6570\u5408\u6cd5\uff08\u8bc4\u6d4b\u53d6\u503c\u8303\u56f4 [0, 1073741823]\uff09",
+      "dtype": [
+        "int32"
+      ],
+      "shape": "[P, 4]"
+    },
+    {
+      "name": "init_regs",
+      "description": "\u5bc4\u5b58\u5668\u5806\u521d\u503c\uff0cR \u4e2a\u5bbd W \u7684\u884c\u5411\u91cf\u5bc4\u5b58\u5668\uff08\u8bc4\u6d4b\u53d6\u503c\u8303\u56f4 [-1, 1]\uff09",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[R, W]"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "final_regs",
+      "description": "\u5168\u90e8\u6307\u4ee4\u6267\u884c\u5b8c\u540e\u7684\u5bc4\u5b58\u5668\u5806\uff0cdtype \u4e0e init_regs \u4e00\u81f4",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[R, W]"
+    }
+  ],
+  "schema": "tensor_program_vm(Tensor program, Tensor init_regs) -> Tensor final_regs"
+}

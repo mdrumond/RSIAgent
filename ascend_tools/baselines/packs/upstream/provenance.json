@@ -1,0 +1,28 @@
+{
+  "repository": "https://gitcode.com/cann/cann-bench",
+  "revision": "f0488d95b4d44a6a0da1b8cd99e91fbd06181962",
+  "files": {
+    "LICENSE": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+    "tasks/suite_manifest.json": "420d35e9eec4bc396361619a973daea43b921765fd7fda965505470b5c1e8c79",
+    "tasks/level5/kimi_delta_attention/golden.py": "efaeefea209a34bec6c6cfb616e46334b1f424699b7c2d3942d2154c5b0de7e8",
+    "tasks/level5/kimi_delta_attention/proto.yaml": "2d8844a2e50bcb1d96167c468c0f3b3d81d25c7ba483bff9c7769bd8b0bd5f79",
+    "tasks/level5/kimi_delta_attention/cases.yaml": "e790889b4c68ba7d70a16ee3be881fcebc117f63fff1ab7654a88b1d4b2b4729",
+    "tasks/level5/kimi_delta_attention/cases.csv": "412dc2486a1022a0b9ac5c741c62a7de8678053d067e88938bc3c2fde727ba35",
+    "tasks/level5/kimi_delta_attention/desc.md": "1dff78c6e1c8e7d5d72d4971dac544c391cc0f4533480275c4b413d6b70ad0c5",
+    "tasks/level5/lact_ttt_chunk/golden.py": "1173c70a08a52b09e84c817b9abd04294b5ac82b7ba3814317c8161c27588ce6",
+    "tasks/level5/lact_ttt_chunk/proto.yaml": "7617a4868ccf7be6a246c6ba38bbba876a5694c723f336a1dcb9c8d2b3db329f",
+    "tasks/level5/lact_ttt_chunk/cases.yaml": "ee4e48db73645a3bec406041aad88b933c73b922af91d8a8e53958c46a813e6d",
+    "tasks/level5/lact_ttt_chunk/cases.csv": "49aa8f9d745a78af5dd0e3e02a9546a2a2be91975326fdc1e07c091af16029d8",
+    "tasks/level5/lact_ttt_chunk/desc.md": "e2c32175cb596505bac8aefc6198062e423375a5027ac1e9dbcc771800798fdf",
+    "tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance/golden.py": "b2702fb1a6727e025f4c56d4e8ec1f598e7e864d694e3a7075b7c9f7dbdbbd55",
+    "tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance/proto.yaml": "e51c47e1888a47cfda5312a11e2ad8eecd7ff370efb9d6321e846a7b72fe016d",
+    "tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance/cases.yaml": "4dff5c0b52c8000b0667c71e5938471e3854469a5a93544e5b7d3dcfa563f8c9",
+    "tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance/cases.csv": "001531163497b3e08d78c0ee41cafb2073a818d31b877ce1c15a371c1a4d4e83",
+    "tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance/desc.md": "48c4cb6c4d6b8c6b1a114d6162083b41526a7415f08ed610ae8dd36247592b08",
+    "tasks/level5/tensor_program_vm/golden.py": "0c6f908f7fdad0bd486771fcd06a640401fa464cf1e2aa554e569e6f60c1d567",
+    "tasks/level5/tensor_program_vm/proto.yaml": "caa9328128de857ab9d474e83d910640c958ce3698e45939b1552be917ecba01",
+    "tasks/level5/tensor_program_vm/cases.yaml": "78a42bd9ec95063d1d253d254e6d0cacf2f8ff667c17e4294d21d6f524a062f0",
+    "tasks/level5/tensor_program_vm/cases.csv": "7c48359c4d72672f4cae67ce53b2ef29c4160796e9468c6ea13fe6ed7194a055",
+    "tasks/level5/tensor_program_vm/desc.md": "b99ad79ecda4a3c173c247f2e6a104b433569f8ac43b15793808f7d26f564092"
+  }
+}

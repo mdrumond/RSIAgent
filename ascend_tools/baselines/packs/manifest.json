@@ -1,0 +1,100 @@
+{
+  "tensor_program_vm": {
+    "directory": "upstream/tasks/level5/tensor_program_vm",
+    "source": "golden.py",
+    "cases": "cases.json",
+    "function": "tensor_program_vm",
+    "oracle": "tensor_program_vm_oracle",
+    "origin": "cann-bench",
+    "thresholds": {
+      "float32": 0.0001,
+      "float16": 0.001,
+      "bfloat16": 0.008
+    }
+  },
+  "lact_ttt_chunk": {
+    "directory": "upstream/tasks/level5/lact_ttt_chunk",
+    "source": "golden.py",
+    "cases": "cases.json",
+    "function": "lact_ttt_chunk",
+    "oracle": "lact_ttt_chunk_oracle",
+    "origin": "cann-bench",
+    "thresholds": {
+      "float32": 0.001,
+      "float16": 0.005,
+      "bfloat16": 0.02
+    }
+  },
+  "sparse_lightning_indexer_grad_kl_loss_enhance": {
+    "directory": "upstream/tasks/level5/sparse_lightning_indexer_grad_kl_loss_enhance",
+    "source": "golden.py",
+    "cases": "cases.json",
+    "function": "sparse_lightning_indexer_grad_kl_loss_enhance",
+    "oracle": "sparse_lightning_indexer_grad_kl_loss_enhance",
+    "compatibilityAdapter": {
+      "implementation": "inputs.py:_sparse_kl_fp32",
+      "computation": "FP32 on input device; native NPU layout path for all floating input dtypes",
+      "outputs": "FP32 gradients and loss, matching CPU golden",
+      "reason": "FP16 clamp_min(1e-8) underflows before log; preserve frozen golden bytes"
+    },
+    "origin": "cann-bench",
+    "thresholds": {
+      "float32": 0.0001220703125,
+      "float16": 0.0009765625,
+      "bfloat16": 0.0078125
+    }
+  },
+  "kimi_delta_attention": {
+    "directory": "upstream/tasks/level5/kimi_delta_attention",
+    "source": "golden.py",
+    "cases": "cases.json",
+    "function": "kimi_delta_attention",
+    "oracle": "kimi_delta_attention_oracle",
+    "origin": "cann-bench",
+    "thresholds": {
+      "float32": 0.0001220703125,
+      "float16": 0.0009765625,
+      "bfloat16": 0.0078125
+    }
+  },
+  "gdn": {
+    "directory": "gdn",
+    "source": "baseline.py",
+    "cases": "cases.json",
+    "origin": "supplied-reference",
+    "thresholds": {
+      "float32": 0.002,
+      "float16": 0.02,
+      "bfloat16": 0.02
+    }
+  },
+  "bsa": {
+    "directory": "bsa",
+    "source": "baseline.py",
+    "cases": "cases.json",
+    "origin": "supplied-reference",
+    "thresholds": {
+      "float32": 0.002,
+      "float16": 0.02,
+      "bfloat16": 0.02
+    }
+  },
+  "fa": {
+    "directory": "fa",
+    "source": "baseline.py",
+    "cases": "cases.json",
+    "function": "baseline",
+    "oracle": "oracle",
+    "origin": "local-reference",
+    "thresholds": {
+      "float32": 0.003,
+      "float16": 0.003,
+      "bfloat16": 0.02
+    },
+    "atols": {
+      "float32": 0.003,
+      "float16": 0.0003,
+      "bfloat16": 0.002
+    }
+  }
+}
