@@ -72,6 +72,7 @@ async function fixture(t, variant) {
   await writeFile(credentials, 'DRIVER_FIXTURE_KEY=fixture-only\n');
   await writeFile(configure, JSON.stringify({ mode: 'phase2', tune_every: 2,
     actor: { ...current.actor, credentials_file: credentials },
+    skills: { ...current.skills, runsPerArm: 1 },
     curriculum: { phase2: ['reduction', 'parser'] } }));
   await f.run('config', '--config', configure);
   const cleanupSamples = async () => {
@@ -99,7 +100,7 @@ async function fixture(t, variant) {
   return { ...f, control, cleanupSamples };
 }
 
-for (const variant of ['repair', 'regression']) test(`local Python ${variant}: failure-only learning and canonical evaluation`,
+for (const variant of ['repair', 'regression']) test(`local Python ${variant}: failure evidence and canonical integration`,
   { timeout: 180000 }, async t => {
     const f = await fixture(t, variant), abort = new AbortController();
     const roots = [], resumes = [];
@@ -127,18 +128,20 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
       await until(async () => (await Promise.all(rows(interrupted, 'SELECT owner FROM attempts')
         .map(row => ownerStopped(JSON.parse(row.owner))))).every(Boolean));
       result = await tune(await readConfig(f.root), { ...grant, runtime: wrapped });
-      assert.deepEqual(resumes, [interrupted]); assert.equal(roots.length, 8);
+      assert.deepEqual(resumes, [interrupted]); assert.equal(roots.length, 4);
       assert.deepEqual(rows(interrupted, 'SELECT id,session FROM attempts')[0], retained);
     } else result = await tune(await readConfig(f.root), { ...grant, runtime: wrapped });
     const journal = await load(join(result.evaluationRoot, 'round.json'));
     const diagnostic = JSON.stringify({ reason: result.reason, status: result.evaluationStatus,
       samples: journal.samples.map(({ projectId, run, arm, result }) => ({ projectId, run, arm, result })) });
     assert.equal(result.evaluationStatus, 'completed', diagnostic);
-    assert.equal(result.promote, variant === 'repair', diagnostic);
-    assert.equal(result.reason, variant === 'repair' ? 'reliability-improvement' : 'correctness-regression', diagnostic);
-    assert.equal(journal.samples.filter(sample => sample.result).length, 8);
+    assert.equal(result.promote, false, diagnostic);
+    assert.equal(result.reason, variant === 'repair' ? 'insufficient-repetitions' : 'correctness-regression', diagnostic);
+    assert.equal(journal.samples.filter(sample => sample.result).length, 4);
     assert.equal(journal.allocatedSeconds, 120);
-    assert.equal(new Set(journal.samples.map(sample => sample.instanceRoot)).size, 8);
+    assert.deepEqual(journal.samples.map(({ projectId, run, arm }) => `${projectId}:${run}:${arm}`).sort(),
+      ['parser:0:active', 'parser:0:candidate', 'reduction:0:active', 'reduction:0:candidate']);
+    assert.equal(new Set(journal.samples.map(sample => sample.instanceRoot)).size, 4);
     for (const sample of journal.samples) {
       assert.equal(rows(sample.instanceRoot, 'SELECT count(*) AS n FROM attempts')[0].n, 1);
       const verdicts = rows(sample.instanceRoot, "SELECT data FROM events WHERE type='verification'");
@@ -149,6 +152,6 @@ for (const variant of ['repair', 'regression']) test(`local Python ${variant}: f
         (variant === 'repair' || sample.projectId === 'reduction'));
       assert.ok((await readFile(actual.evidence.correctness, 'utf8')).length > 0);
     }
-    assert.equal((await readConfig(f.root)).skills.activeVersion === 'baseline', variant !== 'repair');
+    assert.equal((await readConfig(f.root)).skills.activeVersion, 'baseline');
     await f.cleanupSamples(); f.pass();
   });

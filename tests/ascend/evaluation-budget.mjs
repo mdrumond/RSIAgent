@@ -8,6 +8,7 @@ import { main } from '../../cli/main.mjs';
 import { State } from '../../controller/state.mjs';
 import { tune } from '../../controller/skill-evolution.mjs';
 import { evaluateRound, tuningStatus } from '../../controller/evaluation-round.mjs';
+import { resume as resumeEvaluation, settled as evaluationSettled } from '../../cli/evaluation.mjs';
 
 const load = async path => JSON.parse(await readFile(path, 'utf8'));
 const save = async (path, value) => writeFile(path, JSON.stringify(value));
@@ -189,4 +190,69 @@ test('status includes outstanding active or unknown elapsed without changing the
     assert.equal(await readFile(roundFile, 'utf8'), beforeRound);
     assert.equal(await readFile(stateFile, 'utf8'), beforeState);
   }
+});
+
+
+test('canonical terminal settlement pauses round elapsed and resumes retained results without replay', async t => {
+  const f = await fixture(t), controller = new AbortController();
+  const pending = { evaluationRoot: join(f.root, 'canonical-round'), evaluationSeconds: 10,
+    projectIds: ['a', 'b'], runs: 1, active: 'baseline', candidate: 'candidate' };
+  let milliseconds = 0, firstRoot, retainedRoot, retainedAttempt, retainedSession, calls = 0;
+  const initialized = new Set();
+  const clock = { now: () => milliseconds, wallNow: () => milliseconds };
+  const initialize = async request => {
+    if (initialized.has(request.instanceRoot)) return;
+    initialized.add(request.instanceRoot);
+    await mkdir(request.instanceRoot);
+    await save(join(request.instanceRoot, 'instance.json'), { format: 1, mode: 'phase2' });
+    const session = join(request.instanceRoot, 'retained-session.jsonl');
+    await writeFile(session, 'completed native Bash session fixture\n');
+    const state = new State(join(request.instanceRoot, 'state.sqlite'));
+    try {
+      state.add({ id: request.projectId, goal: 'terminal closure contract', actor_seconds: 5 });
+      const attempt = state.admit(request.projectId, { pid: 2147483647, start: '0', boot: 'old-boot' });
+      state.event(attempt.id, 'native-bash-started', { operation: 'completed-shell' });
+      state.event(attempt.id, 'native-bash-completed', { operation: 'completed-shell', actor_elapsed: 0.2 });
+      // Closure and final elapsed are durable before marking the attempt terminal.
+      state.checkpoint(attempt.id, 0.2, session);
+      state.event(attempt.id, 'accepted', {}); state.finish(attempt.id, 'passed');
+      if (calls === 2) { retainedAttempt = attempt.id; retainedSession = session; }
+    } finally { state.close(); }
+  };
+  await assert.rejects(evaluateRound({ pending, config: {}, ...clock, signal: controller.signal,
+    evaluate: async request => {
+      calls++; await initialize(request); milliseconds += 100;
+      if (calls === 1) { firstRoot = request.instanceRoot; return resumeEvaluation(request); }
+      retainedRoot = request.instanceRoot;
+      controller.abort();
+      const stopped = await evaluationSettled(request);
+      assert.equal(stopped, true);
+      throw Object.assign(controller.signal.reason, { evaluationStopped: stopped });
+    } }), { name: 'AbortError' });
+  const interrupted = await load(join(pending.evaluationRoot, 'round.json'));
+  assert.equal(interrupted.status, 'interrupted');
+  assert.equal(interrupted.samples.filter(sample => sample.result).length, 1);
+  assert.equal(interrupted.runningAt, undefined);
+  milliseconds += 100000;
+  let firstResume = true;
+  const result = await evaluateRound({ pending, config: {}, ...clock,
+    evaluate: async request => {
+      calls++; assert.notEqual(request.instanceRoot, firstRoot);
+      if (firstResume) { assert.equal(request.instanceRoot, retainedRoot); firstResume = false; }
+      await initialize(request); milliseconds += 100;
+      return resumeEvaluation(request);
+    } });
+  assert.equal(result.status, 'completed'); assert.equal(result.elapsedSeconds, 0.5);
+  assert.equal(initialized.size, 4); assert.equal(calls, 5);
+  assert.ok(result.samples.every(sample => sample.result.correct === true));
+  const state = new State(join(retainedRoot, 'state.sqlite'));
+  try {
+    const attempts = state.db.prepare('SELECT id,session,elapsed FROM attempts').all();
+    assert.equal(attempts.length, 1); assert.equal(attempts[0].id, retainedAttempt);
+    assert.equal(attempts[0].session, retainedSession); assert.equal(attempts[0].elapsed, 0.2);
+    assert.equal(state.events(retainedAttempt).filter(event => event.type === 'native-bash-started').length, 1);
+    assert.equal(state.events(retainedAttempt).filter(event => event.type === 'native-bash-completed').length, 1);
+  } finally { state.close(); }
+  assert.equal(await readFile(retainedSession, 'utf8'), 'completed native Bash session fixture\n');
+
 });
