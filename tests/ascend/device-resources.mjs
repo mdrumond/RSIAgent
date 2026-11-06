@@ -548,6 +548,17 @@ for(const product of ['a3','a5'])test(`${product} reserved physical device is ex
   const previous=f.commands.length;
   await assert.rejects(background.execute('must-not-fall-back',f.source,{timeout:5}),/No enabled devices/);
   assert.equal(f.commands.length,previous);
+  const disabled=await scheduler.resources();
+  assert.deepEqual(disabled.map(row=>[row.id,row.metadata.hostSlot,row.available]),
+    [[slots[0].id,0,false],[slots[1].id,1,true]]);
+  assert.deepEqual((await foreground.inspectDevices()).filter(row=>row.available).map(row=>row.metadata.physicalDevice),[0]);
+  assert.equal((await foreground.execute('foreground-while-background-disabled',f.source,{timeout:5})).settled,true);
+  assert.deepEqual(f.commands.at(-1).devices,[0]);
+  assert.equal(f.commands.at(-1).env.ASCEND_RT_VISIBLE_DEVICES,'0');
+  f.setEnabled([]);
+  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),[[slots[0].id,false]]);
+  f.setEnabled([0,2]);
+  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),slots.map(row=>[row.id,true]));
 });
 
 test('physical background routing requires explicit scalar membership and valid worker slot',async t=>{

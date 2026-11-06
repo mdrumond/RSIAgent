@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { cp, mkdir, readFile, writeFile, realpath, stat, rename, rm } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,6 +135,33 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
     if(ledger.db.isTransaction)ledger.db.exec('ROLLBACK');
     throw error;
   } finally {ledger.close();if(staged)await rm(staged,{force:true});}
+}
+
+// Scheduler callbacks must not yield while holding SQLite's write lock: its
+// elapsed timers write through another connection on this same event loop.
+export async function updateConfigImmediate(root,change) {
+  root=await realpath(root);
+  const ledger=new State(join(root,'state.sqlite'));
+  let staged;
+  const pack=()=>ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()
+    ?ledger.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get()?.value??null:null;
+  try {
+    const token=pack();
+    if(token && !await (await import('../controller/lifecycle.mjs')).ownerStopped(token))
+      throw new Error('Pack capture active; writer admission refused');
+    ledger.db.exec('BEGIN IMMEDIATE');
+    if(pack()!==token)throw new Error('Pack capture changed; refresh before publishing');
+    const path=join(root,'instance.json'),current={...JSON.parse(readFileSync(path,'utf8')),root};
+    const next=change(current,ledger);
+    if(next?.then)throw new Error('Immediate config callback must be synchronous');
+    if(current.format!==1 || next.format!==1)throw new Error('Current format required');
+    syncCampaignPlan(ledger,next);
+    next.revision=(current.revision??0)+1;delete next.root;
+    staged=path+'.'+randomUUID()+'.tmp';
+    writeFileSync(staged,JSON.stringify(next,null,2)+'\n',{mode:0o600});
+    renameSync(staged,path);ledger.db.exec('COMMIT');return next;
+  }catch(error){if(ledger.db.isTransaction)ledger.db.exec('ROLLBACK');throw error;}
+  finally{ledger.close();if(staged)rmSync(staged,{force:true});}
 }
 
 async function copyMachinery(machinery,release,install=true,python='python',signal,initialization) {

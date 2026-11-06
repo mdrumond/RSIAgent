@@ -200,3 +200,35 @@ test('real public CLI supervision completes a scripted local project without cha
   }finally{ledger.close();}
   assert.equal(JSON.parse(await readFile(join(f.root,'.supervisor','status.json'),'utf8')).state,'complete');f.pass();
 });
+
+test('orphan workers keep charging a running native clock without modifying its checkpoint',async()=>{
+  const allocation=30*86400,elapsed=allocation-9*3600;
+  for(const [boot,running,gap,reason] of [['boot',true,9*3600,'elapsed'],
+    ['boot',true,8*3600,'complete'],['old-boot',true,9*3600,'complete'],['boot',false,9*3600,'complete']]) {
+    const view={...fresh(),operation:'campaign',attempts:1,
+      budget:{cycle:'same',seconds:allocation,elapsed,monotonic:0,boot,running}};
+    const before=structuredClone(view.budget),f=fixture([view,done()],gap*1000);
+    f.deps.restart=async()=>({stopped:false,observable:true,activeWork:true});
+    f.deps.wait=async()=>{};
+    assert.equal((await superviseCampaign(options(),f.deps)).reason,reason);
+    assert.deepEqual(view.budget,before);
+    assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+  }
+});
+
+test('running controller cannot reset repeated disk failures, including across supervisor restart',async()=>{
+  const running={...fresh(),status:{controller:{state:'running'},progress:{done:false}}};
+  for(const invalid of [false,true]) {
+    const f=fixture([running],120000);
+    f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},blockedSince:0,blockedElapsed:120000});
+    f.deps.space=async()=>{if(invalid)return NaN;throw new Error('disk probe unavailable');};
+    const result=await superviseCampaign(options(),f.deps);
+    assert.equal(result.state,'attention-needed');assert.equal(result.reason,'infrastructure-or-ownership');
+    assert.equal(result.at,1800000);assert.equal(result.blockedSince,0);
+    assert.equal(result.checkpointPending,false);assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+  }
+  const recovered=fixture([running,done()],32*60000);
+  recovered.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},blockedSince:0,blockedElapsed:32*60000});
+  assert.equal((await superviseCampaign(options(),recovered.deps)).state,'complete');
+  assert.equal(recovered.reports.find(report=>report.state==='running').blockedSince,null);
+});
