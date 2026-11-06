@@ -127,9 +127,9 @@ def test_candidate_timing_reuses_one_cpu_reference_outside_every_measurement(mon
 def test_native_cpu_reference_input_mutation_is_rejected_before_target_execution(monkeypatch, path):
     spec, directory, cases = pack(WORKLOAD)
     module, args, kwargs = small_inputs(WORKLOAD, cases[0])
-    def mutating(_workload, _module, values, attrs):
+    def mutating(_workload, _module, values, attrs, oracle_outputs=None):
         values[0].add_(1.)
-        return native_reference(_workload, _module, values, attrs)
+        return native_reference(_workload, _module, values, attrs, oracle_outputs)
     if path == 'qualification':
         monkeypatch.setattr(q, 'inputs', lambda *_: (module, args, kwargs))
         monkeypatch.setattr(q, 'native_reference', mutating)

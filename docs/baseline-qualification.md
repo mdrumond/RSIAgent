@@ -70,7 +70,9 @@ Indexer Grad KL Loss Enhance reference. The upstream NPU branch calculates in th
 input dtype: FP16 rounds `clamp_min(1e-8)` to zero before `log`, producing nonfinite
 loss and gradients. The adapter changes only native-device selection and calculation
 dtype: NPU inputs retain the native NPU layout path, including FP32 inputs, and all
-floating calculations and four outputs use FP32, matching the CPU golden contract.
+floating calculations use FP32. The benchmark returns each gradient in its
+corresponding input dtype and the loss in FP32. The CPU oracle remains unrounded
+FP32; its cached outputs also supply the cast same-precision comparison control.
 There is no CPU fallback for NPU inputs. Vendored bytes, cases and tolerances remain
 unchanged. The manifest declares this adapter; source and verifier hashes bind it.
 Reduced CPU tests reproduce the native-branch FP16 failure and exercise the repaired
