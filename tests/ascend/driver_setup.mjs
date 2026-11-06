@@ -54,6 +54,18 @@ export async function setup(t,scenario,ids,{install=false}={}) {
         return !owner || await ownerStopped(owner);
       },5000);
     }catch(error){t.diagnostic(`Controller cleanup retained for inspection: ${error.message}`);}
+    // Scheduler shutdown only submits final compression. Its detached request
+    // owns files in this fixture until the request process has also exited.
+    // On timeout leave the tree intact and fail cleanup rather than racing rm.
+    await until(async()=>{
+      if(!rows(instance,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
+      const storage=rows(instance,"SELECT status,owner FROM requests WHERE kind='storage'");
+      for(const request of storage) {
+        if(['queued','running'].includes(request.status))return false;
+        if(request.owner && !await ownerStopped(request.owner))return false;
+      }
+      return true;
+    });
     try {
       const receipt=JSON.parse(await readFile(join(instance,'knowledge-service.json'),'utf8'));
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
