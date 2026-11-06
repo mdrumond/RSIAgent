@@ -15,7 +15,18 @@ function lockedThrough() {
   return (campaignProgress?.plan?.lockedPrefix ?? 0) - 1;
 }
 
-function renderPlan() {
+function renderPlan(rebuild = false) {
+  if (!rebuild) {
+    [...el('campaign-entries').children].forEach((row, index) => {
+      const locked = index <= lockedThrough();
+      for (let column = 0; column < 3; column++) row.children[column].children[0].disabled = locked;
+      row.children[3].disabled = locked || index - 1 <= lockedThrough();
+      row.children[4].disabled = locked || index + 1 >= campaignPlan.length;
+      row.children[5].disabled = locked;
+    });
+    el('campaign-add').disabled = !planLoaded;
+    return;
+  }
   el('campaign-entries').replaceChildren();
   campaignPlan.forEach((entry, index) => {
     const row = document.createElement('div');
@@ -31,7 +42,7 @@ function renderPlan() {
       else field.type = type;
       if (type === 'number') { field.min = '1'; field.step = '1'; }
       field.value = entry[key]; field.disabled = locked;
-      field.onchange = () => {
+      field.oninput = field.onchange = () => {
         if (index <= lockedThrough()) return renderPlan();
         entry[key] = type === 'number' ? Number(field.value) : field.value;
         dirty = true;
@@ -48,7 +59,7 @@ function renderPlan() {
         if (index <= lockedThrough() || destination <= lockedThrough()) return;
         if (!offset) campaignPlan.splice(index, 1);
         else [campaignPlan[index], campaignPlan[destination]] = [campaignPlan[destination], campaignPlan[index]];
-        dirty = true; renderPlan();
+        dirty = true; renderPlan(true);
       };
       row.append(button);
     }
@@ -62,7 +73,7 @@ el('campaign-add').onclick = () => {
   let suffix = 1;
   while (campaignPlan.some(entry => entry.id === `entry-${suffix}`)) suffix++;
   campaignPlan.push({id: `entry-${suffix}`, phase: 'phase1', new_projects: 1});
-  dirty = true; renderPlan();
+  dirty = true; renderPlan(true);
 };
 
 async function api(path, method = 'GET', data) {
@@ -96,7 +107,7 @@ function loadFields(config) {
   loadedMode = mode;
   el('config').value = format(config);
   campaignPlan = JSON.parse(JSON.stringify(config.campaign_plan ?? []));
-  renderPlan();
+  renderPlan(true);
   el('skills-status').textContent = format(config.skills ?? {});
   el('baseline').value = config.baselineKDB ?? '';
   const scopes = Object.keys(config.skillsmap ?? {});
@@ -140,7 +151,8 @@ async function refresh() {
   planLoaded = true;
   renderPlan();
   if (state.skills) el('skills-status').textContent = format({ ...state.skills,
-    candidateStatus: state.skills.candidate ? 'Candidate (validation not established by status)' : null});
+    candidateState: !state.skills.candidate ? null : state.skills.candidate === state.skills.activeVersion
+      ? 'active' : state.skills.candidateDecision ?? 'unknown'});
   el('campaign-status').textContent = format({currentEntry: campaignProgress?.currentEntry ?? null,
     progress: campaignProgress, recoveriesIncludingCarriedWork: state.recoveries ?? []});
   el('status').replaceChildren();
