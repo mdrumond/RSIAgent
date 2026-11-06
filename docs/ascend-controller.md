@@ -272,7 +272,12 @@ Skill proposals accumulate without running benchmark projects unless
 candidate evaluation round. This setting initializes each new round once;
 resuming a round never refills it. Existing instances without this setting now
 prepare candidates and report `deferred`, including manual tuning requests.
-Promotion still requires two distinct projects and at least two runs per arm.
+Promotion still requires two distinct projects and at least two runs per arm
+(default `skills.runsPerArm: 2`). For inexpensive integration checks, explicitly
+set `skills.runsPerArm: 1` to run four samples. A single run can reject correctness
+regressions but never promote guidance; passing repair or timing observations
+return `insufficient-repetitions`. These checks establish integration behavior,
+not improvement efficacy.
 
 To evaluate an already prepared candidate or add time to its pending round,
 pass a tuning action such as

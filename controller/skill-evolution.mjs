@@ -39,8 +39,8 @@ export const candidateVersion = (state, active) => state.candidateBase === activ
 
 // Correctness improvements precede timing; every candidate correctness result must pass.
 export function evaluateDecision(results, projectIds, runs = 2) {
-  if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 2)
-    throw new Error('Require two distinct regression projects and at least two runs');
+  if (projectIds.length !== 2 || new Set(projectIds).size !== 2 || !Number.isInteger(runs) || runs < 1)
+    throw new Error('Require two distinct regression projects and a positive run count');
   const expected = projectIds.flatMap(projectId => Array.from({ length: runs }, (_, run) =>
     ['active', 'candidate'].map(arm => ({ projectId, run, arm })))).flat();
   if (results.length !== expected.length) return { promote: false, reason: 'inconclusive' };
@@ -55,6 +55,7 @@ export function evaluateDecision(results, projectIds, runs = 2) {
       return { promote: false, reason: 'inconclusive' };
     paired.push(result);
   }
+  if (runs < 2) return { promote: false, reason: 'insufficient-repetitions' };
   if (paired.some(r => r.arm === 'active' && r.correct === false))
     return { promote: true, reason: 'reliability-improvement' };
   if (paired.some(r => !Number.isFinite(r.score)))

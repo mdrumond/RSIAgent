@@ -70,6 +70,25 @@ test('candidate repairs active failures before performance, but reverse never pr
   assert.equal(evaluateDecision(results, config.skills.tuningProjectIds).promote, false);
 });
 
+test('single-run integration observes repair and regressions without promoting guidance', () => {
+  const ids = config.skills.tuningProjectIds;
+  const results = ids.flatMap(projectId => ['active', 'candidate'].map(arm =>
+    ({ projectId, run: 0, arm, correct: true, score: arm === 'candidate' ? 2 : 1 })));
+  const insufficient = { promote: false, reason: 'insufficient-repetitions' };
+  assert.equal(results.length, 4);
+  assert.deepEqual(evaluateDecision(results, ids, 1), insufficient);
+  const repaired = structuredClone(results);
+  repaired[0].correct = false; delete repaired[0].score;
+  assert.deepEqual(evaluateDecision(repaired, ids, 1), insufficient);
+  const regressed = structuredClone(results);
+  regressed[1].correct = false;
+  assert.deepEqual(evaluateDecision(regressed, ids, 1), { promote: false, reason: 'correctness-regression' });
+  assert.deepEqual(evaluateDecision(results.slice(1), ids, 1), { promote: false, reason: 'inconclusive' });
+  const duplicate = structuredClone(results); duplicate[3] = { ...duplicate[1] };
+  assert.deepEqual(evaluateDecision(duplicate, ids, 1), { promote: false, reason: 'inconclusive' });
+  for (const runs of [0, -1, 0.5, '1']) assert.throws(() => evaluateDecision(results, ids, runs));
+});
+
 test('negative retention and evidence-gated critical pruning are enforced', () => {
   const remove = [{ action: 'remove', id: 'failure' }];
   const options = { allowPruning: true, history: history(24) };
