@@ -31,6 +31,12 @@
     "cases": "cases.json",
     "function": "sparse_lightning_indexer_grad_kl_loss_enhance",
     "oracle": "sparse_lightning_indexer_grad_kl_loss_enhance",
+    "compatibilityAdapter": {
+      "implementation": "inputs.py:_sparse_kl_fp32",
+      "computation": "FP32 on input device; native NPU layout path for all floating input dtypes",
+      "outputs": "FP32 gradients and loss, matching CPU golden",
+      "reason": "FP16 clamp_min(1e-8) underflows before log; preserve frozen golden bytes"
+    },
     "origin": "cann-bench",
     "thresholds": {
       "float32": 0.0001220703125,
