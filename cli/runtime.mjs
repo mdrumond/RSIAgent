@@ -241,7 +241,7 @@ export async function operate(command,config,options={}) {
       if(storage) {
         storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
           parent:job.origin_attempt??null,wave:admitted.wave??wave,
-          skillRevision:storage.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get()?.revision??skillVersion});
+          skillRevision:(await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,

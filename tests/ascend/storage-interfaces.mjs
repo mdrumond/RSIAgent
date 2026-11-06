@@ -205,3 +205,15 @@ test('automatic maintenance submits no empty jobs and reuses a pending request',
   assert.equal(await queueCompression(config),null);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM requests').get().n,1);
 });
+
+test('project verification includes source Git integrity without treating its directory as a log',async t=>{
+  const f=await fixture(t);await f.storage.seal(f.row.id);
+  const repository=join(f.root,'source-history','repository');
+  await mkdir(repository,{recursive:true});await exec('git',['init','--bare',repository]);
+  const history=await f.storage.register(repository,{project:'p',kind:'source-git'});
+  const verified=await f.call({action:'verify',project:'p'});
+  assert.equal(verified.find(row=>row.id===history.id).verified,true);
+  assert.equal(verified.find(row=>row.id===f.row.id).verified,true);
+  await rm(join(repository,'HEAD'));
+  await assert.rejects(f.call({action:'verify',project:'p'}));
+});

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 
 from .log_walk import walk_records
@@ -87,6 +88,11 @@ class Storage:
                     yield block
 
     def verify(self, row):
+        if row['kind'] == 'source-git' and not row['external']:
+            subprocess.run(['git', '--git-dir', str(self.path(row['path'])),
+                            'fsck', '--no-dangling'], check=True, timeout=30,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return dict(id=row['id'], verified=True, kind='source-git')
         digest, size = hashlib.sha256(), 0
         for block in self.content(row):
             digest.update(block)
