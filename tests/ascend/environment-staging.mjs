@@ -14,7 +14,8 @@ async function fixture(t) {
   await writeFile(join(source, 'value.txt'), 'one');
   await writeFile(join(source, 'run.sh'), '#!/bin/bash\ncat value.txt\n', { mode: 0o755 });
   const calls = [], events = [], jobs = new Map(), excluded = [];
-  const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0, uploadStates: null };
+  const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0, uploadStates: null,
+    backend:'remote-agent',failUpload:false,failDownload:false };
   let sequence = 0;
   const operations = sdk.createLocalBashOperations();
   const context = {
@@ -25,9 +26,11 @@ async function fixture(t) {
   function clientFor(remote) {
     return async args => {
       calls.push(args);
-      if (args[0] === 'capabilities') return { state: 'available' };
+      if (args[0] === 'capabilities') return { state: 'available',backend:control.backend };
       if (args[0] === 'preflight') return { state: 'completed' };
       if (args[0] === 'upload') {
+        if(control.failUpload)throw new Error('Upload connection lost');
+        if(control.backend==='ssh')assert.equal(args.length,4,'SSH upload has no retained-transfer flags');
         await delay(control.uploadDelay);
         const destination = join(remote, args[3]);
         await mkdir(dirname(destination), { recursive: true });
@@ -40,7 +43,11 @@ async function fixture(t) {
         }
         return { state: 'completed' };
       }
-      if (args[0] === 'download') { await cp(join(remote, args[2]), args[3]); return { state: 'completed' }; }
+      if (args[0] === 'download') {
+        if(control.failDownload)throw new Error('Download refused');
+        if(control.backend==='ssh')assert.equal(args.length,4,'SSH download uses synchronous completion');
+        await cp(join(remote, args[2]), args[3]); return { state: 'completed' };
+      }
       if (args[0] === 'run') {
         const file = args[args.indexOf('--file') + 1], sync = file.endsWith('sync.sh');
         const handle = `remote:${args[1]}:job:${++sequence}`, job = { state: 'running', sync };
@@ -83,6 +90,40 @@ async function fixture(t) {
   return { root, source, workspace, sdk, environment, control, context, options, calls, events,
     connect, run, sourceUploads, manifests, runs, excluded, idle: () => Promise.all([...jobs.values()].map(job => job.done)) };
 }
+
+test('advertised SSH transfers synchronously stage, execute and collect without retained-transfer flags',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';
+  const environment=await f.connect({},'ssh');
+  assert.equal(await f.run('cat value.txt; printf artifact > result.txt',environment),'one');
+  const destination=join(f.root,'collected.txt');
+  await environment.collectArtifact('owned/ssh/project/result.txt',destination);
+  assert.equal(await readFile(destination,'utf8'),'artifact');
+  assert.equal(f.calls.some(args=>args[0]==='fetch'),false);
+  const transfers=f.events.filter(row=>row.type==='execution-submitted'&&row.accountingExcluded&&row.closed);
+  assert.ok(transfers.length>=3);assert.equal(transfers.every(row=>row.handle===null),true);
+});
+
+test('SSH upload uncertainty prevents payload dispatch and download refusal does not settle earlier work',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';const environment=await f.connect({},'ssh');
+  f.control.failUpload=true;
+  await assert.rejects(environment.execute('touch must-not-run',f.source),/submission identity unknown/);
+  assert.equal(f.runs(false).length,0);assert.equal(f.runs(true).length,0);
+  assert.equal(f.events.at(-1).type,'execution-unresolved');
+  f.control.failUpload=false;f.control.failDownload=true;
+  await assert.rejects(environment.collectArtifact('unavailable',join(f.root,'unused')),error=>{
+    assert.equal(error.closure,undefined);return /submission identity unknown/.test(error.message);
+  });
+  assert.equal(f.events.at(-1).type,'execution-unresolved');
+});
+
+test('an unexpected SSH transfer handle is retained without claiming synchronous closure',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';const environment=await f.connect({},'ssh');
+  f.control.uploadStates=['completed'];
+  await assert.rejects(environment.execute('touch must-not-run',f.source),/Synchronous transfer unresolved/);
+  const submitted=f.events.find(row=>row.type==='execution-submitted'&&row.handle?.includes(':transfer:'));
+  assert.ok(submitted.handle);assert.equal(submitted.closed,false);
+  assert.equal(f.sourceUploads().length,1);assert.equal(f.runs(false).length,0);assert.equal(f.runs(true).length,0);
+});
 
 test('native SDK repeated Bash reuses one upload/manifest but restores source every time and retains build artifacts', async t => {
   const f = await fixture(t);
