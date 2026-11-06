@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, mkdtemp, mkdir, readFile, writeFile, rm, chmod, stat, utimes, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname,basename } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
 
@@ -34,9 +34,15 @@ async function fixture(t) {
         if(control.backend==='ssh')assert.equal(args.length,4,'SSH upload has no retained-transfer flags');
         if(control.uploadExit!==null)return {backend:'ssh',state:'failed',exit:control.uploadExit};
         await delay(control.uploadDelay);
-        const destination = join(remote, args[3]);
+        let destination = join(remote, args[3]);
         if(control.backend==='ssh')assert.equal((await stat(dirname(destination))).isDirectory(),true,'rsync requires an existing remote parent');
         else await mkdir(dirname(destination), { recursive: true });
+        if(control.backend==='ssh'&&(await stat(args[2])).isDirectory()) {
+          // Existing incoming directories occur on retry. Plain rsync nests a
+          // directory basename unless its source argument ends with a slash.
+          await mkdir(destination,{recursive:true});
+          if(!args[2].endsWith('/'))destination=join(destination,basename(args[2]));
+        }
         await cp(args[2], destination, { recursive: true });
         if (control.uploadStates) {
           const handle = `remote:${args[1]}:transfer:${++sequence}`;
@@ -83,7 +89,7 @@ async function fixture(t) {
   }
   const environment = await connect();
   t.after(async () => { await Promise.all([...jobs.values()].map(job => job.done)); await rm(root, { recursive: true, force: true }); });
-  const sourceUploads = () => calls.filter(args => args[0] === 'upload' && args[2] === source);
+  const sourceUploads = () => calls.filter(args => args[0] === 'upload' && args[2].replace(/\/$/,'') === source);
   const manifests = () => calls.filter(args => args[0] === 'upload' && args[2].endsWith('/sync.json'));
   const runs = sync => calls.filter(args => args[0] === 'run' && args[args.indexOf('--file') + 1].endsWith(sync ? 'sync.sh' : 'command.sh'));
   const run = async (command, env = environment, opts = {}) => {
@@ -96,7 +102,7 @@ async function fixture(t) {
     connect, run, sourceUploads, manifests, runs, excluded, idle: () => Promise.all([...jobs.values()].map(job => job.done)) };
 }
 
-test('advertised SSH transfers synchronously stage, execute and collect without retained-transfer flags',async t=>{
+test('advertised SSH transfers stage directory contents into an existing incoming path and collect synchronously',async t=>{
   const f=await fixture(t);f.control.backend='ssh';
   const environment=await f.connect({},'ssh');
   assert.equal(await f.run('cat value.txt; printf artifact > result.txt',environment),'one');
@@ -104,6 +110,8 @@ test('advertised SSH transfers synchronously stage, execute and collect without 
   await environment.collectArtifact('owned/ssh/project/result.txt',destination);
   assert.equal(await readFile(destination,'utf8'),'artifact');
   assert.equal(f.calls.some(args=>args[0]==='fetch'),false);
+  assert.equal(f.sourceUploads()[0][2],f.source+'/');
+  assert.ok(f.manifests().every(args=>!args[2].endsWith('/')));
   const transfers=f.events.filter(row=>row.type==='execution-submitted'&&row.accountingExcluded&&row.closed);
   assert.ok(transfers.length>=3);assert.equal(transfers.every(row=>row.handle===null),true);
   const firstUpload=f.calls.findIndex(args=>args[0]==='upload');
@@ -118,6 +126,7 @@ test('SSH frozen verifier upload prepares its scoped parent before staging sourc
   const f=await fixture(t);f.control.backend='ssh';const verifier=join(f.root,'oracle.py');
   await writeFile(verifier,"print('independent oracle')\n");
   const environment=await f.connect({},'ssh',[verifier]);
+  assert.equal(f.calls.find(args=>args[0]==='upload'&&args[2]===verifier)[2],verifier);
   assert.equal(await readFile(join(f.workspace,'owned/ssh/tree/oracle.py'),'utf8'),await readFile(verifier,'utf8'));
   assert.equal(f.runs(false).length,0);
   assert.equal(await f.run('python3 ../oracle.py',environment),'independent oracle\n');
@@ -284,6 +293,7 @@ test('partial snapshot deletion, content/type/mode changes, extra files and mani
   ]) {
     const f = await fixture(t);
     await mkdir(join(f.source, 'assets'));
+    await chmod(join(f.source, 'assets'),0o755);
     await writeFile(join(f.source, 'assets', 'reference.txt'), 'reference');
     await f.run("incoming=$(printf '%s' ../exec-*/incoming); " + corruption.replaceAll('../exec-*/incoming', '"$incoming"') + '; printf poisoned > value.txt; printf kept > build.marker');
     assert.equal(f.sourceUploads().length, 1);

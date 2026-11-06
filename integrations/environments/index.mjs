@@ -348,7 +348,10 @@ export async function createEnvironment(options, context) {
   async function transfer(args, dir, signal = context.signal) {
     const upload = args[0] === 'upload';
     const synchronous=(await discoverCapabilities()).backend==='ssh';
-    if(synchronous&&upload)await prepareUploadParent(args[3],dir,signal);
+    if(synchronous&&upload) {
+      if((await lstat(args[2])).isDirectory()&&!args[2].endsWith('/'))args[2]+='/';
+      await prepareUploadParent(args[3],dir,signal);
+    }
     if (!synchronous) {
       if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
       else args.push('--timeout', '0');
