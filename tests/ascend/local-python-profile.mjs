@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, writeFile, symlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { setup, rows, until } from './driver_setup.mjs';
 import { bootstrap, readConfig } from '../../cli/instance.mjs';
-import { operate } from '../../cli/runtime.mjs';
 import { ownerStopped } from '../../controller/lifecycle.mjs';
 import { localPythonConfig } from '../../examples/local-python/config.mjs';
 
@@ -25,12 +25,12 @@ test('a reused campaign and Ascend profile admits both fixed local experiment co
     const before = structuredClone(profile);
     const input = localPythonConfig(profile, original.projects);
     assert.deepEqual(profile, before);
-    let cleaned = false;
+    let cleaned = false, localRuntime;
     const cleanup = async () => {
-      if (cleaned) return;
+      if (cleaned || !localRuntime) return;
       try { await access(join(instance, 'state.sqlite')); }
       catch (error) { if (error.code === 'ENOENT') return; throw error; }
-      await operate('stop', await readConfig(instance));
+      await localRuntime.operate('stop', await readConfig(instance));
       await until(async () => {
         const row = rows(instance, "SELECT value FROM control WHERE key='owner'")[0];
         return !row || !JSON.parse(row.value) || await ownerStopped(JSON.parse(row.value));
@@ -52,10 +52,11 @@ test('a reused campaign and Ascend profile admits both fixed local experiment co
     t.after(cleanup);
     await bootstrap(instance, { ...input, install: false });
     await symlink(resolve('node_modules'), join(instance, 'machinery/node_modules'), 'dir');
+    localRuntime = await import(pathToFileURL(join(instance, 'machinery/cli/runtime.mjs')).href);
     const config = await readConfig(instance);
     assert.equal(config.python, profile.python);
     assert.deepEqual(config.skills.tuningProjectIds, ['reduction', 'parser']);
-    await operate('wave', config);
+    await localRuntime.operate('wave', config);
     assert.deepEqual(rows(instance, 'SELECT project,outcome FROM attempts ORDER BY project')
       .map(({ project, outcome }) => ({ project, outcome })),
       [{ project: 'parser', outcome: 'passed' }, { project: 'reduction', outcome: 'passed' }]);
