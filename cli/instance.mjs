@@ -7,6 +7,7 @@ import { randomUUID,createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { State, validateAcceptance } from '../controller/state.mjs';
+import { syncCampaignPlan } from '../controller/progress.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
 
 export async function readConfig(root) {
@@ -53,6 +54,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     concurrency,tune_every,skills:{...skillSettings,activeVersion:'baseline',runtimeModule:'machinery/cli/evaluation.mjs'},environment,projects};
   const ledger=new State(join(destination,'state.sqlite'));
   try {
+    syncCampaignPlan(ledger,config);
     for(const project of projects)ledger.add(project);
     const storage=new CampaignStorage(ledger,destination);
     const campaign=await storage.initialize({target:config.target??null});
@@ -71,6 +73,7 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   try {
     ledger.db.exec('BEGIN IMMEDIATE');
     const current=await readConfig(root),next=await change(current,ledger);
+    syncCampaignPlan(ledger,next);
     if(next.format!==1)throw new Error('Current format required');
     next.revision=(current.revision??0)+1;delete next.root;
     const path=join(current.root,'instance.json');staged=path+'.'+randomUUID()+'.tmp';
