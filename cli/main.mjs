@@ -97,16 +97,15 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   if(command==='project') {
     if(!values.project) return config.projects;
     const spec=await importProject(root,{actor_seconds:config.actor_seconds,...JSON.parse(await readFile(values.project,'utf8'))});
-    const state=new State(join(root,'state.sqlite'));
-    try {
+    return updateConfig(root,(current,state)=>{
       if(state.project(spec.id)) {
         if(state.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(spec.id))
           throw new Error('Executed projects are frozen; clone under a new id');
         if(!spec.goal || !(spec.actor_seconds>0))throw new Error('Invalid project');
         state.db.prepare('UPDATE projects SET spec=? WHERE id=?').run(JSON.stringify(spec),spec.id);
       }else state.add(spec);
-    }finally{state.close();}
-    return updateConfig(root,current=>({...current,projects:[...current.projects.filter(p=>p.id!==spec.id),spec]}));
+      return {...current,projects:[...current.projects.filter(p=>p.id!==spec.id),spec]};
+    });
   }
   if(command==='browse') {
     const {readdir}=await import('node:fs/promises');

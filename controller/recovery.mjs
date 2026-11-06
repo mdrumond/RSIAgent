@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { currentCampaignEntry, startCampaignEntry } from './progress.mjs';
 import { stages } from './workflow.mjs';
 import { failureSettled } from './lifecycle.mjs';
 
@@ -86,6 +87,18 @@ export class RecoveryQueue {
       const original = project?.status === 'queued' && !queue;
       if (!project || project.frozen || (!original && !this.ready(wave).some(row => row.project === projectId)))
         throw new Error('Job is not eligible');
+      if (original) {
+        const saved = this.db.prepare("SELECT name FROM sqlite_master WHERE name='control'").get() &&
+          this.db.prepare("SELECT value FROM control WHERE key='campaign-plan'").get();
+        if (saved) {
+          const persisted = JSON.parse(saved.value);
+          const entry = currentCampaignEntry(this.state, {campaign_plan:persisted.plan});
+          if (!entry || project.spec.campaign_entry !== entry.id || entry.remainingAdmissions === 0 ||
+              this.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(projectId))
+            throw new Error('Original is outside the current campaign entry');
+          startCampaignEntry(this.state, {campaign_plan:persisted.plan});
+        }
+      }
       const kind = original ? 'original' : queue.kind;
       const id = randomUUID();
       this.db.prepare('INSERT INTO attempts(id,project,owner,created) VALUES (?,?,?,?)')
