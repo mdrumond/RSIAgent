@@ -137,6 +137,14 @@ test('catalog reads immutable prior source from both fresh targets, withholding 
     state.event(job.attempt.id,'failure-settlement',{closed:target==='a3'});
     await writeFile(join(source,'kernel.py'),'answer = 99\n');
   }
+  // A peer is visible to the shared catalog immediately after bootstrap, before
+  // its first controller has initialized RecoveryQueue.
+  const waiting=join(root,'not-started');await mkdir(waiting);
+  const waitingState=new State(join(waiting,'state.sqlite'));ledgers.push(waitingState);
+  await new CampaignStorage(waitingState,waiting).initialize({id:'fresh-waiting',target:'a5'});
+  await writeFile(join(waiting,'instance.json'),JSON.stringify({campaign_cohort:'new-study',target:'a5',
+    storage:{campaign_id:'fresh-waiting'}}));
+  campaigns.push({root:waiting,campaignId:'fresh-waiting',target:'a5'});
   const options={cohort:'new-study',campaigns};
   let entries=await buildProjectCatalog(options);assert.equal(entries.length,1);
   assert.deepEqual(await listProjectFiles(entries[0]),['kernel.py']);

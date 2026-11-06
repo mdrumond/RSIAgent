@@ -70,6 +70,7 @@ export async function operate(command,config,options={}) {
       return {pause_requested:true,grace_seconds:config.pause_grace_seconds??30};
     }
     if(command==='stop') {
+      ctl.set('operator-stop',true);
       ctl.set('stop',true);
       for(const event of state.events(null).filter(e=>e.type==='evaluation-started')) {
         try{await operate('stop',await readConfig(event.data.instanceRoot));}
@@ -100,7 +101,7 @@ export async function operate(command,config,options={}) {
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
       ctl.set('owner',owner);
       if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
-      ctl.set('stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
+      ctl.set('stop',false);ctl.set('operator-stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
     if(options.continuous&&config.campaign_seconds!==undefined) {
       const cycle=command==='resume'?ctl.get('campaign-budget')?.cycle??randomUUID():randomUUID();
