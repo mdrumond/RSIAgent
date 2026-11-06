@@ -238,7 +238,7 @@ def _capture(root):
             if row and not delegated and not Storage.stopped(row[0]):
                 raise ValueError('Pack capture already active or unresolved')
             allowed = [me] + ([parent] if delegated else [])
-            for key, value in db.execute("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')"):
+            for key, value in db.execute("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup','supervisor-owner')"):
                 owner = json.loads(value)
                 if owner is None:
                     continue
@@ -287,7 +287,20 @@ def pack(root, dest, project=None, require_complete=True):
         return _pack(root, dest, project, require_complete, Path(temporary))
 
 
+def _require_portable_background(root, project):
+    if project:
+        return  # Project exports do not promise a resumable campaign snapshot.
+    with closing(sqlite3.connect(f'file:{root / "state.sqlite"}?mode=ro', uri=True)) as db:
+        for table in ('skill_evidence_queue', 'evaluation_archives'):
+            if table in _tables(db) and db.execute('SELECT 1 FROM ' + table + ' LIMIT 1').fetchone():
+                raise ValueError('Campaign pack cannot preserve background tuning/archive state; use project exports or retain original campaign files')
+    config = root / 'instance.json'
+    if config.exists() and _load_json(config).get('skills', {}).get('background') and (root / 'skills/evolution.json').exists():
+        raise ValueError('Campaign pack cannot preserve background tuning history; use project exports or retain original campaign files')
+
+
 def _pack(root, dest, project, require_complete, work):
+    _require_portable_background(root, project)
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     if (dest / 'package.json').exists():
         raise FileExistsError('Package already published')

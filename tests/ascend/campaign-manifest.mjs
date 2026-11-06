@@ -10,6 +10,7 @@ import {CampaignStorage} from '../../controller/storage.mjs';
 import {prepareSourceGit} from '../../controller/source-git.mjs';
 import {buildCampaignManifest,campaignEntryConfig,qualificationGate,bootstrapFreshCampaign,workloads} from '../../cli/campaign-manifest.mjs';
 import {buildProjectCatalog,listProjectFiles,readProjectSource,projectCatalogExtension} from '../../cli/project-catalog.mjs';
+import {createEnvironment as createAscendEnvironment} from '../../integrations/environments/ascend.mjs';
 
 const profile={baseline:'/private/base.sqlite',skills:'/private/baseline-skills',
   environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local',runtime:'fixture-runtime'}},
@@ -18,6 +19,27 @@ const profile={baseline:'/private/base.sqlite',skills:'/private/baseline-skills'
 const phase2Projects=Object.fromEntries(workloads.map(workload=>[workload,{goal:workload,source:'/private/'+workload,
   verifier:{files:[],command:'true',performance_command:'true'},performance_goal:'improve frozen baseline'}]));
 const manifest=target=>buildCampaignManifest({campaignId:'fresh-study',target,profile,phase2Projects});
+
+test('Ascend campaign targets admit host slots while preserving the registered transport route',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'campaign-profile-'));
+  try {
+    const instructions=join(root,'instructions.md');await writeFile(instructions,'fixture');
+    for(const target of ['a3','a5']) {
+      const supplied={...profile,environment:{module:'machinery/integrations/environments/ascend.mjs',options:{
+        mode:'cpl',target:'fixture-'+target,profile:target+'-language',runtime:'fixture',instructionFile:instructions,
+        health:{product:target}}}};
+      const config=buildCampaignManifest({campaignId:'fixture',target,profile:supplied,phase2Projects});
+      const env=await createAscendEnvironment(config.environment.options,{instancePath:root,event:async()=>{},
+        exclude:async(_label,fn)=>fn(),client:async args=>{
+          assert.deepEqual(args,['npu','list','fixture-'+target]);
+          return {state:'completed',profiles:[{target:'fixture-'+target,pool:'fixture',devices:[{enabled:true,id:0}]}]};
+        }});
+      assert.equal((await env.resources({target:config.target})).length,1);
+      assert.deepEqual(await env.resources({target:'unrelated'}),[]);
+      assert.equal(supplied.environment.options.profile,target+'-language');
+    }
+  }finally{await rm(root,{recursive:true,force:true});}
+});
 
 test('supplied-only native campaign entries retain configured actor budgets without a curriculum',()=>{
   const config={actor_seconds:17,campaign_plan:[{id:'supplied',phase:'phase2',new_projects:1}]};
@@ -137,6 +159,14 @@ test('catalog reads immutable prior source from both fresh targets, withholding 
     state.event(job.attempt.id,'failure-settlement',{closed:target==='a3'});
     await writeFile(join(source,'kernel.py'),'answer = 99\n');
   }
+  // A peer is visible to the shared catalog immediately after bootstrap, before
+  // its first controller has initialized RecoveryQueue.
+  const waiting=join(root,'not-started');await mkdir(waiting);
+  const waitingState=new State(join(waiting,'state.sqlite'));ledgers.push(waitingState);
+  await new CampaignStorage(waitingState,waiting).initialize({id:'fresh-waiting',target:'a5'});
+  await writeFile(join(waiting,'instance.json'),JSON.stringify({campaign_cohort:'new-study',target:'a5',
+    storage:{campaign_id:'fresh-waiting'}}));
+  campaigns.push({root:waiting,campaignId:'fresh-waiting',target:'a5'});
   const options={cohort:'new-study',campaigns};
   let entries=await buildProjectCatalog(options);assert.equal(entries.length,1);
   assert.deepEqual(await listProjectFiles(entries[0]),['kernel.py']);

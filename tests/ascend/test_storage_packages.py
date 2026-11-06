@@ -69,6 +69,24 @@ class PackageTests(unittest.TestCase):
             db.execute("INSERT INTO entries VALUES('active-entry')")
         self.package = self.base / 'package'
 
+    def test_campaign_export_refuses_unportable_background_state_but_project_export_remains_valid(self):
+        for table in ('skill_evidence_queue', 'evaluation_archives'):
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                db.execute('CREATE TABLE ' + table + '(id TEXT)')
+                db.execute('INSERT INTO ' + table + ' VALUES (?)', ('retained-job',))
+            with self.assertRaisesRegex(ValueError, 'cannot preserve background'):
+                pack(self.root, self.package)
+            self.assertFalse(self.package.exists())
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                db.execute('DELETE FROM ' + table)
+        (self.root / 'instance.json').write_text(json.dumps(dict(format=1, skills=dict(background=True))))
+        (self.root / 'skills').mkdir();(self.root / 'skills/evolution.json').write_text(json.dumps(dict(history=[dict(id='retained')], pending=None)))
+        with self.assertRaisesRegex(ValueError, 'cannot preserve background'):
+            pack(self.root, self.package)
+        self.assertFalse(self.package.exists())
+        result = pack(self.root, self.package, 'p')
+        self.assertTrue(result['complete']);self.assertEqual(result['scope'], 'project')
+
     def test_project_roundtrip_relocation_and_identities(self):
         (self.source / '.env').write_text('do not export')
         result = pack(self.root, self.package, 'p')
@@ -335,7 +353,7 @@ class PackageTests(unittest.TestCase):
         from ascend_tools import storage_package
         live = json.dumps(storage_package._identity(os.getpid()))
         for project in (None, 'p'):
-            for key in ('owner', 'skill-writer', 'memory-writer', 'knowledge-startup'):
+            for key in ('owner', 'skill-writer', 'memory-writer', 'knowledge-startup', 'supervisor-owner'):
                 with self.subTest(project=project, writer=key):
                     with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
                         db.execute('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')

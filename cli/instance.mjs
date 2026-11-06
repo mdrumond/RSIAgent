@@ -184,7 +184,7 @@ export async function upgrade(root,machinery) {
   async function stoppedOwners() {
     await assertPackAvailable(ledger);
     if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
-      for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer')").all()) {
+      for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','supervisor-owner')").all()) {
         const owner=JSON.parse(row.value);
         if(owner && !await ownerStopped(owner))throw new Error('Stop the controller and skill writer before upgrading');
       }

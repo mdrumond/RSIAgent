@@ -6,11 +6,43 @@ import torch
 from . import pack
 
 
+def _sparse_kl_fp32(tree):
+    """Keep upstream KL math/device placement, repairing its low-precision path.
+
+    FP16 clamp_min(1e-8) becomes zero before log, yielding nonfinite loss/gradients.
+    CPU golden already computes and returns all four tensors in FP32. Match that
+    contract on NPU, including FP32 inputs, without its CPU fallback. Vendored
+    source bytes, cases and tolerances remain untouched.
+    """
+    sites = []
+    class Precision(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            if node.name != '_sparse_lightning_kl_grad_impl':
+                return node
+            for statement in node.body:
+                if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+                    continue
+                name = getattr(statement.targets[0], 'id', None)
+                if name == 'native':
+                    statement.value = ast.parse("query.device.type == 'npu'", mode='eval').body
+                    sites.append(name)
+                elif name == 'calc_dtype':
+                    statement.value = ast.parse('torch.float32', mode='eval').body
+                    sites.append(name)
+            return node
+    tree = Precision().visit(tree)
+    if sorted(sites) != ['calc_dtype', 'native']:
+        raise ValueError('Sparse KL compatibility adapter no longer matches frozen reference')
+    return ast.fix_missing_locations(tree)
+
+
 def load(workload, case=None):
     spec, directory, cases = pack(workload)
     module = types.ModuleType('baseline_' + workload)
     module.__file__ = str(directory / spec['source'])
     tree = ast.parse((directory / spec['source']).read_text())
+    if workload == 'sparse_lightning_indexer_grad_kl_loss_enhance':
+        tree = _sparse_kl_fp32(tree)
     if workload == 'gdn':
         # Its original generator hardcodes .npu(); CPU construction must not allocate an NPU.
         class Placement(ast.NodeTransformer):

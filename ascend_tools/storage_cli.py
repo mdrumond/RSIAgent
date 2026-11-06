@@ -200,7 +200,7 @@ class Storage:
 
     def plan(self, action):
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='control'").fetchone():
-            for item in self.db.execute("SELECT value FROM control WHERE key IN ('owner','skill-writer')"):
+            for item in self.db.execute("SELECT value FROM control WHERE key IN ('owner','skill-writer','supervisor-owner')"):
                 if not self.stopped(item['value']):
                     raise ValueError('campaign owner is live or unresolved')
         query, args = 'SELECT outcome,owner FROM attempts', []
