@@ -238,7 +238,7 @@ def _capture(root):
             if row and not delegated and not Storage.stopped(row[0]):
                 raise ValueError('Pack capture already active or unresolved')
             allowed = [me] + ([parent] if delegated else [])
-            for key, value in db.execute("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')"):
+            for key, value in db.execute("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup','supervisor-owner')"):
                 owner = json.loads(value)
                 if owner is None:
                     continue

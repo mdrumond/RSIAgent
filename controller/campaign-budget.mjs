@@ -1,5 +1,18 @@
 import {ActorClock} from './budget.mjs';
 
+// Read-only projection: a retained running clock keeps charging on the same boot.
+export function campaignElapsed(prior,{boot,now=()=>Number(process.hrtime.bigint())/1e6}) {
+  if(!prior)return 0;
+  if(!Number.isFinite(prior.elapsed)||prior.elapsed<0)throw new Error('Invalid retained campaign budget');
+  let elapsed=prior.elapsed;
+  if(prior.running&&prior.boot===boot) {
+    const current=now();
+    if(!Number.isFinite(prior.monotonic)||current<prior.monotonic)throw new Error('Campaign monotonic clock moved backwards');
+    elapsed+=(current-prior.monotonic)/1000;
+  }
+  return elapsed;
+}
+
 // The controller supplies the same cycle identity after automatic restart or
 // Resume. Only an explicit new campaign creates a new cycle. Project clocks are
 // independent and are never reset here.
@@ -14,11 +27,7 @@ export function campaignBudget(state,{seconds,cycle,boot,now=()=>Number(process.
   let elapsed=0;
   if(prior?.cycle===cycle) {
     if(!Number.isFinite(prior.elapsed)||prior.elapsed<0||!Number.isFinite(prior.monotonic))throw new Error('Invalid retained campaign budget');
-    elapsed=prior.elapsed;
-    if(prior.running&&prior.boot===boot) {
-      if(started<prior.monotonic)throw new Error('Campaign monotonic clock moved backwards');
-      elapsed+=(started-prior.monotonic)/1000;
-    }
+    elapsed=campaignElapsed(prior,{boot,now:()=>started});
   }
   const clock=new ActorClock(seconds,elapsed,now);
   let stopped=false,snapshot;
