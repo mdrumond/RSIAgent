@@ -4,7 +4,7 @@ import {skillWorker} from '../../cli/skill-worker.mjs';
 
 function fixture({capacity=8,index=2,work=true,fail=false}={}) {
   const ledger=new Map([['campaign-plan',{index}]]),errors=[];
-  let calls=0,closed=true,resolveRun;
+  let calls=0,closed=true,resolveRun,clock=2000;
   const config={campaign_plan:[{},{}],skills:{background:true}};
   const operations={backgroundSkillStatus:async()=>({hasWork:work}),backgroundSkillsSettled:async()=>closed,
     runBackgroundSkills:async(_config,{signal})=>{
@@ -12,9 +12,10 @@ function fixture({capacity=8,index=2,work=true,fail=false}={}) {
       await new Promise(resolve=>{resolveRun=()=>{closed=true;resolve();};signal.addEventListener('abort',resolve,{once:true});});
     }};
   const worker=skillWorker({control:{get:key=>ledger.get(key),set:(key,value)=>ledger.set(key,value),leased:()=>false},
-    config:()=>config,remaining:()=>100,event:(_type,data)=>errors.push(data),operations,now:()=>2000});
+    config:()=>config,remaining:()=>100,event:(_type,data)=>errors.push(data),operations,now:()=>clock});
   return {worker,ledger,errors,resources:Array.from({length:capacity},(_,i)=>({id:'slot'+i,available:true})),
-    get calls(){return calls;},finish:()=>resolveRun?.(),settle:()=>{closed=true;}};
+    get calls(){return calls;},finish:()=>resolveRun?.(),settle:()=>{closed=true;},
+    advance:()=>{clock+=1000;},setWork:value=>{work=value;}};
 }
 
 test('first iteration uses all capacity; later idle tuning permanently earmarks one slot',async()=>{
@@ -72,4 +73,51 @@ test('marked A/B slot is mandatory and never replaced by an idle foreground slot
   await available.worker.poll(available.resources,0,8);
   assert.equal(available.calls,1);assert.equal(available.worker.resource.id,'slot1');
   available.finish();await available.worker.running;await available.worker.stop();
+});
+
+const marked=fixture=>{
+  fixture.resources[0].metadata={hostSlot:0,backgroundSlot:true};
+  fixture.resources[1].metadata={hostSlot:1,backgroundSlot:false};
+  return fixture;
+};
+const foregroundCapacity=(worker,limit)=>Math.min(limit,worker.capacity)-(worker.reserved?1:0);
+
+test('disabled idle background slot leaves foreground capacity in first and later iterations',async()=>{
+  for(const index of [0,2])for(const limit of [1,2]) {
+    const f=marked(fixture({capacity:2,index}));f.resources[0].available=false;
+    await f.worker.poll(f.resources,0,limit);
+    assert.equal(f.calls,0);assert.equal(f.worker.reserved,false);
+    assert.equal(foregroundCapacity(f.worker,limit),1);
+    assert.equal(f.resources.filter(row=>row.available)[0].metadata.hostSlot,1);
+  }
+  const idle=marked(fixture({capacity:2,work:false}));
+  await idle.worker.poll(idle.resources,0,1);assert.equal(idle.worker.reserved,true);
+  idle.resources[0].available=false;idle.advance();
+  await idle.worker.poll(idle.resources,0,1);
+  assert.equal(idle.worker.resource.id,'slot0');assert.equal(foregroundCapacity(idle.worker,1),1);
+});
+
+test('reenabling background immediately reserves capacity but waits for foreground before starting A/B',async()=>{
+  const f=marked(fixture({capacity:2}));f.resources[0].available=false;
+  await f.worker.poll(f.resources,0,1);assert.equal(foregroundCapacity(f.worker,1),1);
+  f.resources[0].available=true;f.advance();await f.worker.poll(f.resources,1,1);
+  assert.equal(f.calls,0);assert.equal(foregroundCapacity(f.worker,1),0);
+  f.advance();await f.worker.poll(f.resources,0,1);assert.equal(f.calls,1);
+  f.finish();await f.worker.running;await f.worker.stop();
+});
+
+test('disabled running or unresolved A/B remains within the shared host concurrency limit',async()=>{
+  for(const limit of [1,2]) {
+    const f=marked(fixture({capacity:2}));await f.worker.poll(f.resources,0,limit);
+    assert.equal(f.calls,1);f.resources[0].available=false;
+    await f.worker.poll(f.resources,0,limit);
+    assert.equal(foregroundCapacity(f.worker,limit),limit-1);
+    await f.worker.stop(); // Simulated cancellation returns without proving child closure.
+    f.advance();await f.worker.poll(f.resources,0,limit);
+    assert.equal(foregroundCapacity(f.worker,limit),limit-1);
+    assert.equal(f.worker.resource.id,'slot0');assert.equal(f.calls,1);
+    f.settle();f.advance();await f.worker.poll(f.resources,0,limit);
+    assert.equal(foregroundCapacity(f.worker,limit),1);
+    await f.worker.stop();
+  }
 });
