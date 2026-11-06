@@ -56,6 +56,28 @@ def test_state_dtype_and_target_placement_contracts():
         output_check('fa',q,q,[q],'npu:0')
 
 
+@pytest.mark.parametrize('dtype',[torch.float16,torch.bfloat16,torch.float32])
+def test_sparse_adapted_reference_outputs_obey_candidate_dtype_contract(dtype):
+    from test_sparse_kl_adapter import native_branch_on_cpu, WORKLOAD
+    _,module,_=load(WORKLOAD)
+    args=[torch.tensor([[[40.,0.]]],dtype=dtype),
+          torch.tensor([[[1.,0.]],[[-1.,0.]]],dtype=dtype),
+          torch.tensor([[[2.,1.]]],dtype=dtype),
+          torch.tensor([[[1.,0.]],[[0.,1.]]],dtype=dtype),
+          torch.tensor([[.5]],dtype=dtype),torch.tensor([[[0,1]]])]
+    attrs=dict(actual_seq_lengths_query=[1],actual_seq_lengths_key=[2],sparse_mode=0)
+    candidate=native_branch_on_cpu(True)
+    reference=module.sparse_lightning_indexer_grad_kl_loss_enhance(*args,**attrs)
+    actual=candidate(*args,**attrs)
+    assert output_check(WORKLOAD,actual,reference,args,'cpu')==0
+    result=evaluate(WORKLOAD,candidate,build=lambda _workload,_case:(module,args,attrs))
+    assert result['passed'] and len(result['cases'])==20
+    assert result['targetEvidence'] is False
+    wrong=list(actual);wrong[0]=wrong[0].to(torch.float16)
+    with pytest.raises(ValueError,match='dtype'):
+        output_check(WORKLOAD,tuple(wrong),reference,args,'cpu')
+
+
 def test_candidate_import_ignores_stale_bytecode(tmp_path):
     source=tmp_path/'kernel.py';source.write_text('def run(): return 1\n')
     one,h1=load_candidate(source);source.write_text('def run(): return 2\n');two,h2=load_candidate(source)

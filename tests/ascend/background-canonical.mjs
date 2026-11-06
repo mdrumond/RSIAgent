@@ -74,6 +74,11 @@ export const createEnvironment=(options,context)=>local(options,{...context,reso
       projects:initial.projects.map((project,index)=>({...project,phase:plan[index].phase,campaign_entry:plan[index].id,actor_seconds:project.id==='hold'?500:120})),
       skills:{...initial.skills,background:true,runsPerArm:2,tuningProjectIds:['fa','gdn']}}));
     await f.run('config','--config',file);f.config=await readConfig(f.root);
+    // Project edits publish the queued actor allocation into both ledgers.
+    const holdFile=join(f.root,'hold-project.json');
+    await writeFile(holdFile,JSON.stringify(f.config.projects.find(project=>project.id==='hold')));
+    await f.run('project','--project',holdFile);f.config=await readConfig(f.root);
+    assert.equal(JSON.parse(rows(f.root,"SELECT spec FROM projects WHERE id='hold'")[0].spec).actor_seconds,500);
     const campaign=f.start('campaign');
     await until(()=>rows(f.root,"SELECT id FROM attempts WHERE project='hold'").length,180000);
     await until(async()=>{try{await access(join(f.root,'hold-started'));return true;}catch{return false;}},30000);
