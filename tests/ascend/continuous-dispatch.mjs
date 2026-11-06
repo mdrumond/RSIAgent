@@ -49,3 +49,53 @@ test('an unavailable performance project does not block an ordinary project',{ti
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   assert.equal(result.results.length,1);assert.equal(state.project('a').status,'queued');assert.equal(state.project('b').status,'failed');
 });
+
+test('public campaign executes repeated batches once, persists cursor and accepts an appended batch',{timeout:90000},async t=>{
+  const {readFile}=await import('node:fs/promises');
+  const directory=await mkdtemp(join(tmpdir(),'planned-campaign-')),cleanups=[];
+  let passed=false;
+  t.after(async()=>{
+    try{for(const cleanup of cleanups.reverse())await cleanup({remainingSeconds:20});}
+    finally{if(passed)await rm(directory,{recursive:true,force:true});else console.error('Retained campaign evidence: '+directory);}
+  });
+  const f=await campaignFixture({directory,signal:new AbortController().signal,onCleanup:fn=>cleanups.push(fn)},
+    'phase2',['one','two','three','four']);
+  const plan=['phase1','phase2','phase1','phase2'].map((phase,index)=>({id:'r'+index,phase,new_projects:1}));
+  const config=JSON.parse(await readFile(join(f.instance,'instance.json'),'utf8'));
+  const projects=config.projects.map((project,index)=>({...project,campaign_entry:plan[index].id,phase:plan[index].phase}));
+  await f.config({campaign_plan:plan,projects,skills:{...config.skills,tuningDisabled:true}});
+  await f.run('campaign');
+  const originals=f.rows("SELECT json_extract(data,'$.campaign_entry') entry FROM events WHERE type='job-admitted' ORDER BY sequence");
+  assert.deepEqual(originals.map(row=>row.entry),plan.map(entry=>entry.id));
+  assert.equal(f.rows('SELECT * FROM attempts').length,4);
+  assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
+  assert.equal(JSON.parse(f.rows("SELECT value FROM control WHERE key='campaign-plan'")[0].value).index,4);
+  await f.run('campaign');
+  assert.equal(f.rows('SELECT * FROM attempts').length,4,'restart does not replay originals');
+  await f.config({campaign_plan:[...plan,{id:'appended',phase:'phase1',new_projects:1}]});
+  const continuation=f.start('campaign');
+  await waitFor(()=>f.rows("SELECT value FROM control WHERE key='wait'").some(row=>JSON.parse(row.value)?.reason==='waiting-inputs'));
+  assert.equal(f.rows('SELECT * FROM attempts').length,4);
+  await f.run('stop');await continuation.output;
+  passed=true;
+});
+
+test('finite campaign leaves final failed originals queued for recovery',{timeout:60000},async t=>{
+  const {readFile}=await import('node:fs/promises');
+  const directory=await mkdtemp(join(tmpdir(),'final-campaign-')),cleanups=[];
+  let passed=false;
+  t.after(async()=>{
+    try{for(const cleanup of cleanups.reverse())await cleanup({remainingSeconds:20});}
+    finally{if(passed)await rm(directory,{recursive:true,force:true});else console.error('Retained campaign evidence: '+directory);}
+  });
+  const f=await campaignFixture({directory,signal:new AbortController().signal,onCleanup:fn=>cleanups.push(fn)},'freeze',['freeze']);
+  const config=JSON.parse(await readFile(join(f.instance,'instance.json'),'utf8'));
+  await f.config({campaign_plan:[{id:'final',phase:'phase1',new_projects:1}],
+    projects:config.projects.map(project=>({...project,campaign_entry:'final'}))});
+  await f.run('campaign');
+  assert.equal(f.rows('SELECT * FROM attempts').length,1);
+  assert.equal(f.rows('SELECT * FROM recovery_queue').length,1);
+  assert.equal(f.rows('SELECT * FROM recovery_attempts').length,0);
+  assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
+  passed=true;
+});
