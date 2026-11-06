@@ -72,6 +72,35 @@ test('pack claim rejects writer admission and competing capture, then releases o
   assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get(),undefined);
 });
 
+test('pack capture blocks config skill and background frontdoors until released',async t=>{
+  const f=await fixture(t);
+  const {updateConfig,readConfig}=await import('../../cli/instance.mjs');
+  const {withSkillLock}=await import('../../cli/evolution-lock.mjs');
+  const {startBackground,requests}=await import('../../cli/background.mjs');
+  await writeFile(join(f.root,'instance.json'),JSON.stringify({format:1,revision:0,python,
+    storage:{format:1,campaign_id:'campaign-fixture'}}));
+  requests(f.state);
+  let changed=0,worked=0;
+  const change=current=>{changed++;return {...current,concurrency:2};};
+  const work=async()=>{worked++;return 'completed';};
+  await withPackCapture(f.config,async()=>{
+    await assert.rejects(updateConfig(f.root,change),/writer admission refused/);
+    await assert.rejects(withSkillLock(f.config,work),/writer admission refused/);
+    await assert.rejects(startBackground(f.root,'storage',{action:'inspect'},{detach:false}),/writer admission refused/);
+    assert.equal(changed,0);assert.equal(worked,0);
+    assert.equal((await readConfig(f.root)).revision,0);
+    assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM requests').get().n,0);
+    assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='skill-writer'").get(),undefined);
+  });
+  assert.equal((await updateConfig(f.root,change)).revision,1);
+  assert.equal((await readConfig(f.root)).concurrency,2);
+  assert.equal(await withSkillLock(f.config,work),'completed');
+  const result=await startBackground(f.root,'storage',{action:'inspect'},{detach:false});
+  assert.equal(result.campaign.id,'campaign-fixture');
+  assert.equal(changed,1);assert.equal(worked,1);
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM requests WHERE status='passed'").get().n,1);
+});
+
 test('CLI capture delegates to Python while retaining parent ownership',async t=>{
   const f=await fixture(t),me=await processIdentity();
   const {withSkillLock}=await import('../../cli/evolution-lock.mjs');

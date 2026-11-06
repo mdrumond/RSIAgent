@@ -354,6 +354,43 @@ class PackageTests(unittest.TestCase):
                 db.execute('UPDATE attempts SET owner=?', [json.dumps(dict(pid=os.getpid(),start='old',boot='old'))])
         self.assertFalse(self.package.exists())
 
+    def test_campaign_plan_restore_keeps_cursor_and_frozen_prefix(self):
+        plan = [dict(id='warmup', phase='phase1', new_projects=2),
+                dict(id='research', phase='phase2', new_projects=3)]
+        config_path = self.root / 'instance.json'
+        config = dict(format=1, campaign_plan=plan)
+        config_path.write_text(json.dumps(config))
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute("UPDATE projects SET spec=json_set(spec,'$.id',id)")
+            db.execute('PRAGMA user_version=1')
+            db.execute('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            db.execute('INSERT INTO control VALUES(?,?)',
+                       ('campaign-plan', json.dumps(dict(plan=plan, index=1, started=1))))
+        pack(self.root, self.package)
+        dest = self.base / 'planned-restored'
+        unpack(self.package, dest)
+        repository = Path(__file__).resolve().parents[2]
+        code = '''import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const {campaignPlanStatus,syncCampaignPlan}=await import(process.argv[2]);
+const {State}=await import(process.argv[3]);
+const root=process.argv[1],config=JSON.parse(readFileSync(root+'/instance.json','utf8'));
+const state=new State(root+'/state.sqlite');
+try {
+ const progress=campaignPlanStatus(state,config);
+ assert.equal(progress.currentIndex,1);assert.equal(progress.lockedPrefix,2);
+ assert.deepEqual(progress.entries.map(e=>e.state),['completed','started']);
+ syncCampaignPlan(state,config);
+ const changed={...config,campaign_plan:config.campaign_plan.map((e,i)=>i===0?{...e,new_projects:4}:e)};
+ assert.throws(()=>syncCampaignPlan(state,changed),/Cannot edit or remove a started campaign entry/);
+ assert.equal(campaignPlanStatus(state,config).currentIndex,1);
+}finally{state.close();}'''
+        result = subprocess.run(['node', '--input-type=module', '-e', code, str(dest),
+                                 (repository / 'controller/progress.mjs').as_uri(),
+                                 (repository / 'controller/state.mjs').as_uri()],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_capture_accepts_cleared_owner_but_rejects_unresolved_identity(self):
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
             db.execute('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')

@@ -153,7 +153,7 @@ def _snapshot(root, path, project):
                 clause = " AND NOT EXISTS (SELECT 1 FROM storage_retrievals,json_each(citations) j WHERE json_extract(j.value,'$.artifact')=storage_artifacts.id)"
             db.execute("DELETE FROM storage_artifacts WHERE COALESCE(project IN (SELECT id FROM projects),0)=0 AND COALESCE(attempt IN (SELECT id FROM attempts),0)=0" + clause)
         if 'control' in tables:
-            db.execute("DELETE FROM control WHERE key NOT IN ('campaign-budget','wave','fresh-since-recovery')")
+            db.execute("DELETE FROM control WHERE key NOT IN ('campaign-budget','campaign-plan','wave','fresh-since-recovery')")
         db.create_function('portable_text', 1, _sanitize)
         for table in tables & set(PORTABLE_TABLES):
             columns = [r[1] for r in db.execute('PRAGMA table_info(' + _quote(table) + ')') if r[2].upper() == 'TEXT']
