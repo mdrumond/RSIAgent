@@ -21,6 +21,8 @@ export async function buildProjectCatalog({cohort,campaigns}) {
       db.exec('PRAGMA busy_timeout=5000');
       if(db.prepare('SELECT id FROM storage_campaign').get()?.id!==campaign.campaignId)
         throw new Error('Campaign storage identity mismatch');
+      // Bootstrap creates storage before the first controller creates recovery state.
+      if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_lessons'").get())continue;
       const rows=db.prepare(`SELECT a.id,a.project,a.outcome,p.spec,s.phase FROM attempts a
         JOIN projects p ON p.id=a.project JOIN storage_attempts s ON s.attempt=a.id
         WHERE a.outcome IN ('passed','failed') AND s.kind='original'

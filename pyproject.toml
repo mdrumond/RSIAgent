@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["mcp==1.27.2", "Flask==3.0.3", "numpy==2.4.2"]
 
 [project.optional-dependencies]
+baselines = ["torch==2.10.0"]
 embeddings = ["torch==2.10.0", "transformers==5.0.0"]
 dev = ["pytest==9.0.2"]
 
@@ -20,7 +21,7 @@ namespaces = true
 exclude = ["*.tests", "*.tests.*", "*.__pycache__", "*.__pycache__.*"]
 
 [tool.setuptools.package-data]
-ascend_tools = ["templates/kdb/*.md"]
+ascend_tools = ["templates/kdb/*.md", "baselines/packs/**/*", "baselines/packs/manifest.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/ascend"]

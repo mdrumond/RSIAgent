@@ -15,16 +15,16 @@ import { tuningTask, skillEvents } from '../controller/skill-evidence.mjs';
 // Programmatic callers may supply values.runtime with these exact functions instead.
 export async function run(config, values = {}) {
   values.signal?.throwIfAborted();
-  if (config.skills?.tuningDisabled || (values.task?.phase ?? config.mode) === 'phase1')
+  if (config.skills?.tuningDisabled || (!values.background && (values.task?.phase ?? config.mode) === 'phase1'))
     return { analyse: false, evaluate: false };
   const instanceRoot = resolve(config.root);
-  const executedMode = values.task?.phase ?? config.mode;
+  const executedMode = values.background ? 'phase2' : values.task?.phase ?? config.mode;
   const lock = values.lock ?? (await import('./evolution-lock.mjs')).withSkillLock;
   return await lock(config, async () => {
     values.signal?.throwIfAborted();
     const readConfig = values.readConfig ?? (await import('./instance.mjs')).readConfig;
     config = { ...await readConfig(instanceRoot), root: instanceRoot };
-    if (values.task) config.mode = executedMode;
+    if (values.task || values.background) config.mode = executedMode;
     const action = values.config ? JSON.parse(await readFile(resolve(values.config), 'utf8')) : {};
     const task = values.task ?? action.task;
     if (task) config.mode = task.phase ?? executedMode;
@@ -69,7 +69,7 @@ export async function run(config, values = {}) {
       const { generateCandidate } = await import('../controller/skill-evolution.mjs');
       const { ensureKnowledgeService } = values.knowledge ?? await import('./knowledge.mjs');
       const { createKdbBridge } = values.knowledge ?? await import('../integrations/kdb-extension.mjs');
-      const url = await ensureKnowledgeService(config);
+      const url = await ensureKnowledgeService(config, { signal: values.signal });
       values.signal?.throwIfAborted();
       const bridge = createKdbBridge({ url, attemptId: task?.id ?? `manual-${randomUUID()}`,
         agentDir: join(options.directory, 'agent'), event: async (type, data) =>
@@ -89,6 +89,7 @@ export async function run(config, values = {}) {
     };
     const evaluate = async request => {
       request.resource = values.resource;
+      if (values.resource) request.config.resource_ids = [values.resource.id];
       const runtime = values.runtime ?? await import(request.config.skills?.runtimeModule
         ? pathToFileURL(resolve(instanceRoot, request.config.skills.runtimeModule)).href
         : new URL('./evaluation.mjs', import.meta.url).href);
@@ -98,15 +99,20 @@ export async function run(config, values = {}) {
         let exists = false;
         try { await access(request.instanceRoot); exists = true; }
         catch (error) { if (error.code !== 'ENOENT') throw error; }
+        let result;
         if (exists) {
           if (typeof runtime.resume !== 'function') throw new Error('Existing evaluation requires runtime.resume');
-          return await runtime.resume(request);
+          result = await runtime.resume(request);
+        } else {
+          request.signal?.throwIfAborted();
+          await runtime.bootstrap(request);
+          request.signal?.throwIfAborted();
+          result = await runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
+            projectIds: [request.projectId], evaluation: true, remainingSeconds: request.remainingSeconds, signal: request.signal });
         }
-        request.signal?.throwIfAborted();
-        await runtime.bootstrap(request);
-        request.signal?.throwIfAborted();
-        return await runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
-          projectIds: [request.projectId], evaluation: true, remainingSeconds: request.remainingSeconds, signal: request.signal });
+        if (values.background && (!runtime.settled || !await runtime.settled(request)))
+          throw new Error('Background evaluation execution remains unresolved');
+        return result;
       } catch (error) {
         // Only a positive lifecycle/operation proof permits paused elapsed accounting.
         if (runtime.settled) {
@@ -117,9 +123,10 @@ export async function run(config, values = {}) {
       }
     };
     const storage = config.storage ? await import('../controller/storage-knowledge.mjs') : null;
-    if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true});
+    if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true,signal:values.signal});
     const result = await tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
-      task, userinfo, manual, context, evaluate, generate, native: values.native, signal: values.signal,
+      task, userinfo, manual, context, evaluate, generate: values.generate ?? generate, native: values.native, signal: values.signal,
+      background: values.background, evidenceTasks: values.evidenceTasks, backgroundSeconds: values.backgroundSeconds, backgroundResource: values.backgroundResource, clock: values.clock,
       evaluationSeconds: values.evaluationSeconds ?? action.evaluationSeconds, allocationId: values.allocationId ?? action.allocationId });
     if(storage) {
       const latest={...await readConfig(instanceRoot),root:instanceRoot};
@@ -128,7 +135,7 @@ export async function run(config, values = {}) {
       catch(error){if(error.code!=='ENOENT')throw error;}
       const candidate=result.candidate??evolution.candidate;
       if(candidate) await storage.recordStorageSkill(config,candidate,{serialized:true,
-        baseVersion:config.skills.activeVersion,promote:latest.skills.activeVersion===candidate?true:
+        signal:values.signal,baseVersion:config.skills.activeVersion,promote:latest.skills.activeVersion===candidate?true:
           result.promote===false?false:undefined,reason:result.reason??'awaiting-evaluation'});
     }
     return result;
