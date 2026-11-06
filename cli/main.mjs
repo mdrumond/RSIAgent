@@ -1,12 +1,36 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm, open } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
 import { State } from '../controller/state.mjs';
 import {schemaOptions as storageOptions} from './storage.mjs';
+
+// Keep status bounded even when the evolution ledger contains a long history.
+export async function statusSkills(root, config) {
+  const skills = {activeVersion: config.skills?.activeVersion ?? null, candidate: null, candidateBase: null};
+  let file;
+  try {
+    file = await open(join(root, 'skills', 'evolution.json'), 'r');
+    const buffer = Buffer.alloc(1024 * 1024 + 1);
+    const {bytesRead} = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead === buffer.length) throw new Error('Evolution metadata exceeds status read limit');
+    const evolution = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+    for (const key of ['candidate', 'candidateBase'])
+      skills[key] = typeof evolution[key] === 'string' ? evolution[key] : null;
+  } catch (error) {
+    if (error.code !== 'ENOENT') skills.metadataError = error.message;
+  } finally { await file?.close(); }
+  return skills;
+}
+
+export function statusRecoveries(state) {
+  if (!state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='recovery_queue'").get()) return [];
+  return state.db.prepare(`SELECT project,origin,kind,eligible_wave,attempt,failed_rounds
+    FROM recovery_queue ORDER BY project LIMIT 500`).all();
+}
 
 export async function main(argv=process.argv.slice(2),{signal}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
@@ -136,7 +160,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
       const progress=(await import('../controller/progress.mjs')).campaignProgress(state,config);
       const controlValue=key=>state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()
         ?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
-      return {controller,mode:config.mode,progress,wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
+      return {controller,mode:config.mode,progress,skills:await statusSkills(root,config),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
