@@ -4,7 +4,7 @@ import { mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
 import { writeSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { validateAcceptance } from '../controller/state.mjs';
-import { currentCampaignEntry } from '../controller/progress.mjs';
+import { currentCampaignEntry, generationSettings } from '../controller/progress.mjs';
 import { curriculumSession } from './curriculum.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
 
@@ -40,12 +40,20 @@ export function generationEventState(db) {
   };
 }
 
-function drafts(state) {
+function drafts(state, adoptPhase1=false) {
   state.db.exec(`CREATE TABLE IF NOT EXISTS generation_drafts (
     id TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS generation_events (
     sequence INTEGER PRIMARY KEY, draft TEXT NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS generation_role_events ON generation_events(draft,type,sequence)`);
+  // Old generation was phase1-only and had no campaign entry. Annotate only
+  // pending non-plan rows; JSON updates preserve sessions, specs and allocations.
+  if(adoptPhase1)state.db.prepare(`UPDATE generation_drafts
+    SET data=json_set(data,'$.phase','phase1','$.campaign_entry',NULL)
+    WHERE json_type(data,'$.phase') IS NULL AND json_extract(data,'$.campaign_entry') IS NULL
+    AND json_extract(data,'$.status') IN ('draft','ready')
+    AND (json_extract(data,'$.spec.phase') IS NULL OR json_extract(data,'$.spec.phase')='phase1')
+    AND json_extract(data,'$.spec.campaign_entry') IS NULL`).run();
   const save=d=>state.db.prepare('INSERT OR REPLACE INTO generation_drafts VALUES (?,?)').run(d.id,JSON.stringify(d));
   return {save,count:()=>state.db.prepare('SELECT COUNT(*) AS n FROM generation_drafts').get().n,
     pending:(phase,entry,limit)=>state.db.prepare(`SELECT data FROM generation_drafts
@@ -80,8 +88,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
   const entry=currentCampaignEntry(state,config);
   if(config.campaign_plan&&!entry)return [];
   const phase=entry?.phase??config.mode,campaign_entry=entry?.id??null;
-  const base=config.curriculum?.generation;
-  const generation={...base,...base?.by_phase?.[phase]};
+  const generation=generationSettings(config,phase);
   if(!['phase1','phase2'].includes(phase)||generation.enabled!==true)return [];
   if(!Number.isSafeInteger(concurrency)||concurrency<1)throw new Error('Invalid generation concurrency');
   if(!Array.isArray(generation.topics)||!generation.topics.length||generation.topics.some(t=>typeof t!=='string'||!t.trim()))
@@ -89,7 +96,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
   if(!(config.actor_seconds>0))throw new Error('Generation requires actor elapsed allocation');
   const seconds=config.curriculum_seconds??240;
   if(!(seconds>0)||!Number.isFinite(seconds))throw new Error('Invalid curriculum elapsed allocation');
-  const store=drafts(state);
+  const store=drafts(state,config.campaign_plan===undefined&&phase==='phase1');
   const selected=config.curriculum?.[phase];
   const queued=state.db.prepare("SELECT id,spec FROM projects WHERE status IN ('queued','running') AND frozen=0").all()
     .filter(r=>{const spec=JSON.parse(r.spec);return entry?spec.campaign_entry===entry.id:

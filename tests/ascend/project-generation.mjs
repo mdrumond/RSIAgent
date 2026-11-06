@@ -8,7 +8,8 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {State} from '../../controller/state.mjs';
-import {admitJob} from '../../controller/recovery.mjs';
+import {campaignProgress} from '../../controller/progress.mjs';
+import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
 import {refillPhase1,refillProjects,generationEventState} from '../../cli/project-generation.mjs';
 
 async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand}={}) {
@@ -311,4 +312,59 @@ test('missing performance commands block admission and phase1 does not inherit p
     assert.equal(spec.phase,'phase1');assert.equal(spec.performance_goal,'declared microbenchmark target');
     assert.equal(spec.verifier.performance_command,'benchmark');explicit.state.add(spec);
   }
+});
+
+
+test('phase overrides agree on non-plan completion and refilling in both phases',async t=>{
+  for(const phase of ['phase1','phase2'])for(const enabled of [true,false]) {
+    const f=await fixture(t);f.config.mode=phase;
+    f.config.curriculum[phase]=['supplied'];
+    f.config.curriculum.generation={enabled:!enabled,topics:['default'],
+      by_phase:{[phase]:{enabled,topics:['override-topic']}}};
+    f.state.add({id:'supplied',phase,goal:'supplied',actor_seconds:60});
+    const queue=new RecoveryQueue(f.state,{mode:phase}),job=queue.claim('supplied',0);
+    queue.recordOriginal(job.attempt.id,{passed:true,findings:'correct',evidence:[{collection:'memory',entry_id:'proof'}]},0);
+    queue.acknowledgeLesson(queue.lessons()[0].id);
+    f.state.event(job.attempt.id,'postprocess-completed',{});
+    assert.equal(campaignProgress(f.state,f.config).phaseComplete,!enabled);
+    const specs=await refillProjects(f.options);
+    assert.equal(specs.length,enabled?2:0);
+    assert.ok(specs.every(s=>s.phase===phase&&s.generation.topic==='override-topic'));
+    if(!enabled)assert.equal(f.requests.length,0);
+    assert.equal(campaignProgress(f.state,{...f.config,completion_target:1}).phaseComplete,true);
+  }
+});
+
+test('old non-plan interrupted phase1 drafts retain ID, native session and elapsed budget',async t=>{
+  const f=await fixture(t,{pause:true}),abort=new AbortController();
+  const pending=refillProjects({...f.options,signal:abort.signal});
+  await f.waitStarted;abort.abort(new Error('old stop'));await assert.rejects(pending);
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  const before=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  const priorSession=generationEventState(f.state.db).queryEvents(before.id,{types:['curriculum-session']})[0].data.session;
+  f.unpause();const specs=await refillProjects(f.options);
+  assert.equal(specs[0].id,before.id);assert.equal(specs[0].phase,'phase1');
+  const after=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(before.id).data);
+  assert.equal(after.campaign_entry,null);assert.equal(after.seconds,before.seconds);
+  assert.ok(after.elapsed>=before.elapsed);
+  const sessions=generationEventState(f.state.db).queryEvents(before.id,{types:['curriculum-session']});
+  assert.equal(sessions.length,2);assert.ok(sessions.every(s=>s.data.session===priorSession));
+  assert.ok(sessions[1].data.elapsed_seconds>0);
+});
+
+test('old ready phase1 drafts are returned without replacement or budget reset, never adopted by a plan',async t=>{
+  const f=await fixture(t),specs=await refillProjects(f.options);
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  const before=f.state.db.prepare('SELECT data FROM generation_drafts ORDER BY rowid').all().map(r=>JSON.parse(r.data));
+  const requests=f.requests.length;
+  const resumed=await refillProjects(f.options);
+  assert.deepEqual(resumed.map(s=>s.id),specs.map(s=>s.id));assert.equal(f.requests.length,requests);
+  const after=f.state.db.prepare('SELECT data FROM generation_drafts ORDER BY rowid').all().map(r=>JSON.parse(r.data));
+  assert.deepEqual(after,before.map(d=>({...d,phase:'phase1',campaign_entry:null})));
+  // The same unscoped stored shape is ambiguous once a campaign plan exists.
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  campaign(f,'phase1',1);
+  const planned=await refillProjects(f.options);
+  assert.equal(planned.length,1);assert.ok(!specs.some(s=>s.id===planned[0].id));
+  for(const spec of specs)assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).phase,undefined);
 });

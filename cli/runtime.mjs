@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { selectAdmission } from '../controller/dispatch.mjs';
 import {campaignBudget} from '../controller/campaign-budget.mjs';
-import { campaignProgress, currentCampaignEntry, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
+import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
@@ -344,8 +344,8 @@ export async function operate(command,config,options={}) {
       }
       const generationEntry=currentCampaignEntry(state,config);
       const generationPhase=generationEntry?.phase??config.mode;
-      const generationSettings={...config.curriculum?.generation,...config.curriculum?.generation?.by_phase?.[generationPhase]};
-      if(options.continuous&&!progress.phaseComplete&&['phase1','phase2'].includes(generationPhase)&&generationSettings.enabled===true&&!generation&&Date.now()>=nextGeneration) {
+      const generationPolicy=generationSettings(config,generationPhase);
+      if(options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
         const generationConfig=config;
         generation=(async()=>{
           try {
