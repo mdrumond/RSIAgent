@@ -46,7 +46,16 @@ export async function createEnvironment(options, context) {
   if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 120) throw new Error('probeSeconds must be in (0,120]');
   if (options.deviceAffinity !== undefined && (!Array.isArray(options.deviceAffinity) || options.deviceAffinity.some(id => !Number.isInteger(id) || id < 0)))
     throw new Error('deviceAffinity must contain explicit nonnegative physical IDs');
-  const affinity = options.deviceAffinity?.slice();
+  const configuredAffinity = options.deviceAffinity?.slice();
+  const reserved = options.backgroundDevice;
+  if(reserved!==undefined && (!Number.isInteger(reserved)||reserved<0||
+    !configuredAffinity?.includes(reserved)||new Set(configuredAffinity).size!==configuredAffinity.length))
+    throw new Error('backgroundDevice requires one physical ID in explicit unique deviceAffinity');
+  const slot=context.resource?.metadata?.hostSlot;
+  if(reserved!==undefined && context.resource && (!Number.isInteger(slot)||slot<0||slot>=configuredAffinity.length))
+    throw new Error('Reserved device routing requires scheduler host-slot metadata');
+  const affinity=reserved===undefined||!context.resource?configuredAffinity:
+    slot===0?[reserved]:configuredAffinity.filter(id=>id!==reserved);
   await context.event('resource-policy', { target: options.target, runtime: options.runtime, deviceAffinity: affinity ?? null });
   const nativeClient = context.client ?? createCplClient(options.clientPath);
   const client = (args, {signal = context.signal} = {}) => {
@@ -107,14 +116,15 @@ export async function createEnvironment(options, context) {
     });
   }
   let pool;
-  async function enabled() {
+  async function enabled({hostSlots=false}={}) {
     const policy = await client(['npu', 'list', options.target]);
     if (policy.state !== 'completed') throw new Error('NPU permission inventory unavailable');
     const profile = policy.profiles?.find(row => row.target === options.target);
     if (!profile) throw new Error('NPU permission profile missing');
     if (!local && (typeof profile.pool !== 'string' || !profile.pool.trim())) throw new Error('CPL NPU profile requires an actual alias-group pool');
     pool = profile.pool ?? 'local:' + options.target;
-    return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !affinity || affinity.includes(id));
+    const filter=hostSlots?configuredAffinity:affinity;
+    return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !filter || filter.includes(id));
   }
   async function localSnapshot(devices,purpose,emit,budget,signal) {
     const bounded=AbortSignal.any([AbortSignal.timeout(Math.ceil(Math.min(observationSeconds,budget)*1000)),signal].filter(Boolean));
@@ -290,10 +300,13 @@ export async function createEnvironment(options, context) {
   // Scheduler leases represent host concurrency slots, never physical reservations.
   async function resources({target} = {}) {
     if (target && target !== options.target && target !== options.profile) return [];
-    const devices = await enabled();
-    if (!devices.length) return [];
-    return devices.map((_, slot) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
-      available: true, metadata: {kind:'host-slot', pool, target:options.target} }));
+    const devices = await enabled({hostSlots:true});
+    const slots=reserved===undefined?devices.map((_,slot)=>({slot,available:true})):
+      [{slot:0,available:devices.includes(reserved)},
+        ...devices.filter(id=>id!==reserved).map((_,index)=>({slot:index+1,available:true}))];
+    return slots.map(({slot,available}) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
+      available, metadata: {kind:'host-slot', pool, target:options.target,
+        ...(reserved===undefined?{}:{hostSlot:slot,backgroundSlot:slot===0})} }));
   }
   let commandActive=false, controlEnvironment;
   async function control() {

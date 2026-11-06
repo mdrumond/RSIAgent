@@ -31,14 +31,14 @@ import json,sys,os,time
 args=sys.argv; device=int(args[args.index('-i')+1]); query=args[args.index('-t')+1]
 row=json.load(open(os.environ['ASCEND_TEST_TELEMETRY']))[str(device)]
 if row.get('timeout'): time.sleep(2)
-outputs={'board':f'NPU ID: {device}\\nChip Name: Ascend950',
+outputs={'board':f'NPU ID: {device}\\nChip Name: ${health.product==='a3'?'Ascend910C':'Ascend950'}',
 'health':'Health Status: '+row.get('status','OK')+'\\nError Code: 0',
 'usages':f'HBM Capacity(MB): 1000\\nHBM Usage Rate(%): {row.get("memory",0)}\\nAicore Usage Rate(%): 0\\nAivector Usage Rate(%): 0\\nNPU Utilization(%): 0\\nAicube Usage Rate(%): 0',
 'proc-mem':'Process id: 123' if row.get('busy') else 'No process in device.',
 'current-fault-event':'Fault Event Count: 0'}
 print(outputs[query])
 `, { mode: 0o700 });
-  const calls = [], events = [], jobs = new Map(), admissions=new Map();
+  const calls = [], events = [], commands = [], jobs = new Map(), admissions=new Map();
   let runWorkload = false, onSync = async () => {}, running = false, queued = 0;
   let waitSignal;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
@@ -63,6 +63,7 @@ print(outputs[query])
         const script = await readFile(file,'utf8');
         const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
         const inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
+        if(inner.source)commands.push({devices:inner.devices,env:config.env});
         let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled'};
         if(runWorkload){
           const receipt=join(instancePath,'host-admission-'+sequence);
@@ -90,7 +91,7 @@ print(outputs[query])
     workspacePath: '/registry/workspace', remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
-  return { environment, options, context, source, calls, events, rows, telemetry,
+  return { environment, options, context, source, calls, events, commands, rows, telemetry,
     setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
     queued:value=>{queued=value;}, wait:fn=>{waitSignal=fn;},runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
@@ -517,4 +518,55 @@ test('lease telemetry pairs actual release with ownership and emits one wait tra
     {type:'device-wait',pool:f.context.instancePath,waiting:false},
   ]);
   assert.ok(polls>=3);
+});
+
+
+for(const product of ['a3','a5'])test(`${product} reserved physical device is exclusive to marked slot zero`,async t=>{
+  const f=await fixture(t,{product,chip:product==='a3'?0:null});
+  f.rows[2]={};await f.update();
+  const options={...f.options,deviceAffinity:[0,2],backgroundDevice:2};
+  const scheduler=await createEnvironment(options,{...f.context,instancePath:join(f.context.instancePath,'scheduler')});
+  const slots=await scheduler.resources();
+  assert.equal(slots.length,2);assert.deepEqual(slots.map(row=>row.metadata.hostSlot),[0,1]);
+  assert.deepEqual(slots.map(row=>row.metadata.backgroundSlot),[true,false]);
+  assert.deepEqual((await scheduler.inspectDevices()).map(row=>row.metadata.physicalDevice),[0,2]);
+  const background=await createEnvironment(options,{...f.context,resource:slots[0],instancePath:join(f.context.instancePath,'background')});
+  const foreground=await createEnvironment(options,{...f.context,resource:slots[1],instancePath:join(f.context.instancePath,'foreground')});
+  for(const [environment,physical] of [[background,2],[foreground,0]]) {
+    assert.deepEqual((await environment.resources()).map(row=>row.id),slots.map(row=>row.id));
+    assert.deepEqual((await environment.inspectDevices()).map(row=>row.metadata.physicalDevice),[physical]);
+    await environment.prepare({project:{source:f.source},attempt:{id:product+'-'+physical}});
+    assert.equal((await environment.execute('true',f.source,{timeout:5})).settled,true);
+    const payload=f.commands.at(-1);assert.deepEqual(payload.devices,[physical]);
+    assert.equal(payload.env.ASCEND_PHYSICAL_DEVICE,String(physical));
+    assert.equal(payload.env.ASCEND_RT_VISIBLE_DEVICES,String(physical));
+  }
+  f.rows[2]={status:'ALARM'};await f.update();
+  assert.equal((await background.inspectDevices()).some(row=>row.available),false);
+  assert.deepEqual((await foreground.inspectDevices()).filter(row=>row.available).map(row=>row.metadata.physicalDevice),[0]);
+  f.setEnabled([0,1,3]);
+  const previous=f.commands.length;
+  await assert.rejects(background.execute('must-not-fall-back',f.source,{timeout:5}),/No enabled devices/);
+  assert.equal(f.commands.length,previous);
+  const disabled=await scheduler.resources();
+  assert.deepEqual(disabled.map(row=>[row.id,row.metadata.hostSlot,row.available]),
+    [[slots[0].id,0,false],[slots[1].id,1,true]]);
+  assert.deepEqual((await foreground.inspectDevices()).filter(row=>row.available).map(row=>row.metadata.physicalDevice),[0]);
+  assert.equal((await foreground.execute('foreground-while-background-disabled',f.source,{timeout:5})).settled,true);
+  assert.deepEqual(f.commands.at(-1).devices,[0]);
+  assert.equal(f.commands.at(-1).env.ASCEND_RT_VISIBLE_DEVICES,'0');
+  f.setEnabled([]);
+  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),[[slots[0].id,false]]);
+  f.setEnabled([0,2]);
+  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),slots.map(row=>[row.id,true]));
+});
+
+test('physical background routing requires explicit scalar membership and valid worker slot',async t=>{
+  const f=await fixture(t);
+  for(const settings of [{backgroundDevice:0},{deviceAffinity:[0,2],backgroundDevice:[0,2]},
+    {deviceAffinity:[0,2],backgroundDevice:1},{deviceAffinity:[0,0],backgroundDevice:0}])
+    await assert.rejects(createEnvironment({...f.options,...settings},f.context),/backgroundDevice/);
+  await assert.rejects(createEnvironment({...f.options,deviceAffinity:[0,2],backgroundDevice:2},
+    {...f.context,resource:{id:'legacy'}}),/host-slot metadata/);
+  assert.equal((await f.environment.resources()).some(row=>'backgroundSlot' in row.metadata),false);
 });

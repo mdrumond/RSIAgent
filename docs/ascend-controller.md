@@ -37,6 +37,17 @@ its device through compilation, execution and profiling; later commands may
 use another device. Server aliases and runtimes share the registered NPU pool.
 Unknown executions retain their reservations until positively reconciled.
 
+For campaigns that permanently reserve an A/B device, the private Ascend profile
+sets `backgroundDevice` to one physical ID in its explicit `deviceAffinity`.
+Scheduler slot zero is marked for A/B and routes commands only to that device;
+other workers exclude it. The first full iteration may use slot zero for
+foreground work. Later iterations earmark it even while tuning is idle. An
+unhealthy or disabled reserved device never falls back to a foreground device.
+Scheduler inventories remain complete; ordinary command health and global lease
+checks still decide whether execution can proceed. Profiles without this option
+retain their existing routing.
+
+
 ## Continuous campaigns
 
 Merge these portable policy settings into the private bootstrap profile:
