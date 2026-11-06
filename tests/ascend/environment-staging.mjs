@@ -32,7 +32,7 @@ async function fixture(t) {
       if (args[0] === 'upload') {
         if(control.failUpload)throw new Error('Upload connection lost');
         if(control.backend==='ssh')assert.equal(args.length,4,'SSH upload has no retained-transfer flags');
-        if(control.uploadExit!==null)return {backend:'ssh',state:'failed',exit:control.uploadExit};
+        if(control.uploadExit!==null)return {backend:'ssh',operation:'upload',state:'failed',exit:control.uploadExit};
         await delay(control.uploadDelay);
         let destination = join(remote, args[3]);
         if(control.backend==='ssh')assert.equal((await stat(dirname(destination))).isDirectory(),true,'rsync requires an existing remote parent');
@@ -55,7 +55,7 @@ async function fixture(t) {
       if (args[0] === 'download') {
         if(control.failDownload)throw new Error('Download refused');
         if(control.backend==='ssh')assert.equal(args.length,4,'SSH download uses synchronous completion');
-        if(control.downloadExit!==null)return {backend:'ssh',state:'failed',exit:control.downloadExit};
+        if(control.downloadExit!==null)return {backend:'ssh',operation:'download',state:'failed',exit:control.downloadExit};
         await cp(join(remote, args[2]), args[3]); return { state: 'completed' };
       }
       if (args[0] === 'run') {

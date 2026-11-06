@@ -14,13 +14,14 @@ import {stages} from '../../controller/workflow.mjs';
 import {processIdentity,attemptStopped} from '../../controller/lifecycle.mjs';
 import {createEnvironment,closedSetupError} from '../../integrations/environments/index.mjs';
 
-for(const scenario of ['closed','not-admitted','unknown','unproved-code','unsettled-payload','closed-at-stop','closed-at-budget'])
+for(const scenario of ['closed','not-admitted','unknown','unproved-code','unsettled-payload','closed-at-stop','closed-at-budget',
+  'closed-ssh-upload','unknown-ssh-upload','failed-ssh-download'])
 test(`native Pi setup error: ${scenario}`,{timeout:20000},async()=>{
   const root=await mkdtemp(join(tmpdir(),'settled-setup-')),source=join(root,'source');
   await mkdir(source);
   const state=new State(join(root,'state.sqlite')),calls=[],requests=[];
   const known=scenario.startsWith('closed')||scenario==='not-admitted';
-  const mayContinue=['closed','not-admitted'].includes(scenario),abort=new AbortController();
+  const mayContinue=['closed','not-admitted','closed-ssh-upload'].includes(scenario),abort=new AbortController();
   const command='python3 -c "import runpy; assert runpy.run_path(\'answer.py\')[\'answer\']() == 42"';
   for(const stage of stages){
     calls.push(['rsi_skill',{}]);
@@ -72,6 +73,10 @@ test(`native Pi setup error: ${scenario}`,{timeout:20000},async()=>{
           if(++executions===1){
             sessionAtFailure=state.attempt(attempt.id).session;
             if(scenario==='unsettled-payload')return {handle:'fixture:running',settled:false};
+            if(['closed-ssh-upload','unknown-ssh-upload','failed-ssh-download'].includes(scenario))
+              throw closedSetupError('SSH transfer setup failed',{reason:{backend:'ssh',
+                operation:scenario==='failed-ssh-download'?'download':'upload',
+                state:scenario==='unknown-ssh-upload'?'unknown':'failed',exit:23}});
             if(!known)throw Object.assign(new Error('Submission identity unknown'),
               scenario==='unproved-code'?{code:'CPL_NOT_ADMITTED'}:{});
             if(scenario==='not-admitted'){
@@ -99,6 +104,11 @@ test(`native Pi setup error: ${scenario}`,{timeout:20000},async()=>{
       const settled=state.events(attempt.id).find(e=>e.type==='execution-settled'&&e.data.setupClosure);
       assert.equal(settled.data.setupClosure.payloadStarted,false);
       assert.equal(settled.data.handle,failedHandle??null);
+      if(scenario==='closed-ssh-upload') {
+        assert.deepEqual(settled.data.setupClosure.handles,[]);
+        assert.equal(settled.data.setupClosure.reason.operation,'upload');
+        assert.equal(settled.data.setupClosure.reason.exit,23);
+      }
       assert.ok(settled.data.actor_elapsed>=settled.data.startElapsed);
       assert.equal(state.events(attempt.id).some(e=>e.type==='execution-unresolved'),false);
       if(failedHandle){
@@ -119,7 +129,8 @@ test(`native Pi setup error: ${scenario}`,{timeout:20000},async()=>{
       assert.ok(state.events(attempt.id).some(e=>e.type==='execution-settled'&&e.data.setupClosure));
       assert.equal(await attemptStopped(state,state.attempt(attempt.id),backend),true);
     }else{
-      await assert.rejects(promise,scenario==='unsettled-payload'?/Execution closure unknown/:/Submission identity unknown/);
+      await assert.rejects(promise,scenario==='unsettled-payload'?/Execution closure unknown/:
+        scenario.includes('ssh')?/SSH transfer setup failed/:/Submission identity unknown/);
       assert.equal(executions,1);assert.equal(state.attempt(attempt.id).outcome,null);
       assert.ok(state.events(attempt.id).some(e=>e.type==='execution-unresolved'));
       assert.equal(await attemptStopped(state,state.attempt(attempt.id),backend),false);
