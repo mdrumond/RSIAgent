@@ -7,6 +7,7 @@ import sys
 import tarfile
 from . import baselines
 from .baselines.projects import _LAUNCHER
+from .phase2_focus import FOCUSED_LAUNCHER, focused_files, select_focus
 
 
 def inspect_launch(request):
@@ -35,7 +36,11 @@ def inspect_launch(request):
         archive = next(p for p in paths if p.name == 'verifier.tar.gz')
         if archive.parent != launcher.parent:
             raise ValueError('Verifier archive must accompany its launcher')
-        if launcher.read_text() != _LAUNCHER.replace('ARCHIVE_HASH', baselines.file_hash(archive)):
+        focus = project.get('benchmark_focus')
+        if focus is not None and focus != select_focus(receipt):
+            raise ValueError('Project focus differs from qualified timing evidence')
+        template = FOCUSED_LAUNCHER if focus is not None else _LAUNCHER
+        if launcher.read_text() != template.replace('ARCHIVE_HASH', baselines.file_hash(archive)):
             raise ValueError('Frozen verifier launcher changed')
         contract = {'language': 'Triton-Ascend' if target == 'a3' else 'Catlass DSL', 'format': 1,
                     'workload': workload, 'target': target, 'expected': expected,
@@ -46,6 +51,8 @@ def inspect_launch(request):
         for path in package.rglob('*'):
             if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc':
                 files['ascend_tools/baselines/' + path.relative_to(package).as_posix()] = path.read_bytes()
+        if focus is not None:
+            files.update(focused_files(focus))
         with tarfile.open(archive) as tar:
             members = tar.getmembers()
             if len(members) != len(files) or {m.name for m in members} != files.keys():
