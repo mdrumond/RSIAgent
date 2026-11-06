@@ -59,7 +59,7 @@ async function access(config, options, operation) {
 
 // Export only lesson text, never repository corpora or vectors. Overlapping chunks
 // reconstruct the original JSON by source line rather than duplicating evidence.
-async function baselineLessons(config, database=join(config.root,'knowledge.sqlite')) {
+async function baselineLessons(config, database=join(config.root,'knowledge.sqlite'), signal) {
   return python(config, ['-c', String.raw`
 import sqlite3,json,sys,pathlib
 p=pathlib.Path(sys.argv[1])
@@ -89,7 +89,7 @@ for (name,) in c.execute(query):
         if key in records and records[key]!=record: raise ValueError('Conflicting baseline delivery')
         records[key]=record
 print(json.dumps(dict(records=list(records.values()),collections=collections)))
-`, database], '', undefined);
+`, database], '', signal);
 }
 
 // Prepare immutable objects before the database swap; activate and roll back the
@@ -124,7 +124,7 @@ export async function initializeStorageKnowledge(config, state, options = {}) {
   return access(config, { ...options, state }, async context => {
     const { history } = context;
     if (!(await history.ref('refs/knowledge/baseline'))) {
-      const baseline=await baselineLessons(config);
+      const baseline=await baselineLessons(config,undefined,options.signal);
       const records=baseline.records.map(item=>lessonRecord(config,
         {...item,delivery_id:item.delivery_id??`baseline-${hash(item)}`}));
       let revision=await history.ref('refs/heads/memory');

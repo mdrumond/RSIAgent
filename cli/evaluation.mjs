@@ -42,7 +42,7 @@ export async function bootstrap(request) {
       if(!project)throw new Error('Unknown frozen regression project');
       return project;
     });
-    await createInstance(inputs,{baseline:join(original.root,'knowledge.sqlite'),
+    await createInstance(inputs,{python:request.config.python??original.python,baseline:join(original.root,'knowledge.sqlite'),
       skills:join(original.root,'skills','versions',request.skillVersion),
       environment:original.environment,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')});
     frozen=await readConfig(inputs);

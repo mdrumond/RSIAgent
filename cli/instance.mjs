@@ -40,7 +40,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   } finally {source.close();}
   if(legacy)await new Promise((ok,no)=>{
     const child=spawn(settings.python??'python',['-m','ascend_tools.kdb_import','--source',resolve(baseline),
-      '--destination',join(destination,'knowledge.sqlite')],{env:{...process.env,PYTHONPATH:machinery},stdio:['ignore','ignore','pipe']});
+      '--destination',join(destination,'knowledge.sqlite')],{signal,env:{...process.env,PYTHONPATH:machinery},stdio:['ignore','ignore','pipe']});
     let error='';child.stderr.setEncoding('utf8');child.stderr.on('data',data=>{error=(error+data).slice(-65536);});
     child.on('error',no);child.on('close',code=>code?no(new Error('Baseline KDB import failed: '+error)):ok());
   });
@@ -63,7 +63,7 @@ export async function bootstrap(destination,{baseline,skills,environment,project
     const campaign=await storage.initialize({target:config.target??null});
     config.storage={format:1,campaign_id:campaign.id};
     await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(
-      {...config,root:destination},ledger,{serialized:true});
+      {...config,root:destination},ledger,{serialized:true,signal});
   }finally {ledger.close();}
   await writeFile(join(destination,'instance.json'),JSON.stringify(config,null,2)+'\n',{mode:0o600});
 
@@ -111,7 +111,7 @@ async function copyMachinery(machinery,release,install=true,python='python',sign
     catch(error){if(error.code==='ENOENT')return;throw error;}
     await new Promise((ok,no)=>{
       const child=spawn(python,['-m','ascend_tools.restic_install','--install'],{
-        cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
+        signal,cwd:release,env:{...process.env,PYTHONPATH:release},stdio:['ignore','ignore','inherit']});
       child.on('error',no);
       child.on('close',code=>code?no(new Error('Restic installation failed')):ok());
     });

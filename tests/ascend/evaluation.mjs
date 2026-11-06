@@ -29,7 +29,7 @@ test('A/B samples freeze memory and source once, relocate both checks and block 
       verifier:{files:[verifier,performance],command:`PYTHONPATH=. ${quote(python)} ${quote(verifier)}`,
         performance_command:`PYTHONPATH=. ${quote(python)} ${quote(performance)}`}};
     const parent=join(root,'parent');
-    await instance(parent,{baseline,skills,projects:[project],environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local'}},install:false});
+    await instance(parent,{python,baseline,skills,projects:[project],environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local'}},install:false});
     const config=await readConfig(parent),round=join(parent,'round');await mkdir(round);
     const ledger = new State(join(parent, 'state.sqlite'));
     ledger.db.exec("CREATE TABLE control (key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO control VALUES ('owner','null')"); ledger.close();
