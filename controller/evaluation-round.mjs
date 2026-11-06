@@ -100,7 +100,7 @@ export async function evaluateRound({ pending, config, evaluate, signal,
   return { ...round, evaluationRoot: root };
 }
 
-export async function tuningStatus(root) {
+export async function tuningStatus(root, { wallNow = Date.now } = {}) {
   let state;
   try { state = await read(join(root, 'skills', 'evolution.json')); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -111,8 +111,10 @@ export async function tuningStatus(root) {
     try { round = await read(join(evaluationRoot, 'round.json')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+  const elapsedSeconds = round && round.elapsedSeconds +
+    (round.runningAt === undefined ? 0 : Math.max(0, wallNow() - round.runningAt) / 1000);
   return { candidate: state.candidate, status: round?.status ?? state.evaluationStatus ?? 'deferred',
-    evaluationRoot, remainingSeconds: round && Math.max(0, round.allocatedSeconds - round.elapsedSeconds),
-    elapsedSeconds: round?.elapsedSeconds, allocatedSeconds: round?.allocatedSeconds,
+    evaluationRoot, remainingSeconds: round && Math.max(0, round.allocatedSeconds - elapsedSeconds),
+    elapsedSeconds, allocatedSeconds: round?.allocatedSeconds,
     completedSamples: round?.samples.filter(sample => sample.result).length };
 }

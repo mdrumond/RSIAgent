@@ -167,3 +167,26 @@ test('CLI resumes with the frozen evaluator module after live configuration chan
   assert.equal(history.filter(call => call.kind==='resume').length, 1);
   assert.equal(history[0].root, history.find(call=>call.kind==='resume').root);
 });
+
+
+test('status includes outstanding active or unknown elapsed without changing the journal', async t => {
+  const f = await fixture(t), root = join(f.root, 'round'); await mkdir(root);
+  const stateFile = join(f.root, 'skills', 'evolution.json'), roundFile = join(root, 'round.json');
+  await save(stateFile, { candidate: 'candidate', pending: { evaluationRoot: root } });
+  const beforeState = await readFile(stateFile, 'utf8');
+  for (const [status, runningAt, wall, elapsed, remaining] of [
+    ['running', 1000, 21000, 25, 5],
+    ['interrupted', 1000, 21000, 25, 5],
+    ['interrupted', undefined, 21000, 5, 25],
+    ['running', 22000, 21000, 5, 25],
+    ['running', 1000, 51000, 55, 0]
+  ]) {
+    await save(roundFile, { status, runningAt, elapsedSeconds: 5, allocatedSeconds: 30, samples: [] });
+    const beforeRound = await readFile(roundFile, 'utf8');
+    const view = await tuningStatus(f.root, { wallNow: () => wall });
+    assert.equal(view.elapsedSeconds, elapsed); assert.equal(view.remainingSeconds, remaining);
+    assert.equal(view.status, status); assert.equal(view.allocatedSeconds, 30);
+    assert.equal(await readFile(roundFile, 'utf8'), beforeRound);
+    assert.equal(await readFile(stateFile, 'utf8'), beforeState);
+  }
+});
