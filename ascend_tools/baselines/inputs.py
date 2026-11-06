@@ -10,8 +10,8 @@ def _sparse_kl_fp32(tree):
     """Keep upstream KL math/device placement, repairing its low-precision path.
 
     FP16 clamp_min(1e-8) becomes zero before log, yielding nonfinite loss/gradients.
-    CPU golden already computes and returns all four tensors in FP32. Match that
-    contract on NPU, including FP32 inputs, without its CPU fallback. Vendored
+    CPU golden computes all four tensors in FP32. Preserve that internal math
+    on NPU without its CPU fallback; call() restores the declared output ABI. Vendored
     source bytes, cases and tolerances remain untouched.
     """
     sites = []
@@ -97,13 +97,23 @@ def inputs(workload, case):
     return module, args, kwargs
 
 
+def sparse_outputs(result, args):
+    """Restore declared gradient dtypes after FP32 internal computation."""
+    return tuple(value.to(args[index].dtype) for value, index in zip(result[:3], (2, 3, 4))) + (result[3],)
+
+
 def call(workload, module, args, kwargs, oracle=False):
     if workload in ('gdn', 'bsa'):
         return module.Model()(*args, **kwargs)
     spec, _, _ = pack(workload)
     name = spec['oracle'] if oracle else spec['function']
     function = getattr(module, name)
-    return function(*args, **kwargs)
+    result = function(*args, **kwargs)
+    if workload == 'sparse_lightning_indexer_grad_kl_loss_enhance' and not oracle:
+        # desc.md outputs: gradients match their differentiated input tensors;
+        # loss remains FP32. The oracle keeps the literal CPU golden unrounded.
+        return sparse_outputs(result, args)
+    return result
 
 
 def tensors(value):

@@ -40,7 +40,7 @@ def output_check(workload,result,reference,args,device,native=None):
     if workload=='gdn':dtypes=[args[2].dtype]+([torch.float32] if reference[1] is not None else [])
     elif workload=='kimi_delta_attention':dtypes=[args[0].dtype,torch.float32]
     elif workload=='tensor_program_vm':dtypes=[args[1].dtype]
-    elif workload=='sparse_lightning_indexer_grad_kl_loss_enhance':dtypes=[torch.float32]*4
+    elif workload=='sparse_lightning_indexer_grad_kl_loss_enhance':dtypes=[args[i].dtype for i in (2,3,4)]+[torch.float32]
     else:dtypes=[args[0].dtype]*len(actual)
     if [a.dtype for a in actual]!=dtypes:raise ValueError('Candidate output dtype differs from contract')
     return check(workload,actual,expected,native)
@@ -64,7 +64,7 @@ def evaluate(workload,candidate,*,device='cpu',performance=False,case_ids=None,b
         ref_args=[a.double() if isinstance(a,torch.Tensor) and a.is_floating_point() else a for a in args]
         if workload in ('gdn','bsa','sparse_lightning_indexer_grad_kl_loss_enhance'):ref_args=args
         reference=call(workload,module,ref_args,kwargs,oracle=workload not in ('gdn','bsa'))
-        native=native_reference(workload,module,args,kwargs)
+        native=native_reference(workload,module,args,kwargs,tensors(reference))
         if original!=tensor_hash([a for a in args if isinstance(a,torch.Tensor)]):raise ValueError('Reference mutated input')
         placed=[a.to(device) if isinstance(a,torch.Tensor) else a for a in args]
         before=tensor_hash([a for a in placed if isinstance(a,torch.Tensor)])

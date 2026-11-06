@@ -65,7 +65,7 @@ def execute_case(workload, case_id, device, warmup=5, repeats=20):
         expected_args = args # Their original reference explicitly computes FP32; independent small checks are separate.
     reference_before=tensor_hash([a for a in args if isinstance(a,torch.Tensor)])
     expected = tensors(call(workload,module,expected_args,kwargs,oracle=workload not in ('gdn','bsa')))
-    native = native_reference(workload,module,args,kwargs)
+    native = native_reference(workload,module,args,kwargs,expected)
     if reference_before != tensor_hash([a for a in args if isinstance(a,torch.Tensor)]):
         raise ValueError('CPU reference mutated input')
     actual_args = [a.to(device) if isinstance(a,torch.Tensor) else a for a in args]

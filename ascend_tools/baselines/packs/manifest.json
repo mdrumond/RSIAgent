@@ -34,7 +34,7 @@
     "compatibilityAdapter": {
       "implementation": "inputs.py:_sparse_kl_fp32",
       "computation": "FP32 on input device; native NPU layout path for all floating input dtypes",
-      "outputs": "FP32 gradients and loss, matching CPU golden",
+      "outputs": "Benchmark gradients match query_index/key_index/weights dtypes; FP32 loss; unrounded FP32 CPU oracle",
       "reason": "FP16 clamp_min(1e-8) underflows before log; preserve frozen golden bytes"
     },
     "origin": "cann-bench",

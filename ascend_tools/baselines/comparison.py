@@ -10,7 +10,7 @@ SHA256 thresholds.py: 6a26f1709a4dbb72de21da19165bb1655797053939d34ab125f3fd7c93
 The existing outer checks still reject nonfinite or structurally invalid output.
 """
 import torch
-from .inputs import call, tensors
+from .inputs import call, sparse_outputs, tensors
 
 
 # (small-value boundary, absolute-error cutoff, cancellation boundary/zero).
@@ -20,11 +20,15 @@ REGIONS = {'float16': (2**-11, 2**-16, 2**-5),
            'float32': (2**-14, 2**-30, 2**-8)}
 
 
-def native_reference(workload, module, args, kwargs):
+def native_reference(workload, module, args, kwargs, oracle_outputs=None):
     """Plain golden at case precision; computed once before target timing."""
     if workload not in ('lact_ttt_chunk', 'tensor_program_vm',
                         'sparse_lightning_indexer_grad_kl_loss_enhance'):
         return None
+    if workload == 'sparse_lightning_indexer_grad_kl_loss_enhance' and oracle_outputs is not None:
+        # Sparse's pinned CPU oracle and plain math are literally the same FP32
+        # function on the same values. Only the benchmark output casts differ.
+        return tensors(sparse_outputs(oracle_outputs, args))
     return tensors(call(workload, module, args, kwargs))
 
 
