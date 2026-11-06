@@ -127,3 +127,32 @@ test('submission-only identities support ordered closure',async t=>{
   event('execution-unresolved',{submission:'transfer',handle:null});
   assert.equal(await operationsStopped(state,state.attempt(id),{}),false);
 });
+
+test('normal resume closes the final job without retaining an older settled lease-control fence',async t=>{
+  const {state,queue,id,event}=fixture(t);
+  // After the old lease-control operation settled, the final FA execution was
+  // unknown to the actor; normal resume later observed its completion.
+  event('execution-starting',{operation:'final-fa',startElapsed:385.8068864969994});
+  event('execution-handle',{operation:'final-fa',handle:'final-job'});
+  event('execution-unresolved',{operation:'final-fa',startElapsed:385.8068864969994,
+    handle:'final-job',actor_elapsed:391.5498050519993});
+  const calls=[];
+  const env={reconcileOperation:async({operation})=>{
+    calls.push(operation);
+    return {closed:false};
+  },observe:async handle=>{assert.equal(handle,'final-job');return {state:'stopped'};}};
+  assert.equal(await reconcileFailure(state,id,env),false);
+  assert.equal(queue.pendingOutcomes().length,0);
+  env.reconcileOperation=async({operation})=>{
+    calls.push(operation);assert.equal(operation,'final-fa');
+    return {closed:true,executionSeconds:11.739579109940678,handles:['final-job']};
+  };
+  assert.equal(await reconcileFailure(state,id,env),true);
+  const elapsed=385.8068864969994+11.739579109940678;
+  assert.equal(state.attempt(id).elapsed,elapsed);
+  assert.equal(state.attempt(id).outcome,'failed');
+  assert.equal(queue.pendingOutcomes().length,1);
+  assert.equal(await reconcileFailure(state,id,env),true);
+  assert.equal(state.attempt(id).elapsed,elapsed);
+  assert.deepEqual(calls,['final-fa','final-fa']);
+});
