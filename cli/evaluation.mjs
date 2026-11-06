@@ -48,7 +48,8 @@ export async function bootstrap(request) {
   }
   const project=frozen.projects.find(project=>project.id===request.projectId);
   if(!project)throw new Error('Project not in the frozen evaluation round');
-  const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,...settings}=request.config;
+  const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,
+    campaign_plan:_plan,phase_sequence:_sequence,phase_targets:_targets,completion_target:_target,...settings}=request.config;
   const environment=structuredClone(original.environment);
   request.signal?.throwIfAborted();
   await createInstance(request.instanceRoot,{...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
@@ -61,8 +62,9 @@ export async function wave({instanceRoot,config,signal}) {
   try {
     await new Promise((ok,no)=>{
       let failure;
-      const child=spawn(process.execPath,[join(instanceRoot,'machinery','cli','main.mjs'),'wave',
-        '--instance',instanceRoot,'--mode',config.mode],{signal,stdio:['ignore',log.fd,log.fd]});
+      // Internal evaluations inherit the maintenance/actor service cap. Calling
+      // public dispatch here would reserve a second aggregate outside that cap.
+      const child=spawn(process.execPath,[join(instanceRoot,'machinery','cli','runtime.mjs'),'wave',instanceRoot,JSON.stringify({mode:config.mode})],{signal,stdio:['ignore',log.fd,log.fd]});
       child.once('error',error=>{failure=error;if(!child.pid)no(error);});
       child.once('close',code=>failure?no(failure):code?no(new Error('Evaluation wave failed; inspect evaluation-wave.log')):ok());
     });

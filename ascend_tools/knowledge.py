@@ -252,6 +252,7 @@ class KnowledgeDB:
         self.embeddings = embeddings
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self._check_format()
         self._create_schema()
         self._init_caches()
 
@@ -285,16 +286,16 @@ class KnowledgeDB:
     def _matrix(rows):
         ids, values = [], None
         for index, row in enumerate(rows):
-            vector = json.loads(row['vector_json'])
+            vector = np.frombuffer(row['vector'], dtype='<f4')
             if values is None:
-                values = np.empty((len(rows), len(vector)), dtype=np.float64)
+                values = np.empty((len(rows), len(vector)), dtype=np.float32)
             if len(vector) != values.shape[1]:
                 raise ValueError('embedding dimensions do not match')
             values[index] = vector
             ids.append(row['chunk_id'])
         if values is None:
-            values = np.empty((0, 0), dtype=np.float64)
-        norms = np.linalg.norm(values, axis=1)
+            values = np.empty((0, 0), dtype=np.float32)
+        norms = np.sqrt(np.einsum('ij,ij->i', values, values, dtype=np.float64))
         values.flags.writeable = norms.flags.writeable = False
         return _VectorMatrix(tuple(ids), values, norms)
 
@@ -308,7 +309,7 @@ class KnowledgeDB:
                 check_remaining()
             return list(cached.scores(query))
         cursor = self.connection.execute(
-            'SELECT chunk_id,vector_json FROM chunks WHERE collection=? ORDER BY chunk_id', (collection,))
+            'SELECT chunk_id,vector FROM chunks WHERE collection=? ORDER BY chunk_id', (collection,))
         matrices, scores, size = [], [], 0
         while rows := cursor.fetchmany(256):
             if check_remaining:
@@ -345,6 +346,7 @@ class KnowledgeDB:
         view.connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         view.connection.row_factory = sqlite3.Row
         view.connection.execute("PRAGMA query_only = ON")
+        view._check_format()
         view._init_caches()
         return view
 
@@ -359,29 +361,61 @@ class KnowledgeDB:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def _check_format(self):
+        legacy = self.connection.execute(
+            "SELECT type FROM sqlite_master WHERE name='chunks'").fetchone()
+        if legacy and legacy[0] == 'table':
+            self.connection.close()
+            raise ValueError("legacy knowledge database; import to a new destination first")
+
     def _create_schema(self) -> None:
-        self.connection.executescript(
-            """
+        self.connection.executescript("""
             CREATE TABLE IF NOT EXISTS collections (
-                name TEXT PRIMARY KEY,
-                language TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                manifest_json TEXT NOT NULL,
+                name TEXT PRIMARY KEY, language TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, manifest_json TEXT NOT NULL,
                 fts_table TEXT NOT NULL UNIQUE
             );
-            CREATE TABLE IF NOT EXISTS chunks (
-                rowid INTEGER PRIMARY KEY,
-                collection TEXT NOT NULL REFERENCES collections(name),
-                chunk_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                start_line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                vector_json TEXT NOT NULL,
-                UNIQUE(collection, chunk_id)
+            CREATE TABLE IF NOT EXISTS chunk_contents (
+                content_id TEXT PRIMARY KEY, text TEXT NOT NULL
             );
-            """
-        )
+            CREATE TABLE IF NOT EXISTS chunk_vectors (
+                content_id TEXT NOT NULL, model TEXT NOT NULL, revision TEXT NOT NULL,
+                vector BLOB NOT NULL, PRIMARY KEY(content_id,model,revision)
+            );
+            CREATE TABLE IF NOT EXISTS chunk_provenance (
+                rowid INTEGER PRIMARY KEY, collection TEXT NOT NULL,
+                chunk_id TEXT NOT NULL, path TEXT NOT NULL,
+                start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                content_id TEXT NOT NULL, UNIQUE(collection,chunk_id)
+            );
+            CREATE INDEX IF NOT EXISTS provenance_content ON chunk_provenance(content_id);
+            CREATE VIEW IF NOT EXISTS chunks AS
+                SELECT p.rowid,p.collection,p.chunk_id,p.path,p.start_line,p.end_line,
+                       t.text,v.vector,p.content_id FROM chunk_provenance p
+                JOIN chunk_contents t USING(content_id)
+                JOIN collections c ON c.name=p.collection
+                JOIN chunk_vectors v ON v.content_id=p.content_id
+                    AND v.model=json_extract(c.manifest_json,'$.embedding_model')
+                    AND v.revision=json_extract(c.manifest_json,'$.embedding_revision');
+        """)
+
+    def _store_chunk(self, collection, chunk, vector, model, revision):
+        content_id = _sha256(chunk.text.encode())
+        self.connection.execute('INSERT OR IGNORE INTO chunk_contents VALUES(?,?)',
+                                (content_id, chunk.text))
+        encoded = np.asarray(_normalize(vector), dtype='<f4')
+        if not np.isfinite(encoded).all():
+            raise ValueError("embeddings must contain only finite float32 values")
+        self.connection.execute('INSERT OR IGNORE INTO chunk_vectors VALUES(?,?,?,?)',
+                                (content_id, model, revision, encoded.tobytes()))
+        cursor = self.connection.execute(
+            """INSERT INTO chunk_provenance
+               (collection,chunk_id,path,start_line,end_line,content_id) VALUES(?,?,?,?,?,?)""",
+            (collection,chunk.chunk_id,chunk.path,chunk.start_line,chunk.end_line,content_id))
+        self.connection.execute(
+            f'INSERT INTO {self._fts_table_name(collection)}(rowid,text) VALUES(?,?)',
+            (cursor.lastrowid,chunk.text))
+
     @staticmethod
     def _fts_table_name(collection: str) -> str:
         # Only fixed ASCII plus a digest ever reaches a SQL identifier position.
@@ -462,33 +496,34 @@ class KnowledgeDB:
             def encoded_chunks():
                 total = 0
                 while batch := list(islice(chunks, batch_size)):
-                    vectors = self.embeddings.embed([chunk.text for chunk in batch])
-                    if len(vectors) != len(batch):
+                    missing = {}
+                    for chunk in batch:
+                        key = _sha256(chunk.text.encode())
+                        row = self.connection.execute(
+                            'SELECT vector FROM chunk_vectors WHERE content_id=? AND model=? AND revision=?',
+                            (key, self.embeddings.model, self.embeddings.revision)).fetchone()
+                        if row is None:
+                            missing[key] = chunk.text
+                    vectors = self.embeddings.embed(list(missing.values())) if missing else []
+                    if len(vectors) != len(missing):
                         raise ValueError("embedding backend returned the wrong number of vectors")
-                    yield from zip(batch, vectors)
+                    encoded = dict(zip(missing, vectors))
+                    for chunk in batch:
+                        key = _sha256(chunk.text.encode())
+                        vector = encoded.get(key)
+                        if vector is None:
+                            row = self.connection.execute(
+                                'SELECT vector FROM chunk_vectors WHERE content_id=? AND model=? AND revision=?',
+                                (key, self.embeddings.model, self.embeddings.revision)).fetchone()
+                            vector = np.frombuffer(row['vector'], dtype='<f4')
+                        yield chunk, vector
                     total += len(batch)
                     if progress:
                         progress(total)
 
             for chunk, vector in encoded_chunks():
-                cursor = self.connection.execute(
-                    """INSERT INTO chunks
-                       (collection, chunk_id, path, start_line, end_line, text, vector_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        collection,
-                        chunk.chunk_id,
-                        chunk.path,
-                        chunk.start_line,
-                        chunk.end_line,
-                        chunk.text,
-                        json.dumps(_normalize(vector), separators=(",", ":")),
-                    ),
-                )
-                self.connection.execute(
-                    f"INSERT INTO {fts_table}(rowid, text) VALUES (?, ?)",
-                    (cursor.lastrowid, chunk.text),
-                )
+                self._store_chunk(collection, chunk, vector,
+                                  manifest.embedding_model, manifest.embedding_revision)
         if manifest_path:
             manifest_path.write_text(manifest.to_json(), encoding="utf-8")
         self._invalidate(collection)

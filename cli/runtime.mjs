@@ -1,17 +1,28 @@
 import { spawn } from 'node:child_process';
-import { open, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { open, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { selectAdmission } from '../controller/dispatch.mjs';
+import {campaignBudget} from '../controller/campaign-budget.mjs';
+import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
-import { processIdentity, ownerStopped, attemptStopped } from '../controller/lifecycle.mjs';
-import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
-import { readConfig,updateConfig } from './instance.mjs';
+import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
+import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
+import { readConfig,updateConfig,importProject } from './instance.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
   maxFailedRounds:config.failed_recovery_rounds??5,investigationSeconds:config.investigation_seconds??9600});
 const stateFor=root=>new State(join(root,'state.sqlite'));
+async function writeJob(path,value) {
+  const temporary=path+'.'+randomUUID()+'.tmp';
+  await writeFile(temporary,JSON.stringify(value),{mode:0o600,flag:'wx'});
+  await rename(temporary,path);
+}
 function control(state) {
   state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
   return {
@@ -23,24 +34,35 @@ async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
   return module.createEnvironment(config.environment.options,{instancePath:path,event,exclude,resource,signal});
 }
+export async function instanceStopped(config) {
+  const state=stateFor(config.root),ctl=control(state);
+  try {
+    for(const key of ['owner','skill-writer']) {
+      const owner=ctl.get(key);if(owner&&!await ownerStopped(owner))return false;
+    }
+    for(const row of state.db.prepare('SELECT owner FROM attempts').all())
+      if(!await ownerStopped(row.owner))return false;
+    return true;
+  } finally {state.close();}
+}
+
 export async function operate(command,config,options={}) {
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
     recovery:options['no-recovery']?false:config.recovery};
   if(!['phase1','phase2','inference'].includes(config.mode))throw new Error('Unknown execution mode');
-  if(options.detach && command!=='stop') {
-    await mkdir(join(config.root,'logs'),{recursive:true});
-    const log=await open(join(config.root,'logs','controller.log'),'a',0o600);
-    const child=spawn(process.execPath,[self,command,config.root,JSON.stringify({...options,detach:false,signal:undefined})],
-      {detached:true,stdio:['ignore',log.fd,log.fd]});
-    child.unref();await log.close();return {pid:child.pid,submitted:true};
-  }
   const state=stateFor(config.root), ctl=control(state);
-  let owned=false,watcher;
+  if(command==='resume'&&ctl.get('operation')==='campaign')options={...options,continuous:true};
+  let owned=false,watcher,campaignClock,budgetTimer,budgetWatcher;
   const schedulerAbort=new AbortController();
-  const abort=()=>{ctl.set('stop',true);schedulerAbort.abort(new Error('Wave interrupted'));};
+  const backgroundAbort=new AbortController();
+  const abort=()=>{ctl.set('stop',true);schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();};
   options.signal?.addEventListener('abort',abort,{once:true});
   try {
+    if(command==='pause') {
+      ctl.set('pause-at',Date.now());ctl.set('pause',true);
+      return {pause_requested:true,grace_seconds:config.pause_grace_seconds??30};
+    }
     if(command==='stop') {
       ctl.set('stop',true);
       for(const event of state.events(null).filter(e=>e.type==='evaluation-started')) {
@@ -50,32 +72,72 @@ export async function operate(command,config,options={}) {
       const {requests}=await import('./background.mjs');
       requests(state);
       state.db.prepare("UPDATE requests SET status='failed',error='Stopped before execution' WHERE status='queued'").run();
-      for(const request of requests(state).filter(r=>r.status==='running')) {
-        const owner=request.owner;
-        if(owner?.start && owner?.boot && !await ownerStopped(owner))process.kill(owner.pid,'SIGTERM');
+      for(const request of state.db.prepare("SELECT owner FROM requests WHERE status='running'").iterate()) {
+        const owner=JSON.parse(request.owner);
+        if(owner?.start&&owner?.boot&&!await ownerStopped(owner)) {
+          await (await import('./background.mjs')).stopRequest(owner);
+        }
       }
       return {stop_requested:true};
+    }
+    if(command!=='resume'&&ctl.get('pause'))return {reason:'paused'};
+    for(const attempt of state.db.prepare('SELECT id,owner FROM attempts WHERE outcome IS NULL AND owner IS NOT NULL').iterate()) {
+      const identity=JSON.parse(attempt.owner);
+      if(identity?.pid&&identity.start&&identity.boot&&!await ownerStopped(identity))throw new Error('Previous worker remains active; observe or stop it before starting another controller: '+attempt.id);
     }
     const active=ctl.get('owner');
     if(active && !await ownerStopped(active))throw new Error('Instance controller is already running');
     const owner=await processIdentity();
     state.db.exec('BEGIN IMMEDIATE');
     try {
+      await assertPackAvailable(state);
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
-      ctl.set('owner',owner);ctl.set('stop',false);state.db.exec('COMMIT');owned=true;
+      ctl.set('owner',owner);
+      if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
+      ctl.set('stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
-    watcher=setInterval(()=>{if(ctl.get('stop'))schedulerAbort.abort(new Error('Wave interrupted'));},100);
+    if(options.continuous&&config.campaign_seconds!==undefined) {
+      const cycle=command==='resume'?ctl.get('campaign-budget')?.cycle??randomUUID():randomUUID();
+      campaignClock=campaignBudget(state,{seconds:config.campaign_seconds,cycle,boot:owner.boot});
+      if(campaignClock.remaining<=0)return {reason:'elapsed'};
+      const expire=()=>{
+        if(campaignClock.remaining>0)budgetTimer=setTimeout(expire,Math.max(1,Math.ceil(campaignClock.remaining*1000)));
+        else {campaignClock.stop();abort();}
+      };
+      budgetTimer=setTimeout(expire,Math.ceil(campaignClock.remaining*1000));
+      budgetWatcher=setInterval(()=>campaignClock.checkpoint(),1000);
+    }
+    watcher=setInterval(()=>{
+      if(ctl.get('stop')){schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();}
+      if(ctl.get('pause')){campaignClock?.stop();backgroundAbort.abort(new Error('Instance paused'));}
+    },100);
     if(options.signal?.aborted)abort();
     if((await readConfig(config.root)).mode!==config.mode)await updateConfig(config.root,current=>({...current,mode:config.mode}));
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
-    const wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
+    let wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
+    syncCampaignPlan(state,config);
     const queue=new RecoveryQueue(state,policy(config));
+    if(config.storage) {
+      const url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal});
+      await (await import('../controller/storage-knowledge.mjs')).activateStorageBaseline(config,{state,url,signal:schedulerAbort.signal});
+    }
+    // Unknown failed execution is reconciled, never replayed through the actor.
+    for(const attempt of state.db.prepare('SELECT * FROM attempts WHERE outcome IS NOT NULL').all()) {
+      if(failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
+      try {
+        const path=join(config.root,'attempts',attempt.id);
+        const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+          async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
+        await reconcileFailure(state,attempt.id,previous);
+      }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+    }
     // A prior scheduler may have died before its worker-exit waiter released a lease.
     for(const attempt of state.db.prepare(`SELECT a.*,l.resource FROM resource_leases l
       JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
       schedulerAbort.signal.throwIfAborted();
       try {
-        if(!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
+        if(!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
         const path=join(config.root,'attempts',attempt.id);
         const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
         const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
@@ -93,26 +155,83 @@ export async function operate(command,config,options={}) {
         await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:schedulerAbort.signal}),signal:schedulerAbort.signal});
       }catch(error){state.event(null,'memory-update-error',{message:error.message});}
     }
-    const finalize=pendingOutcomes(state,policy(config));
+    const finalize=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`)
+      .all().filter(attempt=>failureSettled(state,attempt.id));
     const jobs=[];
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
     jobs.push(...(command==='resume'
-      ? state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all().map(attempt=>({attempt,projectId:attempt.project,resume:true}))
+      ? state.db.prepare('SELECT * FROM attempts WHERE outcome IS NULL').all()
+          .map(attempt=>({attempt,projectId:attempt.project,resume:true}))
       : nextWave(state,{wave,...policy(config)}).filter(job=>{
           const selected=config.curriculum?.[config.mode];
           return Array.isArray(selected)?selected.includes(job.projectId):(!job.project.spec.phase || job.project.spec.phase===config.mode);
         })));
-    const access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
+    for(const job of jobs)if(job.resume) {
+      const manifest=JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8'));
+      Object.assign(job,{...manifest,...job});
+    }
+    let access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
+    let environmentRevision=JSON.stringify(config.environment);
     const running=new Set();
     const requested=options.concurrency??config.concurrency??1;
     const concurrency=requested==='auto'?Math.max(1,jobs.length):Number(requested);
     if(!Number.isSafeInteger(concurrency)||concurrency<1)throw new Error('Invalid concurrency');
+    const contain=async(attempt,resource,kind,message,unclaimed=false)=>{
+      const current=state.attempt(attempt.id);
+      let stopped=unclaimed && current.owner===JSON.stringify(owner);
+      if(!stopped) {
+        try {stopped=await ownerStopped(current.owner);}
+        catch(error){state.event(attempt.id,'owner-observation-error',{message:error.message});}
+      }
+      if(!stopped) {
+        state.event(attempt.id,'worker-containment-blocked',{reason:'Current owner is not confirmed stopped'});
+        return false;
+      }
+      let previous;
+      try {
+        previous=await environment(config,join(config.root,'attempts',attempt.id),
+          (type,data)=>state.event(attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal);
+      }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+      if(state.attempt(attempt.id).owner!==current.owner) {
+        state.event(attempt.id,'worker-containment-blocked',{reason:'Owner changed during closure observation'});
+        return false;
+      }
+      // A recovery investigation does not settle the original project as passed.
+      return settleFailure(state,attempt.id,previous,{phase:'controller',kind,message});
+    };
     const launch=async(job,resource)=>{
-      const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy(config)});
-      const attempt=admitted.attempt;
-      const assignedResource=resource??admitted.resource;
+      let attempt,assignedResource,child,path;
+      try {
+      const prepare=async()=>{
+      let pinnedMode=job.mode??config.mode;
+      if(job.origin_attempt&&!job.resume)pinnedMode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
+      const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
+      admitted.mode=pinnedMode;
+      attempt=admitted.attempt;
+      assignedResource=resource??admitted.resource;
+      if(job.origin_attempt&&!job.resume) {
+        const parent=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8'));
+        admitted.mode=parent.mode;
+      }
+      if(job.failure_pattern) {
+        const {claimFailureInvestigation}=await import('../controller/failure-patterns.mjs');
+        if(claimFailureInvestigation(state,job.failure_pattern))admitted.failure_pattern=job.failure_pattern;
+      }
+      path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
+      // Retain a finalization manifest even if subsequent launch preparation fails.
+      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,
+        options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,
+        skillVersion:admitted.skillVersion??config.skills.activeVersion,resource:assignedResource,
+        deferFinalization:options.continuous&&!job.finalize});
       const latest=await readConfig(config.root);
+      if(latest.storage) {
+        const mapped=state.db.prepare("SELECT revision,decision FROM storage_skill_versions WHERE version=?").get(latest.skills.activeVersion);
+        const active=state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get();
+        if(!mapped||mapped.decision!=='promoted'||mapped.revision!==active?.revision)
+          await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(latest,state);
+      }
       let skillVersion=admitted.skillVersion??latest.skills.activeVersion;
       if(!job.resume && admitted.kind!=='original') {
         try{
@@ -122,88 +241,287 @@ export async function operate(command,config,options={}) {
         catch(error){if(error.code!=='ENOENT')throw error;}
       }
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
-      const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
-      await writeFile(join(path,'job.json'),JSON.stringify({...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource}),{mode:0o600});
-      const log=await open(join(path,'worker.log'),'a',0o600);
-      const child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
-      let complete=false;
-      child.once('exit',()=>{complete=true;});
-      child.once('error',error=>{state.event(attempt.id,'worker-spawn-error',{message:error.message});complete=true;});
-      await log.close();
-      while(!complete)await delay(50);
-      const outcome=state.attempt(attempt.id).outcome;
-      if(outcome)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
-      return {attempt:attempt.id,outcome};
-    };
-    const results=[];
-    try {
-    for(const job of jobs) {
-      if(ctl.get('stop'))break;
-      while(running.size>=concurrency)await Promise.race(running);
-      if(job.finalize) {
-        const pending=launch(job).then(value=>results.push(value));running.add(pending);
-        pending.then(()=>running.delete(pending),()=>running.delete(pending));continue;
+      const storage=CampaignStorage.open(state,config.root);
+      if(storage) {
+        storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
+          parent:job.origin_attempt??null,wave:admitted.wave??wave,
+          skillRevision:(await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
+        await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
-      let resources=await access.resources({purpose:(job.project?.spec??state.project(job.projectId)?.spec)?.performance_goal?'performance':(job.project?.spec?.purpose??'ordinary'),target:config.target});
+      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
+        deferFinalization:options.continuous&&!job.finalize});
+      return {argv:[process.execPath,self,'worker',config.root,attempt.id],cwd:config.root,
+        env:{...process.env,...assignedResource?.env},
+        stdout:join(path,'worker.log'),stderr:join(path,'worker.log')};
+      };
+      let exit;
+      await prepare();
+      const log=await open(join(path,'worker.log'),'a',0o600);
+      child=spawn(process.execPath,[self,'worker',config.root,attempt.id],{stdio:['ignore',log.fd,log.fd],env:{...process.env,...assignedResource?.env}});
+      const exited=new Promise(resolve=>{
+        child.once('exit',(code,signal)=>resolve({code,signal}));
+        child.once('error',error=>resolve({message:error.message}));
+      });
+      await log.close();exit=await exited;
+      state.event(attempt.id,'worker-exited',exit);
+      // Intentional stop preserves resumability and the lease.
+      if(!ctl.get('stop') && !ctl.get('pause') && !state.attempt(attempt.id).outcome) {
+        const closed=await contain(attempt,assignedResource,'worker-exit',JSON.stringify(exit),!job.resume &&
+          (!child.pid || child.exitCode!==null || child.signalCode!==null));
+        if(closed)state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+      }
+      // Even an outcome is not proof that detached execution has stopped.
+      if(state.attempt(attempt.id).outcome) {
+        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+          async(_label,fn)=>fn(),assignedResource,schedulerAbort.signal);
+        if(await attemptStopped(state,state.attempt(attempt.id),previous) && failureSettled(state,attempt.id))
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+      }
+      return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome};
+      }catch(error) {
+        if(!attempt) {
+          state.event(null,'job-error',{project:job.projectId,message:error.message});
+          return {project:job.projectId,error:error.message};
+        }
+        const childStopped=!child || !child.pid || child.exitCode!==null || child.signalCode!==null;
+        const closed=await contain(attempt,assignedResource,'worker-boundary',error.message,!job.resume && childStopped);
+        if(closed && childStopped)
+          state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
+        return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,error:error.message};
+      }
+
+    };
+    const results=[],activeJobs=new Map(),startedJobs=new Set();
+    const unavailable=new Set();let resourceWait;
+    const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
+      `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
+    let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot,storageLaunch;
+    const compress=()=>{
+      if(!config.storage||storageLaunch)return;
+      storageLaunch=import('./storage-maintenance.mjs').then(({queueCompression})=>queueCompression(config))
+        .catch(error=>state.event(null,'storage-maintenance-error',{message:error.message})).finally(()=>{storageLaunch=null;});
+    };
+    let freshSinceRecovery=ctl.get('fresh-since-recovery')??0;
+    const track=(job,operation)=>{
+      const key=keyFor(job);startedJobs.add(key);
+      const pending=Promise.resolve().then(operation).then(value=>{
+        if(value.deferred)startedJobs.delete(key);else results.push(value);
+        if(!value.deferred)compress();
+      });
+      running.add(pending);activeJobs.set(pending,job);
+      pending.finally(()=>{running.delete(pending);activeJobs.delete(pending);
+        if(job.finalize)setTimeout(()=>startedJobs.delete(key),5000).unref();}).catch(()=>{});
+    };
+    const start=async(job,resource)=>{
+      track(job,()=>launch(job,resource));
+      if(!job.finalize) {
+        freshSinceRecovery=job.kind==='original'?freshSinceRecovery+1:0;
+        ctl.set('fresh-since-recovery',freshSinceRecovery);
+      }
+      return true;
+    };
+    try {
+    for(;;) {
+      if(ctl.get('stop') || ctl.get('pause') || schedulerAbort.signal.aborted)break;
+      const latest=await readConfig(config.root);
+      config={...latest,mode:config.mode,recovery:options['no-recovery']?false:latest.recovery};
+      syncCampaignPlan(state,config);
+      for(const project of config.projects) {
+        const existing=state.project(project.id);
+        if(!existing)state.add(project);
+        else if(config.campaign_plan && existing.status==='queued')state.db.prepare('UPDATE projects SET spec=? WHERE id=?')
+          .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry,phase:project.phase}),project.id);
+      }
+      if(config.campaign_plan)startCampaignEntry(state,config);
+      const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
+      if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
+      if(config.campaign_plan && progress.currentEntry)config={...config,mode:progress.currentEntry.phase};
+      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)) {
+        advanceCampaignEntry(state,config);
+        if(progress.done)break;
+        continue;
+      }
+      if(options.continuous&&!config.campaign_plan&&progress.nextMode) {
+        await updateConfig(config.root,current=>({...current,mode:progress.nextMode}));
+        state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
+        config={...config,mode:progress.nextMode};continue;
+      }
+      const generationEntry=currentCampaignEntry(state,config);
+      const generationPhase=generationEntry?.phase??config.mode;
+      const generationPolicy=generationSettings(config,generationPhase);
+      if(options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
+        const generationConfig=config;
+        generation=(async()=>{
+          try {
+            const {ensureKnowledgeService}=await import('./knowledge.mjs');
+            const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
+            const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
+            const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),attemptId:'generation-'+randomUUID(),agentDir:path,target:generationConfig.target,
+              event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
+            const specs=await (await import('./project-generation.mjs')).refillProjects({config:generationConfig,state,bridge,
+              concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal});
+            for(const spec of specs) {
+              backgroundAbort.signal.throwIfAborted();
+              if(generationConfig.campaign_plan&&currentCampaignEntry(state,generationConfig)?.id!==spec.campaign_entry)break;
+              if(state.project(spec.id))continue;
+              const imported=await importProject(config.root,spec);
+              await updateConfig(config.root,(current,ledger)=>{
+                if(!ledger.project(imported.id))ledger.add(imported);
+                return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
+                  curriculum:{...current.curriculum,[generationPhase]:[...new Set([...(current.curriculum?.[generationPhase]??[]),imported.id])]}};
+              });
+            }
+          }catch(error){if(!backgroundAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
+          finally{nextGeneration=Date.now()+5000;generation=null;}
+        })();
+      }
+      if(options.continuous&&!maintenance&&Date.now()>=nextMaintenance&&queue.lessons().length) {
+        maintenance=(async()=>{
+          try {
+            const {ensureKnowledgeService}=await import('./knowledge.mjs');
+            const {deliverLessons}=await import('./memory.mjs');
+            await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:backgroundAbort.signal}),signal:backgroundAbort.signal});
+          }catch(error){state.event(null,'memory-update-error',{message:error.message});}
+          finally{nextMaintenance=Date.now()+5000;maintenance=null;}
+        })();
+      }
+      const revision=JSON.stringify(config.environment);
+      if(revision!==environmentRevision) {
+        access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
+        environmentRevision=revision;
+      }
+      const requestedNow=options.concurrency??config.concurrency??1;
+      const limit=requestedNow==='auto'?Math.max(1,config.projects.length):Number(requestedNow);
+      if(!Number.isSafeInteger(limit)||limit<1)throw new Error('Invalid concurrency');
+      const selected=config.curriculum?.[config.mode];
+      const admittedIds=new Set([...activeJobs.values()].map(keyFor));
+      const maintenanceJobs=[];
+      if(options.continuous)for(const attempt of state.db.prepare(`SELECT a.* FROM attempts a
+        WHERE outcome IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events e
+          WHERE e.attempt=a.id AND e.type='postprocess-completed')`).all()) {
+        if(!failureSettled(state,attempt.id)||!await ownerStopped(attempt.owner))continue;
+        const manifest=JSON.parse(await readFile(join(config.root,'attempts',attempt.id,'job.json'),'utf8'));
+        maintenanceJobs.push({...manifest,attempt,projectId:attempt.project,resume:true,finalize:true});
+      }
+      const candidates=command==='resume' && !options.continuous?jobs:
+        [...maintenanceJobs,...jobs.filter(job=>job.resume),...nextWave(state,{wave:options.continuous?wave+1:wave,...policy({...config,mode:'phase1'})})];
+      for(const job of candidates)if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt)
+        job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
+      const eligible=candidates.filter(job=>{
+        const key=keyFor(job);
+        if(config.campaign_plan&&!job.finalize&&!job.resume) {
+          if(progress.done&&(options.continuous||job.kind==='original'))return false;
+          if(job.kind==='original' && (job.project.spec.campaign_entry!==progress.currentEntry?.id ||
+            progress.currentEntry.remainingAdmissions===0))return false;
+        }
+        if(job.attempt&&[...activeJobs.values()].some(active=>active.attempt?.id===job.attempt.id))return false;
+        if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
+        if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
+        if(job.finalize&&state.queryEvents(job.attempt.id,{types:['postprocess-completed'],limit:1}).length)return false;
+        if(['investigation','retry'].includes(job.kind)&&(config.campaign_plan ||
+          (config.mode!=='phase1'&&!config.skills?.tuningDisabled))&&
+          state.db.prepare(`SELECT 1 FROM attempts a WHERE project=? AND outcome IS NOT NULL
+            AND NOT EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed') LIMIT 1`).get(job.projectId))return false;
+        return !startedJobs.has(key)&&!admittedIds.has(key) && (job.finalize || ['investigation','retry'].includes(job.kind) ||
+          (config.campaign_plan?job.project?.spec.campaign_entry===progress.currentEntry?.id:
+            Array.isArray(selected)?selected.includes(job.projectId):(!job.project?.spec.phase || job.project.spec.phase===config.mode)));
+      });
+      const finalizer=eligible.find(job=>job.finalize);
+      if(finalizer && ![...activeJobs.values()].some(job=>job.finalize)) {
+        if(await start(finalizer))continue;
+        await Promise.race([...running,delay(250)]);continue;
+      }
+      const activeActors=[...activeJobs.values()].filter(job=>!job.finalize);
+      const job=selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{running:activeActors,concurrency:limit,freshSinceRecovery});
+      if(!job) {
+        if(!running.size&&!options.continuous&&!resourceWait)break;
+        if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
+          !eligible.some(job=>job.finalize||['investigation','retry'].includes(job.kind)))break;
+        ctl.set('wait',resourceWait??{reason:running.size?'actor-capacity':config.campaign_plan?'waiting-inputs':'inputs-or-recovery',at:new Date().toISOString()});
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);unavailable.clear();continue;
+      }
+      if(job.kind==='investigation') {
+        const {failureInvestigations}=await import('../controller/failure-patterns.mjs');
+        const recent=state.db.prepare(`SELECT a.id,a.project,a.outcome FROM attempts a
+          WHERE outcome IS NOT NULL AND EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')
+          ORDER BY (SELECT MAX(sequence) FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed') DESC LIMIT 10`).all().reverse();
+        for(const attempt of recent){attempt.target=ctl.get('target-pool')??config.target;attempt.failures=state.failures(attempt.id,{order:'desc',limit:20}).map(e=>e.data);}
+        const claimed=state.queryEvents(null,{types:['failure-investigation-claimed'],order:'desc',limit:1000}).map(e=>e.data);
+        job.failure_pattern=failureInvestigations(recent,claimed).find(pattern=>pattern.attempts.some(a=>a.project===job.projectId));
+      }
+      let resources;
+      try {
+        resources=await access.resources({purpose:(job.project?.spec??state.project(job.projectId)?.spec)?.performance_goal?'performance':(job.project?.spec?.purpose??'ordinary'),target:config.target});
+        resourceWait=null;
+      }catch(error){
+        unavailable.add(keyFor(job));
+        resourceWait={reason:error.code==='MEMORY_ENFORCEMENT_UNAVAILABLE'?'memory-enforcement':'resources',
+          code:error.code,message:error.message,project:job.projectId,at:new Date().toISOString()};
+        ctl.set('wait',resourceWait);continue;
+      }
+      ctl.set('actor-capacity',Math.min(resources.filter(r=>r.available).length,limit));
+      if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
       const prior=job.resume?JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')).resource:null;
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:
         !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)));
-      let resource=choose();
-      while(!resource && running.size && !ctl.get('stop')) {
-        await Promise.race(running);
-        resources=await access.resources({purpose:(job.project?.spec??state.project(job.projectId)?.spec)?.performance_goal?'performance':(job.project?.spec?.purpose??'ordinary'),target:config.target});
-        resource=choose();
+      const resource=choose();
+      if(!resource) {
+        unavailable.add(keyFor(job));
+        ctl.set('wait',{reason:'resources',project:job.projectId,at:new Date().toISOString()});
+        continue;
       }
-      if(!resource)continue;
       if(ctl.get('stop'))break;
-      const pending=launch(job,resource).then(value=>results.push(value));
-      running.add(pending);pending.then(()=>running.delete(pending),()=>running.delete(pending));
+      if(options.continuous && job.kind!=='original' && job.eligible_wave>wave){wave=job.eligible_wave;ctl.set('wave',wave);}
+      ctl.set('wait',null);
+      if(!await start(job,resource))await Promise.race([...running,delay(250)]);
     }
     await Promise.all(running);
+    if(maintenance)await maintenance;
+    if(generation)await generation;
+    compress();if(storageLaunch)await storageLaunch;
     }catch(error){
+      const interrupted=schedulerAbort.signal.aborted;
+      if(!interrupted)state.event(null,'scheduler-error',{message:error.message});
       try{ctl.set('stop',true);}finally{await Promise.allSettled([...running]);}
-      throw error;
+      if(maintenance)await maintenance;
+      if(generation)await generation;
+      if(!interrupted)throw error;
     }
     return {wave,results};
-  } finally {clearInterval(watcher);options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
+  } finally {clearInterval(watcher);clearInterval(budgetWatcher);clearTimeout(budgetTimer);campaignClock?.stop();options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
 }
 
 // A campaign only advances waves; every actor still uses operate and the same worker.
 export async function campaign(config,options={}) {
-  const waves=[],started=performance.now();
+  const waves=[];
   const seconds=config.campaign_seconds;
   if(seconds!==undefined && (!Number.isFinite(seconds)||seconds<=0))throw new Error('Invalid campaign elapsed allocation');
   const abort=new AbortController(),stop=()=>abort.abort();
   options.signal?.addEventListener('abort',stop,{once:true});
   if(options.signal?.aborted)abort.abort();
-  const timer=seconds===undefined?null:setTimeout(stop,seconds*1000);
   try {
-    while(!abort.signal.aborted) {
-      const current=await readConfig(config.root),state=stateFor(config.root);
-      let stopped;
-      try {
-        stopped=control(state).get('stop');
-      }finally{state.close();}
-      if(stopped && waves.length)return {waves,reason:'stopped'};
-      const result=await operate('wave',current,{...options,detach:false,signal:abort.signal});
-      waves.push(result);
-      if(!result.results.length) {
-        const ledger=stateFor(config.root);
-        try {
-          const open=ledger.db.prepare('SELECT 1 FROM attempts WHERE outcome IS NULL LIMIT 1').get();
-          return {waves,reason:open?'requires-resume':'complete-or-blocked'};
-        }finally{ledger.close();}
-      }
-    }
-    return {waves,reason:seconds!==undefined && (performance.now()-started)/1000>=seconds?'elapsed':'stopped'};
-  }finally{clearTimeout(timer);options.signal?.removeEventListener('abort',stop);}
+    const result=await operate(options.resume?'resume':'wave',await readConfig(config.root),{...options,continuous:true,detach:false,signal:abort.signal});
+    waves.push(result);
+    const ledger=stateFor(config.root);
+    let stopped,paused,elapsed;
+    try{stopped=control(ledger).get('stop');paused=control(ledger).get('pause');elapsed=control(ledger).get('campaign-budget')?.elapsed;}finally{ledger.close();}
+    return {waves,reason:seconds!==undefined&&elapsed>=seconds?'elapsed':
+      paused?'paused':abort.signal.aborted||stopped?'stopped':'complete'};
+  }finally{options.signal?.removeEventListener('abort',stop);}
+}
+
+export async function resume(config,options={}) {
+  const state=stateFor(config.root);
+  let continuous;
+  try{continuous=control(state).get('operation')==='campaign';}finally{state.close();}
+  return continuous?campaign(config,{...options,resume:true}):operate('resume',config,options);
 }
 
 async function worker(root,id) {
   let config=await readConfig(root);const state=stateFor(root),attempt=state.attempt(id);
   const path=join(root,'attempts',id),job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
   config={...config,mode:job.mode??config.mode,recovery:job.options['no-recovery']?false:config.recovery};
-  let env,bridge,url,stopping,interrupted=false,claimed=false;
+  let env,bridge,url,stopping,interrupted=false,claimed=false,actorRunning=false;
   const abort=new AbortController(),ctl=control(state);
   const signal=()=>{
     if(interrupted)return;interrupted=true;abort.abort();process.exitCode=130;
@@ -212,9 +530,15 @@ async function worker(root,id) {
     }})();
   };
   process.on('SIGTERM',signal);process.on('SIGINT',signal);
-  const watcher=setInterval(()=>{if(ctl.get('stop'))signal();},100);
+  const grace=config.pause_grace_seconds??30;
+  if(!Number.isFinite(grace)||grace<0)throw new Error('Invalid pause grace elapsed allocation');
+  const watcher=setInterval(()=>{if(ctl.get('stop') || (ctl.get('pause')&&
+    (!actorRunning||Date.now()-(ctl.get('pause-at')??0)>=grace*1000)))signal();},100);
   async function finish() {
     const current=state.attempt(id);
+    if(!failureSettled(state,id))return;
+    if(current.outcome==='failed' && !state.failures(id,{limit:1}).length)
+      state.recordFailure(id,{phase:'actor',kind:'failed-outcome',message:'Actor completed without acceptance'});
     if(!outcomeRecorded(state,id,policy(config))) {
       const {findingsFor}=await import('./findings.mjs');
       const findings=await findingsFor({config,job:{...job,attempt},path,state,bridge,
@@ -227,9 +551,10 @@ async function worker(root,id) {
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
         await (await import('./skills.mjs')).run(config,{signal:abort.signal,resource:job.resource,
-          task:{id,projectId:attempt.project,kind:job.kind,completed:true,phase:config.mode,events:state.events(id)}});
+          task:{id,projectId:attempt.project,kind:job.kind,completed:true,phase:config.mode,events:state.queryEvents(id,{types:['skill-read','knowledge-retrieved','guidance-contradicted','failure-recorded',
+            'verification','rejected','stage-completed'],limit:1000,order:'desc'}).reverse()}});
         state.event(id,'skills-updated',{});
-      }catch(error){if(abort.signal.aborted)throw error;state.event(id,'skill-update-error',{message:error.message});}
+      }catch(error){state.event(id,'skill-update-error',{message:error.message});throw error;}
     }
     state.event(id,'postprocess-completed',{});
   }
@@ -247,7 +572,10 @@ async function worker(root,id) {
     if(interrupted)throw new Error('Worker interrupted');
     url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
-    bridge=createKdbBridge({url,attemptId:id,agentDir:path,target:config.target,event:(type,data)=>state.event(id,type,data)});
+    const storage=CampaignStorage.open(state,config.root);
+    const pinned=storage?.db.prepare('SELECT knowledge_generation FROM storage_attempts WHERE attempt=?').get(id);
+    bridge=createKdbBridge({url,attemptId:id,agentDir:path,target:config.target,generation:pinned?.knowledge_generation,
+      recordRetrieval:storage?entry=>storage.retrieval({...entry,attempt:id}):undefined,event:(type,data)=>state.event(id,type,data)});
     const base=state.project(attempt.project).spec;
     let project={...base,actor_seconds:job.actor_seconds};
     if(!job.finalize && job.kind==='investigation') {
@@ -268,19 +596,28 @@ async function worker(root,id) {
       const skills=JSON.parse(await readFile(join(directory,'skill-map.json'),'utf8'));
       for(const scope in skills)skills[scope]=resolve(directory,skills[scope]);
       state.event(id,'task-constructed',{goal:project.goal,kind:job.kind,actor_seconds:project.actor_seconds});
-      await (await import('../controller/pi.mjs')).runAttempt({state,attempt:state.attempt(id),project,attemptPath:path,
+      actorRunning=true;
+      try {await (await import('../controller/pi.mjs')).runAttempt({state,attempt:state.attempt(id),project,attemptPath:path,
         signal:abort.signal,settleProject:job.kind!=='investigation',
+        shouldPause:()=>Boolean(ctl.get('pause')),onPause:signal,
         environmentFactory:ctx=>environment(config,path,ctx.event,ctx.exclude,job.resource,ctx.signal),
         ...await (await import('../controller/model.mjs')).modelFromProfile(config.actor),
         skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension]});
+      }finally{actorRunning=false;}
     }
-    if(!interrupted)await finish();
+    if(!interrupted) {
+      if(state.attempt(id).outcome==='failed')
+        await settleFailure(state,id,env,{phase:'actor',kind:'failed-outcome',
+          message:'Actor completed without acceptance',settleProject:job.kind!=='investigation'});
+      if(!job.deferFinalization)await finish();
+    }
   }catch(error) {
     state.event(id,'attempt-error',{message:error.message,stage:'worker'});
-    if(!interrupted && claimed && !state.attempt(id).outcome) {
-      const {operationsStopped}=await import('../controller/lifecycle.mjs');
-      if(await operationsStopped(state,state.attempt(id),env??{})) {
-        state.finish(id,'failed',{settleProject:job.kind!=='investigation'});
+    if(!interrupted && claimed) {
+      if(!state.attempt(id).outcome || (state.attempt(id).outcome==='failed' && !failureSettled(state,id))) {
+        await settleFailure(state,id,env,{message:error.message,settleProject:job.kind!=='investigation'});
+      }else state.recordFailure(id,{phase:'postprocess',kind:'exception',message:error.message});
+      if(failureSettled(state,id)&&!job.deferFinalization) {
         try{await finish();}catch(failure){state.event(id,'postprocess-error',{message:failure.message});}
       }
     }

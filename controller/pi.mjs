@@ -1,7 +1,7 @@
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { mkdir, appendFile, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join,resolve,relative,basename } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ActorClock } from './budget.mjs';
 import { Workflow } from './workflow.mjs';
@@ -9,19 +9,49 @@ import { validateAcceptance } from './state.mjs';
 import { fingerprint, freezeFiles } from './evidence.mjs';
 import { createEnvironmentTools } from '../integrations/environments/index.mjs';
 import { createPiTelemetryJournal } from './pi-telemetry.mjs';
+import {CampaignStorage} from './storage.mjs';
+import {prepareSourceGit} from './source-git.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
+const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
+  'tool_execution_start','tool_execution_end','auto_compaction_start','auto_compaction_end','auto_retry_start','auto_retry_end']);
 
 // Pi owns sessions, context, model retries, standard tools and compaction.
 export async function runAttempt({state,attempt,project,attemptPath,environmentFactory,
-  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true}) {
+  knowledge,modelRuntime,model,thinkingLevel='off',skillMap,extensions=[],signal,settleProject=true,
+  shouldPause=()=>false,onPause=()=>{}}) {
   validateAcceptance(project);
   await mkdir(attemptPath,{recursive:true});
+  const storage=CampaignStorage.open(state,resolve(attemptPath,'../..'));
+  let artifactWrites=Promise.resolve(),artifactError;
+  const register=(path,kind,external=false)=>storage?.register(path,{attempt:attempt.id,project:attempt.project,kind,external});
   let activeOperation=null;
   const eventData=data=>({...data,
     operation:activeOperation??data.operation??data.submission,actor_elapsed:clock.elapsed});
-  const event=(type,data)=>state.event(attempt.id,type,eventData(data));
+  const event=(type,data)=>{
+    state.event(attempt.id,type,eventData(data));
+    if(storage&&type==='stage-completed'&&data.stage!=='validation') {
+      artifactWrites=artifactWrites.then(async()=>{
+        const snapshot=sourceGit&&['implementation','optimisation'].includes(data.stage)
+          ?await sourceGit.captureTree({signal,timeout:Math.min(30000,clock.remaining*1000)}):null;
+        storage.iteration(attempt.id,{stage:data.stage,reflection:data.reflection,
+          sourceHash:snapshot?.tree_oid??null,sourceCommit:snapshot?.head??null});
+        if(snapshot)state.event(attempt.id,'source-snapshot',{stage:data.stage,...snapshot});
+      }).catch(error=>{artifactError??=error;});
+      return artifactWrites.then(()=>{if(artifactError)throw artifactError;});
+    }
+    if(storage&&type==='execution-output')artifactWrites=artifactWrites.then(async()=>{
+      for(const stream of ['stdout','stderr'])if(data[stream])await register(data[stream],'execution-'+stream);
+      if(data.partial&&data.archive)await register(JSON.stringify(data.archive),'execution-output',true);
+    }).catch(error=>{artifactError??=error;});
+  };
   const clock=new ActorClock(project.actor_seconds,attempt.elapsed);
+  const sourceGit=storage?await clock.exclude('setup',async()=>{
+    const key=createHash('sha256').update(attempt.project+'\0'+relative(storage.root,project.source)).digest('hex');
+    const gitDir=join(storage.root,'source-history',key);
+    const git=await prepareSourceGit({source:project.source,gitDir,attemptId:attempt.id});
+    await storage.register(gitDir,{project:attempt.project,kind:'source-git'});return git;
+  }):null;
   const telemetry=createPiTelemetryJournal(join(attemptPath,'pi-events.jsonl'),attempt.id,
     data=>state.event(attempt.id,'pi-event',data));
   const environment=await environmentFactory({instancePath:attemptPath,event,signal,
@@ -70,6 +100,11 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       return {content:guidance+'\n\n'+content,evidence:{path,sha256:createHash('sha256').update(content).digest('hex')}};
     },search:(request,ctx)=>knowledge.search({...request,attempt_id:attempt.id},ctx),
     verify:async(verifySignal)=>{
+      if(sourceGit) {
+        const snapshot=await sourceGit.captureTree({signal:verifySignal??signal,timeout:Math.min(30000,clock.remaining*1000)});
+        storage.iteration(attempt.id,{stage:'validation',reflection:JSON.stringify(snapshot),
+          sourceHash:snapshot.tree_oid,sourceCommit:snapshot.head});
+      }
       const check=async(command,purpose)=>{
         clock.check();
         await checkVerifier();
@@ -80,6 +115,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
         await checkVerifier();
         const evidence=join(attemptPath,`verify-${purpose}-${Date.now()}.log`);
         await appendFile(evidence,output);
+        await register(evidence,'verification');
         const evidence_sha256=createHash('sha256').update(await readFile(evidence)).digest('hex');
         return {passed:response.exitCode === 0,exitCode:response.exitCode,evidence,evidence_sha256};
       };
@@ -91,6 +127,20 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
         evidence:{correctness:correctness.evidence,performance:performance?.evidence??null}};
     }}).restore(state.events(attempt.id));
   const extension=async pi=>{
+    if(storage)pi.registerTool({name:'rsi_artifact',label:'Register retained evidence',
+      description:'Register an evidence file outside editable source. Use external=true for an uncollected remote path; it remains explicitly missing until collected.',
+      parameters:Type.Object({path:Type.String(),kind:Type.String(),external:Type.Optional(Type.Boolean()),collect:Type.Optional(Type.Boolean())}),
+      execute:async(_id,args)=>{
+        const artifact=await register(args.external?args.path:resolve(project.source,args.path),args.kind,args.external);
+        if(args.collect) {
+          if(!args.external||!environment.collectArtifact)throw new Error('Collection requires an external file and configured environment');
+          const directory=join(attemptPath,'artifacts');await mkdir(directory,{recursive:true});
+          const destination=join(directory,randomUUID()+'-'+basename(args.path));
+          await environment.collectArtifact(args.path,destination);
+          return result(await storage.collected(artifact.id,destination));
+        }
+        return result(artifact);
+      }});
     pi.registerTool({name:'rsi_skill',label:'Read workflow skill',description:'Read the current step skill.',
       parameters:Type.Object({}),execute:async()=>result({stage:workflow.stage,skill:await workflow.skill(),history:workflow.history})});
     pi.registerTool({name:'rsi_knowledge',label:'Retrieve knowledge',description:'Query positive or negative prior evidence.',
@@ -109,13 +159,13 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'From debug, optimisation, validation, or acceptance, return to design or implementation with an observed reason. Then complete the canonical steps and fresh validation before accepting.',
       parameters:Type.Object({to:Type.Union([Type.Literal('design'),Type.Literal('implementation')]),reflection:Type.String({minLength:1})}),
       execute:async(_id,args)=>result(await workflow.advance({next:args.to,reflection:args.reflection}))});
-    const [target]=await createEnvironmentTools({execute:async(command,cwd,options)=>{
+    const shellTools=await createEnvironmentTools({shellOnTarget:environment.shellOnTarget,execute:async(command,cwd,options)=>{
       clock.check();
       return execute(command,cwd,{...options,
         purpose:project.purpose??(project.performance_goal?'performance':'ordinary'),
         timeout:Math.min(options.timeout??Infinity,clock.remaining)});
     }},project.source,sdk);
-    pi.registerTool(target);
+    for(const tool of shellTools)pi.registerTool(tool);
     for (const type of ['before_provider_request','provider_stream_event']) {
       pi.on(type,async payload=>{
         await appendFile(join(attemptPath,'provider.jsonl'),JSON.stringify(payload)+'\n');
@@ -125,6 +175,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       await appendFile(join(attemptPath,'provider.jsonl'),JSON.stringify({type:payload.type,status:payload.status})+'\n');
     });
     pi.on('tool_call',async()=>{
+      if(shouldPause()){onPause();return {block:true,reason:'Instance paused at execution boundary'};}
       clock.check();
       if (uncertain) return {block:true,reason:'Execution closure is unknown; resume only after observation'};
       if (accepted) return {block:true,reason:'Project already accepted'};
@@ -136,12 +187,15 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     await environment.prepare({project,attempt});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
+    if(storage)await storage.session(manager.getSessionFile(),{attempt:attempt.id,
+      phase:storage.db.prepare('SELECT phase FROM storage_attempts WHERE attempt=?').get(attempt.id)?.phase??'phase1'});
+    await register(join(attemptPath,'provider.jsonl'),'provider-telemetry');
     await clock.exclude('setup',async()=>{
     const agentDir=join(attemptPath,'agent');
     await mkdir(agentDir,{recursive:true});
     const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
     const loader=new sdk.DefaultResourceLoader({cwd:project.source,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
-      extensionFactories:[extension,...extensions]});
+      extensionFactories:[extension,...(sourceGit?[sourceGit.extension]:[]),...extensions]});
     await loader.reload();
     ({session}=await sdk.createAgentSession({cwd:project.source,agentDir,settingsManager,modelRuntime,model,thinkingLevel,
       sessionManager:manager,resourceLoader:loader}));
@@ -153,7 +207,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     });
     state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
     session.subscribe(e=>{
-      if(e.type==='tool_execution_start' && e.toolName==='bash') {
+      if(e.type==='tool_execution_start' && e.toolName==='bash' && !environment.shellOnTarget) {
         const operation=randomUUID();nativeBash.set(e.toolCallId,operation);
         event('native-bash-started',{operation,tool_call_id:e.toolCallId,session:manager.getSessionFile()});
       }
@@ -164,16 +218,22 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       // Native session files retain model/tool content; this sidecar retains lifecycle telemetry.
       if (e.type === 'message_end' && e.message.role === 'assistant' && e.message.stopReason === 'error')
         diagnostics.push(e.message.errorMessage ?? 'Native provider error');
+      // Raw streams remain in provider.jsonl; SQL stores lifecycle labels only.
+      if(storage&&!lifecycleEvents.has(e.type))return;
       try { telemetry(eventData({type:e.type,stage:workflow.stage,elapsed:clock.elapsed})); }
       catch(error) { telemetryFailure??=error; throw error; }
     });
     timer=setInterval(()=>{
       state.checkpoint(attempt.id,clock.elapsed,manager.getSessionFile());
+      if(shouldPause()&&!activeOperation&&!nativeBash.size)onPause();
       if (!clock.remaining) void session.abort();
     },1000);
     if(signal?.aborted)throw new Error('Attempt interrupted');
-    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.`);
+    const gitGuidance=sourceGit?await readFile(new URL('../templates/skills/source-git.md',import.meta.url),'utf8'):'';
+    await session.prompt(`Goal: ${project.goal}\nPerformance goal: ${JSON.stringify(project.performance_goal??null)}\nFrozen numeric command: ${project.verifier.command}\nFrozen performance command: ${project.verifier.performance_command??'not required'}\nEnvironment instructions: ${environment.instructions}\nFollow the canonical workflow using rsi_skill, rsi_knowledge, rsi_advance and rsi_verify. Current step: ${workflow.stage}. Design and optimisation require positive and negative retrieval and retrospection. Only a passing frozen verifier can accept the project. Persist findings and evidence as local artifacts; the controller records KDB lessons after completion. Actor KDB access is retrieval-only: do not index repositories, submit lessons, or block the workflow on manual KDB writes.\n${gitGuidance}`);
     await session.waitForIdle();
+    await artifactWrites;
+    if(artifactError)throw artifactError;
     if(telemetryFailure)throw telemetryFailure;
     if(signal?.aborted)throw new Error('Attempt interrupted');
     if(uncertain)throw uncertain;
@@ -202,5 +262,6 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       try {await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'});}
       finally {session.dispose();}
     }
+    await artifactWrites;
   }
 }

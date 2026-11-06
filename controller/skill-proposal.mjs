@@ -14,7 +14,7 @@ const save = async (path, value) => {
 
 // Native Pi owns tool turns, correction, context, retry and compaction.
 export async function generateCandidate({ directory, input, modelRuntime, model, native,
-  seconds = 240, extensions = [], validate = () => {}, signal }) {
+  seconds = 240, extensions = [], validate = () => {}, signal,onSession=async()=>{},onSessionClosed=async()=>{} }) {
   signal?.throwIfAborted();
   if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Writer elapsed seconds must be positive');
   const started = performance.now();
@@ -28,6 +28,7 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   await mkdir(agentDir, { recursive: true });
   const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true } });
   const manager = sdk.SessionManager.create(directory, directory);
+  if(manager.getSessionFile)await onSession(manager.getSessionFile(),join(directory,'provider.jsonl'));
   let submitted;
   const id = Type.String({ pattern: '^[a-z0-9-]+$' });
   const contradiction = { contradictoryEvidence: Type.Optional(Type.Array(Type.String())) };
@@ -55,10 +56,6 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   const { session } = await sdk.createAgentSession({ cwd: directory, agentDir, settingsManager, modelRuntime, model,
     tools: ['read', 'grep', 'find', 'ls', 'submit_changes', 'mcp__kdb__search', 'mcp__kdb__read_entry'],
     sessionManager: manager, resourceLoader: loader });
-  const responses = [];
-  const unsubscribe = session.subscribe(event => {
-    if (event.type === 'message_end') responses.push(event.message);
-  });
   let timer, expired = false, failure;
   const abort = () => { void session.abort().catch(() => {}); };
   signal?.addEventListener('abort', abort, { once: true });
@@ -85,14 +82,10 @@ Submit via submit_changes; correct any rejection. A final text response does not
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
     const cleanup = async operation => { try { await operation(); } catch (error) { failure ??= error; } };
-    await cleanup(() => save(join(directory, 'responses.json'), responses));
-    await cleanup(() => {
-      const messages = manager.getEntries?.().filter(entry => entry.type === 'message').map(entry => entry.message) ?? responses;
-      return writeFile(join(directory, 'sft.native.jsonl'), messages.map(x => JSON.stringify(x)).join('\n'));
-    });
+    await cleanup(() => session.exportToJsonl(join(directory, 'session.native.jsonl')));
     await cleanup(() => session.extensionRunner?.emit({ type: 'session_shutdown', reason: 'quit' }));
-    await cleanup(() => unsubscribe?.());
     await cleanup(() => session.dispose());
+    if(manager.getSessionFile)await cleanup(()=>onSessionClosed(manager.getSessionFile()));
     if (failure) throw failure;
   }
 }

@@ -110,6 +110,7 @@ test('live, unknown and empty SQLite startup claims remain preserved on wait can
 test('native curriculum returns executable source-relative verifier after relocation',{timeout:15000},async t=>{
   const config=await fixture(t),source=join(config.root,'original');await mkdir(source);await writeFile(join(source,'answer.py'),'answer=42\n');
   const calls=[['write',{path:'verify.py',content:"import runpy\nassert runpy.run_path('answer.py')['answer']==6*7\nprint(42)\n"}],
+    ['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],
     ['submit_investigation',{goal:'independent numeric check',question:'Is the result42?',verifier:'verify.py'}]];
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
@@ -128,9 +129,10 @@ test('native curriculum returns executable source-relative verifier after reloca
   const state=new State(join(config.root,'curriculum.sqlite'));t.after(()=>state.close());
   state.add({id:'p',source,goal:'numeric',actor_seconds:120,verifier:{files:[],command:'true'}});
   const attempt=state.admit('p',await processIdentity());
-  const spec=await investigate({config,path,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state,bridge:{extension:()=>{}}});
+  const spec=await investigate({config,path,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric',performance_goal:'parent only'},state,bridge:{extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}}});
   assert.equal(state.events(attempt.id).find(e=>e.type==='curriculum-session').data.role,'investigation');
   assert.equal(spec.performance_goal,undefined);
+  assert.deepEqual(state.queryEvents(attempt.id,{types:['investigation-knowledge']}).map(e=>e.data.kind),['good','negative']);
   const relocated=join(config.root,'relocated');await cp(join(path,'investigation'),relocated,{recursive:true});await rm(path,{recursive:true});
   const result=await promisify(execFile)('bash',['-c',spec.verifier.command],{cwd:join(relocated,'source')});assert.equal(Number(result.stdout.trim()),42);
 });
@@ -162,7 +164,8 @@ test('native summary and investigation retrieve authoritative diagnostics despit
       const results=tools.slice(0,2).map(m=>typeof m.content==='string'?m.content:JSON.stringify(m.content));
       assert.ok(results[0].includes('native-actor-diagnostic-17'));assert.ok(results[1].includes('numeric-check-observed-42'));
       if(investigation&&tools.length===2){name='write';args={path:'verify.py',content:'print(42)\n'};}
-      else if(tools.length===(investigation?3:2)) {
+      else if(investigation&&[3,4].includes(tools.length)){name='investigation_knowledge';args={query:'numeric acceptance evidence',kind:tools.length===3?'good':'negative'};}
+      else if(tools.length===(investigation?5:2)) {
         retrieved.push({session:context.session,evidence:logs});
         name=investigation?'submit_investigation':'record_findings';
         args=investigation?{goal:'inspect numeric',question:'why acceptance incomplete?',verifier:'verify.py'}:
@@ -180,9 +183,11 @@ test('native summary and investigation retrieve authoritative diagnostics despit
   t.after(()=>{if(old===undefined)delete process.env.SERVICE_DIAGNOSTIC_KEY;else process.env.SERVICE_DIAGNOSTIC_KEY=old;});
   config.actor={provider:'service-diagnostics',model:'scripted',base_url:`http://127.0.0.1:${server.address().port}/v1`,credential_env:'SERVICE_DIAGNOSTIC_KEY',
     metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
-  const findings=await summarize({config,path,state,job:{attempt},bridge:{extension:()=>{}},passed:true});
+  const bridge={extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}};
+  const findings=await summarize({config,path,state,job:{attempt},bridge,passed:true});
   assert.equal(findings.evidence[0].path,evidence);
-  await investigate({config,path,state,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric'},bridge:{extension:()=>{}}});
+  await investigate({config,path,state,job:{attempt,origin_attempt:attempt.id,actor_seconds:120},base:{source,goal:'numeric'},bridge});
   assert.deepEqual(retrieved,[{session,evidence},{session,evidence}]);
+  assert.deepEqual(state.queryEvents(attempt.id,{types:['investigation-knowledge']}).map(e=>e.data.kind),['good','negative']);
   assert.equal(state.events(attempt.id).filter(event=>event.type==='pi-event').length,80);
 });

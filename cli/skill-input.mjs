@@ -34,18 +34,28 @@ export async function copyVersion(config,map,edit) {
   }
   return version;
 }
-export async function run(config,action) {
+export async function run(config,action,options={}) {
+  if(config.storage&&!options.serialized) {
+    const {withSkillLock}=await import('./evolution-lock.mjs');
+    return withSkillLock(config,()=>run(config,action,{serialized:true}));
+  }
   const directory=join(config.root,'skills','versions',config.skills.activeVersion);
   const map=JSON.parse(await readFile(join(directory,'skill-map.json'),'utf8'));
   if(!['global-kdb',...stages].includes(action.scope))throw new Error('Choose a mapped workflow scope');
   await validateSkillMap(directory,map);
   if(action.content===undefined)return {scope:action.scope,content:await readFile(resolve(directory,map[action.scope]),'utf8')};
   if(typeof action.content!=='string'||!action.content.trim())throw new Error('Skill content is required');
+  const storage=config.storage?await import('../controller/storage-knowledge.mjs'):null;
+  if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true});
   const version=await copyVersion(config,map,action);
+  if(storage) await storage.recordStorageSkill(config,version,{serialized:true,
+    baseVersion:config.skills.activeVersion,reason:'user-edit'});
   const {updateConfig}=await import('./instance.mjs');
   await updateConfig(config.root,current=>{
     if(current.skills.activeVersion!==config.skills.activeVersion)throw new Error('Skills changed; refresh the editor');
     return {...current,skills:{...current.skills,activeVersion:version}};
   });
+  if(storage) await storage.recordStorageSkill(config,version,{serialized:true,
+    baseVersion:config.skills.activeVersion,promote:true,reason:'user-edit'});
   return {scope:action.scope,content:action.content,version};
 }

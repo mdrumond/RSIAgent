@@ -3,6 +3,8 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { tune } from '../controller/skill-evolution.mjs';
+import {State} from '../controller/state.mjs';
+import {CampaignStorage} from '../controller/storage.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
 // and wave({instanceRoot,config,projectIds:[id],evaluation:true}). bootstrap must copy
@@ -61,7 +63,18 @@ export async function run(config, values = {}) {
       const bridge = createKdbBridge({ url, attemptId: task?.id ?? `manual-${randomUUID()}`,
         agentDir: join(options.directory, 'agent'), event: async (type, data) =>
           appendFile(join(options.directory, 'knowledge-events.jsonl'), JSON.stringify({ type, data }) + '\n') });
-      return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension] });
+      const roleStorage=config.storage?{
+        onSession:async(path,provider)=>{
+          const state=new State(join(instanceRoot,'state.sqlite'));
+          try{await CampaignStorage.open(state,instanceRoot)?.session(path,{provider,
+            attempt:task?.id&&state.attempt(task.id)?task.id:null,phase:executedMode,role:'skill-writer'});}finally{state.close();}
+        },
+        onSessionClosed:async(path)=>{
+          const state=new State(join(instanceRoot,'state.sqlite'));
+          try{CampaignStorage.open(state,instanceRoot)?.closeSession(path);}finally{state.close();}
+        }
+      }:{};
+      return generateCandidate({ ...options, modelRuntime, model, extensions: [bridge.extension],...roleStorage });
     };
     const evaluate = async request => {
       request.resource = values.resource;
@@ -80,7 +93,20 @@ export async function run(config, values = {}) {
       return runtime.wave({ instanceRoot: request.instanceRoot, config: request.config,
         projectIds: [request.projectId], evaluation: true, signal: request.signal });
     };
-    return tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
+    const storage = config.storage ? await import('../controller/storage-knowledge.mjs') : null;
+    if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true});
+    const result = await tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
       task, userinfo, manual, context, evaluate, generate, native: values.native, signal: values.signal });
+    if(storage) {
+      const latest={...await readConfig(instanceRoot),root:instanceRoot};
+      let evolution={};
+      try {evolution=JSON.parse(await readFile(join(instanceRoot,'skills','evolution.json'),'utf8'));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+      const candidate=result.candidate??evolution.candidate;
+      if(candidate) await storage.recordStorageSkill(config,candidate,{serialized:true,
+        baseVersion:config.skills.activeVersion,promote:latest.skills.activeVersion===candidate?true:
+          result.promote===false?false:undefined,reason:result.reason??'awaiting-evaluation'});
+    }
+    return result;
   }, { signal: values.signal });
 }

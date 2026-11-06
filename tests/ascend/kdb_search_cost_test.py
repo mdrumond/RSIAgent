@@ -7,6 +7,8 @@ import sqlite3
 import tempfile
 import time
 import unittest
+
+import numpy as np
 from unittest.mock import patch
 
 from ascend_tools.kdb import KDB
@@ -49,7 +51,7 @@ def reference(db, query, kind='all', target=None, limit=10):
                 f'SELECT c.chunk_id FROM {table} CROSS JOIN chunks c ON c.rowid={table}.rowid '
                 f'WHERE {table} MATCH ? AND c.collection=?', (lexical, name)))
         for row in db.db.connection.execute('SELECT * FROM chunks WHERE collection=?', (name,)):
-            candidates.append((name, row, cosine(vector, json.loads(row['vector_json'])), scoped_kind, scope['target']))
+            candidates.append((name, row, cosine(vector, np.frombuffer(row['vector'], dtype='<f4').astype(float)), scoped_kind, scope['target']))
     candidates.sort(key=lambda row: (-row[2], row[0], row[1]['chunk_id']))
     lexical_ranks = {key: i for i, key in enumerate(
         ((name, row['chunk_id']) for name, row, *_ in candidates if (name, row['chunk_id']) in keywords), 1)}
@@ -59,7 +61,7 @@ def reference(db, query, kind='all', target=None, limit=10):
         score = 1/(RRF_K+rank) + (1/(RRF_K+lexical_rank) if lexical_rank else 0)
         manifest = db.db.manifest(name)
         result.append(dict({key: row[key] for key in ('chunk_id', 'path', 'start_line', 'end_line', 'text')},
-            collection=name, kind=scoped_kind, target=scoped_target, language=manifest.language,
+            collection=name, kind=scoped_kind, generation=None, target=scoped_target, language=manifest.language,
             kernel_languages=list(manifest.kernel_languages), score=score, vector_rank=rank,
             lexical_rank=lexical_rank, lexical_score=None,
             source_sha256=db.db.source_fingerprint(name, row['path']).sha256))
@@ -124,7 +126,9 @@ class SearchCostTests(unittest.TestCase):
             self.addCleanup(view.close)
             before = view.cosine_scores('base', [1]*16)
             with sqlite3.connect(db.db.path) as other:
-                other.execute('UPDATE chunks SET vector_json=? WHERE collection=?', (json.dumps([0]*16), 'base'))
+                other.execute('UPDATE chunk_vectors SET vector=? WHERE content_id IN '
+                              '(SELECT content_id FROM chunk_provenance WHERE collection=?)',
+                              (np.zeros(16, dtype='<f4').tobytes(), 'base'))
             self.assertNotEqual(view.cosine_scores('base', [1]*16), before)
             self.assertEqual(db.search('aligned'), reference(db, 'aligned'))
 

@@ -1,0 +1,370 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+import {once} from 'node:events';
+import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
+import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
+import {State} from '../../controller/state.mjs';
+import {campaignProgress} from '../../controller/progress.mjs';
+import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
+import {refillPhase1,refillProjects,generationEventState} from '../../cli/project-generation.mjs';
+
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand}={}) {
+  const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  const verifierContent=badVerifier?'pass\n':`from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+  const requests=[];
+  let waiting;const waitStarted=new Promise(ok=>waiting=ok);
+  const server=createServer(async(req,res)=>{
+    let raw='';for await(const b of req)raw+=b;
+    const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;requests.push(body);
+    if(pause || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
+    const plan=[
+      ['write',{path:'source/answer.py',content:'answer=0\n'}],
+      ['write',{path:'reference/answer.py',content:`answer=${positive}\n`}],
+      ['write',{path:'negative/answer.py',content:`answer=${negative}\n`}],
+      ['write',{path:'verify.py',content:verifierContent}],
+      ['submit_project',{goal,...(performanceGoal!==undefined?{performance_goal:performanceGoal}:{}),source:'source',reference:'reference',negative_controls:['negative'],
+        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),command:separateCommand?'requires-device-runtime':"PYTHONPATH=. python3 ../verify.py"},
+        ...(separateCommand?{construction_command:"PYTHONPATH=. python3 ../verify.py"}:{})}]];
+    if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
+    if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
+      ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
+    res.writeHead(200,{'Content-Type':'text/event-stream'});
+    const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'generation',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
+    const call=plan[n];
+    if(call){frame({role:'assistant',tool_calls:[{index:0,id:'call-'+n,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
+    else{frame({role:'assistant',content:'Done'});frame({},'stop');}
+    res.end('data: [DONE]\n\n');
+  });
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
+  const key='GENERATION_FIXTURE_KEY';process.env[key]='fixture';t.after(()=>delete process.env[key]);
+  const config={root,mode:'phase1',actor_seconds:60,curriculum_seconds:20,
+    curriculum:{phase1:['supplied'],generation:{enabled:true,topics:['arithmetic'],preprompt:'Construct CPU fixtures'}},
+    actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
+      metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
+  const options={config,state,path:join(root,'drafts'),bridge:{extension:()=>{}},concurrency:1};
+  return {options,state,config,requests,verifierContent,waitStarted,unpause:()=>{pause=false;pauseAfterRejection=false;}};
+}
+
+test('native Pi constructs projects; real Python controls gate staged specs without original quota',async t=>{
+  const f=await fixture(t),specs=await refillPhase1(f.options);
+  assert.equal(specs.length,2);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n,0);
+  assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.ok(Object.keys(specs[0].verifier.hashes).length);
+  const again=await refillPhase1(f.options);assert.deepEqual(again.map(s=>s.id),specs.map(s=>s.id));
+  for(const s of specs)f.state.add(s);
+  assert.deepEqual(await refillPhase1(f.options),[]);
+  const imported=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+  assert.deepEqual(imported.map(d=>d.status),['imported','imported']);
+  assert.ok(imported.every(d=>Object.keys(d).length===2));
+});
+
+test('a verifier accepting negative controls never enters original ledger',async t=>{
+  const f=await fixture(t,{badVerifier:true});
+  assert.deepEqual(await refillPhase1(f.options),[]);
+  const drafts=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+  assert.equal(drafts.length,2);assert.ok(drafts.every(d=>d.status==='invalid'&&d.elapsed>0));
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
+});
+
+test('an incorrect control accepted by the verifier is rejected and inference never generates',async t=>{
+  const f=await fixture(t,{negative:42});
+  assert.deepEqual(await refillPhase1(f.options),[]);
+  for(const mode of ['inference'])assert.deepEqual(await refillPhase1({...f.options,config:{...f.config,mode}}),[]);
+});
+
+test('batch cap and exhausted resume retain the original elapsed allocation',async t=>{
+  const f=await fixture(t);
+  // Initialize durable schema without provider work by filling the backlog.
+  for(let i=0;i<2;i++)f.state.add({id:'p'+i,goal:'supplied',actor_seconds:60,generation:{},source:'.'});
+  await refillPhase1(f.options);
+  f.state.db.prepare("UPDATE projects SET status='passed'").run();
+  const d={id:'generated-exhausted',status:'draft',phase:'phase1',campaign_entry:null,seconds:1,elapsed:1,topic:'arithmetic'};
+  f.state.db.prepare('INSERT INTO generation_drafts VALUES (?,?)').run(d.id,JSON.stringify(d));
+  f.config.curriculum_seconds=.001;
+  assert.deepEqual(await refillPhase1({...f.options,concurrency:10}),[]);
+  const rows=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+  assert.equal(rows.length,8);assert.equal(rows[0].status,'exhausted');assert.equal(rows[0].seconds,1);
+});
+
+
+test('interruption resumes the same native draft and retains elapsed allocation',async t=>{
+  const f=await fixture(t,{pause:true}),abort=new AbortController();
+  const pending=refillPhase1({...f.options,signal:abort.signal});
+  await f.waitStarted;abort.abort(new Error('stop'));
+  await assert.rejects(pending);
+  const original=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.ok(original.elapsed>0);assert.equal(original.status,'draft');
+  f.unpause();
+  const specs=await refillPhase1(f.options);
+  assert.equal(specs[0].id,original.id);
+  const resumed=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(original.id).data);
+  assert.ok(resumed.elapsed>=original.elapsed);assert.equal(resumed.seconds,original.seconds);
+  const sessions=f.state.db.prepare("SELECT data FROM generation_events WHERE draft=? AND type='curriculum-session'").all(original.id).map(r=>JSON.parse(r.data));
+  assert.equal(sessions.length,2);assert.equal(sessions[0].session,sessions[1].session);
+  assert.ok(sessions[1].elapsed_seconds>0);
+});
+
+
+test('the trusted positive must pass the independent verifier',async t=>{
+  const f=await fixture(t,{positive:41});
+  assert.deepEqual(await refillPhase1(f.options),[]);
+  const rows=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+  assert.ok(rows.every(d=>d.status==='invalid'));
+  const rejections=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected'").all().map(r=>JSON.parse(r.data));
+  assert.ok(rejections.every(e=>e.checks.length===1&&e.checks[0].kind==='reference'&&e.checks[0].exitCode===1));
+});
+
+
+test('generation telemetry pages exclusive cursors without original event tables',t=>{
+  const db=new DatabaseSync(':memory:');t.after(()=>db.close());
+  db.exec('CREATE TABLE generation_events(sequence INTEGER PRIMARY KEY,draft TEXT,type TEXT,data TEXT)');
+  const state=generationEventState(db);
+  state.event('draft','curriculum-session',{role:'generation',session:'first',allocation_seconds:30});
+  for(let i=1;i<=205;i++)state.event('draft','curriculum-checkpoint',{role:'generation',elapsed_seconds:i/10});
+  state.event('other','curriculum-checkpoint',{role:'generation',elapsed_seconds:999});
+  state.event('draft','curriculum-session',{role:'generation',session:'latest',allocation_seconds:300});
+  const page=state.queryEvents('draft',{types:['curriculum-checkpoint'],order:'desc',limit:100});
+  assert.equal(page.length,100);assert.equal(page[0].data.elapsed_seconds,20.5);
+  const next=state.queryEvents('draft',{types:['curriculum-checkpoint'],order:'desc',limit:100,before:page.at(-1).sequence});
+  assert.equal(next.length,100);assert.ok(next[0].sequence<page.at(-1).sequence);
+  const forward=state.queryEvents('draft',{order:'asc',limit:2,after:page.at(-1).sequence,before:page[0].sequence});
+  assert.equal(forward.length,2);assert.equal(forward[0].sequence,page.at(-1).sequence+1);
+  assert.deepEqual(state.queryEvents('draft',{types:[]}),[]);
+  assert.deepEqual(curriculumRoleHistory(state,'draft','generation'),{
+    prior:{role:'generation',session:'latest',allocation_seconds:300},seconds:30,elapsed:20.5});
+  for(const options of [{limit:0},{limit:1001},{order:'bad'},{before:-1},{after:1.2},{types:'x'}])
+    assert.throws(()=>state.queryEvents('draft',options));
+});
+
+
+test('native Pi repairs a rejected negative and resubmits in the same draft session',async t=>{
+  const f=await fixture(t,{negative:42,repair:true,afterAccepted:true,verbose:true});
+  const specs=await refillPhase1(f.options);assert.equal(specs.length,2);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM generation_drafts').get().n,2);
+  for(const spec of specs) {
+    const events=generationEventState(f.state.db).queryEvents(spec.id,{limit:1000});
+    const sessions=events.filter(e=>e.type==='curriculum-session');assert.equal(sessions.length,1);
+    const [failure]=events.filter(e=>e.type==='generation-rejected');assert.ok(failure);
+    const check=failure.data.checks.at(-1);
+    assert.equal(check.kind,'negative');assert.equal(check.exitCode,0);assert.equal(check.expected_exit,1);
+    assert.equal(check.cwd,join(f.options.path,spec.id,'negative'));
+    assert.ok((await readFile(check.log,'utf8')).length>6000);assert.equal(check.output.length,4000);
+    assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+    assert.equal(await readFile(join(spec.source,'answer.py'),'utf8'),'answer=0\n');
+    assert.equal(await readFile(spec.verifier.files[0],'utf8'),f.verifierContent);
+  }
+  const replies=f.requests.flatMap(r=>r.messages.filter(m=>m.role==='tool'));
+  const error=replies.find(m=>m.tool_call_id==='call-4');
+  assert.ok(error); // The model receives the controller's actual negative-check observation.
+  const observed=JSON.parse(error.content.slice(error.content.indexOf('{')));
+  assert.equal(observed.expected_exit,1);assert.equal(observed.exitCode,0);
+  assert.ok(observed.log.endsWith('.log'));
+});
+
+test('separate CPU construction command preserves the actual target verifier',async t=>{
+  const f=await fixture(t,{separateCommand:true}),specs=await refillPhase1(f.options);
+  assert.equal(specs.length,2);
+  assert.ok(specs.every(s=>s.verifier.command==='requires-device-runtime'));
+  assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
+});
+
+
+test('a rejected submission resumes with its evidence and remaining budget in the same session',async t=>{
+  const f=await fixture(t,{negative:42,repair:true,pauseAfterRejection:true}),abort=new AbortController();
+  const pending=refillPhase1({...f.options,signal:abort.signal});
+  await f.waitStarted;
+  const before=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.equal(before.status,'draft');assert.equal(before.proposal,undefined);assert.equal(before.spec,undefined);
+  const failure=generationEventState(f.state.db).queryEvents(before.id,{types:['generation-rejected']})[0];
+  assert.equal(failure.data.checks.at(-1).exitCode,0);
+  abort.abort(new Error('stop after rejection'));await assert.rejects(pending);
+  const stopped=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.ok(stopped.elapsed>0);assert.equal(stopped.status,'draft');
+  f.unpause();const specs=await refillPhase1(f.options);
+  assert.equal(specs[0].id,before.id);
+  const events=generationEventState(f.state.db).queryEvents(before.id,{limit:1000});
+  const sessions=events.filter(e=>e.type==='curriculum-session');
+  assert.equal(sessions.length,2);assert.equal(sessions[0].data.session,sessions[1].data.session);
+  assert.equal(sessions[0].data.allocation_seconds,sessions[1].data.allocation_seconds);
+  assert.ok(sessions[1].data.elapsed_seconds>0);
+  assert.equal(events.filter(e=>e.type==='generation-rejected').length,1);
+  assert.equal(await readFile(failure.data.checks.at(-1).log,'utf8'),'cpu-check: 42\n');
+});
+
+
+function campaign(f,phase='phase2',count=2) {
+  f.config.mode=phase;
+  f.config.campaign_plan=[{id:'old',phase,new_projects:2},{id:'fresh',phase,new_projects:count}];
+  // Persist the completed entry's cursor without running an actor campaign.
+  f.state.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  f.state.db.prepare("INSERT OR REPLACE INTO control VALUES ('campaign-plan',?)")
+    .run(JSON.stringify({plan:f.config.campaign_plan,index:1}));
+}
+
+test('phase2 generates a fresh batch ignoring older projects and ready drafts',async t=>{
+  const goal='End-to-end throughput >= 100 samples/s';
+  const f=await fixture(t,{goal});
+  campaign(f);
+  f.config.curriculum.generation.by_phase={phase2:{topics:['end-to-end throughput']}};
+  // An old ready draft must not be emitted or included in the current backlog.
+  f.state.add({id:'old-project',phase:'phase2',campaign_entry:'old',goal:'old',source:'.',actor_seconds:60});
+  const first=await refillProjects(f.options);
+  assert.equal(first.length,2);
+  for(const spec of first) {
+    assert.equal(spec.phase,'phase2');assert.equal(spec.campaign_entry,'fresh');
+    assert.equal(spec.goal,goal);
+    assert.equal(spec.generation.topic,'end-to-end throughput');
+    assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+    assert.notEqual(spec.id,'old-project');assert.equal(spec.parent,undefined);
+  }
+  const plan=[...f.config.campaign_plan,{id:'next',phase:'phase2',new_projects:1}];
+  f.config.campaign_plan=plan;
+  f.state.db.prepare("UPDATE control SET value=? WHERE key='campaign-plan'").run(JSON.stringify({plan,index:2}));
+  const next=await refillProjects(f.options);
+  assert.equal(next.length,1);assert.equal(next[0].campaign_entry,'next');
+  assert.ok(!first.some(s=>s.id===next[0].id));
+  const requests=f.requests.length;
+  assert.deepEqual((await refillProjects(f.options)).map(s=>s.id),next.map(s=>s.id));
+  assert.equal(f.requests.length,requests);
+});
+
+test('a phase2 interrupted draft resumes within admission quota without duplicates',async t=>{
+  const f=await fixture(t,{pause:true});campaign(f,'phase2',1);
+  const abort=new AbortController(),pending=refillProjects({...f.options,signal:abort.signal});
+  await f.waitStarted;abort.abort(new Error('stop'));await assert.rejects(pending);
+  const before=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.equal(before.phase,'phase2');assert.equal(before.campaign_entry,'fresh');
+  f.unpause();
+  const specs=await refillProjects({...f.options,concurrency:8});
+  assert.equal(specs.length,1);assert.equal(specs[0].id,before.id);
+  assert.deepEqual((await refillProjects({...f.options,concurrency:8})).map(s=>s.id),specs.map(s=>s.id));
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM generation_drafts').get().n,1);
+  f.state.add(specs[0]);
+  assert.deepEqual(await refillProjects({...f.options,concurrency:8}),[]);
+});
+
+test('unattempted current-entry projects consume admission space but old projects do not',async t=>{
+  const f=await fixture(t);campaign(f,'phase1',2);
+  for(const [id,entry] of [['queued','fresh'],['old','old']])
+    f.state.add({id,phase:'phase1',campaign_entry:entry,goal:'supplied',source:'.',actor_seconds:60});
+  const specs=await refillProjects({...f.options,concurrency:8});
+  assert.equal(specs.length,1);assert.equal(specs[0].campaign_entry,'fresh');
+  f.state.add(specs[0]);assert.deepEqual(await refillProjects({...f.options,concurrency:8}),[]);
+});
+
+test('phase2 rejects CPU-negative acceptance and verifier mutation',async t=>{
+  for(const options of [{negative:42},{mutateVerifier:true}]) {
+    const f=await fixture(t,options);campaign(f,'phase2',1);
+    assert.deepEqual(await refillProjects(f.options),[]);
+    const drafts=f.state.db.prepare('SELECT data FROM generation_drafts').all().map(r=>JSON.parse(r.data));
+    assert.equal(drafts.length,1);assert.equal(drafts[0].status,'invalid');
+    assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
+    const [failure]=generationEventState(f.state.db).queryEvents(drafts[0].id,{types:['generation-rejected']});
+    if(options.negative)assert.equal(failure.data.checks.at(-1).exitCode,0);
+    else assert.equal(failure.data.error,'Verifier changed during CPU checks');
+  }
+});
+
+
+test('admitted originals consume remainingAdmissions exactly once',async t=>{
+  const f=await fixture(t);campaign(f,'phase2',2);
+  f.state.add({id:'active',phase:'phase2',campaign_entry:'fresh',goal:'active',source:'.',actor_seconds:60});
+  admitJob(f.state,{projectId:'active',wave:1,mode:'phase2'});
+  const specs=await refillProjects({...f.options,concurrency:8});
+  assert.equal(specs.length,1);
+  f.state.add(specs[0]);admitJob(f.state,{projectId:specs[0].id,wave:1,mode:'phase2'});
+  assert.deepEqual(await refillProjects({...f.options,concurrency:8}),[]);
+});
+
+
+test('phase2 retains declared performance contracts without executing timing on CPU',async t=>{
+  const performanceGoal={minimum_samples_per_second:100};
+  const performanceCommand='requires-isolated-target benchmark';
+  const f=await fixture(t,{performanceGoal,performanceCommand});campaign(f,'phase2',1);
+  const [spec]=await refillProjects(f.options);
+  assert.deepEqual(spec.performance_goal,performanceGoal);
+  assert.equal(spec.verifier.performance_command,performanceCommand);
+  assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.ok(spec.generation.checks.every(c=>c.command!==performanceCommand));
+  f.state.add(spec);assert.deepEqual(f.state.project(spec.id).spec.performance_goal,performanceGoal);
+});
+
+test('missing performance commands block admission and phase1 does not inherit phase2 goals',async t=>{
+  const missing=await fixture(t,{performanceGoal:'declared throughput'});campaign(missing,'phase2',1);
+  assert.deepEqual(await refillProjects(missing.options),[]);
+  assert.equal(missing.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
+  const ordinary=await fixture(t);
+  ordinary.config.curriculum.generation.by_phase={phase2:{preprompt:'Require target throughput'}};
+  const specs=await refillProjects(ordinary.options);
+  assert.ok(specs.every(s=>s.phase==='phase1'&&s.performance_goal===undefined&&s.verifier.performance_command===undefined));
+  const explicit=await fixture(t,{performanceGoal:'declared microbenchmark target',performanceCommand:'benchmark'});
+  const microbenchmarks=await refillProjects(explicit.options);
+  assert.equal(microbenchmarks.length,2);
+  for(const spec of microbenchmarks) {
+    assert.equal(spec.phase,'phase1');assert.equal(spec.performance_goal,'declared microbenchmark target');
+    assert.equal(spec.verifier.performance_command,'benchmark');explicit.state.add(spec);
+  }
+});
+
+
+test('phase overrides agree on non-plan completion and refilling in both phases',async t=>{
+  for(const phase of ['phase1','phase2'])for(const enabled of [true,false]) {
+    const f=await fixture(t);f.config.mode=phase;
+    f.config.curriculum[phase]=['supplied'];
+    f.config.curriculum.generation={enabled:!enabled,topics:['default'],
+      by_phase:{[phase]:{enabled,topics:['override-topic']}}};
+    f.state.add({id:'supplied',phase,goal:'supplied',actor_seconds:60});
+    const queue=new RecoveryQueue(f.state,{mode:phase}),job=queue.claim('supplied',0);
+    queue.recordOriginal(job.attempt.id,{passed:true,findings:'correct',evidence:[{collection:'memory',entry_id:'proof'}]},0);
+    queue.acknowledgeLesson(queue.lessons()[0].id);
+    f.state.event(job.attempt.id,'postprocess-completed',{});
+    assert.equal(campaignProgress(f.state,f.config).phaseComplete,!enabled);
+    const specs=await refillProjects(f.options);
+    assert.equal(specs.length,enabled?2:0);
+    assert.ok(specs.every(s=>s.phase===phase&&s.generation.topic==='override-topic'));
+    if(!enabled)assert.equal(f.requests.length,0);
+    assert.equal(campaignProgress(f.state,{...f.config,completion_target:1}).phaseComplete,true);
+  }
+});
+
+test('old non-plan interrupted phase1 drafts retain ID, native session and elapsed budget',async t=>{
+  const f=await fixture(t,{pause:true}),abort=new AbortController();
+  const pending=refillProjects({...f.options,signal:abort.signal});
+  await f.waitStarted;abort.abort(new Error('old stop'));await assert.rejects(pending);
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  const before=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  const priorSession=generationEventState(f.state.db).queryEvents(before.id,{types:['curriculum-session']})[0].data.session;
+  f.unpause();const specs=await refillProjects(f.options);
+  assert.equal(specs[0].id,before.id);assert.equal(specs[0].phase,'phase1');
+  const after=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(before.id).data);
+  assert.equal(after.campaign_entry,null);assert.equal(after.seconds,before.seconds);
+  assert.ok(after.elapsed>=before.elapsed);
+  const sessions=generationEventState(f.state.db).queryEvents(before.id,{types:['curriculum-session']});
+  assert.equal(sessions.length,2);assert.ok(sessions.every(s=>s.data.session===priorSession));
+  assert.ok(sessions[1].data.elapsed_seconds>0);
+});
+
+test('old ready phase1 drafts are returned without replacement or budget reset, never adopted by a plan',async t=>{
+  const f=await fixture(t),specs=await refillProjects(f.options);
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  const before=f.state.db.prepare('SELECT data FROM generation_drafts ORDER BY rowid').all().map(r=>JSON.parse(r.data));
+  const requests=f.requests.length;
+  const resumed=await refillProjects(f.options);
+  assert.deepEqual(resumed.map(s=>s.id),specs.map(s=>s.id));assert.equal(f.requests.length,requests);
+  const after=f.state.db.prepare('SELECT data FROM generation_drafts ORDER BY rowid').all().map(r=>JSON.parse(r.data));
+  assert.deepEqual(after,before.map(d=>({...d,phase:'phase1',campaign_entry:null})));
+  // The same unscoped stored shape is ambiguous once a campaign plan exists.
+  f.state.db.prepare("UPDATE generation_drafts SET data=json_remove(data,'$.phase','$.campaign_entry')").run();
+  campaign(f,'phase1',1);
+  const planned=await refillProjects(f.options);
+  assert.equal(planned.length,1);assert.ok(!specs.some(s=>s.id===planned[0].id));
+  for(const spec of specs)assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).phase,undefined);
+});

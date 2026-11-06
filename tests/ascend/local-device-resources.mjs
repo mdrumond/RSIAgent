@@ -7,6 +7,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
 import {createEnvironmentTools} from '../../integrations/environments/index.mjs';
 import {State} from '../../controller/state.mjs';
+import {ActorClock} from '../../controller/budget.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {setup,rows,until as driverUntil} from './driver_setup.mjs';
 import {execFile} from 'node:child_process';
@@ -39,15 +40,15 @@ print(text[q])
     health:{product:'a5',chip:null,query_timeout_seconds:.5}};
   async function bind(resource,extra={},path=join(root,'instance-'+sequence++)){
     const events=[],handles=new Set();let depth=0;
-    const context={instancePath:path,resource,signal:extra.signal,
+    const context={instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
-        return {state:'completed',profiles:[{target:'local-fixture',devices:enabled.map(id=>({id,enabled:true}))}]};},
-      exclude:async(_label,fn)=>{depth++;try{return await fn();}finally{depth--;}},
+        return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
+      exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
       event:async(type,data)=>{
         events.push({type,data});
         if(type==='execution-handle'){
           handles.add(data.handle);assert.match(data.handle,/^local:exec-/);
-          assert.equal(depth>0,data.purpose==='resource-health');
+          assert.equal(depth>0,['resource-health','device-lease-control'].includes(data.purpose));
         }
       }};
     const environment=await createEnvironment({...options,...extra,health:{...options.health,...extra.health}},context);
@@ -59,6 +60,10 @@ print(text[q])
     finally{try{for(const close of closers)await close();}finally{await rm(root,{recursive:true,force:true});}}
   });
   return {root,source,rows,options,calls,update,bind,onClose:fn=>closers.push(fn),setEnabled:ids=>{enabled=ids;}};
+}
+
+async function dead(pid){
+  await until(async()=>{try{const stat=await readFile('/proc/'+pid+'/stat','utf8');return ['Z','X'].includes(stat.slice(stat.lastIndexOf(')')+2).split(' ')[0]);}catch(error){if(error.code==='ENOENT')return true;throw error;}});
 }
 
 test('two native local devices overlap with distinct masks and a third waits for the existing lease',{timeout:30000},async t=>{
@@ -79,71 +84,70 @@ test('two native local devices overlap with distinct masks and a third waits for
   void runA.catch(()=>{});void runB.catch(()=>{});
   await until(async()=>await exists(join(f.source,'0.started'))&&await exists(join(f.source,'1.started')));
   assert.equal(doneB,false);assert.equal(state.db.prepare('SELECT count(*) AS n FROM attempts').get().n,2);
-  await writeFile(join(f.source,'0.release'),'release');const resultA=await runA;
+  const selectedA=first.events.find(e=>e.type==='device-lease-acquired').data.physicalDevice;
+  const selectedB=1-selectedA;
+  await writeFile(join(f.source,selectedA+'.release'),'release');const resultA=await runA;
   assert.equal(resultA.exitCode,0);assert.equal((await first.environment.observe(resultA.handle)).state,'stopped');
   state.finish(a.attempt.id,'passed');state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(a.attempt.id);
   const third=queue.claim('c',1,owner,resources[0].id),thirdEnv=await f.bind(resources[0]);
   await thirdEnv.environment.prepare({project:{source:f.source},attempt:third.attempt});
   let outC='';assert.equal((await thirdEnv.environment.execute('printf "%s" "$ASCEND_PHYSICAL_DEVICE"',f.source,{timeout:5,onData:d=>outC+=d})).exitCode,0);
-  assert.equal(outC.trim().split('\n').at(-1),'0');assert.equal(doneB,false);
-  await writeFile(join(f.source,'1.release'),'release');assert.equal((await runB).exitCode,0);
-  assert.equal(JSON.parse(outA.trim().split('\n').at(-1)).physical,'0');assert.equal(JSON.parse(outB.trim().split('\n').at(-1)).physical,'1');
+  assert.equal(outC.trim().split('\n').at(-1),String(selectedA));assert.equal(doneB,false);
+  await writeFile(join(f.source,selectedB+'.release'),'release');assert.equal((await runB).exitCode,0);
+  assert.equal(JSON.parse(outA.trim().split('\n').at(-1)).physical,String(selectedA));assert.equal(JSON.parse(outB.trim().split('\n').at(-1)).physical,String(selectedB));
   assert.ok(f.calls.every(args=>args[0]==='npu'));
 });
 
 test('local health uses the real parser and bounded per-device queries; policy and timing stay strict',{timeout:60000},async t=>{
   const f=await fixture(t);Object.assign(f.rows,{1:{status:'ALARM'},2:{busy:true,memory:49},3:{faults:1},4:{hang:true},5:{}});
   f.setEnabled([0,1,2,3,4]);await f.update();
-  const ordinary=await f.bind(),rows=await ordinary.environment.resources();
+  const ordinary=await f.bind(),rows=await ordinary.environment.inspectDevices();
   assert.deepEqual(rows.filter(r=>r.available).map(r=>r.metadata.physicalDevice),[0]);
   assert.ok(rows.find(r=>r.metadata.physicalDevice===4).metadata.failure);
   const alarm=await f.bind(undefined,{health:{allow_alarm:true}});
-  assert.deepEqual((await alarm.environment.resources()).filter(r=>r.available).map(r=>r.metadata.physicalDevice),[0,1]);
-  assert.deepEqual((await alarm.environment.resources({purpose:'profiling'})).filter(r=>r.available).map(r=>r.metadata.physicalDevice),[0]);
-  const resource=rows[0],bound=await f.bind(resource);f.setEnabled([1]);
-  await assert.rejects(bound.environment.execute('must-not-run',f.source),/not enabled/);
+  assert.deepEqual((await alarm.environment.inspectDevices()).filter(r=>r.available).map(r=>r.metadata.physicalDevice),[0,1]);
+  assert.deepEqual((await alarm.environment.inspectDevices({purpose:'profiling'})).filter(r=>r.available).map(r=>r.metadata.physicalDevice),[0]);
+  const resource=rows[0],bound=await f.bind(resource);f.setEnabled([]);
+  await assert.rejects(bound.environment.execute('must-not-run',f.source),/No enabled/);
   assert.equal(bound.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
   assert.ok(f.calls.every(args=>args[0]==='npu'));
 });
 
-test('local pre-execution admission rechecks health and rejects raw physical IDs',{timeout:20000},async t=>{
-  const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0],bound=await f.bind(row);
-  f.rows[0].busy=true;await f.update();await assert.rejects(bound.environment.execute('must-not-run',f.source),/admission refused/);
+test('local command selects a new idle device after earlier attempt assignment',async t=>{
+  const f=await fixture(t),inventory=await f.bind(),slot=(await inventory.environment.resources())[0];
+  assert.equal(slot.env,undefined);assert.equal(slot.metadata.kind,'host-slot');
+  const bound=await f.bind(slot);
+  for(const physical of [0,1]){
+    if(physical){f.rows[0].busy=true;await f.update();}
+    let output='';
+    const result=await bound.environment.execute('printf "%s" "$ASCEND_PHYSICAL_DEVICE"',f.source,{timeout:5,onData:d=>output+=d});
+    assert.equal(result.exitCode,0);assert.equal(output,String(physical));
+  }
   await assert.rejects(createEnvironment({...f.options,runtime:undefined},{}),/registered runtime/);
-  const raw=await f.bind('0');await assert.rejects(raw.environment.execute('must-not-run',f.source),/not enabled/);
-  assert.equal(bound.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
 });
 
-test('local terminal health refusal retains closure and permits a later explicit healthy call', async t => {
-  const f = await fixture(t), inventory = await f.bind();
-  const lease = (await inventory.environment.resources())[0], bound = await f.bind(lease);
-  f.rows[0].busy = true; await f.update();
-  await assert.rejects(bound.environment.execute('touch forbidden-payload', f.source), error => {
-    assert.equal(error.code, 'SETUP_CLOSED');
-    assert.equal(error.closure.closed, true); assert.equal(error.closure.payloadStarted, false);
-    const probe = bound.events.find(e => e.type === 'resource-probe-completed');
-    assert.deepEqual(error.closure.handles, [probe.data.handle]);
-    assert.equal(error.closure.reason.row.admitted, false);
-    assert.equal(error.closure.reason.physicalDevice, 0);
-    assert.equal(error.closure.reason.policy, 'health-admission-refused');
-    return true;
-  });
-  assert.equal(await exists(join(f.source,'forbidden-payload')), false);
-  assert.equal(bound.events.some(e => e.type === 'execution-handle' && !e.data.purpose), false);
-  for (const handle of bound.handles) assert.equal((await bound.environment.observe(handle)).state, 'stopped');
-  f.rows[0].busy = false; await f.update();
-  const result = await bound.environment.execute('touch explicit-payload', f.source, {timeout:5});
-  assert.equal(result.exitCode, 0); assert.equal(result.settled, true);
-  assert.equal(await exists(join(f.source,'explicit-payload')), true);
+ test('no idle device queues without payload, cancellation retains positive probe closure',async t=>{
+  const f=await fixture(t);f.rows[0].busy=f.rows[1].busy=true;await f.update();
+  const abort=new AbortController(),bound=await f.bind(undefined,{signal:abort.signal});
+  const pending=bound.environment.execute('touch forbidden-payload',f.source,{signal:abort.signal,timeout:5});
+  void pending.catch(()=>{});
+  await until(()=>bound.events.some(e=>e.type==='resource-probe-completed'));
+  abort.abort();await assert.rejects(pending);
+  assert.equal(await exists(join(f.source,'forbidden-payload')),false);
+  assert.equal(bound.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
+  for(const handle of bound.handles)assert.equal((await bound.environment.observe(handle)).state,'stopped');
 });
 
 test('STOP closes native local work; fresh binding observes the same handle without replay',{timeout:20000},async t=>{
   const f=await fixture(t),inventory=await f.bind(),row=(await inventory.environment.resources())[0],abort=new AbortController();
   const bound=await f.bind(row,{signal:abort.signal});let handle;
-  const run=bound.environment.execute('python3 -c '+quote("from pathlib import Path; import time; Path('started').touch(); time.sleep(30)"),f.source,{signal:abort.signal,timeout:10});
+  const run=bound.environment.execute('python3 -c '+quote("from pathlib import Path; import time; Path('started').write_text(str(__import__('os').getpid())); time.sleep(30)"),f.source,{signal:abort.signal,timeout:10});
   void run.catch(()=>{});await until(()=>exists(join(f.source,'started')));
   handle=bound.events.find(e=>e.type==='execution-handle'&&!e.data.purpose).data.handle;abort.abort();
   assert.equal((await run).settled,true);
+  const pid=Number(await readFile(join(f.source,'started'),'utf8'));await dead(pid);
+  const reused=await f.bind(row,{},bound.path);
+  assert.equal((await reused.environment.execute('true',f.source,{timeout:5})).settled,true);
   const resumed=await f.bind(row,{},bound.path);assert.equal((await resumed.environment.observe(handle)).state,'stopped');
   assert.equal(resumed.events.some(e=>e.type==='execution-handle'&&!e.data.purpose),false);
   assert.ok(bound.events.some(e=>e.type==='resource-probe-completed'&&e.data.accountingExcluded&&e.data.executionSeconds===0));
@@ -155,7 +159,7 @@ test('local pending probe without native identity stays held on restart, never r
   const [name]=await readdir(root),pending=join(root,name,'pending.json');
   await writeFile(pending,JSON.stringify({submission:'unknown',handle:null}));
   const restarted=await f.bind(undefined,{},bound.path);
-  await assert.rejects(restarted.environment.resources(),/identity unknown/);
+  await assert.rejects(restarted.environment.inspectDevices(),/identity unknown/);
   assert.equal(restarted.events.some(e=>e.type==='execution-handle'),false);
   const state=new State(join(f.root,'held.sqlite'));f.onClose(()=>state.close());state.add({id:'held',goal:'proof',source:f.source,actor_seconds:30});
   const a=state.admit('held',await processIdentity());state.event(a.id,'execution-starting',{operation:'unknown'});
@@ -178,16 +182,10 @@ test('public CLI auto scheduler overlaps two masks and admits third only after f
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/ascend.mjs';
 import {createBashTool} from '@earendil-works/pi-coding-agent';
 export async function createEnvironment(options,context){
- const environment=await base(options,{...context,client:async args=>{
+ const environment=await base(options,{...context,leaseDirectory:${JSON.stringify(join(gate,'leases'))},client:async args=>{
   if(args[0]!=='npu')throw Error('Unexpected local transport operation');
-  return {state:'completed',profiles:[{target:options.target,devices:[0,1].map(id=>({id,enabled:true}))}]};
+  return {state:'completed',profiles:[{target:options.target,pool:${JSON.stringify(gate)},devices:[0,1].map(id=>({id,enabled:true}))}]};
  }});
- if(context.resource?.env&&context.instancePath.includes('/attempts/')){
-  const file=${JSON.stringify(gate)}+'/'+context.instancePath.split('/').at(-1)+'.native-mask';
-  const shellQuote=${quote.toString()};
-  const code='import os,json; from pathlib import Path; Path('+JSON.stringify(file)+').write_text(json.dumps({k:os.environ[k] for k in ["ASCEND_PHYSICAL_DEVICE","ASCEND_RT_VISIBLE_DEVICES","ASCEND_VISIBLE_DEVICES"]}))';
-  await createBashTool(context.instancePath).execute('worker-native-mask',{command:'python3 -c '+shellQuote(code),timeout:5});
- }
  return {...environment,execute:(command,cwd,opts)=>environment.execute(command.includes('holding execution')?
  'python3 -c '+${JSON.stringify(quote(payload))}:command,cwd,{...opts,env:{...opts.env,FIXTURE_ATTEMPT:context.instancePath.split('/').at(-1)}})};
 }
@@ -196,12 +194,17 @@ export async function createEnvironment(options,context){
   const {stdout}=await promisify(execFile)(config.python,['-c','import sys;print(sys.executable)']);
   const python=stdout.trim(),wrapper=join(driver.root,'hold-finalizer');
   await writeFile(wrapper,`#!${python}
-import os,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
 root=Path(${JSON.stringify(gate)})
-if sys.argv[1:3]==['-m','ascend_tools.kdb_client'] and '--attempt' in sys.argv and (root/'hold-attempt').exists() and sys.argv[sys.argv.index('--attempt')+1]==(root/'hold-attempt').read_text():
- (root/'finalizer-entered').touch()
- while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+# Storage memory publication passes the actual MCP request on stdin.
+if sys.argv[1:2]==['-c'] and 'from ascend_tools.kdb_client import invoke' in sys.argv[2]:
+ data=sys.stdin.buffer.read()
+ request=json.loads(data)
+ if request.get('tool')=='stage_memory_revision' and (root/'hold-attempt').exists() and request.get('attempt')==(root/'hold-attempt').read_text():
+  (root/'finalizer-entered').touch()
+  while not (root/'finalizer-release').exists() and not (root/'release-all').exists(): time.sleep(.01)
+ sys.exit(subprocess.run([${JSON.stringify(python)},*sys.argv[1:]],input=data).returncode)
 os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
 `,{mode:0o700});
   const patch=join(driver.root,'local-config.json');
@@ -215,12 +218,9 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   const pair=rows(driver.root,'SELECT * FROM attempts ORDER BY rowid');
   const masks=await Promise.all(pair.map(async a=>JSON.parse(await readFile(join(gate,a.id+'.started'),'utf8'))));
   assert.deepEqual(new Set(masks.map(m=>m.physical)),new Set(['0','1']));
-  for(const [i,a] of pair.entries()){
-    const native=JSON.parse(await readFile(join(gate,a.id+'.native-mask'),'utf8'));
+  for(const a of pair){
     const job=JSON.parse(await readFile(join(driver.root,'attempts',a.id,'job.json'),'utf8'));
-    for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES']){
-      assert.equal(native[key],masks[i].physical);assert.equal(job.resource.env[key],native[key]);
-    }
+    assert.equal(job.resource.env,undefined);assert.equal(job.resource.metadata.kind,'host-slot');
   }
   assert.equal(rows(driver.root,'SELECT * FROM resource_leases').length,2);
   await writeFile(join(gate,'hold-attempt'),pair[0].id);await writeFile(join(gate,pair[0].id+'.release'),'release');
@@ -235,8 +235,6 @@ os.execv(${JSON.stringify(python)},[${JSON.stringify(python)},*sys.argv[1:]])
   assert.equal(await ownerStopped(first.owner),true);
   const third=rows(driver.root,"SELECT * FROM attempts WHERE project='third'")[0];
   assert.equal(JSON.parse(await readFile(join(gate,third.id+'.started'),'utf8')).physical,masks[0].physical);
-  const thirdNative=JSON.parse(await readFile(join(gate,third.id+'.native-mask'),'utf8'));
-  for(const key of ['ASCEND_PHYSICAL_DEVICE','ASCEND_RT_VISIBLE_DEVICES','ASCEND_VISIBLE_DEVICES'])assert.equal(thirdNative[key],masks[0].physical);
   await writeFile(join(gate,'release-all'),'release');await wave.output;
   const finished=rows(driver.root,'SELECT * FROM attempts');assert.equal(finished.length,3);
   assert.ok(finished.every(a=>a.outcome==='passed'));assert.equal(rows(driver.root,'SELECT * FROM resource_leases').length,0);
@@ -265,4 +263,32 @@ test('native target tool filters inherited env but retains session identity and 
   assert.equal(explicit.exitCode,0);const direct=JSON.parse(output.trim().split('\n').at(-1));
   assert.equal(direct.CANN_HOME,'explicit-cann');assert.equal(direct.UNIQUE_CALL,'explicit');assert.equal(direct.PI_SESSION_ID,'direct-session');
   assert.equal(direct.PATH,runtime.PATH);assert.equal(direct.ASCEND_PHYSICAL_DEVICE,'0');
+});
+
+for(const mode of ['timeout','ordinary-background'])test(`native ${mode} proves actual payload PID death before device reuse`,{timeout:20000},async t=>{
+  const f=await fixture(t);f.setEnabled([0]);const bound=await f.bind();
+  const command=mode==='timeout'?'python3 -c '+quote("import os,time; from pathlib import Path; Path('pid').write_text(str(os.getpid())); time.sleep(30)"):'sleep 30 & echo $! > pid';
+  const result=await bound.environment.execute(command,f.source,{timeout:mode==='timeout'?1:5});
+  assert.equal(result.settled,true);await dead(Number(await readFile(join(f.source,'pid'),'utf8')));
+  assert.equal((await bound.environment.execute('true',f.source,{timeout:5})).settled,true);
+});
+
+test('target contention retries only structured nonadmission; payload exit 126 executes once',{timeout:20000},async t=>{
+  const f=await fixture(t);f.setEnabled([0]);const first=await f.bind(),second=await f.bind();
+  let now=0;const clock=new ActorClock(30,0,()=>now);
+  second.environment=await createEnvironment(f.options,{...second.context,leaseDirectory:join(f.root,'different-controller'),
+    exclude:(label,fn)=>clock.exclude(label,()=>second.context.exclude(label,async()=>{if(label==='admission')now+=1000;return fn();}))});
+  const holding=first.environment.execute('touch started; while [ ! -f release ]; do sleep .01; done',f.source,{timeout:10});
+  void holding.catch(()=>{});await until(()=>exists(join(f.source,'started')));
+  const next=second.environment.execute('echo ran >> invocations; exit 126',f.source,{timeout:5});void next.catch(()=>{});
+  await until(()=>second.events.filter(e=>e.type==='device-lease-acquired').length>=2);
+  assert.equal(await exists(join(f.source,'invocations')),false);
+  await writeFile(join(f.source,'release'),'go');const held=await holding;
+  // A competing controller may briefly hold the target cleanup lock.
+  // Reconcile the same completed handle before releasing its controller lease.
+  await until(()=>first.environment.reconcileLease());
+  assert.equal((await first.environment.observe(held.handle)).state,'stopped');
+  const result=await next;assert.equal(result.exitCode,126);assert.equal(result.admission.decision,'admitted');
+  assert.equal(await readFile(join(f.source,'invocations'),'utf8'),'ran\n');
+  assert.equal(clock.elapsed,1,'confirmed contention refunded; genuine payload 126 charged');
 });

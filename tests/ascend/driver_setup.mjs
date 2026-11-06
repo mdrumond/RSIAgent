@@ -1,3 +1,4 @@
+import {portableCli} from './portable-cli.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -22,7 +23,7 @@ export async function until(check,timeout=15000) {
   while (Date.now()<end) {const value=await check();if(value)return value;await delay(50);}
   throw new Error('Timed out waiting for observable driver transition');
 }
-export async function setup(t,scenario,ids,{install=true}={}) {
+export async function setup(t,scenario,ids,{install=false}={}) {
   const root = await mkdtemp(join(process.env.DRIVER_ARTIFACTS ?? tmpdir(),'driver-acceptance-'));
   const instance = join(root,'instance'), server = await provider(scenario,{nativeSession:async()=>
     rows(instance,'SELECT session FROM attempts WHERE session IS NOT NULL ORDER BY rowid DESC LIMIT 1')[0]?.session});
@@ -53,6 +54,18 @@ export async function setup(t,scenario,ids,{install=true}={}) {
         return !owner || await ownerStopped(owner);
       },5000);
     }catch(error){t.diagnostic(`Controller cleanup retained for inspection: ${error.message}`);}
+    // Scheduler shutdown only submits final compression. Its detached request
+    // owns files in this fixture until the request process has also exited.
+    // On timeout leave the tree intact and fail cleanup rather than racing rm.
+    await until(async()=>{
+      if(!rows(instance,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
+      const storage=rows(instance,"SELECT status,owner FROM requests WHERE kind='storage'");
+      for(const request of storage) {
+        if(['queued','running'].includes(request.status))return false;
+        if(request.owner && !await ownerStopped(request.owner))return false;
+      }
+      return true;
+    });
     try {
       const receipt=JSON.parse(await readFile(join(instance,'knowledge-service.json'),'utf8'));
       if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
@@ -82,7 +95,7 @@ export async function setup(t,scenario,ids,{install=true}={}) {
   const input=join(root,'bootstrap.json');await writeFile(input,JSON.stringify(config));
   const boot=execute(process.execPath,[cli,'bootstrap',instance,'--config',input]);await boot.output;
   if(!install)await symlink(resolve('node_modules'),join(instance,'machinery','node_modules'),'dir');
-  cli=join(instance,'machinery','cli','main.mjs');
+  cli=await portableCli(join(instance,'machinery','cli','main.mjs'),root);
   // Install only the configurable test embedding module, never replace runtime code.
   await cp(fixture,join(instance,'machinery','ascend_tools','fixture_embeddings.py'));
   const settings=join(root,'settings.json');await writeFile(settings,JSON.stringify({python,

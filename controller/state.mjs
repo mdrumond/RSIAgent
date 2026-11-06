@@ -126,6 +126,11 @@ export class State {
       const attempt = this.attempt(id);
       if (!attempt || attempt.outcome) throw new Error('Attempt already closed');
       this.db.prepare('UPDATE attempts SET outcome=? WHERE id=?').run(outcome,id);
+      // Failure is factual, but detached execution still needs a closure proof.
+      // Empty execution ledgers preserve the no-execution finish API.
+      if(outcome==='failed' && this.queryEvents(id,{types:['execution-starting',
+        'execution-submitting','execution-unresolved','execution-handle','native-bash-started'],limit:1}).length)
+        this.event(id,'failure-settlement',{closed:false});
       if(settleProject)this.db.prepare('UPDATE projects SET status=? WHERE id=?').run(outcome,attempt.project);
       this.db.exec('COMMIT');
     } catch(error) { this.db.exec('ROLLBACK'); throw error; }

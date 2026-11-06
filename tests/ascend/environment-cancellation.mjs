@@ -104,11 +104,11 @@ export const createEnvironment=async(_options,context)=>({resources:async()=>{
   await writeFile(join(f.root,'instance.json'),JSON.stringify(config));
   const cli=new URL('../../cli/main.mjs',import.meta.url).pathname,exec=promisify(execFile);
   const wave=exec(process.execPath,[cli,'wave','--instance',f.root],{timeout:12000});
-  const stopped=assert.rejects(wave,/Wave interrupted|abort/i);
   const deadline=performance.now()+5000;
   for(;;){try{await readFile(marker);break;}catch(error){if(error.code!=='ENOENT')throw error;}
     assert.ok(performance.now()<deadline);await delay(10);}
-  await exec(process.execPath,[cli,'stop','--instance',f.root]);await stopped;
+  await exec(process.execPath,[cli,'stop','--instance',f.root]);
+  assert.deepEqual(JSON.parse((await wave).stdout.trim()).results,[]);
   const state=new State(join(f.root,'state.sqlite'));t.after(()=>state.close());
   assert.equal(JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='owner'").get().value),null);
   assert.equal(state.db.prepare('SELECT count(*) AS n FROM attempts').get().n,0);

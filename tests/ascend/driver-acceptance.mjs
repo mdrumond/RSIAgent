@@ -25,7 +25,9 @@ export async function createEnvironment(options,context){
       const [attempt]=rows(f.root,'SELECT * FROM attempts');
       return attempt?.elapsed>=1 && attempt.session && rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
     });
-    await assert.rejects(campaign(await readConfig(f.root)),/Instance controller is already running/);
+    const beforeConcurrent=rows(f.root,'SELECT id FROM attempts');
+    await assert.rejects(campaign(await readConfig(f.root)));
+    assert.deepEqual(rows(f.root,'SELECT id FROM attempts'),beforeConcurrent);
     await f.run('stop');await wave.output;
     const [interrupted]=rows(f.root,'SELECT * FROM attempts');
     assert.equal(interrupted.outcome,null);
@@ -37,10 +39,11 @@ export async function createEnvironment(options,context){
     await writeFile(settings,JSON.stringify({curriculum:{phase1:['interrupt','unrelated']}}));
     await f.run('config','--config',settings);
     const requests=f.server.requests.length;
-    const result=await f.run('campaign');
-    assert.equal(result.reason,'requires-resume');
-    assert.equal(result.waves[0].results.length,1);
-    assert.equal(result.waves.at(-1).results.length,0);
+    const continuation=f.start('campaign');
+    await until(()=>rows(f.root,"SELECT 1 FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project='unrelated' AND e.type='postprocess-completed'").length);
+    await f.run('pause');
+    const result=await continuation.output;
+    assert.equal(result.reason,'paused');
     const attempts=rows(f.root,'SELECT * FROM attempts');
     assert.equal(attempts.length,2);
     assert.deepEqual(attempts.find(row=>row.id===interrupted.id),interrupted);
@@ -86,7 +89,7 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
     assert.equal(status.attempts.filter(a=>a.project==='recover').length,3);
     assert.equal(status.attempts.find(a=>a.id===original.id).outcome,'failed');
     assert.deepEqual(JSON.parse(rows(f.root,"SELECT spec FROM projects WHERE id='recover'")[0].spec),frozen);
-    const kinds=rows(f.root,"SELECT DISTINCT kind FROM knowledge_scopes WHERE collection LIKE 'lesson-%'",'knowledge.sqlite').map(r=>r.kind);
+    const kinds=rows(f.root,"SELECT DISTINCT s.kind FROM knowledge_scopes s JOIN generation_collections g ON g.collection=s.collection JOIN active_generation a ON a.revision=g.generation",'knowledge.sqlite').map(r=>r.kind);
     assert.deepEqual(kinds.sort(),['good','negative']);
     const lessons=rows(f.root,'SELECT * FROM recovery_lessons');
     assert.ok(lessons.every(row=>row.recorded===1));
@@ -99,8 +102,8 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
       assert.ok(verifierFiles.includes(evidence) || evidence===nativeFile);
       assert.ok((await readFile(evidence,'utf8')).length>0);
     }
-    const delivered=rows(f.root,"SELECT * FROM knowledge_events WHERE operation='record_lesson'",'knowledge.sqlite');
-    assert.equal(new Set(delivered.map(e=>e.attempt_id)).size,4);
+    const delivered=rows(f.root,"SELECT DISTINCT json_extract(c.text,'$.delivery_id') AS delivery FROM chunks c JOIN generation_collections g ON g.collection=c.collection JOIN active_generation a ON a.revision=g.generation",'knowledge.sqlite');
+    assert.equal(new Set(delivered.map(e=>e.delivery)).size,lessons.length);
     for(const attempt of status.attempts.filter(a=>a.outcome==='passed')) {
       const events=rows(f.root,`SELECT type,data FROM events WHERE attempt='${attempt.id}'`);
       assert.equal(events.filter(e=>e.type==='stage-completed').length,8);
@@ -114,13 +117,25 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
 
 test('CLI freezes at the configured unsuccessful recovery-round limit', {timeout:120000},async t=>{
   const f=await setup(t,'freeze',['freeze']);
-  const campaign=await f.run('campaign','--detach');
-  assert.equal(campaign.submitted,true);
-  await until(async()=>(await f.run('status')).projects.find(p=>p.id==='freeze')?.frozen===1);
+  const campaign=f.start('campaign');
+  let observed;
+  try {
+    // Three native workflows must settle within the outer 120s test allocation.
+    await until(async()=>{
+      observed=await f.run('status');
+      return observed.projects.find(p=>p.id==='freeze')?.frozen===1;
+    },90000);
+  }catch(error){
+    t.diagnostic(JSON.stringify({project:observed?.projects.find(p=>p.id==='freeze'),
+      attempts:observed?.attempts,recentEvents:rows(f.root,
+        'SELECT sequence,attempt,type FROM events ORDER BY sequence DESC LIMIT 5')}));
+    throw error;
+  }
   await until(()=>{
     const owner=rows(f.root,"SELECT value FROM control WHERE key='owner'")[0];
     return owner && JSON.parse(owner.value)===null;
   });
+  await campaign.output;
   const status=await f.run('status');
   assert.equal(status.projects[0].status,'failed');assert.equal(status.projects[0].frozen,1);
   assert.equal(status.attempts.length,3);
@@ -156,7 +171,7 @@ test('CLI stop/resume preserves the interrupted attempt, native session and rema
 
 
 test('resource discovery failure waits for an already launched worker before releasing ownership',{timeout:120000},async t=>{
-  const f=await setup(t,'recover',['first','second']);
+  const f=await setup(t,'interrupt',['first','second']);
   const module=join(f.root,'machinery','failing-resources.mjs');
   await writeFile(module,`import {createEnvironment as base} from './integrations/environments/index.mjs';
 import {writeFile,readFile} from 'node:fs/promises';
@@ -173,7 +188,15 @@ export async function createEnvironment(options,context){
   const action=join(f.root,'scheduler-input.json');
   await writeFile(action,JSON.stringify({concurrency:2,environment:{module:'machinery/failing-resources.mjs',options:{gate:join(f.root,'worker-ready')}}}));
   await f.run('config','--config',action);
-  await assert.rejects(f.run('wave'));
+  const wave=f.start('wave');
+  await until(()=>{
+    if(!rows(f.root,"SELECT 1 FROM sqlite_master WHERE name='control'").length)return false;
+    const value=rows(f.root,"SELECT value FROM control WHERE key='wait'")[0]?.value;
+    return value&&JSON.parse(value)?.reason==='resources'&&rows(f.root,"SELECT 1 FROM events WHERE type='execution-handle'").length;
+  });
+  assert.equal(rows(f.root,'SELECT * FROM attempts').length,1);
+  assert.equal(await ownerStopped(rows(f.root,'SELECT * FROM attempts')[0].owner),false);
+  await f.run('stop');await wave.output;
   const attempts=rows(f.root,'SELECT * FROM attempts');assert.equal(attempts.length,1);
   assert.equal(await ownerStopped(attempts[0].owner),true);
   assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='owner'")[0].value),null);

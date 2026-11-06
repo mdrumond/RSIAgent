@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm,copyFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -224,6 +224,10 @@ export async function createEnvironment(options, context) {
       if (receipt) { executionReceipts.set(handle, receipt); break; }
     }
     if (receipt?.timingKey && receipt.spool) {
+      if(receipt.admissionToken){
+        const admission=await readAdmission(handle,{signal});
+        if(admission?.token===receipt.admissionToken&&admission.decision==='contended')return {executionSeconds:0,accountingExcluded:true};
+      }
       const path = join(receipt.dir, 'timing.json');
       try {
         let timing;
@@ -344,6 +348,7 @@ export async function createEnvironment(options, context) {
     if (!remote) {
       handle = `local:${dir.slice(dir.lastIndexOf('/') + 1)}`;
       await save(join(dir, 'execution.json'), { boot: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(), cwd });
+      if (opts.leaseReceipt) opts = {...opts, env:{...opts.env, RSI_LEASE_RECEIPT:join(dir,'admission.json')}};
       await event('execution-handle', { handle });
       const wrapper = `cat /proc/$$/stat > ${quote(join(dir, 'identity.tmp'))}\nmv ${quote(join(dir, 'identity.tmp'))} ${quote(join(dir, 'identity'))}\n` +
         `trap ${quote(`code=$?; printf "%s" "$code" > ${quote(join(dir, 'exit.tmp'))}; mv ${quote(join(dir, 'exit.tmp'))} ${quote(join(dir, 'exit'))}`)} EXIT\nbash -c ${quote(command)}`;
@@ -428,13 +433,14 @@ export async function createEnvironment(options, context) {
     const timingKey = randomUUID();
     const configuration = { command, timingKey, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
       spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
+    if (opts.leaseReceipt) configuration.env.RSI_LEASE_RECEIPT = posix.join(configuration.spool,'admission.json');
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
     await writeFile(script, `${quote(options.python ?? 'python3')} -c ${quote(supervisor)} ${quote(JSON.stringify(configuration))}\n`, { mode: 0o600 });
     const args = ['run', options.target, '--file', script, '--receipt-file', receipt];
     if (options.runtime) args.push('--runtime', options.runtime);
     if (opts.resourceId !== undefined) args.push('--npu', String(opts.resourceId));
-    const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, cwd: configuration.cwd };
+    const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, admissionToken:opts.admissionToken, cwd: configuration.cwd };
     await save(join(dir, 'execution.json'), receiptData);
     const submitted = await submit(args, receipt, false, false, signal);
     handle = submitted.handle;
@@ -466,6 +472,25 @@ export async function createEnvironment(options, context) {
     }
     return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped',
       ...(state.executionSeconds === undefined ? { accountingUnresolved: true } : { executionSeconds: state.executionSeconds }) };
+  }
+  // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
+  async function readAdmission(handle, {signal = context.signal} = {}) {
+    check(handle);
+    let dir = !remote ? join(root,handle.slice(6)) : null, execution;
+    if (remote) for (const name of await readdir(root)) {
+      const candidate=join(root,name);
+      try {
+        const row=await json(join(candidate,'execution.json'));
+        const id=row.handle ?? (row.receiptFile ? (await json(row.receiptFile)).handle : null);
+        if(id===handle){dir=candidate;execution=row;break;}
+      } catch { /* unrelated execution */ }
+    }
+    if(!dir) return null;
+    const path=join(dir,'admission.json');
+    try {
+      if(remote) await exclude('transfer',()=>transfer(['download',options.target,posix.join(execution.spool,'admission.json'),path],dir,signal));
+      return await json(path);
+    } catch { return null; }
   }
   async function reconcileOperation({ operation, events }) {
     const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
@@ -545,7 +570,7 @@ export async function createEnvironment(options, context) {
     } catch { return false; }
   }
   return {
-    instructions, execute, observe, stop, reconcileOperation,
+    instructions, execute, observe, stop, reconcileOperation, readAdmission,
     ...(remote ? { canUpgrade } : {}),
     async prepare({ project, attempt }) {
       return exclude('setup', async () => {
@@ -586,6 +611,16 @@ export async function createEnvironment(options, context) {
       const dir = await mkdtemp(join(root, 'download-'));
       return exclude('transfer', () => transfer(['download', options.target, path, join(dir, 'content')], dir));
     },
+    async collectArtifact(source,destination) {
+      return exclude('transfer',async()=>{
+        if(!remote)await copyFile(source,destination);
+        else {
+          const directory=await mkdtemp(join(root,'collect-'));
+          await transfer(['download',options.target,source,destination],directory,context.signal);
+        }
+        return destination;
+      });
+    },
   };
 }
 
@@ -597,7 +632,10 @@ export async function createEnvironmentTools(environment, cwd, sdk) {
     if (!result.settled) throw new Error(`Execution remains unresolved: ${result.handle}`);
     return result;
   } } });
-  return [{...tool,name:'rsi_target',label:'Run target command',
-    description:'Execute a command in the configured target environment. Remote targets use an execution snapshot; use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'}];
+  const target={...tool,name:'rsi_target',label:'Run target command',
+    description:'Execute a command in the configured target environment. Remote targets use an execution snapshot; use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'};
+  // On a device host, override Pi's Bash tool through its supported extension
+  // API. Both shell names must pass through the same admission and supervision.
+  return environment.shellOnTarget ? [target,{...tool,name:'bash'}] : [target];
 }
 

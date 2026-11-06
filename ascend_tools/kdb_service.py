@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -75,12 +76,30 @@ def create_server(backend_factory, *, port=8765):
                 else os.environ.get('ASCEND_ATTEMPT_ID'))
 
     def invoke_backend(attempt_id, operation, args):
+        if operation in ('search', 'read_entry') and args.get('generation') is None and attempt_id:
+            # Native Pi MCP calls and workflow wrappers share the same pinned view.
+            state_path = getattr(getattr(backend, 'db', None), 'path', None)
+            if state_path is not None:
+                ledger = Path(state_path).parent / 'state.sqlite'
+                if ledger.is_file():
+                    with sqlite3.connect(ledger.as_uri() + '?mode=ro', uri=True) as connection:
+                        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='storage_attempts'").fetchone():
+                            row = connection.execute('SELECT knowledge_generation FROM storage_attempts WHERE attempt=?', (attempt_id,)).fetchone()
+                            if row and row[0]:
+                                args = dict(args, generation=row[0])
         try:
             result = getattr(backend, operation)(**args)
         except Exception as exc:
             backend.event(operation, attempt_id, status='failed', error=type(exc).__name__)
             raise
-        backend.event(operation, attempt_id, status='completed', arguments=args,
+        event_args = dict(args)
+        if operation in ('search', 'read_entry') and hasattr(backend, 'current_memory_revision'):
+            event_args['generation'] = args.get('generation') or backend.current_memory_revision()
+        if operation == 'adopt_memory_revision':
+            event_args = {'revision': args['revision'], 'collection_count': len(args['collections'])}
+        if operation == 'stage_memory_revision':
+            event_args = {'revision': args['revision'], 'record_count': len(args['records'])}
+        backend.event(operation, attempt_id, status='completed', arguments=event_args,
                       result_count=len(result) if isinstance(result, list) else 1)
         return result
 
@@ -89,14 +108,16 @@ def create_server(backend_factory, *, port=8765):
 
     @server.tool()
     async def search(query: str, ctx: Context, kind: str = 'all',
-                     target: str | None = None, limit: int = 10) -> list[dict]:
+                     target: str | None = None, limit: int = 10,
+                     generation: str | None = None) -> list[dict]:
         """Search positive/negative source knowledge within a target scope."""
-        return await invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit)
+        return await invoke(ctx, 'search', query=query, kind=kind, target=target, limit=limit,
+                            generation=generation)
 
     @server.tool()
-    async def read_entry(collection: str, entry_id: str, ctx: Context) -> dict[str, Any]:
+    async def read_entry(collection: str, entry_id: str, ctx: Context, generation: str | None = None) -> dict[str, Any]:
         """Read stored chunk text (up to16KiB UTF-8) and direct validated evidence."""
-        return await invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id)
+        return await invoke(ctx, 'read_entry', collection=collection, entry_id=entry_id, generation=generation)
 
     @server.tool()
     async def add_repo(path: str, collection: str, language: str, ctx: Context,
@@ -115,6 +136,21 @@ def create_server(backend_factory, *, port=8765):
             raise ValueError('attempt_id differs from request correlation')
         return await invoke(ctx, 'record_lesson', lesson=lesson, outcome=outcome,
                       applicability=applicability, evidence=evidence, attempt_id=attempt_id)
+
+    @server.tool()
+    async def stage_memory_revision(revision: str, records: list[dict], ctx: Context) -> dict[str, Any]:
+        """Controller publication: index a memory revision without activating it."""
+        return await invoke(ctx, 'stage_memory_revision', revision=revision, records=records)
+
+    @server.tool()
+    async def activate_memory_revision(revision: str, ctx: Context) -> dict[str, Any]:
+        """Controller publication: atomically activate a staged memory revision."""
+        return await invoke(ctx, 'activate_memory_revision', revision=revision)
+
+    @server.tool()
+    async def adopt_memory_revision(revision: str, collections: list[str], ctx: Context) -> dict[str, Any]:
+        """Controller baseline: activate existing indexed lessons without embedding."""
+        return await invoke(ctx, 'adopt_memory_revision', revision=revision, collections=collections)
 
     @server.resource('kdb://knowledge/skill')
     async def skill() -> str:

@@ -74,7 +74,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()
                                 tools = await session.list_tools()
-                                self.assertEqual(len(tools.tools), 4)
+                                self.assertEqual({tool.name for tool in tools.tools},
+                                    {'search', 'read_entry', 'add_repo', 'record_lesson',
+                                     'stage_memory_revision', 'activate_memory_revision', 'adopt_memory_revision'})
                     self.assertFalse(closed.is_set())
                 finally:
                     release.set()
@@ -143,3 +145,33 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await releaser
         self.assertTrue(closed.is_set())
         self.assertEqual(order, ['finished', 'event', 'closed'])
+
+class PinnedGenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_native_search_uses_attempt_generation(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with sqlite3.connect(root / 'state.sqlite') as ledger:
+                ledger.execute('CREATE TABLE storage_attempts(attempt TEXT,knowledge_generation TEXT)')
+                ledger.execute("INSERT INTO storage_attempts VALUES ('actor','frozen-memory')")
+            class Backend:
+                def __init__(self):
+                    self.db = SimpleNamespace(path=root / 'knowledge.sqlite')
+                def search(self, **args):
+                    return [{'text': 'evidence', 'generation': args.get('generation') or 'newly-active'}]
+                def event(self, *args, **kwargs):
+                    pass
+                def close(self):
+                    pass
+            app = create_server(Backend).streamable_http_app()
+            async with app.router.lifespan_context(app):
+                for headers, expected in [({'x-attempt-id': 'actor'}, 'frozen-memory'), ({}, 'newly-active')]:
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), headers=headers) as client:
+                        async with streamable_http_client('http://127.0.0.1:8765/mcp', http_client=client) as (read, write, _):
+                            async with ClientSession(read, write) as session:
+                                await session.initialize()
+                                result = await session.call_tool('search', {'query': 'memory'})
+                                self.assertFalse(result.isError)
+                                self.assertEqual(result.structuredContent['result'][0]['generation'], expected)

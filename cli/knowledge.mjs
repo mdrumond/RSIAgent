@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processIdentity, ownerStopped } from '../controller/lifecycle.mjs';
 import { State } from '../controller/state.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function freePort() {
@@ -44,6 +45,7 @@ export async function ensureKnowledgeService(config,{signal}={}) {
       }
       state.db.exec('BEGIN IMMEDIATE');
       try {
+        await assertPackAvailable(state);
         const current=state.db.prepare('SELECT value FROM control WHERE key=?').get(key);
         if(current?.value!==row?.value){state.db.exec('ROLLBACK');continue;}
         state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run(key,me);
@@ -57,14 +59,14 @@ export async function ensureKnowledgeService(config,{signal}={}) {
         signal?.throwIfAborted();
         const port=await freePort(),url=`http://127.0.0.1:${port}/mcp`;
         await mkdir(join(config.root,'logs'),{recursive:true});
-        const log=await open(join(config.root,'logs','knowledge.log'),'a',0o600);
-        let child;
+        const logPath=join(config.root,'logs','knowledge.log');
+        const args=['-m','ascend_tools.kdb_service','--db',join(config.root,'knowledge.sqlite'),'--port',String(port)];
+        if(config.embedding_factory)args.push('--embedding-factory',config.embedding_factory);
+        if(config.embeddings?.cache_dir)args.push('--embedding-cache',config.embeddings.cache_dir);
+        const env={...process.env,PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)};
+        const log=await open(logPath,'a',0o600);let child;
         try {
-          const args=['-m','ascend_tools.kdb_service','--db',join(config.root,'knowledge.sqlite'),'--port',String(port)];
-          if(config.embedding_factory)args.push('--embedding-factory',config.embedding_factory);
-          if(config.embeddings?.cache_dir)args.push('--embedding-cache',config.embeddings.cache_dir);
-          child=spawn(config.python??'python',args,{cwd:config.root,detached:true,
-            stdio:['ignore',log.fd,log.fd],env:{...process.env,PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)}});
+          child=spawn(config.python??'python',args,{cwd:config.root,detached:true,stdio:['ignore',log.fd,log.fd],env});
           await new Promise((ok,no)=>{child.once('spawn',ok);child.once('error',no);});
         }finally{await log.close();}
         const owner=await processIdentity(child.pid);child.unref();
@@ -92,7 +94,7 @@ export async function run(config,values) {
   return new Promise((ok,no)=>{
     const child=spawn(config.python??'python',args,{env:{...process.env,
       PYTHONPATH:resolve(new URL('..',import.meta.url).pathname)},signal:values.signal,stdio:['ignore','pipe','pipe']});
-    let output='',error='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>error+=d);
+    let output='',error='';child.stdout.on('data',d=>{output+=d;if(output.length>1024*1024){child.kill('SIGTERM');no(new Error('KDB response exceeded output limit'));}});child.stderr.on('data',d=>error=(error+d).slice(-65536));
     child.on('error',no);child.on('close',code=>{if(code)no(new Error(error));else{try{ok(JSON.parse(output));}catch(e){no(e);}}});
   });
 }

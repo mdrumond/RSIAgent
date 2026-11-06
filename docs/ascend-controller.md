@@ -7,7 +7,7 @@ The supported implementation consists of:
 | Path | Responsibility |
 | --- | --- |
 | `controller/` | SQLite current state, admission, elapsed budgets, canonical Pi worker and recovery queue |
-| `cli/` | Bootstrap, configuration, projects, detached wave driver, stop/resume, KDB and tuning actions |
+| `cli/` | Bootstrap, configuration, continuous admission, process lifecycle, pause/resume, KDB and tuning actions |
 | `integrations/environments/` | User-configured local or CPL execution, source synchronization and durable execution handles |
 | `integrations/kdb-extension.mjs` | Native Pi MCP registration, correlated retrieval and bounded evidence |
 | `ascend_tools/` | Python KDB/BGE, shared MCP service, trusted target leaves and thin Flask dashboard |
@@ -30,10 +30,72 @@ Install root Node dependencies and the Python helper package first. Production B
 `embeddings` extra and the pinned model already available in its configured
 cache. No embedding model download or corpus reindex is part of bootstrap.
 
-Environment resource rows may include an `env` map of string values. The CLI applies
-that map only to the selected worker process, preserving the same resource on
-resume and finalization. Local Ascend rows bind all three physical-device masks;
-CPL rows omit them so remote device IDs do not change controller-host masks.
+Ascend scheduler rows represent host worker slots. The Pi execution extension
+selects a fresh idle, permitted physical device for each shell command. Local
+device-host `bash` and `rsi_target` share that admission path. The command keeps
+its device through compilation, execution and profiling; later commands may
+use another device. Server aliases and runtimes share the registered NPU pool.
+Unknown executions retain their reservations until positively reconciled.
+
+## Continuous campaigns
+
+Merge these portable policy settings into the private bootstrap profile:
+
+```json
+{
+  "concurrency": "auto",
+  "failed_recovery_rounds": 5,
+  "pause_grace_seconds": 30,
+  "phase_sequence": ["phase1", "phase2"],
+  "phase_targets": {"phase1": 128},
+  "curriculum": {
+    "phase1": [],
+    "phase2": ["end-to-end-project"],
+    "generation": {
+      "enabled": true,
+      "topics": ["compiler recovery", "numeric debugging", "profiling"],
+      "preprompt": "Use the configured Ascend language and existing repository evidence."
+    }
+  }
+}
+```
+
+Phase 1 and Phase 2 refill their backlogs from the curriculum when generation is enabled.
+Phase 1 constructs microprojects; Phase 2 constructs end-to-end projects with
+declared performance goals preserved as `performance_goal` with
+`verifier.performance_command`. These optional fields are preserved in either phase;
+a non-null goal requires a performance command. CPU construction checks establish
+correctness only and do not execute that performance command. Optional
+`curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override
+`enabled`, `topics`, and `preprompt` for that phase. With a campaign plan, drafts
+are pinned to a phase and entry; older entry drafts and projects cannot fill a
+new batch. Remaining admissions cap staged projects, including pending drafts. Draft construction checks run
+on CPU references and negative controls; rejected checks return to the same Pi
+session for repair within the remaining construction allocation. An optional
+`construction_command` lets these checks differ from the real target verifier.
+Both phases can also consume supplied projects; inference consumes supplied projects. An empty supplied backlog waits
+for input; a completed configured target advances the phase sequence.
+
+A finished original requires a terminal result, settled execution, acknowledged
+memory and completed postprocessing. Failures count; investigations and extra
+retries do not. Recovery investigates smaller gaps and retains negative evidence.
+It uses at most one worker per target; a single available worker admits three
+fresh projects per recovery admission. Reaching the configured unsuccessful
+recovery-round limit freezes the project for operator attention.
+
+`campaign` continuously admits work. `pause` stops admission and pauses actors at
+command boundaries, with a default 30-second grace before cancellation. `resume`
+preserves sessions and elapsed allocations. `stop` requests immediate cancellation.
+Pure device-queue waiting, actor setup and data transfer are excluded from actor
+time; thinking, compilation, execution and profiling are charged. A configured
+campaign elapsed allocation also survives controller restarts.
+
+Public commands run as ordinary Node and Python processes. The CLI starts workers
+and the instance KDB directly; no service-manager provisioning is required.
+After a controller interruption, explicitly invoke `resume` to continue from
+retained state. Native Pi sessions and elapsed allocations remain authoritative.
+Choose an explicit concurrency appropriate to the host and target resources.
+RSI does not install or enforce a shared host memory quota.
 
 A private bootstrap JSON file has this shape; replace the example paths with
 actual private paths before running it:

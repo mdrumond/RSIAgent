@@ -40,13 +40,23 @@ export async function provider(scenario, {nativeSession} = {}) {
       const key = prompt.startsWith('Goal:') ? prompt.split('\n')[0] : prompt;
       if (!count) {
         let plan;
-        if (prompt.startsWith('Read the failed')) {
+        if (prompt.startsWith('Construct ONE fresh original')) {
+          plan=[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
+            tool('write',{path:'source/answer.py',content:'def answer(): return 0\n'}),
+            tool('write',{path:'reference/answer.py',content:'def answer(): return 6 * 7\n'}),
+            tool('write',{path:'negative/answer.py',content:'def answer(): return -1\n'}),
+            tool('write',{path:'verify.py',content:'from answer import answer\nimport sys\nsys.exit(0 if answer()==42 else 1)\n'}),
+            tool('submit_project',{goal:'unrelated generated arithmetic',source:'source',reference:'reference',
+              negative_controls:['negative'],verifier:{files:['verify.py'],command:'PYTHONPATH=. python ../verify.py'}})];
+        } else if (prompt.startsWith('Read the failed')) {
           const verifier = 'import importlib.util\nfrom pathlib import Path\n' +
             'p=Path(__file__).parent/"source"/"answer.py"\n' +
             's=importlib.util.spec_from_file_location("candidate",p)\nm=importlib.util.module_from_spec(s)\n' +
             's.loader.exec_module(m)\nactual=m.answer(); expected=sum(6 for _ in range(7))\n' +
             'print({"actual":actual,"expected":expected},flush=True)\nassert actual==expected\n';
           plan = [tool('write',{path:'verifier.py',content:verifier}),
+            tool('investigation_knowledge',{query:'independent numeric oracle',kind:'good'}),
+            tool('investigation_knowledge',{query:'numeric mismatch recovery',kind:'negative'}),
             tool('submit_investigation',{goal:'SMALL arithmetic observation',
               question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py'})];
         } else if (prompt.startsWith('Inspect the native')) {
@@ -70,7 +80,7 @@ export async function provider(scenario, {nativeSession} = {}) {
           const unrelated = prompt.includes('Goal: unrelated');
           const small = prompt.includes('Goal: SMALL');
           const pass = unrelated || scenario === 'phase2' || scenario === 'interrupt' || (scenario !== 'freeze' && (small || originals++ > 0));
-          plan = workflow({pass,interrupt:scenario === 'interrupt'});
+          plan = workflow({pass,interrupt:scenario === 'interrupt'&&!unrelated});
         } else throw new Error(`Unknown scripted conversation: ${prompt.slice(0,100)}`);
         plans.set(key,plan);
       }

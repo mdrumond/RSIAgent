@@ -9,6 +9,7 @@ import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {investigate,summarize} from '../../cli/curriculum.mjs';
+import {State} from '../../controller/state.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
 
 async function fixture(t,plan) {
@@ -35,20 +36,22 @@ async function fixture(t,plan) {
   t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});
   const config={root,curriculum_seconds:15,actor:{provider:'admission-fixture',model:'scripted',credential_env:key,
     base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
-  const state={events:()=>[],queryEvents:()=>[],attempt:()=>({session:null}),event:()=>{}},bridge={extension:()=>{}};
-  const options={config,path,state,bridge,job:{origin_attempt:'old',attempt:{id:'new'},actor_seconds:120},base:{source,goal:'numeric'}};
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  state.add({id:'p',source,goal:'numeric',actor_seconds:120});
+  const attempt=state.admit('p',{}),bridge={extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}};
+  const options={config,path,state,bridge,job:{origin_attempt:attempt.id,attempt,actor_seconds:120},base:{source,goal:'numeric'}};
   return {root,path,source,options,results:()=>received.at(-1)};
 }
 const proposal={goal:'Check exact numeric answer',question:'Does the implementation return42?',verifier:'verify.py'};
 
 test('native submit rejects missing verifier then accepts write and resubmit in the same session',{timeout:15000},async t=>{
   const verifier="import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n";
-  const f=await fixture(t,[['submit_investigation',proposal],['write',{path:'verify.py',content:verifier}],['submit_investigation',proposal]]);
+  const f=await fixture(t,[['submit_investigation',proposal],['write',{path:'verify.py',content:verifier}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]]);
   const result=await investigate(f.options),responses=f.results();
-  assert.equal(responses.length,3);
+  assert.equal(responses.length,5);
   assert.match(responses[0].content,/Artifact is missing/);
   assert.match(responses[0].content,/investigation\/verify.py/);
-  assert.equal(responses[2].content,'Recorded');
+  assert.equal(responses[4].content,'Recorded');
   assert.equal(result.verifier.files[0],join(f.path,'investigation','verify.py'));
   assert.equal(await readFile(result.verifier.files[0],'utf8'),verifier);
   assert.equal(await readFile(join(f.source,'answer.py'),'utf8'),'answer=42\n');
@@ -83,7 +86,7 @@ test('pre-actor failure has readable diagnostics before native summary repairs d
   const record={findings:'Missing verifier prevented actor startup; no experiment ran.',useful:false,paths:['.']};
   const f=await fixture(t,[['record_findings',record],['read',{path:'diagnostics.json'}],['record_findings',{...record,paths:['diagnostics.json']}]]);
   const failure={type:'attempt-error',data:{message:'ENOENT missing verifier',stage:'worker'}};
-  f.options.state={events:()=>[failure],queryEvents:(_id,{types})=>!types||types.includes(failure.type)?[failure]:[],attempt:()=>({session:null}),event:()=>{}};
+  f.options.state.event(f.options.job.attempt.id,failure.type,failure.data);
   const result=await findingsFor({...f.options,passed:false});
   assert.match(f.results()[0].content,/regular file/);
   assert.deepEqual(JSON.parse(f.results()[1].content),[failure]);

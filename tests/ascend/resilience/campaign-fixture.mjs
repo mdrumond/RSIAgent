@@ -1,3 +1,4 @@
+import {portableCli} from '../portable-cli.mjs';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdir,writeFile,readFile,cp,symlink,stat} from 'node:fs/promises';
@@ -25,7 +26,7 @@ export async function waitFor(check,signal,seconds=20) {
   }
 }
 
-// Each fixture uses an external installed release, native Pi and the real KDB.
+// All cases call the installed public CLI with native Pi and the real KDB.
 // The SDK is reused from the source installation; packaging is another case's remit.
 export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false}={}) {
   const directory=join(ctx.directory,scenario),instance=join(directory,'instance');
@@ -112,7 +113,7 @@ export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false}={}) 
   }
   server=await provider(scenario,{nativeSession:async()=>rows(
     'SELECT session FROM attempts WHERE session IS NOT NULL ORDER BY rowid DESC LIMIT 1')[0]?.session});
-  // Seed only source knowledge; all attempts and outcomes come from the actual CLI.
+  // Seed only source knowledge; the canonical runtime creates attempts and outcomes.
   const baseline=join(directory,'baseline.sqlite');
   await execute(python,[oracle,'baseline',baseline]).output;
   const skills=join(directory,'skills');await mkdir(skills);
@@ -133,6 +134,7 @@ export async function campaignFixture(ctx,scenario,ids,{loseDelivery=false}={}) 
   await execute(process.execPath,[cli,'bootstrap',instance,'--config',input]).output;
   await symlink(join(repository,'node_modules'),join(instance,'machinery/node_modules'),'dir');
   cli=join(instance,'machinery/cli/main.mjs');
+  cli=await portableCli(cli);
   await cp(oracle,join(instance,'machinery/ascend_tools/fixture_embeddings.py'));
   // Fault at the real durable sink boundary, not a fake outbox/state transition.
   if(loseDelivery)await writeFile(join(instance,'machinery/ascend_tools/campaign_delivery.py'),`

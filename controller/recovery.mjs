@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { currentCampaignEntry, startCampaignEntry } from './progress.mjs';
 import { stages } from './workflow.mjs';
+import { failureSettled } from './lifecycle.mjs';
 
 export function modePolicy(mode, { inferenceRecovery = true } = {}) {
   if (!['phase1', 'phase2', 'inference'].includes(mode)) throw new Error('Unknown mode');
@@ -50,6 +52,7 @@ export class RecoveryQueue {
     this.wave(wave);
     return this.transaction(() => {
       const attempt = this.db.prepare('SELECT * FROM attempts WHERE id=?').get(attemptId);
+      if (!failureSettled(this.state,attemptId)) throw new Error('Execution settlement is unknown');
       if (!attempt || attempt.outcome !== 'failed') throw new Error('Original attempt must have failed');
       if (this.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId))
         throw new Error('Recovery attempts complete through the recovery queue');
@@ -71,6 +74,10 @@ export class RecoveryQueue {
       WHERE q.attempt IS NULL AND q.eligible_wave<=? AND p.frozen=0 AND p.status='failed'
       AND NOT EXISTS (SELECT 1 FROM recovery_lessons l JOIN attempts a ON a.id=l.attempt
         WHERE a.project=q.project AND l.recorded=0)
+      AND NOT EXISTS (SELECT 1 FROM attempts a JOIN events e ON e.attempt=a.id
+        WHERE a.project=q.project AND e.sequence=(SELECT MAX(last.sequence) FROM events last
+          WHERE last.attempt=a.id AND last.type='failure-settlement')
+        AND json_extract(e.data,'$.closed')!=1)
       ORDER BY q.eligible_wave,q.project`).all(wave);
   }
   claim(projectId, wave, owner = {}, resourceId) {
@@ -80,6 +87,18 @@ export class RecoveryQueue {
       const original = project?.status === 'queued' && !queue;
       if (!project || project.frozen || (!original && !this.ready(wave).some(row => row.project === projectId)))
         throw new Error('Job is not eligible');
+      if (original) {
+        const saved = this.db.prepare("SELECT name FROM sqlite_master WHERE name='control'").get() &&
+          this.db.prepare("SELECT value FROM control WHERE key='campaign-plan'").get();
+        if (saved) {
+          const persisted = JSON.parse(saved.value);
+          const entry = currentCampaignEntry(this.state, {campaign_plan:persisted.plan});
+          if (!entry || project.spec.campaign_entry !== entry.id || entry.remainingAdmissions === 0 ||
+              this.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(projectId))
+            throw new Error('Original is outside the current campaign entry');
+          startCampaignEntry(this.state, {campaign_plan:persisted.plan});
+        }
+      }
       const kind = original ? 'original' : queue.kind;
       const id = randomUUID();
       this.db.prepare('INSERT INTO attempts(id,project,owner,created) VALUES (?,?,?,?)')
@@ -93,7 +112,7 @@ export class RecoveryQueue {
       }
       this.db.prepare("UPDATE projects SET status='running' WHERE id=?").run(projectId);
       const actorSeconds = kind === 'investigation' ? this.investigationSeconds : project.spec.actor_seconds;
-      this.state.event(id, 'job-admitted', { kind, wave, actor_seconds: actorSeconds });
+      this.state.event(id, 'job-admitted', { kind, wave, actor_seconds: actorSeconds, mode:this.policy.mode, campaign_entry:project.spec.campaign_entry });
       return { attempt: this.db.prepare('SELECT * FROM attempts WHERE id=?').get(id),
         project: this.state.project(projectId), kind, actor_seconds: actorSeconds,
         origin_attempt: queue?.origin ?? null, failed_rounds: queue?.failed_rounds ?? 0, policy: this.policy };
@@ -119,6 +138,7 @@ export class RecoveryQueue {
   complete(attemptId, { passed, useful = false, findings, evidence = [] }, wave) {
     this.wave(wave);
     this.validateResult({ passed, findings, evidence });
+    if (!failureSettled(this.state,attemptId)) throw new Error('Execution settlement is unknown');
     return this.transaction(() => {
       const recovery = this.db.prepare('SELECT * FROM recovery_attempts WHERE attempt=?').get(attemptId);
       if (!recovery || recovery.completed) throw new Error('Recovery attempt is not open');
@@ -170,6 +190,7 @@ export class RecoveryQueue {
   recordOriginal(attemptId, { passed, useful = false, findings, evidence = [] }, wave) {
     this.wave(wave);
     this.validateResult({ passed, findings, evidence });
+    if (!failureSettled(this.state,attemptId)) throw new Error('Execution settlement is unknown');
     return this.transaction(() => {
       const attempt = this.db.prepare('SELECT * FROM attempts WHERE id=?').get(attemptId);
       if (!attempt || this.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId))
@@ -205,6 +226,7 @@ export class RecoveryQueue {
       FROM attempts a LEFT JOIN recovery_attempts r ON r.attempt=a.id
       LEFT JOIN recovery_lessons l ON l.attempt=a.id
       WHERE a.outcome IS NOT NULL AND l.id IS NULL ORDER BY a.created,a.rowid`).all()
+      .filter(attempt=>failureSettled(this.state,attempt.id))
       .map(attempt => {
         const admission = this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted'").get(attempt.id);
         return { ...attempt, wave: attempt.wave ?? (admission ? JSON.parse(admission.data).wave : null) };

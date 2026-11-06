@@ -8,7 +8,7 @@ import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {investigate,summarize} from '../../cli/curriculum.mjs';
+import {investigate,summarize,curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
 import {State} from '../../controller/state.mjs';
 import {AgentSession} from '@earendil-works/pi-coding-agent';
@@ -42,7 +42,7 @@ async function fixture(t,plan) {
     base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   state.add({id:'p',source,goal:'numeric',actor_seconds:120,verifier:{files:[],command:'true'}});
-  const attempt=state.admit('p',{}),bridge={extension:()=>{}};
+  const attempt=state.admit('p',{}),bridge={extension:()=>{},knowledge:{search:async({kind})=>({content:[{kind}],evidence:[]})}};
   const options={config,path,state,bridge,job:{origin_attempt:attempt.id,attempt,actor_seconds:120},base:{source,goal:'numeric'}};
   config.curriculum_seconds=1;
   return {root,path,source,options,get events(){return state.events(attempt.id);},prompts,waitStarted,results:()=>received.at(-1)};
@@ -50,7 +50,7 @@ async function fixture(t,plan) {
 }
 
 const proposal={goal:'Check numeric fact',question:'Is answer42?',verifier:'verify.py'};
-const acceptedPlan=[['write',{path:'verify.py',content:'print(42)\n'}],['submit_investigation',proposal],'wait'];
+const acceptedPlan=[['write',{path:'verify.py',content:'print(42)\n'}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal],'wait'];
 
 test('elapsed abort retains real session and summary reads it when actor session is absent',{timeout:15000},async t=>{
   const plan=['wait'],f=await fixture(t,plan);
@@ -146,5 +146,54 @@ test('summary diagnostics use bounded tails without reading complete history',{t
   assert.equal(wire.events.length,30);
   assert.equal(wire.curriculum_sessions.length,30);
   assert.equal(wire.curriculum_sessions[0].session,'session-10');
-  assert.deepEqual(wire.diagnostics.map(event=>event.data.n),[30,31,32,33,34,35,36,37,38,39]);
+  assert.deepEqual(wire.diagnostics.filter(event=>event.type==='verification').map(event=>event.data.n),[31,32,33,34,35,36,37,38,39]);
+});
+
+test('ordinary investigation rejects proposals until it reads both KDB kinds and runs a smaller Python control',{timeout:15000},async t=>{
+  const f=await fixture(t,[
+    ['write',{path:'verify.py',content:'from pathlib import Path\nassert Path("answer.py").read_text().strip() == "answer=42"\n'}],
+    ['submit_investigation',proposal],
+    ['investigation_knowledge',{query:'numeric mismatch control',kind:'good'}],
+    ['submit_investigation',proposal],
+    ['investigation_knowledge',{query:'numeric mismatch actor misuse',kind:'negative'}],
+    ['submit_investigation',proposal],
+  ]);
+  f.options.config.curriculum_seconds=10;
+  const queries=[];
+  f.options.bridge.knowledge={search:async request=>{queries.push(request);return {content:[{observed:request.kind}],evidence:[{path:request.kind+'.log'}]};}};
+  const parentVerifier={files:[],command:'original-verifier'};
+  f.options.base.verifier=parentVerifier;
+  f.options.base.performance_goal={minimum:2};
+  const before=JSON.stringify(f.options.base);
+  const result=await investigate(f.options);
+  assert.deepEqual([1,3,5].map(index=>f.results()[index].content==='Recorded'),[false,false,true]);
+  assert.deepEqual(queries.map(q=>q.kind),['good','negative']);
+  assert.equal(f.events.filter(e=>e.type==='curriculum-proposal').length,1);
+  assert.deepEqual(f.events.filter(e=>e.type==='investigation-knowledge').map(e=>e.data.evidence),[[{path:'good.log'}],[{path:'negative.log'}]]);
+  await promisify(execFile)('python3',[result.verifier.files[0]],{cwd:result.source});
+  assert.equal(await readFile(join(f.source,'answer.py'),'utf8'),'answer=42\n');
+  assert.equal(JSON.stringify(f.options.base),before);
+  assert.equal(result.actor_seconds,120);
+  assert.equal(result.performance_goal,undefined);
+});
+
+test('role restoration pages telemetry and preserves original elapsed allocation',async t=>{
+  const f=await fixture(t,[]),{state,job}=f.options,id=job.attempt.id;
+  state.event(id,'curriculum-session',{role:'investigation',session:'first',allocation_seconds:240});
+  for(let n=0;n<250;n++) {
+    state.event(id,'pi-event',{ignored:n});
+    state.event(id,'curriculum-checkpoint',{role:'investigation',elapsed_seconds:n});
+    state.event(id,'curriculum-checkpoint',{role:'summary',elapsed_seconds:9000});
+  }
+  state.event(id,'curriculum-session',{role:'investigation',session:'latest',allocation_seconds:999});
+  state.event(id,'curriculum-interrupted',{role:'investigation',elapsed_seconds:230});
+  state.events=()=>{throw new Error('Complete history must not be loaded');};
+  const original=state.queryEvents.bind(state),sizes=[];
+  state.queryEvents=(...args)=>{const page=original(...args);sizes.push(page.length);return page;};
+  const restored=curriculumRoleHistory(state,id,'investigation');
+  assert.equal(restored.prior.session,'latest');
+  assert.equal(restored.seconds,240);
+  assert.equal(restored.elapsed,249);
+  assert.ok(sizes.length>1);assert.ok(sizes.every(n=>n<=100));
+  await assert.rejects(investigate({...f.options,job:{...job,resume:true}}),/elapsed allocation exhausted/);
 });

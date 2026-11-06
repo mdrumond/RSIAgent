@@ -8,12 +8,20 @@
 <main>
 <section><h2>Projects and attempts</h2><div id="status"></div>
 <div class="actions"><label>Wave <select id="mode"><option>phase1</option><option>phase2</option><option>inference</option><option>revisit</option></select></label>
-<button id="wave">Start wave</button><button id="campaign">Start campaign</button><button id="stop">Stop</button><button id="resume">Resume</button></div></section>
+<button id="wave">Start wave</button><button id="campaign">Start campaign</button><button id="pause">Pause at command boundary</button><button id="stop">Cancel now</button><button id="resume">Resume</button></div></section>
+<section><h2>Campaign storage</h2><pre id="storage-summary"></pre><div id="storage-inventory"></div>
+<form id="storage-form"><label>Storage action (JSON) <textarea id="storage-action" rows="4">{"action":"inspect","limit":100}</textarea></label>
+<p>Actions: inspect, verify, pack, compress, prune. Prune returns an inventory plan; apply requires that inventory. Compression retains sources unless delete_source is explicitly set.</p>
+<button>Run storage action</button></form><pre id="storage-result"></pre></section>
 <section><h2>Instance settings</h2>
 <p>JSON editors retain additional settings. Save before starting a wave.</p>
 <button id="reload-settings" type="button">Reload settings (discard edits)</button>
 <p id="settings-conflict" role="alert" hidden>Settings changed on the server. Your edits remain here; copy any you want to keep, then reload settings before saving.</p>
 <form id="settings">
+<h3>Ordered campaign plan</h3>
+<p>IDs are stable batch identities. Edit future entries here; started entries are locked by progress and validated by the CLI. Save appended entries before resuming.</p>
+<div id="campaign-entries"></div><button id="campaign-add" type="button">Append entry</button>
+<pre id="campaign-status"></pre>
 <label>Baseline KDB path <input id="baseline" type="text"></label>
 <label>Skills map (JSON) <textarea id="skillsmap" rows="4"></textarea></label>
 <label>Curriculum (JSON) <textarea id="curriculum" rows="4"></textarea></label>
@@ -24,13 +32,14 @@
 <button id="apply" type="button">Apply JSON to fields</button><button type="submit">Save settings</button>
 </form></section>
 <section><h2>Skill content</h2>
+<pre id="skills-status"></pre>
 <label>Scope <select id="skill-scope"></select></label>
 <button id="skill-load" type="button">Load skill</button>
 <label>Content <textarea id="skill-content" rows="12"></textarea></label>
 <button id="skill-save" type="button">Save new skill version</button></section>
 <section><h2>Folder browser</h2><form id="browse"><label>Path <input id="path" value="."></label><button>Browse</button></form>
 <p>Paths are resolved by the configured CLI environment. Select a folder to browse it.</p><div id="folders"></div><pre id="browse-result"></pre></section>
-<section><h2>Add project</h2><form id="project-form"><label>Project specification (JSON)
+<section><h2>Add project</h2><p>For an ordered plan, set <code>campaign_entry</code> in the project JSON to its entry ID. Optional <code>phase</code> must match that entry.</p><form id="project-form"><label>Project specification (JSON)
 <textarea id="project" rows="8">{"id":"","goal":"","source":"","target":"","actor_seconds":28800,"verifier":{}}</textarea></label><button>Add project</button></form></section>
 <section><h2>Skilltune</h2><form id="tune-form"><label>User information <textarea id="userinfo" rows="4"></textarea></label>
 <label>Action (JSON) <textarea id="tune-action" rows="3">{}</textarea></label>

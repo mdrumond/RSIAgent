@@ -118,9 +118,10 @@ def create_app(instance, machinery=None, node="node"):
             return jsonify(driver.call(request.path.rsplit("/", 1)[-1], detach=True, mode=mode))
 
     @app.post("/api/stop")
+    @app.post("/api/pause")
     def stop():
         with lock:
-            return jsonify(driver.call("stop"))
+            return jsonify(driver.call(request.path.rsplit("/", 1)[-1]))
 
     @app.post("/api/resume")
     def resume():
@@ -132,6 +133,19 @@ def create_app(instance, machinery=None, node="node"):
         value = body()
         with lock:
             return jsonify(driver.call("kdb", value, detach=True))
+
+    @app.get("/api/storage")
+    def storage_status():
+        return jsonify(driver.call("storage", {"action": "inspect", "limit": 100}))
+
+    @app.post("/api/storage")
+    def storage_action():
+        value = body()
+        if value.get("action") not in ("inspect", "verify", "compress", "pack", "prune"):
+            raise BadRequest("Unknown dashboard storage action")
+        with lock:
+            return jsonify(driver.call("storage", value,
+                                      detach=value["action"] in ("compress", "pack", "prune")))
 
     @app.post("/api/tune")
     def tune():
