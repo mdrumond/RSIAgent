@@ -103,3 +103,30 @@ test('zero-dispatch pause clears the running checkpoint and resumes the same eig
   assert.deepEqual(after.samples.map(sample=>sample.instanceRoot),before.samples.map(sample=>sample.instanceRoot));
   assert.equal(after.samples.filter(sample=>sample.result).length,8);
 });
+
+
+test('ready bootstrap receipts cannot settle live controllers, workers or unclosed execution',async t=>{
+  const round=await mkdtemp(join(tmpdir(),'evaluation-ready-receipt-'));t.after(()=>rm(round,{recursive:true,force:true}));
+  const root=join(round,'sample'),inputs=join(round,'inputs'),live=await processIdentity();
+  const stopped={pid:2147483647,start:'0',boot:'old-boot'};
+  for(const path of [inputs,root])await managedBootstrap(path,{binding:{source:'frozen'}},async()=>{await mkdir(path);});
+  await writeFile(join(root,'instance.json'),JSON.stringify({format:1,mode:'phase2'}));
+  const state=new State(join(root,'state.sqlite'));
+  try {
+    state.add({id:'p',goal:'positive actor closure',actor_seconds:5});
+    const attempt=state.admit('p',stopped);state.event(attempt.id,'accepted',{});state.finish(attempt.id,'passed');
+    state.db.exec("CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)");
+    state.db.prepare("INSERT INTO control VALUES ('owner',?)").run(JSON.stringify(live));
+    assert.equal(await bootstrapSettled(root),true);assert.equal(await bootstrapSettled(inputs),true);
+    assert.equal(await settled({instanceRoot:root}),false);
+    state.db.prepare("UPDATE control SET value='null' WHERE key='owner'").run();
+    state.db.prepare('UPDATE attempts SET owner=? WHERE id=?').run(JSON.stringify(live),attempt.id);
+    assert.equal(await settled({instanceRoot:root}),false);
+    state.db.prepare('UPDATE attempts SET owner=? WHERE id=?').run(JSON.stringify(stopped),attempt.id);
+    assert.equal(await settled({instanceRoot:root}),true);
+    state.event(attempt.id,'native-bash-started',{operation:'still-unresolved'});
+    assert.equal(await settled({instanceRoot:root}),false);
+    state.event(attempt.id,'native-bash-completed',{operation:'still-unresolved',actor_elapsed:0});
+    assert.equal(await settled({instanceRoot:root}),true);
+  }finally{state.close();}
+});

@@ -39,7 +39,7 @@ def output_check(workload,result,reference,args,device):
     if workload=='gdn':dtypes=[args[2].dtype]+([torch.float32] if reference[1] is not None else [])
     elif workload=='kimi_delta_attention':dtypes=[args[0].dtype,torch.float32]
     elif workload=='tensor_program_vm':dtypes=[args[1].dtype]
-    elif workload=='sparse_lightning_indexer_grad_kl_loss_enhance':dtypes=[args[2].dtype,args[3].dtype,args[4].dtype,torch.float32]
+    elif workload=='sparse_lightning_indexer_grad_kl_loss_enhance':dtypes=[torch.float32]*4
     else:dtypes=[args[0].dtype]*len(actual)
     if [a.dtype for a in actual]!=dtypes:raise ValueError('Candidate output dtype differs from contract')
     return check(workload,actual,expected)

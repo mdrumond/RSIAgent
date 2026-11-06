@@ -185,6 +185,7 @@ export async function createEnvironment(options, context) {
     return capabilities;
   }
   const executionReceipts = new Map();
+  const uploadParents = new Set();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     '\nNative bash/read/write/edit operate in the LOCAL project; use them for persistent source edits. rsi_target executes commands in the configured target environment.' +
     (remote ? ' Target commands use a synchronized execution snapshot: local edits sync first, and target-side source edits are overwritten on the next synchronization. Use project-relative paths with rsi_target.' : '');
@@ -227,8 +228,8 @@ export async function createEnvironment(options, context) {
         const execution = await json(join(dir, 'execution.json'));
         if (execution.handle === handle || (!execution.handle && execution.receiptFile && (await json(execution.receiptFile)).handle === handle)) receipt = { ...execution, dir };
       } catch { /* another operation */ }
-      if (!receipt) try {
-        if ((await json(join(dir, 'sync-submission.json'))).handle === handle) return { executionSeconds: 0, accountingExcluded: true };
+      if (!receipt) for(const name of ['sync-submission.json','upload-parent-submission.json'])try {
+        if ((await json(join(dir, name))).handle === handle) return { executionSeconds: 0, accountingExcluded: true };
       } catch { /* not a setup receipt */ }
       if (receipt) { executionReceipts.set(handle, receipt); break; }
     }
@@ -301,6 +302,13 @@ export async function createEnvironment(options, context) {
       await event('execution-submitted', { submission: operation, handle: result.handle ?? null, closed: !result.handle, accountingExcluded });
       return result;
     }
+    if(allowCompleted&&capabilities?.backend==='ssh'&&['upload','download'].includes(args[0])&&
+      terminal.has(result?.state)&&Number.isInteger(result.exit)&&!result.handle) {
+      await event('execution-submitted',{submission:operation,handle:null,closed:true,accountingExcluded,reason:result});
+      const error=closedSetupError(`CPL ${args[0]} failed with exit ${result.exit}`,{reason:result});
+      if(args[0]==='download')delete error.closure;
+      throw error;
+    }
     if (result?.admitted === false || result?.submitted === false) {
       await event('execution-not-admitted', { submission: operation, closed: true });
       throw rejected(result.reason);
@@ -309,9 +317,41 @@ export async function createEnvironment(options, context) {
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
     throw new Error(message, { cause });
   }
+  async function prepareUploadParent(destination,dir,signal) {
+    const path=posix.normalize(destination);
+    if(posix.isAbsolute(path)||!attemptRoot||!path.startsWith(attemptRoot+'/'))
+      throw closedSetupError('Upload destination must remain within the prepared attempt');
+    const parent=posix.dirname(path);
+    if(uploadParents.has(parent))return;
+    const file=join(dir,'upload-parent.sh'),receipt=join(dir,'upload-parent-submission.json');
+    await writeFile(file,`mkdir -p -- ${quote(posix.join(options.workspacePath,parent))}\n`,{mode:0o600});
+    const args=['run',options.target,'--file',file,'--receipt-file',receipt,'--cwd',options.workspacePath];
+    if(options.runtime)args.push('--runtime',options.runtime);
+    const submitted=await submit(args,receipt,false,true,signal);
+    await event('execution-handle',{handle:submitted.handle,purpose:'setup'});
+    let state;
+    try {
+      do {
+        state=await observe(submitted.handle,{signal});
+        signal?.throwIfAborted();
+        if(state.state==='running')await delay(options.pollMs??250,undefined,{signal});
+      }while(state.state==='running');
+    }catch(error) {
+      if(signal?.aborted)state=await stop(submitted.handle);
+      if(state?.state==='stopped')throw closedSetupError('Upload parent setup interrupted',{handle:submitted.handle,reason:state});
+      throw error;
+    }
+    if(state.state!=='stopped')throw new Error(`Upload parent setup unresolved; observe ${submitted.handle}`);
+    if(state.exitCode!==0)throw closedSetupError('Upload parent setup failed',{handle:submitted.handle,reason:state});
+    uploadParents.add(parent);
+  }
   async function transfer(args, dir, signal = context.signal) {
     const upload = args[0] === 'upload';
     const synchronous=(await discoverCapabilities()).backend==='ssh';
+    if(synchronous&&upload) {
+      if((await lstat(args[2])).isDirectory()&&!args[2].endsWith('/'))args[2]+='/';
+      await prepareUploadParent(args[3],dir,signal);
+    }
     if (!synchronous) {
       if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
       else args.push('--timeout', '0');
