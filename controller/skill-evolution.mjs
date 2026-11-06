@@ -295,7 +295,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   state.pending = null;
   await save(statePath, state, signal);
   if (resumeIncoming && !background) return tune({ instanceRoot, config: await json(configPath), configPath,
-    task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal, publish });
+    task, userinfo, manual, context, evaluate, generate, native, modelRuntime, model, signal, publish, prepareCandidate });
   if (background && verdict.reason === 'superseded')
     await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   return { ...verdict, evaluationStatus: 'completed', candidate: pending.candidate, evaluationRoot };
