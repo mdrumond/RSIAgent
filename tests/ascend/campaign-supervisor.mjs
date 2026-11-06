@@ -11,6 +11,7 @@ import {CampaignStorage} from '../../controller/storage.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 import {withPackCapture} from '../../cli/storage.mjs';
 import {readConfig} from '../../cli/instance.mjs';
+import {operate} from '../../cli/runtime.mjs';
 import {setup} from './driver_setup.mjs';
 import {workloads} from '../../cli/campaign-manifest.mjs';
 import {superviseCampaign,claimSupervisor,localOwnersStopped} from '../../cli/campaign-supervisor.mjs';
@@ -62,6 +63,26 @@ test('dead local owners resume the same native cycle while retained A/B handles 
   assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
   assert.deepEqual(retained,before);assert.equal(f.reports.find(report=>report.state==='launching').elapsedSeconds,123);
   assert.ok(f.calls.every(call=>!call.includes('config')));
+});
+
+test('explicit stop survives a failed campaign request while internal failures remain resumable',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'supervisor-operator-stop-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  new State(join(root,'state.sqlite')).close();
+  await operate('stop',{root,mode:'phase1'});
+  const state=new State(join(root,'state.sqlite'));
+  let operatorStopped;
+  try{operatorStopped=JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='operator-stop'").get().value);}
+  finally{state.close();}
+  const failed={...fresh(),operatorStopped,budget:{cycle:'same',elapsed:3},operation:'campaign',
+    status:{controller:{state:'stopped',stopRequested:true},progress:{done:false},
+      requests:[{id:'failed',kind:'campaign',status:'failed'}]}};
+  const stopped=fixture([failed]);
+  assert.equal((await superviseCampaign(options(),stopped.deps)).reason,'operator-stop');
+  assert.deepEqual(stopped.calls.map(call=>call[0]),['pause']);
+  const crashed=fixture([{...failed,operatorStopped:false},done()]);
+  await superviseCampaign(options(),crashed.deps);
+  assert.deepEqual(crashed.calls.map(call=>call[0]),['resume','pause']);
 });
 
 test('unknown ownership and repeated native resume failures become attention after30 elapsed minutes',async()=>{
