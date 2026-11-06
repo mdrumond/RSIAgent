@@ -15,7 +15,8 @@ async function fixture(t) {
   await writeFile(join(source, 'run.sh'), '#!/bin/bash\ncat value.txt\n', { mode: 0o755 });
   const calls = [], events = [], jobs = new Map(), excluded = [];
   const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0, uploadStates: null,
-    backend:'remote-agent',failUpload:false,failDownload:false };
+    backend:'remote-agent',failUpload:false,failDownload:false,parentUnknown:false,failParent:false,
+    uploadExit:null,downloadExit:null };
   let sequence = 0;
   const operations = sdk.createLocalBashOperations();
   const context = {
@@ -31,9 +32,11 @@ async function fixture(t) {
       if (args[0] === 'upload') {
         if(control.failUpload)throw new Error('Upload connection lost');
         if(control.backend==='ssh')assert.equal(args.length,4,'SSH upload has no retained-transfer flags');
+        if(control.uploadExit!==null)return {backend:'ssh',state:'failed',exit:control.uploadExit};
         await delay(control.uploadDelay);
         const destination = join(remote, args[3]);
-        await mkdir(dirname(destination), { recursive: true });
+        if(control.backend==='ssh')assert.equal((await stat(dirname(destination))).isDirectory(),true,'rsync requires an existing remote parent');
+        else await mkdir(dirname(destination), { recursive: true });
         await cp(args[2], destination, { recursive: true });
         if (control.uploadStates) {
           const handle = `remote:${args[1]}:transfer:${++sequence}`;
@@ -46,14 +49,15 @@ async function fixture(t) {
       if (args[0] === 'download') {
         if(control.failDownload)throw new Error('Download refused');
         if(control.backend==='ssh')assert.equal(args.length,4,'SSH download uses synchronous completion');
+        if(control.downloadExit!==null)return {backend:'ssh',state:'failed',exit:control.downloadExit};
         await cp(join(remote, args[2]), args[3]); return { state: 'completed' };
       }
       if (args[0] === 'run') {
-        const file = args[args.indexOf('--file') + 1], sync = file.endsWith('sync.sh');
-        const handle = `remote:${args[1]}:job:${++sequence}`, job = { state: 'running', sync };
+        const file = args[args.indexOf('--file') + 1], sync = file.endsWith('sync.sh'),parent=file.endsWith('upload-parent.sh');
+        const handle = `remote:${args[1]}:job:${++sequence}`, job = { state: 'running', sync,parent };
         jobs.set(handle, job);
         if (!control.missingReceipt) await writeFile(args[args.indexOf('--receipt-file') + 1], JSON.stringify({ handle }));
-        const script = sync && control.failSync ? 'exit 17\n' : await readFile(file, 'utf8');
+        const script = parent&&control.failParent?'exit 19\n':sync && control.failSync ? 'exit 17\n' : await readFile(file, 'utf8');
         control.failSync = false;
         job.done = operations.exec(script, remote, { onData: () => {} }).then(result => {
           job.state = 'completed'; job.exit = result.exitCode;
@@ -63,17 +67,18 @@ async function fixture(t) {
       if (args[0] === 'observe') {
         const job = jobs.get(args[1]);
         if (job.states) return { state: job.states.shift() ?? 'completed' };
+        if(job.parent&&control.parentUnknown)return {state:'observation-unavailable'};
         if (job.sync && control.disconnected) return { state: 'observation-unavailable' };
         return { state: job.state, exit: job.exit };
       }
       throw Error('unexpected CPL call ' + args[0]);
     };
   }
-  async function connect(changes = {}, attempt = 'a') {
+  async function connect(changes = {}, attempt = 'a',verifierFiles=[]) {
     const selected = { ...options, ...changes };
     await mkdir(selected.workspacePath, { recursive: true });
     const env = await createEnvironment(selected, { ...context, client: clientFor(selected.workspacePath) });
-    await env.prepare({ project: { id: 'p', source }, attempt: { id: attempt } });
+    await env.prepare({ project: { id: 'p', source,verifier:{files:verifierFiles} }, attempt: { id: attempt } });
     return env;
   }
   const environment = await connect();
@@ -101,6 +106,47 @@ test('advertised SSH transfers synchronously stage, execute and collect without 
   assert.equal(f.calls.some(args=>args[0]==='fetch'),false);
   const transfers=f.events.filter(row=>row.type==='execution-submitted'&&row.accountingExcluded&&row.closed);
   assert.ok(transfers.length>=3);assert.equal(transfers.every(row=>row.handle===null),true);
+  const firstUpload=f.calls.findIndex(args=>args[0]==='upload');
+  const parent=f.calls.slice(0,firstUpload).find(args=>args[0]==='run');
+  assert.equal(parent[parent.indexOf('--cwd')+1],f.workspace);
+  assert.equal(parent[parent.indexOf('--runtime')+1],'declared');
+  const receipt=JSON.parse(await readFile(parent[parent.indexOf('--receipt-file')+1],'utf8'));
+  assert.ok(f.calls.slice(0,firstUpload).some(args=>args[0]==='observe'&&args[1]===receipt.handle));
+});
+
+test('SSH frozen verifier upload prepares its scoped parent before staging source',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';const verifier=join(f.root,'oracle.py');
+  await writeFile(verifier,"print('independent oracle')\n");
+  const environment=await f.connect({},'ssh',[verifier]);
+  assert.equal(await readFile(join(f.workspace,'owned/ssh/tree/oracle.py'),'utf8'),await readFile(verifier,'utf8'));
+  assert.equal(f.runs(false).length,0);
+  assert.equal(await f.run('python3 ../oracle.py',environment),'independent oracle\n');
+});
+
+for(const failure of ['failed','unknown'])test(`SSH parent setup ${failure} prevents transfer and payload`,async t=>{
+  const f=await fixture(t);f.control.backend='ssh';const environment=await f.connect({},'ssh');
+  f.control.failParent=failure==='failed';f.control.parentUnknown=failure==='unknown';
+  await assert.rejects(environment.execute('touch must-not-run',f.source),error=>{
+    if(failure==='failed'){assert.equal(error.closure.closed,true);assert.equal(error.closure.reason.exitCode,19);}
+    else assert.equal(error.closure,undefined);
+    return /Upload parent setup/.test(error.message);
+  });
+  assert.equal(f.sourceUploads().length,0);assert.equal(f.runs(true).length,0);assert.equal(f.runs(false).length,0);
+});
+
+test('terminal SSH transfer failures retain exit evidence without falsely settling prior download work',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';const environment=await f.connect({},'ssh');
+  f.control.uploadExit=23;
+  await assert.rejects(environment.execute('touch must-not-run',f.source),error=>{
+    assert.equal(error.closure.closed,true);assert.equal(error.closure.reason.exit,23);return true;
+  });
+  assert.equal(f.runs(true).length,0);assert.equal(f.runs(false).length,0);
+  assert.equal(f.events.at(-1).reason.exit,23);assert.equal(f.events.at(-1).closed,true);
+  f.control.downloadExit=23;
+  await assert.rejects(environment.collectArtifact('missing',join(f.root,'unused')),error=>{
+    assert.equal(error.closure,undefined);return /exit 23/.test(error.message);
+  });
+  assert.equal(f.events.at(-1).reason.exit,23);
 });
 
 test('SSH upload uncertainty prevents payload dispatch and download refusal does not settle earlier work',async t=>{
