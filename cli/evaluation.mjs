@@ -144,15 +144,19 @@ async function stoppedAttempts(config, state, signal, allOperations = false) {
 }
 
 export async function settled(request) {
-  try {
-    const config = await readConfig(request.instanceRoot);
-    const state = new State(join(config.root, 'state.sqlite'));
-    try { await stoppedAttempts(config, state, AbortSignal.timeout(5000), true); return true; }
-    finally { state.close(); }
-  } catch {
+  let config;
+  try {config=await readConfig(request.instanceRoot);}
+  catch(error) {
+    if(error.code!=='ENOENT')return false;
     return await bootstrapSettled(request.instanceRoot) &&
       await bootstrapSettled(join(dirname(request.instanceRoot),'inputs'));
   }
+  // Ready setup receipts prove no closure for subsequently admitted actors.
+  try {
+    const state = new State(join(config.root, 'state.sqlite'));
+    try { await stoppedAttempts(config, state, AbortSignal.timeout(5000), true); return true; }
+    finally { state.close(); }
+  } catch {return false;}
 }
 
 
