@@ -95,7 +95,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
           if(ledger.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n)throw new Error('Baseline is frozen after first attempt; bootstrap a fresh instance');
           const {ownerStopped}=await import('../controller/lifecycle.mjs');
           if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get())
-            for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')").all())
+            for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup','supervisor-owner')").all())
               if(row.value!=='null'&&!await ownerStopped(JSON.parse(row.value)))throw new Error('Stop campaign and knowledge writers before replacing the baseline');
           staged=join(root,'knowledge-next-'+randomUUID()+'.sqlite');
           const db=new DatabaseSync(input.baselineKDB,{readOnly:true});
