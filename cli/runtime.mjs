@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { selectAdmission } from '../controller/dispatch.mjs';
 import {campaignBudget} from '../controller/campaign-budget.mjs';
-import { campaignProgress, syncCampaignPlan, advanceCampaignEntry } from '../controller/progress.mjs';
+import { campaignProgress, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
@@ -113,6 +113,7 @@ export async function operate(command,config,options={}) {
     if((await readConfig(config.root)).mode!==config.mode)await updateConfig(config.root,current=>({...current,mode:config.mode}));
     for(const project of config.projects)if(!state.project(project.id))state.add(project);
     let wave=(ctl.get('wave')??0)+(command==='wave'?1:0);ctl.set('wave',wave);
+    syncCampaignPlan(state,config);
     const queue=new RecoveryQueue(state,policy(config));
     if(config.storage) {
       const url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal});
@@ -325,12 +326,13 @@ export async function operate(command,config,options={}) {
         const existing=state.project(project.id);
         if(!existing)state.add(project);
         else if(config.campaign_plan && existing.status==='queued')state.db.prepare('UPDATE projects SET spec=? WHERE id=?')
-          .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry}),project.id);
+          .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry,phase:project.phase}),project.id);
       }
+      if(config.campaign_plan)startCampaignEntry(state,config);
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
       if(config.campaign_plan && progress.currentEntry)config={...config,mode:progress.currentEntry.phase};
-      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&!running.size) {
+      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)) {
         advanceCampaignEntry(state,config);
         if(progress.done)break;
         continue;
@@ -408,11 +410,13 @@ export async function operate(command,config,options={}) {
         if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
         if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
         if(job.finalize&&state.queryEvents(job.attempt.id,{types:['postprocess-completed'],limit:1}).length)return false;
-        if(['investigation','retry'].includes(job.kind)&&config.mode!=='phase1'&&!config.skills?.tuningDisabled&&
+        if(['investigation','retry'].includes(job.kind)&&(config.campaign_plan ||
+          (config.mode!=='phase1'&&!config.skills?.tuningDisabled))&&
           state.db.prepare(`SELECT 1 FROM attempts a WHERE project=? AND outcome IS NOT NULL
             AND NOT EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed') LIMIT 1`).get(job.projectId))return false;
         return !startedJobs.has(key)&&!admittedIds.has(key) && (job.finalize || ['investigation','retry'].includes(job.kind) ||
-          (Array.isArray(selected)?selected.includes(job.projectId):(!job.project?.spec.phase || job.project.spec.phase===config.mode)));
+          (config.campaign_plan?job.project?.spec.campaign_entry===progress.currentEntry?.id:
+            Array.isArray(selected)?selected.includes(job.projectId):(!job.project?.spec.phase || job.project.spec.phase===config.mode)));
       });
       const finalizer=eligible.find(job=>job.finalize);
       if(finalizer && ![...activeJobs.values()].some(job=>job.finalize)) {
