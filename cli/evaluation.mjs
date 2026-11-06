@@ -1,10 +1,11 @@
 import { join, resolve, dirname } from 'node:path';
-import { ownerStopped, operationsStopped } from '../controller/lifecycle.mjs';
+import { ownerStopped, operationsStopped, processIdentity } from '../controller/lifecycle.mjs';
 import { bootstrap as createInstance, readConfig } from './instance.mjs';
 import { spawn } from 'node:child_process';
 import { open, readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { State } from '../controller/state.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 // Every A/B sample gets its own state, source, verifier, memory and native evidence.
 export async function bootstrap(request) {
@@ -58,7 +59,7 @@ export async function bootstrap(request) {
     skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
     signal:request.signal,machinery:join(original.root,'machinery')});
 }
-export async function wave({instanceRoot,config,signal,resuming=false}) {
+export async function wave({instanceRoot,config,signal,resuming=false,remainingSeconds}) {
   const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);
   try {
     await new Promise((ok,no)=>{
@@ -70,7 +71,7 @@ export async function wave({instanceRoot,config,signal,resuming=false}) {
       child.once('close',code=>failure?no(failure):code?no(new Error('Evaluation wave failed; inspect evaluation-wave.log')):ok());
     });
   }finally{await log.close();}
-  return result(instanceRoot);
+  return completedResult(instanceRoot,{signal,remainingSeconds});
 }
 
 function result(instanceRoot) {
@@ -96,7 +97,7 @@ export async function resume(request) {
   try {
     attempts = await stoppedAttempts(config, state, request.signal);
   } finally { state.close(); }
-  if (attempts.length && attempts[0].outcome !== null) return result(request.instanceRoot);
+  if (attempts.length && attempts[0].outcome !== null) return completedResult(request.instanceRoot,request);
   return wave({ ...request, config, resuming: attempts.length > 0 });
 }
 
@@ -132,4 +133,42 @@ export async function settled(request) {
     try { await stoppedAttempts(config, state, AbortSignal.timeout(5000), true); return true; }
     finally { state.close(); }
   } catch { return false; }
+}
+
+
+// Completed samples retain their databases and sessions, but not eight idle KDB
+// daemons per comparison. Cleanup retries never execute the original actor again.
+async function completedResult(instanceRoot,{signal,remainingSeconds=30}={}) {
+  signal?.throwIfAborted();
+  if(!await settled({instanceRoot}))throw new Error('Evaluation execution remains unresolved');
+  const bounded=AbortSignal.timeout(Math.max(1,Math.ceil(Math.min(30,remainingSeconds)*1000)));
+  const active=signal?AbortSignal.any([signal,bounded]):bounded;
+  const wait=async check=>{
+    while(true){active.throwIfAborted();if(await check())return;await delay(50,undefined,{signal:active});}
+  };
+  await wait(async()=>{
+    const state=new State(join(instanceRoot,'state.sqlite'));
+    try {
+      if(!state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='requests'").get())return true;
+      for(const request of state.db.prepare("SELECT status,owner FROM requests WHERE kind='storage'").all())
+        if(['queued','running'].includes(request.status)||(request.owner&&!await ownerStopped(request.owner)))return false;
+      return true;
+    } finally {state.close();}
+  });
+  let receipt;
+  try {receipt=JSON.parse(await readFile(join(instanceRoot,'knowledge-service.json'),'utf8'));}
+  catch(error){if(error.code!=='ENOENT')throw error;}
+  if(receipt) {
+    const owner=receipt.owner;
+    if(!Number.isInteger(owner?.pid)||!owner.start||!owner.boot)throw new Error('Evaluation KDB owner cannot be verified');
+    if(!await ownerStopped(owner)) {
+      const current=await processIdentity(owner.pid);
+      if(current.pid===owner.pid&&current.start===owner.start&&current.boot===owner.boot) {
+        active.throwIfAborted();
+        try{process.kill(owner.pid,'SIGTERM');}catch(error){if(error.code!=='ESRCH')throw error;}
+      }
+    }
+    await wait(()=>ownerStopped(owner));
+  }
+  return result(instanceRoot);
 }
