@@ -173,7 +173,9 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
       const progress=(await import('../controller/progress.mjs')).campaignProgress(state,config);
       const controlValue=key=>state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()
         ?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
-      return {controller,mode:config.mode,tuning:await (await import('../controller/evaluation-round.mjs')).tuningStatus(root),progress,skills:await statusSkills(root,config,state),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
+      return {controller,mode:config.mode,tuning:await (await import('../controller/evaluation-round.mjs')).tuningStatus(root),
+        backgroundTuning:config.skills?.background?await (await import('./skill-background.mjs')).backgroundSkillStatus(config):null,
+        progress,skills:await statusSkills(root,config,state),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }

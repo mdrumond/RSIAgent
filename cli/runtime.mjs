@@ -10,10 +10,11 @@ import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaig
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
-import { readConfig,updateConfig,importProject } from './instance.mjs';
+import { readConfig,updateConfigImmediate as updateConfig,importProject } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
+import {skillWorker} from './skill-worker.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectCatalogExtension} from './project-catalog.mjs';
 
@@ -40,11 +41,13 @@ async function environment(config,path,event,exclude,resource,signal) {
 export async function instanceStopped(config) {
   const state=stateFor(config.root),ctl=control(state);
   try {
-    for(const key of ['owner','skill-writer']) {
+    for(const key of ['owner','skill-writer','memory-writer']) {
       const owner=ctl.get(key);if(owner&&!await ownerStopped(owner))return false;
     }
     for(const row of state.db.prepare('SELECT owner FROM attempts').all())
       if(!await ownerStopped(row.owner))return false;
+    if(ctl.get('skill-background-resource') &&
+      !await (await import('./skill-background.mjs')).backgroundSkillsSettled(config))return false;
     return true;
   } finally {state.close();}
 }
@@ -105,12 +108,14 @@ export async function operate(command,config,options={}) {
       campaignClock=campaignBudget(state,{seconds:config.campaign_seconds,cycle,boot:owner.boot});
       if(campaignClock.remaining<=0)return {reason:'elapsed'};
       const expire=()=>{
-        if(campaignClock.remaining>0)budgetTimer=setTimeout(expire,Math.max(1,Math.ceil(campaignClock.remaining*1000)));
+        if(campaignClock.remaining>0)budgetTimer=setTimeout(expire,Math.min(2147483647,Math.max(1,Math.ceil(campaignClock.remaining*1000))));
         else {campaignClock.stop();abort();}
       };
-      budgetTimer=setTimeout(expire,Math.ceil(campaignClock.remaining*1000));
+      budgetTimer=setTimeout(expire,Math.min(2147483647,Math.max(1,Math.ceil(campaignClock.remaining*1000))));
       budgetWatcher=setInterval(()=>campaignClock.checkpoint(),1000);
     }
+    if(options.continuous&&config.skills?.background&&!campaignClock)
+      throw new Error('Background tuning requires an explicit campaign elapsed allocation');
     watcher=setInterval(()=>{
       if(ctl.get('stop')){schedulerAbort.abort(new Error('Wave interrupted'));backgroundAbort.abort();}
       if(ctl.get('pause')){campaignClock?.stop();backgroundAbort.abort(new Error('Instance paused'));}
@@ -249,7 +254,8 @@ export async function operate(command,config,options={}) {
       if(storage) {
         storage.attempt(attempt.id,{phase:admitted.mode??config.mode,kind:admitted.kind,
           parent:job.origin_attempt??null,wave:admitted.wave??wave,
-          skillRevision:(await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
+          skillRevision:state.db.prepare('SELECT revision FROM storage_skill_versions WHERE version=?').get(skillVersion)?.revision??
+            (await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
       await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
@@ -296,6 +302,11 @@ export async function operate(command,config,options={}) {
 
     };
     const results=[],activeJobs=new Map(),startedJobs=new Set();
+    const tuning=options.continuous&&config.skills?.background?skillWorker({
+      control:{...ctl,leased:id=>Boolean(state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(id))},
+      config:()=>config,remaining:()=>campaignClock.remaining,
+      event:(type,data)=>state.event(null,type,data),signal:backgroundAbort.signal,
+    }):null;
     const unavailable=new Set();let resourceWait;
     const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
@@ -436,7 +447,19 @@ export async function operate(command,config,options={}) {
         await Promise.race([...running,delay(250)]);continue;
       }
       const activeActors=[...activeJobs.values()].filter(job=>!job.finalize);
-      const job=selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{running:activeActors,concurrency:limit,freshSinceRecovery});
+      if(tuning) {
+        let slots=[];
+        try{slots=await access.resources({purpose:'ordinary',target:config.target});}
+        catch(error){state.event(null,'skill-background-error',{message:error.message});}
+        try{await tuning.poll(slots,activeActors.length,limit);}
+        catch(error){state.event(null,'skill-background-error',{message:error.message});}
+      }
+      const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
+      if(tuning && foregroundLimit<1)resourceWait={reason:tuning.capacity?'skill-background-reserved':'resources',
+        capacityLimited:true,available:tuning.capacity,at:new Date().toISOString()};
+      else if(resourceWait?.capacityLimited)resourceWait=null;
+      const job=foregroundLimit>0?selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{
+        running:activeActors,concurrency:foregroundLimit,freshSinceRecovery}):null;
       if(!job) {
         if(!running.size&&!options.continuous&&!resourceWait)break;
         if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
@@ -467,7 +490,7 @@ export async function operate(command,config,options={}) {
       if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
       const prior=job.resume?JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')).resource:null;
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:
-        !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)));
+        !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)) && r.id!==tuning?.resource?.id);
       const resource=choose();
       if(!resource) {
         unavailable.add(keyFor(job));
@@ -482,6 +505,7 @@ export async function operate(command,config,options={}) {
     await Promise.all(running);
     if(maintenance)await maintenance;
     if(generation)await generation;
+    await tuning?.stop(ctl.get('pause')?'Campaign paused':'Campaign stopped');
     compress();if(storageLaunch)await storageLaunch;
     }catch(error){
       const interrupted=schedulerAbort.signal.aborted;
@@ -490,6 +514,8 @@ export async function operate(command,config,options={}) {
       if(maintenance)await maintenance;
       if(generation)await generation;
       if(!interrupted)throw error;
+    }finally{
+      await tuning?.stop(ctl.get('pause')?'Campaign paused':'Campaign stopped');
     }
     return {wave,results};
   } finally {clearInterval(watcher);clearInterval(budgetWatcher);clearTimeout(budgetTimer);campaignClock?.stop();options.signal?.removeEventListener('abort',abort);if(owned)ctl.set('owner',null);state.close();}
@@ -554,9 +580,14 @@ async function worker(root,id) {
     state.event(id,'memory-updated',{});
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
-        await (await import('./skills.mjs')).run(config,{signal:abort.signal,resource:job.resource,
-          task:tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode})});
-        state.event(id,'skills-updated',{});
+        const task=tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode});
+        if(config.skills.background) {
+          (await import('./skill-background.mjs')).enqueueSkillEvidence(config,task);
+          state.event(id,'skill-evidence-queued',{});
+        }else{
+          await (await import('./skills.mjs')).run(config,{signal:abort.signal,resource:job.resource,task});
+          state.event(id,'skills-updated',{});
+        }
       }catch(error){state.event(id,'skill-update-error',{message:error.message});throw error;}
     }
     state.event(id,'postprocess-completed',{});

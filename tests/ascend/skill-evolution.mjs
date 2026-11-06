@@ -436,16 +436,23 @@ test('finishing or reconciling older A/B consumes a different incoming task exac
     await writeFile(join(root, 'skills', 'evolution.json'), JSON.stringify({ history: history(8), lastEvaluated: 0,
       candidate, candidateBase: 'baseline', pending: { active: 'baseline', candidate, projects: 8 } }));
     let analyses = 0, arms = 0;
+    const prepared=new Map();
+    const prepareCandidate=async ({active,candidate:version})=>{
+      await readFile(join(root,'skills','versions',version,'guidance.json'));
+      if(version!==candidate)assert.notEqual((await load(join(root,'skills','evolution.json'))).candidate,version);
+      prepared.set(version,active);
+    };
     const incoming = task(8);
     const generate = async ({ input }) => {
       analyses++; assert.equal(input.context.id, incoming.id); assert.equal(input.history.length, 9); return [];
     };
     const evaluate = async ({ arm }) => { arms++; return { correct: true,
       score: ending === 'promoted' && arm === 'candidate' ? 2 : 1 }; };
-    assert.equal((await tune({ instanceRoot: root, config: current, task: incoming, generate, evaluate })).analyse, true);
+    assert.equal((await tune({ instanceRoot: root, config: current, task: incoming, generate, evaluate, prepareCandidate })).analyse, true);
     const saved = await load(join(root, 'skills', 'evolution.json'));
     assert.equal(saved.history.length, 9); assert.equal(saved.history.filter(x => x.id === incoming.id).length, 1);
     assert.equal(saved.lastEvaluated, 8); assert.equal(saved.pending, null);
+    assert.equal(prepared.get(saved.candidate),saved.candidateBase);
     assert.equal(analyses, 1); assert.equal(arms, ending === 'reconciled' ? 0 : 8);
     const latest = await load(join(root, 'instance.json'));
     assert.equal((await tune({ instanceRoot: root, config: latest, task: incoming, generate, evaluate })).analyse, false);

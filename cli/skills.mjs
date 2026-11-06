@@ -126,7 +126,9 @@ export async function run(config, values = {}) {
     if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true,signal:values.signal});
     const result = await tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
       task, userinfo, manual, context, evaluate, generate: values.generate ?? generate, native: values.native, signal: values.signal,
-      background: values.background, evidenceTasks: values.evidenceTasks, backgroundSeconds: values.backgroundSeconds, backgroundResource: values.backgroundResource, clock: values.clock,
+      prepareCandidate: storage ? request=>storage.recordStorageSkill(config,request.candidate,{serialized:true,
+        signal:values.signal,baseVersion:request.active,reason:'awaiting-evaluation'}) : undefined,
+      publish: values.publish ?? (request=>publishSkillVersion(instanceRoot,request)), background: values.background, evidenceTasks: values.evidenceTasks, backgroundSeconds: values.backgroundSeconds, backgroundResource: values.backgroundResource, clock: values.clock,
       evaluationSeconds: values.evaluationSeconds ?? action.evaluationSeconds, allocationId: values.allocationId ?? action.allocationId });
     if(storage) {
       const latest={...await readConfig(instanceRoot),root:instanceRoot};
@@ -140,4 +142,21 @@ export async function run(config, values = {}) {
     }
     return result;
   }, { signal: values.signal });
+}
+
+
+// Curriculum updates and skill publication serialize through the same config ledger.
+export async function publishSkillVersion(root,{active,candidate,signal}) {
+  const {updateConfigImmediate:updateConfig}=await import('./instance.mjs');
+  try {
+    return await updateConfig(root,current=>{
+      signal?.throwIfAborted();
+      if(current.skills.activeVersion!==active)
+        throw Object.assign(new Error('Active skills changed during evaluation'),{code:'SKILL_BASE_CHANGED'});
+      return {...current,skills:{...current.skills,activeVersion:candidate}};
+    });
+  } catch(error) {
+    if(error.code==='SKILL_BASE_CHANGED')return null;
+    throw error;
+  }
 }
