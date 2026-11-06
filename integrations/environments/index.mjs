@@ -175,6 +175,15 @@ export async function createEnvironment(options, context) {
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
+  let capabilities;
+  async function discoverCapabilities() {
+    if(!capabilities) {
+      const result=await client(['capabilities',options.target]);
+      if(result.state!=='available')throw new Error('CPL target unavailable');
+      capabilities=result;
+    }
+    return capabilities;
+  }
   const executionReceipts = new Map();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     '\nNative bash/read/write/edit operate in the LOCAL project; use them for persistent source edits. rsi_target executes commands in the configured target environment.' +
@@ -302,9 +311,14 @@ export async function createEnvironment(options, context) {
   }
   async function transfer(args, dir, signal = context.signal) {
     const upload = args[0] === 'upload';
-    if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
-    else args.push('--timeout', '0');
-    let result = await submit(args, upload ? join(dir, 'transfer.json') : undefined, true, true, signal);
+    const synchronous=(await discoverCapabilities()).backend==='ssh';
+    if (!synchronous) {
+      if (upload) args.push('--receipt-file', join(dir, 'transfer.json'), '--no-wait');
+      else args.push('--timeout', '0');
+    }
+    let result = await submit(args, upload&&!synchronous ? join(dir, 'transfer.json') : undefined, true, true, signal);
+    if(synchronous&&(result.state!=='completed'||result.handle))
+      throw new Error('Synchronous transfer unresolved; retain any returned handle before retry');
     const handle = result.handle;
     if (handle) {
       await event('execution-handle', { handle, purpose: 'transfer' });
@@ -590,8 +604,7 @@ export async function createEnvironment(options, context) {
           for (const file of verifierFiles) frozen.push({ local: file,
             remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
             sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
-          const capabilities = await client(['capabilities', options.target]);
-          if (capabilities.state !== 'available') throw new Error('CPL target unavailable');
+          await discoverCapabilities();
           if ((await client(['preflight', options.target])).state !== 'completed') throw new Error('CPL preflight failed');
           for (const file of frozen) await exclude('transfer', async () => {
             const dir = await mkdtemp(join(root, 'verifier-'));
