@@ -402,7 +402,7 @@ export async function operate(command,config,options={}) {
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
         if(config.campaign_plan&&!job.finalize&&!job.resume) {
-          if(progress.done)return false;
+          if(progress.done&&(options.continuous||job.kind==='original'))return false;
           if(job.kind==='original' && (job.project.spec.campaign_entry!==progress.currentEntry?.id ||
             progress.currentEntry.remainingAdmissions===0))return false;
         }

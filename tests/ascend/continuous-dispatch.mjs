@@ -97,5 +97,23 @@ test('finite campaign leaves final failed originals queued for recovery',{timeou
   assert.equal(f.rows('SELECT * FROM recovery_queue').length,1);
   assert.equal(f.rows('SELECT * FROM recovery_attempts').length,0);
   assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
+  const original=f.rows('SELECT * FROM attempts')[0];
+  const cursor=f.rows("SELECT value FROM control WHERE key='campaign-plan'")[0].value;
+  await f.config({mode:'phase2'});
+  await f.run('wave','--mode','revisit');
+  const investigations=f.rows("SELECT * FROM recovery_attempts WHERE kind='investigation'");
+  assert.equal(investigations.length,1);
+  const admission=f.rows("SELECT data FROM events WHERE attempt=? AND type='job-admitted'",
+    'state.sqlite',[investigations[0].attempt])[0];
+  assert.equal(JSON.parse(admission.data).mode,'phase1','revisit preserves the origin phase');
+  assert.equal(f.rows('SELECT * FROM attempts').length,2,'no original is replayed');
+  const pending=f.rows('SELECT * FROM recovery_queue');
+  assert.equal(pending.length,1,'failed investigation remains pending for a later explicit wave');
+  assert.equal(pending[0].origin,original.id);
+  assert.equal(pending[0].failed_rounds,1);
+  assert.equal(pending[0].attempt,null);
+  assert.equal(f.rows("SELECT value FROM control WHERE key='campaign-plan'")[0].value,cursor);
+  assert.equal((await f.run('status')).progress.done,true);
+  assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
   passed=true;
 });
