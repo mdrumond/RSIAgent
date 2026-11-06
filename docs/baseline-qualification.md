@@ -78,3 +78,21 @@ unchanged. The manifest declares this adapter; source and verifier hashes bind i
 Reduced CPU tests reproduce the native-branch FP16 failure and exercise the repaired
 branch across FP16/BF16/FP32. They do not establish NPU behavior; fresh full A3 and A5
 qualification is required before launch.
+
+## Five-case Phase 2 campaigns
+
+`ascend_tools.phase2_focus.prepare_focused_project` creates a Phase 2 project whose
+iteration checks and final score cover exactly five cases. It ranks the target's
+fully qualified baseline cases by descending median of the twenty synchronized
+device-call samples, breaking ties by ascending case ID. A3 and A5 select their
+own cases. The project instructions list the selected IDs and measured medians.
+
+The protected two-file verifier bundle binds this selection to the complete
+qualification receipt and records `evaluationScope`, including selected cases,
+full qualified case count and a scope hash. Correctness must pass for all five;
+performance requires geometric-mean paired speedup greater than one across those
+same five cases. A focused pass is not a full-suite score. Numerical tolerances,
+dtype/structure/placement checks, mutation checks and the five-warmup/twenty-sample
+paired timing protocol remain unchanged. The original `prepare_project` API still
+creates full-case projects. Complete qualification evidence remains reusable:
+the focused selector/scorer lives outside the immutable baseline package.
