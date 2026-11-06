@@ -1,0 +1,99 @@
+{
+  "category": "FusedComposite",
+  "difficulty": "L5",
+  "name": "KimiDeltaAttention",
+  "description": "Kimi Delta Attention\u7684\u95e8\u63a7\u72b6\u6001\u9012\u63a8\u6838\u5fc3\uff1b\u53ef\u9009QK\u5f52\u4e00\u5316\uff1b\u8f93\u51fa\u5e8f\u5217\u53ca\u6700\u7ec8\u72b6\u6001\u3002",
+  "formula": "Q,K optionally x/sqrt(sum(x*x)+1e-6); A=diag(exp(g_t)); Hbar=A@Hprev; r=v_t-k_t^T@Hbar; H=Hbar+beta_t*k_t@r^T; y_t=scale*q_t^T@H",
+  "shape_support": "q,k,g:[B,T,H,Dk]; v:[B,T,H,Dv]; beta:[B,T,H]; state:[B,H,Dk,Dv]; equal Q/K/V head counts",
+  "inputs": [
+    {
+      "name": "q",
+      "shape": "[B,T,H,Dk]",
+      "dtype": [
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "description": "\u672a\u5f52\u4e00\u5316\u6216\u6309\u5c5e\u6027\u76f4\u63a5\u4f7f\u7528\u7684\u67e5\u8be2"
+    },
+    {
+      "name": "k",
+      "shape": "[B,T,H,Dk]",
+      "dtype": [
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "description": "\u952e\uff1b\u5f52\u4e00\u5316\u5c5e\u4e8e\u88ab\u6d4b\u8ba1\u7b97"
+    },
+    {
+      "name": "v",
+      "shape": "[B,T,H,Dv]",
+      "dtype": [
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "description": "\u503c"
+    },
+    {
+      "name": "g",
+      "shape": "[B,T,H,Dk]",
+      "dtype": [
+        "float32"
+      ],
+      "description": "\u9010token\u9010key\u901a\u9053\u81ea\u7136\u5bf9\u6570\u8870\u51cf\uff1b\u4e0d\u662f\u7d2f\u8ba1gate"
+    },
+    {
+      "name": "beta",
+      "shape": "[B,T,H]",
+      "dtype": [
+        "float32"
+      ],
+      "description": "\u76f4\u63a5\u7ed9\u5b9a\u5199\u5165\u5f3a\u5ea6[0,1]\uff1b\u4e0d\u518dsigmoid"
+    },
+    {
+      "name": "initial_state",
+      "shape": "[B,H,Dk,Dv]",
+      "dtype": [
+        "float32"
+      ],
+      "description": "\u5fc5\u9009\u521d\u6001\uff1b\u65e0\u5386\u53f2\u65f6\u4f20\u96f6\u5f20\u91cf\uff1b\u4e0d\u53ef\u539f\u5730\u4fee\u6539"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B,T,H,Dv]",
+      "dtype": [
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "description": "dtype\u4e0eq\u4e00\u81f4"
+    },
+    {
+      "name": "final_state",
+      "shape": "[B,H,Dk,Dv]",
+      "dtype": [
+        "float32"
+      ],
+      "description": "\u672b\u6001\uff1b\u5fc5\u987b\u53c2\u4e0e\u7cbe\u5ea6\u6bd4\u8f83"
+    }
+  ],
+  "attrs": [
+    {
+      "name": "use_qk_l2norm",
+      "type": "bool",
+      "default": true,
+      "description": "\u662f\u5426\u5728\u6838\u5fc3\u4e2d\u5bf9Q/K\u6309sum(x\u00b2)+1e-6\u5f52\u4e00\u5316"
+    },
+    {
+      "name": "scaleValue",
+      "type": "float",
+      "default": -1.0,
+      "description": "<=0\u81ea\u52a81/sqrt(Dk)\uff1b>0\u4f7f\u7528\u663e\u5f0f\u503c\uff1b\u4ec5\u7f29\u653e\u8bfb\u53d6\u8f93\u51fa"
+    }
+  ],
+  "schema": "kimi_delta_attention(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor initial_state, bool use_qk_l2norm=True, float scaleValue=-1.0) -> (Tensor y, Tensor final_state)"
+}

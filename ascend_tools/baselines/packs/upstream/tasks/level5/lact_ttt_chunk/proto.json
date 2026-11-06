@@ -1,0 +1,151 @@
+{
+  "name": "LactTttChunk",
+  "category": "FusedComposite",
+  "difficulty": "L5",
+  "formula": "q\u0302, k\u0302 = q, k \u6cbf D \u505a L2 \u5f52\u4e00\u5316\uff08eps 1e-6\uff09\uff1b\u5feb\u6743\u91cd f_W(x) = W2 [SiLU(W1 x) \u2299 (W3 x)]\n\u5e8f\u5217\u6309 chunk_size \u5207\u5757\uff0c\u5bf9\u6bcf\u5757 I_c\uff08update_first=False \u65f6\u5148 apply \u540e update\uff09\uff1a\n  apply:  y_t = f_{W^{(c)}}(q\u0302_t)\uff0ct \u2208 I_c\n  update: \u2112 = \u03a3_{i\u2208I_c} lr_i \u00b7 (\u2212f_W(k\u0302_i)\u1d40 v_i)\uff0cg = \u2207_W \u2112\uff08W1/W2/W3 \u95ed\u5f0f\u68af\u5ea6\uff09\n          \u0394 = Muon(g)\uff08use_muon=True\uff0cNewton\u2013Schulz 5 \u6b65 zeropower\uff09\u6216 g\n          W \u2190 RowL2Normalize(W \u2212 \u0394)\uff08\u9010\u8f93\u51fa\u795e\u7ecf\u5143 L2 \u5f52\u4e00\uff0ceps 1e-6\uff09\n\u8f93\u51fa y \u4e0e\u6700\u7ec8\u5feb\u6743\u91cd w1_out / w2_out / w3_out\n",
+  "description": "Large-Chunk Test-Time Training\uff08LaCT\uff09\u5c42\u524d\u5411\uff0cSwiGLU \u5feb\u6743\u91cd\u4ee5\u5927 chunk \u4e3a\u5355\u4f4d\u505a\u4e00\u6b65\u68af\u5ea6\u66f4\u65b0\uff08\u53ef\u9009 Muon \u6b63\u4ea4\u5316\uff09",
+  "shape_support": "q/k/v [B, L, H, D]\uff0cw1/w3 [B, H, Dh, D]\uff0cw2 [B, H, D, Dh]\uff0clr [B, L, H]\uff1b\u8f93\u51fa y [B, L, H, D]\uff0cw1_out/w2_out/w3_out \u4e0e\u8f93\u5165\u5feb\u6743\u91cd\u540c shape",
+  "precision_thresholds": {
+    "float32": 0.001,
+    "float16": 0.005,
+    "bfloat16": 0.02
+  },
+  "attrs": [
+    {
+      "name": "chunk_size",
+      "type": "int",
+      "default": 2048,
+      "description": "TTT \u5757\u5927\u5c0f C\uff0c\u5e8f\u5217\u6309 C \u5207\u5757\u3001\u672b\u5757\u6309\u5b9e\u9645\u957f\u5ea6\u5904\u7406\uff1b\u5f71\u54cd\u6570\u5b66\u7ed3\u679c\uff08\u6bcf\u5757\u4e00\u6b65\u6743\u91cd\u66f4\u65b0\uff09",
+      "required": false
+    },
+    {
+      "name": "use_muon",
+      "type": "bool",
+      "default": false,
+      "description": "True \u65f6\u6743\u91cd\u589e\u91cf \u0394 = Muon(g)\uff08Newton\u2013Schulz 5 \u6b65 zeropower\uff0c\u7cfb\u6570 a=3.4445, b=\u22124.7750, c=2.0315\uff09\uff0cFalse \u65f6 \u0394 = g",
+      "required": false
+    },
+    {
+      "name": "update_first",
+      "type": "bool",
+      "default": false,
+      "description": "False \u4e3a apply-then-update\uff08\u56e0\u679c\uff0c\u5757\u5185\u7528\u8fdb\u5165\u8be5\u5757\u524d\u7684\u6743\u91cd\uff09\uff0cTrue \u4e3a update-then-apply\uff08\u53cc\u5411\uff0c\u5757\u5185\u53ef\u89c1\u672a\u6765\uff09",
+      "required": false
+    }
+  ],
+  "inputs": [
+    {
+      "name": "q",
+      "description": "\u67e5\u8be2\u5f20\u91cf\uff0c\u7b97\u5b50\u5185\u90e8\u6cbf D \u505a L2 \u5f52\u4e00\u5316\u540e\u9001\u5165\u5feb\u6743\u91cd\u7f51\u7edc",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, L, H, D]"
+    },
+    {
+      "name": "k",
+      "description": "\u952e\u5f20\u91cf\uff0c\u7b97\u5b50\u5185\u90e8\u6cbf D \u505a L2 \u5f52\u4e00\u5316\u540e\u4f5c\u4e3a\u5feb\u6743\u91cd\u66f4\u65b0\u7684\u8f93\u5165",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, L, H, D]"
+    },
+    {
+      "name": "v",
+      "description": "\u503c\u5f20\u91cf\uff0c\u5feb\u6743\u91cd\u66f4\u65b0\u7684\u56de\u5f52\u76ee\u6807\uff08\u8d1f\u5185\u79ef\u635f\u5931\uff09",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, L, H, D]"
+    },
+    {
+      "name": "w1",
+      "description": "\u5feb\u6743\u91cd W1\uff08SwiGLU \u95e8\u5206\u652f\uff09\uff0c\u9010\u6837\u672c\u3001\u9010\u5934\u72ec\u7acb",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, Dh, D]"
+    },
+    {
+      "name": "w2",
+      "description": "\u5feb\u6743\u91cd W2\uff08\u8f93\u51fa\u6295\u5f71\uff09\uff0c\u9010\u6837\u672c\u3001\u9010\u5934\u72ec\u7acb",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, D, Dh]"
+    },
+    {
+      "name": "w3",
+      "description": "\u5feb\u6743\u91cd W3\uff08SwiGLU \u7ebf\u6027\u5206\u652f\uff09\uff0c\u9010\u6837\u672c\u3001\u9010\u5934\u72ec\u7acb",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, Dh, D]"
+    },
+    {
+      "name": "lr",
+      "description": "\u9010 token \u9010\u5934\u5b66\u4e60\u7387\uff0c\u8981\u6c42\u6052\u6b63\uff08\u8bc4\u6d4b\u53d6\u503c\u8303\u56f4 [0.001, 0.05]\uff09",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, L, H]"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "description": "\u8f93\u51fa\u5e8f\u5217 y_t = f_W(q\u0302_t)\uff0cdtype \u4e0e q \u4e00\u81f4",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, L, H, D]"
+    },
+    {
+      "name": "w1_out",
+      "description": "\u5e8f\u5217\u672b\u5c3e\u7684\u5feb\u6743\u91cd W1\uff0cdtype \u4e0e q \u4e00\u81f4",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, Dh, D]"
+    },
+    {
+      "name": "w2_out",
+      "description": "\u5e8f\u5217\u672b\u5c3e\u7684\u5feb\u6743\u91cd W2\uff0cdtype \u4e0e q \u4e00\u81f4",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, D, Dh]"
+    },
+    {
+      "name": "w3_out",
+      "description": "\u5e8f\u5217\u672b\u5c3e\u7684\u5feb\u6743\u91cd W3\uff0cdtype \u4e0e q \u4e00\u81f4",
+      "dtype": [
+        "float32",
+        "float16",
+        "bfloat16"
+      ],
+      "shape": "[B, H, Dh, D]"
+    }
+  ],
+  "schema": "lact_ttt_chunk(Tensor q, Tensor k, Tensor v, Tensor w1, Tensor w2, Tensor w3, Tensor lr, int chunk_size=2048, bool use_muon=False, bool update_first=False) -> (Tensor y, Tensor w1_out, Tensor w2_out, Tensor w3_out)"
+}

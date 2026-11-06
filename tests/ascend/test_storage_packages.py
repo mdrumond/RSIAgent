@@ -167,7 +167,33 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output(['git', '--git-dir', str(restored), 'rev-parse', ref], text=True).strip(), tree)
 
     def test_sqlite_ledger_many_events_is_bounded_and_preserves_schema(self):
-        count = 12000
+        # Trace only the storage workload in a fresh interpreter: pytest plugins
+        # and other collected modules can allocate lazily in this process.
+        probe = os.environ.get('RSI_PACKAGE_MEMORY_PROBE')
+        if probe is None:
+            peaks = []
+            for count in (1200, 12000):
+                env = dict(os.environ, RSI_PACKAGE_MEMORY_PROBE=str(count))
+                script = (
+                    'import sys, unittest; '
+                    'sys.path.insert(0, "tests/ascend"); '
+                    'import test_storage_packages as t; '
+                    'suite=unittest.TestSuite([t.PackageTests('
+                    '"test_sqlite_ledger_many_events_is_bounded_and_preserves_schema")]); '
+                    'result=unittest.TextTestRunner().run(suite); '
+                    'sys.exit(not result.wasSuccessful())'
+                )
+                run = subprocess.run([sys.executable, '-c', script], env=env,
+                                     capture_output=True, text=True, timeout=120)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                measurement = json.loads(run.stdout)
+                self.assertEqual(measurement['count'], count)
+                peaks.append(measurement['peak'])
+            # A tenfold ledger must not require retaining its added ~22 MiB of
+            # event text. Allow only small fixed bookkeeping/cache variation.
+            self.assertLess(peaks[1] - peaks[0], 2 * 1024 * 1024, peaks)
+            return
+        count = int(probe)
         payload = json.dumps({'text': 'x' * 2048, 'owner': 'private-owner',
                               'executed_source': str(self.source / 'kernel.py')})
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
@@ -202,6 +228,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 1)
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 2)
+        print(json.dumps({'count': count, 'peak': peak}))
 
     def automatic_fixture(self):
         (self.root / 'package-inputs.json').unlink()

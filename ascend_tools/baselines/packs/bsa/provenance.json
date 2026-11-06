@@ -1,0 +1,8 @@
+{
+  "origin": "supplied-reference",
+  "description": "Original supplied PyTorch benchmark contract, unchanged; no optimized kernels or historical results.",
+  "files": {
+    "baseline.py": "37db28c5be1b5af617dcc556cdf26d33667f90db6c56f177099a61727ca65c6e",
+    "baseline.json": "63f2c51b7d5552313979f8620688910b1d73c1c492140ad0473fcc6f26e11806"
+  }
+}
