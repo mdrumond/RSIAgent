@@ -126,6 +126,8 @@ export async function run(config, values = {}) {
     if(storage) await storage.initializeStorageKnowledge(config,undefined,{serialized:true,signal:values.signal});
     const result = await tune({ instanceRoot, config, configPath: values.configPath ?? join(instanceRoot, 'instance.json'),
       task, userinfo, manual, context, evaluate, generate: values.generate ?? generate, native: values.native, signal: values.signal,
+      prepareCandidate: storage ? request=>storage.recordStorageSkill(config,request.candidate,{serialized:true,
+        signal:values.signal,baseVersion:request.active,reason:'awaiting-evaluation'}) : undefined,
       publish: values.publish ?? (request=>publishSkillVersion(instanceRoot,request)), background: values.background, evidenceTasks: values.evidenceTasks, backgroundSeconds: values.backgroundSeconds, backgroundResource: values.backgroundResource, clock: values.clock,
       evaluationSeconds: values.evaluationSeconds ?? action.evaluationSeconds, allocationId: values.allocationId ?? action.allocationId });
     if(storage) {
@@ -145,7 +147,7 @@ export async function run(config, values = {}) {
 
 // Curriculum updates and skill publication serialize through the same config ledger.
 export async function publishSkillVersion(root,{active,candidate,signal}) {
-  const {updateConfig}=await import('./instance.mjs');
+  const {updateConfigImmediate:updateConfig}=await import('./instance.mjs');
   try {
     return await updateConfig(root,current=>{
       signal?.throwIfAborted();

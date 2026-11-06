@@ -301,9 +301,11 @@ export async function createEnvironment(options, context) {
   async function resources({target} = {}) {
     if (target && target !== options.target && target !== options.profile) return [];
     const devices = await enabled({hostSlots:true});
-    if (!devices.length) return [];
-    return devices.map((_, slot) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
-      available: true, metadata: {kind:'host-slot', pool, target:options.target,
+    const slots=reserved===undefined?devices.map((_,slot)=>({slot,available:true})):
+      [{slot:0,available:devices.includes(reserved)},
+        ...devices.filter(id=>id!==reserved).map((_,index)=>({slot:index+1,available:true}))];
+    return slots.map(({slot,available}) => ({ id: 'ascend-host-' + digest(JSON.stringify([pool, slot])),
+      available, metadata: {kind:'host-slot', pool, target:options.target,
         ...(reserved===undefined?{}:{hostSlot:slot,backgroundSlot:slot===0})} }));
   }
   let commandActive=false, controlEnvironment;
