@@ -130,3 +130,27 @@ test('ready bootstrap receipts cannot settle live controllers, workers or unclos
     assert.equal(await settled({instanceRoot:root}),true);
   }finally{state.close();}
 });
+
+test('a minted local handle without a process receipt remains fenced despite stopped host owners',async t=>{
+  const round=await mkdtemp(join(tmpdir(),'evaluation-prelaunch-fence-'));t.after(()=>rm(round,{recursive:true,force:true}));
+  const root=join(round,'sample'),inputs=join(round,'inputs');
+  for(const path of [inputs,root])await managedBootstrap(path,{binding:{source:'frozen'}},async()=>{await mkdir(path);});
+  await writeFile(join(root,'instance.json'),JSON.stringify({format:1,mode:'phase2',environment:{
+    module:new URL('../../integrations/environments/index.mjs',import.meta.url).pathname,options:{mode:'local'}}}));
+  const state=new State(join(root,'state.sqlite'));
+  try {
+    state.add({id:'p',goal:'retain prelaunch uncertainty',actor_seconds:5});
+    const attempt=state.admit('p',{pid:2147483647,start:'old',boot:'old'});
+    state.event(attempt.id,'accepted',{});state.finish(attempt.id,'passed');
+    const path=join(root,'attempts',attempt.id),execution=join(path,'.executions','exec-prelaunch');
+    await mkdir(execution,{recursive:true});await writeFile(join(path,'job.json'),JSON.stringify({resource:{id:'local'}}));
+    const identity=await processIdentity();
+    await writeFile(join(execution,'execution.json'),JSON.stringify({boot:identity.boot,cwd:root}));
+    state.event(attempt.id,'execution-handle',{handle:'local:exec-prelaunch'});
+    assert.equal(await bootstrapSettled(root),true);assert.equal(await bootstrapSettled(inputs),true);
+    assert.equal(await settled({instanceRoot:root}),false);
+    await assert.rejects(resume({instanceRoot:root}),/execution remains unresolved/);
+    await assert.rejects(readFile(join(execution,'identity')),{code:'ENOENT'});
+    assert.equal(state.db.prepare('SELECT count(*) AS n FROM attempts').get().n,1);
+  }finally{state.close();}
+});
