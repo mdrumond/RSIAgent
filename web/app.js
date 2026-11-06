@@ -6,6 +6,75 @@ const fields = ['skillsmap', 'curriculum', 'environment'];
 let dirty = false;
 let loadedMode;
 let needsReload = false;
+let campaignPlan = [];
+let campaignProgress;
+let planLoaded = false;
+
+function lockedThrough() {
+  if (!planLoaded) return Infinity;
+  return (campaignProgress?.plan?.lockedPrefix ?? 0) - 1;
+}
+
+function renderPlan(rebuild = false) {
+  if (!rebuild) {
+    [...el('campaign-entries').children].forEach((row, index) => {
+      const locked = index <= lockedThrough();
+      for (let column = 0; column < 3; column++) row.children[column].children[0].disabled = locked;
+      row.children[3].disabled = locked || index - 1 <= lockedThrough();
+      row.children[4].disabled = locked || index + 1 >= campaignPlan.length;
+      row.children[5].disabled = locked;
+    });
+    el('campaign-add').disabled = !planLoaded;
+    return;
+  }
+  el('campaign-entries').replaceChildren();
+  campaignPlan.forEach((entry, index) => {
+    const row = document.createElement('div');
+    const locked = index <= lockedThrough();
+    const input = (key, type) => {
+      const label = document.createElement('label');
+      label.textContent = key;
+      const field = document.createElement(type === 'select' ? 'select' : 'input');
+      if (type === 'select') for (const phase of ['phase1', 'phase2', 'inference']) {
+        const option = document.createElement('option');
+        option.value = phase; option.textContent = phase; field.append(option);
+      }
+      else field.type = type;
+      if (type === 'number') { field.min = '1'; field.step = '1'; }
+      field.value = entry[key]; field.disabled = locked;
+      field.oninput = field.onchange = () => {
+        if (index <= lockedThrough()) return renderPlan();
+        entry[key] = type === 'number' ? Number(field.value) : field.value;
+        dirty = true;
+      };
+      label.append(field); row.append(label);
+    };
+    input('id', 'text'); input('phase', 'select'); input('new_projects', 'number');
+    for (const [title, offset] of [['Move up', -1], ['Move down', 1], ['Remove', 0]]) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = title;
+      const destination = index + offset;
+      button.disabled = locked || destination <= lockedThrough() || destination >= campaignPlan.length;
+      button.onclick = () => {
+        if (index <= lockedThrough() || destination <= lockedThrough()) return;
+        if (!offset) campaignPlan.splice(index, 1);
+        else [campaignPlan[index], campaignPlan[destination]] = [campaignPlan[destination], campaignPlan[index]];
+        dirty = true; renderPlan(true);
+      };
+      row.append(button);
+    }
+    el('campaign-entries').append(row);
+  });
+  el('campaign-add').disabled = !planLoaded;
+}
+
+el('campaign-add').onclick = () => {
+  if (!planLoaded) return;
+  let suffix = 1;
+  while (campaignPlan.some(entry => entry.id === `entry-${suffix}`)) suffix++;
+  campaignPlan.push({id: `entry-${suffix}`, phase: 'phase1', new_projects: 1});
+  dirty = true; renderPlan(true);
+};
 
 async function api(path, method = 'GET', data) {
   const response = await fetch(`/api/${path}`, {
@@ -28,6 +97,7 @@ async function perform(action) {
     el('message').textContent = error.message;
   } finally {
     buttons.forEach(button => { button.disabled = false; });
+    renderPlan();
   }
 }
 
@@ -36,6 +106,9 @@ function loadFields(config) {
   if (loadedMode !== mode) el('mode').value = mode;
   loadedMode = mode;
   el('config').value = format(config);
+  campaignPlan = JSON.parse(JSON.stringify(config.campaign_plan ?? []));
+  renderPlan(true);
+  el('skills-status').textContent = format(config.skills ?? {});
   el('baseline').value = config.baselineKDB ?? '';
   const scopes = Object.keys(config.skillsmap ?? {});
   const selected = el('skill-scope').value;
@@ -74,6 +147,14 @@ function table(title, rows) {
 
 async function refresh() {
   const state = await api('status');
+  campaignProgress = state.progress;
+  planLoaded = true;
+  renderPlan();
+  if (state.skills) el('skills-status').textContent = format({ ...state.skills,
+    candidateState: !state.skills.candidate ? null : state.skills.candidate === state.skills.activeVersion
+      ? 'active' : state.skills.candidateDecision ?? 'unknown'});
+  el('campaign-status').textContent = format({currentEntry: campaignProgress?.currentEntry ?? null,
+    progress: campaignProgress, recoveriesIncludingCarriedWork: state.recoveries ?? []});
   el('status').replaceChildren();
   table('Controller / wave', state.controller);
   table('Phase progress', state.progress);
@@ -92,6 +173,7 @@ el('settings').onsubmit = event => {
   perform(async () => {
     if (needsReload) throw new Error('Reload settings before saving; your edits are still available');
     const config = parse('config');
+    if (campaignPlan.length || config.campaign_plan !== undefined) config.campaign_plan = JSON.parse(JSON.stringify(campaignPlan));
     config.baselineKDB = el('baseline').value;
     fields.forEach(key => { config[key] = parse(key); });
     const actors = parse('actors');
@@ -123,7 +205,7 @@ for (const action of ['load', 'save']) {
 }
 for (const action of ['wave', 'campaign', 'pause', 'stop', 'resume']) {
   el(action).onclick = () => perform(async () => {
-    if (dirty && ['wave', 'campaign'].includes(action)) throw new Error('Save settings before starting');
+    if (dirty && ['wave', 'campaign', 'resume'].includes(action)) throw new Error('Save settings before starting');
     const value = await api(action, 'POST', ['wave', 'campaign'].includes(action) ? {mode: el('mode').value} : {});
     el('action-result').textContent = format(value);
     await refresh();

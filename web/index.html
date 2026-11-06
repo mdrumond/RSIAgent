@@ -18,6 +18,10 @@
 <button id="reload-settings" type="button">Reload settings (discard edits)</button>
 <p id="settings-conflict" role="alert" hidden>Settings changed on the server. Your edits remain here; copy any you want to keep, then reload settings before saving.</p>
 <form id="settings">
+<h3>Ordered campaign plan</h3>
+<p>IDs are stable batch identities. Edit future entries here; started entries are locked by progress and validated by the CLI. Save appended entries before resuming.</p>
+<div id="campaign-entries"></div><button id="campaign-add" type="button">Append entry</button>
+<pre id="campaign-status"></pre>
 <label>Baseline KDB path <input id="baseline" type="text"></label>
 <label>Skills map (JSON) <textarea id="skillsmap" rows="4"></textarea></label>
 <label>Curriculum (JSON) <textarea id="curriculum" rows="4"></textarea></label>
@@ -28,13 +32,14 @@
 <button id="apply" type="button">Apply JSON to fields</button><button type="submit">Save settings</button>
 </form></section>
 <section><h2>Skill content</h2>
+<pre id="skills-status"></pre>
 <label>Scope <select id="skill-scope"></select></label>
 <button id="skill-load" type="button">Load skill</button>
 <label>Content <textarea id="skill-content" rows="12"></textarea></label>
 <button id="skill-save" type="button">Save new skill version</button></section>
 <section><h2>Folder browser</h2><form id="browse"><label>Path <input id="path" value="."></label><button>Browse</button></form>
 <p>Paths are resolved by the configured CLI environment. Select a folder to browse it.</p><div id="folders"></div><pre id="browse-result"></pre></section>
-<section><h2>Add project</h2><form id="project-form"><label>Project specification (JSON)
+<section><h2>Add project</h2><p>For an ordered plan, set <code>campaign_entry</code> in the project JSON to its entry ID. Optional <code>phase</code> must match that entry.</p><form id="project-form"><label>Project specification (JSON)
 <textarea id="project" rows="8">{"id":"","goal":"","source":"","target":"","actor_seconds":28800,"verifier":{}}</textarea></label><button>Add project</button></form></section>
 <section><h2>Skilltune</h2><form id="tune-form"><label>User information <textarea id="userinfo" rows="4"></textarea></label>
 <label>Action (JSON) <textarea id="tune-action" rows="3">{}</textarea></label>
