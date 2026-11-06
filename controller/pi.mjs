@@ -78,9 +78,12 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
       return response;
     } catch(error) {
       const closure=error.closure;
+      const reason=closure?.reason;
+      const terminalSshUpload=reason?.backend==='ssh'&&reason.operation==='upload'&&reason.state==='failed'&&
+        Number.isInteger(reason.exit)&&reason.exit!==0&&reason.handle==null;
       if(['SETUP_CLOSED','CPL_NOT_ADMITTED'].includes(error.code) && closure?.closed===true &&
           closure.payloadStarted===false && Array.isArray(closure.handles) &&
-          (error.code==='CPL_NOT_ADMITTED'||closure.handles.length>0)) {
+          (error.code==='CPL_NOT_ADMITTED'||closure.handles.length>0||terminalSshUpload)) {
         state.checkpoint(attempt.id,clock.elapsed);
         event('execution-settled',{operation,startElapsed,handle:closure.handles[0]??null,
           setupClosure:closure,message:error.message});

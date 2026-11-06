@@ -131,7 +131,7 @@ async function writeVersion(root, entries, source) {
 // instance, execute its canonical original wave, retain raw/SFT/evidence there, and return
 // {correct:boolean,score:number} (higher is better). No releases are read or adopted.
 export async function tune({ instanceRoot, config, configPath = join(instanceRoot, 'instance.json'),
-  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock, background = false, evidenceTasks = [], backgroundSeconds, backgroundResource, publish }) {
+  task, userinfo, manual = false, context = {}, evaluate, generate = generateCandidate, native, modelRuntime, model, signal, evaluationSeconds, allocationId, clock, background = false, evidenceTasks = [], backgroundSeconds, backgroundResource, publish, prepareCandidate }) {
   signal?.throwIfAborted();
   const current = await json(configPath);
   const mode = background ? 'phase2' : task?.phase ?? config?.mode ?? current.mode;
@@ -224,6 +224,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     if (!Array.isArray(changes)) throw new Error('Candidate must contain changes array');
     const updated = validate(changes);
     const candidate = await writeVersion(root, updated, source);
+    await prepareCandidate?.({active,candidate});
     signal?.throwIfAborted();
     state.history = history;
     state.pending = shouldEvaluate && (background || current.skills?.evaluationSeconds !== undefined)
@@ -252,6 +253,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     state.allocations[allocationId] = { seconds: evaluationSeconds, evaluationRoot: pending.evaluationRoot };
   }
   await save(statePath, state, signal);
+  await prepareCandidate?.({active:pending.active,candidate:pending.candidate});
   const retainIncoming = async () => {
     if (decision.analyse && !state.history.some(x => x.id === task?.id)) state.history.push(compactTask(task));
     await save(statePath, state);
