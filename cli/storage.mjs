@@ -63,6 +63,7 @@ export async function sealClosedArtifacts(config,action={}) {
 // Writer admission must check pack-capture in the same transaction that claims
 // its owner. Keep this claim through sealing and the delegated Python capture.
 export async function assertPackAvailable(state) {
+  if(!state.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control'").get())return;
   const row=state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get();
   if(row&&!await ownerStopped(row.value))throw new Error('Pack capture active; writer admission refused');
 }
@@ -76,8 +77,9 @@ export async function withPackCapture(config,operation) {
     try {
       const capture=state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get();
       if(capture&&!await ownerStopped(capture.value))throw new Error('Pack capture already active or unresolved');
-      for(const row of state.db.prepare("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance')").all()) {
+      for(const row of state.db.prepare("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')").all()) {
         const owner=JSON.parse(row.value);
+        if(owner===null)continue;
         if(row.key==='storage-maintenance'&&owner.pid===me.pid&&owner.start===me.start&&owner.boot===me.boot)continue;
         if(!await ownerStopped(owner))throw new Error('Pack requires stopped writers: '+row.key);
       }

@@ -335,7 +335,7 @@ class PackageTests(unittest.TestCase):
         from ascend_tools import storage_package
         live = json.dumps(storage_package._identity(os.getpid()))
         for project in (None, 'p'):
-            for key in ('owner', 'skill-writer', 'memory-writer'):
+            for key in ('owner', 'skill-writer', 'memory-writer', 'knowledge-startup'):
                 with self.subTest(project=project, writer=key):
                     with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
                         db.execute('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
@@ -353,6 +353,17 @@ class PackageTests(unittest.TestCase):
             with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
                 db.execute('UPDATE attempts SET owner=?', [json.dumps(dict(pid=os.getpid(),start='old',boot='old'))])
         self.assertFalse(self.package.exists())
+
+    def test_capture_accepts_cleared_owner_but_rejects_unresolved_identity(self):
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            db.execute("INSERT INTO control VALUES('owner','null')")
+        self.assertTrue(pack(self.root, self.package)['complete'])
+        for owner in ({}, {'pid': os.getpid()}):
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                db.execute("UPDATE control SET value=? WHERE key='owner'", [json.dumps(owner)])
+            with self.assertRaisesRegex(ValueError, 'stopped writers'):
+                pack(self.root, self.package)
 
     def test_capture_claim_spans_copy_rejects_competitors_and_releases_on_failure(self):
         from ascend_tools import storage_package

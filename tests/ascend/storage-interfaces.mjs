@@ -31,6 +31,22 @@ async function fixture(t,{live=false,finish=true,postprocess=true,settled=true}=
   return {root,state,storage,row,attempt,call,config};
 }
 
+test('pack admission accepts absent control and capture accepts cleared owner only',async t=>{
+  const f=await fixture(t);
+  f.state.db.exec('DROP TABLE IF EXISTS control');
+  await assertPackAvailable(f.state);
+  f.state.db.exec("CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO control VALUES('owner','null')");
+  let captured=false;
+  await withPackCapture(f.config,async()=>{captured=true;});assert.equal(captured,true);
+  for(const owner of [{},{pid:process.pid}]) {
+    f.state.db.prepare("UPDATE control SET value=? WHERE key='owner'").run(JSON.stringify(owner));
+    await assert.rejects(withPackCapture(f.config,async()=>assert.fail('unresolved writer admitted')),/stopped writers/);
+  }
+  f.state.db.prepare("UPDATE control SET value='null' WHERE key='owner'").run();
+  f.state.db.prepare("INSERT INTO control VALUES('knowledge-startup',?)").run(JSON.stringify(await processIdentity()));
+  await assert.rejects(withPackCapture(f.config,async()=>assert.fail('knowledge startup admitted')),/knowledge-startup/);
+});
+
 test('pack rejects live writers before sealing for campaign and project exports',async t=>{
   const f=await fixture(t,{live:true});
   for(const project of [undefined,'p'])
