@@ -6,6 +6,7 @@ function positive(value) {
 
 // Read-only projection: never changes admission, recovery ownership or config.
 export function campaignProgress(state, config) {
+  if (config.campaign_plan !== undefined) return plannedProgress(state, config);
   const mode = config.mode;
   const sequence = config.phase_sequence ?? [mode];
   if (!phases.includes(mode) || !Array.isArray(sequence) || !sequence.length ||
@@ -71,4 +72,90 @@ export function campaignProgress(state, config) {
   const nextMode = phaseComplete ? sequence[sequence.indexOf(mode) + 1] ?? null : null;
   return {mode, finishedOriginals, totalOriginals, phaseCounts, target, phaseComplete, nextMode,
     done: phaseComplete && nextMode === null};
+}
+
+
+export function validateCampaignPlan(config) {
+  const plan = config.campaign_plan;
+  if (plan === undefined) return;
+  if (!Array.isArray(plan) || !plan.length || plan.some(entry => !entry ||
+      typeof entry.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(entry.id) ||
+      !phases.includes(entry.phase) || !positive(entry.new_projects)) ||
+      new Set(plan.map(entry => entry.id)).size !== plan.length)
+    throw new Error('Invalid campaign plan');
+  for (const project of config.projects ?? []) {
+    const entry = plan.find(entry => entry.id === project.campaign_entry);
+    if (!entry || (project.phase !== undefined && project.phase !== entry.phase))
+      throw new Error('Project requires a matching campaign_entry: ' + project.id);
+  }
+}
+
+// Persisted through the same control ledger as pause, progress and scheduler state.
+// The cursor names a batch, never a phase: repeated phases are independent batches.
+export function syncCampaignPlan(state, config) {
+  validateCampaignPlan(config);
+  state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  const previous = JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='campaign-plan'").get()?.value ?? 'null');
+  if (previous && config.campaign_plan === undefined) throw new Error('Cannot remove a started campaign plan');
+  if (config.campaign_plan === undefined) return null;
+  const cursor = previous?.index ?? 0;
+  if (previous) for (let index = 0; index <= Math.min(cursor, previous.plan.length - 1); index++) {
+    if (JSON.stringify(previous.plan[index]) !== JSON.stringify(config.campaign_plan[index]))
+      throw new Error('Cannot edit or remove a started campaign entry');
+  }
+  for (const project of config.projects ?? []) {
+    const admitted = state.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(project.id);
+    if (admitted && state.project(project.id)?.spec.campaign_entry !== project.campaign_entry)
+      throw new Error('Cannot change campaign_entry of an admitted project');
+  }
+  const value = {plan: config.campaign_plan, index: cursor};
+  state.db.prepare("INSERT OR REPLACE INTO control(key,value) VALUES ('campaign-plan',?)").run(JSON.stringify(value));
+  return value;
+}
+
+// PR3 generation and PR4 status contract. remainingOriginals excludes completed
+// originals; remainingAdmissions also excludes active originals in this batch.
+export function currentCampaignEntry(state, config) {
+  const persisted = syncCampaignPlan(state, config);
+  if (!persisted) return null;
+  const entry = persisted.plan[persisted.index];
+  if (!entry) return null;
+  const hasQueue = state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='recovery_attempts'").get();
+  if (!hasQueue) return {...entry, index: persisted.index, finishedOriginals: 0, totalOriginals: 0,
+    remainingOriginals: entry.new_projects, remainingAdmissions: entry.new_projects};
+  const rows = state.db.prepare(`SELECT DISTINCT a.project FROM attempts a
+    JOIN projects p ON p.id=a.project WHERE json_extract(p.spec,'$.campaign_entry')=?
+    AND NOT EXISTS (SELECT 1 FROM recovery_attempts r WHERE r.attempt=a.id)
+    AND a.outcome IN ('passed','failed')
+    AND EXISTS (SELECT 1 FROM recovery_lessons l WHERE l.attempt=a.id AND l.recorded=1)
+    AND EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed'
+      AND json_valid(e.data) AND json_type(e.data)='object')
+    AND NOT EXISTS (SELECT 1 FROM events e WHERE e.sequence=(SELECT MAX(sequence) FROM events
+      WHERE attempt=a.id AND type='failure-settlement') AND
+      CASE WHEN json_valid(e.data) THEN COALESCE(json_type(e.data,'$.closed')!='true',1) ELSE 1 END)`)
+    .all(entry.id);
+  const total = state.db.prepare(`SELECT COUNT(DISTINCT a.project) n FROM attempts a JOIN projects p ON p.id=a.project
+    WHERE json_extract(p.spec,'$.campaign_entry')=? AND NOT EXISTS
+    (SELECT 1 FROM recovery_attempts r WHERE r.attempt=a.id)`).get(entry.id).n;
+  return {...entry, index: persisted.index, finishedOriginals: rows.length, totalOriginals: total,
+    remainingOriginals: Math.max(0, entry.new_projects - rows.length),
+    remainingAdmissions: Math.max(0, entry.new_projects - total)};
+}
+
+function plannedProgress(state, config) {
+  const entry = currentCampaignEntry(state, config);
+  const phaseComplete = !entry || entry.remainingOriginals === 0;
+  const next = entry && phaseComplete ? config.campaign_plan[entry.index + 1] : null;
+  return {mode: entry?.phase ?? config.mode, currentEntry: entry,
+    finishedOriginals: entry?.finishedOriginals ?? 0, totalOriginals: entry?.totalOriginals ?? 0,
+    target: entry?.new_projects ?? null, phaseComplete, nextMode: next?.phase ?? null,
+    done: phaseComplete && !next};
+}
+
+export function advanceCampaignEntry(state, config) {
+  const progress = plannedProgress(state, config);
+  if (!progress.phaseComplete || !progress.currentEntry) return false;
+  state.db.prepare("UPDATE control SET value=? WHERE key='campaign-plan'")
+    .run(JSON.stringify({plan: config.campaign_plan, index: progress.currentEntry.index + 1}));
+  return true;
 }

@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { selectAdmission } from '../controller/dispatch.mjs';
 import {campaignBudget} from '../controller/campaign-budget.mjs';
-import { campaignProgress } from '../controller/progress.mjs';
+import { campaignProgress, syncCampaignPlan, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
@@ -320,10 +320,22 @@ export async function operate(command,config,options={}) {
       if(ctl.get('stop') || ctl.get('pause') || schedulerAbort.signal.aborted)break;
       const latest=await readConfig(config.root);
       config={...latest,mode:config.mode,recovery:options['no-recovery']?false:latest.recovery};
-      for(const project of config.projects)if(!state.project(project.id))state.add(project);
+      syncCampaignPlan(state,config);
+      for(const project of config.projects) {
+        const existing=state.project(project.id);
+        if(!existing)state.add(project);
+        else if(config.campaign_plan && existing.status==='queued')state.db.prepare('UPDATE projects SET spec=? WHERE id=?')
+          .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry}),project.id);
+      }
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
-      if(options.continuous&&progress.nextMode) {
+      if(config.campaign_plan && progress.currentEntry)config={...config,mode:progress.currentEntry.phase};
+      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&!running.size) {
+        advanceCampaignEntry(state,config);
+        if(progress.done)break;
+        continue;
+      }
+      if(options.continuous&&!config.campaign_plan&&progress.nextMode) {
         await updateConfig(config.root,current=>({...current,mode:progress.nextMode}));
         state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
         config={...config,mode:progress.nextMode};continue;
@@ -387,6 +399,11 @@ export async function operate(command,config,options={}) {
         job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
+        if(config.campaign_plan&&!job.finalize&&!job.resume) {
+          if(progress.done)return false;
+          if(job.kind==='original' && (job.project.spec.campaign_entry!==progress.currentEntry?.id ||
+            progress.currentEntry.remainingAdmissions===0))return false;
+        }
         if(job.attempt&&[...activeJobs.values()].some(active=>active.attempt?.id===job.attempt.id))return false;
         if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
         if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
@@ -408,7 +425,7 @@ export async function operate(command,config,options={}) {
         if(!running.size&&!options.continuous&&!resourceWait)break;
         if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
           !eligible.some(job=>job.finalize||['investigation','retry'].includes(job.kind)))break;
-        ctl.set('wait',resourceWait??{reason:running.size?'actor-capacity':'inputs-or-recovery',at:new Date().toISOString()});
+        ctl.set('wait',resourceWait??{reason:running.size?'actor-capacity':config.campaign_plan?'waiting-inputs':'inputs-or-recovery',at:new Date().toISOString()});
         await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);unavailable.clear();continue;
       }
       if(job.kind==='investigation') {
