@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processIdentity, ownerStopped } from '../controller/lifecycle.mjs';
 import { State } from '../controller/state.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function freePort() {
@@ -44,6 +45,7 @@ export async function ensureKnowledgeService(config,{signal}={}) {
       }
       state.db.exec('BEGIN IMMEDIATE');
       try {
+        await assertPackAvailable(state);
         const current=state.db.prepare('SELECT value FROM control WHERE key=?').get(key);
         if(current?.value!==row?.value){state.db.exec('ROLLBACK');continue;}
         state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run(key,me);

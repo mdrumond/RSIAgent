@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { State, validateAcceptance } from '../controller/state.mjs';
 import { syncCampaignPlan } from '../controller/progress.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -72,6 +73,7 @@ export async function updateConfig(root,change,{activate,rollback}={}) {
   let staged;
   try {
     ledger.db.exec('BEGIN IMMEDIATE');
+    await assertPackAvailable(ledger);
     const current=await readConfig(root),next=await change(current,ledger);
     syncCampaignPlan(ledger,next);
     if(next.format!==1)throw new Error('Current format required');
@@ -126,6 +128,7 @@ export async function upgrade(root,machinery) {
   const ledger=new State(join(root,'state.sqlite'));
   const staged=join(root,'machinery-next-'+randomUUID());
   async function stoppedOwners() {
+    await assertPackAvailable(ledger);
     if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
       for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer')").all()) {
         const owner=JSON.parse(row.value);

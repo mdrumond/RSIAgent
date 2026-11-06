@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { State } from '../controller/state.mjs';
 import { processIdentity,ownerStopped } from '../controller/lifecycle.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 // A short SQLite claim protects files across processes; no transaction spans model work.
 export async function withSkillLock(config,operation,{signal,key='skill-writer'}={}) {
@@ -16,6 +17,7 @@ export async function withSkillLock(config,operation,{signal,key='skill-writer'}
       if(row && !await ownerStopped(JSON.parse(row.value))){await delay(100,undefined,{signal});continue;}
       state.db.exec('BEGIN IMMEDIATE');
       try {
+        await assertPackAvailable(state);
         const current=state.db.prepare('SELECT value FROM control WHERE key=?').get(key);
         if(current?.value!==row?.value){state.db.exec('ROLLBACK');continue;}
         state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run(key,me);

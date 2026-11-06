@@ -48,7 +48,8 @@ export async function bootstrap(request) {
   }
   const project=frozen.projects.find(project=>project.id===request.projectId);
   if(!project)throw new Error('Project not in the frozen evaluation round');
-  const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,...settings}=request.config;
+  const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,
+    campaign_plan:_plan,phase_sequence:_sequence,phase_targets:_targets,completion_target:_target,...settings}=request.config;
   const environment=structuredClone(original.environment);
   request.signal?.throwIfAborted();
   await createInstance(request.instanceRoot,{...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),

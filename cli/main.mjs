@@ -80,7 +80,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
     const map=JSON.parse(await readFile(join(skillRoot,'skill-map.json'),'utf8'));
     if (!values.config)return {...config,skillsmap:map};
     const input=JSON.parse(await readFile(values.config,'utf8'));
-    let staged,archive,activated=false;
+    let staged,archive,baselineState,activated=false;
     try {
       return await updateConfig(root,async(current,ledger)=>{
         if(input.revision!==undefined && input.revision!==(current.revision??0))throw new Error('Inputs changed; refresh before saving');
@@ -93,9 +93,15 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
         delete input.skillsmap;
         if(input.baselineKDB && input.baselineKDB!==current.baselineKDB) {
           if(ledger.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n)throw new Error('Baseline is frozen after first attempt; bootstrap a fresh instance');
+          const {ownerStopped}=await import('../controller/lifecycle.mjs');
+          if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get())
+            for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')").all())
+              if(row.value!=='null'&&!await ownerStopped(JSON.parse(row.value)))throw new Error('Stop campaign and knowledge writers before replacing the baseline');
           staged=join(root,'knowledge-next-'+randomUUID()+'.sqlite');
           const db=new DatabaseSync(input.baselineKDB,{readOnly:true});
           try{db.prepare('VACUUM INTO ?').run(staged);}finally{db.close();}
+          if(current.storage)baselineState=await (await import('../controller/storage-knowledge.mjs'))
+            .prepareStorageBaseline({...current,...input,root},staged,ledger);
         }
         return {...current,...input,format:1};
       },{activate:async()=>{
@@ -115,10 +121,10 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
         }
         archive=join(root,'knowledge-before-'+randomUUID()+'.sqlite');
         await rename(join(root,'knowledge.sqlite'),archive);
-        try{await rename(staged,join(root,'knowledge.sqlite'));activated=true;}
-        catch(error){await rename(archive,join(root,'knowledge.sqlite'));throw error;}
+        try{await rename(staged,join(root,'knowledge.sqlite'));await baselineState?.activate();activated=true;}
+        catch(error){await baselineState?.rollback();await rename(archive,join(root,'knowledge.sqlite'));throw error;}
       },rollback:async()=>{
-        if(activated){await rm(join(root,'knowledge.sqlite'));await rename(archive,join(root,'knowledge.sqlite'));}
+        if(activated){await baselineState?.rollback();await rm(join(root,'knowledge.sqlite'));await rename(archive,join(root,'knowledge.sqlite'));}
       }});
     }finally{if(staged)await rm(staged,{force:true});}
   }

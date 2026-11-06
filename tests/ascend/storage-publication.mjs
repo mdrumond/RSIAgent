@@ -167,3 +167,58 @@ test('baseline export includes active memory only, excluding staged and supersed
  assert.deepEqual(initialized.baseline.collections,['active']);
  assert.deepEqual((await history.readRevision(initialized.baseline.revision)).memory.map(r=>r.lesson),['active']);
 });
+
+test('pre-attempt baseline replacement updates Git provenance and adopts only the new collections',async t=>{
+  const {DatabaseSync}=await import('node:sqlite');
+  const {main}=await import('../../cli/main.mjs');
+  const f=await fixture(t);
+  const seed=(file,name)=>{
+    const db=new DatabaseSync(file);
+    try{
+      db.exec('CREATE TABLE collections(name TEXT,language TEXT);CREATE TABLE chunks(collection TEXT,path TEXT,start_line INTEGER,end_line INTEGER,text TEXT,chunk_id TEXT)');
+      db.prepare('INSERT INTO collections VALUES (?,?)').run(name,'lesson');
+      db.prepare('INSERT INTO chunks VALUES (?,?,?,?,?,?)').run(name,'lesson.json',1,1,JSON.stringify({delivery_id:name,lesson:name,evidence_refs:['evidence://'+name],kind:'good'}),name);
+    }finally{db.close();}
+  };
+  const old=join(f.config.root,'knowledge.sqlite'),next=join(f.config.root,'replacement.sqlite');
+  seed(old,'old');seed(next,'new');
+  const original=await initializeStorageKnowledge(f.config,f.state);
+  const skills=await f.history.state('skills');
+  const input=join(f.config.root,'baseline-input.json');await writeFile(input,JSON.stringify({baselineKDB:next}));
+  await main(['config','--instance',f.config.root,'--config',input]);
+  const changed=await initializeStorageKnowledge(f.config,f.state);
+  assert.deepEqual(changed.baseline.collections,['new']);
+  assert.deepEqual((await f.history.readRevision(changed.baseline.revision)).memory.map(r=>r.lesson),['new']);
+  assert.deepEqual((await f.history.readRevision(original.baseline.revision)).memory.map(r=>r.lesson),['old']);
+  assert.deepEqual(await f.history.state('skills'),skills);
+  const calls=[];
+  await publishStorageMemory(f.config,lesson(1),{invoke:async(tool,args)=>{
+    calls.push({tool,...args});return {generation:args.revision};
+  }});
+  assert.deepEqual(calls.find(c=>c.tool==='adopt_memory_revision').collections,['new']);
+  assert.deepEqual(calls.find(c=>c.tool==='stage_memory_revision').records.map(r=>r.lesson).sort(),['lesson 1','new']);
+});
+
+test('independent campaigns do not collide when their local outbox IDs restart',async t=>{
+  const first=await fixture(t),second=await fixture(t);
+  first.config.storage.campaign_id='first-campaign';second.config.storage.campaign_id='second-campaign';
+  const invoke=async(_tool,args)=>({generation:args.revision});
+  await publishStorageMemory(first.config,{...lesson(1),findings:'first campaign lesson'},{invoke});
+  await rm(join(second.config.root,'knowledge.git'),{recursive:true,force:true});
+  await cp(join(first.config.root,'knowledge.git'),join(second.config.root,'knowledge.git'),{recursive:true});
+  const result=await publishStorageMemory(second.config,{...lesson(1),findings:'second campaign lesson'},{invoke});
+  const records=(await second.history.readRevision(result.revision)).memory;
+  assert.deepEqual(records.map(r=>r.lesson).sort(),['first campaign lesson','second campaign lesson']);
+  assert.equal(new Set(records.map(r=>r.delivery_id)).size,2);
+});
+
+test('an existing pre-namespace delivery resumes without another memory commit',async t=>{
+  const {lessonRecord}=await import('../../controller/storage-knowledge.mjs');
+  const f=await fixture(t),item=lesson(1);
+  const legacy=lessonRecord(f.config,{...item,delivery_id:'outbox-1'});
+  const before=await f.history.commitMemory([legacy],{indexRevision:async revision=>revision,activate:async()=>{}});
+  f.config.storage.campaign_id='campaign';
+  const after=await publishStorageMemory(f.config,item,{invoke:()=>{throw Error('Already delivered');}});
+  assert.equal(after.revision,before.revision);
+  assert.equal((await f.history.readRevision(after.revision)).memory.length,1);
+});

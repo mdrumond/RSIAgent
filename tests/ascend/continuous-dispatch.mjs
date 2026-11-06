@@ -117,3 +117,25 @@ test('finite campaign leaves final failed originals queued for recovery',{timeou
   assert.ok(f.rows('SELECT * FROM recovery_lessons').every(row=>row.recorded===1));
   passed=true;
 });
+
+test('public generation binds real KDB tools and admits its constructed campaign project',{timeout:90000},async t=>{
+  const directory=await mkdtemp(join(tmpdir(),'generated-campaign-')),cleanups=[];
+  let passed=false;
+  t.after(async()=>{
+    try{for(const cleanup of cleanups.reverse())await cleanup({remainingSeconds:20});}
+    finally{if(passed)await rm(directory,{recursive:true,force:true});else console.error('Retained campaign evidence: '+directory);}
+  });
+  const f=await campaignFixture({directory,signal:new AbortController().signal,onCleanup:fn=>cleanups.push(fn)},'phase2',['supplied']);
+  await f.config({campaign_plan:[{id:'generated',phase:'phase1',new_projects:1}],
+    curriculum:{phase1:[],generation:{enabled:true,topics:['arithmetic']}}});
+  await f.run('campaign');
+  const attempts=f.rows('SELECT project,outcome FROM attempts');
+  assert.equal(attempts.length,1);assert.equal(attempts[0].outcome,'passed');
+  assert.match(attempts[0].project,/^generated-/);
+  assert.equal(f.rows("SELECT COUNT(*) n FROM events WHERE type='generation-error'")[0].n,0);
+  assert.ok(f.rows("SELECT COUNT(*) n FROM events WHERE json_extract(data,'$.role')='generation'")[0].n>0);
+  assert.equal(f.rows("SELECT status FROM projects WHERE id='supplied'")[0].status,'queued');
+  const generated=JSON.parse(f.rows("SELECT spec FROM projects WHERE id='"+attempts[0].project+"'")[0].spec);
+  assert.deepEqual(generated.generation.checks.map(check=>check.exitCode),[0,1]);
+  passed=true;
+});

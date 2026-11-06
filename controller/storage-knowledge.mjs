@@ -11,7 +11,7 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 const reference = value => typeof value === 'string' ? value :
   value.collection && value.entry_id ? `${value.collection}:${value.entry_id}` : `sha256:${hash(value)}`;
 export function lessonRecord(config, item) {
-  const delivery = String(item.delivery_id ?? `outbox-${item.id}`);
+  const delivery = String(item.delivery_id ?? `outbox-${config.storage?.campaign_id ?? item.attempt_id ?? 'local'}-${item.id}`);
   return { id: hash(delivery), delivery_id: delivery, lesson: item.findings ?? item.lesson,
     kind: ['good','negative'].includes(item.kind)?item.kind:
       (item.outcome === 'passed' || item.outcome === 'good' ? 'good' : 'negative'),
@@ -59,7 +59,7 @@ async function access(config, options, operation) {
 
 // Export only lesson text, never repository corpora or vectors. Overlapping chunks
 // reconstruct the original JSON by source line rather than duplicating evidence.
-async function baselineLessons(config) {
+async function baselineLessons(config, database=join(config.root,'knowledge.sqlite')) {
   return python(config, ['-c', String.raw`
 import sqlite3,json,sys,pathlib
 p=pathlib.Path(sys.argv[1])
@@ -89,7 +89,36 @@ for (name,) in c.execute(query):
         if key in records and records[key]!=record: raise ValueError('Conflicting baseline delivery')
         records[key]=record
 print(json.dumps(dict(records=list(records.values()),collections=collections)))
-`, join(config.root, 'knowledge.sqlite')], '', undefined);
+`, database], '', undefined);
+}
+
+// Prepare immutable objects before the database swap; activate and roll back the
+// three mutable refs together with the caller's configuration transaction.
+export async function prepareStorageBaseline(config, database, state) {
+  return access(config,{state,serialized:true},async({history})=>{
+    const baseline=await baselineLessons(config,database);
+    const records=baseline.records.map(item=>lessonRecord(config,
+      {...item,delivery_id:item.delivery_id??`baseline-${hash(item)}`}));
+    const files=Object.fromEntries(records.map(record=>[`memory/${record.id}.json`,JSON.stringify(record)+'\n']));
+    const revision=await history.commit(null,files,{type:'baseline',deliveries:records.map(record=>record.delivery_id)});
+    const blob=await history.git(['hash-object','-w','--stdin'],{input:JSON.stringify({revision,collections:baseline.collections})});
+    const names=['refs/knowledge/baseline','refs/heads/memory','refs/knowledge/active-memory'];
+    const previous=await Promise.all(names.map(name=>history.ref(name)));
+    const swap=async values=>{
+      let input='start\n';
+      for(let i=0;i<names.length;i++) {
+        if(values[i])input+=`update ${names[i]} ${values[i]}\n`;
+        else if(await history.ref(names[i]))input+=`delete ${names[i]}\n`;
+      }
+      await history.git(['update-ref','--stdin'],{input:input+'prepare\ncommit\n'});
+    };
+    return {activate:async()=>{
+      if(previous[0])await history.git(['update-ref',`refs/knowledge/baselines/${previous[0]}`,previous[0]]);
+      if(previous[1])await history.git(['update-ref',`refs/knowledge/previous-memory/${previous[1]}`,previous[1]]);
+      await swap([blob,revision,null]);
+      state.db.prepare("DELETE FROM storage_revisions WHERE name='memory'").run();
+    },rollback:()=>swap(previous)};
+  });
 }
 export async function initializeStorageKnowledge(config, state, options = {}) {
   return access(config, { ...options, state }, async context => {
@@ -140,7 +169,12 @@ export async function publishStorageMemory(config, item, options = {}) {
     const invoke = options.invoke ?? ((tool, args) => invokeStorageKdb(config, options.url, tool, args,
       { signal: options.signal, attempt: item.attempt_id }));
     await activateBaseline(context,invoke);
-    return history.commitMemory([lessonRecord(config, item)], {
+    const legacy=`outbox-${item.id}`;
+    const prior=await history.ref('refs/knowledge/deliveries/'+createHash('sha256').update(legacy).digest('hex'));
+    const recorded=prior&&(await history.readRevision(prior)).memory.find(record=>
+      record.delivery_id===legacy && record.attempt_id===item.attempt_id);
+    const record=lessonRecord(config,recorded?{...item,delivery_id:legacy}:item);
+    return history.commitMemory([record], {
       indexRevision: async (revision, snapshot) => {
         const result = await invoke('stage_memory_revision', { revision, records: snapshot.memory });
         if (result.generation !== revision) throw new Error('KDB staged a different revision');

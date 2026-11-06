@@ -9,9 +9,10 @@ import {campaignBudget} from '../controller/campaign-budget.mjs';
 import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
-import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
+import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
 import { readConfig,updateConfig,importProject } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -89,6 +90,7 @@ export async function operate(command,config,options={}) {
     const owner=await processIdentity();
     state.db.exec('BEGIN IMMEDIATE');
     try {
+      await assertPackAvailable(state);
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
       ctl.set('owner',owner);
       if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
@@ -153,7 +155,9 @@ export async function operate(command,config,options={}) {
         await deliverLessons({config,state,queue,url:await ensureKnowledgeService(config,{signal:schedulerAbort.signal}),signal:schedulerAbort.signal});
       }catch(error){state.event(null,'memory-update-error',{message:error.message});}
     }
-    const finalize=pendingOutcomes(state,policy(config));
+    const finalize=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`)
+      .all().filter(attempt=>failureSettled(state,attempt.id));
     const jobs=[];
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
@@ -352,7 +356,7 @@ export async function operate(command,config,options={}) {
             const {ensureKnowledgeService}=await import('./knowledge.mjs');
             const {createKdbBridge}=await import('../integrations/kdb-extension.mjs');
             const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
-            const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),agentDir:path,target:generationConfig.target,
+            const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),attemptId:'generation-'+randomUUID(),agentDir:path,target:generationConfig.target,
               event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
             const specs=await (await import('./project-generation.mjs')).refillProjects({config:generationConfig,state,bridge,
               concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal});

@@ -6,6 +6,7 @@ import {randomUUID} from 'node:crypto';
 import {State} from '../controller/state.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
+import {assertPackAvailable} from './storage.mjs';
 
 export function requests(state) {
   state.db.exec(`CREATE TABLE IF NOT EXISTS requests (
@@ -44,7 +45,12 @@ export async function startBackground(root,command,action,{detach=true,signal}={
   await mkdir(directory,{recursive:true});
   const file=join(directory,'input.json');await writeFile(file,JSON.stringify(action),{mode:0o600});
   const state=new State(join(root,'state.sqlite'));requests(state);
-  state.db.prepare("INSERT INTO requests(id,kind,status) VALUES (?,?,'queued')").run(id,command);
+  state.db.exec('BEGIN IMMEDIATE');
+  try {
+    await assertPackAvailable(state);
+    state.db.prepare("INSERT INTO requests(id,kind,status) VALUES (?,?,'queued')").run(id,command);
+    state.db.exec('COMMIT');
+  }catch(error){state.db.exec('ROLLBACK');state.close();throw error;}
   const log=await open(join(directory,'output.log'),'a',0o600);
   let child,exited;
   const cancel=()=>{if(child?.pid&&child.exitCode===null&&child.signalCode===null)terminateGroup(child.pid);};

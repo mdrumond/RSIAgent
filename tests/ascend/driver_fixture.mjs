@@ -40,7 +40,15 @@ export async function provider(scenario, {nativeSession} = {}) {
       const key = prompt.startsWith('Goal:') ? prompt.split('\n')[0] : prompt;
       if (!count) {
         let plan;
-        if (prompt.startsWith('Read the failed')) {
+        if (prompt.startsWith('Construct ONE fresh original')) {
+          plan=[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
+            tool('write',{path:'source/answer.py',content:'def answer(): return 0\n'}),
+            tool('write',{path:'reference/answer.py',content:'def answer(): return 6 * 7\n'}),
+            tool('write',{path:'negative/answer.py',content:'def answer(): return -1\n'}),
+            tool('write',{path:'verify.py',content:'from answer import answer\nimport sys\nsys.exit(0 if answer()==42 else 1)\n'}),
+            tool('submit_project',{goal:'unrelated generated arithmetic',source:'source',reference:'reference',
+              negative_controls:['negative'],verifier:{files:['verify.py'],command:'PYTHONPATH=. python ../verify.py'}})];
+        } else if (prompt.startsWith('Read the failed')) {
           const verifier = 'import importlib.util\nfrom pathlib import Path\n' +
             'p=Path(__file__).parent/"source"/"answer.py"\n' +
             's=importlib.util.spec_from_file_location("candidate",p)\nm=importlib.util.module_from_spec(s)\n' +
