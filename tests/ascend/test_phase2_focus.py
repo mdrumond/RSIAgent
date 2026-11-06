@@ -126,3 +126,23 @@ def test_focused_bundle_launch_binding_and_legacy_compatibility(tmp_path, target
         Path(project['verifier']['files'][0]).write_text(
             FOCUSED_LAUNCHER.replace('ARCHIVE_HASH', file_hash(archive)))
         with pytest.raises(ValueError, match='differs'): inspect_launch(request)
+
+
+def test_focused_launcher_relocates_without_checkout_dependencies(tmp_path):
+    import shutil
+    import subprocess
+    import sys
+    project, _, focus = contract_for(tmp_path)
+    relocated = tmp_path / 'relocated project'
+    shutil.copytree(Path(project['source']).parent, relocated)
+    command = [sys.executable, str(relocated / 'frozen/verify.py'), '--candidate',
+               str(relocated / 'source/kernel.py'), '--mode', 'correctness',
+               '--artifacts', str(tmp_path / 'evidence')]
+    result = subprocess.run(command, cwd=relocated / 'source', text=True,
+                            capture_output=True, timeout=30)
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report['passed'] is False and report['targetEvidence'] is False
+    assert Path(report['evidence']).is_file()
+    with tarfile.open(relocated / 'frozen/verifier.tar.gz') as tar:
+        assert json.load(tar.extractfile('focus.json')) == focus
