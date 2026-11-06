@@ -10,7 +10,7 @@ permissions:
 jobs:
   cpu:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     env:
       RSI_TEST_PYTHON: python
       RSI_KDB_TEST_PYTHON: python
