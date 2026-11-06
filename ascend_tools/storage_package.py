@@ -6,7 +6,7 @@ cited-entry, knowledge-history, machinery, dependencies. Campaigns additionally
 snapshot knowledge.sqlite. No directory discovery outside project sources.
 Writers must be stopped before packing; runtime bindings must be supplied anew.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 
 from .storage_archive import archive_files, restore_files
+from .storage_cli import Storage
 
 MAX_JSON_BYTES = 8 * 1024 * 1024
 
@@ -162,6 +163,8 @@ def _snapshot(root, path, project):
         db.execute('UPDATE projects SET frozen=1')
         if 'requests' in tables:
             db.execute("UPDATE requests SET owner=NULL,status=CASE WHEN status IN ('queued','running') THEN 'failed' ELSE status END")
+        if 'control' in tables:
+            db.execute("DELETE FROM control WHERE key='pack-capture'")
         db.commit()
         db.execute('VACUUM')  # Remove deleted projects and credentials from free pages.
     os.replace(temporary, path)
@@ -203,6 +206,71 @@ def _revision_files(git_dir, revision, kind, work, collect):
         return process.wait() == 0 and not pending
 
 
+def _identity(pid):
+    stat = Path(f'/proc/{pid}/stat').read_text()
+    return dict(pid=pid, start=stat[stat.rfind(')') + 2:].split()[19],
+                boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+
+
+@contextmanager
+def _capture(root):
+    """Admission contract: writers check pack-capture while claiming ownership.
+
+    All checks and the claim share one SQLite write transaction. The claim is
+    committed before copying, so snapshots can use independent connections.
+    A CLI parent can delegate its claim to its direct Python child.
+    """
+    me = _identity(os.getpid())
+    try:
+        parent = _identity(os.getppid())
+    except FileNotFoundError:
+        parent = None
+    token = json.dumps(me)
+    owned = False
+    with closing(sqlite3.connect(f'file:{root / "state.sqlite"}?mode=rw', uri=True)) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            row = db.execute("SELECT value FROM control WHERE key='pack-capture'").fetchone()
+            maintenance = db.execute("SELECT value FROM control WHERE key='storage-maintenance'").fetchone()
+            delegated = (row and maintenance and json.loads(row[0]) == parent
+                         and json.loads(maintenance[0]) == parent)
+            if row and not delegated and not Storage.stopped(row[0]):
+                raise ValueError('Pack capture already active or unresolved')
+            allowed = [me] + ([parent] if delegated else [])
+            for key, value in db.execute("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance')"):
+                if key == 'storage-maintenance' and json.loads(value) in allowed:
+                    continue
+                if not Storage.stopped(value):
+                    raise ValueError('Pack requires stopped writers: ' + key)
+            for owner, outcome in db.execute('SELECT owner,outcome FROM attempts'):
+                if (not owner and outcome is None) or (owner and not Storage.stopped(owner)):
+                    raise ValueError('Pack requires stopped attempt writers')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='requests'").fetchone():
+                for kind, owner in db.execute("SELECT kind,owner FROM requests WHERE status IN ('queued','running')"):
+                    if kind == 'storage' and owner and json.loads(owner) in allowed:
+                        continue
+                    if not owner or not Storage.stopped(owner):
+                        raise ValueError('Pack requires stopped background writers')
+            # Transfer a delegated claim to the actual copying process. If the
+            # CLI parent dies, its surviving child must still exclude writers.
+            db.execute("INSERT OR REPLACE INTO control VALUES('pack-capture',?)", [token])
+            owned = True
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        try:
+            yield
+        finally:
+            if owned:
+                with db:
+                    if delegated and not Storage.stopped(parent):
+                        db.execute("UPDATE control SET value=? WHERE key='pack-capture' AND value=?", [row[0], token])
+                    else:
+                        db.execute("DELETE FROM control WHERE key='pack-capture' AND value=?", [token])
+
+
 def pack(root, dest, project=None, require_complete=True):
     """Collect an inventory and publish one standard Restic snapshot plus metadata.
 
@@ -212,7 +280,7 @@ def pack(root, dest, project=None, require_complete=True):
     if dest == root or root.is_relative_to(dest) or dest.is_relative_to(root):
         raise ValueError('Package must be separate from campaign')
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.package-inputs-', dir=dest.parent) as temporary:
+    with _capture(root), tempfile.TemporaryDirectory(prefix='.package-inputs-', dir=dest.parent) as temporary:
         return _pack(root, dest, project, require_complete, Path(temporary))
 
 

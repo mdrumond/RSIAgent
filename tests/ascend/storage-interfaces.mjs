@@ -8,7 +8,7 @@ import {promisify} from 'node:util';
 import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
-import {run,sealClosedArtifacts} from '../../cli/storage.mjs';
+import {run,sealClosedArtifacts,withPackCapture,assertPackAvailable} from '../../cli/storage.mjs';
 const exec=promisify(execFile),python=process.env.RSI_TEST_PYTHON??'python3.13';
 
 async function fixture(t,{live=false,finish=true,postprocess=true,settled=true}={}) {
@@ -30,6 +30,49 @@ async function fixture(t,{live=false,finish=true,postprocess=true,settled=true}=
   const call=async action=>{const file=join(root,'action.json');await writeFile(file,JSON.stringify(action));return run(config,{config:file});};
   return {root,state,storage,row,attempt,call,config};
 }
+
+test('pack rejects live writers before sealing for campaign and project exports',async t=>{
+  const f=await fixture(t,{live:true});
+  for(const project of [undefined,'p'])
+    await assert.rejects(f.call({action:'pack',project,destination:f.root+'-package'}),/stopped attempt writers/);
+  assert.equal(f.storage.list()[0].status,'open');
+  assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get(),undefined);
+});
+
+test('pack claim rejects writer admission and competing capture, then releases on failure',async t=>{
+  const f=await fixture(t);
+  await assert.rejects(withPackCapture(f.config,async()=>{
+    // Simulate the shared ownership-claim transaction used by writer startup.
+    f.state.db.exec('BEGIN IMMEDIATE');
+    try{await assert.rejects(assertPackAvailable(f.state),/writer admission refused/);}
+    finally{f.state.db.exec('ROLLBACK');}
+    await assert.rejects(withPackCapture(f.config,async()=>assert.fail('competing capture admitted')),/already active/);
+    throw new Error('capture failed');
+  }),/capture failed/);
+  await assertPackAvailable(f.state);
+  assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get(),undefined);
+  f.state.db.prepare("INSERT INTO control VALUES ('pack-capture',?)").run(JSON.stringify({...await processIdentity(),start:'old'}));
+  await withPackCapture(f.config,async()=>{});
+  assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get(),undefined);
+});
+
+test('CLI capture delegates to Python while retaining parent ownership',async t=>{
+  const f=await fixture(t),me=await processIdentity();
+  const {withSkillLock}=await import('../../cli/evolution-lock.mjs');
+  await withSkillLock(f.config,()=>withPackCapture(f.config,async()=>{
+    const code=`from pathlib import Path
+from ascend_tools.storage_package import _capture
+import sys,sqlite3
+with _capture(Path(sys.argv[1])):
+ with sqlite3.connect(str(Path(sys.argv[1])/'state.sqlite')) as db:
+  print(db.execute("SELECT value FROM control WHERE key='pack-capture'").fetchone()[0])`;
+    const {stdout}=await exec(python,['-c',code,f.root]);
+    const copyingOwner=JSON.parse(stdout);
+    assert.notEqual(copyingOwner.pid,me.pid);assert.equal(copyingOwner.boot,me.boot);
+    assert.deepEqual(JSON.parse(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get().value),me);
+  }),{key:'storage-maintenance'});
+  assert.equal(f.state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get(),undefined);
+});
 
 test('bounded metadata filters preserve identities and report missing evidence',async t=>{
   const f=await fixture(t);

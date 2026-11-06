@@ -1,6 +1,7 @@
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -42,7 +43,8 @@ class PackageTests(unittest.TestCase):
                 CREATE TABLE storage_iterations(id INTEGER PRIMARY KEY,attempt TEXT,stage TEXT,ordinal INTEGER,reflection TEXT);''')
             db.execute('INSERT INTO projects VALUES(?,?,?,?)', ('p', json.dumps(spec), 'running', 0))
             db.execute('INSERT INTO projects VALUES(?,?,?,?)', ('other', json.dumps(spec), 'queued', 0))
-            db.execute('INSERT INTO attempts VALUES(?,?,?,?,?,?,?)', ('a', 'p', 'session-secret', 0.5, None, 'owner-secret', 'now'))
+            stopped = json.dumps(dict(pid=os.getpid(), start='old-process', boot='old-boot'))
+            db.execute('INSERT INTO attempts VALUES(?,?,?,?,?,?,?)', ('a', 'p', 'session-secret', 0.5, None, stopped, 'now'))
             db.execute('INSERT INTO storage_campaign VALUES(?,?,?,?)', ('campaign-id', 'now', 'a5', 1))
             db.execute('INSERT INTO storage_artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        ('log-id', 'a', 'p', 'log', 'actor', 'attempt.log', 0, 'closed', self.log.stat().st_size,
@@ -328,6 +330,77 @@ class PackageTests(unittest.TestCase):
                                  check=True, capture_output=True, text=True)
         self.assertEqual(json.loads(process.stdout)['content'], 'active skill; see assets/policy.txt')
         self.assertEqual((dest / 'skills/versions/used/assets/policy.txt').read_text(), 'used policy')
+
+    def test_pack_rejects_live_writers_in_both_scopes_before_capture(self):
+        from ascend_tools import storage_package
+        live = json.dumps(storage_package._identity(os.getpid()))
+        for project in (None, 'p'):
+            for key in ('owner', 'skill-writer', 'memory-writer'):
+                with self.subTest(project=project, writer=key):
+                    with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                        db.execute('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+                        db.execute('INSERT OR REPLACE INTO control VALUES(?,?)', (key, live))
+                    with patch.object(storage_package, '_pack') as capture:
+                        with self.assertRaisesRegex(ValueError, 'stopped writers'):
+                            pack(self.root, self.package, project)
+                        capture.assert_not_called()
+                    with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                        db.execute('DELETE FROM control')
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                db.execute('UPDATE attempts SET owner=?', [live])
+            with self.assertRaisesRegex(ValueError, 'stopped attempt writers'):
+                pack(self.root, self.package, project)
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                db.execute('UPDATE attempts SET owner=?', [json.dumps(dict(pid=os.getpid(),start='old',boot='old'))])
+        self.assertFalse(self.package.exists())
+
+    def test_capture_claim_spans_copy_rejects_competitors_and_releases_on_failure(self):
+        from ascend_tools import storage_package
+        def interrupted(*args):
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as db:
+                owner = json.loads(db.execute("SELECT value FROM control WHERE key='pack-capture'").fetchone()[0])
+                self.assertEqual(owner, storage_package._identity(os.getpid()))
+            # A separate process cannot take the live claim.
+            code = ('from ascend_tools.storage_package import pack; import sys; '
+                    'pack(sys.argv[1],sys.argv[2])')
+            result = subprocess.run([sys.executable, '-c', code, str(self.root), str(self.base/'competing')],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Pack capture already active', result.stderr)
+            raise InterruptedError('copy interrupted')
+        with patch.object(storage_package, '_pack', side_effect=interrupted):
+            with self.assertRaises(InterruptedError):
+                pack(self.root, self.package)
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            self.assertIsNone(db.execute("SELECT value FROM control WHERE key='pack-capture'").fetchone())
+            db.execute("INSERT INTO control VALUES('pack-capture',?)",
+                       [json.dumps(dict(pid=os.getpid(),start='old',boot='old'))])
+        with patch.object(storage_package, '_pack', return_value={'complete': True}):
+            self.assertTrue(pack(self.root, self.package)['complete'])
+
+    def test_queued_and_running_background_writers_refuse_capture(self):
+        from ascend_tools import storage_package
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+            db.execute('CREATE TABLE requests(id TEXT,kind TEXT,status TEXT,owner TEXT)')
+        for status, owner in [('queued', None), ('running', json.dumps(storage_package._identity(os.getpid())))]:
+            with self.subTest(status=status):
+                with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
+                    db.execute('DELETE FROM requests')
+                    db.execute('INSERT INTO requests VALUES(?,?,?,?)', ('writer', 'kdb', status, owner))
+                with patch.object(storage_package, '_pack') as capture:
+                    with self.assertRaisesRegex(ValueError, 'stopped background writers'):
+                        pack(self.root, self.package)
+                    capture.assert_not_called()
+
+    def test_capture_process_death_allows_recovery(self):
+        from ascend_tools import storage_package
+        code = ('from ascend_tools.storage_package import _capture; from pathlib import Path; import os,sys; '
+                'gate=_capture(Path(sys.argv[1])); gate.__enter__(); os._exit(0)')
+        subprocess.run([sys.executable, '-c', code, str(self.root)], check=True)
+        with patch.object(storage_package, '_pack', return_value={'complete': True}):
+            self.assertTrue(pack(self.root, self.package)['complete'])
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as db:
+            self.assertIsNone(db.execute("SELECT value FROM control WHERE key='pack-capture'").fetchone())
 
     def test_interrupted_campaign_kdb_backup_ignores_partial_scratch(self):
         self.automatic_fixture()

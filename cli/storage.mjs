@@ -4,7 +4,7 @@ import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {State} from '../controller/state.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
-import {ownerStopped,failureSettled} from '../controller/lifecycle.mjs';
+import {ownerStopped,failureSettled,processIdentity} from '../controller/lifecycle.mjs';
 
 export const schemaOptions=Object.fromEntries([
   'action','artifact','project','role','phase','kind','outcome','stage','iteration',
@@ -60,6 +60,45 @@ export async function sealClosedArtifacts(config,action={}) {
   }finally{state.close();}
 }
 
+// Writer admission must check pack-capture in the same transaction that claims
+// its owner. Keep this claim through sealing and the delegated Python capture.
+export async function assertPackAvailable(state) {
+  const row=state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get();
+  if(row&&!await ownerStopped(row.value))throw new Error('Pack capture active; writer admission refused');
+}
+
+export async function withPackCapture(config,operation) {
+  const state=new State(join(config.root,'state.sqlite'));
+  const me=await processIdentity(),token=JSON.stringify(me);let owned=false;
+  try {
+    state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+    state.db.exec('BEGIN IMMEDIATE');
+    try {
+      const capture=state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get();
+      if(capture&&!await ownerStopped(capture.value))throw new Error('Pack capture already active or unresolved');
+      for(const row of state.db.prepare("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance')").all()) {
+        const owner=JSON.parse(row.value);
+        if(row.key==='storage-maintenance'&&owner.pid===me.pid&&owner.start===me.start&&owner.boot===me.boot)continue;
+        if(!await ownerStopped(owner))throw new Error('Pack requires stopped writers: '+row.key);
+      }
+      for(const row of state.db.prepare('SELECT owner,outcome FROM attempts').all())
+        if((!row.owner&&row.outcome===null)||(row.owner&&!await ownerStopped(row.owner)))throw new Error('Pack requires stopped attempt writers');
+      if(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='requests'").get())
+        for(const row of state.db.prepare("SELECT kind,owner FROM requests WHERE status IN ('queued','running')").all()) {
+          const owner=row.owner&&JSON.parse(row.owner);
+          if(row.kind==='storage'&&owner?.pid===me.pid&&owner.start===me.start&&owner.boot===me.boot)continue;
+          if(!owner||!await ownerStopped(owner))throw new Error('Pack requires stopped background writers');
+        }
+      state.db.prepare("INSERT OR REPLACE INTO control VALUES ('pack-capture',?)").run(token);
+      state.db.exec('COMMIT');owned=true;
+    }catch(error){state.db.exec('ROLLBACK');throw error;}
+    return await operation();
+  }finally {
+    if(owned)state.db.prepare("DELETE FROM control WHERE key='pack-capture' AND value=?").run(token);
+    state.close();
+  }
+}
+
 export async function run(config,values={}) {
   const action=values.config?JSON.parse(await readFile(values.config,'utf8')):{...values};
   action.action??=values.action??'inspect';
@@ -68,7 +107,9 @@ export async function run(config,values={}) {
     return invoke(config,action,values.signal);
   };
   if(['compress','pack','prune','restore'].includes(action.action))
-    return (await import('./evolution-lock.mjs')).withSkillLock(config,operation,{signal:values.signal,key:'storage-maintenance'});
+    return (await import('./evolution-lock.mjs')).withSkillLock(config,
+      action.action==='pack'?()=>withPackCapture(config,operation):operation,
+      {signal:values.signal,key:'storage-maintenance'});
   return operation();
 }
 
