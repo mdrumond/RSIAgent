@@ -60,11 +60,20 @@ Merge these portable policy settings into the private bootstrap profile:
 }
 ```
 
-Phase 1 refills its backlog from the curriculum. Draft construction checks run
+Phase 1 and Phase 2 refill their backlogs from the curriculum when generation is enabled.
+Phase 1 constructs microprojects; Phase 2 constructs end-to-end projects with
+declared performance goals preserved as `performance_goal` with
+`verifier.performance_command`. These optional fields are preserved in either phase;
+a non-null goal requires a performance command. CPU construction checks establish
+correctness only and do not execute that performance command. Optional
+`curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override
+`enabled`, `topics`, and `preprompt` for that phase. With a campaign plan, drafts
+are pinned to a phase and entry; older entry drafts and projects cannot fill a
+new batch. Remaining admissions cap staged projects, including pending drafts. Draft construction checks run
 on CPU references and negative controls; rejected checks return to the same Pi
 session for repair within the remaining construction allocation. An optional
 `construction_command` lets these checks differ from the real target verifier.
-Phase 2 and inference consume supplied projects. An empty supplied backlog waits
+Both phases can also consume supplied projects; inference consumes supplied projects. An empty supplied backlog waits
 for input; a completed configured target advances the phase sequence.
 
 A finished original requires a terminal result, settled execution, acknowledged

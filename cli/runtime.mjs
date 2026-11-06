@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { selectAdmission } from '../controller/dispatch.mjs';
 import {campaignBudget} from '../controller/campaign-budget.mjs';
-import { campaignProgress, syncCampaignPlan, advanceCampaignEntry } from '../controller/progress.mjs';
+import { campaignProgress, currentCampaignEntry, syncCampaignPlan, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,pendingOutcomes,outcomeRecorded } from '../controller/recovery.mjs';
@@ -340,7 +340,10 @@ export async function operate(command,config,options={}) {
         state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
         config={...config,mode:progress.nextMode};continue;
       }
-      if(options.continuous&&!progress.phaseComplete&&config.mode==='phase1'&&config.curriculum?.generation?.enabled&&!generation&&Date.now()>=nextGeneration) {
+      const generationEntry=currentCampaignEntry(state,config);
+      const generationPhase=generationEntry?.phase??config.mode;
+      const generationSettings={...config.curriculum?.generation,...config.curriculum?.generation?.by_phase?.[generationPhase]};
+      if(options.continuous&&!progress.phaseComplete&&['phase1','phase2'].includes(generationPhase)&&generationSettings.enabled===true&&!generation&&Date.now()>=nextGeneration) {
         const generationConfig=config;
         generation=(async()=>{
           try {
@@ -349,16 +352,17 @@ export async function operate(command,config,options={}) {
             const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
             const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),agentDir:path,target:generationConfig.target,
               event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
-            const specs=await (await import('./project-generation.mjs')).refillPhase1({config:generationConfig,state,bridge,
+            const specs=await (await import('./project-generation.mjs')).refillProjects({config:generationConfig,state,bridge,
               concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal});
             for(const spec of specs) {
               backgroundAbort.signal.throwIfAborted();
+              if(generationConfig.campaign_plan&&currentCampaignEntry(state,generationConfig)?.id!==spec.campaign_entry)break;
               if(state.project(spec.id))continue;
               const imported=await importProject(config.root,spec);
               await updateConfig(config.root,(current,ledger)=>{
                 if(!ledger.project(imported.id))ledger.add(imported);
                 return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
-                  curriculum:{...current.curriculum,phase1:[...new Set([...(current.curriculum?.phase1??[]),imported.id])]}};
+                  curriculum:{...current.curriculum,[generationPhase]:[...new Set([...(current.curriculum?.[generationPhase]??[]),imported.id])]}};
               });
             }
           }catch(error){if(!backgroundAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
