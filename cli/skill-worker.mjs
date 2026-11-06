@@ -25,7 +25,9 @@ export function skillWorker({control, config, remaining, event, signal, operatio
       const status=await operations.backgroundSkillStatus(current);
       // Retain the previous identity across unknown execution and sample resume.
       const retained=resource??status.resource;
-      const selected=available.find(row=>(!retained || row.id===retained.id) && !control.leased(row.id));
+      const marked=resources.some(row=>row.metadata?.backgroundSlot===true);
+      const selected=available.find(row=>(!marked || row.metadata?.backgroundSlot===true) &&
+        (!retained || row.id===retained.id) && !control.leased(row.id));
       if(!selected || capacity<1 || active>capacity-1)return;
       resource=selected;control.set('skill-background-resource',resource);
       if(!status.hasWork || remaining()<=0 || !await settled())return;
