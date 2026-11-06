@@ -4,6 +4,13 @@ function positive(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
+// Plain configuration policy shared by completion and generation callers.
+export function generationSettings(config, phase=config.mode) {
+  const base=config.curriculum?.generation;
+  const settings={...base,...base?.by_phase?.[phase]};
+  return {...settings,enabled:['phase1','phase2'].includes(phase)&&settings.enabled===true};
+}
+
 // Read-only projection: never changes admission, recovery ownership or config.
 export function campaignProgress(state, config) {
   if (config.campaign_plan !== undefined) return plannedProgress(state, config);
@@ -66,7 +73,7 @@ export function campaignProgress(state, config) {
   const phaseCounts = Object.fromEntries(phases.map(phase => [phase, {finishedOriginals: 0, totalOriginals: 0}]));
   for (const row of rows) phaseCounts[row.phase] = {finishedOriginals: row.finished, totalOriginals: row.total};
   const {finishedOriginals, totalOriginals} = phaseCounts[mode];
-  const generation = mode === 'phase1' && config.curriculum?.generation?.enabled === true;
+  const generation = generationSettings(config,mode).enabled;
   const phaseComplete = target !== null ? finishedOriginals >= target : !generation && lists[mode].length > 0 &&
     (rows.find(row => row.phase === mode)?.supplied_finished ?? 0) === lists[mode].length;
   const nextMode = phaseComplete ? sequence[sequence.indexOf(mode) + 1] ?? null : null;
