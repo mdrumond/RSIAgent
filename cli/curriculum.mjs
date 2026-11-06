@@ -62,11 +62,18 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
     : 'Curriculum interrupted by external signal');
   const interrupt=cause=>{reason??=cause;readiness.abort(interruption());void session.abort();};
   const abort=()=>interrupt('external-signal');
+  const expire=()=>{
+    const remaining=seconds-spent();
+    // Timer delays have millisecond precision; a callback can precede the
+    // monotonic deadline. Only actual elapsed time exhausts the allocation.
+    if(remaining<=0)interrupt('elapsed-allocation');
+    else timer=setTimeout(expire,remaining*1000);
+  };
   try {
     session.agent.toolExecution='sequential';
     await state.event(attemptId,'curriculum-session',{role,session:manager.getSessionFile(),allocation_seconds:seconds,elapsed_seconds:elapsed});
     signal?.addEventListener('abort',abort,{once:true});
-    timer=setTimeout(()=>interrupt('elapsed-allocation'),Math.max(0,seconds-spent())*1000);
+    expire();
     checkpoints=setInterval(()=>{try{checkpoint();}catch(error){telemetryError=error;interrupt('telemetry-failure');}},1000);
     if(signal?.aborted)interrupt('external-signal');
     if(spent()>=seconds)interrupt('elapsed-allocation');

@@ -56,6 +56,38 @@ test('constructor resumes the same native session and source; no manifest or act
   assert.deepEqual(f.options.state.attempt(stopped.id),stopped);
 });
 
+test('an early allocation timer re-arms without cancelling readiness or charging unspent time',{timeout:15000},async t=>{
+  const f=await fixture(t,[]),abort=new AbortController();
+  const nativeTimeout=globalThis.setTimeout,event=f.options.state.event.bind(f.options.state);
+  let armed=false,earlyTimer,rearmed=false;
+  f.options.state.event=(...args)=>{
+    const result=event(...args);
+    if(args[1]==='curriculum-session')armed=true;
+    return result;
+  };
+  t.mock.method(globalThis,'setTimeout',(callback,ms,...args)=>{
+    if(armed){
+      armed=false;earlyTimer=callback;
+      return nativeTimeout(()=>{},0);
+    }
+    if(earlyTimer && callback===earlyTimer)rearmed=true;
+    return nativeTimeout(callback,ms,...args);
+  });
+  f.options.bridge.prepareSession=async(session,{signal})=>{
+    await session.bindExtensions({});
+    assert.equal(typeof earlyTimer,'function');
+    earlyTimer();
+    assert.equal(signal.aborted,false);
+    assert.equal(rearmed,true);
+    abort.abort();
+  };
+  await assert.rejects(investigate({...f.options,signal:abort.signal}),/external signal/);
+  assert.equal(f.requests.length,0);
+  const stopped=f.events().find(e=>e.type==='curriculum-interrupted').data;
+  assert.equal(stopped.reason,'external-signal');
+  assert.ok(stopped.elapsed_seconds<stopped.allocation_seconds);
+});
+
 test('resumed constructor uses original elapsed allocation even when config increases; exhausted resume never calls provider',{timeout:15000},async t=>{
   const f=await fixture(t,[['write',{path:'source/answer.py',content:'answer=42\n'}],'wait']);
   f.options.config.curriculum_seconds=.6;await interrupt(f);
