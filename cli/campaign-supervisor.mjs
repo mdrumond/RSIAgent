@@ -6,6 +6,7 @@ import {pathToFileURL} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {setTimeout as delay} from 'node:timers/promises';
 import {State} from '../controller/state.mjs';
+import {campaignElapsed} from '../controller/campaign-budget.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {qualificationGate} from './campaign-manifest.mjs';
@@ -132,16 +133,14 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(current.campaign_cohort!==cohort||current.campaign_source_revision!==sourceRevision||current.campaign_seconds!==config.campaign_seconds)
           return await pause('campaign-binding-changed');
         const view=await snapshot(config),status=view.status;
-        const used=view.budget?.elapsed??0;
+        const used=campaignElapsed(view.budget,{boot:owner.boot,now});
         const latestRequest=status.requests?.find(request=>request.id===lastLaunch?.request)??
           status.requests?.find(request=>['campaign','resume'].includes(request.kind));
         if(status.progress?.done)return await pause('complete');
         if(used>=config.campaign_seconds)return await pause('elapsed');
         if(view.paused)return await pause('operator-pause');
         if(view.operatorStopped||(status.controller?.stopRequested&&latestRequest?.status==='passed'))return await pause('operator-stop');
-        if(status.controller?.state==='running')blockedSince=null;
-        else if(latestRequest?.status==='failed'&&blockedSince===null)blockedSince=now();
-        if(blockedSince!==null&&now()-blockedSince>=1800000)return await pause('infrastructure-or-ownership');
+        if(status.controller?.state!=='running'&&latestRequest?.status==='failed'&&blockedSince===null)blockedSince=now();
         const available=await space(config),started=Boolean(view.budget?.cycle||view.operation==='campaign'||view.attempts||lastLaunch||latestRequest);
         if(!Number.isFinite(available)||available<0)throw new Error('Disk availability unknown');
         if(available<(started?16:64)*GiB) {
@@ -149,8 +148,9 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
           return await publish('attention-needed','initial-disk',{availableBytes:available});
         }
         if(status.controller?.state==='unknown')throw new Error('Unresolved controller ownership');
+        if(status.controller?.state==='running')blockedSince=null;
+        if(blockedSince!==null&&now()-blockedSince>=1800000)return await pause('infrastructure-or-ownership');
         if(status.controller?.state==='running') {
-          blockedSince=null;
           await publish('running',status.wait?.reason??'active',{progress:{currentEntry:status.progress?.currentEntry?.id??null,
             finishedOriginals:status.progress?.finishedOriginals??0,target:status.progress?.target??null},elapsedSeconds:used,availableBytes:available});
         }else if(now()>=nextReconcile) {
