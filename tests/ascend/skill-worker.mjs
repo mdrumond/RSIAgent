@@ -57,3 +57,19 @@ test('background failures leave foreground reservation and campaign operation in
   await f.worker.running;assert.equal(f.errors[0].message,'writer failed');
   assert.equal(f.worker.resource.id,'slot0');await f.worker.stop();
 });
+
+
+test('marked A/B slot is mandatory and never replaced by an idle foreground slot',async()=>{
+  const f=fixture();
+  f.resources[0].metadata={hostSlot:0,backgroundSlot:true};
+  f.resources[0].available=false;
+  f.resources[1].metadata={hostSlot:1,backgroundSlot:false};
+  await f.worker.poll(f.resources,0,8);
+  assert.equal(f.calls,0);assert.equal(f.worker.resource,undefined);
+  const available=fixture();
+  available.resources[0].metadata={hostSlot:1,backgroundSlot:false};
+  available.resources[1].metadata={hostSlot:0,backgroundSlot:true};
+  await available.worker.poll(available.resources,0,8);
+  assert.equal(available.calls,1);assert.equal(available.worker.resource.id,'slot1');
+  available.finish();await available.worker.running;await available.worker.stop();
+});

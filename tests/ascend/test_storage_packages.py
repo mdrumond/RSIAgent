@@ -353,7 +353,7 @@ class PackageTests(unittest.TestCase):
         from ascend_tools import storage_package
         live = json.dumps(storage_package._identity(os.getpid()))
         for project in (None, 'p'):
-            for key in ('owner', 'skill-writer', 'memory-writer', 'knowledge-startup'):
+            for key in ('owner', 'skill-writer', 'memory-writer', 'knowledge-startup', 'supervisor-owner'):
                 with self.subTest(project=project, writer=key):
                     with closing(sqlite3.connect(self.root / 'state.sqlite')) as db, db:
                         db.execute('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)')

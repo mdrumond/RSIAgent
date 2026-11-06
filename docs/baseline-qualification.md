@@ -62,3 +62,17 @@ against expected hashes, target, runtime fingerprint and exact case IDs. It is
 not a substitute for executing qualification or checking runtime provenance.
 Local CPU checks cannot produce an NPU-qualified receipt. Launch requires all
 seven workloads qualified separately on A3 and A5.
+
+## Sparse KL precision compatibility
+
+The owned loader applies `inputs.py:_sparse_kl_fp32` to the frozen Sparse Lightning
+Indexer Grad KL Loss Enhance reference. The upstream NPU branch calculates in the
+input dtype: FP16 rounds `clamp_min(1e-8)` to zero before `log`, producing nonfinite
+loss and gradients. The adapter changes only native-device selection and calculation
+dtype: NPU inputs retain the native NPU layout path, including FP32 inputs, and all
+floating calculations and four outputs use FP32, matching the CPU golden contract.
+There is no CPU fallback for NPU inputs. Vendored bytes, cases and tolerances remain
+unchanged. The manifest declares this adapter; source and verifier hashes bind it.
+Reduced CPU tests reproduce the native-branch FP16 failure and exercise the repaired
+branch across FP16/BF16/FP32. They do not establish NPU behavior; fresh full A3 and A5
+qualification is required before launch.

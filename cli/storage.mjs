@@ -77,7 +77,7 @@ export async function withPackCapture(config,operation) {
     try {
       const capture=state.db.prepare("SELECT value FROM control WHERE key='pack-capture'").get();
       if(capture&&!await ownerStopped(capture.value))throw new Error('Pack capture already active or unresolved');
-      for(const row of state.db.prepare("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup')").all()) {
+      for(const row of state.db.prepare("SELECT key,value FROM control WHERE key IN ('owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup','supervisor-owner')").all()) {
         const owner=JSON.parse(row.value);
         if(owner===null)continue;
         if(row.key==='storage-maintenance'&&owner.pid===me.pid&&owner.start===me.start&&owner.boot===me.boot)continue;
