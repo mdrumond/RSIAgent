@@ -25,13 +25,16 @@ export async function operationsStopped(state,attempt,environment) {
   if(events.some(e=>e.type==='native-bash-started' && !closedBash.has(e.data.operation)))return false;
   const nativeElapsed=Math.max(attempt.elapsed,...completedBash.map(e=>e.data.actor_elapsed).filter(Number.isFinite));
   if(nativeElapsed>attempt.elapsed)checkpointExecution(state,attempt.id,nativeElapsed);
-  const finished=new Set(events.filter(e=>['execution-settled','execution-reconciled'].includes(e.type) &&
-    (e.type==='execution-settled'||e.data.closed===true)).map(e=>e.data.operation));
   const pending=new Map();
   for(const {type,data} of events) {
-    if(!['execution-starting','execution-unresolved','execution-submitting'].includes(type))continue;
     const operation=data.operation??data.submission;
-    if(finished.has(operation))continue;
+    // Closure covers only preceding work, not a later submission or unknown
+    // marker that happens to carry the same enclosing operation identity.
+    if(type==='execution-settled' || (type==='execution-reconciled' && data.closed===true)) {
+      if(operation!=null)pending.delete(operation);
+      continue;
+    }
+    if(!['execution-starting','execution-unresolved','execution-submitting'].includes(type))continue;
     const previous=pending.get(operation);
     pending.set(operation,{...previous,...data,startElapsed:previous?.startElapsed??data.startElapsed??data.actor_elapsed});
   }
@@ -55,11 +58,17 @@ export async function operationsStopped(state,attempt,environment) {
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
   events=state.events(attempt.id);
-  const reconciled=new Set(events.filter(e=>e.type==='execution-reconciled' && e.data.closed===true).map(e=>e.data.operation));
-  const unresolved=events.filter(e=>e.type==='execution-unresolved' && !reconciled.has(e.data.operation));
+  const closedThrough=new Map();
+  for(const [index,{type,data}] of events.entries()) {
+    const operation=data.operation??data.submission;
+    if(operation!=null && (type==='execution-settled' ||
+        (type==='execution-reconciled' && data.closed===true)))closedThrough.set(operation,index);
+  }
+  const unresolved=events.filter((e,index)=>e.type==='execution-unresolved' &&
+    index>(closedThrough.get(e.data.operation??e.data.submission)??-1));
   if(unresolved.some(e=>!e.data.handle))return false;
   const handles=new Set([...events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle),
-    ...unresolved.map(e=>e.data.handle)]);
+    ...events.filter(e=>e.type==='execution-unresolved' && e.data.handle).map(e=>e.data.handle)]);
   for (const handle of handles) {
     if (!handle || (await environment.observe(handle)).state !== 'stopped') return false;
   }
