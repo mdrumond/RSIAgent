@@ -10,6 +10,7 @@ import {CampaignStorage} from '../../controller/storage.mjs';
 import {prepareSourceGit} from '../../controller/source-git.mjs';
 import {buildCampaignManifest,campaignEntryConfig,qualificationGate,bootstrapFreshCampaign,workloads} from '../../cli/campaign-manifest.mjs';
 import {buildProjectCatalog,listProjectFiles,readProjectSource,projectCatalogExtension} from '../../cli/project-catalog.mjs';
+import {createEnvironment as createAscendEnvironment} from '../../integrations/environments/ascend.mjs';
 
 const profile={baseline:'/private/base.sqlite',skills:'/private/baseline-skills',
   environment:{module:'machinery/integrations/environments/index.mjs',options:{mode:'local',runtime:'fixture-runtime'}},
@@ -18,6 +19,27 @@ const profile={baseline:'/private/base.sqlite',skills:'/private/baseline-skills'
 const phase2Projects=Object.fromEntries(workloads.map(workload=>[workload,{goal:workload,source:'/private/'+workload,
   verifier:{files:[],command:'true',performance_command:'true'},performance_goal:'improve frozen baseline'}]));
 const manifest=target=>buildCampaignManifest({campaignId:'fresh-study',target,profile,phase2Projects});
+
+test('Ascend campaign targets admit host slots while preserving the registered transport route',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'campaign-profile-'));
+  try {
+    const instructions=join(root,'instructions.md');await writeFile(instructions,'fixture');
+    for(const target of ['a3','a5']) {
+      const supplied={...profile,environment:{module:'machinery/integrations/environments/ascend.mjs',options:{
+        mode:'cpl',target:'fixture-'+target,profile:target+'-language',runtime:'fixture',instructionFile:instructions,
+        health:{product:target}}}};
+      const config=buildCampaignManifest({campaignId:'fixture',target,profile:supplied,phase2Projects});
+      const env=await createAscendEnvironment(config.environment.options,{instancePath:root,event:async()=>{},
+        exclude:async(_label,fn)=>fn(),client:async args=>{
+          assert.deepEqual(args,['npu','list','fixture-'+target]);
+          return {state:'completed',profiles:[{target:'fixture-'+target,pool:'fixture',devices:[{enabled:true,id:0}]}]};
+        }});
+      assert.equal((await env.resources({target:config.target})).length,1);
+      assert.deepEqual(await env.resources({target:'unrelated'}),[]);
+      assert.equal(supplied.environment.options.profile,target+'-language');
+    }
+  }finally{await rm(root,{recursive:true,force:true});}
+});
 
 test('supplied-only native campaign entries retain configured actor budgets without a curriculum',()=>{
   const config={actor_seconds:17,campaign_plan:[{id:'supplied',phase:'phase2',new_projects:1}]};

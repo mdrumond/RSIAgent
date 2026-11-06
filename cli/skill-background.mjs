@@ -5,6 +5,7 @@ import { State } from '../controller/state.mjs';
 import { tuningStatus, positiveSeconds } from '../controller/evaluation-round.mjs';
 import { withSkillLock } from './evolution-lock.mjs';
 import { run } from './skills.mjs';
+import {enqueueCompletedEvaluation,evaluationArchiveStatus,evaluationArchivesSettled,drainEvaluationArchives} from './evaluation-archives.mjs';
 
 const read = async path => {
   try { return JSON.parse(await readFile(path, 'utf8')); }
@@ -30,6 +31,7 @@ export function enqueueSkillEvidence(config, task) {
 
 export async function backgroundSkillStatus(config) {
   const evolution = await read(join(config.root, 'skills', 'evolution.json'));
+  const archives = await evaluationArchiveStatus(config,evolution);
   const pending = evolution?.pending;
   const round = pending && await read(join(pending.evaluationRoot, 'round.json'));
   const state = new State(join(config.root, 'state.sqlite'));
@@ -38,7 +40,7 @@ export async function backgroundSkillStatus(config) {
     const control = state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get();
     const owner = control && state.db.prepare("SELECT value FROM control WHERE key='skill-writer'").get();
     return { ...await tuningStatus(config.root), queued, pending: Boolean(pending),
-      hasWork: !config.skills?.tuningDisabled && (pending ? round?.status !== 'exhausted' : queued > 0),
+      archives, hasWork: !config.skills?.tuningDisabled && ((pending ? round?.status !== 'exhausted' : queued > 0)||archives.hasWork),
       unresolved: round?.runningAt !== undefined, resource: pending?.resource,
       owner: owner ? JSON.parse(owner.value) : null };
   } finally { state.close(); }
@@ -47,6 +49,7 @@ export async function backgroundSkillStatus(config) {
 // Used by scheduler settlement before returning a reserved slot to foreground work.
 export async function backgroundSkillsSettled(config, { runtime } = {}) {
   try {
+    if(!await evaluationArchivesSettled(config))return false;
     const evolution = await read(join(config.root, 'skills', 'evolution.json'));
     const pending = evolution?.pending;
     if (!pending) return true;
@@ -81,6 +84,8 @@ export async function runBackgroundSkills(config, values = {}) {
   const signal = values.signal ? AbortSignal.any([values.signal, deadline.signal]) : deadline.signal;
   try { return await withSkillLock(config, async () => {
     const evolution = await read(join(config.root, 'skills', 'evolution.json'));
+    await enqueueCompletedEvaluation(config,evolution);
+    await drainEvaluationArchives(config,{signal});
     const pending = evolution?.pending;
     if (pending?.resource && values.resource?.id !== pending.resource.id)
       throw new Error('Resume skill evaluation on its retained resource');
@@ -101,6 +106,7 @@ export async function runBackgroundSkills(config, values = {}) {
     } finally {
       // A crash before candidate/history persistence leaves evidence eligible for retry.
       const retained = await read(join(config.root, 'skills', 'evolution.json'));
+      await enqueueCompletedEvaluation(config,retained);
       const state = new State(join(config.root, 'state.sqlite'));
       try {
         if (queue(state)) {
@@ -108,6 +114,7 @@ export async function runBackgroundSkills(config, values = {}) {
           for (const task of retained?.history ?? []) consume.run(task.id);
         }
       } finally { state.close(); }
+      await drainEvaluationArchives(config,{signal});
     }
   }, { signal }); } finally { clearTimeout(timer); }
 }
