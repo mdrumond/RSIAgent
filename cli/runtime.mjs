@@ -15,6 +15,8 @@ import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
 import {skillWorker} from './skill-worker.mjs';
+import {campaignEntryConfig} from './campaign-manifest.mjs';
+import {projectCatalogExtension} from './project-catalog.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -347,7 +349,7 @@ export async function operate(command,config,options={}) {
       if(config.campaign_plan)startCampaignEntry(state,config);
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
-      if(config.campaign_plan && progress.currentEntry)config={...config,mode:progress.currentEntry.phase};
+      if(config.campaign_plan && progress.currentEntry)config=campaignEntryConfig(config,progress.currentEntry.id);
       if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)) {
         advanceCampaignEntry(state,config);
         if(progress.done)break;
@@ -634,7 +636,8 @@ async function worker(root,id) {
         shouldPause:()=>Boolean(ctl.get('pause')),onPause:signal,
         environmentFactory:ctx=>environment(config,path,ctx.event,ctx.exclude,job.resource,ctx.signal),
         ...await (await import('../controller/model.mjs')).modelFromProfile(config.actor),
-        skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension]});
+        skillMap:skills,knowledge:bridge.knowledge,extensions:[bridge.extension,...(config.project_catalog?
+          [projectCatalogExtension({...config.project_catalog,event:(type,data)=>state.event(id,type,data)})]:[])]});
       }finally{actorRunning=false;}
     }
     if(!interrupted) {

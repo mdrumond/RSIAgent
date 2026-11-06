@@ -66,16 +66,26 @@ export async function readProjectSource(entry,path) {
 export function projectCatalogExtension(options) {
   return async pi=>pi.registerTool({name:'rsi_previous_projects',label:'Previous campaign projects',
     description:'Inspect immutable sources from earlier settled projects in these fresh campaigns. Choose any useful starting point; results retain target provenance.',
-    parameters:Type.Object({action:Type.Union(['list','files','read'].map(value=>Type.Literal(value))),
+    parameters:Type.Object({action:Type.Union(['list','files','read','select'].map(value=>Type.Literal(value))),
       id:Type.Optional(Type.String()),path:Type.Optional(Type.String()),
+      starter:Type.Optional(Type.Union(['baseline','scratch','prior'].map(value=>Type.Literal(value)))),
       offset:Type.Optional(Type.Integer({minimum:0})),limit:Type.Optional(Type.Integer({minimum:1,maximum:100}))}),
-    execute:async(_id,{action,id,path,offset=0,limit=20})=>{
+    execute:async(_id,{action,id,path,starter='prior',offset=0,limit=20})=>{
+      if(action==='select'&&['baseline','scratch'].includes(starter)) {
+        options.event?.('starter-selected',{starter});
+        return {content:[{type:'text',text:JSON.stringify({starter})}],details:{starter}};
+      }
       const entries=await buildProjectCatalog(options);
       const entry=entries.find(item=>item.id===id);
       if(action!=='list'&&!entry)throw new Error('Unknown settled campaign project');
+      const provenance=entry&&{campaignId:entry.campaignId,projectId:entry.projectId,attemptId:entry.attemptId,
+        target:entry.target,runtime:entry.runtime,tree:entry.source.tree,commit:entry.source.commit};
       const result=action==='list'?{projects:entries.slice(offset,offset+limit),total:entries.length,
         nextOffset:offset+limit<entries.length?offset+limit:null}:
-        action==='files'?await listProjectFiles(entry):await readProjectSource(entry,path);
+        action==='select'?{starter:'prior',...provenance}:
+          action==='files'?await listProjectFiles(entry):await readProjectSource(entry,path);
+      if(action==='select')options.event?.('starter-selected',{starter:'prior',...provenance});
+      if(action==='read'||action==='files')options.event?.('prior-project-read',{action,...provenance,...(path?{path}:{})});
       return {content:[{type:'text',text:typeof result==='string'?result:JSON.stringify(result)}],details:result};
     }});
 }
