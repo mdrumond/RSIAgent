@@ -10,7 +10,7 @@ import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaig
 import { State } from '../controller/state.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
-import { readConfig,updateConfig,importProject } from './instance.mjs';
+import { readConfig,updateConfigImmediate as updateConfig,importProject } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';

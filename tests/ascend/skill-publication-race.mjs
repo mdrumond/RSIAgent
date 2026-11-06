@@ -37,3 +37,31 @@ const result=await publishSkillVersion(${JSON.stringify(root)},{active:'baseline
   assert.equal(await publishSkillVersion(root,{active:'baseline',candidate:'stale'}),null);
   assert.deepEqual(JSON.parse(await readFile(join(root,'instance.json'),'utf8')),config);
 });
+
+test('same-process promotion and curriculum commits leave elapsed checkpoint writes unblocked',async t=>{
+  const {updateConfigImmediate}=await import('../../cli/instance.mjs');
+  const {campaignBudget}=await import('../../controller/campaign-budget.mjs');
+  const root=await mkdtemp(join(tmpdir(),'skill-publication-clock-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  state.db.exec('PRAGMA busy_timeout=25');
+  const clock=campaignBudget(state,{seconds:60,cycle:'same-process',boot:'fixture'});
+  await writeFile(join(root,'instance.json'),JSON.stringify({format:1,revision:0,mode:'phase1',projects:[],skills:{activeVersion:'baseline'}}));
+  let ticks=0;const failures=[];
+  const watcher=setInterval(()=>{try{clock.checkpoint();ticks++;}catch(error){failures.push(error.message);}},1);
+  try {
+    for(let i=0;i<20;i++)await Promise.all([
+      publishSkillVersion(root,{active:i?'candidate'+(i-1):'baseline',candidate:'candidate'+i}),
+      updateConfigImmediate(root,(current,ledger)=>{
+        const project={id:'p'+i,goal:'generated project',actor_seconds:60};ledger.add(project);
+        return {...current,projects:[...current.projects,project]};
+      }),
+    ]);
+    await new Promise(resolve=>setTimeout(resolve,5));
+  }finally{clearInterval(watcher);clock.stop();}
+  assert.ok(ticks>0);assert.deepEqual(failures,[]);
+  const config=JSON.parse(await readFile(join(root,'instance.json'),'utf8'));
+  assert.equal(config.skills.activeVersion,'candidate19');assert.equal(config.projects.length,20);assert.equal(config.revision,40);
+  assert.equal(state.db.prepare('SELECT count(*) AS n FROM projects').get().n,20);
+  await assert.rejects(updateConfigImmediate(root,current=>Promise.resolve(current)),/must be synchronous/);
+  assert.equal(JSON.parse(await readFile(join(root,'instance.json'),'utf8')).revision,40);
+});
