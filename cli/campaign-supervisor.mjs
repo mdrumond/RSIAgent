@@ -70,7 +70,8 @@ async function nativeSnapshot(config,cli) {
     const control=state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get();
     const value=key=>control?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
     return {status,budget:value('campaign-budget'),operation:value('operation'),
-      paused:Boolean(value('pause')),attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n};
+      paused:Boolean(value('pause')),operatorStopped:Boolean(value('operator-stop')),
+      attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n};
   }finally{state.close();}
 }
 async function diskBytes(config) {const value=await statfs(config.root);return value.bavail*value.bsize;}
@@ -137,7 +138,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(status.progress?.done)return await pause('complete');
         if(used>=config.campaign_seconds)return await pause('elapsed');
         if(view.paused)return await pause('operator-pause');
-        if(status.controller?.stopRequested&&latestRequest?.status==='passed')return await pause('operator-stop');
+        if(view.operatorStopped||(status.controller?.stopRequested&&latestRequest?.status==='passed'))return await pause('operator-stop');
         if(status.controller?.state==='running')blockedSince=null;
         else if(latestRequest?.status==='failed'&&blockedSince===null)blockedSince=now();
         if(blockedSince!==null&&now()-blockedSince>=1800000)return await pause('infrastructure-or-ownership');
