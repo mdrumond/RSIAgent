@@ -118,7 +118,19 @@ test('CLI original failure -> smaller canonical investigation -> memory -> origi
 test('CLI freezes at the configured unsuccessful recovery-round limit', {timeout:120000},async t=>{
   const f=await setup(t,'freeze',['freeze']);
   const campaign=f.start('campaign');
-  await until(async()=>(await f.run('status')).projects.find(p=>p.id==='freeze')?.frozen===1);
+  let observed;
+  try {
+    // Three native workflows must settle within the outer 120s test allocation.
+    await until(async()=>{
+      observed=await f.run('status');
+      return observed.projects.find(p=>p.id==='freeze')?.frozen===1;
+    },90000);
+  }catch(error){
+    t.diagnostic(JSON.stringify({project:observed?.projects.find(p=>p.id==='freeze'),
+      attempts:observed?.attempts,recentEvents:rows(f.root,
+        'SELECT sequence,attempt,type FROM events ORDER BY sequence DESC LIMIT 5')}));
+    throw error;
+  }
   await until(()=>{
     const owner=rows(f.root,"SELECT value FROM control WHERE key='owner'")[0];
     return owner && JSON.parse(owner.value)===null;
