@@ -7,6 +7,7 @@ import { validateAcceptance } from '../controller/state.mjs';
 import { currentCampaignEntry, generationSettings } from '../controller/progress.mjs';
 import { curriculumSession } from './curriculum.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
+import {campaignEntryConfig} from './campaign-manifest.mjs';
 
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
@@ -56,6 +57,9 @@ function drafts(state, adoptPhase1=false) {
     AND json_extract(data,'$.spec.campaign_entry') IS NULL`).run();
   const save=d=>state.db.prepare('INSERT OR REPLACE INTO generation_drafts VALUES (?,?)').run(d.id,JSON.stringify(d));
   return {save,count:()=>state.db.prepare('SELECT COUNT(*) AS n FROM generation_drafts').get().n,
+    reserved:(phase,entry)=>state.db.prepare(`SELECT data FROM generation_drafts
+      WHERE json_extract(data,'$.status') IN ('draft','ready') AND json_extract(data,'$.phase')=?
+      AND json_extract(data,'$.campaign_entry') IS ?`).all(phase,entry).map(row=>JSON.parse(row.data)),
     pending:(phase,entry,limit)=>state.db.prepare(`SELECT data FROM generation_drafts
       WHERE json_extract(data,'$.status') IN ('draft','ready') AND json_extract(data,'$.phase')=?
       AND json_extract(data,'$.campaign_entry') IS ? ORDER BY rowid LIMIT ?`).all(phase,entry,limit).map(r=>JSON.parse(r.data)),
@@ -87,6 +91,7 @@ async function checkProposal(root,p) {
 export async function refillProjects({config,state,bridge,concurrency,path,signal}) {
   const entry=currentCampaignEntry(state,config);
   if(config.campaign_plan&&!entry)return [];
+  if(entry)config=campaignEntryConfig(config,entry.id);
   const phase=entry?.phase??config.mode,campaign_entry=entry?.id??null;
   const generation=generationSettings(config,phase);
   if(!['phase1','phase2'].includes(phase)||generation.enabled!==true)return [];
@@ -111,15 +116,29 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
   const result=[],batch=randomUUID();
   let processed=0;
   const pending=store.pending(phase,campaign_entry,wanted);
+  const quota=entry?.generation?.topics;
+  const reserved=new Map();
+  const reserve=(topic,delta)=>reserved.set(topic,(reserved.get(topic)??0)+delta);
+  if(quota) {
+    for(const row of state.db.prepare('SELECT spec FROM projects').all()) {
+      const spec=JSON.parse(row.spec);
+      if(spec.campaign_entry===entry.id)reserve(spec.generation?.topic,1);
+    }
+    for(const draft of store.reserved(phase,campaign_entry))reserve(draft.topic,1);
+  }
+  const nextTopic=()=>quota?.find(topic=>(reserved.get(topic)??0)<quota.filter(item=>item===topic).length)
+    ??(quota?undefined:generation.topics[topicIndex++%generation.topics.length]);
   let topicIndex=store.count();
   while(result.length<wanted && processed<wanted) {
     processed++;
     signal?.throwIfAborted();
     let d=pending.shift();
     if(!d){
+      const topic=nextTopic();if(topic===undefined)break;
       // One bounded batch per call; rejected proposals cannot spin a provider loop.
       d={id:'generated-'+randomUUID(),batch,status:'draft',phase,campaign_entry,seconds,elapsed:0,
-        topic:generation.topics[topicIndex++%generation.topics.length]};
+        topic};
+      if(quota)reserve(topic,1);
       store.save(d);
     }
     if(d.status==='ready'){result.push(d.spec);continue;}
@@ -127,15 +146,18 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
     const started=performance.now(),prior=d.elapsed??0;
     const spent=()=>prior+(performance.now()-started)/1000;
     const checkpoint=()=>{d.elapsed=spent();store.save(d);};
-    if(prior>=d.seconds){d.status='exhausted';store.save(d);continue;}
+    if(prior>=d.seconds){d.status='exhausted';store.save(d);if(quota)reserve(d.topic,-1);continue;}
     const bounded=AbortSignal.timeout(Math.max(1,Math.ceil((d.seconds-prior)*1000)));
     const active=signal?AbortSignal.any([signal,bounded]):bounded;
     const timer=setInterval(checkpoint,250);
+    const requirements=generation.requirements?.[d.topic]??{};
     try {
       await curriculumSession({config:{...config,curriculum_seconds:d.seconds},state:store.adapter,
         attemptId:d.id,role:'generation',path:root,bridge,signal:active,resume:true,accepted:()=>d.status==='ready',
         prompt:`Construct ONE fresh original ${phase==='phase1'?'microproject':'end-to-end project'} in Python for topic ${JSON.stringify(d.topic)}.\n`+
           `Retain performance goals requested by the curriculum as performance_goal with verifier.performance_command. Do not invent performance requirements or claim CPU construction proves timing.\n`+
+          (requirements.performance?`This topic requires a real performance_goal, verifier.performance_command and a separate CPU construction_command.\n`:'')+
+          (requirements.capabilityEvidence?`The target verifier must establish supported ${config.kernel_language??'target'} SIMT APIs/compiler mapping from actual target evidence. Benchmark against an equivalent non-SIMT/vector baseline on an isolated device; CPU construction cannot prove this.\n`:'')+
           `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
           `Use the existing KDB tools and baseline skills at ${join(config.root,'skills','versions',config.skills?.activeVersion??'baseline')}.\n`+
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
@@ -148,6 +170,8 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           execute:async(_id,p)=>{
             const checks=[];
             try {
+              if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command?.trim()||!p.construction_command?.trim()))
+                throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
               validateAcceptance(p);
               const artifacts=await checkProposal(root,p);
               const env=await createEnvironment({mode:'local'},{instancePath:root,signal:active,
@@ -176,7 +200,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                 target:config.target,...(p.performance_goal!=null?{performance_goal:p.performance_goal}:{}),
                 verifier:{files:artifacts.files,command:p.verifier.command,hashes,
                   ...(p.verifier.performance_command!==undefined?{performance_command:p.verifier.performance_command}:{})},
-                generation:{draft:d.id,topic:d.topic,checks}};
+                generation:{draft:d.id,topic:d.topic,requirements,checks}};
               d.proposal=p;d.status='ready';delete d.error;checkpoint();
               return reply('Project validated and accepted; finish without further tool calls.');
             }catch(error){
@@ -190,6 +214,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
     }catch(error){
       if(signal?.aborted){checkpoint();throw error;}
       d.status=bounded.aborted?'exhausted':'invalid';d.error=error.message;checkpoint();
+      if(quota)reserve(d.topic,-1);
     }finally{clearInterval(timer);checkpoint();}
   }
   return result;

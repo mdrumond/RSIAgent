@@ -19,6 +19,13 @@ const phase2Projects=Object.fromEntries(workloads.map(workload=>[workload,{goal:
   verifier:{files:[],command:'true',performance_command:'true'},performance_goal:'improve frozen baseline'}]));
 const manifest=target=>buildCampaignManifest({campaignId:'fresh-study',target,profile,phase2Projects});
 
+test('supplied-only native campaign entries retain configured actor budgets without a curriculum',()=>{
+  const config={actor_seconds:17,campaign_plan:[{id:'supplied',phase:'phase2',new_projects:1}]};
+  const current=campaignEntryConfig(config,'supplied');
+  assert.equal(current.mode,'phase2');assert.equal(current.actor_seconds,17);
+  assert.equal(current.curriculum.generation.enabled,undefined);assert.equal(config.curriculum,undefined);
+});
+
 test('both manifests drive exactly128 settled Phase1 and25 Phase2 originals through native progress',()=>{
   const before=structuredClone({profile,phase2Projects});
   for(const target of ['a3','a5']) {
@@ -71,9 +78,10 @@ function qualification() {
   for(const target of ['a3','a5']) {
     expected[target]={};
     for(const workload of workloads) {
-      expected[target][workload]={sourceHash:'source',caseHash:'cases',verifierHash:'verifier',runtimeFingerprint:target+'-runtime',caseIds:[1,2]};
+      expected[target][workload]={sourceHash:'source',caseHash:'cases',verifierHash:'verifier',independentCheckHash:'checker',runtimeFingerprint:target+'-runtime',caseIds:[1,2]};
       receipts.push({format:1,qualified:true,target,workload,sourceHash:'source',caseHash:'cases',verifierHash:'verifier',
-        runtime:{fingerprint:target+'-runtime'},cases:[1,2].map(id=>({id,passed:true,referenceHash:'reference',outputHash:'output',maxAbsError:0})),
+        runtime:{fingerprint:target+'-runtime'},independentChecks:{workload,passed:true,checkerHash:'checker'},
+        cases:[1,2].map(id=>({id,passed:true,referenceHash:'reference',outputHash:'output',maxAbsError:0})),
         timing:{passed:true,samples:[1,2].map(id=>({id,seconds:[.1,.2]}))}});
     }
   }
@@ -84,7 +92,9 @@ test('launch gate rejects stale local checks and missing, mismatched, failed or 
   const cases=[q=>q.localValidation.passed=false,q=>q.localValidation.sourceRevision='old',q=>q.receipts.pop(),
     q=>q.receipts[0].runtime.fingerprint='other-runtime',q=>q.receipts[0].sourceHash='changed',
     q=>q.receipts[0].cases[0].passed=false,q=>q.receipts[0].cases.pop(),
-    q=>q.receipts[0].timing.samples[0].seconds=[0],q=>q.receipts[0].timing.samples.pop()];
+    q=>q.receipts[0].timing.samples[0].seconds=[0],q=>q.receipts[0].timing.samples.pop(),
+    q=>delete q.receipts[0].independentChecks,q=>q.receipts[0].independentChecks.checkerHash='different',
+    q=>q.receipts[0].independentChecks.passed=false];
   for(const change of cases) {
     const q=qualification();change(q);
     await assert.rejects(bootstrapFreshCampaign({destination:'/not-created',campaignId:'fresh-study',target:'a3',
@@ -145,12 +155,18 @@ test('catalog reads immutable prior source from both fresh targets, withholding 
   a5.event(attempt,'failure-settlement',{closed:true});entries=await buildProjectCatalog(options);
   assert.deepEqual(entries.map(entry=>entry.target),['a3','a5']);
   assert.equal(entries.every(entry=>entry.runtime==='actual-runtime'&&entry.product===entry.target&&entry.outcome==='failed'),true);
-  let tool;await projectCatalogExtension(options)({registerTool:value=>tool=value});
+  const events=[];let tool;await projectCatalogExtension({...options,event:(type,data)=>events.push({type,data})})({registerTool:value=>tool=value});
   const first=(await tool.execute('call',{action:'list',limit:1})).details;
   assert.equal(first.projects.length,1);assert.equal(first.total,2);assert.equal(first.nextOffset,1);
   const second=(await tool.execute('call',{action:'list',offset:first.nextOffset,limit:1})).details;
   assert.equal(second.projects[0].target,'a5');assert.equal(second.nextOffset,null);
   const selected=entries[1];assert.equal((await tool.execute('call',{action:'read',id:selected.id,path:'kernel.py'})).details,'answer = 42\n');
+  assert.deepEqual(events.at(-1).data,{action:'read',campaignId:selected.campaignId,projectId:selected.projectId,
+    attemptId:selected.attemptId,target:'a5',runtime:'actual-runtime',tree:selected.source.tree,commit:selected.source.commit,path:'kernel.py'});
+  const choice=(await tool.execute('call',{action:'select',id:selected.id})).details;
+  assert.equal(choice.tree,selected.source.tree);assert.equal(events.at(-1).type,'starter-selected');
+  await tool.execute('call',{action:'select',starter:'scratch'});assert.deepEqual(events.at(-1).data,{starter:'scratch'});
+  await tool.execute('call',{action:'select',starter:'baseline'});assert.deepEqual(events.at(-1).data,{starter:'baseline'});
   assert.equal(await readFile(join(campaigns[0].root,'instance.json'),'utf8'),before);
   await assert.rejects(buildProjectCatalog({...options,cohort:'historical'}),/outside/);
 });
