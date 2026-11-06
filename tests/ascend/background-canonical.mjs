@@ -5,36 +5,55 @@ import {join} from 'node:path';
 import {setup,rows,until} from './driver_setup.mjs';
 import {readConfig} from '../../cli/instance.mjs';
 import {operate,instanceStopped} from '../../cli/runtime.mjs';
-import {ownerStopped} from '../../controller/lifecycle.mjs';
+import {ownerStopped,processIdentity} from '../../controller/lifecycle.mjs';
 
 // All eight A/B samples use the production evaluator, SDK and Python verifier.
 // Only the provider and embedding backend are scripted, as in the CLI fixtures.
+const timeout=Number(process.env.RSI_CANONICAL_TEST_TIMEOUT_MS??600000);
 test('background canonical eight-sample evaluation closes while foreground memory advances',
-  {timeout:Number(process.env.RSI_CANONICAL_TEST_TIMEOUT_MS??240000)},async t=>{
+  {timeout},async t=>{
+    const deadline=performance.now()+timeout;
     let f,release,round;
     const cleanup=async()=>{
       if(!f)return;
-      await writeFile(release,'released');await f.run('stop');
-      await until(()=>instanceStopped({...f.config,root:f.root}),15000);
-      let evolution;try{evolution=JSON.parse(await readFile(join(f.root,'skills','evolution.json'),'utf8'));}
-      catch(error){if(error.code==='ENOENT')return;throw error;}
-      const path=evolution.pending?.evaluationRoot??evolution.lastEvaluationRoot;
-      if(!path)return;
-      const journal=JSON.parse(await readFile(join(path,'round.json'),'utf8'));
-      for(const sample of journal.samples) {
-        try {await access(join(sample.instanceRoot,'instance.json'));}
-        catch(error){if(error.code==='ENOENT')continue;throw error;}
-        const config=await readConfig(sample.instanceRoot);await operate('stop',config);
-        await until(()=>instanceStopped(config),15000);
-        await until(async()=>{
-          if(!rows(config.root,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
-          for(const request of rows(config.root,'SELECT status,owner FROM requests'))
-            if(['queued','running'].includes(request.status)||(request.owner&&!await ownerStopped(request.owner)))return false;
-          return true;
-        },15000);
-        const receipt=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));
-        if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
-        await until(()=>ownerStopped(receipt.owner),15000);
+      try {
+        await writeFile(release,'released');await f.run('stop');
+        await until(()=>instanceStopped({...f.config,root:f.root}),15000);
+        let evolution;try{evolution=JSON.parse(await readFile(join(f.root,'skills','evolution.json'),'utf8'));}
+        catch(error){if(error.code==='ENOENT')return;throw error;}
+        const path=evolution.pending?.evaluationRoot??evolution.lastEvaluationRoot;
+        if(!path)return;
+        const journal=JSON.parse(await readFile(join(path,'round.json'),'utf8'));
+        for(const sample of journal.samples) {
+          try {await access(join(sample.instanceRoot,'instance.json'));}
+          catch(error){if(error.code==='ENOENT')continue;throw error;}
+          const config=await readConfig(sample.instanceRoot);await operate('stop',config);
+          await until(()=>instanceStopped(config),15000);
+          await until(async()=>{
+            if(!rows(config.root,"SELECT 1 FROM sqlite_master WHERE name='requests'").length)return true;
+            for(const request of rows(config.root,'SELECT status,owner FROM requests'))
+              if(['queued','running'].includes(request.status)||(request.owner&&!await ownerStopped(request.owner)))return false;
+            return true;
+          },15000);
+          const receipt=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));
+          if(!await ownerStopped(receipt.owner))process.kill(receipt.owner.pid,'SIGTERM');
+          await until(()=>ownerStopped(receipt.owner),15000);
+        }
+      } finally {
+        try {
+          const owner=rows(f.root,"SELECT value FROM control WHERE key='owner'")[0];
+          const stopped=(!owner||await ownerStopped(JSON.parse(owner.value)))&&
+            (await Promise.all(rows(f.root,'SELECT owner FROM attempts').map(row=>ownerStopped(row.owner)))).every(Boolean);
+          if(stopped) {
+            const receipt=JSON.parse(await readFile(join(f.root,'knowledge-service.json'),'utf8'));
+            if(!await ownerStopped(receipt.owner)) {
+              const actual=await processIdentity(receipt.owner.pid);
+              assert.equal(actual.start,receipt.owner.start);assert.equal(actual.boot,receipt.owner.boot);
+              process.kill(receipt.owner.pid,'SIGTERM');
+              await until(()=>ownerStopped(receipt.owner),5000);
+            }
+          }
+        } finally {await f.server.close();}
       }
     };
     t.after(cleanup); // Runs before setup removes any parent/source files.
@@ -67,7 +86,7 @@ export const createEnvironment=(options,context)=>local(options,{...context,reso
         round=JSON.parse(await readFile(join(path,'round.json'),'utf8'));
         return round.status==='completed'&&round.samples.filter(sample=>sample.result).length===8;
       }catch(error){if(error.code==='ENOENT')return false;throw error;}
-    },180000);
+    },Math.max(1,deadline-performance.now()-30000));
     assert.equal(rows(f.root,"SELECT outcome FROM attempts WHERE project='hold'")[0].outcome,null);
     assert.equal(new Set(round.samples.map(sample=>sample.instanceRoot)).size,8);
     const startingSources=new Map();
