@@ -104,9 +104,12 @@ export async function inspectCampaignLaunch(input) {
     [id,{...project,source:resolve(project.source),verifier:{...project.verifier,files:project.verifier.files.map(file=>resolve(file))}}]))};
   const child=execFile(input.profile.python??'python3',['-m','ascend_tools.campaign_launch'],
     {cwd:machinery,env:{...process.env,PYTHONPATH:machinery},maxBuffer:1024*1024});
+  let diagnostic='';
+  child.stderr.on('data',data=>{diagnostic=(diagnostic+data).slice(-16384);});
   child.stdin.end(JSON.stringify(inspection));
   await new Promise((resolve,reject)=>{child.on('error',reject);child.on('close',code=>
-    code===0?resolve():reject(new Error('Actual frozen campaign inputs failed qualification inspection')));});
+    code===0?resolve():reject(new Error('Actual frozen campaign inputs failed qualification inspection',
+      {cause:{exitCode:code,stderr:diagnostic}})));});
 }
 
 // Inspect actual copied machinery and verifier files before creating any destination.
