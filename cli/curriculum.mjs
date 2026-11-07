@@ -5,6 +5,7 @@ import { join, resolve, relative, sep } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {State} from '../controller/state.mjs';
+import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 
 // Page telemetry without retaining complete event or native Pi history. The first
 // allocation remains authoritative across resumes; checkpoints never reset it.
@@ -29,11 +30,15 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
   const agentDir=join(path,'agent');await mkdir(agentDir,{recursive:true});
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const providerPath=join(path,'provider-'+role+'.jsonl');
+  let remaining=()=>config.curriculum_seconds??240;
+  const local=createLocalExecutionOperations(sdk,config.local_execution);
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
     extensionFactories:[bridge.extension,pi=>{
       if(config.storage)for(const type of ['before_provider_request','provider_stream_event'])
         pi.on(type,payload=>appendFile(providerPath,JSON.stringify(payload)+'\n'));
       pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
+      pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
+        {...options,timeout:Math.min(options.timeout??Infinity,remaining())})}}));
       for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);
     }]});
   await loader.reload();
@@ -51,9 +56,10 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
     }finally{ledger.close();}
   }
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
-    thinkingLevel:'off',tools:['read','write','edit','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
+    thinkingLevel:'off',tools:['read','write','edit','bash','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
   const started=performance.now();
   const spent=()=>elapsed+(performance.now()-started)/1000;
+  remaining=()=>Math.max(.001,seconds-spent());
   const checkpoint=()=>state.event(attemptId,'curriculum-checkpoint',{role,session:manager.getSessionFile(),allocation_seconds:seconds,elapsed_seconds:spent()});
   let reason,timer,checkpoints,telemetryError;
   const readiness=new AbortController();

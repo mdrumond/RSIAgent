@@ -54,7 +54,7 @@ export async function bootstrap(request) {
       projects:await Promise.all(projects.map(async project=>({...project,sourceHash:await fingerprint(project.source)})))},signal:request.signal,
       remainingSeconds:request.remainingSeconds},async initialization=>createInstance(inputs,{initialization,python:request.config.python??original.python,baseline:join(original.root,'knowledge.sqlite'),
       skills:join(original.root,'skills','versions',request.skillVersion),
-      environment:original.environment,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')}));
+      environment:original.environment,local_execution:original.local_execution,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')}));
     frozen=await readConfig(inputs);
   }
   const project=frozen.projects.find(project=>project.id===request.projectId);
@@ -133,7 +133,7 @@ async function stoppedAttempts(config, state, signal, allOperations = false) {
         if (state.events(attempt.id).some(event => event.type.startsWith('execution-'))) {
           const job = JSON.parse(await readFile(join(path, 'job.json'), 'utf8'));
           const module = await import(pathToFileURL(resolve(config.root, config.environment.module)));
-          environment = await module.createEnvironment(config.environment.options, { instancePath: path,
+          environment = await module.createEnvironment({...config.environment.options,localExecution:config.local_execution}, { instancePath: path,
             event: (type, data) => state.event(attempt.id, type, data), exclude: async (_label, fn) => fn(),
             resource: job.resource, signal });
         }

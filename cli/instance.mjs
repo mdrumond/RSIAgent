@@ -234,7 +234,7 @@ export async function upgrade(root,machinery) {
     const plugin=within(installed,configured)?resolve(staged,relative(installed,configured)):configured;
     const module=pending.length?await import(pathToFileURL(plugin)):null;
     for(const attempt of pending) {
-      const environment=await module.createEnvironment(config.environment.options,{
+      const environment=await module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{
         instancePath:join(root,'attempts',attempt.id),event:async()=>{},exclude:async(_label,fn)=>fn()});
       const safe=environment.canUpgrade
         ? await environment.canUpgrade({attempt,events:ledger.events(attempt.id)})

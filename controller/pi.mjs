@@ -164,7 +164,10 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     pi.registerTool({name:'rsi_revise',label:'Revise after findings',description:'From debug, optimisation, validation, or acceptance, return to design or implementation with an observed reason. Then complete the canonical steps and fresh validation before accepting.',
       parameters:Type.Object({to:Type.Union([Type.Literal('design'),Type.Literal('implementation')]),reflection:Type.String({minLength:1})}),
       execute:async(_id,args)=>result(await workflow.advance({next:args.to,reflection:args.reflection}))});
-    const shellTools=await createEnvironmentTools({shellOnTarget:environment.shellOnTarget,execute:async(command,cwd,options)=>{
+    const shellTools=await createEnvironmentTools({shellOnTarget:environment.shellOnTarget,
+      localOperations:environment.localOperations&&{exec:(command,cwd,options)=>{
+        clock.check();return environment.localOperations.exec(command,cwd,{...options,timeout:Math.min(options.timeout??Infinity,clock.remaining)});
+      }},execute:async(command,cwd,options)=>{
       clock.check();
       return execute(command,cwd,{...options,
         purpose:project.purpose??(project.performance_goal?'performance':'ordinary'),

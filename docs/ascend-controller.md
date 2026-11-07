@@ -376,6 +376,18 @@ command names, never arguments or environment. Missing memory observations block
 work. A recovery that cannot settle or cool within 30 elapsed minutes needs attention.
 Existing instances without `local_memory` keep their prior supervision behavior.
 
+Fresh campaigns also set `local_execution` limits for each local command: 128
+tasks (including threads), 4 GiB memory and no swap. Pi's native Bash operations
+own spawning, streaming, timeout and cancellation; a user-systemd scope enforces
+the resource boundary and cleans all descendants, including detached processes.
+This requires a delegated Linux user manager with memory and pids controllers.
+Missing containment fails closed rather than executing outside the scope.
+The same policy covers native Pi Bash in actors and curriculum generation, and
+CPU construction checks invoked by the submission tool. A limit violation is a
+normal Pi tool error, so the agent can repair its command within the remaining
+elapsed allocation. Device execution continues through the configured CPL target.
+Legacy configurations without `local_execution` retain their existing behavior.
+
 Memory-triggered resumes retain their expected pause token through the durable request
 and recheck it atomically when claiming the native controller; a newer operator pause
 or stop cannot be cleared by a queued recovery. If a retained one-worker cap cannot
