@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
-import {tmpdir} from 'node:os';
+import {tmpdir,homedir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
 import {createEnvironmentTools} from '../../integrations/environments/index.mjs';
@@ -319,11 +319,12 @@ test('closed cleanup contention retries after the other controller releases its 
 
 
 test('closed cleanup ownership mismatch preserves an orphan fence and retries after its closure',{timeout:20000},async t=>{
-  const f=await fixture(t);f.options.env.HOME=f.root;const first=await f.bind();
+  const f=await fixture(t);const first=await f.bind();
   const prior=await reserveDevice(f.root,0,first.context.leaseDirectory,{instancePath:first.path});
   await writeFile(join(first.path,'.ascend-command-lease.json'),JSON.stringify({receipt:prior.receipt,token:prior.token,pool:f.root,physicalDevice:0}));
   const key=createHash('sha256').update(JSON.stringify([f.root,0])).digest('hex');
-  const fence=join(f.root,'.local/state/rsi/device-leases-host',key+'.held');await mkdir(fence,{recursive:true});
+  const fence=join(homedir(),'.local/state/rsi/device-leases-host',key+'.held');await mkdir(fence,{recursive:true});
+  t.after(async()=>{await rm(fence,{recursive:true,force:true});await rm(fence.replace(/\.held$/,'.lock'),{force:true});});
   const newer=JSON.stringify({pool:f.root,token:'newer-owner'});await writeFile(join(fence,'lease.json'),newer);
   assert.equal(await first.environment.reconcileLease(),false);
   assert.equal(await readFile(join(fence,'lease.json'),'utf8'),newer);
