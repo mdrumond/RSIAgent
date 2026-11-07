@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import {createLocalExecutionOperations} from './local-bash.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
@@ -60,8 +61,9 @@ export async function readProcessStat(pid, read = readFile) {
 }
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 async function save(path, value) {
-  await writeFile(path + '.tmp', JSON.stringify(value), { mode: 0o600 });
-  await rename(path + '.tmp', path);
+  const temporary=path+'.'+randomUUID()+'.tmp';
+  await writeFile(temporary,JSON.stringify(value),{mode:0o600});
+  await rename(temporary,path);
 }
 
 // Only the installed public CLI owns remote protocols and credentials.
@@ -171,7 +173,7 @@ export async function createEnvironment(options, context) {
     signal?.throwIfAborted();
     return nativeClient(args, {signal});
   };
-  const local = sdk.createLocalBashOperations();
+  const local = createLocalExecutionOperations(sdk,options.localExecution);
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
@@ -199,6 +201,14 @@ export async function createEnvironment(options, context) {
     try {
       const receipt = await json(join(dir, 'execution.json'));
       if (receipt.boot !== (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()) return { state: 'unknown' };
+      if(receipt.containment) {
+        if(receipt.containment.closed) {
+          let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
+          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{})};
+        }
+        const state=await local.observe(receipt.containment.unit);
+        return state.state==='stopped'?{state:'unknown'}:state;
+      }
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
       const pid = Number(original.slice(0, original.indexOf(' ')));
       const fields = text => text.slice(text.lastIndexOf(')') + 2).split(' ');
@@ -269,6 +279,12 @@ export async function createEnvironment(options, context) {
     if (remote) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
     } else {
+      const receipt=await json(join(root,handle.slice(6),'execution.json'));
+      if(receipt.containment) {
+        await local.stop(receipt.containment.unit);
+        await save(join(root,handle.slice(6),'execution.json'),{...receipt,containment:{...receipt.containment,closed:true}});
+        return observe(handle);
+      }
       const state = await localState(handle);
       if (state.state === 'running') {
         try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
@@ -401,12 +417,18 @@ export async function createEnvironment(options, context) {
     let handle;
     if (!remote) {
       handle = `local:${dir.slice(dir.lastIndexOf('/') + 1)}`;
-      await save(join(dir, 'execution.json'), { boot: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(), cwd });
+      const receipt={boot:(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim(),cwd};
+      await save(join(dir,'execution.json'),receipt);
       if (opts.leaseReceipt) opts = {...opts, env:{...opts.env, RSI_LEASE_RECEIPT:join(dir,'admission.json')}};
       await event('execution-handle', { handle });
       const wrapper = `cat /proc/$$/stat > ${quote(join(dir, 'identity.tmp'))}\nmv ${quote(join(dir, 'identity.tmp'))} ${quote(join(dir, 'identity'))}\n` +
         `trap ${quote(`code=$?; printf "%s" "$code" > ${quote(join(dir, 'exit.tmp'))}; mv ${quote(join(dir, 'exit.tmp'))} ${quote(join(dir, 'exit'))}`)} EXIT\nbash -c ${quote(command)}`;
-      try { await local.exec(wrapper, cwd, { ...opts, env: opts.env ? { ...process.env, ...opts.env } : undefined, timeout: remaining(), onData: opts.onData ?? (() => {}) }); }
+      try {
+        const result=await local.exec(wrapper,cwd,{...opts,env:opts.env?{...process.env,...opts.env}:undefined,
+          timeout:remaining(),onData:opts.onData??(()=>{}),
+          onContainment:async containment=>save(join(dir,'execution.json'),{...receipt,containment})});
+        await writeFile(join(dir,'exit'),String(result.exitCode));
+      }
       catch (error) {
         const state = await stop(handle);
         if (state.state !== 'stopped') throw new Error(`Local execution unresolved: ${handle}`, { cause: error });
@@ -624,7 +646,7 @@ export async function createEnvironment(options, context) {
     } catch { return false; }
   }
   return {
-    instructions, execute, observe, stop, reconcileOperation, readAdmission,
+    instructions, execute, observe, stop, reconcileOperation, readAdmission,localOperations:local,
     ...(remote ? { canUpgrade } : {}),
     async prepare({ project, attempt }) {
       return exclude('setup', async () => {
@@ -689,6 +711,7 @@ export async function createEnvironmentTools(environment, cwd, sdk) {
     description:'Execute a command in the configured target environment. Remote targets use an execution snapshot; use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'};
   // On a device host, override Pi's Bash tool through its supported extension
   // API. Both shell names must pass through the same admission and supervision.
-  return environment.shellOnTarget ? [target,{...tool,name:'bash'}] : [target];
+  return environment.shellOnTarget ? [target,{...tool,name:'bash'}] :
+    [target,sdk.createBashTool(cwd,{operations:environment.localOperations??sdk.createLocalBashOperations()})];
 }
 

@@ -36,7 +36,7 @@ function control(state) {
 }
 async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
-  return module.createEnvironment(config.environment.options,{instancePath:path,event,exclude,resource,signal});
+  return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal});
 }
 export async function instanceStopped(config) {
   const state=stateFor(config.root),ctl=control(state);

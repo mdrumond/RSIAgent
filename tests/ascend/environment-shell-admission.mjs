@@ -22,7 +22,7 @@ for(const name of ['bash','rsi_target'])test(`${name} uses device-host execution
 
 test('remote target leaves controller-host Bash available',async()=>{
   const tools=await createEnvironmentTools({execute:()=>assert.fail('not executed')},process.cwd());
-  assert.deepEqual(tools.map(tool=>tool.name),['rsi_target']);
+  assert.deepEqual(tools.map(tool=>tool.name),['rsi_target','bash']);
 });
 
 test('both shell names surface unresolved execution without replay',async()=>{

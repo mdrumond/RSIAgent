@@ -174,7 +174,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                 throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
               validateAcceptance(p);
               const artifacts=await checkProposal(root,p);
-              const env=await createEnvironment({mode:'local'},{instancePath:root,signal:active,
+              const env=await createEnvironment({mode:'local',localExecution:config.local_execution},{instancePath:root,signal:active,
                 exclude:async(_label,fn)=>fn(),event:(type,data)=>store.adapter.event(d.id,type,data)});
               const hashFiles=async()=>Object.fromEntries(await Promise.all(artifacts.files.map(async f=>[f,createHash('sha256').update(await readFile(f)).digest('hex')])));
               const hashes=await hashFiles();

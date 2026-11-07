@@ -41,7 +41,7 @@ export function buildCampaignManifest({campaignId,target,profile,phase2Projects}
   }
   return {...settings,mode:'phase1',target,campaign_cohort:campaignId,
     kernel_language:target==='a3'?'triton':'catlass-dsl',actor_seconds:7200,curriculum_seconds:1800,
-    campaign_seconds:seconds,recovery:false,concurrency:4,local_memory:{},tune_every:1,campaign_plan:plan,projects,
+    campaign_seconds:seconds,recovery:false,concurrency:4,local_memory:{},local_execution:{tasks:128,memory_bytes:4*1024**3},tune_every:1,campaign_plan:plan,projects,
     skillSettings:{...skillPolicy,activeVersion:'baseline',tuningDisabled:false,background:true,archiveEvaluations:true,runsPerArm:2,
       tuningProjectIds:projects.slice(0,2).map(project=>project.id)},
     curriculum:{phase1:[],phase2:projects.map(project=>project.id),generation:{enabled:true,topics,
