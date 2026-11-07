@@ -192,6 +192,9 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
               await publish('observing','memory-resume',{request:request.id});
             }else if(memory.action==='resume') {
               if(!await closed(config))return await publish('attention-needed','memory-ownership',{checkpointPending:true});
+              // A restored cooling checkpoint may precede service shutdown; recheck before every resume.
+              try{await memoryRelease(config);}
+              catch(error){return await publish('attention-needed','memory-service-release',{checkpointPending:true,errorType:error.name});}
               // Persist intent before dispatch. Observe a retained queued request after interruption, never replay it.
               memory.resumePending=true;memory.priorRequests=(status.requests??[]).map(request=>request.id);memory.phaseAt=now();
               await publish('launching','memory-resume');

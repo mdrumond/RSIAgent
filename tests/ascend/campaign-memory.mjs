@@ -89,3 +89,15 @@ test('real allocated child memory is attributed once and released after a scaled
   assert.ok(reports.some(report=>report.reason==='memory-recovered'));assert.deepEqual(budget,{cycle:'same',elapsed:123});
   const released=await sampleCampaignMemory({root},owner,{known});assert.ok(baseline.rssBytes-released.rssBytes>=32*1024**2);
 });
+
+
+test('a stubborn owned service requires attention after its shutdown grace without forced killing',{timeout:5000},async t=>{
+  const root=await mkdtemp(join(tmpdir(),'memory-stubborn-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"],{stdio:['ignore','pipe','ignore']});
+  const exit=once(child,'exit');t.after(async()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await exit;});
+  await once(child.stdout,'data');const owner=await processIdentity(child.pid);
+  await writeFile(join(root,'knowledge-service.json'),JSON.stringify({owner}));
+  await assert.rejects(releaseKnowledgeService({root},{timeoutMs:40,pollMs:10}),/did not release memory/);
+  assert.equal(child.exitCode,null);assert.equal(child.signalCode,null);
+  assert.deepEqual(await processIdentity(child.pid),owner);
+});

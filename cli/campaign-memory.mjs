@@ -51,18 +51,21 @@ export function requestMemoryPause(config,token) {
     }catch(error){state.db.exec('ROLLBACK');throw error;}
   });
 }
-export async function releaseKnowledgeService(config) {
+export async function releaseKnowledgeService(config,{timeoutMs=((config.pause_grace_seconds??30)+60)*1000,pollMs=100}={}) {
+  if(!Number.isFinite(timeoutMs)||timeoutMs<=0||!Number.isFinite(pollMs)||pollMs<=0)throw Error('Positive service shutdown grace required');
   let service;
   try{service=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));}
   catch(error){if(error.code==='ENOENT')return;throw error;}
   if(!service.owner?.start||!service.owner?.boot)throw Error('Knowledge service ownership unknown');
   if(await ownerStopped(service.owner))return;
-  const current=await processIdentity(service.owner.pid);
-  if(current.start===service.owner.start&&current.boot===service.owner.boot)process.kill(current.pid,'SIGTERM');
-  const until=performance.now()+30000;
+  try {
+    const current=await processIdentity(service.owner.pid);
+    if(current.start===service.owner.start&&current.boot===service.owner.boot)process.kill(current.pid,'SIGTERM');
+  }catch(error){if(['ENOENT','ESRCH'].includes(error.code))return;throw error;}
+  const until=performance.now()+timeoutMs;
   while(!await ownerStopped(service.owner)) {
     if(performance.now()>=until)throw Error('Knowledge service did not release memory after checkpoint');
-    await delay(100);
+    await delay(pollMs);
   }
 }
 // Use comm, never argv/environment. Owned roots also cover detached services after supervisor restart.

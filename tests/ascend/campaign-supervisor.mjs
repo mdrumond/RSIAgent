@@ -268,7 +268,7 @@ function memoryFixture({rss=29,prior,operator=false,settled=true,queuedPolls=0,o
 test('memory checkpoint releases services then resumes retained attempts and elapsed allocation at a lower cap',async()=>{
   const f=memoryFixture();
   const result=await superviseCampaign(options(),f.deps);
-  assert.equal(result.reason,'complete');assert.equal(f.releases(),1);
+  assert.equal(result.reason,'complete');assert.equal(f.releases(),2);
   assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
   assert.ok(f.reports.some(report=>report.state==='cooling'));
   assert.equal(result.memory.limit,3);assert.equal(result.memory.recovered,true);
@@ -327,6 +327,15 @@ test('failed memory observation blocks admissions and retains infrastructure fai
 
 test('unconfirmed knowledge-service release prevents automatic recovery',async()=>{
   const f=memoryFixture();f.deps.memoryRelease=async()=>{throw Error('service still alive');};
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'memory-service-release');assert.equal(result.checkpointPending,true);
+  assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+
+test('restored cooling checkpoint verifies service release again before native resume',async()=>{
+  const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}});
+  f.deps.memoryRelease=async()=>{throw Error('retained service is still live');};
   const result=await superviseCampaign(options(),f.deps);
   assert.equal(result.reason,'memory-service-release');assert.equal(result.checkpointPending,true);
   assert.equal(f.calls.some(call=>call[0]==='resume'),false);
