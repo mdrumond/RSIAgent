@@ -381,7 +381,8 @@ export async function createEnvironment(options, context) {
       if(!lease.record.controlHandle)return false;
       if((await cleanup.observe(lease.record.controlHandle)).state!=='stopped')return false;
       const receipt=await cleanup.readAdmission(lease.record.controlHandle);
-      if(receipt?.token===lease.token&&receipt.decision==='contended'){
+      if(receipt?.token===lease.token&&['contended','ownership-mismatch'].includes(receipt.decision)){
+        await preserveControls(dirname(lease.receipt));
         await lease.update({controlStarted:false,controlHandle:null});return false;
       }
       if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
