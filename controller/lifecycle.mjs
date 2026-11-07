@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { excludedExecutionProofs } from './execution-proof.mjs';
 
 export async function processIdentity(pid=process.pid) {
   const stat=await readFile(`/proc/${pid}/stat`,'utf8');
@@ -69,8 +70,11 @@ export async function operationsStopped(state,attempt,environment) {
   if(unresolved.some(e=>!e.data.handle))return false;
   const handles=new Set([...events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle),
     ...events.filter(e=>e.type==='execution-unresolved' && e.data.handle).map(e=>e.data.handle)]);
+  const excluded=excludedExecutionProofs(events);
   for (const handle of handles) {
-    if (!handle || (await environment.observe(handle)).state !== 'stopped') return false;
+    if (!handle) return false;
+    const proof=excluded.get(handle) ?? await environment.observe(handle,{accountingExcluded:excluded.has(handle)});
+    if (proof.state !== 'stopped') return false;
   }
   return true;
 }
