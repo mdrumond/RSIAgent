@@ -31,6 +31,30 @@ export async function openDeviceLease(receipt, token) {
       await rm(dirname(receipt),{recursive:true});
     }};
 }
+// Positive closure is token-scoped and outlives the active device directory.
+// Retain native journals so the original checkpoint can finish observing them.
+const closedPath=(receipt,token)=>join(dirname(dirname(receipt)),'.closed',
+  createHash('sha256').update(JSON.stringify([receipt,token])).digest('hex'));
+export async function closedDeviceLease(receipt,token) {
+  const path=closedPath(receipt,token);
+  try {
+    const proof=JSON.parse(await readFile(join(path,'closure.json'),'utf8'));
+    return proof.closed===true&&proof.receipt===receipt&&proof.token===token?{...proof,path}:null;
+  }catch(error){if(error.code==='ENOENT')return null;throw error;}
+}
+export async function closeDeviceLease(lease) {
+  const path=closedPath(lease.receipt,lease.token);
+  await mkdir(dirname(path),{recursive:true,mode:0o700});
+  return leaseLock(dirname(dirname(lease.receipt)),()=>{
+    const record=JSON.parse(readFileSync(lease.receipt,'utf8'));
+    if(record.token!==lease.token)throw new Error('Lease ownership changed');
+    const proof={closed:true,receipt:lease.receipt,token:lease.token,pool:record.pool,
+      physicalDevice:record.physicalDevice,handles:record.handles};
+    writeFileSync(join(dirname(lease.receipt),'closure.json'),JSON.stringify(proof),{mode:0o600});
+    renameSync(dirname(lease.receipt),path);return proof;
+  });
+}
+
 // Atomic mkdir spans instances/runtimes; owner death/expiry never proves closure.
 export function deviceLeaseReceipt(pool,physicalDevice,directory=join(homedir(),'.local/state/rsi/device-leases')) {
   return join(directory,createHash('sha256').update(JSON.stringify([pool,physicalDevice])).digest('hex'),'lease.json');
@@ -77,7 +101,7 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
     record.reconciliation=claim;return true;
   }))return blocked('ownership-changed');
   try {
-    const lease=await openDeviceLease(receipt,before.token),handles=new Set(lease.record.handles);
+    const lease=await openDeviceLease(receipt,before.token),handles=new Set([...lease.record.handles,lease.record.controlHandle,lease.record.payloadHandle].filter(Boolean));
     for(const row of lease.record.submissions){
       if(row.closed===true)continue;
       let handle=row.handle;
@@ -90,7 +114,7 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
       if(!['stopped','completed','failed','cancelled'].includes(result?.state))return blocked('execution-unresolved',{handle});
     }
     if(!await reconcileHost(lease))return blocked('host-fence-unresolved');
-    await lease.release();return {closed:true,receipt,token:before.token};
+    await closeDeviceLease(lease);return {closed:true,receipt,token:before.token};
   }finally{
     try{changeLease(receipt,record=>{
       if(record.token!==before.token||record.reconciliation?.id!==claim.id)return false;
