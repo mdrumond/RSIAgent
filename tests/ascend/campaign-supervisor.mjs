@@ -379,3 +379,12 @@ test('retained one-worker cap with real A/B reservation checkpoints instead of s
   }finally{await f.run('pause');await runtime.output;ledger.close();}
   f.pass();
 });
+
+test('new unresolved global reservation checkpoints supervision instead of polling forever',async()=>{
+  const running={...fresh(),status:{controller:{state:'running'},progress:{done:false}},
+    leaseBlocked:{created:new Date(Date.now()+1000).toISOString(),data:JSON.stringify({reservations:[{reason:'owner-unknown'}]})}};
+  const f=fixture([running]);
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.state,'attention-needed');assert.equal(result.reason,'device-lease-blocked');
+  assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+});
