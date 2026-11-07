@@ -73,7 +73,8 @@ async function nativeSnapshot(config,cli) {
     const value=key=>control?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
     return {status,budget:value('campaign-budget'),operation:value('operation'),
       paused:Boolean(value('pause')),memoryPause:value('memory-pause'),operatorStopped:Boolean(value('operator-stop')),
-      attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n};
+      attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,
+      leaseBlocked:state.db.prepare("SELECT data,created FROM events WHERE type='device-lease-blocked' ORDER BY sequence DESC LIMIT 1").get()};
   }finally{state.close();}
 }
 async function diskBytes(config) {const value=await statfs(config.root);return value.bavail*value.bsize;}
@@ -111,6 +112,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
   const snapshot=providedSnapshot??(config=>nativeSnapshot(config,cli));
   const owner=await identity(),release=await claim(config,owner);
   let blockedSince=null,nextReconcile=0,lastLaunch=null,report,memory;
+  const startedWall=Date.now();
   const settings=config.local_memory?memorySettings(config.local_memory):null,known=new Map();
   const publish=async(state,reason,extra={})=>{
     report={format:1,at:now(),observedAt:new Date().toISOString(),owner,state,reason,sourceRevision,
@@ -145,6 +147,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(current.campaign_cohort!==cohort||current.campaign_source_revision!==sourceRevision||current.campaign_seconds!==config.campaign_seconds)
           return await pause('campaign-binding-changed');
         const view=await snapshot(config),status=view.status;
+        if(view.leaseBlocked&&Date.parse(view.leaseBlocked.created)>=startedWall)return await pause('device-lease-blocked');
         const used=campaignElapsed(view.budget,{boot:owner.boot,now});
         const latestRequest=status.requests?.find(request=>request.id===lastLaunch?.request)??
           status.requests?.find(request=>['campaign','resume'].includes(request.kind));

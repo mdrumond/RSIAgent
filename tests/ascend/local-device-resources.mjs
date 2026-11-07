@@ -1,8 +1,9 @@
 import test from 'node:test';
+import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
-import {tmpdir} from 'node:os';
+import {tmpdir,homedir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
 import {createEnvironmentTools} from '../../integrations/environments/index.mjs';
@@ -12,6 +13,7 @@ import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {setup,rows,until as driverUntil} from './driver_setup.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
 import {attemptStopped,processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
@@ -291,4 +293,44 @@ test('target contention retries only structured nonadmission; payload exit 126 e
   const result=await next;assert.equal(result.exitCode,126);assert.equal(result.admission.decision,'admitted');
   assert.equal(await readFile(join(f.source,'invocations'),'utf8'),'ran\n');
   assert.equal(clock.elapsed,1,'confirmed contention refunded; genuine payload 126 charged');
+});
+
+
+test('closed cleanup contention retries after the other controller releases its fence',{timeout:30000},async t=>{
+  const f=await fixture(t);f.setEnabled([0]);const first=await f.bind(),second=await f.bind();
+  const prior=await reserveDevice(f.root,0,first.context.leaseDirectory,{instancePath:first.path});
+  await writeFile(join(first.path,'.ascend-command-lease.json'),JSON.stringify({receipt:prior.receipt,token:prior.token,pool:f.root,physicalDevice:0}));
+  second.environment=await createEnvironment(f.options,{...second.context,leaseDirectory:join(f.root,'other-controller')});
+  const holding=second.environment.execute('touch newer-started; while [ ! -f newer-release ]; do sleep .01; done',f.source,{timeout:20});
+  void holding.catch(()=>{});await until(()=>exists(join(f.source,'newer-started')));
+  assert.equal(await first.environment.reconcileLease(),false);
+  const controls=first.events.filter(e=>e.type==='execution-handle'&&e.data.purpose==='device-lease-control');
+  assert.equal(controls.length,1);
+  const receipt=JSON.parse(await readFile(join(prior.receipt,'..','control','.executions',controls[0].data.handle.slice(6),'admission.json'),'utf8'));
+  assert.equal(receipt.token,prior.token);assert.equal(receipt.decision,'contended');
+  assert.equal(JSON.parse(await readFile(prior.receipt,'utf8')).controlStarted,false);
+  // A second refusal proves the first cleanup left the newer fence intact.
+  assert.equal(await first.environment.reconcileLease(),false);
+  await writeFile(join(f.source,'newer-release'),'go');assert.equal((await holding).exitCode,0);
+  await until(()=>second.environment.reconcileLease());
+  assert.equal(await first.environment.reconcileLease(),true);
+  assert.equal(first.events.filter(e=>e.type==='execution-handle'&&e.data.purpose==='device-lease-control').length,3);
+});
+
+
+test('closed cleanup ownership mismatch preserves an orphan fence and retries after its closure',{timeout:20000},async t=>{
+  const f=await fixture(t);const first=await f.bind();
+  const prior=await reserveDevice(f.root,0,first.context.leaseDirectory,{instancePath:first.path});
+  await writeFile(join(first.path,'.ascend-command-lease.json'),JSON.stringify({receipt:prior.receipt,token:prior.token,pool:f.root,physicalDevice:0}));
+  const key=createHash('sha256').update(JSON.stringify([f.root,0])).digest('hex');
+  const fence=join(homedir(),'.local/state/rsi/device-leases-host',key+'.held');await mkdir(fence,{recursive:true});
+  t.after(async()=>{await rm(fence,{recursive:true,force:true});await rm(fence.replace(/\.held$/,'.lock'),{force:true});});
+  const newer=JSON.stringify({pool:f.root,token:'newer-owner'});await writeFile(join(fence,'lease.json'),newer);
+  assert.equal(await first.environment.reconcileLease(),false);
+  assert.equal(await readFile(join(fence,'lease.json'),'utf8'),newer);
+  const handle=first.events.find(e=>e.type==='execution-handle'&&e.data.purpose==='device-lease-control').data.handle;
+  const receipt=JSON.parse(await readFile(join(prior.receipt,'..','control','.executions',handle.slice(6),'admission.json'),'utf8'));
+  assert.equal(receipt.token,prior.token);assert.equal(receipt.decision,'ownership-mismatch');
+  await rm(fence,{recursive:true});
+  assert.equal(await first.environment.reconcileLease(),true);
 });
