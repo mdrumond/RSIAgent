@@ -570,3 +570,34 @@ test('physical background routing requires explicit scalar membership and valid 
     {...f.context,resource:{id:'legacy'}}),/host-slot metadata/);
   assert.equal((await f.environment.resources()).some(row=>'backgroundSlot' in row.metadata),false);
 });
+
+test('stopped prior reservation is reconciled through native closure and target fence before actor admission',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory,{instancePath:'/deleted/old-attempt'});
+  await held.update({owner:{...held.record.owner,start:'old-process'},handles:['remote:fixture:job:prior']});
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
+  assert.equal((await f.environment.execute('new-payload',f.source,{timeout:5})).settled,true);
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:prior'));
+  assert.equal(f.events.filter(e=>e.type==='device-lease-reconciled').length,1);
+  assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').length,1);
+});
+
+test('legacy reservation with no owner proof reports actionable blockage without an endless probe loop',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);await held.update({owner:null});
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>error.code==='DEVICE_LEASE_BLOCKED');
+  const blocked=f.events.find(e=>e.type==='device-lease-blocked');
+  assert.equal(blocked.reservations[0].receipt,held.receipt);assert.equal(blocked.reservations[0].reason,'owner-unknown');
+  assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').length,0);
+  assert.equal(f.calls.filter(a=>a[0]==='run'&&a[a.indexOf('--file')+1].endsWith('probe.sh')).length,1);
+});
+
+test('retaining native fence-control receipts preserves the actor source staging cache',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'source-cache'}});
+  assert.equal((await f.environment.execute('first',f.source,{timeout:5})).settled,true);
+  assert.equal((await f.environment.execute('second',f.source,{timeout:5})).settled,true);
+  const stages=f.events.filter(e=>e.type==='source-staged'&&!e.purpose);
+  assert.equal(stages.length,2);assert.equal(stages[0].reused,false);assert.equal(stages[1].reused,true);
+});

@@ -2,6 +2,9 @@ import { mkdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import {readFileSync,writeFileSync,renameSync,mkdirSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
+import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 
 export async function openDeviceLease(receipt, token) {
   const record=JSON.parse(await readFile(receipt,'utf8'));
@@ -29,13 +32,71 @@ export async function openDeviceLease(receipt, token) {
     }};
 }
 // Atomic mkdir spans instances/runtimes; owner death/expiry never proves closure.
-export async function reserveDevice(pool,physicalDevice,directory=join(homedir(),'.local/state/rsi/device-leases')) {
+export function deviceLeaseReceipt(pool,physicalDevice,directory=join(homedir(),'.local/state/rsi/device-leases')) {
+  return join(directory,createHash('sha256').update(JSON.stringify([pool,physicalDevice])).digest('hex'),'lease.json');
+}
+export async function reserveDevice(pool,physicalDevice,directory=join(homedir(),'.local/state/rsi/device-leases'),metadata={}) {
   const key=createHash('sha256').update(JSON.stringify([pool,physicalDevice])).digest('hex');
   await mkdir(directory,{recursive:true,mode:0o700});
-  const path=join(directory,key),token=randomUUID(),receipt=join(path,'lease.json');
-  try{await mkdir(path,{mode:0o700});}catch(error){if(error.code==='EEXIST')return null;throw error;}
-  await writeFile(receipt,JSON.stringify({version:2,token,pool,physicalDevice,handles:[],submissions:[]}),{mode:0o600});
-  return openDeviceLease(receipt,token);
+  const path=join(directory,key),token=randomUUID(),receipt=join(path,'lease.json'),owner=await processIdentity();
+  const created=leaseLock(directory,()=>{
+    try{mkdirSync(path,{mode:0o700});}catch(error){if(error.code==='EEXIST')return false;throw error;}
+    writeFileSync(receipt,JSON.stringify({version:2,token,pool,physicalDevice,owner,instancePath:metadata.instancePath,handles:[],submissions:[]}),{mode:0o600});
+    return true;
+  });
+  return created?openDeviceLease(receipt,token):null;
+}
+// Serialize only local claim metadata; never hold a SQLite lock across remote I/O.
+function leaseLock(directory,action) {
+  const db=new DatabaseSync(join(directory,'.reconciliation.sqlite'));
+  try {db.exec('PRAGMA busy_timeout=5000; BEGIN IMMEDIATE');const result=action();db.exec('COMMIT');return result;}
+  finally{db.close();}
+}
+function changeLease(receipt,change) {
+  return leaseLock(dirname(dirname(receipt)),()=>{
+    const record=JSON.parse(readFileSync(receipt,'utf8'));
+    if(!change(record))return false;
+    const temporary=receipt+'.'+randomUUID();
+    writeFileSync(temporary,JSON.stringify(record),{mode:0o600});renameSync(temporary,receipt);return true;
+  });
+}
+
+// Closure and fencing are separate proofs. Callers may supply an independently
+// retained owner-closure proof for legacy records without owner metadata.
+export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe,reconcileHost}={}) {
+  let before;
+  try{before=leaseLock(dirname(dirname(receipt)),()=>JSON.parse(readFileSync(receipt,'utf8')));}
+  catch(error){if(error.code==='ENOENT')return {closed:false,reason:'missing-receipt',receipt};throw error;}
+  const blocked=(reason,extra={})=>({closed:false,reason,receipt,token:before.token,...extra});
+  if(before.version!==2)return blocked('unsupported-receipt');
+  if(!await stopped(before.owner,before))return blocked(before.owner?'owner-active':'owner-unknown');
+  if(before.reconciliation&&!await ownerStopped(before.reconciliation.owner))return blocked('reconciliation-active');
+  const claim={id:randomUUID(),owner:await processIdentity()};
+  if(!changeLease(receipt,record=>{
+    if(JSON.stringify(record)!==JSON.stringify(before))return false;
+    record.reconciliation=claim;return true;
+  }))return blocked('ownership-changed');
+  try {
+    const lease=await openDeviceLease(receipt,before.token),handles=new Set(lease.record.handles);
+    for(const row of lease.record.submissions){
+      if(row.closed===true)continue;
+      let handle=row.handle;
+      if(!handle&&row.receiptFile)try{handle=JSON.parse(await readFile(row.receiptFile,'utf8')).handle;}catch{}
+      if(!handle)return blocked('submission-unknown');
+      handles.add(handle);
+    }
+    for(const handle of handles){
+      let result;try{result=await observe(handle);}catch{return blocked('execution-unresolved',{handle});}
+      if(!['stopped','completed','failed','cancelled'].includes(result?.state))return blocked('execution-unresolved',{handle});
+    }
+    if(!await reconcileHost(lease))return blocked('host-fence-unresolved');
+    await lease.release();return {closed:true,receipt,token:before.token};
+  }finally{
+    try{changeLease(receipt,record=>{
+      if(record.token!==before.token||record.reconciliation?.id!==claim.id)return false;
+      delete record.reconciliation;return true;
+    });}catch(error){if(error.code!=='ENOENT')throw error;}
+  }
 }
 
 // Used only inside generic supervised execution (CPL or native local Pi).

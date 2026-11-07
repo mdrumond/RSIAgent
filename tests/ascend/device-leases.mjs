@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {setTimeout as delay} from 'node:timers/promises';
-import {reserveDevice,hostLease,hostReconcile} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,reconcileDeviceLease,hostLease,hostReconcile} from '../../integrations/environments/device-leases.mjs';
 import {ActorClock} from '../../controller/budget.mjs';
 
 async function root(t){const path=await mkdtemp(join(tmpdir(),'command-leases-'));t.after(()=>rm(path,{recursive:true,force:true}));return path;}
@@ -70,4 +70,52 @@ test('admission holds unpublished time then charges only nonqueue work',async()=
   assert.equal(clock.elapsed,1);
   await assert.rejects(clock.exclude('admission',async()=>{now+=1000;throw new Error('unknown');}));
   assert.equal(clock.elapsed,2);
+});
+
+test('a stopped owner is reclaimed only after every native identity and host fence close',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory,{instancePath:'/old/deleted/attempt'});
+  await lease.update({owner:{...lease.record.owner,start:'old-process'},handles:['remote:target:job:payload'],
+    submissions:[{submission:'copy',handle:'remote:target:transfer:copy'}]});
+  const calls=[];
+  const proof=await reconcileDeviceLease(lease.receipt,{
+    observe:async h=>{calls.push(h);return {state:'completed'};},
+    reconcileHost:async held=>{assert.equal(held.token,lease.token);calls.push('fence');return true;}
+  });
+  assert.equal(proof.closed,true);assert.deepEqual(calls,['remote:target:job:payload','remote:target:transfer:copy','fence']);
+  await assert.rejects(readFile(lease.receipt),{code:'ENOENT'});
+  assert.ok(await reserveDevice('pool',0,directory));
+});
+
+for(const scenario of ['live-owner','legacy-owner','live-job','unknown-submission','unknown-fence'])test(`reservation reconciliation preserves ${scenario}`,async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  if(scenario!=='live-owner')await lease.update({owner:scenario==='legacy-owner'?null:{...lease.record.owner,start:'old-process'}});
+  if(scenario==='live-job')await lease.retain('remote:target:job:live');
+  if(scenario==='unknown-submission')await lease.event('execution-submitting',{submission:'lost',receiptFile:join(directory,'deleted-receipt')});
+  let fences=0;
+  const proof=await reconcileDeviceLease(lease.receipt,{
+    observe:async()=>({state:'running'}),reconcileHost:async()=>{fences++;return false;}
+  });
+  assert.equal(proof.closed,false);await readFile(lease.receipt);
+  assert.equal(fences,scenario==='unknown-fence'?1:0);
+  assert.equal(await reserveDevice('pool',0,directory),null);
+});
+
+test('legacy owner closure requires explicit independent proof, then normal remote proofs still apply',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  await lease.update({owner:null,handles:['remote:target:job:old']});
+  let closed=false;
+  const callbacks={stopped:async(_owner,record)=>record.token===lease.token,
+    observe:async()=>({state:closed?'completed':'observation-unavailable'}),reconcileHost:async()=>true};
+  assert.equal((await reconcileDeviceLease(lease.receipt,callbacks)).reason,'execution-unresolved');
+  closed=true;assert.equal((await reconcileDeviceLease(lease.receipt,callbacks)).closed,true);
+});
+
+test('concurrent reconcilers cannot release or replay another live reconciliation',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  await lease.update({owner:{...lease.record.owner,start:'old-process'},handles:['remote:target:job:old']});
+  let started,finish;const entered=new Promise(ok=>started=ok),gate=new Promise(ok=>finish=ok);let fences=0;
+  const callbacks={observe:async()=>{started();await gate;return {state:'completed'};},reconcileHost:async()=>{fences++;return true;}};
+  const first=reconcileDeviceLease(lease.receipt,callbacks);await entered;
+  assert.equal((await reconcileDeviceLease(lease.receipt,callbacks)).reason,'reconciliation-active');
+  finish();assert.equal((await first).closed,true);assert.equal(fences,1);
 });

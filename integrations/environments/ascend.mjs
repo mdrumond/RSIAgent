@@ -1,7 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
-import { readFile, writeFile, mkdir, mkdtemp, rename, unlink } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rename, unlink, cp, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, openDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
+import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -308,12 +308,13 @@ export async function createEnvironment(options, context) {
       available, metadata: {kind:'host-slot', pool, target:options.target,
         ...(reserved===undefined?{}:{hostSlot:slot,backgroundSlot:slot===0})} }));
   }
-  let commandActive=false, controlEnvironment;
+  let commandActive=false, controlEnvironment, controlToken;
   async function control() {
-    if(controlEnvironment)return controlEnvironment;
-    const path=join(root,'lease-control'),sourcePath=join(path,'source');
+    if(controlEnvironment&&controlToken===activeLease.token)return controlEnvironment;
+    controlToken=activeLease.token;
+    const path=join(dirname(activeLease.receipt),'control'),sourcePath=join(path,'source');
     await mkdir(sourcePath,{recursive:true});
-    controlEnvironment=await genericEnvironment(options,{...commandContext,signal:undefined,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
+    controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:undefined,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
       await commandContext.event(type,{...data,...(type==='execution-submitting'&&data.kind==='run'&&data.accountingExcluded===false?{controlPayload:true}:{}),purpose:'device-lease-control',accountingExcluded:true});
       if(activeLease&&type==='execution-handle'&&!data.purpose)await activeLease.update({controlHandle:data.handle});
     }});
@@ -349,16 +350,22 @@ export async function createEnvironment(options, context) {
       }
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
       for(const handle of handles)if((await environment.observe(handle,{signal:AbortSignal.timeout(observationSeconds*1000)})).state!=='stopped')return false;
+      if(!await reconcileHostLease(lease))return false;
+      await releaseLease(lease);return true;
+    } finally {activeLease=null;}
+  }
+  async function reconcileHostLease(lease) {
       const cleanup=await control();
       // A positively refused control submission may be retried. Unknown submissions
       // returned above; a recovered payload handle is always observed, never replayed.
+      if(lease.record.controlStarted&&lease.record.controlHandle&&!await cleanup.readAdmission(lease.record.controlHandle))await lease.update({controlStarted:false,controlHandle:null});
       if(lease.record.controlStarted&&!lease.record.controlHandle)await lease.update({controlStarted:false});
       if(!lease.record.controlStarted){
         await lease.update({controlStarted:true});
-        const request={devices:[retained.physicalDevice],lease:{pool:retained.pool,token:lease.token}};
+        const request={devices:[lease.record.physicalDevice],lease:{pool:lease.record.pool,token:lease.token}};
         const code="import os,sys,json,hashlib,time\nc=json.loads(sys.argv[1])\n"+hostReconcile;
         const result=await context.exclude('setup',()=>cleanup.execute(`${quote(options.python??'python3')} -c ${quote(code)} ${quote(JSON.stringify(request))}`,
-          join(root,'lease-control','source'),{timeout:seconds,leaseReceipt:true}));
+          join(dirname(lease.receipt),'control','source'),{timeout:seconds,leaseReceipt:true}));
         if(!result.settled)return false;
       }
       if(!lease.record.controlHandle)return false;
@@ -368,11 +375,29 @@ export async function createEnvironment(options, context) {
         await lease.update({controlStarted:false,controlHandle:null});return false;
       }
       if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
-      await releaseLease(lease);return true;
-    } finally {activeLease=null;}
+      // Preserve native control receipts in this attempt before releasing the
+      // global journal: normal lifecycle observers still re-observe its handles.
+      const journal=join(dirname(lease.receipt),'control','.executions');
+      for(const entry of await readdir(journal,{withFileTypes:true}))if(entry.isDirectory())
+        await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
+      return true;
+  }
+  async function recoverReservation(physical,proof={}) {
+    return reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
+      ...proof,
+      observe:handle=>local?environment.observe(handle):client(['observe',handle]),
+      reconcileHost:async lease=>{
+        activeLease=lease;
+        try{return await reconcileHostLease(lease);}finally{activeLease=null;}
+      }
+    });
   }
   return {
     ...environment, resources, inspectDevices,
+    reconcileReservation:(physical,proof)=>serial(async()=>{
+      if(!Number.isInteger(physical)||physical<0)throw new Error('Physical device required');
+      await enabled();return recoverReservation(physical,proof);
+    }),
     reconcileLease:()=>commandActive?Promise.resolve(false):reconcileLease(), shellOnTarget:local,
     async observe(handle,settings){
       const result=await environment.observe(handle,settings);
@@ -416,12 +441,24 @@ export async function createEnvironment(options, context) {
             if (!devices.length) throw closedSetupError('No enabled devices in pool');
             const result = await exclude('setup', () => snapshot(devices, opts.purpose ?? 'ordinary', emit, seconds, signal));
             const permitted = new Set(await enabled());
+            const blocked=[];
             for (const row of result.devices) {
               if (!devices.includes(row.physical_device) || !permitted.has(row.physical_device) || row.admitted !== true || row.measurements?.idle !== true) continue;
-              lease = await reserveDevice(pool, row.physical_device, context.leaseDirectory);
+              lease = await reserveDevice(pool, row.physical_device, context.leaseDirectory,{instancePath:context.instancePath});
+              if(!lease){
+                const proof=await recoverReservation(row.physical_device);
+                if(proof.closed){
+                  await context.event('device-lease-reconciled',{pool,physicalDevice:row.physical_device,...proof});
+                  lease=await reserveDevice(pool,row.physical_device,context.leaseDirectory,{instancePath:context.instancePath});
+                }else if(!['owner-active','reconciliation-active','ownership-changed'].includes(proof.reason))blocked.push({physicalDevice:row.physical_device,...proof});
+              }
               if (lease) { physical = row.physical_device; break; }
             }
             if (lease) break;
+            if(blocked.length){
+              await context.event('device-lease-blocked',{pool,reservations:blocked});
+              throw Object.assign(new Error('Device reservations require reconciliation: '+JSON.stringify(blocked)),{code:'DEVICE_LEASE_BLOCKED'});
+            }
             await waitForDevice();
             await exclude('queue-wait', () => delay(options.leasePollMs ?? 250, undefined, {signal}));
           }
