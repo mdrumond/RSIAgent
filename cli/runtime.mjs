@@ -99,6 +99,10 @@ export async function operate(command,config,options={}) {
     try {
       await assertPackAvailable(state);
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
+      const memoryToken=options['memory-pause-token'];
+      if(memoryToken!==undefined&&(command!=='resume'||typeof memoryToken!=='string'||!memoryToken||
+        ctl.get('memory-pause')!==memoryToken||!ctl.get('pause')||ctl.get('operator-stop')))
+        throw new Error('Memory resume was superseded by an operator pause or stop');
       ctl.set('owner',owner);
       if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
       ctl.set('stop',false);ctl.set('operator-stop',false);ctl.set('pause',false);ctl.set('memory-pause',null);state.db.exec('COMMIT');owned=true;
@@ -452,10 +456,14 @@ export async function operate(command,config,options={}) {
         let slots=[];
         try{slots=await access.resources({purpose:'ordinary',target:config.target});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
-        try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked});}
+        try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked&&memory?.limit!==1});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
       }
       const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
+      if(memory?.limit===1&&tuning?.reserved&&tuning.capacity>0&&foregroundLimit<1) {
+        ctl.set('wait',{reason:'memory-concurrency-minimum',at:new Date().toISOString()});
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);continue;
+      }
       if(tuning && foregroundLimit<1)resourceWait={reason:tuning.capacity?'skill-background-reserved':'resources',
         capacityLimited:true,available:tuning.capacity,at:new Date().toISOString()};
       else if(resourceWait?.capacityLimited)resourceWait=null;

@@ -44,7 +44,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     ...storageOptions,instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
-    concurrency:{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
+    concurrency:{type:'string'},'memory-pause-token':{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
   const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{

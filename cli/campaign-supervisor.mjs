@@ -153,6 +153,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(view.paused&&(!memory?.token||view.memoryPause!==memory.token))return await pause('operator-pause');
         if(view.operatorStopped||(status.controller?.stopRequested&&latestRequest?.status==='passed'))return await pause('operator-stop');
         if(settings) {
+          if(status.wait?.reason==='memory-concurrency-minimum')return await pause('memory-at-minimum');
           // A completed resume may have survived a supervisor crash before its acknowledgement.
           if(memory?.resumePending&&!view.paused&&status.controller?.state==='running') {
             memory={...memory,token:null,resumePending:false,recovered:true,lowSince:null,highSince:null,lastReduction:null};
@@ -195,10 +196,13 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
               // A restored cooling checkpoint may precede service shutdown; recheck before every resume.
               try{await memoryRelease(config);}
               catch(error){return await publish('attention-needed','memory-service-release',{checkpointPending:true,errorType:error.name});}
+              const ready=await snapshot(config);
+              if(ready.operatorStopped)return await pause('operator-stop');
+              if(!ready.paused||ready.memoryPause!==memory.token)return await pause('operator-pause');
               // Persist intent before dispatch. Observe a retained queued request after interruption, never replay it.
               memory.resumePending=true;memory.priorRequests=(status.requests??[]).map(request=>request.id);memory.phaseAt=now();
               await publish('launching','memory-resume');
-              lastLaunch=await cli(['resume','--instance',config.root,'--detach']);
+              lastLaunch=await cli(['resume','--instance',config.root,'--detach','--memory-pause-token',memory.token]);
               memory.resumeRequest=lastLaunch?.request;
               await publish('observing','memory-resume',{request:memory.resumeRequest});
             }else await publish('cooling','memory-pressure');

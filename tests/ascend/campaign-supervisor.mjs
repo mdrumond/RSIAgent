@@ -340,3 +340,42 @@ test('restored cooling checkpoint verifies service release again before native r
   assert.equal(result.reason,'memory-service-release');assert.equal(result.checkpointPending,true);
   assert.equal(f.calls.some(call=>call[0]==='resume'),false);
 });
+
+
+test('operator pause or stop during knowledge service release prevents memory resume submission',async()=>{
+  for(const stopped of [false,true]) {
+    const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}});
+    let interrupted=false;const snapshot=f.deps.snapshot;
+    f.deps.memoryRelease=async()=>{interrupted=true;};
+    f.deps.snapshot=async()=>{const view=await snapshot();return interrupted?{...view,memoryPause:null,operatorStopped:stopped}:view;};
+    const result=await superviseCampaign(options(),f.deps);
+    assert.equal(result.reason,stopped?'operator-stop':'operator-pause');
+    assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+  }
+});
+
+test('retained one-worker cap with real A/B reservation checkpoints instead of silently starving foreground',{timeout:60000},async t=>{
+  const f=await setup(t,'phase2',['unrelated']),original=await readConfig(f.root);
+  const input=join(f.root,'minimum-cap-config.json');
+  await writeFile(input,JSON.stringify({mode:'phase1',campaign_seconds:60,concurrency:4,
+    skills:{...original.skills,background:true,tuningDisabled:false},
+    projects:original.projects.map(project=>({...project,phase:'phase1'}))}));
+  await f.run('config','--config',input);
+  const config=await readConfig(f.root),ledger=new State(join(f.root,'state.sqlite'));
+  ledger.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  ledger.db.prepare('INSERT OR REPLACE INTO control VALUES (?,?)').run('memory-admission',JSON.stringify({limit:1,blocked:false}));
+  const runtime=f.start('campaign');runtime.output.catch(()=>{});
+  try {
+    const deadline=Date.now()+15000;let waiting;
+    while(Date.now()<deadline) {
+      waiting=JSON.parse(ledger.db.prepare("SELECT value FROM control WHERE key='wait'").get()?.value??'null');
+      if(waiting?.reason==='memory-concurrency-minimum')break;await delay(25);
+    }
+    assert.equal(waiting?.reason,'memory-concurrency-minimum');
+    assert.equal(ledger.db.prepare('SELECT count(*) n FROM attempts').get().n,0);
+    const observation=memoryFixture();observation.deps.snapshot=async()=>({...fresh(),status:{controller:{state:'running'},progress:{done:false},wait:waiting}});
+    const result=await superviseCampaign(options(),observation.deps);
+    assert.equal(result.reason,'memory-at-minimum');assert.deepEqual(observation.calls.map(call=>call[0]),['pause']);
+  }finally{await f.run('pause');await runtime.output;ledger.close();}
+  f.pass();
+});

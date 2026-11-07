@@ -375,3 +375,9 @@ Supervisor status includes RSS, effective cap and the largest owned processes us
 command names, never arguments or environment. Missing memory observations block new
 work. A recovery that cannot settle or cool within 30 elapsed minutes needs attention.
 Existing instances without `local_memory` keep their prior supervision behavior.
+
+Memory-triggered resumes retain their expected pause token through the durable request
+and recheck it atomically when claiming the native controller; a newer operator pause
+or stop cannot be cleared by a queued recovery. If a retained one-worker cap cannot
+serve foreground work alongside the permanent A/B reservation, supervision checkpoints
+and reports `memory-at-minimum` instead of leaving the campaign silently stalled.
