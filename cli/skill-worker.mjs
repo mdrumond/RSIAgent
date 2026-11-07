@@ -13,7 +13,7 @@ export function skillWorker({control, config, remaining, event, signal, operatio
     get reserved(){return reservation;},
     get running(){return running;},
     get capacity(){return capacity;},
-    async poll(resources, active, limit) {
+    async poll(resources, active, limit, {admit=true}={}) {
       const current=config();
       const available=resources.filter(row=>row.available &&
         (!current.resource_ids || current.resource_ids.includes(row.id)));
@@ -26,7 +26,7 @@ export function skillWorker({control, config, remaining, event, signal, operatio
         reservation=Boolean(occupied||(enabled()&&(marked?backgroundAvailable:true)));
       };
       await account();
-      if(!enabled() || signal?.aborted)return;
+      if(!admit || !enabled() || signal?.aborted)return;
       if(running)return;
       if(now()<nextPoll)return;
       nextPoll=now()+1000;

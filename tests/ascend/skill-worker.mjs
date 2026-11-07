@@ -121,3 +121,13 @@ test('disabled running or unresolved A/B remains within the shared host concurre
     await f.worker.stop();
   }
 });
+
+test('memory pressure preserves A/B reservation and existing work while blocking new comparisons',async()=>{
+  const f=fixture({capacity:8});
+  await f.worker.poll(f.resources,0,4,{admit:false});
+  assert.equal(f.calls,0);assert.equal(f.worker.reserved,true);assert.equal(f.worker.capacity,4);
+  await f.worker.poll(f.resources,3,4);assert.equal(f.calls,1);
+  const active=f.worker.running;
+  await f.worker.poll(f.resources,3,2,{admit:false});assert.equal(f.worker.running,active);assert.equal(f.calls,1);
+  f.finish();await active;await f.worker.stop();
+});

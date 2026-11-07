@@ -361,3 +361,17 @@ evolution using tiny Python workloads, the production native controller and
 isolated evaluator, and independent frozen verifiers. Its deterministic provider
 is local and free of API charges. An explicitly opted-in real-provider experiment
 uses the same workloads with private configuration and separate retained evidence.
+
+Fresh campaign manifests cap foreground actors plus the reserved A/B worker at four.
+Their `local_memory` settings enable process-tree RSS observation every two seconds:
+24 GiB blocks new admissions and reduces the retained worker cap every 30 seconds;
+28 GiB or two minutes of pressure requests a checkpoint with the normal pause grace
+plus 60 seconds. After local owners stop, the owned knowledge service is released.
+The supervisor resumes only its own memory pause after usage stays below 20 GiB for
+60 seconds. Reductions survive resume and supervisor restart; recurrent pressure at
+one worker needs attention. Operator pauses/stops take precedence. The 32 GiB
+emergency limit remains host containment, not an automatic restart trigger.
+Supervisor status includes RSS, effective cap and the largest owned processes using
+command names, never arguments or environment. Missing memory observations block new
+work. A recovery that cannot settle or cool within 30 elapsed minutes needs attention.
+Existing instances without `local_memory` keep their prior supervision behavior.

@@ -11,6 +11,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {qualificationGate} from './campaign-manifest.mjs';
 import {assertPackAvailable} from './storage.mjs';
+import {memorySettings,memoryDecision,sampleCampaignMemory,writeMemoryControl,requestMemoryPause,releaseKnowledgeService} from './campaign-memory.mjs';
 
 const GiB=1024**3,ownerKey='supervisor-owner';
 const writerKeys=['owner','skill-writer','memory-writer','storage-maintenance','knowledge-startup'];
@@ -71,7 +72,7 @@ async function nativeSnapshot(config,cli) {
     const control=state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get();
     const value=key=>control?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
     return {status,budget:value('campaign-budget'),operation:value('operation'),
-      paused:Boolean(value('pause')),operatorStopped:Boolean(value('operator-stop')),
+      paused:Boolean(value('pause')),memoryPause:value('memory-pause'),operatorStopped:Boolean(value('operator-stop')),
       attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n};
   }finally{state.close();}
 }
@@ -86,14 +87,19 @@ async function save(config,report) {
   await rename(temp,join(root,'status.json'));
   const checkpoint=join(root,randomUUID()+'.json');await writeFile(checkpoint,JSON.stringify(report)+'\n',{mode:0o600});
   await rename(checkpoint,join(root,'state.json'));
-  await appendFile(join(root,'events.jsonl'),JSON.stringify(report)+'\n',{mode:0o600});
+  const signature=JSON.stringify([report.state,report.reason,report.memory?.limit]);
+  if(save.last?.root!==root||save.last.signature!==signature||report.at-save.last.at>=60000) {
+    await appendFile(join(root,'events.jsonl'),JSON.stringify(report)+'\n',{mode:0o600});save.last={root,signature,at:report.at};
+  }
 }
 
 export async function superviseCampaign({instance,cohort,qualification,sourceRevision,signal},dependencies={}) {
   const {read=readConfig,cli:providedCli,identity=processIdentity,claim=claimSupervisor,
     restart=localOwnersStopped,closed:providedClosed,
     space=diskBytes,now=()=>Number(process.hrtime.bigint())/1e6,wait=delay,
-    persist=save,load:restore=load,snapshot:providedSnapshot}=dependencies;
+    persist=save,load:restore=load,snapshot:providedSnapshot,
+    memorySample=sampleCampaignMemory,memoryControl=writeMemoryControl,memoryPause=requestMemoryPause,
+    memoryRelease=releaseKnowledgeService}=dependencies;
   qualificationGate(qualification);
   if(sourceRevision!==qualification.expected.sourceRevision)throw new Error('Supervisor source revision does not match qualification');
   const config=await read(resolve(instance));
@@ -104,10 +110,11 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
   const closed=providedClosed??(async config=>await nativeClosed(config)&&(await localOwnersStopped(config)).stopped);
   const snapshot=providedSnapshot??(config=>nativeSnapshot(config,cli));
   const owner=await identity(),release=await claim(config,owner);
-  let blockedSince=null,nextReconcile=0,lastLaunch=null,report;
+  let blockedSince=null,nextReconcile=0,lastLaunch=null,report,memory;
+  const settings=config.local_memory?memorySettings(config.local_memory):null,known=new Map();
   const publish=async(state,reason,extra={})=>{
     report={format:1,at:now(),observedAt:new Date().toISOString(),owner,state,reason,sourceRevision,
-      blockedSince,blockedElapsed:blockedSince===null?0:Math.max(0,now()-blockedSince),...extra};
+      blockedSince,blockedElapsed:blockedSince===null?0:Math.max(0,now()-blockedSince),...(memory?{memory}:{}),...extra};
     await persist(config,report);return report;
   };
   const pause=async reason=>{
@@ -124,6 +131,11 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
   };
   try {
     const prior=await restore(config);
+    if(settings&&prior?.sourceRevision===sourceRevision&&prior.memory) {
+      memory={...prior.memory,lowSince:null};
+      if(prior.owner?.boot!==owner.boot){memory.highSince=null;memory.lastReduction=null;memory.phaseAt=now();}
+      await memoryControl(config,memory);
+    }
     if(prior?.sourceRevision===sourceRevision&&Number.isFinite(prior.blockedSince))
       blockedSince=prior.owner?.boot===owner.boot?Math.min(prior.blockedSince,now()):now()-(prior.blockedElapsed??0);
     for(;;) {
@@ -138,8 +150,58 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
           status.requests?.find(request=>['campaign','resume'].includes(request.kind));
         if(status.progress?.done)return await pause('complete');
         if(used>=config.campaign_seconds)return await pause('elapsed');
-        if(view.paused)return await pause('operator-pause');
+        if(view.paused&&(!memory?.token||view.memoryPause!==memory.token))return await pause('operator-pause');
         if(view.operatorStopped||(status.controller?.stopRequested&&latestRequest?.status==='passed'))return await pause('operator-stop');
+        if(settings) {
+          // A completed resume may have survived a supervisor crash before its acknowledgement.
+          if(memory?.resumePending&&!view.paused&&status.controller?.state==='running') {
+            memory={...memory,token:null,resumePending:false,recovered:true,lowSince:null,highSince:null,lastReduction:null};
+            await memoryControl(config,memory);await publish('running','memory-recovered');
+          }
+          let measured;
+          try{measured=await memorySample(config,owner,{known});}
+          catch(error){memory={...memory,limit:memory?.limit??Number(current.concurrency??4),blocked:true};await memoryControl(config,memory);throw error;}
+          memory={...memoryDecision(memory,{rssBytes:measured.rssBytes,now:now(),maximum:Number(current.concurrency??4)},settings),...measured};
+          await memoryControl(config,memory);
+          if(memory.action==='emergency')return await pause('memory-emergency');
+          if(['checkpoint','exhausted'].includes(memory.action)) {
+            const exhausted=memory.action==='exhausted';
+            memory.token=randomUUID();memory.phaseAt=now();await publish('checkpointing','memory-pressure');
+            await memoryPause(config,memory.token);
+            const until=now()+((config.pause_grace_seconds??30)+60)*1000;
+            while(!await closed(config)) {
+              if(now()>=until)return await publish('attention-needed','memory-checkpoint-timeout',{checkpointPending:true});
+              await wait(settings.pollMs);const sample=await memorySample(config,owner,{known});
+              memory={...memory,...sample};await publish('checkpointing','memory-pressure');
+              if(sample.rssBytes>=settings.hardBytes)return await publish('attention-needed','memory-emergency',{checkpointPending:true});
+            }
+            try{await memoryRelease(config);}
+            catch(error){return await publish('attention-needed','memory-service-release',{checkpointPending:true,errorType:error.name});}
+            if(exhausted)return await publish('attention-needed','memory-at-minimum',{checkpointPending:false});
+            memory.lowSince=null;await publish('cooling','memory-pressure');continue;
+          }
+          if(memory.token) {
+            if(!view.paused||view.memoryPause!==memory.token)return await pause('memory-pause-ownership');
+            if(now()-(memory.phaseAt??now())>=1800000)return await publish('attention-needed','memory-recovery-timeout');
+            if(memory.resumePending) {
+              const candidates=(status.requests??[]).filter(request=>request.kind==='resume'&&!(memory.priorRequests??[]).includes(request.id));
+              const request=memory.resumeRequest?(status.requests??[]).find(request=>request.id===memory.resumeRequest):candidates.length===1?candidates[0]:null;
+              if(!request)return await publish('attention-needed','memory-resume-unresolved');
+              memory.resumeRequest=request.id;
+              if(['failed','passed'].includes(request.status))return await publish('attention-needed','memory-resume-failed');
+              await publish('observing','memory-resume',{request:request.id});
+            }else if(memory.action==='resume') {
+              if(!await closed(config))return await publish('attention-needed','memory-ownership',{checkpointPending:true});
+              // Persist intent before dispatch. Observe a retained queued request after interruption, never replay it.
+              memory.resumePending=true;memory.priorRequests=(status.requests??[]).map(request=>request.id);memory.phaseAt=now();
+              await publish('launching','memory-resume');
+              lastLaunch=await cli(['resume','--instance',config.root,'--detach']);
+              memory.resumeRequest=lastLaunch?.request;
+              await publish('observing','memory-resume',{request:memory.resumeRequest});
+            }else await publish('cooling','memory-pressure');
+            await wait(settings.pollMs);continue;
+          }
+        }
         if(status.controller?.state!=='running'&&latestRequest?.status==='failed'&&blockedSince===null)blockedSince=now();
         const available=await space(config),started=Boolean(view.budget?.cycle||view.operation==='campaign'||view.attempts||lastLaunch||latestRequest);
         if(!Number.isFinite(available)||available<0)throw new Error('Disk availability unknown');
@@ -175,7 +237,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         await publish('waiting','infrastructure-or-ownership',{errorType:error.name,blockedSeconds:(now()-blockedSince)/1000});
         if(now()-blockedSince>=1800000)return await pause('infrastructure-or-ownership');
       }
-      try{await wait(60000,undefined,{signal});}catch(error){if(!signal?.aborted)throw error;}
+      try{await wait(settings?.pollMs??60000,undefined,{signal});}catch(error){if(!signal?.aborted)throw error;}
     }
   }catch(error){try{await cli(['pause','--instance',config.root]);}catch{}throw error;}
   finally{await release();}
