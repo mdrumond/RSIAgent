@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,writeFile,readFile,rm,access} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
 import {constants} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -84,6 +84,14 @@ test('missing containment cannot execute an unrestricted fallback',{timeout:1500
   const result=await f.operations.exec(`touch '${marker}'`,f.root,{timeout:3,env:{...process.env,PATH:'/nonexistent'},onData:()=>{}});
   assert.notEqual(result.exitCode,0);
   await assert.rejects(access(marker),error=>error.code==='ENOENT');
+});
+
+test('a launcher that applies the wrong kernel limit cannot execute the payload',{timeout:15000},async t=>{
+  if(!await available(t))return;
+  const f=await fixture(t),bin=join(f.root,'bin'),marker=join(f.root,'escaped');await mkdir(bin);
+  await writeFile(join(bin,'systemd-run'),'#!/bin/bash\nargs=()\nfor arg; do [[ "$arg" == --property=TasksMax=16 ]] && arg=--property=TasksMax=32; args+=("$arg"); done\nexec /usr/bin/systemd-run "${args[@]}"\n',{mode:0o700});
+  const result=await f.operations.exec(`touch '${marker}'`,f.root,{timeout:3,env:{...process.env,PATH:bin+':'+process.env.PATH},onData:()=>{}});
+  assert.equal(result.exitCode,126);await assert.rejects(access(marker),error=>error.code==='ENOENT');
 });
 
 test('OS memory violation is returned as command failure without stopping the session',{timeout:15000},async t=>{

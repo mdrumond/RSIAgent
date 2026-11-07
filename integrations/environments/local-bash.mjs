@@ -48,6 +48,7 @@ export function createLocalExecutionOperations(sdk,limits) {
     await options.onContainment?.({unit,closed:false});
     // Bash builtins can retain the denial counter even when no further fork is possible.
     const script=`IFS=: read -r hierarchy controllers group < /proc/self/cgroup\nprintf '%s' "$group" > ${quote(ready)}\n`+
+      `if ! read -r actual_tasks < "/sys/fs/cgroup$group/pids.max" || ! read -r actual_memory < "/sys/fs/cgroup$group/memory.max" || ! read -r actual_swap < "/sys/fs/cgroup$group/memory.swap.max" || [[ "$actual_tasks" != ${tasks} || "$actual_memory" != ${memory_bytes} || "$actual_swap" != 0 ]]; then printf 'Local execution resource limits are unavailable; command was not executed.\\n' >&2; exit 126; fi\n`+
       `trap ${quote(`{ while read -r key value; do printf 'pids.%s %s\\n' "$key" "$value"; done < "/sys/fs/cgroup$group/pids.events"; while read -r key value; do printf 'memory.%s %s\\n' "$key" "$value"; done < "/sys/fs/cgroup$group/memory.events"; } > ${quote(finished)}`)} EXIT\n`+
       `bash -c ${quote(command)}`;
     const wrapper=['systemd-run','--user','--scope','--quiet','--unit='+unit,
