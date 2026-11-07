@@ -66,7 +66,7 @@ export async function operate(command,config,options={}) {
   options.signal?.addEventListener('abort',abort,{once:true});
   try {
     if(command==='pause') {
-      ctl.set('pause-at',Date.now());ctl.set('pause',true);
+      ctl.set('memory-pause',null);ctl.set('pause-at',Date.now());ctl.set('pause',true);
       return {pause_requested:true,grace_seconds:config.pause_grace_seconds??30};
     }
     if(command==='stop') {
@@ -99,9 +99,13 @@ export async function operate(command,config,options={}) {
     try {
       await assertPackAvailable(state);
       if(JSON.stringify(ctl.get('owner'))!==JSON.stringify(active))throw new Error('Instance ownership changed');
+      const memoryToken=options['memory-pause-token'];
+      if(memoryToken!==undefined&&(command!=='resume'||typeof memoryToken!=='string'||!memoryToken||
+        ctl.get('memory-pause')!==memoryToken||!ctl.get('pause')||ctl.get('operator-stop')))
+        throw new Error('Memory resume was superseded by an operator pause or stop');
       ctl.set('owner',owner);
       if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
-      ctl.set('stop',false);ctl.set('operator-stop',false);ctl.set('pause',false);state.db.exec('COMMIT');owned=true;
+      ctl.set('stop',false);ctl.set('operator-stop',false);ctl.set('pause',false);ctl.set('memory-pause',null);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
     if(options.continuous&&config.campaign_seconds!==undefined) {
       const cycle=command==='resume'?ctl.get('campaign-budget')?.cycle??randomUUID():randomUUID();
@@ -312,7 +316,7 @@ export async function operate(command,config,options={}) {
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
     let maintenance,nextMaintenance=0,generation,nextGeneration=0,progressSnapshot,storageLaunch;
     const compress=()=>{
-      if(!config.storage||storageLaunch)return;
+      if(!config.storage||storageLaunch||ctl.get('memory-admission')?.blocked)return;
       storageLaunch=import('./storage-maintenance.mjs').then(({queueCompression})=>queueCompression(config))
         .catch(error=>state.event(null,'storage-maintenance-error',{message:error.message})).finally(()=>{storageLaunch=null;});
     };
@@ -361,10 +365,11 @@ export async function operate(command,config,options={}) {
         state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
         config={...config,mode:progress.nextMode};continue;
       }
+      const memory=ctl.get('memory-admission');
       const generationEntry=currentCampaignEntry(state,config);
       const generationPhase=generationEntry?.phase??config.mode;
       const generationPolicy=generationSettings(config,generationPhase);
-      if(options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
+      if(!memory?.blocked&&options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
         const generationConfig=config;
         generation=(async()=>{
           try {
@@ -390,7 +395,7 @@ export async function operate(command,config,options={}) {
           finally{nextGeneration=Date.now()+5000;generation=null;}
         })();
       }
-      if(options.continuous&&!maintenance&&Date.now()>=nextMaintenance&&queue.lessons().length) {
+      if(!memory?.blocked&&options.continuous&&!maintenance&&Date.now()>=nextMaintenance&&queue.lessons().length) {
         maintenance=(async()=>{
           try {
             const {ensureKnowledgeService}=await import('./knowledge.mjs');
@@ -406,7 +411,7 @@ export async function operate(command,config,options={}) {
         environmentRevision=revision;
       }
       const requestedNow=options.concurrency??config.concurrency??1;
-      const limit=requestedNow==='auto'?Math.max(1,config.projects.length):Number(requestedNow);
+      const limit=Math.min(requestedNow==='auto'?Math.max(1,config.projects.length):Number(requestedNow),memory?.limit??Infinity);
       if(!Number.isSafeInteger(limit)||limit<1)throw new Error('Invalid concurrency');
       const selected=config.curriculum?.[config.mode];
       const admittedIds=new Set([...activeJobs.values()].map(keyFor));
@@ -442,7 +447,7 @@ export async function operate(command,config,options={}) {
             Array.isArray(selected)?selected.includes(job.projectId):(!job.project?.spec.phase || job.project.spec.phase===config.mode)));
       });
       const finalizer=eligible.find(job=>job.finalize);
-      if(finalizer && ![...activeJobs.values()].some(job=>job.finalize)) {
+      if(!memory?.blocked&&finalizer && ![...activeJobs.values()].some(job=>job.finalize)) {
         if(await start(finalizer))continue;
         await Promise.race([...running,delay(250)]);continue;
       }
@@ -451,14 +456,18 @@ export async function operate(command,config,options={}) {
         let slots=[];
         try{slots=await access.resources({purpose:'ordinary',target:config.target});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
-        try{await tuning.poll(slots,activeActors.length,limit);}
+        try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked&&memory?.limit!==1});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
       }
       const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
+      if(memory?.limit===1&&tuning?.reserved&&tuning.capacity>0&&foregroundLimit<1) {
+        ctl.set('wait',{reason:'memory-concurrency-minimum',at:new Date().toISOString()});
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);continue;
+      }
       if(tuning && foregroundLimit<1)resourceWait={reason:tuning.capacity?'skill-background-reserved':'resources',
         capacityLimited:true,available:tuning.capacity,at:new Date().toISOString()};
       else if(resourceWait?.capacityLimited)resourceWait=null;
-      const job=foregroundLimit>0?selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{
+      const job=!memory?.blocked&&foregroundLimit>0?selectAdmission(eligible.filter(job=>!job.finalize&&!unavailable.has(keyFor(job))),{
         running:activeActors,concurrency:foregroundLimit,freshSinceRecovery}):null;
       if(!job) {
         if(!running.size&&!options.continuous&&!resourceWait)break;

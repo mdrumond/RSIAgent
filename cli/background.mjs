@@ -57,7 +57,7 @@ export async function startBackground(root,command,action,{detach=true,signal}={
   signal?.addEventListener('abort',cancel,{once:true});
   try {
     const argv=[fileURLToPath(new URL('./main.mjs',import.meta.url)),command,'--instance',root,'--config',file,'--request',id];
-    for(const key of ['mode','concurrency'])if(action[key]!==undefined)argv.push('--'+key,String(action[key]));
+    for(const key of ['mode','concurrency','memory-pause-token'])if(action[key]!==undefined)argv.push('--'+key,String(action[key]));
     if(action['no-recovery'])argv.push('--no-recovery');
     child=spawn(process.execPath,argv,{cwd:root,detached:true,env:process.env,stdio:['ignore',log.fd,log.fd]});
     exited=new Promise(resolve=>child.once('exit',resolve));

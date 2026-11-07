@@ -86,7 +86,7 @@ test('both manifests drive exactly128 settled Phase1 and25 Phase2 originals thro
       assert.deepEqual([...topics.values()].sort((a,b)=>a-b),[14,14,14,14,14,14,14,14,16]);
       const controls=config.skillSettings.tuningProjectIds.map(id=>config.projects.find(project=>project.id===id));
       assert.deepEqual(controls.map(project=>project.campaign_workload),['fa','gdn']);
-      assert.equal(config.curriculum_seconds,1800);assert.equal(config.recovery,false);assert.equal(config.concurrency,8);
+      assert.equal(config.curriculum_seconds,1800);assert.equal(config.recovery,false);assert.equal(config.concurrency,4);
       assert.equal(config.skillSettings.background,true);assert.equal(config.skillSettings.tuningDisabled,false);
       assert.equal(config.skillSettings.evaluationSeconds,undefined);assert.equal(config.skillSettings.activeVersion,'baseline');
       for(const project of config.projects)assert.deepEqual(project.verifier,phase2Projects[project.campaign_workload].verifier);

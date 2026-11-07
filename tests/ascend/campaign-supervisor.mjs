@@ -189,8 +189,18 @@ test('real public CLI supervision completes a scripted local project without cha
     campaign_source_revision:'frozen-source',campaign_seconds:60,skills:{...original.skills,tuningDisabled:true},
     campaign_plan:[{id:'only',phase:'phase1',new_projects:1}],projects:original.projects.map(project=>({...project,phase:'phase1',campaign_entry:'only'}))}));
   await f.run('config','--config',input);
-  const result=await superviseCampaign({...options(),instance:f.root,qualification:q,signal:t.signal},
+  const admission=new State(join(f.root,'state.sqlite'));
+  admission.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  admission.db.prepare('INSERT OR REPLACE INTO control VALUES (?,?)').run('memory-admission',JSON.stringify({limit:1,blocked:true}));
+  const pending=superviseCampaign({...options(),instance:f.root,qualification:q,signal:t.signal},
     {space:async()=>100*1024**3,wait:(ms,value,opts)=>delay(Math.min(ms,30),value,opts)});
+  const entryDeadline=Date.now()+15000;
+  while(!admission.queryEvents(null,{types:['campaign-entry-started'],limit:1}).length) {
+    if(Date.now()>entryDeadline)throw Error('Runtime did not start the campaign entry');await delay(25);
+  }
+  await delay(150);assert.equal(admission.db.prepare('SELECT count(*) n FROM attempts').get().n,0);
+  admission.db.prepare('UPDATE control SET value=? WHERE key=?').run(JSON.stringify({limit:1,blocked:false}),'memory-admission');admission.close();
+  const result=await pending;
   assert.equal(result.state,'complete');
   const status=await f.run('status');assert.equal(status.progress.done,true);assert.equal(status.attempts.length,1);
   const ledger=new State(join(f.root,'state.sqlite'));
@@ -231,4 +241,141 @@ test('running controller cannot reset repeated disk failures, including across s
   recovered.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},blockedSince:0,blockedElapsed:32*60000});
   assert.equal((await superviseCampaign(options(),recovered.deps)).state,'complete');
   assert.equal(recovered.reports.find(report=>report.state==='running').blockedSince,null);
+});
+
+function memoryFixture({rss=29,prior,operator=false,settled=true,queuedPolls=0,operatorPending=false}={}) {
+  const f=fixture([fresh()]);f.config.concurrency=4;
+  f.config.local_memory={lowBytes:20,softBytes:24,checkpointBytes:28,hardBytes:32,pollMs:2,reduceMs:30,highMs:120,coolMs:6};
+  let paused=Boolean(prior?.token),token=prior?.token,resumed=false,releases=0,samples=0,acknowledged=0,queued=0;
+  const controls=[];
+  const budget={cycle:'retained-cycle',elapsed:123};
+  f.deps.snapshot=async()=>{
+    if(resumed&&queued++>=queuedPolls){paused=false;token=null;acknowledged++;}
+    return {budget,operation:'campaign',attempts:2,paused,memoryPause:operator||operatorPending&&resumed?'operator':token,operatorStopped:false,
+      status:{controller:{state:paused?'stopped':'running'},progress:{done:acknowledged>1},
+        requests:resumed?[{id:'same-request',kind:'resume',status:'running'}]:[]}};
+  };
+  f.deps.memorySample=async()=>({rssBytes:paused||resumed?10:rss,processCount:1,largest:[],sample:++samples});
+  f.deps.memoryControl=async(_config,state)=>controls.push(structuredClone(state));
+  f.deps.memoryPause=async(_config,value)=>{paused=true;token=value;};
+  f.deps.memoryRelease=async()=>releases++;
+  f.deps.closed=async()=>settled;
+  f.deps.cli=async argv=>{f.calls.push(argv);if(argv[0]==='resume')resumed=true;return {request:'same-request'};};
+  if(prior)f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},memory:prior});
+  return {...f,controls,budget,releases:()=>releases,samples:()=>samples};
+}
+
+test('memory checkpoint releases services then resumes retained attempts and elapsed allocation at a lower cap',async()=>{
+  const f=memoryFixture();
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'complete');assert.equal(f.releases(),2);
+  assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
+  assert.ok(f.reports.some(report=>report.state==='cooling'));
+  assert.equal(result.memory.limit,3);assert.equal(result.memory.recovered,true);
+  assert.deepEqual(f.budget,{cycle:'retained-cycle',elapsed:123});
+  assert.ok(f.controls.some(control=>control.blocked));assert.equal(f.controls.at(-1).blocked,false);
+});
+
+test('guard restart restores reduced cap and own pause; operator pause takes precedence',async()=>{
+  const prior={limit:2,token:'retained-pause',lowSince:0};
+  const f=memoryFixture({prior});
+  assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+  assert.equal(f.reports.at(-1).memory.limit,2);assert.equal(f.calls[0][0],'resume');
+  const operator=memoryFixture({prior,operator:true});
+  assert.equal((await superviseCampaign(options(),operator.deps)).reason,'operator-pause');
+  assert.deepEqual(operator.calls.map(call=>call[0]),['pause']);assert.equal(operator.samples(),0);
+});
+
+test('memory emergency, recurring pressure at one and unresolved checkpoint never automatically resume',async()=>{
+  const emergency=memoryFixture({rss:32});
+  assert.equal((await superviseCampaign(options(),emergency.deps)).reason,'memory-emergency');
+  const minimum=memoryFixture({rss:29,prior:{limit:1,recovered:true}});
+  assert.equal((await superviseCampaign(options(),minimum.deps)).reason,'memory-at-minimum');assert.equal(minimum.releases(),1);
+  const unresolved=memoryFixture({settled:false});
+  const result=await superviseCampaign(options(),unresolved.deps);
+  assert.equal(result.reason,'memory-checkpoint-timeout');assert.equal(result.checkpointPending,true);
+  for(const f of [emergency,minimum,unresolved])assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+
+test('queued memory resume is observed until native acknowledgement, and a newer operator pause wins',async()=>{
+  const f=memoryFixture({queuedPolls:5});
+  assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+  assert.equal(f.calls.filter(call=>call[0]==='resume').length,1);
+  assert.ok(f.reports.filter(report=>report.reason==='memory-resume').length>=5);
+  const operator=memoryFixture({queuedPolls:5,operatorPending:true});
+  assert.equal((await superviseCampaign(options(),operator.deps)).reason,'operator-pause');
+  assert.equal(operator.calls.filter(call=>call[0]==='resume').length,1);
+});
+
+test('unreclaimed memory cool-down is bounded without repeatedly resuming',async()=>{
+  const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}});
+  f.deps.memorySample=async()=>({rssBytes:23,processCount:1,largest:[]});
+  let clock=0;f.deps.now=()=>clock;f.deps.wait=async()=>{clock+=600000;};
+  assert.equal((await superviseCampaign(options(),f.deps)).reason,'memory-recovery-timeout');
+  assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+test('failed memory observation blocks admissions and retains infrastructure failure elapsed time',async()=>{
+  const f=memoryFixture();f.deps.memorySample=async()=>{throw Error('proc unavailable');};
+  let clock=0;f.deps.now=()=>clock;f.deps.wait=async()=>{clock+=600000;};
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'infrastructure-or-ownership');assert.ok(f.controls.length>=3);
+  assert.ok(f.controls.every(control=>control.blocked));assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+
+test('unconfirmed knowledge-service release prevents automatic recovery',async()=>{
+  const f=memoryFixture();f.deps.memoryRelease=async()=>{throw Error('service still alive');};
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'memory-service-release');assert.equal(result.checkpointPending,true);
+  assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+
+test('restored cooling checkpoint verifies service release again before native resume',async()=>{
+  const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}});
+  f.deps.memoryRelease=async()=>{throw Error('retained service is still live');};
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'memory-service-release');assert.equal(result.checkpointPending,true);
+  assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+});
+
+
+test('operator pause or stop during knowledge service release prevents memory resume submission',async()=>{
+  for(const stopped of [false,true]) {
+    const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}});
+    let interrupted=false;const snapshot=f.deps.snapshot;
+    f.deps.memoryRelease=async()=>{interrupted=true;};
+    f.deps.snapshot=async()=>{const view=await snapshot();return interrupted?{...view,memoryPause:null,operatorStopped:stopped}:view;};
+    const result=await superviseCampaign(options(),f.deps);
+    assert.equal(result.reason,stopped?'operator-stop':'operator-pause');
+    assert.equal(f.calls.some(call=>call[0]==='resume'),false);
+  }
+});
+
+test('retained one-worker cap with real A/B reservation checkpoints instead of silently starving foreground',{timeout:60000},async t=>{
+  const f=await setup(t,'phase2',['unrelated']),original=await readConfig(f.root);
+  const input=join(f.root,'minimum-cap-config.json');
+  await writeFile(input,JSON.stringify({mode:'phase1',campaign_seconds:60,concurrency:4,
+    skills:{...original.skills,background:true,tuningDisabled:false},
+    projects:original.projects.map(project=>({...project,phase:'phase1'}))}));
+  await f.run('config','--config',input);
+  const config=await readConfig(f.root),ledger=new State(join(f.root,'state.sqlite'));
+  ledger.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  ledger.db.prepare('INSERT OR REPLACE INTO control VALUES (?,?)').run('memory-admission',JSON.stringify({limit:1,blocked:false}));
+  const runtime=f.start('campaign');runtime.output.catch(()=>{});
+  try {
+    const deadline=Date.now()+15000;let waiting;
+    while(Date.now()<deadline) {
+      waiting=JSON.parse(ledger.db.prepare("SELECT value FROM control WHERE key='wait'").get()?.value??'null');
+      if(waiting?.reason==='memory-concurrency-minimum')break;await delay(25);
+    }
+    assert.equal(waiting?.reason,'memory-concurrency-minimum');
+    assert.equal(ledger.db.prepare('SELECT count(*) n FROM attempts').get().n,0);
+    const observation=memoryFixture();observation.deps.snapshot=async()=>({...fresh(),status:{controller:{state:'running'},progress:{done:false},wait:waiting}});
+    const result=await superviseCampaign(options(),observation.deps);
+    assert.equal(result.reason,'memory-at-minimum');assert.deepEqual(observation.calls.map(call=>call[0]),['pause']);
+  }finally{await f.run('pause');await runtime.output;ledger.close();}
+  f.pass();
 });
