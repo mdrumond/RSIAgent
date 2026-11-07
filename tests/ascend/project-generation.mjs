@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
-import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,rm,access} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -12,10 +13,13 @@ import {campaignProgress} from '../../controller/progress.mjs';
 import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
 import {refillPhase1,refillProjects,generationEventState} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
-  const verifierContent=badVerifier?'pass\n':`from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+  const verifierContent=pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
+    badVerifier?'pass\n':`from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+  const python=pytorch?(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3'):'python3';
+  const cpuCommand=`PYTHONPATH=. '${python.replaceAll("'","'\\''")}' ../verify.py`;
   const requests=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
@@ -23,13 +27,13 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;requests.push(body);
     if(pause || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
     const plan=[
-      ['write',{path:'source/answer.py',content:'answer=0\n'}],
-      ['write',{path:'reference/answer.py',content:`answer=${positive}\n`}],
-      ['write',{path:'negative/answer.py',content:`answer=${negative}\n`}],
+      ['write',{path:'source/answer.py',content:pytorch?'def run(x):\n    return x + x\n':'answer=0\n'}],
+      ['write',{path:'reference/answer.py',content:pytorch?`def run(x):\n    return x * ${positive===42?2:3}\n`:`answer=${positive}\n`}],
+      ['write',{path:'negative/answer.py',content:pytorch?`def run(x):\n    return x * ${negative===42?2:0}\n`:`answer=${negative}\n`}],
       ['write',{path:'verify.py',content:verifierContent}],
       ['submit_project',{goal,...(performanceGoal!==undefined?{performance_goal:performanceGoal}:{}),source:'source',reference:'reference',negative_controls:['negative'],
-        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),command:separateCommand?'requires-device-runtime':"PYTHONPATH=. python3 ../verify.py"},
-        ...(separateCommand?{construction_command:"PYTHONPATH=. python3 ../verify.py"}:{})}]];
+        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),command:pytorch?cpuCommand+' --target':separateCommand?'requires-device-runtime':cpuCommand},
+        ...(separateCommand||pytorch?{construction_command:cpuCommand}:{})}]];
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
     if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
       ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
@@ -57,6 +61,35 @@ function topicQuota(f,topics) {
     generation:{topics,requirements:{SIMT:{performance:true,capabilityEvidence:true,comparison:'non-simt-or-vector'}}}}];
   f.config.kernel_language='triton';
 }
+
+test('PyTorch-only SIMT specification is admitted on CPU while target implementation remains deferred',async t=>{
+  const f=await fixture(t,{pytorch:true,performanceGoal:{comparison:'non-SIMT baseline'},performanceCommand:'actor-target-benchmark'});
+  topicQuota(f,['SIMT']);
+  const [spec]=await refillProjects(f.options);
+  assert.ok(spec);
+  assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.equal(spec.generation.requirements.capabilityEvidence,true);
+  assert.deepEqual(spec.performance_goal,{comparison:'non-SIMT baseline'});
+  assert.equal(spec.verifier.performance_command,'actor-target-benchmark');
+  await assert.rejects(access(join(spec.source,'target-requested')),{code:'ENOENT'});
+  assert.throws(()=>execFileSync(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3',
+    [spec.verifier.files[0],'--target'],{cwd:spec.source,env:{...process.env,PYTHONPATH:spec.source},stdio:'pipe'}),
+    error=>error.status===1);
+  await access(join(spec.source,'target-requested'));
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
+});
+
+test('PyTorch specifications still require a correct reference and discriminating negative controls',async t=>{
+  for(const scenario of [{positive:41},{negative:42}])await t.test(JSON.stringify(scenario),async t=>{
+    const f=await fixture(t,{pytorch:true,...scenario});topicQuota(f,['layout']);
+    assert.deepEqual(await refillProjects(f.options),[]);
+    assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
+    const rejection=generationEventState(f.state.db).queryEvents(
+      f.state.db.prepare('SELECT id FROM generation_drafts').get().id,{types:['generation-rejected']})[0];
+    assert.equal(rejection.data.checks.at(-1).kind,scenario.positive?'reference':'negative');
+    assert.equal(rejection.data.checks.at(-1).exitCode,scenario.positive?1:0);
+  });
+});
 
 test('entry topic quotas stage one SIMT benchmark and seven distinct projects without running device timing',async t=>{
   const performanceGoal={comparison:'vector baseline'},performanceCommand='isolated-target-timing';
