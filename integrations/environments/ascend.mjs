@@ -315,6 +315,15 @@ export async function createEnvironment(options, context) {
     const path=join(dirname(activeLease.receipt),'control'),sourcePath=join(path,'source');
     await mkdir(sourcePath,{recursive:true});
     controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:undefined,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
+      if(type==='execution-output'&&(data.stdout||data.stderr)){
+        // Global native journals must survive owner loss. Actor-facing artifacts
+        // belong to the campaign and must be retained before storage sees them.
+        const retained=join(context.instancePath,'lease-control-artifacts',digest(data.handle));
+        await mkdir(retained,{recursive:true});data={...data};
+        for(const stream of ['stdout','stderr'])if(data[stream]){
+          const path=join(retained,stream);await cp(data[stream],path);data[stream]=path;
+        }
+      }
       await commandContext.event(type,{...data,...(type==='execution-submitting'&&data.kind==='run'&&data.accountingExcluded===false?{controlPayload:true}:{}),purpose:'device-lease-control',accountingExcluded:true});
       if(activeLease&&type==='execution-handle'&&!data.purpose)await activeLease.update({controlHandle:data.handle});
     }});
