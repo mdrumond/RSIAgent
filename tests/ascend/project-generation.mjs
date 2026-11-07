@@ -47,7 +47,8 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
   server.listen(0,'127.0.0.1');await once(server,'listening');
   t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
   const key='GENERATION_FIXTURE_KEY';process.env[key]='fixture';t.after(()=>delete process.env[key]);
-  const config={root,mode:'phase1',actor_seconds:60,curriculum_seconds:20,
+  // ARM Torch startup is paid by each independent construction process.
+  const config={root,mode:'phase1',actor_seconds:60,curriculum_seconds:pytorch?120:20,
     curriculum:{phase1:['supplied'],generation:{enabled:true,topics:['arithmetic'],preprompt:'Construct CPU fixtures'}},
     actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
       metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
@@ -66,7 +67,7 @@ test('PyTorch-only SIMT specification is admitted on CPU while target implementa
   const f=await fixture(t,{pytorch:true,performanceGoal:{comparison:'non-SIMT baseline'},performanceCommand:'actor-target-benchmark'});
   topicQuota(f,['SIMT']);
   const [spec]=await refillProjects(f.options);
-  assert.ok(spec);
+  assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
   assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
   assert.equal(spec.generation.requirements.capabilityEvidence,true);
   assert.deepEqual(spec.performance_goal,{comparison:'non-SIMT baseline'});
