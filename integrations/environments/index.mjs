@@ -6,6 +6,7 @@ import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import {createLocalExecutionOperations} from './local-bash.mjs';
+import {excludedExecutionProofs} from '../../controller/execution-proof.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
@@ -262,12 +263,15 @@ export async function createEnvironment(options, context) {
     await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
     return { accountingUnresolved: true };
   }
-  async function observe(handle, {signal = context.signal} = {}) {
+  async function observe(handle, {signal = context.signal,accountingExcluded = false} = {}) {
     check(handle);
     let state;
     try {
       state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle);
-      if (remote && state.state === 'stopped' && state.executionSeconds === undefined) Object.assign(state, await executionTiming(handle, signal));
+      if (remote && state.state === 'stopped') {
+        if(accountingExcluded === true)Object.assign(state,{executionSeconds:0,accountingExcluded:true});
+        else if(state.executionSeconds === undefined)Object.assign(state, await executionTiming(handle, signal));
+      }
     }
     catch { state = { state: 'unknown' }; }
     await event('execution-state', { handle, ...state });
@@ -573,15 +577,18 @@ export async function createEnvironment(options, context) {
     const handles = new Set();
     if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
     let executionSeconds = 0;
+    const excluded=excludedExecutionProofs(events);
     for (const { data } of pending) {
       const response = events.find(event => ['execution-submitted', 'execution-not-admitted'].includes(event.type) && event.data.submission === data.submission);
       if (response?.type === 'execution-not-admitted' || (response?.data.closed && data.accountingExcluded)) continue;
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
       if (!handle) return { closed: false, accountingUnresolved: true, handles: [...handles] };
+      check(handle);
       if (handles.has(handle)) continue;
       handles.add(handle);
-      const state = await observe(handle);
+      const state = (data.accountingExcluded === true && excluded.get(handle)) ||
+        await observe(handle,{accountingExcluded:data.accountingExcluded === true});
       if (state.state !== 'stopped' || (!data.accountingExcluded && !Number.isFinite(state.executionSeconds))) return { closed: false, accountingUnresolved: true, handles: [...handles] };
       if (!data.accountingExcluded) executionSeconds += state.executionSeconds;
     }
@@ -594,6 +601,7 @@ export async function createEnvironment(options, context) {
     const staging = posix.join(options.remoteDirectory, encodeURIComponent(attempt.id));
     const submitted = events.filter(e => e.type === 'execution-submitting');
     const handles = new Set(), operations = new Set();
+    const excluded=excludedExecutionProofs(events);
     try {
       for (const { data } of submitted) {
         if (typeof data.submission !== 'string' || !data.submission) return false;
@@ -608,6 +616,10 @@ export async function createEnvironment(options, context) {
         if (['upload', 'download'].includes(data.kind) && data.accountingExcluded === true &&
             responses.some(e => e.type === 'execution-submitted' && e.data.closed === true) &&
             !responses.some(e => e.data.handle)) continue;
+        const completed = responses.map(e=>e.data.handle).filter(Boolean);
+        if (data.accountingExcluded === true && completed.length === 1 && excluded.get(completed[0])) {
+          check(completed[0]);handles.add(completed[0]);continue;
+        }
         const receipt = data.receiptFile ? await json(data.receiptFile) : null;
         const ids = new Set([...responses.map(e => e.data.handle), receipt?.handle].filter(Boolean));
         if (ids.size !== 1) return false;
