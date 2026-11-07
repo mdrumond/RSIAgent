@@ -1,7 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink, cp, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
+import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -322,7 +322,7 @@ export async function createEnvironment(options, context) {
     return controlEnvironment;
   }
   async function releaseLease(lease) {
-    await lease.release();
+    await closeDeviceLease(lease);
     await unlink(leasePath);
     await context.event('device-lease-released', {pool:lease.record.pool,
       physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
@@ -335,6 +335,13 @@ export async function createEnvironment(options, context) {
   async function reconcileCurrent() {
     let retained;
     try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return true;throw error;}
+    const proof=await closedDeviceLease(retained.receipt,retained.token);
+    if(proof&&proof.pool===retained.pool&&proof.physicalDevice===retained.physicalDevice){
+      await preserveControls(proof.path);
+      await unlink(leasePath);
+      await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token});
+      return true;
+    }
     const lease=await openDeviceLease(retained.receipt,retained.token);
     if(lease.record.version!==2)return false;
     activeLease=lease;
@@ -358,8 +365,11 @@ export async function createEnvironment(options, context) {
       const cleanup=await control();
       // A positively refused control submission may be retried. Unknown submissions
       // returned above; a recovered payload handle is always observed, never replayed.
-      if(lease.record.controlStarted&&lease.record.controlHandle&&!await cleanup.readAdmission(lease.record.controlHandle))await lease.update({controlStarted:false,controlHandle:null});
-      if(lease.record.controlStarted&&!lease.record.controlHandle)await lease.update({controlStarted:false});
+      if(lease.record.controlStarted&&!lease.record.controlHandle){
+        const refused=lease.record.submissions.filter(row=>row.controlPayload).at(-1);
+        if(refused?.closed===true&&!refused.handle)await lease.update({controlStarted:false});
+        else return false;
+      }
       if(!lease.record.controlStarted){
         await lease.update({controlStarted:true});
         const request={devices:[lease.record.physicalDevice],lease:{pool:lease.record.pool,token:lease.token}};
@@ -375,18 +385,34 @@ export async function createEnvironment(options, context) {
         await lease.update({controlStarted:false,controlHandle:null});return false;
       }
       if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
-      // Preserve native control receipts in this attempt before releasing the
-      // global journal: normal lifecycle observers still re-observe its handles.
-      const journal=join(dirname(lease.receipt),'control','.executions');
-      for(const entry of await readdir(journal,{withFileTypes:true}))if(entry.isDirectory())
-        await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
+      await preserveControls(dirname(lease.receipt));
       return true;
+  }
+  async function preserveControls(directory) {
+    // Preserve only native execution directories, never another source cache.
+    const journal=join(directory,'control','.executions');
+    let entries;try{entries=await readdir(journal,{withFileTypes:true});}
+    catch(error){if(error.code==='ENOENT')return;throw error;}
+    await mkdir(join(context.instancePath,'.executions'),{recursive:true});
+    for(const entry of entries)if(entry.isDirectory())
+      await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
   }
   async function recoverReservation(physical,proof={}) {
     return reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
       ...proof,
       observe:handle=>local?environment.observe(handle):client(['observe',handle]),
       reconcileHost:async lease=>{
+        // Administrative migration is separate from a failed receipt download.
+        // Existing journals always retain their known native control identity.
+        if(lease.record.controlHandle&&proof.migrateClosedControl){
+          let missing=false;
+          try{await readdir(join(dirname(lease.receipt),'control','.executions'));}
+          catch(error){if(error.code==='ENOENT')missing=true;else throw error;}
+          if(missing&&await proof.migrateClosedControl(lease.record)){
+            await lease.retain(lease.record.controlHandle);
+            await lease.update({controlStarted:false,controlHandle:null});
+          }
+        }
         activeLease=lease;
         try{return await reconcileHostLease(lease);}finally{activeLease=null;}
       }

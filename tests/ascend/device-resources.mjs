@@ -601,3 +601,67 @@ test('retaining native fence-control receipts preserves the actor source staging
   const stages=f.events.filter(e=>e.type==='source-staged'&&!e.purpose);
   assert.equal(stages.length,2);assert.equal(stages[0].reused,false);assert.equal(stages[1].reused,true);
 });
+
+test('reclaimed token closure lets its original checkpoint resume without touching a new reservation',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory,{instancePath:f.context.instancePath});
+  await held.update({owner:{...held.record.owner,start:'old-process'},handles:['remote:fixture:job:prior']});
+  await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
+  const other=await createEnvironment(f.options,{...f.context,instancePath:join(f.context.instancePath,'other-controller')});
+  assert.equal((await other.reconcileReservation(0)).closed,true);
+  const fresh=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);assert.ok(fresh);
+  assert.notEqual(fresh.token,held.token);
+  assert.equal(await f.environment.reconcileLease(),true);
+  await assert.rejects(readFile(join(f.context.instancePath,'.ascend-command-lease.json')),{code:'ENOENT'});
+  assert.equal(JSON.parse(await readFile(fresh.receipt,'utf8')).token,fresh.token);
+});
+
+for(const unknown of [false,true])test(`failed control admission download (${unknown?'unknown':'closed'} transfer) retains its native handle without replay`,async t=>{
+  const f=await fixture(t);let broken=true,controlHandle;
+  const client=async(args,settings)=>{
+    if(args[0]==='capabilities')return {state:'available',backend:'ssh'};
+    if(broken&&args[0]==='download'&&args[2].includes('/lease-control/')&&args[2].endsWith('/admission.json')){
+      if(unknown)throw new Error('native transfer acknowledgement lost');
+      return {state:'failed',exit:255};
+    }
+    const result=await f.context.client(args,settings);
+    if(args[0]==='run'&&!args.includes('--npu')&&args[args.indexOf('--file')+1].endsWith('command.sh'))controlHandle=result.handle;
+    return result;
+  };
+  const environment=await createEnvironment(f.options,{...f.context,client});
+  await environment.prepare({project:{source:f.source},attempt:{id:'download-retry'}});
+  assert.equal((await environment.execute('payload-once',f.source,{timeout:5})).settled,false);
+  assert.ok(controlHandle);
+  const runs=f.calls.filter(a=>a[0]==='run').length;
+  const restarted=await createEnvironment(f.options,{...f.context,client});
+  assert.equal(await restarted.reconcileLease(),false);
+  let migrated=false;
+  assert.equal((await restarted.reconcileReservation(0,{stopped:async()=>true,
+    migrateClosedControl:async()=>{migrated=true;return true;}})).closed,false);
+  assert.equal(migrated,false,'an existing native journal is not a legacy migration');
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+  broken=false;const recovered=await restarted.reconcileLease();
+  assert.equal(recovered,!unknown);
+  if(unknown){const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+    assert.equal(JSON.parse(await readFile(pointer.receipt,'utf8')).controlHandle,controlHandle);}
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+});
+
+test('control-started without a native identity is held instead of redispatched',async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  await held.update({controlStarted:true});
+  await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
+  assert.equal(await f.environment.reconcileLease(),false);
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
+  assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).controlStarted,true);
+});
+
+test('explicit closed legacy-control migration requires an absent journal and native closure',async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  await held.update({owner:null,controlStarted:true,controlHandle:'remote:fixture:job:legacy-control'});
+  let checked=false;
+  const result=await f.environment.reconcileReservation(0,{stopped:async()=>true,
+    migrateClosedControl:async record=>{checked=true;return record.token===held.token&&record.controlHandle==='remote:fixture:job:legacy-control';}});
+  assert.equal(result.closed,true);assert.equal(checked,true);
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:legacy-control'));
+});
