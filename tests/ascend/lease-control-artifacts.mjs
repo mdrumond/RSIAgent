@@ -85,8 +85,9 @@ for(const product of ['a3','a5'])test(`${product} lease cleanup output remains c
   // copies must remain independently readable and sealable afterward.
   const [closed]=await readdir(join(leases,'.closed'));
   const journal=join(leases,'.closed',closed,'control','.executions');
-  const nativeStreams=[];for(const execution of await readdir(journal)){
-    try{nativeStreams.push(await readFile(join(journal,execution,'stdout'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  const nativeStreams=[];for(const execution of await readdir(journal,{withFileTypes:true})){
+    if(!execution.isDirectory())continue;
+    try{nativeStreams.push(await readFile(join(journal,execution.name,'stdout'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
   }
   assert.ok(nativeStreams.includes('native stdout\n'),'global cleanup journal remains durable');
   for(const stream of ['stdout','stderr']){
