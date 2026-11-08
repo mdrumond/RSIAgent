@@ -134,3 +134,15 @@ test('existing recovery queues migrate without changing ordinary investigation a
   queue.enqueue(f.attempt.id,1);
   assert.equal(queue.claim('p',2,{}).kind,'investigation');
 });
+
+test('resumed real baseline failure supersedes earlier infrastructure without blocking progress forever',async t=>{
+  const f=await fixture(t);f.state.event(f.attempt.id,'preactor-infrastructure',{reason:'prior-transport-loss'});
+  f.project.verifier.baseline_command='exit 1';
+  await assert.rejects(f.baseline(),{code:'PROJECT_BASELINE_INVALID'});
+  f.state.finish(f.attempt.id,'failed');f.state.event(f.attempt.id,'failure-settlement',{closed:true});
+  f.queue.recordOriginal(f.attempt.id,{passed:false,findings:'Observed baseline failure',evidence:[{path:'failure',sha256:'digest'}]},1);
+  for(const lesson of f.queue.lessons())f.queue.acknowledgeLesson(lesson.id);
+  f.state.event(f.attempt.id,'postprocess-completed',{});
+  assert.equal(f.state.project('p').frozen,true);assert.equal(f.queue.entry('p'),undefined);
+  assert.equal(campaignProgress(f.state,{mode:'phase1',completion_target:1}).finishedOriginals,1);
+});

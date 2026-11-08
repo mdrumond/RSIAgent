@@ -2,12 +2,14 @@ const phases = ['phase1', 'phase2', 'inference'];
 
 // A transport refusal before any actor starts is not an observed original.
 // Ordinary kernel failures still count, including those awaiting investigation.
-const observedOriginal=`(a.session IS NOT NULL OR NOT EXISTS (
+const observedOriginal=`(a.session IS NOT NULL OR EXISTS (SELECT 1 FROM events verdict
+  WHERE verdict.attempt=a.id AND verdict.type='project-invalid') OR NOT EXISTS (
   SELECT 1 FROM events infrastructure WHERE infrastructure.attempt=a.id AND infrastructure.type='preactor-infrastructure'
 ) OR EXISTS (
   SELECT 1 FROM attempts observed WHERE observed.project=a.project AND observed.outcome IN ('passed','failed')
   AND NOT EXISTS (SELECT 1 FROM events infrastructure WHERE infrastructure.attempt=observed.id
-    AND infrastructure.type='preactor-infrastructure' AND observed.session IS NULL)
+    AND infrastructure.type='preactor-infrastructure' AND observed.session IS NULL
+    AND NOT EXISTS (SELECT 1 FROM events verdict WHERE verdict.attempt=observed.id AND verdict.type='project-invalid'))
   AND EXISTS (SELECT 1 FROM events post WHERE post.attempt=observed.id AND post.type='postprocess-completed')
   AND NOT EXISTS (SELECT 1 FROM events settlement WHERE settlement.sequence=(SELECT MAX(sequence) FROM events
     WHERE attempt=observed.id AND type='failure-settlement')

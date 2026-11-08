@@ -39,7 +39,8 @@ export class RecoveryQueue {
       this.db.exec('ALTER TABLE recovery_queue ADD COLUMN retry_after REAL NOT NULL DEFAULT 0');
   }
   preactorInfrastructure(attempt) {
-    return !attempt.session&&this.state.queryEvents(attempt.id,{types:['preactor-infrastructure'],limit:1}).length>0;
+    return !attempt.session&&this.state.queryEvents(attempt.id,{types:['preactor-infrastructure'],limit:1}).length>0&&
+      !this.state.queryEvents(attempt.id,{types:['project-invalid'],limit:1}).length;
   }
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE');
