@@ -6,10 +6,11 @@ import {setup,rows,until} from './driver_setup.mjs';
 
 // Real controller/worker failure, Pi finalization, storage, KDB and phase cursor;
 // only detached native execution observation is a deterministic fixture.
-for(const proof of ['late','unknown'])test(`live campaign reconciles ${proof} native closure without actor replay`,{timeout:90000},async t=>{
+for(const proof of ['late','unknown','slow-timing'])test(`live campaign reconciles ${proof} native closure without actor replay`,{timeout:90000},async t=>{
   const f=await setup(t,'phase2',['holder','next']);
-  const marker=join(f.root,'native-closed'),module=join(f.root,'late-proof.mjs');
-  await writeFile(module,`import {readFile,access,writeFile} from 'node:fs/promises';
+  const marker=join(f.root,'native-closed'),module=join(f.root,'late-proof.mjs'),downloads=join(f.root,'timing-downloads.jsonl');
+  await writeFile(module,`import {readFile,access,writeFile,mkdir,appendFile} from 'node:fs/promises';
+import {setTimeout as delay} from 'node:timers/promises';
 import {createHash} from 'node:crypto';
 import {join} from 'node:path';
 import {createEnvironment as local} from './machinery/integrations/environments/index.mjs';
@@ -20,9 +21,11 @@ export async function createEnvironment(options,context){
   if(job.attempt.project==='holder'&&job.kind==='original'&&!job.finalize){
    await context.event('execution-starting',{operation:'detached',startElapsed:0});
    await context.event('execution-submitting',{operation:'detached',submission:'native',kind:'run',accountingExcluded:false});
-   await context.event('execution-submitted',{submission:'native',handle:'fixture:exact-native'});
-   await context.event('execution-handle',{operation:'detached',handle:'fixture:exact-native'});
-   await context.event('execution-unresolved',{operation:'detached',handle:'fixture:exact-native'});
+   await context.event('execution-submitted',{submission:'native',handle:'remote:fixture:job:exact-native'});
+   await context.event('execution-handle',{operation:'detached',handle:'remote:fixture:job:exact-native'});
+   await context.event('execution-unresolved',{operation:'detached',handle:'remote:fixture:job:exact-native'});
+   const nativeDir=join(context.instancePath,'.executions','exec-native');await mkdir(nativeDir,{recursive:true});
+   await writeFile(join(nativeDir,'execution.json'),JSON.stringify({handle:'remote:fixture:job:exact-native',spool:'owned/native/output',timingKey:'native-duration'}));
    const evidence=join(context.instancePath,'native-failure.log'),content='Worker exited with detached native execution unresolved.\\n';
    await writeFile(evidence,content);
    await writeFile(join(context.instancePath,'findings.json'),JSON.stringify({findings:content,useful:false,evidence:[{path:evidence,sha256:createHash('sha256').update(content).digest('hex')}]}));
@@ -30,8 +33,26 @@ export async function createEnvironment(options,context){
   }
  }
  const closed=async()=>{try{await access(${JSON.stringify(marker)});return true;}catch{return false;}};
- return {...base,observe:async handle=>handle==='fixture:exact-native'?{state:await closed()?'stopped':'unknown'}:base.observe(handle),
- reconcileOperation:async({operation})=>operation==='detached'?{closed:await closed(),executionSeconds:2.5,handles:['fixture:exact-native']}:{closed:false}};
+ const slow=${JSON.stringify(proof==='slow-timing')};
+ const native=slow?await local({mode:'cpl',target:'fixture',workspacePath:'/registry/workspace',remoteDirectory:'owned'},
+ {...context,client:async(args,{signal}={})=>{
+  if(args[0]==='capabilities')return {state:'available',backend:'remote-agent'};
+  if(args[0]==='observe')return {state:args[1].includes(':transfer:')||await closed()?'completed':'observation-unavailable',exit:0};
+  if(args[0]==='download'){
+   await appendFile(${JSON.stringify(downloads)},JSON.stringify(args)+String.fromCharCode(10));
+   await delay(6000,undefined,{signal});
+   return {state:'queued',handle:'remote:fixture:transfer:duration'};
+  }
+  if(args[0]==='fetch'){
+   await writeFile(args[2],JSON.stringify({completed:true,key:'native-duration',executionSeconds:4.25}));
+   return {state:'completed'};
+  }
+  throw new Error('Unexpected native timing request '+args[0]);
+ }}):null;
+ return {...base,observe:async(handle,settings)=>handle.startsWith('remote:fixture:')?
+   slow?native.observe(handle,settings):{state:await closed()?'stopped':'unknown'}:base.observe(handle,settings),
+ reconcileOperation:request=>slow?native.reconcileOperation(request):request.operation==='detached'?
+   closed().then(closed=>({closed,executionSeconds:2.5,handles:['remote:fixture:job:exact-native']})):{closed:false}};
 }
 `);
   const initial=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
@@ -43,17 +64,28 @@ export async function createEnvironment(options,context){
   const campaign=f.start('campaign');void campaign.output.catch(()=>{});
   let drained=false;t.after(async()=>{if(!drained){await f.run('stop');await campaign.output;}});
   await until(()=>rows(f.root,"SELECT * FROM events WHERE type='failure-settlement' AND json_extract(data,'$.closed')=0").length);
+  // Wait until worker-exit containment has finished; the late proof must be
+  // collected by the live periodic pass, not its initial exit callback.
+  await until(()=>rows(f.root,"SELECT value FROM control WHERE key='wait'")
+    .some(row=>JSON.parse(row.value)?.reason==='waiting-inputs'));
   const original=rows(f.root,"SELECT * FROM attempts WHERE project='holder'")[0];
   assert.equal(original.outcome,'failed');
   assert.equal(rows(f.root,'SELECT * FROM resource_leases').length,1);
   assert.equal(rows(f.root,"SELECT * FROM attempts WHERE project='next'").length,0);
-  if(proof==='late'){
+  if(proof!=='unknown'){
     await writeFile(marker,'exact native proof');
     await until(()=>rows(f.root,"SELECT * FROM events WHERE type='postprocess-completed'").length===2,60000);
     await campaign.output;
     assert.equal(rows(f.root,'SELECT * FROM resource_leases').length,0);
     assert.equal(rows(f.root,"SELECT * FROM events WHERE type='job-admitted' AND json_extract(data,'$.kind')='original'").length,2);
-    assert.equal(rows(f.root,`SELECT elapsed FROM attempts WHERE id='${original.id}'`)[0].elapsed,2.5);
+    assert.equal(rows(f.root,`SELECT elapsed FROM attempts WHERE id='${original.id}'`)[0].elapsed,proof==='slow-timing'?4.25:2.5);
+    if(proof==='slow-timing'){
+      assert.equal((await readFile(downloads,'utf8')).trim().split('\n').length,1);
+      const reconciled=rows(f.root,`SELECT data FROM events WHERE attempt='${original.id}' AND type='execution-reconciled'`);
+      assert.equal(reconciled.filter(e=>JSON.parse(e.data).operation==='detached').length,1);
+      assert.ok(rows(f.root,`SELECT data FROM events WHERE attempt='${original.id}' AND type='execution-submitted'`)
+        .some(e=>JSON.parse(e.data).handle==='remote:fixture:transfer:duration'));
+    }
     assert.equal(rows(f.root,"SELECT status FROM projects WHERE id='next'")[0].status,'passed');
   }else{
     // Wait past multiple periodic checks; unknown identity/closure never releases.

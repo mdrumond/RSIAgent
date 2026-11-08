@@ -136,7 +136,7 @@ export async function operate(command,config,options={}) {
     }
     // Reuse startup closure proof during a live campaign: worker exit can precede
     // native terminal receipts. Never replay the actor to discover that proof.
-    const settlementChecks=new Map();
+    const settlementChecks=new Map(),launchedAttempts=new Set();
     async function reconcileCompleted({periodic=false}={}) {
       const candidates=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL`).all()
         .filter(attempt=>!failureSettled(state,attempt.id)||
@@ -147,8 +147,10 @@ export async function operate(command,config,options={}) {
       for(const attempt of periodic?candidates.slice(0,1):candidates) {
         schedulerAbort.signal.throwIfAborted();
         settlementChecks.set(attempt.id,performance.now());
-        if(!await ownerStopped(attempt.owner))continue;
-        const signal=periodic?AbortSignal.any([schedulerAbort.signal,AbortSignal.timeout(5000)]):schedulerAbort.signal;
+        if(launchedAttempts.has(attempt.id)||!await ownerStopped(attempt.owner))continue;
+        // A retry cadence must not abort native receipt transfers before their
+        // identities arrive. Keep the campaign/stop signal and transport budgets.
+        const signal=schedulerAbort.signal;
         try {
           const path=join(config.root,'attempts',attempt.id);
           const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
@@ -232,6 +234,7 @@ export async function operate(command,config,options={}) {
       const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
       admitted.mode=pinnedMode;
       attempt=admitted.attempt;
+      launchedAttempts.add(attempt.id);
       assignedResource=resource??admitted.resource;
       if(job.origin_attempt&&!job.resume) {
         const parent=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8'));
@@ -311,7 +314,7 @@ export async function operate(command,config,options={}) {
         if(closed && childStopped)
           state.db.prepare('DELETE FROM resource_leases WHERE attempt=?').run(attempt.id);
         return {attempt:attempt.id,outcome:state.attempt(attempt.id).outcome,error:error.message};
-      }
+      }finally{if(attempt)launchedAttempts.delete(attempt.id);}
 
     };
     const results=[],activeJobs=new Map(),startedJobs=new Set();
