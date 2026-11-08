@@ -9,7 +9,7 @@ import { curriculumSession } from './curriculum.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectBundle,bundleHashes} from './project-bundle.mjs';
-import {compileVerifierEntries} from '../controller/project-commands.mjs';
+import {compileVerifierEntries,entrypointCommand} from '../controller/project-commands.mjs';
 
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
@@ -187,7 +187,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               const artifacts=await checkProposal(root,p);
               const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
               validateAcceptance({...p,verifier});
-              const constructionCommand=p.construction_command??verifier.command;
+              const constructionCommand=p.construction_command??entrypointCommand(verifier.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;
               const env=await createEnvironment({mode:'local',localExecution:config.local_execution},{instancePath:root,signal:active,
@@ -197,7 +197,8 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               await mkdir(join(root,'construction'),{recursive:true});
               for(const [index,cwd] of [artifacts.reference,...artifacts.negatives].entries()) {
                 active.throwIfAborted();
-                // Preserve submitted source-relative verifier commands across sibling fixtures.
+                // An omitted CPU command uses the frozen absolute entrypoint;
+                // fixture cwd depths need not match the editable source.
                 const command=constructionCommand;
                 let output='',execution;
                 const logPath=join(root,'construction',randomUUID()+'.log'),log=await open(logPath,'wx',0o600);

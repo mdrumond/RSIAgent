@@ -94,6 +94,9 @@ Arguments use source-relative paths rather than absolute generation paths.
 Commands cannot supply `cd` prefixes or shell fragments. Supplied legacy project
 strings remain supported; their existing shell behavior is unchanged. A bundle's
 declared root and relative source/trusted-file layout also survive target staging.
+When the separate CPU construction command is omitted, its fallback uses the
+same frozen entrypoint with an absolute path so reference and negative-control
+directories may have different depths; import relocates that entrypoint too.
 CPU construction checks establish
 correctness only and do not execute that performance command. Optional
 `curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override
