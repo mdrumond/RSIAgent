@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join,dirname,resolve} from 'node:path';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
+import {DatabaseSync} from 'node:sqlite';
 import {runSmoke,candidate} from '../../examples/ascend-smoke/run.mjs';
 import {provider} from './driver_fixture.mjs';
 import {stages} from '../../controller/workflow.mjs';
@@ -53,6 +54,9 @@ test('actor hello smoke uses actual Pi tools and verifier with no curriculum or 
     const config=JSON.parse(await readFile(join(report.instance,'instance.json')));
     assert.equal(config.projects[0].performance_goal,undefined);
     assert.equal(config.projects[0].verifier.baseline_command,undefined);
+    const state=new DatabaseSync(join(report.instance,'state.sqlite'),{readOnly:true});
+    try {assert.equal(JSON.parse(state.prepare("SELECT data FROM events WHERE type='verification'").get().data).performance,null);}
+    finally{state.close();}
     if(!process.env.DRIVER_ARTIFACTS)await rm(path,{recursive:true});
   });
 
