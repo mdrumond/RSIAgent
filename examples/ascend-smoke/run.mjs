@@ -137,9 +137,12 @@ async function stopKnowledge(instance) {
 export async function runSmoke({kind,profile,destination,live=false,device='npu:0',signal}) {
   assert.ok(['controller','curriculum','actor'].includes(kind));
   if(kind!=='controller'&&!live)throw Error('Real curriculum/actor smoke requires explicit live authorization');
-  const cpu=device==='cpu',target=cpu?'cpu':profile.target??profile.environment?.options?.health?.product;
+  const cpu=device==='cpu',product=profile.environment?.options?.health?.product;
+  const target=cpu?'cpu':profile.target??product;
   if(!cpu) {
     assert.ok(['a3','a5'].includes(target),'An explicit A3/A5 target binding is required');
+    if(profile.target!==undefined)assert.equal(profile.target,product,
+      'Smoke target must match the Ascend health product');
     assert.equal(profile.environment?.options?.mode,target==='a3'?'cpl':'local',
       'A3 uses the host CPL path; A5 must execute directly on its device host');
     assert.equal(profile.environment?.module,'machinery/integrations/environments/ascend.mjs',

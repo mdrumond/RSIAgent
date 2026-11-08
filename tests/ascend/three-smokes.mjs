@@ -28,7 +28,8 @@ async function actorProfile(path,url) {
 test('device smoke rejects relaxed containment before creating an instance or contacting a provider',async t=>{
   const path=await root(t),destination=join(path,'must-not-start');
   await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',
-    environment:{...environment,module:'machinery/integrations/environments/ascend.mjs'},
+    environment:{...environment,module:'machinery/integrations/environments/ascend.mjs',
+      options:{...environment.options,health:{product:'a5'}}},
     local_execution:{tasks:129,memory_bytes:4*1024**3}},destination}),/require containment/);
   await assert.rejects(access(destination),{code:'ENOENT'});
   await rm(path,{recursive:true});
@@ -36,8 +37,23 @@ test('device smoke rejects relaxed containment before creating an instance or co
 
 test('device smoke rejects a generic backend before creating any instance',async t=>{
   const path=await root(t),destination=join(path,'must-not-start');
-  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',environment},destination}),/copied Ascend adapter/);
+  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',
+    environment:{...environment,options:{...environment.options,health:{product:'a5'}}}},destination}),/copied Ascend adapter/);
   await assert.rejects(access(destination),{code:'ENOENT'});
+  await rm(path,{recursive:true});
+});
+
+test('device smoke rejects a target/product mismatch before model access or workspace creation',async t=>{
+  const path=await root(t);
+  for(const [target,product] of [['a3','a5'],['a5','a3']]) {
+    const destination=join(path,target);let providerReads=0;
+    const profile={target,environment:{module:'machinery/integrations/environments/ascend.mjs',
+      options:{mode:target==='a3'?'cpl':'local',health:{product}}},
+      get actor(){providerReads++;throw new Error('Provider must not be accessed');}};
+    await assert.rejects(runSmoke({kind:'actor',profile,destination,live:true}),/match the Ascend health product/);
+    assert.equal(providerReads,0);
+    await assert.rejects(access(destination),{code:'ENOENT'});
+  }
   await rm(path,{recursive:true});
 });
 
