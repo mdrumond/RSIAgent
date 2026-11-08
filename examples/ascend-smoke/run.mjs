@@ -142,6 +142,8 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     assert.ok(['a3','a5'].includes(target),'An explicit A3/A5 target binding is required');
     assert.equal(profile.environment?.options?.mode,target==='a3'?'cpl':'local',
       'A3 uses the host CPL path; A5 must execute directly on its device host');
+    assert.equal(profile.environment?.module,'machinery/integrations/environments/ascend.mjs',
+      'Device smokes require the copied Ascend adapter for health, masks and admission');
   }
   const localExecution=cpu?profile.local_execution:{tasks:profile.local_execution?.tasks??128,
     memory_bytes:profile.local_execution?.memory_bytes??4*1024**3};

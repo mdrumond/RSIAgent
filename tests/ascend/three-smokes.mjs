@@ -27,8 +27,16 @@ async function actorProfile(path,url) {
 
 test('device smoke rejects relaxed containment before creating an instance or contacting a provider',async t=>{
   const path=await root(t),destination=join(path,'must-not-start');
-  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',environment,
+  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',
+    environment:{...environment,module:'machinery/integrations/environments/ascend.mjs'},
     local_execution:{tasks:129,memory_bytes:4*1024**3}},destination}),/require containment/);
+  await assert.rejects(access(destination),{code:'ENOENT'});
+  await rm(path,{recursive:true});
+});
+
+test('device smoke rejects a generic backend before creating any instance',async t=>{
+  const path=await root(t),destination=join(path,'must-not-start');
+  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',environment},destination}),/copied Ascend adapter/);
   await assert.rejects(access(destination),{code:'ENOENT'});
   await rm(path,{recursive:true});
 });
