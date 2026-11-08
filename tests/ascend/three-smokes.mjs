@@ -75,7 +75,8 @@ test('actor hello smoke uses actual Pi tools and verifier with no curriculum or 
       const calls=[];for(const stage of stages){calls.push({name:'rsi_skill',args:{}});
         if(['design','optimisation'].includes(stage))for(const kind of ['good','negative'])
           calls.push({name:'rsi_knowledge',args:{query:'tiny hello',kind}});
-        if(stage==='implementation')calls.push({name:'write',args:{path:'answer.py',content:candidate}});
+        if(stage==='implementation')calls.push({name:'write',args:{path:'answer.py',content:candidate}},
+          {name:'bash',args:{command:'printf smoke-native-bash',timeout:10}});
         if(stage==='validation')calls.push({name:'rsi_verify',args:{}});
         calls.push({name:'rsi_advance',args:{reflection:'Independent hello oracle.'}});}return calls;
     }});t.after(()=>server.close());
@@ -87,7 +88,11 @@ test('actor hello smoke uses actual Pi tools and verifier with no curriculum or 
     assert.equal(config.projects[0].performance_goal,undefined);
     assert.equal(config.projects[0].verifier.baseline_command,undefined);
     const state=new DatabaseSync(join(report.instance,'state.sqlite'),{readOnly:true});
-    try {assert.equal(JSON.parse(state.prepare("SELECT data FROM events WHERE type='verification'").get().data).performance,null);}
+    try {assert.equal(JSON.parse(state.prepare("SELECT data FROM events WHERE type='verification'").get().data).performance,null);
+      const completed=JSON.parse(state.prepare("SELECT data FROM events WHERE type='native-bash-completed'").get().data);
+      const attempt=state.prepare('SELECT elapsed,outcome FROM attempts').get();
+      assert.ok(completed.actor_elapsed>0);assert.ok(completed.actor_elapsed<attempt.elapsed);
+      assert.equal(attempt.outcome,'passed');}
     finally{state.close();}
     if(!process.env.DRIVER_ARTIFACTS)await rm(path,{recursive:true});
   });

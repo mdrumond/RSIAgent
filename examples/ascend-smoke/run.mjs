@@ -106,7 +106,7 @@ async function actorOnly(config,state,signal) {
     environmentIdentity:config.environment,knowledge:bridge.knowledge,extensions:[bridge.extension],skillMap:map,
     ...await modelFromProfile(config.actor),environmentFactory:async context=>environment=await module.createEnvironment(
       {...config.environment.options,localExecution:config.local_execution},context)});
-  assert.equal(await operationsStopped(state,attempt,environment),true,'Actor execution must positively close');
+  assert.equal(await operationsStopped(state,state.attempt(attempt.id),environment),true,'Actor execution must positively close');
   if(environment.reconcileLease)assert.equal(await environment.reconcileLease(),true);
   return result;
 }
