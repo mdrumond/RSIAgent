@@ -2,13 +2,17 @@
 import argparse
 import asyncio
 import json
+from urllib.parse import urlsplit
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 async def invoke(url, tool, arguments, attempt=None):
     headers = {'X-Attempt-Id': attempt} if attempt else {}
-    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(30, read=None)) as client, streamable_http_client(url, http_client=client) as (reader, writer, _):
+    endpoint = urlsplit(url)
+    loopback = endpoint.scheme == 'http' and endpoint.hostname in {'127.0.0.1', 'localhost', '::1'}
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(30, read=None),
+                                 trust_env=not loopback) as client, streamable_http_client(url, http_client=client) as (reader, writer, _):
         async with ClientSession(reader, writer) as session:
             await session.initialize()
             result = await session.call_tool(tool, arguments)
