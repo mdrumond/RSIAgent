@@ -119,7 +119,7 @@ test('curriculum smoke validates and imports exactly one real-tool PyTorch proje
     const imported=JSON.parse(await readFile(join(path,'curriculum/curriculum-project.json')));
     assert.ok(imported.source.startsWith(resolve(report.instance)));assert.ok(imported.bundle);
     assert.equal(imported.target,'cpu');assert.equal(report.target,'cpu');assert.equal(report.deviceEvidence,false);
-    const config=JSON.parse(await readFile(join(report.instance,'campaign.json')));
+    const config=JSON.parse(await readFile(join(report.instance,'instance.json')));
     assert.equal(config.curriculum_seconds,180);assert.equal(config.target,'cpu');
     assert.equal(config.environment.module,'machinery/integrations/environments/index.mjs');
     assert.equal(config.environment.options.mode,'local');
