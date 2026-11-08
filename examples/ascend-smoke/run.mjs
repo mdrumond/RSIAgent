@@ -202,7 +202,8 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     if(initialized)await stopKnowledge(instance);
     await scripted?.server.close();
   }
-  const report={kind,target,device,passed:true,instance,...result,cleanupClosed:true};
+  const report={kind,target,device:kind==='curriculum'?null:device,
+    deviceEvidence:kind!=='curriculum'&&device!=='cpu',passed:true,instance,...result,cleanupClosed:true};
   await save(join(root,'result.json'),report);return report;
 }
 
