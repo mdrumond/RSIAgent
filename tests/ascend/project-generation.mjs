@@ -20,13 +20,14 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
-  const verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
+  let verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
     badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`);
   const python=pytorch?(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3'):'python3';
   const cpuCommand=`PYTHONPATH=. '${python.replaceAll("'","'\\''")}' ../verify.py`;
+  if(omitConstruction)verifierContent=verifierContent.replace("parent/'reference'","parent/'controls'/'reference'/'deep'");
   const requests=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
@@ -57,7 +58,13 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
         starter[1].path='project/task/src/impl/answer.py';proposal.source='project/task/src/impl';
         proposal.construction_command=`PYTHONPATH=. '${python}' '${join(root,'drafts',state.db.prepare('SELECT id FROM generation_drafts ORDER BY rowid DESC LIMIT 1').get().id,'project/task/verify.py')}'`;
       }
+      if(omitConstruction) {
+        proposal.reference='project/task/controls/reference/deep';
+        for(const call of plan)if(call[0]==='write'&&call[1].path.startsWith('project/task/reference/'))
+          call[1].path=call[1].path.replace('project/task/reference/',proposal.reference+'/');
+      }
     }
+    if(omitConstruction)delete plan.at(-1)[1].construction_command;
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
     if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
@@ -553,6 +560,18 @@ test('absolute construction paths retain meaning when source and trusted fixture
   const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
   await rm(f.options.path,{recursive:true});
   await validateBundle(imported,join(f.config.root,'unequal-proof'));
+  assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
+    error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
+});
+
+test('omitted construction command uses one frozen entrypoint across unequal fixture depths',async t=>{
+  const f=await fixture(t,{nestedBundle:true,unequalDepth:true,omitConstruction:true});
+  const [spec]=await refillProjects(f.options);
+  assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
+  assert.deepEqual(spec.generation.checks.map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1]);
+  const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
+  await rm(f.options.path,{recursive:true});
+  await validateBundle(imported,join(f.config.root,'fallback-proof'));
   assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
     error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
 });

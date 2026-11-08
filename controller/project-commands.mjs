@@ -3,6 +3,12 @@ import {relative,resolve,isAbsolute,sep} from 'node:path';
 const fields=['command','baseline_command','performance_command'];
 const quote=value=>"'"+value.replaceAll("'","'\\''")+"'";
 
+// Omit the source cwd for CPU construction, which runs from several fixture
+// directories and must keep the same frozen entrypoint identity in each one.
+export function entrypointCommand({entrypoint,args},source) {
+  return ['python3',source===undefined?entrypoint:relative(source,entrypoint),...args].map(quote).join(' ');
+}
+
 // Generated verifier commands are Python entrypoints with literal arguments.
 // Store the file identity as well as the compatible shell command so imports
 // can regenerate paths without interpreting or repairing shell programs.
@@ -25,7 +31,7 @@ export function compileVerifierEntries(verifier,{root,source,files,required=fals
     const entrypoint=resolve(root,submitted.entrypoint);
     if(!frozen.has(entrypoint))throw new Error(`Verifier entrypoint must be a declared frozen file: ${submitted.entrypoint}`);
     entries[field]={entrypoint,args:[...submitted.args]};
-    result[field]=['python3',relative(source,entrypoint),...submitted.args].map(quote).join(' ');
+    result[field]=entrypointCommand(entries[field],source);
   }
   if(Object.keys(entries).length)result.entrypoints=entries;
   return result;
