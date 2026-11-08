@@ -141,7 +141,7 @@ async function stopKnowledge(instance) {
 export async function runSmoke({kind,profile,destination,live=false,device='npu:0',signal}) {
   assert.ok(['controller','curriculum','actor'].includes(kind));
   if(kind!=='controller'&&!live)throw Error('Real curriculum/actor smoke requires explicit live authorization');
-  const cpu=device==='cpu',product=profile.environment?.options?.health?.product;
+  const cpu=kind==='curriculum'||device==='cpu',product=profile.environment?.options?.health?.product;
   const target=cpu?'cpu':profile.target??product;
   if(!cpu) {
     assert.ok(['a3','a5'].includes(target),'An explicit A3/A5 target binding is required');
@@ -166,11 +166,13 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
       [await fixedProject(root,{python,device,actor:kind==='actor'})];
     if(kind==='controller')scripted=await scriptedActor(root,instance);
     const curriculum={phase1:projects.map(project=>project.id),generation:{enabled:kind==='curriculum',
-      topics:['tiny-pytorch'],preprompt:'Construct only run(x)=x+1 for CPU float32 tensors with shapes (1,) and (17,). One independent reference, one wrong control, a verifier, and a straightforward PyTorch starter. No performance goal, device commands, kernel code, optimization, or additional topics.'}};
+      topics:['tiny-pytorch'],preprompt:'Construct only run(x)=x+1 for CPU float32 tensors with shapes (1,) and (17,). One independent reference, one wrong control, a verifier, and a straightforward PyTorch starter. No performance goal, device commands, kernel code, optimization, or additional topics. Keep only the two fixed tensor cases in the verifier, using torch tensors directly; no fixture JSON, loaders, benchmark or selftest framework. Submit as soon as the reference and wrong control are ready; the controller performs both CPU checks. The verifier loads answer.py from its current working directory, and computes expected x+1 independently. Use the same answer.py name in source, reference and wrong-control directories.'}};
     const settings={...fixture,python,target,projects,install:false,mode:'phase1',recovery:false,concurrency:1,
       actor:scripted?.actor??profile.actor,curriculum_actor:kind==='curriculum'?(profile.curriculum_actor??profile.actor):undefined,
       actor_seconds:300,curriculum_seconds:180,embedding_factory:'ascend_tools.fixture_embeddings:Embeddings',
-      environment:smokeEnvironment(profile.environment,target),local_execution:localExecution,curriculum,
+      environment:kind==='curriculum'?{module:'machinery/integrations/environments/index.mjs',
+        options:{mode:'local',env:{PATH:dirname(python)+':'+process.env.PATH}}}:smokeEnvironment(profile.environment,target),
+      local_execution:localExecution,curriculum,
       skillSettings:{background:false},...(kind==='curriculum'?{campaign_plan:[{id:'curriculum-smoke',phase:'phase1',
         new_projects:1,actor_seconds:300,generation:{topics:['tiny-pytorch'],requirements:{}}}]}:{})};
     delete settings.embeddings;
