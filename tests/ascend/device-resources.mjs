@@ -766,7 +766,7 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
 
 for(const stage of ['payload-observe','control-prepare','control-observe','admission-read'])
 test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
-  const f=await fixture(t),controls=new Set(),receipts=new Set();let payload,observations=0,aborted=0;
+  const f=await fixture(t),controls=new Set(),receipts=new Set();let payload,observations=0,aborted=0,blocking=true;
   const hang=signal=>{
     assert.ok(signal,'cleanup must pass its independent signal into every RPC');
     return new Promise((_,reject)=>{
@@ -775,10 +775,10 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
     });
   };
   const client=async(args,{signal}={})=>{
-    if(stage==='payload-observe'&&args[0]==='observe'&&args[1]===payload&&++observations>1)return hang(signal);
-    if(stage==='control-prepare'&&args[0]==='capabilities'&&f.commands.length)return hang(signal);
-    if(stage==='control-observe'&&args[0]==='observe'&&controls.has(args[1]))return hang(signal);
-    if(stage==='admission-read'&&args[0]==='download'&&[...receipts].some(path=>path===args[2]||path.endsWith('/'+args[2])))return hang(signal);
+    if(blocking&&stage==='payload-observe'&&args[0]==='observe'&&args[1]===payload&&++observations>1)return hang(signal);
+    if(blocking&&stage==='control-prepare'&&args[0]==='capabilities'&&f.commands.length)return hang(signal);
+    if(blocking&&stage==='control-observe'&&args[0]==='observe'&&controls.has(args[1]))return hang(signal);
+    if(blocking&&stage==='admission-read'&&args[0]==='download'&&[...receipts].some(path=>path===args[2]||path.endsWith('/'+args[2])))return hang(signal);
     const result=await f.context.client(args,{signal});
     if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')) {
       if(args.includes('--npu'))payload=result.handle;
@@ -801,4 +801,7 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
   assert.ok(retained.handles.includes(payload));
   for(const handle of controls)assert.ok(retained.handles.includes(handle));
+  blocking=false;
+  assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
+  assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
 });
