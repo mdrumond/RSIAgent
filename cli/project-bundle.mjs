@@ -68,28 +68,36 @@ export async function checkBundle(spec) {
     throw new Error('Trusted bundle dependency is not frozen: '+relative(root,file));
 }
 
-// Run from the relocated fixtures. Original-tree construction evidence cannot
-// prove that an imported bundle retained its executable dependency closure.
-export async function validateBundle(spec,instancePath,{signal,localExecution,checkpoint=()=>{}}={}) {
+// One elapsed allocation covers import I/O and CPU proof, including failure and
+// interruption before the first command can start.
+export async function withBundleBudget(spec,{signal,checkpoint=()=>{}}={},action) {
+  if(!spec.bundle)return action({signal});
+  const allocation=spec.bundle.seconds;
+  if(!Number.isFinite(allocation)||allocation<=0)throw new Error('Project bundle validation allocation exhausted');
+  const bounded=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)));
+  const active=signal?AbortSignal.any([signal,bounded]):bounded,started=performance.now();
+  const remaining=()=>Math.max(0,allocation-(performance.now()-started)/1000);
+  const save=()=>{spec.bundle={...spec.bundle,seconds:remaining()};checkpoint(spec.bundle.seconds);};
+  const timer=setInterval(save,250);let result;
+  try {active.throwIfAborted();result=await action({signal:active,remaining});active.throwIfAborted();return result;}
+  finally{clearInterval(timer);save();if(result?.bundle)result.bundle.seconds=spec.bundle.seconds;}
+}
+
+// Original-tree construction evidence cannot prove the imported dependency closure.
+export async function validateBundle(spec,instancePath,options={}) {
   if(!spec.bundle)return;
-  await checkBundle(spec);
+  if(!options.budget)return withBundleBudget(spec,options,budget=>validateBundle(spec,instancePath,{...options,budget}));
+  const {signal:active,remaining}=options.budget;
+  active.throwIfAborted();await checkBundle(spec);
   const unchanged=await freezeFiles(spec.verifier.files,spec.source,spec.verifier.hashes);
-  const bounded=AbortSignal.timeout(Math.max(1,Math.ceil(spec.bundle.seconds*1000)));
-  const active=signal?AbortSignal.any([signal,bounded]):bounded;
-  const started=performance.now(),allocation=spec.bundle.seconds;
-  const save=()=>{const remaining=Math.max(0,allocation-(performance.now()-started)/1000);
-    spec.bundle={...spec.bundle,seconds:remaining};checkpoint(remaining);};
-  const timer=setInterval(save,250);
-  try {
-    const environment=await createEnvironment({mode:'local',localExecution},{instancePath,signal:active,
-      exclude:async(_label,fn)=>fn(),event:()=>{}});
-    for(const [index,cwd] of [spec.bundle.reference,...spec.bundle.negative_controls].entries()) {
-      active.throwIfAborted();await unchanged();
-      const result=await environment.execute(spec.bundle.construction_command,cwd,{signal:active,
-        timeout:Math.max(.001,allocation-(performance.now()-started)/1000)});
-      active.throwIfAborted();await unchanged();
-      if(!result.settled||result.exitCode!==(index?1:0))
-        throw new Error('Imported bundle CPU '+(index?'negative control':'reference')+' failed: '+JSON.stringify({cwd,...result}));
-    }
-  }finally{clearInterval(timer);save();}
+  active.throwIfAborted();
+  const environment=await createEnvironment({mode:'local',localExecution:options.localExecution},{instancePath,signal:active,
+    exclude:async(_label,fn)=>fn(),event:()=>{}});
+  for(const [index,cwd] of [spec.bundle.reference,...spec.bundle.negative_controls].entries()) {
+    active.throwIfAborted();await unchanged();active.throwIfAborted();
+    const result=await environment.execute(spec.bundle.construction_command,cwd,{signal:active,timeout:Math.max(.001,remaining())});
+    active.throwIfAborted();await unchanged();
+    if(!result.settled||result.exitCode!==(index?1:0))
+      throw new Error('Imported bundle CPU '+(index?'negative control':'reference')+' failed: '+JSON.stringify({cwd,...result}));
+  }
 }

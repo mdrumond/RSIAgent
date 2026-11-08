@@ -11,7 +11,7 @@ import { State, validateAcceptance } from '../controller/state.mjs';
 import { syncCampaignPlan } from '../controller/progress.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
-import {checkBundle,validateBundle} from './project-bundle.mjs';
+import {checkBundle,validateBundle,withBundleBudget} from './project-bundle.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -19,8 +19,8 @@ export async function readConfig(root) {
   if (config.format !== 1) throw new Error('Unsupported instance; bootstrap a fresh instance');
   return {...config,root};
 }
-async function fileDigest(path) {
-  const digest=createHash('sha256');for await(const chunk of createReadStream(path))digest.update(chunk);return digest.digest('hex');
+async function fileDigest(path,{signal}={}) {
+  const digest=createHash('sha256');for await(const chunk of createReadStream(path,{signal}))digest.update(chunk);return digest.digest('hex');
 }
 async function initializationCopy(from,to,options={},retain=false) {
   const filter=options.filter;
@@ -271,16 +271,20 @@ export async function upgrade(root,machinery) {
   }
 }
 
-export async function importProject(root,spec,{continuing=false,signal,localExecution,checkpoint}={}) {
+export async function importProject(root,spec,options={}) {
+  return withBundleBudget(spec,options,budget=>importProjectFiles(root,spec,{...options,signal:budget.signal,budget}));
+}
+async function importProjectFiles(root,spec,{continuing=false,signal,localExecution,budget}={}) {
   validateAcceptance(spec);
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
-  await checkBundle(spec);
+  signal?.throwIfAborted();await checkBundle(spec);
   const source=await realpath(spec.source),files=spec.verifier.files;
-  const hash=fileDigest;
+  const hash=path=>fileDigest(path,{signal});
   const expected={};
   for(const file of files) {
+    signal?.throwIfAborted();
     const absolute=resolve(file),actual=await hash(absolute);
     if(spec.verifier.hashes&&spec.verifier.hashes[absolute]!==actual)throw new Error('Frozen verifier changed before import');
     expected[absolute]=actual;
@@ -289,22 +293,24 @@ export async function importProject(root,spec,{continuing=false,signal,localExec
   const own=join(resolve(root),'projects',spec.id);
   if(within(own,source) && files.every(path=>within(own,resolve(path)))) {
     const retained={...spec,verifier:{...spec.verifier,hashes:expected}};
-    await validateBundle(retained,join(own,'bundle-validation'),{signal,localExecution,checkpoint});return retained;
+    await validateBundle(retained,join(own,'bundle-validation'),{signal,localExecution,budget});return retained;
   }
   let common=spec.bundle?await realpath(spec.bundle.root):source;
   for(const path of files)while(!within(common,resolve(path)))common=dirname(common);
   const tree=join(own,continuing?'inputs-managed':'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
   const destination=join(tree,relative(common,source));
-  const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
+  const filter=path=>{signal?.throwIfAborted();return !['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');};
   await initializationCopy(source,destination,{recursive:true,verbatimSymlinks:true,filter},continuing);
-  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command,
-    construction_command:spec.bundle?.construction_command};
+  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
+  let construction_command=spec.bundle?.construction_command;
   const copied=[],hashes={};
   for(const path of files) {
+    signal?.throwIfAborted();
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
     await mkdir(dirname(target),{recursive:true});await cp(absolute,target,{force:!continuing});copied.push(target);
     if(await hash(target)!==expected[absolute])throw new Error('Frozen verifier changed during import');
     hashes[target]=expected[absolute];
+    if(construction_command)construction_command=construction_command.split(absolute).join(target);
     for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
   }
   for(const key of Object.keys(commands))if(commands[key]) {
@@ -312,13 +318,13 @@ export async function importProject(root,spec,{continuing=false,signal,localExec
     if(spec.bundle)commands[key]=commands[key].split(common+sep).join(relative(destination,tree)+sep);
   }
   const result={...spec,source:destination};
-  const {construction_command,...verifierCommands}=commands;
-  if(spec.verifier)result.verifier={...spec.verifier,...verifierCommands,files:copied,hashes};
+  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied,hashes};
   if(spec.bundle) {
+    construction_command=construction_command.split(common+sep).join(tree+sep);
     const relocate=path=>join(tree,relative(common,path));
     result.bundle={...spec.bundle,root:tree,reference:relocate(spec.bundle.reference),
       negative_controls:spec.bundle.negative_controls.map(relocate),construction_command};
-    await validateBundle(result,join(own,'bundle-validation'),{signal,localExecution,checkpoint});
+    await validateBundle(result,join(own,'bundle-validation'),{signal,localExecution,budget});
   }
   return result;
 }

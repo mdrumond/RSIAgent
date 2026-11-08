@@ -4,6 +4,9 @@ import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {mkdtemp,readFile,writeFile,rm,access} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
+import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+import {setTimeout as delay} from 'node:timers/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -17,7 +20,7 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false,nestedBundle=false,duplicateControl=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   const verifierContent=pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
@@ -46,6 +49,12 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       for(const call of plan)if(call[0]==='write')call[1].path='project/task/'+call[1].path;
       const proposal=plan.at(-1)[1];proposal.source='project/task/source';proposal.reference='project/task/reference';
       proposal.negative_controls=['project/task/negative',...Array.from({length:7},(_,i)=>`project/task/negative-${i+1}`)];proposal.verifier.files=['project/task/verify.py'];
+      if(unequalDepth) {
+        const starter=plan.find(call=>call[0]==='write'&&call[1].path==='project/task/source/answer.py');
+        starter[1].path='project/task/src/impl/answer.py';proposal.source='project/task/src/impl';
+        proposal.construction_command=`PYTHONPATH=. '${python}' '${join(root,'drafts',state.db.prepare('SELECT id FROM generation_drafts ORDER BY rowid DESC LIMIT 1').get().id,'project/task/verify.py')}'`;
+        proposal.verifier.command=proposal.construction_command;
+      }
     }
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
@@ -523,4 +532,35 @@ test('rejected imported closure is not reoffered and interrupted import retains 
   const rejected=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
   assert.equal(rejected.status,'invalid');
   assert.equal(f.state.db.prepare("SELECT COUNT(*) n FROM generation_drafts WHERE id=? AND json_extract(data,'$.status') IN ('draft','ready')").get(spec.id).n,0);
+});
+
+
+test('absolute construction paths retain meaning when source and trusted fixtures have unequal depths',async t=>{
+  const f=await fixture(t,{nestedBundle:true,unequalDepth:true});
+  const [spec]=await refillProjects(f.options);assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
+  const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
+  await rm(f.options.path,{recursive:true});
+  await validateBundle(imported,join(f.config.root,'unequal-proof'));
+  assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
+    error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
+});
+
+test('slow pre-CPU import hashing consumes and checkpoints the same elapsed allocation',async t=>{
+  const f=await fixture(t,{nestedBundle:true});const [spec]=await refillProjects(f.options);assert.ok(spec);
+  spec.bundle.seconds=.5;
+  const marker=join(f.config.root,'cpu-must-not-start');
+  spec.bundle.construction_command=`touch '${marker}'; `+spec.bundle.construction_command;
+  const original=fs.createReadStream,slowFile=spec.verifier.files[0];let delayed=false,hashing=false,checkpointDuringHash=false,saved;
+  t.mock.method(fs,'createReadStream',function(path,...args) {
+    if(path!==slowFile||delayed)return original(path,...args);
+    delayed=true;
+    return (async function*(){hashing=true;try{await delay(1000);for await(const chunk of original(path,...args))yield chunk;}finally{hashing=false;}})();
+  });
+  syncBuiltinESMExports();t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+  await assert.rejects(importProject(join(f.config.root,'slow'),spec,{checkpoint:seconds=>{
+    saved=seconds;checkpointDuringHash ||= hashing;checkpointGeneratedBundle(f.state,spec,seconds);
+  }}));
+  assert.equal(delayed,true);assert.equal(checkpointDuringHash,true);assert.equal(saved,0);
+  assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).spec.bundle.seconds,0);
+  await assert.rejects(access(marker),{code:'ENOENT'});
 });
