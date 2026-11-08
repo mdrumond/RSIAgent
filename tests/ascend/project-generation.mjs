@@ -78,7 +78,10 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     if(starterLayout) {
       for(const call of plan)if(call[0]==='write') {
         if(call[1].path.endsWith('/answer.py'))call[1].path=call[1].path.replace('/answer.py','/src/answer.py');
-        if(call[1].path==='verify.py')call[1].content=call[1].content.replace("sys.path.insert(0, '.')","sys.path.insert(0, 'src')");
+        if(call[1].path==='verify.py')call[1].content=call[1].content
+          .replace("sys.path.insert(0, '.')", "import importlib.util, pathlib\npath=pathlib.Path.cwd()/'src'/'answer.py'\nspec=importlib.util.spec_from_file_location('candidate',path)\nloaded=importlib.util.module_from_spec(spec);spec.loader.exec_module(loaded)")
+          .replace('import sys, pathlib, torch, answer','import sys, pathlib, torch\nanswer=loaded')
+          .replace('from answer import answer','answer=loaded.answer');
       }
       if(starterLayout==='mismatch')plan.at(-1)[1].source='source/src';
     }
