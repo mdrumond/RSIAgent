@@ -120,12 +120,15 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
 const supervisor = String.raw`import hashlib, json, os, signal, subprocess, sys, time
 c=json.loads(sys.argv[1]); os.makedirs(c['spool'],exist_ok=True)
 started=time.monotonic()
+outcome={'kind':'command'}
 def intact():
  try:
   return all(hashlib.sha256(open(path,'rb').read()).hexdigest()==digest for path,digest in c['verifiers'])
  except OSError: return False
 with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as err:
- if not intact(): err.write(b'Frozen verifier changed before execution\n'); code=125
+ if not intact():
+  err.write(b'Frozen verifier changed before execution\n'); code=125
+  outcome={'kind':'infrastructure','reason':'frozen-verifier-before'}
  else:
   p=subprocess.Popen(['bash','-c',c['command']],cwd=c['cwd'],env={**os.environ,**c['env']},stdout=out,stderr=err,start_new_session=True)
   def stop(*args):
@@ -133,12 +136,15 @@ with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as 
    except ProcessLookupError: pass
   signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
   try: code=p.wait(timeout=c['timeout'])
-  except subprocess.TimeoutExpired: stop(); p.wait(); code=124
+  except subprocess.TimeoutExpired:
+   stop(); p.wait(); code=124; outcome={'kind':'infrastructure','reason':'elapsed-timeout'}
   finally: stop()
-  if not intact(): err.write(b'Frozen verifier changed after execution\n'); code=125
+  if not intact():
+   err.write(b'Frozen verifier changed after execution\n'); code=125
+   outcome={'kind':'infrastructure','reason':'frozen-verifier-after'}
 with open(c['spool']+'/exit','w') as f: f.write(str(code))
 with open(c['spool']+'/timing.json.tmp','w') as f:
- json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey']},f); f.flush(); os.fsync(f.fileno())
+ json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey'],'outcome':outcome},f); f.flush(); os.fsync(f.fileno())
 os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
 sys.exit(code if code>=0 else 128-code)
 `;
@@ -205,7 +211,7 @@ export async function createEnvironment(options, context) {
     signal?.throwIfAborted();
     return nativeClient(args, {signal});
   };
-  const local = createLocalExecutionOperations(sdk,options.localExecution);
+  const local = createLocalExecutionOperations(sdk,options.localExecution,{signal:context.stopSignal});
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
@@ -213,7 +219,7 @@ export async function createEnvironment(options, context) {
   async function discoverCapabilities() {
     if(!capabilities) {
       const result=await client(['capabilities',options.target]);
-      if(result.state!=='available')throw new Error('CPL target unavailable');
+      if(result.state!=='available')throw closedSetupError('CPL target unavailable',{reason:result});
       capabilities=result;
     }
     return capabilities;
@@ -227,7 +233,7 @@ export async function createEnvironment(options, context) {
     if (remote && !handle.startsWith(`remote:${options.target}:`)) throw new Error('Handle belongs to another target');
     if (!remote && !/^local:exec-[A-Za-z0-9]+$/.test(handle)) throw new Error('Invalid local handle');
   };
-  async function localState(handle) {
+  async function localState(handle,{signal}={}) {
     check(handle);
     const dir = join(root, handle.slice(6));
     try {
@@ -236,9 +242,9 @@ export async function createEnvironment(options, context) {
       if(receipt.containment) {
         if(receipt.containment.closed) {
           let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
-          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{})};
+          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{}),...(receipt.outcome?{outcome:receipt.outcome}:{})};
         }
-        const state=await local.observe(receipt.containment.unit);
+        const state=await local.observe(receipt.containment.unit,{signal});
         return state.state==='stopped'?{state:'unknown'}:state;
       }
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
@@ -258,7 +264,8 @@ export async function createEnvironment(options, context) {
       }
       let exitCode;
       try { exitCode = Number(await readFile(join(dir, 'exit'), 'utf8')); } catch { /* interrupted wrapper */ }
-      return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}) };
+      return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+        ...(receipt.outcome?{outcome:receipt.outcome}:{}) };
     } catch { return { state: 'unknown' }; }
   }
   async function executionTiming(handle, signal) {
@@ -288,7 +295,8 @@ export async function createEnvironment(options, context) {
           await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir, signal));
           timing = await json(path);
         }
-        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0) return { executionSeconds: timing.executionSeconds };
+        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0)
+          return {executionSeconds:timing.executionSeconds,...(['command','infrastructure'].includes(timing.outcome?.kind)?{outcome:timing.outcome}:{})};
       } catch { /* terminal work without complete timing is not free work */ }
     }
     await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
@@ -298,7 +306,7 @@ export async function createEnvironment(options, context) {
     check(handle);
     let state;
     try {
-      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle);
+      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle,{signal});
       if (remote && state.state === 'stopped') {
         if(accountingExcluded === true)Object.assign(state,{executionSeconds:0,accountingExcluded:true});
         else if(state.executionSeconds === undefined)Object.assign(state, await executionTiming(handle, signal));
@@ -308,19 +316,19 @@ export async function createEnvironment(options, context) {
     await event('execution-state', { handle, ...state });
     return state;
   }
-  async function stop(handle, {accountingExcluded=false}={}) {
+  async function stop(handle, {accountingExcluded=false,signal:stopSignal=context.stopSignal}={}) {
     check(handle);
-    const signal = AbortSignal.timeout(5000);
+    const signal = stopSignal??AbortSignal.timeout(5000);
     if (remote) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
     } else {
       const receipt=await json(join(root,handle.slice(6),'execution.json'));
       if(receipt.containment) {
-        await local.stop(receipt.containment.unit);
+        await local.stop(receipt.containment.unit,{signal});
         await save(join(root,handle.slice(6),'execution.json'),{...receipt,containment:{...receipt.containment,closed:true}});
         return observe(handle,{accountingExcluded});
       }
-      const state = await localState(handle);
+      const state = await localState(handle,{signal});
       if (state.state === 'running') {
         try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
@@ -437,7 +445,7 @@ export async function createEnvironment(options, context) {
     return result;
   }
   async function execute(command, cwd, opts = {}) {
-    opts = {...opts, signal: context.signal && opts.signal
+    opts = {...opts,stopSignal:opts.stopSignal??context.stopSignal, signal: context.signal && opts.signal
       ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal};
     const signal = opts.signal;
     const started = performance.now();
@@ -463,16 +471,19 @@ export async function createEnvironment(options, context) {
           timeout:remaining(),onData:opts.onData??(()=>{}),
           onContainment:async containment=>save(join(dir,'execution.json'),{...receipt,containment})});
         await writeFile(join(dir,'exit'),String(result.exitCode));
+        await save(join(dir,'execution.json'),{...await json(join(dir,'execution.json')),
+          outcome:result.outcome});
       }
       catch (error) {
-        const state = await stop(handle);
+        const state = await stop(handle,{signal:opts.stopSignal});
         if (state.state !== 'stopped') throw new Error(`Local execution unresolved: ${handle}`, { cause: error });
-        return { handle, exitCode: state.exitCode ?? null, settled: true };
+        return {handle,exitCode:state.exitCode??null,settled:true,
+          outcome:{kind:'infrastructure',reason:'local-execution-interrupted'}};
       }
       const state = await localState(handle);
       if (state.state === 'running') await stop(handle);
       const final = await observe(handle);
-      return { handle, exitCode: final.exitCode ?? null, settled: final.state === 'stopped' };
+      return {handle,exitCode:final.exitCode??null,settled:final.state==='stopped',...(final.outcome?{outcome:final.outcome}:{})};
     }
     if (!projectRoot || !attemptRoot) throw new Error('Call prepare with project.sourceDirectory and attempt.id before remote execute');
     const subdir = relative(projectRoot, resolve(cwd ?? projectRoot));
@@ -563,8 +574,8 @@ export async function createEnvironment(options, context) {
     let state;
     for (;;) {
       const stopping = signal?.aborted || remaining() === 0;
-      state = stopping ? await stop(handle) : await observe(handle, {signal});
-      if (!stopping && signal?.aborted) state = await stop(handle);
+      state = stopping ? await stop(handle,{signal:opts.stopSignal}) : await observe(handle, {signal});
+      if (!stopping && signal?.aborted) state = await stop(handle,{signal:opts.stopSignal});
       if (state.state !== 'running') break;
       await delay(Math.min(options.pollMs ?? 250, (remaining() ?? 1) * 1000));
     }
@@ -582,6 +593,7 @@ export async function createEnvironment(options, context) {
       }
     }
     return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped',
+      ...(state.outcome?{outcome:state.outcome}:{}),
       ...(state.executionSeconds === undefined ? { accountingUnresolved: true } : { executionSeconds: state.executionSeconds }) };
   }
   // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
@@ -713,7 +725,8 @@ export async function createEnvironment(options, context) {
             remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
             sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
           await discoverCapabilities();
-          if ((await client(['preflight', options.target])).state !== 'completed') throw new Error('CPL preflight failed');
+          const preflight=await client(['preflight',options.target]);
+          if(preflight.state!=='completed')throw closedSetupError('CPL preflight failed',{reason:preflight});
           for (const file of frozen) await exclude('transfer', async () => {
             const dir = await mkdtemp(join(root, 'verifier-'));
             await transfer(['upload', options.target, file.local, file.remote], dir);

@@ -26,7 +26,7 @@ export class RecoveryQueue {
     this.db.exec(`CREATE TABLE IF NOT EXISTS recovery_queue (
       project TEXT PRIMARY KEY REFERENCES projects(id), origin TEXT NOT NULL REFERENCES attempts(id),
       failed_rounds INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL,
-      eligible_wave INTEGER NOT NULL, attempt TEXT REFERENCES attempts(id));
+      eligible_wave INTEGER NOT NULL, attempt TEXT REFERENCES attempts(id), retry_after REAL NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS recovery_attempts (
       attempt TEXT PRIMARY KEY REFERENCES attempts(id), project TEXT NOT NULL REFERENCES projects(id),
       kind TEXT NOT NULL, wave INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
@@ -35,6 +35,12 @@ export class RecoveryQueue {
       data TEXT NOT NULL, recorded INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS resource_leases (resource TEXT PRIMARY KEY NOT NULL,
       attempt TEXT NOT NULL UNIQUE REFERENCES attempts(id));`);
+    if(!this.db.prepare('PRAGMA table_info(recovery_queue)').all().some(column=>column.name==='retry_after'))
+      this.db.exec('ALTER TABLE recovery_queue ADD COLUMN retry_after REAL NOT NULL DEFAULT 0');
+  }
+  preactorInfrastructure(attempt) {
+    return !attempt.session&&this.state.queryEvents(attempt.id,{types:['preactor-infrastructure'],limit:1}).length>0&&
+      !this.state.queryEvents(attempt.id,{types:['project-invalid'],limit:1}).length;
   }
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE');
@@ -61,9 +67,10 @@ export class RecoveryQueue {
       const existing = this.entry(project.id);
       if (existing) return existing;
       if (!this.policy.recovery) return null;
-      this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave)
-        VALUES (?,?,'investigation',?)`).run(project.id, attemptId, wave + 1);
-      this.state.event(attemptId, 'recovery-scheduled', { kind: 'investigation', wave: wave + 1 });
+      const infrastructure=this.preactorInfrastructure(attempt),kind=infrastructure?'retry':'investigation';
+      this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave,retry_after)
+        VALUES (?,?,?,?,?)`).run(project.id,attemptId,kind,wave+1,infrastructure?Date.now()+30000:0);
+      this.state.event(attemptId, 'recovery-scheduled', {kind,wave:wave+1,infrastructure});
       return this.entry(project.id);
     });
   }
@@ -71,14 +78,14 @@ export class RecoveryQueue {
     this.wave(wave);
     if (!this.policy.recovery) return [];
     return this.db.prepare(`SELECT q.* FROM recovery_queue q JOIN projects p ON p.id=q.project
-      WHERE q.attempt IS NULL AND q.eligible_wave<=? AND p.frozen=0 AND p.status='failed'
+      WHERE q.attempt IS NULL AND q.eligible_wave<=? AND q.retry_after<=? AND p.frozen=0 AND p.status='failed'
       AND NOT EXISTS (SELECT 1 FROM recovery_lessons l JOIN attempts a ON a.id=l.attempt
         WHERE a.project=q.project AND l.recorded=0)
       AND NOT EXISTS (SELECT 1 FROM attempts a JOIN events e ON e.attempt=a.id
         WHERE a.project=q.project AND e.sequence=(SELECT MAX(last.sequence) FROM events last
           WHERE last.attempt=a.id AND last.type='failure-settlement')
         AND json_extract(e.data,'$.closed')!=1)
-      ORDER BY q.eligible_wave,q.project`).all(wave);
+      ORDER BY q.eligible_wave,q.project`).all(wave,Date.now());
   }
   claim(projectId, wave, owner = {}, resourceId) {
     this.wave(wave);
@@ -156,15 +163,18 @@ export class RecoveryQueue {
       this.db.prepare('UPDATE recovery_attempts SET completed=1 WHERE attempt=?').run(attemptId);
       const accepted = recovery.kind === 'retry' && passed;
       const retry = recovery.kind === 'investigation' && useful === true;
-      const failures = queue.failed_rounds + (accepted || retry ? 0 : 1);
-      const frozen = !accepted && failures >= this.limit;
+      const infrastructure=!passed&&this.preactorInfrastructure(attempt);
+      const invalid=!passed&&this.state.queryEvents(attemptId,{types:['project-invalid'],limit:1}).length>0;
+      const failures = queue.failed_rounds + (accepted || retry || infrastructure ? 0 : 1);
+      const frozen = !accepted && (invalid||failures >= this.limit);
       this.db.prepare('UPDATE projects SET status=?,frozen=? WHERE id=?')
         .run(accepted ? 'passed' : 'failed', frozen ? 1 : 0, recovery.project);
       if (accepted || frozen) {
         this.db.prepare('DELETE FROM recovery_queue WHERE project=?').run(recovery.project);
       } else {
-        this.db.prepare(`UPDATE recovery_queue SET failed_rounds=?,kind=?,eligible_wave=?,attempt=NULL
-          WHERE project=?`).run(failures, retry ? 'retry' : 'investigation', wave + 1, recovery.project);
+        this.db.prepare(`UPDATE recovery_queue SET failed_rounds=?,kind=?,eligible_wave=?,attempt=NULL,retry_after=?
+          WHERE project=?`).run(failures,retry||infrastructure?'retry':'investigation',wave+1,
+            infrastructure?Date.now()+30000:0,recovery.project);
       }
       const result = { accepted, frozen, failed_rounds: failures,
         next: accepted || frozen ? null : this.entry(recovery.project) };
@@ -211,10 +221,12 @@ export class RecoveryQueue {
         outcome, useful: useful === true, findings, evidence };
       this.db.prepare('INSERT INTO recovery_lessons(attempt,data) VALUES (?,?)').run(attemptId, JSON.stringify(lesson));
       const invalid=!passed&&this.state.queryEvents(attemptId,{types:['project-invalid'],limit:1}).length>0;
+      const infrastructure=!passed&&this.preactorInfrastructure(attempt);
       if(invalid)this.db.prepare('UPDATE projects SET frozen=1 WHERE id=?').run(attempt.project);
       if (!passed && !invalid && this.policy.recovery) {
-        this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave)
-          VALUES (?,?,'investigation',?)`).run(attempt.project, attemptId, wave + 1);
+        this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave,retry_after)
+          VALUES (?,?,?,?,?)`).run(attempt.project,attemptId,infrastructure?'retry':'investigation',wave+1,
+            infrastructure?Date.now()+30000:0);
       }
       const result = { accepted: passed, frozen: invalid, failed_rounds: 0,
         next: this.entry(attempt.project) ?? null };

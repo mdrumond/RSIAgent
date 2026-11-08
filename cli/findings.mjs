@@ -16,6 +16,14 @@ export async function findingsFor(options) {
   const events=state.queryEvents(job.attempt.id,{types:['verification','rejected','attempt-error','failure-recorded','stage-completed','curriculum-session','curriculum-interrupted'],order:'desc',limit:12}).reverse().map(({type,data})=>({type,data}));
   const evidence=join(path,'diagnostics.json'),content=JSON.stringify(events,null,2)+'\n';
   await writeFile(evidence,content);
+  const infrastructure=!state.attempt(job.attempt.id).session&&
+    state.queryEvents(job.attempt.id,{types:['preactor-infrastructure'],order:'desc',limit:1})[0];
+  if(infrastructure) {
+    const findings={findings:'Execution infrastructure failed before actor startup; no kernel verdict. '+
+      JSON.stringify(infrastructure.data).slice(0,3000),useful:false,
+      evidence:[infrastructure.data.evidence??{path:evidence,sha256:createHash('sha256').update(content).digest('hex')}]};
+    await writeFile(file,JSON.stringify(findings,null,2)+'\n',{mode:0o600});return findings;
+  }
   let findings;
   try {findings=await summarize(options);}
   catch(error) {

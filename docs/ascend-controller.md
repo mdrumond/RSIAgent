@@ -97,6 +97,16 @@ declared root and relative source/trusted-file layout also survive target stagin
 When the separate CPU construction command is omitted, its fallback uses the
 same frozen entrypoint with an absolute path so reference and negative-control
 directories may have different depths; import relocates that entrypoint too.
+
+Execution receipts retain an optional `outcome` with `kind: "infrastructure"`
+and a reason for frozen-file guards, resource containment and device admission
+refusals. Reserved exits 124–126 and signal exits are not baseline verdicts,
+including legacy receipts without this metadata. Before-actor infrastructure
+failures retain diagnostic evidence and use deterministic postprocessing, then
+retry directly after a 30-second cooldown without spending investigation tokens
+or unsuccessful recovery rounds. Positive execution settlement is still required;
+unknown work stays fenced. The cooldown survives controller restart and does not
+replace the campaign's elapsed stopping budget.
 CPU construction checks establish
 correctness only and do not execute that performance command. Optional
 `curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override

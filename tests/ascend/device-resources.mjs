@@ -763,3 +763,67 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
   const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
   for(const handle of controls)assert.ok(retained.handles.includes(handle));
 });
+
+for(const stage of ['payload-observe','control-prepare','control-observe','admission-read','upload-parent','transfer'])
+test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
+  const f=await fixture(t),controls=new Set(),parents=new Set(),receipts=new Set();
+  const heldTransfer='remote:fixture:transfer:held-cleanup-upload';
+  let payload,observations=0,aborted=0,blocking=true,freshCancellation=0;
+  const {createServer,connect}=await import('node:net'),sockets=new Set();
+  const server=createServer(socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));});
+  const hang=signal=>{
+    assert.ok(signal,'cleanup must pass its independent signal into every RPC');
+    return new Promise((_,reject)=>{
+      // A real open transport keeps the event loop alive, as a CPL request does.
+      const socket=connect(server.address().port,'127.0.0.1');socket.on('error',reject);
+      const stop=()=>{aborted++;socket.destroy();reject(signal.reason);};
+      if(signal.aborted)stop();else signal.addEventListener('abort',stop,{once:true});
+    });
+  };
+  const client=async(args,{signal}={})=>{
+    if(stage==='upload-parent'&&args[0]==='capabilities'&&f.commands.length)return {state:'available',backend:'ssh'};
+    if(blocking&&stage==='transfer'&&args[0]==='upload'&&f.commands.length)
+      return {state:'running',handle:heldTransfer};
+    if(blocking&&args[0]==='observe'&&(parents.has(args[1])||args[1]===heldTransfer))return hang(signal);
+    if(blocking&&args[0]==='cancel'&&(parents.has(args[1])||args[1]===heldTransfer)) {
+      freshCancellation++;return hang(signal);
+    }
+    if(blocking&&stage==='payload-observe'&&args[0]==='observe'&&args[1]===payload&&++observations>1)return hang(signal);
+    if(blocking&&stage==='control-prepare'&&args[0]==='capabilities'&&f.commands.length)return hang(signal);
+    if(blocking&&stage==='control-observe'&&args[0]==='observe'&&controls.has(args[1]))return hang(signal);
+    if(blocking&&stage==='admission-read'&&args[0]==='download'&&[...receipts].some(path=>path===args[2]||path.endsWith('/'+args[2])))return hang(signal);
+    const result=await f.context.client(args,{signal});
+    if(stage==='upload-parent'&&args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('upload-parent.sh'))parents.add(result.handle);
+    if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')) {
+      if(args.includes('--npu'))payload=result.handle;
+      else {
+        controls.add(result.handle);
+        const script=await readFile(args[args.indexOf('--file')+1],'utf8');
+        const configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+        receipts.add(configuration.env.RSI_LEASE_RECEIPT);
+      }
+    }
+    return result;
+  };
+  const environment=await createEnvironment({...f.options,probeObservationSeconds:1},{...f.context,client});
+  await environment.prepare({project:{source:f.source},attempt:{id:'bounded-cleanup'}});
+  const start=performance.now(),result=await environment.execute('payload-once',f.source,{timeout:5});
+  assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
+  assert.equal(freshCancellation,0,'cleanup cancellation must not start a fresh RPC budget after its deadline');
+  assert.ok(performance.now()-start<5000,'a hung cleanup must not receive fresh per-RPC observation windows');
+  assert.equal(f.commands.length,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+  const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
+  assert.ok(retained.handles.includes(payload));
+  for(const handle of controls)assert.ok(retained.handles.includes(handle));
+  for(const handle of parents)assert.ok(retained.handles.includes(handle));
+  if(stage==='transfer')assert.ok(retained.handles.includes(heldTransfer));
+  blocking=false;
+  if(stage==='admission-read') {
+    assert.ok(retained.submissions.some(row=>!row.closed&&!row.handle),'an interrupted unacknowledged transfer remains unknown');
+    assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
+  } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
+  assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
+});

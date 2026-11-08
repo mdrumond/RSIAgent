@@ -82,13 +82,15 @@ test('device-placement defect rejects construction before any model session and 
 });
 
 test('transport uncertainty and cancellation never mark a project baseline invalid',async t=>{
-  for(const mode of ['transport','unsettled','cancel','timeout','killed'])await t.test(mode,async t=>{
+  for(const mode of ['transport','unsettled','cancel','timeout','killed','refused','containment','health'])await t.test(mode,async t=>{
     const f=await fixture(t),abort=new AbortController();
     await assert.rejects(validateTargetBaseline({...f,signal:abort.signal,remaining:()=>60,
       register:async()=>{},checkVerifier:async()=>{},execute:async()=>{
         if(mode==='transport')throw new Error('Connection lost');
         if(mode==='cancel')abort.abort();
-        return {settled:mode!=='unsettled',exitCode:mode==='timeout'?124:mode==='killed'?137:1};
+        return {settled:mode!=='unsettled',exitCode:mode==='timeout'?124:mode==='killed'?137:
+          mode==='refused'?125:mode==='containment'?126:1,
+          ...(mode==='health'?{outcome:{kind:'infrastructure',reason:'device-health-refused'}}:{})};
       }}));
     assert.equal(f.state.events(f.attempt.id).some(e=>e.type==='project-invalid'),false);
     assert.equal(f.state.project('p').frozen,false);

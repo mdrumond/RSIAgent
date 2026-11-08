@@ -12,19 +12,19 @@ const counters=text=>Object.fromEntries(text.trim().split('\n').filter(Boolean).
 
 // Pi owns command execution, output streaming, cancellation and timeouts. The
 // operating system bounds its complete command cgroup, including detached children.
-export function createLocalExecutionOperations(sdk,limits) {
+export function createLocalExecutionOperations(sdk,limits,{signal:cleanupSignal}={}) {
   const pi=sdk.createLocalBashOperations();
   if(!limits)return pi;
   const {tasks=128,memory_bytes=4*1024**3}=limits;
   if(!Number.isSafeInteger(tasks)||tasks<4||!Number.isSafeInteger(memory_bytes)||memory_bytes<1024**2)
     throw Error('Positive local execution task and memory limits required');
-  const control=async command=>{
-    let output='';const result=await pi.exec(command,process.cwd(),{timeout:5,onData:chunk=>{output=(output+chunk).slice(-16384);}});
+  const control=async(command,{signal=cleanupSignal}={})=>{
+    let output='';const result=await pi.exec(command,process.cwd(),{timeout:5,signal,onData:chunk=>{output=(output+chunk).slice(-16384);}});
     return {...result,output};
   };
-  const observe=async unit=>{
+  const observe=async(unit,{signal=cleanupSignal}={})=>{
     if(!units.test(unit))throw Error('Owned command scope required');
-    const result=await control(`systemctl --user show ${quote(unit)} --property=LoadState --property=ActiveState --property=ControlGroup`);
+    const result=await control(`systemctl --user show ${quote(unit)} --property=LoadState --property=ActiveState --property=ControlGroup`,{signal});
     const properties=Object.fromEntries(result.output.trim().split('\n').filter(line=>line.includes('=')).map(line=>{
       const index=line.indexOf('=');return [line.slice(0,index),line.slice(index+1)];
     }));
@@ -32,13 +32,13 @@ export function createLocalExecutionOperations(sdk,limits) {
     if(result.exitCode!==0)return {state:'unknown'};
     return {state:['inactive','failed'].includes(properties.ActiveState)?'stopped':'running',cgroup:properties.ControlGroup};
   };
-  const stop=async unit=>{
+  const stop=async(unit,{signal=cleanupSignal}={})=>{
     if(!units.test(unit))throw Error('Owned command scope required');
     // A timeout/abort may have stopped systemd-run while its scope still has work.
-    await control(`systemctl --user kill --kill-whom=all --signal=KILL ${quote(unit)}; systemctl --user stop ${quote(unit)}`);
-    const result=await observe(unit);
+    await control(`systemctl --user kill --kill-whom=all --signal=KILL ${quote(unit)}; systemctl --user stop ${quote(unit)}`,{signal});
+    const result=await observe(unit,{signal});
     if(result.state!=='stopped')throw Error('Local command scope remains unresolved: '+unit);
-    await control(`systemctl --user reset-failed ${quote(unit)}`);
+    await control(`systemctl --user reset-failed ${quote(unit)}`,{signal});
     return result;
   };
   return {observe,stop,async exec(command,cwd,options) {
@@ -65,7 +65,7 @@ export function createLocalExecutionOperations(sdk,limits) {
           if(!group.startsWith('/')||!group.endsWith('/'+unit)||group.includes('..'))throw Error('Unexpected command cgroup');
           const denied=counters(await readFile('/sys/fs/cgroup'+group+'/pids.events','utf8')).max;
           const memory=counters(await readFile('/sys/fs/cgroup'+group+'/memory.events','utf8'));
-          if(denied>0||memory.oom_kill>0){violation=denied>0?'process':'memory';await stop(unit);abort.abort();break;}
+          if(denied>0||memory.oom_kill>0){violation=denied>0?'process':'memory';await stop(unit,{signal:options.stopSignal});abort.abort();break;}
         }catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;}
         await delay(25);
       }
@@ -74,18 +74,20 @@ export function createLocalExecutionOperations(sdk,limits) {
         if(events['pids.max']>0)violation='process';else if(events['memory.oom_kill']>0)violation='memory';
       }catch(error){if(error.code!=='ENOENT')throw error;}
       if(!violation&&result?.exitCode!==0) {
-        const status=await control(`systemctl --user show ${quote(unit)} --property=Result --value`);
+        const status=await control(`systemctl --user show ${quote(unit)} --property=Result --value`,{signal:options.stopSignal});
         if(status.output.trim()==='oom-kill')violation='memory';
       }
     }finally {
       try {
-        try{await stop(unit);}finally{abort.abort();await execution;}
+        try{await stop(unit,{signal:options.stopSignal});}finally{abort.abort();await execution;}
         await options.onContainment?.({unit,closed:true});
       }finally{await rm(directory,{recursive:true,force:true});}
     }
-    if(violation){options.onData(Buffer.from(`Command exceeded its ${violation} limit; all descendants were terminated. Fix the command and retry within the remaining allocation.\n`));return {exitCode:125};}
+    if(violation){options.onData(Buffer.from(`Command exceeded its ${violation} limit; all descendants were terminated. Fix the command and retry within the remaining allocation.\n`));
+      return {exitCode:125,outcome:{kind:'infrastructure',reason:violation+'-limit'}};}
     if(failure)throw failure;
-    if(result.exitCode!==0&&!group)options.onData(Buffer.from('Local command containment could not start; no uncontained fallback was executed.\n'));
+    if(result.exitCode!==0&&!group){options.onData(Buffer.from('Local command containment could not start; no uncontained fallback was executed.\n'));
+      return {...result,outcome:{kind:'infrastructure',reason:'containment-unavailable'}};}
     return result;
   }};
 }
