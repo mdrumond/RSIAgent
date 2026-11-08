@@ -68,6 +68,27 @@ async function save(path, value) {
 }
 
 // Only the installed public CLI owns remote protocols and credentials.
+function nativeFailureDiagnostic(stderr) {
+  // Native stderr can contain routes, usernames or credentials. Persist only
+  // recognised failure categories, never the native text itself.
+  const categories = [
+    ['connection-reset', /connection reset|broken pipe/i],
+    ['connection-refused', /connection refused/i],
+    ['connection-timeout', /connection timed out|operation timed out|timeout in data send/i],
+    ['connection-closed', /connection closed|connection unexpectedly closed/i],
+    ['authentication-failed', /permission denied.*publickey|authentication failed/i],
+    ['host-key-failed', /host key verification failed|remote host identification has changed/i],
+    ['name-resolution-failed', /could not resolve hostname|name or service not known/i],
+    ['remote-tool-missing', /rsync.*(?:command not found|not found)/i],
+    ['rsync-protocol-error', /protocol version mismatch|protocol incompatibility/i],
+    ['remote-path-missing', /no such file or directory/i],
+    ['remote-permission-denied', /permission denied/i],
+    ['remote-storage-full', /no space left on device|disk quota exceeded/i],
+  ].filter(([, pattern]) => pattern.test(stderr)).map(([category]) => category);
+  const rsyncCode = stderr.match(/rsync error:[^\n]*\(code (\d+)\)/i);
+  return {categories: categories.length ? categories : ['native-error-output'],
+    ...(rsyncCode ? {rsyncExit:Number(rsyncCode[1])} : {})};
+}
 export function createCplClient(executable = join(homedir(), '.agents/skills/remote-access/scripts/cpl-remote')) {
   return async (args,{signal}={}) => {
     await readFile(join(homedir(), '.agents/skills/remote-access/SKILL.md'), 'utf8');
@@ -75,11 +96,20 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
       const child = spawn(executable, ['--json', ...args], { stdio: ['ignore', 'pipe', 'pipe'],signal });
       let output = '', error = '';
       child.stdout.on('data', data => { output += data; });
-      child.stderr.on('data', data => { error += data; });
+      child.stderr.on('data', data => { error = (error + data).slice(-16384); });
       child.on('error', reject);
       child.on('close', code => {
-        try { resolve(JSON.parse(output)); }
-        catch { reject(new Error(`CPL ${args[0]} failed (${code}): ${error}`)); }
+        try {
+          const result = JSON.parse(output);
+          if (error && (code !== 0 || result.state === 'failed'))
+            result.diagnostic = nativeFailureDiagnostic(error);
+          resolve(result);
+        }
+        catch {
+          const diagnostic = nativeFailureDiagnostic(error);
+          reject(Object.assign(new Error(`CPL ${args[0]} failed (${code}): ${diagnostic.categories.join(', ')}`),
+            {diagnostic}));
+        }
       });
     });
   };
