@@ -25,6 +25,10 @@ const quote=text=>"'"+text.replaceAll("'","'\\''")+"'";
 export const candidate="def run(x):\n    print('hello', x.device, flush=True)\n    return x + 1\n";
 const reference='def run(x):\n    return x + 1\n';
 
+export function smokeEnvironment(environment,target) {
+  return target==='cpu'?environment:{...environment,options:{...environment.options,profile:target}};
+}
+
 export async function fixedProject(root,{python='python3',device='npu:0',actor=false}={}) {
   const bundle=join(root,'planned'),source=join(bundle,'work/items/source');
   const trusted=join(bundle,'trusted'),verifier=join(trusted,'checks/verify.py');
@@ -166,7 +170,7 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     const settings={...fixture,python,target,projects,install:false,mode:'phase1',recovery:false,concurrency:1,
       actor:scripted?.actor??profile.actor,curriculum_actor:kind==='curriculum'?(profile.curriculum_actor??profile.actor):undefined,
       actor_seconds:300,curriculum_seconds:180,embedding_factory:'ascend_tools.fixture_embeddings:Embeddings',
-      environment:profile.environment,local_execution:localExecution,curriculum,
+      environment:smokeEnvironment(profile.environment,target),local_execution:localExecution,curriculum,
       skillSettings:{background:false},...(kind==='curriculum'?{campaign_plan:[{id:'curriculum-smoke',phase:'phase1',
         new_projects:1,actor_seconds:300,generation:{topics:['tiny-pytorch'],requirements:{}}}]}:{})};
     delete settings.embeddings;
