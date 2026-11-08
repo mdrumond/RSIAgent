@@ -14,6 +14,7 @@ import {runAttempt} from '../../controller/pi.mjs';
 import {validateTargetBaseline} from '../../controller/baseline-preflight.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
+import {reconcileFailure} from '../../controller/lifecycle.mjs';
 
 const exec=promisify(execFile);
 async function fixture(t) {
@@ -47,7 +48,7 @@ test('successful baseline opens an actor session and a resumed gate does not rep
     id:'scripted',name:'Baseline fixture',api:'openai-completions',reasoning:false,input:['text'],
     contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
   await runtime.setRuntimeApiKey('baseline-fixture','fixture');
-  await runAttempt({...f,skillMap:{},environmentFactory:async()=>({instructions:'fixture',
+  await runAttempt({...f,skillMap:{},knowledge:{search:async()=>({content:[],evidence:[]})},environmentFactory:async()=>({instructions:'fixture',
     prepare:async()=>{},execute:async()=>{checks++;return {settled:true,exitCode:0};}}),
     modelRuntime:runtime,model:runtime.getModel('baseline-fixture','scripted')});
   assert.equal(checks,1);assert.equal(requests,1);assert.ok(f.state.attempt(f.attempt.id).session);
@@ -68,6 +69,7 @@ test('device-placement defect rejects construction before any model session and 
   assert.equal(f.state.events(f.attempt.id).some(e=>e.type==='project-invalid'),true);
   assert.equal(f.state.events(f.attempt.id).some(e=>e.type==='execution-settled'),true);
   f.state.finish(f.attempt.id,'failed');
+  assert.equal(await reconcileFailure(f.state,f.attempt.id,{observe:async()=>({state:'stopped'})}),true);
   // A deliberately unusable provider proves postprocessing uses the native
   // verdict/evidence directly instead of spending a summary/investigation call.
   const findings=await findingsFor({state:f.state,job:{attempt:f.attempt,kind:'original'},path:f.attemptPath,
