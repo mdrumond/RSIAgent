@@ -337,8 +337,11 @@ export async function createEnvironment(options, context) {
       physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
   }
   let reconciling, retryFailedControl=false;
-  async function reconcileClosedPayload(signal) {
+  async function reconcileClosedPayload() {
     const deadline=performance.now()+observationSeconds*1000;
+    // Payload closure is already positive. Cancellation must not cancel the
+    // token-scoped cleanup that proves its host fence can be released.
+    const signal=AbortSignal.timeout(observationSeconds*1000);
     do {
       signal?.throwIfAborted();
       retryFailedControl=false;
@@ -553,7 +556,7 @@ export async function createEnvironment(options, context) {
             await releaseLease(lease);
           } else {
             activeLease=null;
-            if(!await reconcileClosedPayload(signal))return {...result,settled:false,admissionUnknown:true};
+            if(!await reconcileClosedPayload())return {...result,settled:false,admissionUnknown:true};
           }
           if(admission.decision==='contended'){
             await waitForDevice();

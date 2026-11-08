@@ -155,6 +155,19 @@ test('STOP closes native local work; fresh binding observes the same handle with
   assert.ok(bound.events.some(e=>e.type==='resource-probe-completed'&&e.data.accountingExcluded&&e.data.executionSeconds===0));
 });
 
+test('native last-moment health refusal returns infrastructure125 without executing the candidate',async t=>{
+  const f=await fixture(t),bound=await f.bind(),event=bound.context.event;
+  bound.context.event=async(type,data)=>{
+    await event(type,data);
+    if(type==='execution-handle'&&!data.purpose){f.rows[0].busy=true;await f.update();}
+  };
+  const result=await bound.environment.execute('touch forbidden-payload',f.source,{timeout:10});
+  assert.equal(result.settled,true);assert.equal(result.exitCode,125);
+  assert.equal(result.admission.decision,'health-refused');
+  assert.deepEqual(result.outcome,{kind:'infrastructure',reason:'device-health-refused'});
+  assert.equal(await exists(join(f.source,'forbidden-payload')),false);
+});
+
 test('local pending probe without native identity stays held on restart, never redispatched',async t=>{
   const f=await fixture(t),bound=await f.bind();
   const {readdir}=await import('node:fs/promises');const root=join(bound.path,'.ascend-resources');
