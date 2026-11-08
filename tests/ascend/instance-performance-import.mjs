@@ -15,9 +15,10 @@ for(const mode of ['absolute','relative'])test(`performance project import: ${mo
     await writeFile(join(source,'answer.py'),'answer=42\n');
     const files=[join(checks,'numeric.py'),join(checks,'performance.py')];
     for(const file of files)await writeFile(file,"import runpy,sys\nvalue=runpy.run_path(sys.argv[1])['answer']\nassert value==42\nprint(value)\n");
+    const python="'"+(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3').replaceAll("'","'\\''")+"'";
     const command=index=>mode==='absolute'
-      ? `python3.12 '${files[index]}' '${join(source,'answer.py')}'`
-      : `python3.12 ../checks/${index?'performance':'numeric'}.py answer.py`;
+      ? `${python} '${files[index]}' '${join(source,'answer.py')}'`
+      : `${python} ../checks/${index?'performance':'numeric'}.py answer.py`;
     const spec={id:'p',source,goal:'correct answer',actor_seconds:30,performance_goal:'trusted frozen check',
       verifier:{files,command:command(0),performance_command:command(1)}};
     const instance=join(root,'instance');

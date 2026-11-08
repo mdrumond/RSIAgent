@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
-import {mkdtemp,readFile,rm,access} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,rm,access} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
+import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+import {setTimeout as delay} from 'node:timers/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -11,13 +14,17 @@ import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
 import {State} from '../../controller/state.mjs';
 import {campaignProgress} from '../../controller/progress.mjs';
 import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
-import {refillPhase1,refillProjects,generationEventState} from '../../cli/project-generation.mjs';
+import {importProject} from '../../cli/instance.mjs';
+import {validateBundle} from '../../cli/project-bundle.mjs';
+import {createEnvironment} from '../../integrations/environments/index.mjs';
+import {target} from './resilience/fixtures.mjs';
+import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   const verifierContent=pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
-    badVerifier?'pass\n':`from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+    badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
   const python=pytorch?(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3'):'python3';
   const cpuCommand=`PYTHONPATH=. '${python.replaceAll("'","'\\''")}' ../verify.py`;
   const requests=[];
@@ -34,6 +41,22 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       ['submit_project',{goal,...(performanceGoal!==undefined?{performance_goal:performanceGoal}:{}),source:'source',reference:'reference',negative_controls:['negative'],
         verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),command:pytorch?cpuCommand+' --target':separateCommand?'requires-device-runtime':cpuCommand},
         ...(separateCommand||pytorch?{construction_command:cpuCommand}:{})}]];
+    if(nestedBundle) {
+      plan.splice(4,0,['write',{path:'helper.py',content:'factor=2\n'}],
+        ['write',{path:'reference/metadata.json',content:'trusted'}],['write',{path:'negative/metadata.json',content:'wrong'}]);
+      for(let i=1;i<8;i++)plan.splice(plan.length-1,0,['write',{path:`negative-${i}/answer.py`,content:'answer=0\n'}],
+        ['write',{path:`negative-${i}/metadata.json`,content:'wrong'}]);
+      for(const call of plan)if(call[0]==='write')call[1].path='project/task/'+call[1].path;
+      const proposal=plan.at(-1)[1];proposal.source='project/task/source';proposal.reference='project/task/reference';
+      proposal.negative_controls=['project/task/negative',...Array.from({length:7},(_,i)=>`project/task/negative-${i+1}`)];proposal.verifier.files=['project/task/verify.py'];
+      if(unequalDepth) {
+        const starter=plan.find(call=>call[0]==='write'&&call[1].path==='project/task/source/answer.py');
+        starter[1].path='project/task/src/impl/answer.py';proposal.source='project/task/src/impl';
+        proposal.construction_command=`PYTHONPATH=. '${python}' '${join(root,'drafts',state.db.prepare('SELECT id FROM generation_drafts ORDER BY rowid DESC LIMIT 1').get().id,'project/task/verify.py')}'`;
+        proposal.verifier.command=proposal.construction_command;
+      }
+    }
+    if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
     if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
       ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
@@ -48,7 +71,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
   t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
   const key='GENERATION_FIXTURE_KEY';process.env[key]='fixture';t.after(()=>delete process.env[key]);
   // ARM Torch startup is paid by each independent construction process.
-  const config={root,mode:'phase1',actor_seconds:60,curriculum_seconds:pytorch?120:20,
+  const config={root,mode:'phase1',actor_seconds:60,curriculum_seconds:pytorch||nestedBundle?120:20,
     curriculum:{phase1:['supplied'],generation:{enabled:true,topics:['arithmetic'],preprompt:'Construct CPU fixtures'}},
     actor:{provider:'generation-fixture',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,
       metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
@@ -444,4 +467,100 @@ test('old ready phase1 drafts are returned without replacement or budget reset, 
   const planned=await refillProjects(f.options);
   assert.equal(planned.length,1);assert.ok(!specs.some(s=>s.id===planned[0].id));
   for(const spec of specs)assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).phase,undefined);
+});
+
+
+test('generated immutable bundle survives JSON export, import and actual CPU staging without its original tree',async t=>{
+  const f=await fixture(t,{nestedBundle:true});
+  const [generated]=await refillProjects(f.options);assert.ok(generated);
+  const draft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(generated.id).data);
+  assert.equal(generated.bundle.seconds,draft.seconds-draft.elapsed);
+  const exported=join(f.config.root,'export.json');await writeFile(exported,JSON.stringify(generated));
+  const imported=await importProject(join(f.config.root,'instance'),JSON.parse(await readFile(exported,'utf8')));
+  assert.ok(imported.bundle.seconds<generated.bundle.seconds);
+  assert.ok(imported.verifier.files.some(path=>path.endsWith('/helper.py')));
+  assert.ok(imported.verifier.files.some(path=>path.endsWith('/reference/metadata.json')));
+  assert.ok(imported.verifier.files.some(path=>path.endsWith('/negative/metadata.json')));
+  await rm(f.options.path,{recursive:true});
+  await validateBundle(imported,join(f.config.root,'roundtrip-proof'));
+  const backendRoot=await mkdtemp(join(tmpdir(),'bundle-target-')),backend=await target({root:backendRoot});
+  t.after(async()=>{try{await backend.close();}finally{await rm(backendRoot,{recursive:true,force:true});}});
+  const environment=await createEnvironment({mode:'cpl',target:'fixture',runtime:'cpu',workspacePath:backend.workspace,
+    remoteDirectory:'owned',pollMs:1},{instancePath:join(f.config.root,'staging'),client:backend.client,
+    exclude:async(_label,fn)=>fn(),event:()=>{}});
+  await environment.prepare({project:imported,attempt:{id:'roundtrip'}});
+  for(const [directory,exitCode] of [['reference',0],['negative',1],...Array.from({length:7},(_,i)=>[`negative-${i+1}`,1])]) {
+    const result=await environment.execute(`cd ../${directory} && ${imported.bundle.construction_command}`,imported.source,{timeout:20});
+    assert.equal(result.settled,true);assert.equal(result.exitCode,exitCode);
+  }
+  assert.ok([...backend.jobs.values()].every(job=>job.state==='completed'));
+});
+
+test('import rejects missing manifested dependencies and CPU checks reject an omitted helper before admission',async t=>{
+  const f=await fixture(t,{nestedBundle:true});const [spec]=await refillProjects(f.options);assert.ok(spec);
+  const helper=spec.verifier.files.find(path=>path.endsWith('/helper.py'));
+  const omitted={...spec,verifier:{...spec.verifier,files:spec.verifier.files.filter(path=>path!==helper)}};
+  await assert.rejects(importProject(join(f.config.root,'omitted'),omitted),/Imported bundle CPU reference failed/);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
+  await rm(helper);
+  await assert.rejects(importProject(join(f.config.root,'missing'),spec),{code:'ENOENT'});
+});
+
+
+test('duplicate negative fixture identities reject generation instead of counting as distinct controls',async t=>{
+  const f=await fixture(t,{duplicateControl:true});
+  assert.deepEqual(await refillProjects(f.options),[]);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
+  const draft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts').get().data);
+  assert.equal(draft.status,'invalid');
+});
+
+test('rejected imported closure is not reoffered and interrupted import retains its elapsed allocation',async t=>{
+  const f=await fixture(t,{nestedBundle:true});const [spec]=await refillProjects(f.options);
+  const remaining=spec.bundle.seconds;
+  spec.bundle.construction_command='sleep 1; '+spec.bundle.construction_command;
+  const interrupted=new AbortController();let saved;
+  await assert.rejects(importProject(join(f.config.root,'interrupted'),spec,{signal:interrupted.signal,
+    checkpoint:seconds=>{saved=seconds;checkpointGeneratedBundle(f.state,spec,seconds);interrupted.abort();}}));
+  assert.ok(saved<remaining);
+  const savedDraft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
+  assert.equal(savedDraft.spec.bundle.seconds,saved);
+  const resumed=(await refillProjects(f.options)).find(candidate=>candidate.id===spec.id);
+  assert.equal(resumed.bundle.seconds,saved);
+  assert.ok(savedDraft.elapsed>=savedDraft.seconds-saved);
+  rejectGeneratedProject(f.state,spec,new Error('Imported bundle CPU reference failed'));
+  const rejected=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
+  assert.equal(rejected.status,'invalid');
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) n FROM generation_drafts WHERE id=? AND json_extract(data,'$.status') IN ('draft','ready')").get(spec.id).n,0);
+});
+
+
+test('absolute construction paths retain meaning when source and trusted fixtures have unequal depths',async t=>{
+  const f=await fixture(t,{nestedBundle:true,unequalDepth:true});
+  const [spec]=await refillProjects(f.options);assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
+  const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
+  await rm(f.options.path,{recursive:true});
+  await validateBundle(imported,join(f.config.root,'unequal-proof'));
+  assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
+    error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
+});
+
+test('slow pre-CPU import hashing consumes and checkpoints the same elapsed allocation',async t=>{
+  const f=await fixture(t,{nestedBundle:true});const [spec]=await refillProjects(f.options);assert.ok(spec);
+  spec.bundle.seconds=.5;
+  const marker=join(f.config.root,'cpu-must-not-start');
+  spec.bundle.construction_command=`touch '${marker}'; `+spec.bundle.construction_command;
+  const original=fs.createReadStream,slowFile=spec.verifier.files[0];let delayed=false,hashing=false,checkpointDuringHash=false,saved;
+  t.mock.method(fs,'createReadStream',function(path,...args) {
+    if(path!==slowFile||delayed)return original(path,...args);
+    delayed=true;
+    return (async function*(){hashing=true;try{await delay(1000);for await(const chunk of original(path,...args))yield chunk;}finally{hashing=false;}})();
+  });
+  syncBuiltinESMExports();t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+  await assert.rejects(importProject(join(f.config.root,'slow'),spec,{checkpoint:seconds=>{
+    saved=seconds;checkpointDuringHash ||= hashing;checkpointGeneratedBundle(f.state,spec,seconds);
+  }}));
+  assert.equal(delayed,true);assert.equal(checkpointDuringHash,true);assert.equal(saved,0);
+  assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).spec.bundle.seconds,0);
+  await assert.rejects(access(marker),{code:'ENOENT'});
 });

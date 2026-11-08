@@ -1,6 +1,6 @@
 import { Type } from 'typebox';
-import { randomUUID, createHash } from 'node:crypto';
-import { mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, realpath, stat } from 'node:fs/promises';
 import { writeSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { validateAcceptance } from '../controller/state.mjs';
@@ -8,6 +8,7 @@ import { currentCampaignEntry, generationSettings } from '../controller/progress
 import { curriculumSession } from './curriculum.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
+import {projectBundle,bundleHashes} from './project-bundle.mjs';
 
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
@@ -145,7 +146,11 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
     const root=join(resolve(path),d.id);await mkdir(root,{recursive:true});
     const started=performance.now(),prior=d.elapsed??0;
     const spent=()=>prior+(performance.now()-started)/1000;
-    const checkpoint=()=>{d.elapsed=spent();store.save(d);};
+    const checkpoint=()=>{
+      d.elapsed=spent();
+      if(d.status==='ready'&&d.spec.bundle)d.spec.bundle.seconds=Math.max(0,d.seconds-d.elapsed);
+      store.save(d);
+    };
     if(prior>=d.seconds){d.status='exhausted';store.save(d);if(quota)reserve(d.topic,-1);continue;}
     const bounded=AbortSignal.timeout(Math.max(1,Math.ceil((d.seconds-prior)*1000)));
     const active=signal?AbortSignal.any([signal,bounded]):bounded;
@@ -161,6 +166,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           (requirements.capabilityEvidence?`SIMT is the actor's optimization objective. Specify deferred target acceptance that requires actual supported ${config.kernel_language??'target'} SIMT APIs/compiler mapping and comparison against an equivalent non-SIMT/vector baseline on an isolated device. Do not implement or benchmark either device kernel during curriculum construction. CPU construction cannot establish SIMT or timing evidence.\n`:'')+
           `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
           `Use the existing KDB tools and baseline skills at ${join(config.root,'skills','versions',config.skills?.activeVersion??'baseline')}.\n`+
+          `Keep the complete project in one dedicated subdirectory, including all verifier helpers, reference data and negative controls, so it can be imported and staged independently of this generation session. List any dependencies outside that project subdirectory explicitly in verifier.files. `+
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
           `Create an independent verifier outside those trees. Its command runs from editable source for actual target acceptance. `+
           (phase==='phase1'?`Keep target acceptance separate from CPU specification validation: an unchanged PyTorch starter must not satisfy the target kernel goal. Provide the target correctness/performance commands for the actor to run later; do not probe target APIs, compile kernels, submit remote jobs or collect device timings to construct this specification.\n`:'')+
@@ -176,9 +182,11 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                 throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
               validateAcceptance(p);
               const artifacts=await checkProposal(root,p);
+              const packaged=await projectBundle(artifacts,p.construction_command??p.verifier.command,d.seconds,await realpath(root));
+              artifacts.files=packaged.files;
               const env=await createEnvironment({mode:'local',localExecution:config.local_execution},{instancePath:root,signal:active,
                 exclude:async(_label,fn)=>fn(),event:(type,data)=>store.adapter.event(d.id,type,data)});
-              const hashFiles=async()=>Object.fromEntries(await Promise.all(artifacts.files.map(async f=>[f,createHash('sha256').update(await readFile(f)).digest('hex')])));
+              const hashFiles=()=>bundleHashes(artifacts.files);
               const hashes=await hashFiles();
               await mkdir(join(root,'construction'),{recursive:true});
               for(const [index,cwd] of [artifacts.reference,...artifacts.negatives].entries()) {
@@ -200,6 +208,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               active.throwIfAborted();
               d.spec={id:d.id,phase:d.phase,...(d.campaign_entry?{campaign_entry:d.campaign_entry}:{}),goal:p.goal,source:artifacts.source,actor_seconds:config.actor_seconds,
                 target:config.target,...(p.performance_goal!=null?{performance_goal:p.performance_goal}:{}),
+                bundle:{...packaged.bundle,seconds:Math.max(.001,d.seconds-spent())},
                 verifier:{files:artifacts.files,command:p.verifier.command,hashes,
                   ...(p.verifier.performance_command!==undefined?{performance_command:p.verifier.performance_command}:{})},
                 generation:{draft:d.id,topic:d.topic,requirements,checks}};
@@ -224,3 +233,20 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
 
 // Retain the existing entry point for callers; phase selection is shared.
 export const refillPhase1=refillProjects;
+
+// An incomplete imported closure is a rejected specification, not permission to
+// retry the same ready draft with a fresh validation allocation every refill.
+export function rejectGeneratedProject(state,spec,error) {
+  const row=state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.generation?.draft);
+  if(!row)return;
+  const draft=JSON.parse(row.data);draft.status='invalid';draft.error=error.message;
+  state.db.prepare('UPDATE generation_drafts SET data=? WHERE id=?').run(JSON.stringify(draft),draft.id);
+}
+
+export function checkpointGeneratedBundle(state,spec,seconds) {
+  const row=state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.generation?.draft);
+  if(!row)return;
+  const draft=JSON.parse(row.data);
+  draft.spec.bundle.seconds=seconds;draft.elapsed=Math.max(draft.elapsed,draft.seconds-seconds);
+  state.db.prepare('UPDATE generation_drafts SET data=? WHERE id=?').run(JSON.stringify(draft),draft.id);
+}

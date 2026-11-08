@@ -384,7 +384,13 @@ export async function operate(command,config,options={}) {
               backgroundAbort.signal.throwIfAborted();
               if(generationConfig.campaign_plan&&currentCampaignEntry(state,generationConfig)?.id!==spec.campaign_entry)break;
               if(state.project(spec.id))continue;
-              const imported=await importProject(config.root,spec);
+              let imported;const packaging=await import('./project-generation.mjs');
+              try{imported=await importProject(config.root,spec,{signal:backgroundAbort.signal,localExecution:config.local_execution,
+                checkpoint:seconds=>packaging.checkpointGeneratedBundle(state,spec,seconds)});}
+              catch(error){
+                if(!backgroundAbort.signal.aborted)packaging.rejectGeneratedProject(state,spec,error);
+                throw error;
+              }
               await updateConfig(config.root,(current,ledger)=>{
                 if(!ledger.project(imported.id))ledger.add(imported);
                 return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
