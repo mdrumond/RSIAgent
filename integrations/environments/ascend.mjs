@@ -560,7 +560,8 @@ export async function createEnvironment(options, context) {
             await exclude('queue-wait',()=>delay(options.leasePollMs??250,undefined,{signal}));
             continue;
           }
-          return {...result,admission};
+          return {...result,admission,...(admission.decision==='admitted'?{}:
+            {outcome:{kind:'infrastructure',reason:'device-'+admission.decision}})};
         } catch (error) {
           // Even known native closure requires target-fence reconciliation.
           if(error.closure?.closed){activeLease=null;await reconcileLease();}

@@ -120,12 +120,15 @@ export function createCplClient(executable = join(homedir(), '.agents/skills/rem
 const supervisor = String.raw`import hashlib, json, os, signal, subprocess, sys, time
 c=json.loads(sys.argv[1]); os.makedirs(c['spool'],exist_ok=True)
 started=time.monotonic()
+outcome={'kind':'command'}
 def intact():
  try:
   return all(hashlib.sha256(open(path,'rb').read()).hexdigest()==digest for path,digest in c['verifiers'])
  except OSError: return False
 with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as err:
- if not intact(): err.write(b'Frozen verifier changed before execution\n'); code=125
+ if not intact():
+  err.write(b'Frozen verifier changed before execution\n'); code=125
+  outcome={'kind':'infrastructure','reason':'frozen-verifier-before'}
  else:
   p=subprocess.Popen(['bash','-c',c['command']],cwd=c['cwd'],env={**os.environ,**c['env']},stdout=out,stderr=err,start_new_session=True)
   def stop(*args):
@@ -133,12 +136,15 @@ with open(c['spool']+'/stdout','wb') as out, open(c['spool']+'/stderr','wb') as 
    except ProcessLookupError: pass
   signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
   try: code=p.wait(timeout=c['timeout'])
-  except subprocess.TimeoutExpired: stop(); p.wait(); code=124
+  except subprocess.TimeoutExpired:
+   stop(); p.wait(); code=124; outcome={'kind':'infrastructure','reason':'elapsed-timeout'}
   finally: stop()
-  if not intact(): err.write(b'Frozen verifier changed after execution\n'); code=125
+  if not intact():
+   err.write(b'Frozen verifier changed after execution\n'); code=125
+   outcome={'kind':'infrastructure','reason':'frozen-verifier-after'}
 with open(c['spool']+'/exit','w') as f: f.write(str(code))
 with open(c['spool']+'/timing.json.tmp','w') as f:
- json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey']},f); f.flush(); os.fsync(f.fileno())
+ json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey'],'outcome':outcome},f); f.flush(); os.fsync(f.fileno())
 os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
 sys.exit(code if code>=0 else 128-code)
 `;
@@ -213,7 +219,7 @@ export async function createEnvironment(options, context) {
   async function discoverCapabilities() {
     if(!capabilities) {
       const result=await client(['capabilities',options.target]);
-      if(result.state!=='available')throw new Error('CPL target unavailable');
+      if(result.state!=='available')throw closedSetupError('CPL target unavailable',{reason:result});
       capabilities=result;
     }
     return capabilities;
@@ -236,7 +242,7 @@ export async function createEnvironment(options, context) {
       if(receipt.containment) {
         if(receipt.containment.closed) {
           let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
-          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{})};
+          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{}),...(receipt.outcome?{outcome:receipt.outcome}:{})};
         }
         const state=await local.observe(receipt.containment.unit);
         return state.state==='stopped'?{state:'unknown'}:state;
@@ -258,7 +264,8 @@ export async function createEnvironment(options, context) {
       }
       let exitCode;
       try { exitCode = Number(await readFile(join(dir, 'exit'), 'utf8')); } catch { /* interrupted wrapper */ }
-      return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}) };
+      return { state: live ? 'running' : 'stopped', pid, ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+        ...(receipt.outcome?{outcome:receipt.outcome}:{}) };
     } catch { return { state: 'unknown' }; }
   }
   async function executionTiming(handle, signal) {
@@ -288,7 +295,8 @@ export async function createEnvironment(options, context) {
           await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir, signal));
           timing = await json(path);
         }
-        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0) return { executionSeconds: timing.executionSeconds };
+        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0)
+          return {executionSeconds:timing.executionSeconds,...(['command','infrastructure'].includes(timing.outcome?.kind)?{outcome:timing.outcome}:{})};
       } catch { /* terminal work without complete timing is not free work */ }
     }
     await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
@@ -463,16 +471,19 @@ export async function createEnvironment(options, context) {
           timeout:remaining(),onData:opts.onData??(()=>{}),
           onContainment:async containment=>save(join(dir,'execution.json'),{...receipt,containment})});
         await writeFile(join(dir,'exit'),String(result.exitCode));
+        await save(join(dir,'execution.json'),{...await json(join(dir,'execution.json')),
+          outcome:result.outcome});
       }
       catch (error) {
         const state = await stop(handle);
         if (state.state !== 'stopped') throw new Error(`Local execution unresolved: ${handle}`, { cause: error });
-        return { handle, exitCode: state.exitCode ?? null, settled: true };
+        return {handle,exitCode:state.exitCode??null,settled:true,
+          outcome:{kind:'infrastructure',reason:'local-execution-interrupted'}};
       }
       const state = await localState(handle);
       if (state.state === 'running') await stop(handle);
       const final = await observe(handle);
-      return { handle, exitCode: final.exitCode ?? null, settled: final.state === 'stopped' };
+      return {handle,exitCode:final.exitCode??null,settled:final.state==='stopped',...(final.outcome?{outcome:final.outcome}:{})};
     }
     if (!projectRoot || !attemptRoot) throw new Error('Call prepare with project.sourceDirectory and attempt.id before remote execute');
     const subdir = relative(projectRoot, resolve(cwd ?? projectRoot));
@@ -582,6 +593,7 @@ export async function createEnvironment(options, context) {
       }
     }
     return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped',
+      ...(state.outcome?{outcome:state.outcome}:{}),
       ...(state.executionSeconds === undefined ? { accountingUnresolved: true } : { executionSeconds: state.executionSeconds }) };
   }
   // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
@@ -713,7 +725,8 @@ export async function createEnvironment(options, context) {
             remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
             sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
           await discoverCapabilities();
-          if ((await client(['preflight', options.target])).state !== 'completed') throw new Error('CPL preflight failed');
+          const preflight=await client(['preflight',options.target]);
+          if(preflight.state!=='completed')throw closedSetupError('CPL preflight failed',{reason:preflight});
           for (const file of frozen) await exclude('transfer', async () => {
             const dir = await mkdtemp(join(root, 'verifier-'));
             await transfer(['upload', options.target, file.local, file.remote], dir);

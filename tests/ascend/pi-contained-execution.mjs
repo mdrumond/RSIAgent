@@ -72,6 +72,8 @@ test('CPU construction execution retains scoped closure across a new observer',{
   const recursive=join(f.root,'construction.sh');await writeFile(recursive,'#!/bin/bash\nbash "$0" & wait\n');
   const rejected=await env.execute(`bash '${recursive}'`,f.root,{timeout:3});
   assert.equal(rejected.settled,true);assert.equal(rejected.exitCode,125);
+  assert.deepEqual(rejected.outcome,{kind:'infrastructure',reason:'process-limit'});
+  assert.deepEqual((await observer.observe(rejected.handle)).outcome,rejected.outcome);
   assert.equal((await env.execute('printf repaired',f.root,{timeout:3})).exitCode,0);
   const tools=await createEnvironmentTools({...env,shellOnTarget:false},f.root);
   const local=tools.find(tool=>tool.name==='bash');

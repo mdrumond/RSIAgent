@@ -257,6 +257,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
+    if(!session&&(['SETUP_CLOSED','CPL_NOT_ADMITTED','DEVICE_LEASE_BLOCKED'].includes(error.code)||error.diagnostic))
+      event('preactor-infrastructure',{stage:workflow.stage,reason:error.code??'native-client-failed',message:error.message.slice(0,3000)});
     event('attempt-error',{message:error.message,stage:error.code==='PROJECT_BASELINE_INVALID'?'baseline-preflight':workflow.stage});
     state.checkpoint(attempt.id,clock.elapsed);
     if(error.code==='ACTOR_ELAPSED_EXHAUSTED' && !uncertain && !signal?.aborted) {

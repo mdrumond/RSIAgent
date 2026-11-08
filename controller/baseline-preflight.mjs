@@ -12,16 +12,26 @@ export async function validateTargetBaseline({project,state,attempt,attemptPath,
   if(previous?.data.passed===true&&previous.data.command===command)return;
   state.event(attempt.id,'baseline-preflight-started',{command});
   let output='';
-  const response=await execute(command,project.source,{signal,timeout:remaining(),purpose:'performance',
-    onData:chunk=>{output=(output+chunk.toString()).slice(-64000);}});
+  let response,executionError;
+  try {response=await execute(command,project.source,{signal,timeout:remaining(),purpose:'performance',
+    onData:chunk=>{output=(output+chunk.toString()).slice(-64000);}});}
+  catch(error){executionError=error;}
   signal?.throwIfAborted();await checkVerifier();
   // An uncertain transport or interrupted execution is never a verifier verdict.
-  if(!response.settled||!Number.isInteger(response.exitCode))throw new Error('Target baseline execution unresolved');
-  if(response.exitCode===124||response.exitCode<0||response.exitCode>=128)
-    throw new Error('Target baseline interrupted before a verifier verdict');
+  const reason=executionError?'execution-unavailable':response.outcome?.kind==='infrastructure'?(response.outcome.reason??'execution-infrastructure'):
+    !response.settled||!Number.isInteger(response.exitCode)?'execution-unresolved':
+    [124,125,126].includes(response.exitCode)||response.exitCode<0||response.exitCode>=128?'execution-refused-or-interrupted':null;
+  if(reason)output+='\n'+JSON.stringify({infrastructure:reason,exitCode:response?.exitCode,outcome:response?.outcome,
+    ...(executionError?{message:executionError.message.slice(0,3000)}:{})})+'\n';
   const path=join(attemptPath,'baseline-preflight.log');await writeFile(path,output);
   await register(path,'baseline-preflight');
   const evidence={path,sha256:createHash('sha256').update(await readFile(path)).digest('hex')};
+  if(reason) {
+    state.event(attempt.id,'preactor-infrastructure',{stage:'baseline-preflight',reason,evidence,
+      ...(response?{exitCode:response.exitCode,outcome:response.outcome}:{}),
+      ...(executionError?{message:executionError.message.slice(0,3000)}:{})});
+    throw executionError??Object.assign(new Error('Target baseline has no verifier verdict: '+reason),{code:'EXECUTION_INFRASTRUCTURE'});
+  }
   const verdict={command,passed:response.exitCode===0,exitCode:response.exitCode,evidence};
   state.event(attempt.id,'baseline-preflight-completed',verdict);
   if(!verdict.passed) {

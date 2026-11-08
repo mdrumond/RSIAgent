@@ -83,9 +83,11 @@ export function createLocalExecutionOperations(sdk,limits) {
         await options.onContainment?.({unit,closed:true});
       }finally{await rm(directory,{recursive:true,force:true});}
     }
-    if(violation){options.onData(Buffer.from(`Command exceeded its ${violation} limit; all descendants were terminated. Fix the command and retry within the remaining allocation.\n`));return {exitCode:125};}
+    if(violation){options.onData(Buffer.from(`Command exceeded its ${violation} limit; all descendants were terminated. Fix the command and retry within the remaining allocation.\n`));
+      return {exitCode:125,outcome:{kind:'infrastructure',reason:violation+'-limit'}};}
     if(failure)throw failure;
-    if(result.exitCode!==0&&!group)options.onData(Buffer.from('Local command containment could not start; no uncontained fallback was executed.\n'));
+    if(result.exitCode!==0&&!group){options.onData(Buffer.from('Local command containment could not start; no uncontained fallback was executed.\n'));
+      return {...result,outcome:{kind:'infrastructure',reason:'containment-unavailable'}};}
     return result;
   }};
 }
