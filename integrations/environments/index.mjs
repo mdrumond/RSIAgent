@@ -277,7 +277,7 @@ export async function createEnvironment(options, context) {
     await event('execution-state', { handle, ...state });
     return state;
   }
-  async function stop(handle) {
+  async function stop(handle, {accountingExcluded=false}={}) {
     check(handle);
     const signal = AbortSignal.timeout(5000);
     if (remote) {
@@ -287,7 +287,7 @@ export async function createEnvironment(options, context) {
       if(receipt.containment) {
         await local.stop(receipt.containment.unit);
         await save(join(root,handle.slice(6),'execution.json'),{...receipt,containment:{...receipt.containment,closed:true}});
-        return observe(handle);
+        return observe(handle,{accountingExcluded});
       }
       const state = await localState(handle);
       if (state.state === 'running') {
@@ -296,7 +296,7 @@ export async function createEnvironment(options, context) {
     }
     const deadline = performance.now() + 5000;
     while (performance.now() < deadline) {
-      const state = await observe(handle, {signal});
+      const state = await observe(handle, {signal,accountingExcluded});
       if (state.state !== 'running') return state;
       await delay(50);
     }
@@ -335,7 +335,7 @@ export async function createEnvironment(options, context) {
     }
     const message = `CPL ${args[0]} submission identity unknown; do not resubmit`;
     await event('execution-unresolved', { operation, submission: operation, handle: null, message });
-    throw new Error(message, { cause });
+    throw new Error(message, { cause: cause ?? result });
   }
   async function prepareUploadParent(destination,dir,signal) {
     const path=posix.normalize(destination);
@@ -352,12 +352,12 @@ export async function createEnvironment(options, context) {
     let state;
     try {
       do {
-        state=await observe(submitted.handle,{signal});
+        state=await observe(submitted.handle,{signal,accountingExcluded:true});
         signal?.throwIfAborted();
         if(state.state==='running')await delay(options.pollMs??250,undefined,{signal});
       }while(state.state==='running');
     }catch(error) {
-      if(signal?.aborted)state=await stop(submitted.handle);
+      if(signal?.aborted)state=await stop(submitted.handle,{accountingExcluded:true});
       if(state?.state==='stopped')throw closedSetupError('Upload parent setup interrupted',{handle:submitted.handle,reason:state});
       throw error;
     }
@@ -460,7 +460,7 @@ export async function createEnvironment(options, context) {
         let receipt;
         try { receipt = await json(retained.receiptFile); } catch { /* no identity is not closure */ }
         if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
-        const state = await observe(receipt.handle, {signal});
+        const state = await observe(receipt.handle, {signal,accountingExcluded:true});
         if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
         if (state.exitCode !== 0) { await rm(cachePath); throw closedSetupError(`Source synchronization failed: ${receipt.handle}`, {handle: receipt.handle, reason: state}); }
         retained.confirmed = true;
@@ -493,11 +493,11 @@ export async function createEnvironment(options, context) {
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
       do {
-        state = await observe(submitted.handle, {signal});
+        state = await observe(submitted.handle, {signal,accountingExcluded:true});
         if (state.state === 'stopped' && state.exitCode !== 0) {
           await rm(cachePath); throw closedSetupError(`Copy failed: ${submitted.handle}`, {handle: submitted.handle, reason: state});
         }
-        if (signal?.aborted) { await stop(submitted.handle); signal.throwIfAborted(); }
+        if (signal?.aborted) { await stop(submitted.handle,{accountingExcluded:true}); signal.throwIfAborted(); }
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
       if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);

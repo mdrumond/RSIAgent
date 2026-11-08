@@ -134,33 +134,42 @@ export async function operate(command,config,options={}) {
       const url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:schedulerAbort.signal});
       await (await import('../controller/storage-knowledge.mjs')).activateStorageBaseline(config,{state,url,signal:schedulerAbort.signal});
     }
-    // Unknown failed execution is reconciled, never replayed through the actor.
-    for(const attempt of state.db.prepare('SELECT * FROM attempts WHERE outcome IS NOT NULL').all()) {
-      if(failureSettled(state,attempt.id) || !await ownerStopped(attempt.owner))continue;
-      try {
-        const path=join(config.root,'attempts',attempt.id);
-        const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
-        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
-          async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
-        await reconcileFailure(state,attempt.id,previous);
-      }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+    // Reuse startup closure proof during a live campaign: worker exit can precede
+    // native terminal receipts. Never replay the actor to discover that proof.
+    const settlementChecks=new Map();
+    async function reconcileCompleted({periodic=false}={}) {
+      const candidates=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL`).all()
+        .filter(attempt=>!failureSettled(state,attempt.id)||
+          state.db.prepare('SELECT 1 FROM resource_leases WHERE attempt=?').get(attempt.id));
+      const retained=new Set(candidates.map(attempt=>attempt.id));
+      for(const id of settlementChecks.keys())if(!retained.has(id))settlementChecks.delete(id);
+      candidates.sort((a,b)=>(settlementChecks.get(a.id)??0)-(settlementChecks.get(b.id)??0));
+      for(const attempt of periodic?candidates.slice(0,1):candidates) {
+        schedulerAbort.signal.throwIfAborted();
+        settlementChecks.set(attempt.id,performance.now());
+        if(!await ownerStopped(attempt.owner))continue;
+        const signal=periodic?AbortSignal.any([schedulerAbort.signal,AbortSignal.timeout(5000)]):schedulerAbort.signal;
+        try {
+          const path=join(config.root,'attempts',attempt.id);
+          const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+          const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
+            async(_label,fn)=>fn(),job.resource,signal);
+          if(!failureSettled(state,attempt.id))await reconcileFailure(state,attempt.id,previous);
+          // A finalizer must publish its outcome before a retained scheduler
+          // reservation becomes available to another actor.
+          if(!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||
+              !await ownerStopped(state.attempt(attempt.id).owner))continue;
+          if(await attemptStopped(state,state.attempt(attempt.id),previous)) {
+            for(const lease of state.db.prepare('SELECT resource FROM resource_leases WHERE attempt=?').all(attempt.id)) {
+              state.db.prepare('DELETE FROM resource_leases WHERE attempt=? AND resource=?').run(attempt.id,lease.resource);
+              state.event(attempt.id,'resource-lease-reclaimed',{resource:lease.resource});
+            }
+          }
+        }catch(error){state.event(attempt.id,'settlement-error',{message:error.message});}
+      }
     }
-    // A prior scheduler may have died before its worker-exit waiter released a lease.
-    for(const attempt of state.db.prepare(`SELECT a.*,l.resource FROM resource_leases l
-      JOIN attempts a ON a.id=l.attempt WHERE a.outcome IS NOT NULL`).all()) {
-      schedulerAbort.signal.throwIfAborted();
-      try {
-        if(!failureSettled(state,attempt.id)||!queue.outcomeRecorded(attempt.id)||!await ownerStopped(attempt.owner))continue;
-        const path=join(config.root,'attempts',attempt.id);
-        const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
-        const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
-          async(_label,fn)=>fn(),job.resource,schedulerAbort.signal);
-        if(await attemptStopped(state,attempt,previous)) {
-          state.db.prepare('DELETE FROM resource_leases WHERE attempt=? AND resource=?').run(attempt.id,attempt.resource);
-          state.event(attempt.id,'resource-lease-reclaimed',{resource:attempt.resource});
-        }
-      }catch(error){state.event(attempt.id,'lease-reconciliation-error',{message:error.message});}
-    }
+    await reconcileCompleted();
+    let nextSettlement=performance.now()+5000;
     if(queue.lessons().length) {
       try {
         const {ensureKnowledgeService}=await import('./knowledge.mjs');
@@ -344,6 +353,10 @@ export async function operate(command,config,options={}) {
       if(ctl.get('stop') || ctl.get('pause') || schedulerAbort.signal.aborted)break;
       const latest=await readConfig(config.root);
       config={...latest,mode:config.mode,recovery:options['no-recovery']?false:latest.recovery};
+      if(options.continuous&&performance.now()>=nextSettlement) {
+        await reconcileCompleted({periodic:true});
+        nextSettlement=performance.now()+5000;
+      }
       syncCampaignPlan(state,config);
       for(const project of config.projects) {
         const existing=state.project(project.id);
@@ -438,7 +451,7 @@ export async function operate(command,config,options={}) {
         if(['investigation','retry'].includes(job.kind)&&!policy({...config,mode:job.mode??config.mode}).inferenceRecovery&&job.mode==='inference')return false;
         if(options.continuous&&progress.phaseComplete&&job.kind==='original'&&!job.finalize&&!job.resume)return false;
         if(job.finalize&&state.queryEvents(job.attempt.id,{types:['postprocess-completed'],limit:1}).length)return false;
-        if(['investigation','retry'].includes(job.kind)&&(config.campaign_plan ||
+        if(!job.finalize&&['investigation','retry'].includes(job.kind)&&(config.campaign_plan ||
           (config.mode!=='phase1'&&!config.skills?.tuningDisabled))&&
           state.db.prepare(`SELECT 1 FROM attempts a WHERE project=? AND outcome IS NOT NULL
             AND NOT EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed') LIMIT 1`).get(job.projectId))return false;
