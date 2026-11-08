@@ -808,6 +808,9 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   assert.ok(retained.handles.includes(payload));
   for(const handle of controls)assert.ok(retained.handles.includes(handle));
   blocking=false;
-  assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
+  if(stage==='admission-read') {
+    assert.ok(retained.submissions.some(row=>!row.closed&&!row.handle),'an interrupted unacknowledged transfer remains unknown');
+    assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
+  } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
   assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
 });
