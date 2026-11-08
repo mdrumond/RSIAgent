@@ -6,17 +6,13 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {setTimeout as delay} from 'node:timers/promises';
-import {bootstrap,readConfig,importProject} from '../../cli/instance.mjs';
-import {main} from '../../cli/main.mjs';
-import {ensureKnowledgeService} from '../../cli/knowledge.mjs';
+import {bootstrap,readConfig} from '../../cli/instance.mjs';
 import {projectBundle} from '../../cli/project-bundle.mjs';
-import {refillProjects} from '../../cli/project-generation.mjs';
 import {State} from '../../controller/state.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {processIdentity,ownerStopped,operationsStopped} from '../../controller/lifecycle.mjs';
-import {runAttempt} from '../../controller/pi.mjs';
 import {modelFromProfile} from '../../controller/model.mjs';
 import {createKdbBridge} from '../../integrations/kdb-extension.mjs';
 import {provider} from '../../tests/ascend/driver_fixture.mjs';
@@ -24,6 +20,7 @@ import {provider} from '../../tests/ascend/driver_fixture.mjs';
 const exec=promisify(execFile),repository=fileURLToPath(new URL('../..',import.meta.url));
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 const save=(path,data)=>writeFile(path,JSON.stringify(data,null,2)+'\n',{mode:0o600});
+const machinery=(config,path)=>import(pathToFileURL(join(config.root,'machinery',path)));
 const quote=text=>"'"+text.replaceAll("'","'\\''")+"'";
 export const candidate="def run(x):\n    print('hello', x.device, flush=True)\n    return x + 1\n";
 const reference='def run(x):\n    return x + 1\n';
@@ -86,11 +83,13 @@ async function fixtures(root,python,signal) {
 }
 
 async function bridgeFor(config,state,id,path,signal) {
+  const {ensureKnowledgeService}=await machinery(config,'cli/knowledge.mjs');
   return createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:id,agentDir:path,
     target:config.target,event:(type,data)=>state.event(null,type,data)});
 }
 
 async function actorOnly(config,state,signal) {
+  const {runAttempt}=await machinery(config,'controller/pi.mjs');
   const {attempt,project}=new RecoveryQueue(state).claim('actor-hello',1,await processIdentity());
   const path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
   CampaignStorage.open(state,config.root).attempt(attempt.id,{phase:'phase1',kind:'original',wave:1});
@@ -109,6 +108,8 @@ async function actorOnly(config,state,signal) {
 }
 
 async function curriculumOnly(config,state,root,signal) {
+  const {refillProjects}=await machinery(config,'cli/project-generation.mjs');
+  const {importProject}=await machinery(config,'cli/instance.mjs');
   const path=join(config.root,'generation');await mkdir(path);
   const bridge=await bridgeFor(config,state,'smoke-generation',path,signal);
   const generated=await refillProjects({config,state,bridge,concurrency:1,path,signal});
@@ -164,7 +165,10 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     await cp(fixture.embeddings,join(instance,'machinery/ascend_tools/fixture_embeddings.py'));
     if(projects.length)await rm(join(root,'planned'),{recursive:true});
     const config=await readConfig(instance);
-    if(kind==='controller')await main(['wave','--instance',instance,'--mode','phase1'],{signal:active});
+    if(kind==='controller') {
+      const {main}=await machinery(config,'cli/main.mjs');
+      await main(['wave','--instance',instance,'--mode','phase1'],{signal:active});
+    }
     const state=new State(join(instance,'state.sqlite'));
     try {
       if(kind==='actor')await actorOnly(config,state,active);
