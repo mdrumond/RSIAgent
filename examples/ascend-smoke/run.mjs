@@ -124,7 +124,8 @@ async function stopKnowledge(instance) {
   let receipt;try{receipt=await load(join(instance,'knowledge-service.json'));}
   catch(error){if(error.code==='ENOENT')return;throw error;}
   if(await ownerStopped(receipt.owner))return;
-  process.kill(receipt.owner.pid,'SIGTERM');
+  try{process.kill(receipt.owner.pid,'SIGTERM');}
+  catch(error){if(error.code!=='ESRCH')throw error;}
   const deadline=performance.now()+15000;
   while(!await ownerStopped(receipt.owner)) {
     if(performance.now()>=deadline)throw Error('Smoke knowledge service did not stop');
