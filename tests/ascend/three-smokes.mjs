@@ -111,11 +111,18 @@ test('curriculum smoke validates and imports exactly one real-tool PyTorch proje
       res.end('data: [DONE]\n\n');
     });server.listen(0,'127.0.0.1');await once(server,'listening');
     t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
-    const report=await runSmoke({kind:'curriculum',profile:{python,environment,
+    const report=await runSmoke({kind:'curriculum',profile:{python,target:'a3',
+      environment:{module:'machinery/integrations/environments/ascend.mjs',options:{mode:'cpl',target:'unused-device-alias',health:{product:'a3'}}},
       actor:await actorProfile(path,`http://127.0.0.1:${server.address().port}/v1`)},
-      destination:join(path,'curriculum'),device:'cpu',live:true});
+      destination:join(path,'curriculum'),live:true});
     assert.equal(report.passed,true);assert.ok(report.project);assert.ok(requests>=calls.length);
     const imported=JSON.parse(await readFile(join(path,'curriculum/curriculum-project.json')));
     assert.ok(imported.source.startsWith(resolve(report.instance)));assert.ok(imported.bundle);
+    assert.equal(imported.target,'cpu');assert.equal(report.target,'cpu');assert.equal(report.deviceEvidence,false);
+    const config=JSON.parse(await readFile(join(report.instance,'instance.json')));
+    assert.equal(config.curriculum_seconds,180);assert.equal(config.target,'cpu');
+    assert.equal(config.environment.module,'machinery/integrations/environments/index.mjs');
+    assert.equal(config.environment.options.mode,'local');
+    assert.deepEqual(imported.generation.checks.map(check=>check.exitCode),[0,1]);
     if(!process.env.DRIVER_ARTIFACTS)await rm(path,{recursive:true});
   });

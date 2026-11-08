@@ -767,7 +767,7 @@ export async function createEnvironmentTools(environment, cwd, sdk) {
     return result;
   } } });
   const target={...tool,name:'rsi_target',label:'Run target command',
-    description:'Execute a command in the configured target environment. Remote targets use an execution snapshot; use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'};
+    description:'Execute a command in the configured target environment. Commands start in the editable source directory. Remote targets use a source execution snapshot without trusted verifier files; run frozen checks through rsi_verify, which stages those files. Use native local bash/read/write/edit for persistent workspace changes. Returns target stdout/stderr and exit status.'};
   // On a device host, override Pi's Bash tool through its supported extension
   // API. Both shell names must pass through the same admission and supervision.
   return environment.shellOnTarget ? [target,{...tool,name:'bash'}] :
