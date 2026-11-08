@@ -233,7 +233,7 @@ export async function createEnvironment(options, context) {
     if (remote && !handle.startsWith(`remote:${options.target}:`)) throw new Error('Handle belongs to another target');
     if (!remote && !/^local:exec-[A-Za-z0-9]+$/.test(handle)) throw new Error('Invalid local handle');
   };
-  async function localState(handle) {
+  async function localState(handle,{signal}={}) {
     check(handle);
     const dir = join(root, handle.slice(6));
     try {
@@ -244,7 +244,7 @@ export async function createEnvironment(options, context) {
           let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
           return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{}),...(receipt.outcome?{outcome:receipt.outcome}:{})};
         }
-        const state=await local.observe(receipt.containment.unit);
+        const state=await local.observe(receipt.containment.unit,{signal});
         return state.state==='stopped'?{state:'unknown'}:state;
       }
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
@@ -306,7 +306,7 @@ export async function createEnvironment(options, context) {
     check(handle);
     let state;
     try {
-      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle);
+      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle,{signal});
       if (remote && state.state === 'stopped') {
         if(accountingExcluded === true)Object.assign(state,{executionSeconds:0,accountingExcluded:true});
         else if(state.executionSeconds === undefined)Object.assign(state, await executionTiming(handle, signal));
@@ -316,19 +316,19 @@ export async function createEnvironment(options, context) {
     await event('execution-state', { handle, ...state });
     return state;
   }
-  async function stop(handle, {accountingExcluded=false}={}) {
+  async function stop(handle, {accountingExcluded=false,signal:stopSignal}={}) {
     check(handle);
-    const signal = AbortSignal.timeout(5000);
+    const signal = stopSignal??AbortSignal.timeout(5000);
     if (remote) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
     } else {
       const receipt=await json(join(root,handle.slice(6),'execution.json'));
       if(receipt.containment) {
-        await local.stop(receipt.containment.unit);
+        await local.stop(receipt.containment.unit,{signal});
         await save(join(root,handle.slice(6),'execution.json'),{...receipt,containment:{...receipt.containment,closed:true}});
         return observe(handle,{accountingExcluded});
       }
-      const state = await localState(handle);
+      const state = await localState(handle,{signal});
       if (state.state === 'running') {
         try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
@@ -475,7 +475,7 @@ export async function createEnvironment(options, context) {
           outcome:result.outcome});
       }
       catch (error) {
-        const state = await stop(handle);
+        const state = await stop(handle,{signal:opts.stopSignal});
         if (state.state !== 'stopped') throw new Error(`Local execution unresolved: ${handle}`, { cause: error });
         return {handle,exitCode:state.exitCode??null,settled:true,
           outcome:{kind:'infrastructure',reason:'local-execution-interrupted'}};
@@ -574,8 +574,8 @@ export async function createEnvironment(options, context) {
     let state;
     for (;;) {
       const stopping = signal?.aborted || remaining() === 0;
-      state = stopping ? await stop(handle) : await observe(handle, {signal});
-      if (!stopping && signal?.aborted) state = await stop(handle);
+      state = stopping ? await stop(handle,{signal:opts.stopSignal}) : await observe(handle, {signal});
+      if (!stopping && signal?.aborted) state = await stop(handle,{signal:opts.stopSignal});
       if (state.state !== 'running') break;
       await delay(Math.min(options.pollMs ?? 250, (remaining() ?? 1) * 1000));
     }

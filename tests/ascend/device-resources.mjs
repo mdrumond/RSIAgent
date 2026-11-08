@@ -763,3 +763,42 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
   const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
   for(const handle of controls)assert.ok(retained.handles.includes(handle));
 });
+
+for(const stage of ['payload-observe','control-prepare','control-observe','admission-read'])
+test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
+  const f=await fixture(t),controls=new Set(),receipts=new Set();let payload,observations=0,aborted=0;
+  const hang=signal=>{
+    assert.ok(signal,'cleanup must pass its independent signal into every RPC');
+    return new Promise((_,reject)=>{
+      const stop=()=>{aborted++;reject(signal.reason);};
+      if(signal.aborted)stop();else signal.addEventListener('abort',stop,{once:true});
+    });
+  };
+  const client=async(args,{signal}={})=>{
+    if(stage==='payload-observe'&&args[0]==='observe'&&args[1]===payload&&++observations>1)return hang(signal);
+    if(stage==='control-prepare'&&args[0]==='capabilities'&&f.commands.length)return hang(signal);
+    if(stage==='control-observe'&&args[0]==='observe'&&controls.has(args[1]))return hang(signal);
+    if(stage==='admission-read'&&args[0]==='download'&&[...receipts].some(path=>path===args[2]||path.endsWith('/'+args[2])))return hang(signal);
+    const result=await f.context.client(args,{signal});
+    if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')) {
+      if(args.includes('--npu'))payload=result.handle;
+      else {
+        controls.add(result.handle);
+        const script=await readFile(args[args.indexOf('--file')+1],'utf8');
+        const configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+        receipts.add(configuration.env.RSI_LEASE_RECEIPT);
+      }
+    }
+    return result;
+  };
+  const environment=await createEnvironment({...f.options,probeObservationSeconds:1},{...f.context,client});
+  await environment.prepare({project:{source:f.source},attempt:{id:'bounded-cleanup'}});
+  const start=performance.now(),result=await environment.execute('payload-once',f.source,{timeout:5});
+  assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
+  assert.ok(performance.now()-start<5000,'a hung cleanup must not receive fresh per-RPC observation windows');
+  assert.equal(f.commands.length,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+  const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
+  assert.ok(retained.handles.includes(payload));
+  for(const handle of controls)assert.ok(retained.handles.includes(handle));
+});

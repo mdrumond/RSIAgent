@@ -308,13 +308,15 @@ export async function createEnvironment(options, context) {
       available, metadata: {kind:'host-slot', pool, target:options.target,
         ...(reserved===undefined?{}:{hostSlot:slot,backgroundSlot:slot===0})} }));
   }
-  let commandActive=false, controlEnvironment, controlToken;
-  async function control() {
-    if(controlEnvironment&&controlToken===activeLease.token)return controlEnvironment;
-    controlToken=activeLease.token;
+  let commandActive=false, controlEnvironment, controlToken, controlSignal;
+  const cleanupBudget=()=>({deadline:performance.now()+observationSeconds*1000,
+    signal:AbortSignal.timeout(observationSeconds*1000)});
+  async function control(budget) {
+    if(controlEnvironment&&controlToken===activeLease.token&&controlSignal===budget.signal)return controlEnvironment;
+    controlToken=activeLease.token;controlSignal=budget.signal;
     const path=join(dirname(activeLease.receipt),'control'),sourcePath=join(path,'source');
     await mkdir(sourcePath,{recursive:true});
-    controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:undefined,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
+    controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:budget.signal,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
       if(type==='execution-output'&&(data.stdout||data.stderr)){
         // Global native journals must survive owner loss. Actor-facing artifacts
         // belong to the campaign and must be retained before storage sees them.
@@ -338,14 +340,13 @@ export async function createEnvironment(options, context) {
   }
   let reconciling, retryFailedControl=false;
   async function reconcileClosedPayload() {
-    const deadline=performance.now()+observationSeconds*1000;
     // Payload closure is already positive. Cancellation must not cancel the
     // token-scoped cleanup that proves its host fence can be released.
-    const signal=AbortSignal.timeout(observationSeconds*1000);
+    const budget=cleanupBudget(),{deadline,signal}=budget;
     do {
       if(signal.aborted)return false;
       retryFailedControl=false;
-      if(await reconcileLease())return true;
+      if(await reconcileLease(budget))return true;
       // Only a positively terminal failed cleanup permits replacement. Unknown
       // work remains fenced and never triggers another device payload.
       if(!retryFailedControl)return false;
@@ -354,11 +355,13 @@ export async function createEnvironment(options, context) {
     } while(performance.now()<deadline);
     return false;
   }
-  function reconcileLease(){
-    if(!reconciling)reconciling=reconcileCurrent().finally(()=>{reconciling=null;});
+  function reconcileLease(budget=cleanupBudget()){
+    if(!reconciling)reconciling=reconcileCurrent(budget).catch(error=>{
+      if(budget.signal.aborted)return false;throw error;
+    }).finally(()=>{reconciling=null;});
     return reconciling;
   }
-  async function reconcileCurrent() {
+  async function reconcileCurrent(budget) {
     let retained;
     try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return true;throw error;}
     const proof=await closedDeviceLease(retained.receipt,retained.token);
@@ -382,13 +385,13 @@ export async function createEnvironment(options, context) {
         handles.add(handle);
       }
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
-      for(const handle of handles)if((await environment.observe(handle,{signal:AbortSignal.timeout(observationSeconds*1000)})).state!=='stopped')return false;
-      if(!await reconcileHostLease(lease))return false;
+      for(const handle of handles)if((await environment.observe(handle,{signal:budget.signal})).state!=='stopped')return false;
+      if(budget.signal.aborted||!await reconcileHostLease(lease,budget))return false;
       await releaseLease(lease);return true;
     } finally {activeLease=null;}
   }
-  async function reconcileHostLease(lease) {
-      const cleanup=await control();
+  async function reconcileHostLease(lease,budget) {
+      const cleanup=await control(budget);
       // A positively refused control submission may be retried. Unknown submissions
       // returned above; a recovered payload handle is always observed, never replayed.
       if(lease.record.controlStarted&&!lease.record.controlHandle){
@@ -399,17 +402,20 @@ export async function createEnvironment(options, context) {
         else return false;
       }
       if(!lease.record.controlStarted){
+        const remaining=Math.max(0,(budget.deadline-performance.now())/1000);
+        if(!remaining||budget.signal.aborted)return false;
         await lease.update({controlStarted:true});
         const request={devices:[lease.record.physicalDevice],lease:{pool:lease.record.pool,token:lease.token}};
         const code="import os,sys,json,hashlib,time\nc=json.loads(sys.argv[1])\n"+hostReconcile;
         const result=await context.exclude('setup',()=>cleanup.execute(`${quote(options.python??'python3')} -c ${quote(code)} ${quote(JSON.stringify(request))}`,
-          join(dirname(lease.receipt),'control','source'),{timeout:seconds,leaseReceipt:true}));
+          join(dirname(lease.receipt),'control','source'),{timeout:Math.min(seconds,remaining),leaseReceipt:true,
+            signal:budget.signal,stopSignal:budget.signal}));
         if(!result.settled)return false;
       }
       if(!lease.record.controlHandle)return false;
-      const controlState=await cleanup.observe(lease.record.controlHandle);
+      const controlState=await cleanup.observe(lease.record.controlHandle,{signal:budget.signal});
       if(controlState.state!=='stopped')return false;
-      const receipt=await cleanup.readAdmission(lease.record.controlHandle);
+      const receipt=await cleanup.readAdmission(lease.record.controlHandle,{signal:budget.signal});
       if(controlState.nativeState==='failed' && receipt?.token!==lease.token){
         // A terminal failed cleanup may never have entered its Python payload.
         // Preserve its exact journal and permit a new token-scoped cleanup on
@@ -437,9 +443,10 @@ export async function createEnvironment(options, context) {
       await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
   }
   async function recoverReservation(physical,proof={}) {
-    return reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
+    const budget=cleanupBudget();
+    try{return await reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
       ...proof,
-      observe:handle=>local?environment.observe(handle):client(['observe',handle]),
+      observe:handle=>local?environment.observe(handle,{signal:budget.signal}):client(['observe',handle],{signal:budget.signal}),
       reconcileHost:async lease=>{
         // Administrative migration is separate from a failed receipt download.
         // Existing journals always retain their known native control identity.
@@ -453,9 +460,9 @@ export async function createEnvironment(options, context) {
           }
         }
         activeLease=lease;
-        try{return await reconcileHostLease(lease);}finally{activeLease=null;}
+        try{return await reconcileHostLease(lease,budget);}finally{activeLease=null;}
       }
-    });
+    });}catch(error){if(budget.signal.aborted)return {closed:false,reason:'cleanup-observation-expired'};throw error;}
   }
   return {
     ...environment, resources, inspectDevices,
