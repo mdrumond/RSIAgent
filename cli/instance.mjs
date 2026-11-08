@@ -11,6 +11,7 @@ import { State, validateAcceptance } from '../controller/state.mjs';
 import { syncCampaignPlan } from '../controller/progress.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
+import {checkBundle,validateBundle} from './project-bundle.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -93,7 +94,10 @@ export async function bootstrap(destination,{baseline,skills,environment,project
   await mkdir(join(destination,'projects'),{recursive:continuing});
   if (repository) await cp(repository,join(destination,'repository'),{recursive:true,
     filter:path=>!['node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.')});
-  projects=await Promise.all(projects.map(project=>importProject(destination,{actor_seconds,...project},{continuing:!!initialization})));
+  const importedProjects=[];
+  for(const project of projects)importedProjects.push(await importProject(destination,{actor_seconds,...project},
+    {continuing:!!initialization,signal,localExecution:settings.local_execution}));
+  projects=importedProjects;
   await copyMachinery(machinery,join(destination,'machinery'),install,settings.python,signal,initialization);
   signal?.throwIfAborted();
   const config={...settings,format:1,revision:0,mode,baselineKDB:resolve(baseline),actor_seconds,failed_recovery_rounds,recovery,
@@ -267,11 +271,12 @@ export async function upgrade(root,machinery) {
   }
 }
 
-export async function importProject(root,spec,{continuing=false}={}) {
+export async function importProject(root,spec,{continuing=false,signal,localExecution,checkpoint}={}) {
   validateAcceptance(spec);
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
+  await checkBundle(spec);
   const source=await realpath(spec.source),files=spec.verifier.files;
   const hash=fileDigest;
   const expected={};
@@ -282,14 +287,18 @@ export async function importProject(root,spec,{continuing=false}={}) {
   }
   if(!(await stat(source)).isDirectory())throw new Error('Project source must be a directory');
   const own=join(resolve(root),'projects',spec.id);
-  if(within(own,source) && files.every(path=>within(own,resolve(path))))return {...spec,verifier:{...spec.verifier,hashes:expected}};
-  let common=source;
+  if(within(own,source) && files.every(path=>within(own,resolve(path)))) {
+    const retained={...spec,verifier:{...spec.verifier,hashes:expected}};
+    await validateBundle(retained,join(own,'bundle-validation'),{signal,localExecution,checkpoint});return retained;
+  }
+  let common=spec.bundle?await realpath(spec.bundle.root):source;
   for(const path of files)while(!within(common,resolve(path)))common=dirname(common);
   const tree=join(own,continuing?'inputs-managed':'inputs-'+randomUUID());await mkdir(tree,{recursive:true});
   const destination=join(tree,relative(common,source));
   const filter=path=>!['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');
   await initializationCopy(source,destination,{recursive:true,verbatimSymlinks:true,filter},continuing);
-  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
+  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command,
+    construction_command:spec.bundle?.construction_command};
   const copied=[],hashes={};
   for(const path of files) {
     const absolute=resolve(path),target=join(tree,relative(common,absolute));
@@ -298,8 +307,18 @@ export async function importProject(root,spec,{continuing=false}={}) {
     hashes[target]=expected[absolute];
     for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
   }
-  for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(source).join('.');
+  for(const key of Object.keys(commands))if(commands[key]) {
+    commands[key]=commands[key].split(source).join('.');
+    if(spec.bundle)commands[key]=commands[key].split(common+sep).join(relative(destination,tree)+sep);
+  }
   const result={...spec,source:destination};
-  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied,hashes};
+  const {construction_command,...verifierCommands}=commands;
+  if(spec.verifier)result.verifier={...spec.verifier,...verifierCommands,files:copied,hashes};
+  if(spec.bundle) {
+    const relocate=path=>join(tree,relative(common,path));
+    result.bundle={...spec.bundle,root:tree,reference:relocate(spec.bundle.reference),
+      negative_controls:spec.bundle.negative_controls.map(relocate),construction_command};
+    await validateBundle(result,join(own,'bundle-validation'),{signal,localExecution,checkpoint});
+  }
   return result;
 }

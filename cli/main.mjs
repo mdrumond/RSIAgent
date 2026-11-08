@@ -134,7 +134,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   }
   if(command==='project') {
     if(!values.project) return config.projects;
-    const spec=await importProject(root,{actor_seconds:config.actor_seconds,...JSON.parse(await readFile(values.project,'utf8'))});
+    const spec=await importProject(root,{actor_seconds:config.actor_seconds,...JSON.parse(await readFile(values.project,'utf8'))},{signal,localExecution:config.local_execution});
     return updateConfig(root,(current,state)=>{
       if(state.project(spec.id)) {
         if(state.db.prepare('SELECT 1 FROM attempts WHERE project=? LIMIT 1').get(spec.id))

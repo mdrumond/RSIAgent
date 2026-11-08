@@ -83,7 +83,21 @@ are pinned to a phase and entry; older entry drafts and projects cannot fill a
 new batch. Remaining admissions cap staged projects, including pending drafts. Draft construction checks run
 on CPU references and negative controls; rejected checks return to the same Pi
 session for repair within the remaining construction allocation. An optional
-`construction_command` lets these checks differ from the real target verifier.
+`construction_command` lets these checks differ from the real target verifier. Generated specs retain a versioned
+`bundle` with its root, trusted reference, negative controls, CPU construction
+command and remaining curriculum seconds. Files in a coherent project subdirectory
+outside editable source are frozen dependencies, including reference data and
+verifier helpers. If artifacts sit directly in the generation session directory,
+only declared verifier files and reference/control trees enter the bundle; list
+all other helper files explicitly in `verifier.files`.
+
+Import preserves this layout and reruns the unchanged CPU command from the copied
+reference and every control before admission. Missing or changed dependencies and
+non-discriminating controls reject the project. Import checks share the remaining
+curriculum elapsed allocation, checkpoint it on interruption, and use the configured
+local execution policy. A failed imported generated bundle is invalidated rather
+than repeatedly receiving a fresh budget. Legacy supplied projects without a bundle
+continue to import their declared source and verifier files.
 Both phases can also consume supplied projects; inference consumes supplied projects. An empty supplied backlog waits
 for input; a completed configured target advances the phase sequence.
 
