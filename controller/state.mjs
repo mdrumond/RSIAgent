@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 export function validateAcceptance(spec) {
+  if(spec.verifier?.baseline_command!==undefined &&
+      (typeof spec.verifier.baseline_command!=='string'||!spec.verifier.baseline_command.trim()))
+    throw new Error('verifier.baseline_command must be a nonempty command');
   if (spec.performance_goal != null &&
       (typeof spec.verifier?.performance_command !== 'string' || !spec.verifier.performance_command.trim()))
     throw new Error('performance_goal requires verifier.performance_command');
