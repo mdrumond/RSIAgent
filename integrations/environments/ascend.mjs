@@ -376,7 +376,9 @@ export async function createEnvironment(options, context) {
       // returned above; a recovered payload handle is always observed, never replayed.
       if(lease.record.controlStarted&&!lease.record.controlHandle){
         const refused=lease.record.submissions.filter(row=>row.controlPayload).at(-1);
-        if(refused?.closed===true&&!refused.handle)await lease.update({controlStarted:false});
+        // Both callers already proved all prior submissions closed or native-terminal.
+        // Without a payload marker, setup failed before any control payload dispatch.
+        if(!refused||(refused.closed===true&&!refused.handle))await lease.update({controlStarted:false});
         else return false;
       }
       if(!lease.record.controlStarted){

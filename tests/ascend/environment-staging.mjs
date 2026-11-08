@@ -16,7 +16,7 @@ async function fixture(t) {
   const calls = [], events = [], jobs = new Map(), excluded = [];
   const control = { failSync: false, disconnected: false, missingReceipt: false, uploadDelay: 0, uploadStates: null,
     backend:'remote-agent',failUpload:false,failDownload:false,parentUnknown:false,failParent:false,
-    uploadExit:null,downloadExit:null };
+    uploadExit:null,downloadExit:null,dropSetupReceipt:false };
   let sequence = 0;
   const operations = sdk.createLocalBashOperations();
   const context = {
@@ -62,7 +62,7 @@ async function fixture(t) {
         const file = args[args.indexOf('--file') + 1], sync = file.endsWith('sync.sh'),parent=file.endsWith('upload-parent.sh');
         const handle = `remote:${args[1]}:job:${++sequence}`, job = { state: 'running', sync,parent };
         jobs.set(handle, job);
-        if (!control.missingReceipt) await writeFile(args[args.indexOf('--receipt-file') + 1], JSON.stringify({ handle }));
+        if (!control.missingReceipt&&!(control.dropSetupReceipt&&(parent||sync))) await writeFile(args[args.indexOf('--receipt-file') + 1], JSON.stringify({ handle }));
         const script = parent&&control.failParent?'exit 19\n':sync && control.failSync ? 'exit 17\n' : await readFile(file, 'utf8');
         control.failSync = false;
         job.done = operations.exec(script, remote, { onData: () => {} }).then(result => {
@@ -399,4 +399,21 @@ test('canonical native bash edits persist locally and rsi_target restores update
   assert.equal(f.runs(false).length,4); // Three target requests plus frozen verification.
   assert.deepEqual(f.events.filter(e=>e.type==='source-staged').map(e=>e.reused),[false,false,true,true]);
   assert.equal(state.events(attempt.id).find(e=>e.type==='verification').data.passed,true);
+});
+
+
+test('completed excluded parent and sync jobs do not need payload timing or a local submission receipt',async t=>{
+  const f=await fixture(t);f.control.backend='ssh';f.control.dropSetupReceipt=true;
+  const environment=await f.connect({},'lost-setup-receipt');
+  assert.equal(await f.run('cat value.txt',environment),'one');
+  const setup=new Set(f.events.filter(e=>e.type==='execution-submitted'&&e.accountingExcluded&&e.handle?.includes(':job:')).map(e=>e.handle));
+  assert.ok(setup.size>=2);
+  for(const handle of setup){
+    const stopped=f.events.filter(e=>e.type==='execution-state'&&e.handle===handle&&e.state==='stopped');
+    assert.ok(stopped.length);
+    assert.ok(stopped.every(e=>e.accountingExcluded===true&&e.executionSeconds===0));
+  }
+  assert.equal(f.events.some(e=>e.type==='accounting-unresolved'&&setup.has(e.handle)),false);
+  assert.equal(f.sourceUploads().length,1);
+  assert.equal(f.runs(false).length,1);
 });
