@@ -75,7 +75,17 @@ Phase 1 and Phase 2 refill their backlogs from the curriculum when generation is
 Phase 1 constructs microprojects; Phase 2 constructs end-to-end projects with
 declared performance goals preserved as `performance_goal` with
 `verifier.performance_command`. These optional fields are preserved in either phase;
-a non-null goal requires a performance command. CPU construction checks establish
+a non-null goal requires a performance command. Generated performance projects also
+require `verifier.baseline_command`: an independent target self-test of the same
+PyTorch baseline and placement path used by the performance command, covering all
+frozen timing cases, warmup and timing calls against the trusted reference. This
+command must work before any optimized candidate exists. The controller executes
+it using the actor's admitted target resource before opening a model session.
+A completed nonzero baseline verdict marks the generated project invalid and
+freezes it without model summary or investigation retries. Transport uncertainty
+remains an execution-settlement problem rather than a baseline verdict. Existing
+supplied projects without this optional command retain their behavior.
+CPU construction checks establish
 correctness only and do not execute that performance command. Optional
 `curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override
 `enabled`, `topics`, and `preprompt` for that phase. With a campaign plan, drafts

@@ -301,7 +301,7 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
   const destination=join(tree,relative(common,source));
   const filter=path=>{signal?.throwIfAborted();return !['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');};
   await initializationCopy(source,destination,{recursive:true,verbatimSymlinks:true,filter},continuing);
-  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command};
+  const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command,baseline_command:spec.verifier.baseline_command};
   let construction_command=spec.bundle?.construction_command;
   const copied=[],hashes={};
   for(const path of files) {

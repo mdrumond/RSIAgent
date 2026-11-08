@@ -7,6 +7,12 @@ export async function findingsFor(options) {
   const {state,job,path,passed}=options,file=join(path,'findings.json');
   try{return JSON.parse(await readFile(file,'utf8'));}
   catch(error){if(error.code!=='ENOENT')throw error;}
+  const invalid=state.queryEvents(job.attempt.id,{types:['project-invalid'],order:'desc',limit:1})[0];
+  if(invalid) {
+    const findings={findings:'Generated project rejected before actor startup: target performance baseline failed. '+
+      JSON.stringify(invalid.data).slice(0,3000),useful:false,evidence:[invalid.data.evidence]};
+    await writeFile(file,JSON.stringify(findings,null,2)+'\n',{mode:0o600});return findings;
+  }
   const events=state.queryEvents(job.attempt.id,{types:['verification','rejected','attempt-error','failure-recorded','stage-completed','curriculum-session','curriculum-interrupted'],order:'desc',limit:12}).reverse().map(({type,data})=>({type,data}));
   const evidence=join(path,'diagnostics.json'),content=JSON.stringify(events,null,2)+'\n';
   await writeFile(evidence,content);

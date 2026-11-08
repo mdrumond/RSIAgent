@@ -210,11 +210,13 @@ export class RecoveryQueue {
       const lesson = { attempt_id: attemptId, project: attempt.project, kind: 'original',
         outcome, useful: useful === true, findings, evidence };
       this.db.prepare('INSERT INTO recovery_lessons(attempt,data) VALUES (?,?)').run(attemptId, JSON.stringify(lesson));
-      if (!passed && this.policy.recovery) {
+      const invalid=!passed&&this.state.queryEvents(attemptId,{types:['project-invalid'],limit:1}).length>0;
+      if(invalid)this.db.prepare('UPDATE projects SET frozen=1 WHERE id=?').run(attempt.project);
+      if (!passed && !invalid && this.policy.recovery) {
         this.db.prepare(`INSERT INTO recovery_queue(project,origin,kind,eligible_wave)
           VALUES (?,?,'investigation',?)`).run(attempt.project, attemptId, wave + 1);
       }
-      const result = { accepted: passed, frozen: false, failed_rounds: 0,
+      const result = { accepted: passed, frozen: invalid, failed_rounds: 0,
         next: this.entry(attempt.project) ?? null };
       this.state.event(attemptId, 'original-completed', { ...result, lesson });
       return result;

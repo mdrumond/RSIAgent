@@ -20,7 +20,7 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   const verifierContent=pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
@@ -39,7 +39,8 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       ['write',{path:'negative/answer.py',content:pytorch?`def run(x):\n    return x * ${negative===42?2:0}\n`:`answer=${negative}\n`}],
       ['write',{path:'verify.py',content:verifierContent}],
       ['submit_project',{goal,...(performanceGoal!==undefined?{performance_goal:performanceGoal}:{}),source:'source',reference:'reference',negative_controls:['negative'],
-        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),command:pytorch?cpuCommand+' --target':separateCommand?'requires-device-runtime':cpuCommand},
+        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),
+          ...(performanceCommand!==undefined&&baselineCommand!==null?{baseline_command:baselineCommand??cpuCommand}:{}),command:pytorch?cpuCommand+' --target':separateCommand?'requires-device-runtime':cpuCommand},
         ...(separateCommand||pytorch?{construction_command:cpuCommand}:{})}]];
     if(nestedBundle) {
       plan.splice(4,0,['write',{path:'helper.py',content:'factor=2\n'}],
@@ -95,11 +96,21 @@ test('PyTorch-only SIMT specification is admitted on CPU while target implementa
   assert.equal(spec.generation.requirements.capabilityEvidence,true);
   assert.deepEqual(spec.performance_goal,{comparison:'non-SIMT baseline'});
   assert.equal(spec.verifier.performance_command,'actor-target-benchmark');
+  assert.ok(spec.verifier.baseline_command);
+  const imported=await importProject(f.config.root,spec);
+  assert.equal(imported.verifier.baseline_command,spec.verifier.baseline_command);
   await assert.rejects(access(join(spec.source,'target-requested')),{code:'ENOENT'});
   assert.throws(()=>execFileSync(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3',
     [spec.verifier.files[0],'--target'],{cwd:spec.source,env:{...process.env,PYTHONPATH:spec.source},stdio:'pipe'}),
     error=>error.status===1);
   await access(join(spec.source,'target-requested'));
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
+});
+
+test('generated performance acceptance without an independent target baseline is rejected',async t=>{
+  const f=await fixture(t,{performanceGoal:'speedup',performanceCommand:'target-performance',baselineCommand:null,separateCommand:true});
+  assert.deepEqual(await refillProjects(f.options),[]);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM projects').get().n,0);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
 });
 

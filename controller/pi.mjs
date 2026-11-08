@@ -12,6 +12,7 @@ import { createPiTelemetryJournal } from './pi-telemetry.mjs';
 import {CampaignStorage} from './storage.mjs';
 import {prepareSourceGit} from './source-git.mjs';
 import { recordSkillContext } from './skill-evidence.mjs';
+import { validateTargetBaseline } from './baseline-preflight.mjs';
 
 const result=value=>({content:[{type:'text',text:JSON.stringify(value)}],details:{}});
 const lifecycleEvents=new Set(['agent_start','agent_end','turn_start','turn_end','message_end',
@@ -193,6 +194,8 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     if(signal?.aborted)throw new Error('Attempt interrupted');
     clock.check();
     await environment.prepare({project,attempt});
+    if(project.verifier.baseline_command)await validateTargetBaseline({project,state,attempt,attemptPath,
+      execute,checkVerifier,signal,remaining:()=>clock.remaining,register});
     const manager=attempt.session ? sdk.SessionManager.open(attempt.session,attemptPath,project.source)
       : sdk.SessionManager.create(project.source,attemptPath);
     if(storage)await storage.session(manager.getSessionFile(),{attempt:attempt.id,
@@ -254,7 +257,7 @@ export async function runAttempt({state,attempt,project,attemptPath,environmentF
     state.finish(attempt.id,accepted?'passed':'failed',{settleProject});
     return {accepted,elapsed:clock.elapsed};
   } catch(error) {
-    event('attempt-error',{message:error.message,stage:workflow.stage});
+    event('attempt-error',{message:error.message,stage:error.code==='PROJECT_BASELINE_INVALID'?'baseline-preflight':workflow.stage});
     state.checkpoint(attempt.id,clock.elapsed);
     if(error.code==='ACTOR_ELAPSED_EXHAUSTED' && !uncertain && !signal?.aborted) {
       event('rejected',{stage:workflow.stage,reason:error.code});
