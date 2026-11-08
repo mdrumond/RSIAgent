@@ -12,6 +12,7 @@ import { syncCampaignPlan } from '../controller/progress.mjs';
 import { CampaignStorage } from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import {checkBundle,validateBundle,withBundleBudget} from './project-bundle.mjs';
+import {compileVerifierEntries} from '../controller/project-commands.mjs';
 
 export async function readConfig(root) {
   root=await realpath(root);
@@ -275,6 +276,7 @@ export async function importProject(root,spec,options={}) {
   return withBundleBudget(spec,options,budget=>importProjectFiles(root,spec,{...options,signal:budget.signal,budget}));
 }
 async function importProjectFiles(root,spec,{continuing=false,signal,localExecution,budget}={}) {
+  spec={...spec,verifier:compileVerifierEntries(spec.verifier,{root:spec.bundle?.root??spec.source,source:spec.source})};
   validateAcceptance(spec);
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
@@ -318,7 +320,12 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
     if(spec.bundle)commands[key]=commands[key].split(common+sep).join(relative(destination,tree)+sep);
   }
   const result={...spec,source:destination};
-  if(spec.verifier)result.verifier={...spec.verifier,...commands,files:copied,hashes};
+  if(spec.verifier) {
+    const entrypoints=spec.verifier.entrypoints&&Object.fromEntries(Object.entries(spec.verifier.entrypoints)
+      .map(([field,entry])=>[field,{...entry,entrypoint:join(tree,relative(common,entry.entrypoint))}]));
+    result.verifier=compileVerifierEntries({...spec.verifier,...commands,files:copied,hashes,
+      ...(entrypoints?{entrypoints}:{})},{root:tree,source:destination});
+  }
   if(spec.bundle) {
     construction_command=construction_command.split(common+sep).join(tree+sep);
     const relocate=path=>join(tree,relative(common,path));

@@ -85,6 +85,18 @@ A completed nonzero baseline verdict marks the generated project invalid and
 freezes it without model summary or investigation retries. Transport uncertainty
 remains an execution-settlement problem rather than a baseline verdict. Existing
 supplied projects without this optional command retain their behavior.
+New curriculum submissions declare each target command as
+`{entrypoint: "trusted/verify.py", args: ["--mode", "correctness"]}`. The entrypoint
+is relative to the generation draft and must be listed in the frozen verifier
+files. RSI creates a quoted Python command with editable source as its working
+directory, retaining entrypoint metadata so import can regenerate its paths.
+Arguments use source-relative paths rather than absolute generation paths.
+Commands cannot supply `cd` prefixes or shell fragments. Supplied legacy project
+strings remain supported; their existing shell behavior is unchanged. A bundle's
+declared root and relative source/trusted-file layout also survive target staging.
+When the separate CPU construction command is omitted, its fallback uses the
+same frozen entrypoint with an absolute path so reference and negative-control
+directories may have different depths; import relocates that entrypoint too.
 CPU construction checks establish
 correctness only and do not execute that performance command. Optional
 `curriculum.generation.by_phase.phase1` and `.phase2` objects shallowly override
