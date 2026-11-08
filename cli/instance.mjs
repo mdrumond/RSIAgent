@@ -304,7 +304,7 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
   const filter=path=>{signal?.throwIfAborted();return !['.git','node_modules','.venv','__pycache__','.env'].includes(path.split(sep).at(-1)) && !path.split(sep).at(-1).startsWith('.env.');};
   await initializationCopy(source,destination,{recursive:true,verbatimSymlinks:true,filter},continuing);
   const commands={command:spec.verifier.command,performance_command:spec.verifier.performance_command,baseline_command:spec.verifier.baseline_command};
-  let construction_command=spec.bundle?.construction_command;
+  let construction_command=spec.bundle?.construction_command,baseline_construction_command=spec.bundle?.baseline_construction_command;
   const copied=[],hashes={};
   for(const path of files) {
     signal?.throwIfAborted();
@@ -313,6 +313,7 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
     if(await hash(target)!==expected[absolute])throw new Error('Frozen verifier changed during import');
     hashes[target]=expected[absolute];
     if(construction_command)construction_command=construction_command.split(absolute).join(target);
+    if(baseline_construction_command)baseline_construction_command=baseline_construction_command.split(absolute).join(target);
     for(const key of Object.keys(commands))if(commands[key])commands[key]=commands[key].split(absolute).join(relative(destination,target));
   }
   for(const key of Object.keys(commands))if(commands[key]) {
@@ -328,9 +329,11 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
   }
   if(spec.bundle) {
     construction_command=construction_command.split(common+sep).join(tree+sep);
+    if(baseline_construction_command)baseline_construction_command=baseline_construction_command.split(common+sep).join(tree+sep);
     const relocate=path=>join(tree,relative(common,path));
     result.bundle={...spec.bundle,root:tree,reference:relocate(spec.bundle.reference),
-      negative_controls:spec.bundle.negative_controls.map(relocate),construction_command};
+      negative_controls:spec.bundle.negative_controls.map(relocate),construction_command,
+      ...(baseline_construction_command?{baseline_construction_command}:{})};
     await validateBundle(result,join(own,'bundle-validation'),{signal,localExecution,budget});
   }
   return result;

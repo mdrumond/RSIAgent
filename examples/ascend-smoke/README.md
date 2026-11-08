@@ -39,3 +39,22 @@ the real actor has 300. Each smoke has an independent 900-second outer deadline.
 Controller and actor assert zero curriculum-generation records. Evidence, native
 sessions, command receipts and `result.json` remain in the output directory.
 Any failed/blocked check must be resolved before a fresh campaign starts.
+
+The generated-project integration smoke uses scripted actual Pi submissions (no
+paid curriculum calls), then production generation/import, deletion of original
+artifacts, target staging and baseline preflight. Run its portable CPU version:
+
+```sh
+node --test --test-concurrency=1 --test-name-pattern 'generated nested starter' tests/ascend/project-generation.mjs
+```
+
+For an actual A3/A5 binding, set `RSI_ASCEND_SMOKE_LIVE=1` and
+`RSI_GENERATED_SMOKE_PROFILE` to the same ignored private profile used above.
+Run on the controller host for A3 and directly on the A5 host. Set
+`RSI_TEST_PYTHON` to that host's verified CPU PyTorch interpreter. The profile
+must select the canonical Ascend adapter, explicit matching product and mode,
+and containment of at most128tasks/4GiB; the same smoke admission checks apply.
+Use an outer900-second/4GiB process guard and perform device preflight through
+the installed CPL interface. The generated baseline uses only a tiny tensor
+on logical `npu:0`; CPU construction/selftests do not establish device timing.
+This opt-in test never calls a paid provider or starts an optimization actor.

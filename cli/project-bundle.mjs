@@ -56,6 +56,8 @@ export async function checkBundle(spec) {
       typeof bundle.construction_command!=='string'||!bundle.construction_command.trim()||
       !Number.isFinite(bundle.seconds)||bundle.seconds<=0)
     throw new Error('Invalid project bundle contract');
+  if(bundle.baseline_construction_command!==undefined&&(typeof bundle.baseline_construction_command!=='string'||!bundle.baseline_construction_command.trim()))
+    throw new Error('Invalid CPU baseline selftest command');
   const root=await realpath(bundle.root),source=await realpath(spec.source);
   const fixtures=await Promise.all([bundle.reference,...bundle.negative_controls].map(path=>realpath(path)));
   if(new Set(fixtures).size!==fixtures.length)throw new Error('Project bundle reference and controls must be distinct');
@@ -93,11 +95,15 @@ export async function validateBundle(spec,instancePath,options={}) {
   active.throwIfAborted();
   const environment=await createEnvironment({mode:'local',localExecution:options.localExecution},{instancePath,signal:active,
     exclude:async(_label,fn)=>fn(),event:()=>{}});
-  for(const [index,cwd] of [spec.bundle.reference,...spec.bundle.negative_controls].entries()) {
+  const cases=[{kind:'reference',cwd:spec.bundle.reference,expected:0},
+    ...spec.bundle.negative_controls.map(cwd=>({kind:'negative control',cwd,expected:1})),
+    ...(spec.bundle.validate_starter===true?[{kind:'starter',cwd:spec.source,expected:0}]:[]),
+    ...(spec.bundle.baseline_construction_command?[{kind:'baseline',cwd:spec.source,expected:0,command:spec.bundle.baseline_construction_command}]:[])];
+  for(const {kind,cwd,expected,command=spec.bundle.construction_command} of cases) {
     active.throwIfAborted();await unchanged();active.throwIfAborted();
-    const result=await environment.execute(spec.bundle.construction_command,cwd,{signal:active,timeout:Math.max(.001,remaining())});
+    const result=await environment.execute(command,cwd,{signal:active,timeout:Math.max(.001,remaining())});
     active.throwIfAborted();await unchanged();
-    if(!result.settled||result.exitCode!==(index?1:0))
-      throw new Error('Imported bundle CPU '+(index?'negative control':'reference')+' failed: '+JSON.stringify({cwd,...result}));
+    if(!result.settled||result.exitCode!==expected)
+      throw new Error('Imported bundle CPU '+kind+' failed: '+JSON.stringify({cwd,...result}));
   }
 }

@@ -128,6 +128,6 @@ test('curriculum smoke validates and imports exactly one real-tool PyTorch proje
     assert.equal(config.curriculum_seconds,180);assert.equal(config.target,'cpu');
     assert.equal(config.environment.module,'machinery/integrations/environments/index.mjs');
     assert.equal(config.environment.options.mode,'local');
-    assert.deepEqual(imported.generation.checks.map(check=>check.exitCode),[0,1]);
+    assert.deepEqual(imported.generation.checks.map(check=>check.exitCode),[0,1,0]);
     if(!process.env.DRIVER_ARTIFACTS)await rm(path,{recursive:true});
   });

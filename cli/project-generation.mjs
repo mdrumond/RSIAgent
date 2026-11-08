@@ -17,7 +17,7 @@ const entrypoint=Type.Object({entrypoint:Type.String({minLength:1}),args:Type.Ar
 const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1}),
   verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:entrypoint,
     performance_command:Type.Optional(entrypoint),baseline_command:Type.Optional(entrypoint)}),
-  construction_command:Type.Optional(entrypoint),
+  construction_command:Type.Optional(entrypoint),baseline_construction_command:Type.Optional(entrypoint),
   reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
 
 // Same bounded event contract as State, scoped exclusively to generation telemetry.
@@ -164,7 +164,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
         attemptId:d.id,role:'generation',path:root,bridge,signal:active,resume:true,accepted:()=>d.status==='ready',
         prompt:`Construct ONE fresh original ${phase==='phase1'?'microproject':'end-to-end project'} in Python for topic ${JSON.stringify(d.topic)}.\n`+
           (phase==='phase1'?`Issue only a runnable PyTorch workload specification, CPU reference, fixtures, negative controls and verifier interface. Do not generate any device kernel code in source, reference, controls or verifier: no Triton, Catlass DSL or Ascend C implementations, including SIMT/non-SIMT benchmark baselines. Define the callable interface, shapes, dtypes, mathematical behavior and tolerances; use small deterministic CPU fixtures. Editable source is a straightforward PyTorch baseline. ${deviceGoal?`The actor will write all ${config.kernel_language??'target'} kernel code and any device benchmark baselines after admission.`:'This is a CPU-only Python project. The PyTorch starter may satisfy final correctness; no device kernel or separate target acceptance is required.'}\n`:'')+
-          `Retain performance goals requested by the curriculum as performance_goal with verifier.performance_command. For every performance command provide verifier.baseline_command: a target-only self-test that executes the SAME PyTorch baseline callable and placement path used by performance_command over ALL frozen timing cases, including warmup and timing calls. It must compare baseline results to the independent reference, run without an optimized candidate, and exit 0 only when all baseline cases execute correctly. The controller runs this gate on the target before starting the actor; do not run it during curriculum construction. Do not invent performance requirements or claim CPU construction proves timing.\n`+
+          `Retain performance goals requested by the curriculum as performance_goal with verifier.performance_command. For every performance command provide verifier.baseline_command: a target-only self-test that executes the SAME PyTorch baseline callable and placement path used by performance_command over ALL frozen timing cases, including warmup and timing calls. It must compare baseline results to the independent reference, run without an optimized candidate, and exit 0 only when all baseline cases execute correctly. The controller runs this gate on the target before starting the actor; do not run it during curriculum construction. For every performance command also submit baseline_construction_command as {entrypoint,args}, using the SAME frozen entrypoint as baseline_command and SAME baseline callable/dependency path with a tiny CPU fixture. This is only a small dependency/numerical selftest: no timing, warmups, repetitions or replay of expensive target timing cases. Do not invent performance requirements or claim CPU construction proves timing.\n`+
           (requirements.performance?`This topic requires a real performance_goal, verifier.performance_command and a separate CPU construction_command.\n`:'')+
           (requirements.capabilityEvidence?`SIMT is the actor's optimization objective. Specify deferred target acceptance that requires actual supported ${config.kernel_language??'target'} SIMT APIs/compiler mapping and comparison against an equivalent non-SIMT/vector baseline on an isolated device. Do not implement or benchmark either device kernel during curriculum construction. CPU construction cannot establish SIMT or timing evidence.\n`:'')+
           `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
@@ -174,7 +174,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           `Create an independent verifier outside those trees. Declare each target command as {entrypoint, args}: entrypoint is a frozen Python file path relative to this draft directory and args is an array of literal arguments. RSI derives its command from editable source; do not supply shell commands or cd prefixes. `+
           (deviceGoal?`Keep target acceptance separate from CPU specification validation: an unchanged PyTorch starter must not satisfy the target kernel goal. Provide the target correctness/performance commands for the actor to run later; do not probe target APIs, compile kernels, submit remote jobs or collect device timings to construct this specification.\n`:'')+
           `When target acceptance needs a device, provide a separate construction_command as {entrypoint, args}, with the same frozen-file and literal-argument contract, for CPU proof against the reference and controls. Omit construction_command when verifier.command already runs on CPU; the controller uses that entrypoint automatically. `+
-          `The construction command (or verifier command when omitted) must accept reference with exit 0 and reject every negative with exit 1. `+
+          `The construction command (or verifier command when omitted) must accept the independent reference and unchanged PyTorch starter from their respective cwd with exit 0, and reject every negative with exit 1. CPU starter validation does not replace separate target-kernel acceptance. `+
           `CPU construction checks must require no device. Each check executes the SAME command with cwd set to the reference directory, then each negative-control directory. Load the candidate from cwd with the same filename in every tree; never hardcode the reference path in command arguments. Resolve trusted data relative to the frozen verifier file. The source is the actor starting point, not the trusted solution. `+
           `Submit relative artifact paths and the project goal via submit_project. Do not reuse completed implementations. Do not assign project IDs or lineage.`,
         tool:{name:'submit_project',label:'Submit project',description:'Submit constructed source, independent verifier and CPU controls.',parameters:schema,
@@ -188,6 +188,12 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               const artifacts=await checkProposal(root,p);
               const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
               validateAcceptance({...p,verifier});
+              if(p.verifier?.performance_command&&!p.baseline_construction_command)
+                throw new Error('Generated performance project requires baseline_construction_command');
+              const baseline=p.baseline_construction_command===undefined?undefined:
+                compileVerifierEntries({command:p.baseline_construction_command},{root,files:artifacts.files,required:true});
+              if(baseline&&baseline.entrypoints.command.entrypoint!==verifier.entrypoints.baseline_command?.entrypoint)
+                throw new Error('CPU baseline selftest must use the frozen baseline_command entrypoint');
               const construction=p.construction_command===undefined?verifier:
                 compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
               const constructionCommand=entrypointCommand(construction.entrypoints.command);
@@ -198,11 +204,14 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               const hashFiles=()=>bundleHashes(artifacts.files);
               const hashes=await hashFiles();
               await mkdir(join(root,'construction'),{recursive:true});
-              for(const [index,cwd] of [artifacts.reference,...artifacts.negatives].entries()) {
+              const cases=[{kind:'reference',cwd:artifacts.reference,expected:0},
+                ...artifacts.negatives.map(cwd=>({kind:'negative',cwd,expected:1})),
+                {kind:'starter',cwd:artifacts.source,expected:0},
+                ...(baseline?[{kind:'baseline',cwd:artifacts.source,expected:0,command:entrypointCommand(baseline.entrypoints.command)}]:[])];
+              for(const {kind,cwd,expected,command=constructionCommand} of cases) {
                 active.throwIfAborted();
                 // An omitted CPU command uses the frozen absolute entrypoint;
                 // fixture cwd depths need not match the editable source.
-                const command=constructionCommand;
                 let output='',execution;
                 const logPath=join(root,'construction',randomUUID()+'.log'),log=await open(logPath,'wx',0o600);
                 try {
@@ -210,15 +219,15 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                     onData:chunk=>{writeSync(log.fd,chunk);output=(output+chunk.toString()).slice(-4000);}});
                 }catch(error){execution={settled:false,exitCode:null,error:error.message};}
                 finally{await log.close();}
-                const check={kind:index?'negative':'reference',cwd,command,expected_exit:index?1:0,...execution,log:logPath,output};
+                const check={kind,cwd,command,expected_exit:expected,...execution,log:logPath,output};
                 checks.push(check);store.adapter.event(d.id,'generation-construction-check',check);
                 if(JSON.stringify(await hashFiles())!==JSON.stringify(hashes))throw new Error('Verifier changed during CPU checks');
-                if(!execution.settled||execution.exitCode!==(index?1:0))throw new Error('CPU construction check failed: '+JSON.stringify(check));
+                if(!execution.settled||execution.exitCode!==expected)throw new Error('CPU construction check failed: '+JSON.stringify(check));
               }
               active.throwIfAborted();
               d.spec={id:d.id,phase:d.phase,...(d.campaign_entry?{campaign_entry:d.campaign_entry}:{}),goal:p.goal,source:artifacts.source,actor_seconds:config.actor_seconds,
                 target:config.target,...(p.performance_goal!=null?{performance_goal:p.performance_goal}:{}),
-                bundle:{...packaged.bundle,seconds:Math.max(.001,d.seconds-spent())},
+                bundle:{...packaged.bundle,validate_starter:true,...(baseline?{baseline_construction_command:entrypointCommand(baseline.entrypoints.command)}:{}),seconds:Math.max(.001,d.seconds-spent())},
                 verifier:{...verifier,files:artifacts.files,hashes},
                 generation:{draft:d.id,topic:d.topic,requirements,checks}};
               d.proposal=p;d.status='ready';delete d.error;checkpoint();
