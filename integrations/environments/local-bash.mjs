@@ -12,17 +12,17 @@ const counters=text=>Object.fromEntries(text.trim().split('\n').filter(Boolean).
 
 // Pi owns command execution, output streaming, cancellation and timeouts. The
 // operating system bounds its complete command cgroup, including detached children.
-export function createLocalExecutionOperations(sdk,limits) {
+export function createLocalExecutionOperations(sdk,limits,{signal:cleanupSignal}={}) {
   const pi=sdk.createLocalBashOperations();
   if(!limits)return pi;
   const {tasks=128,memory_bytes=4*1024**3}=limits;
   if(!Number.isSafeInteger(tasks)||tasks<4||!Number.isSafeInteger(memory_bytes)||memory_bytes<1024**2)
     throw Error('Positive local execution task and memory limits required');
-  const control=async(command,{signal}={})=>{
+  const control=async(command,{signal=cleanupSignal}={})=>{
     let output='';const result=await pi.exec(command,process.cwd(),{timeout:5,signal,onData:chunk=>{output=(output+chunk).slice(-16384);}});
     return {...result,output};
   };
-  const observe=async(unit,{signal}={})=>{
+  const observe=async(unit,{signal=cleanupSignal}={})=>{
     if(!units.test(unit))throw Error('Owned command scope required');
     const result=await control(`systemctl --user show ${quote(unit)} --property=LoadState --property=ActiveState --property=ControlGroup`,{signal});
     const properties=Object.fromEntries(result.output.trim().split('\n').filter(line=>line.includes('=')).map(line=>{
@@ -32,7 +32,7 @@ export function createLocalExecutionOperations(sdk,limits) {
     if(result.exitCode!==0)return {state:'unknown'};
     return {state:['inactive','failed'].includes(properties.ActiveState)?'stopped':'running',cgroup:properties.ControlGroup};
   };
-  const stop=async(unit,{signal}={})=>{
+  const stop=async(unit,{signal=cleanupSignal}={})=>{
     if(!units.test(unit))throw Error('Owned command scope required');
     // A timeout/abort may have stopped systemd-run while its scope still has work.
     await control(`systemctl --user kill --kill-whom=all --signal=KILL ${quote(unit)}; systemctl --user stop ${quote(unit)}`,{signal});

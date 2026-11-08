@@ -211,7 +211,7 @@ export async function createEnvironment(options, context) {
     signal?.throwIfAborted();
     return nativeClient(args, {signal});
   };
-  const local = createLocalExecutionOperations(sdk,options.localExecution);
+  const local = createLocalExecutionOperations(sdk,options.localExecution,{signal:context.stopSignal});
   const remote = options.mode === 'cpl';
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
@@ -316,7 +316,7 @@ export async function createEnvironment(options, context) {
     await event('execution-state', { handle, ...state });
     return state;
   }
-  async function stop(handle, {accountingExcluded=false,signal:stopSignal}={}) {
+  async function stop(handle, {accountingExcluded=false,signal:stopSignal=context.stopSignal}={}) {
     check(handle);
     const signal = stopSignal??AbortSignal.timeout(5000);
     if (remote) {
@@ -445,7 +445,7 @@ export async function createEnvironment(options, context) {
     return result;
   }
   async function execute(command, cwd, opts = {}) {
-    opts = {...opts, signal: context.signal && opts.signal
+    opts = {...opts,stopSignal:opts.stopSignal??context.stopSignal, signal: context.signal && opts.signal
       ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal};
     const signal = opts.signal;
     const started = performance.now();

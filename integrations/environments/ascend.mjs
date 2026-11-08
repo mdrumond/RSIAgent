@@ -316,7 +316,7 @@ export async function createEnvironment(options, context) {
     controlToken=activeLease.token;controlSignal=budget.signal;
     const path=join(dirname(activeLease.receipt),'control'),sourcePath=join(path,'source');
     await mkdir(sourcePath,{recursive:true});
-    controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:budget.signal,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
+    controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:budget.signal,stopSignal:budget.signal,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
       if(type==='execution-output'&&(data.stdout||data.stderr)){
         // Global native journals must survive owner loss. Actor-facing artifacts
         // belong to the campaign and must be retained before storage sees them.
