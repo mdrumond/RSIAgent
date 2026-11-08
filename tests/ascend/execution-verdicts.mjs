@@ -9,6 +9,7 @@ import {validateTargetBaseline} from '../../controller/baseline-preflight.mjs';
 import {State} from '../../controller/state.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
+import {campaignProgress,syncCampaignPlan,advanceCampaignEntry} from '../../controller/progress.mjs';
 
 // Only transport is a local filesystem fixture: production synchronization and
 // supervisor scripts actually execute through Pi's native Bash operations.
@@ -66,7 +67,18 @@ test('real frozen-file guard exit125 remains infrastructure across target observ
   const result=f.queue.recordOriginal(f.attempt.id,{passed:false,...findings},1);
   assert.equal(result.frozen,false);assert.equal(result.next.kind,'retry');assert.ok(result.next.retry_after>Date.now());
   assert.deepEqual(f.queue.ready(2),[]);
+  const reopened=new State(join(f.root,'state.sqlite'));try {
+    const queue=new RecoveryQueue(reopened);
+    assert.equal(queue.entry('p').retry_after,result.next.retry_after);assert.deepEqual(queue.ready(2),[]);
+  }finally{reopened.close();}
   for(const lesson of f.queue.lessons())f.queue.acknowledgeLesson(lesson.id);
+  f.state.event(f.attempt.id,'postprocess-completed',{});
+  const legacy={mode:'phase1',completion_target:1,phase_sequence:['phase1','phase2']};
+  const planned={mode:'phase1',campaign_plan:[{id:'first',phase:'phase1',new_projects:1},{id:'second',phase:'phase2',new_projects:1}]};
+  f.state.db.prepare("UPDATE events SET data=json_set(data,'$.campaign_entry','first') WHERE attempt=? AND type='job-admitted'").run(f.attempt.id);
+  syncCampaignPlan(f.state,planned);
+  assert.equal(campaignProgress(f.state,legacy).phaseComplete,false);
+  assert.equal(advanceCampaignEntry(f.state,planned),false);
   f.state.db.prepare('UPDATE recovery_queue SET retry_after=?').run(Date.now()-1);
   assert.equal(f.queue.ready(2)[0].kind,'retry');
   const retry=f.queue.claim('p',2,{}).attempt;
@@ -75,6 +87,21 @@ test('real frozen-file guard exit125 remains infrastructure across target observ
   const next=f.queue.complete(retry.id,{passed:false,...findings},2);
   assert.equal(next.frozen,false);assert.equal(next.failed_rounds,0);assert.equal(next.next.kind,'retry');
   assert.ok(next.next.retry_after>Date.now());
+  for(const lesson of f.queue.lessons())f.queue.acknowledgeLesson(lesson.id);
+  f.state.event(retry.id,'postprocess-completed',{});
+  assert.equal(advanceCampaignEntry(f.state,planned),false);
+  f.state.db.prepare('UPDATE recovery_queue SET retry_after=?').run(Date.now()-1);
+  const final=f.queue.claim('p',3,{}).attempt;
+  f.state.finish(final.id,'passed');f.state.event(final.id,'failure-settlement',{closed:false});
+  assert.throws(()=>f.queue.complete(final.id,{passed:true,...findings},3),/settlement/);
+  f.state.event(final.id,'failure-settlement',{closed:true});
+  f.queue.complete(final.id,{...findings,passed:true},3);
+  for(const lesson of f.queue.lessons())f.queue.acknowledgeLesson(lesson.id);
+  assert.equal(advanceCampaignEntry(f.state,planned),false);
+  f.state.event(final.id,'postprocess-completed',{});
+  assert.equal(campaignProgress(f.state,legacy).finishedOriginals,1);
+  assert.equal(campaignProgress(f.state,planned).finishedOriginals,1);
+  assert.equal(advanceCampaignEntry(f.state,planned),true);
 });
 
 test('real completed baseline exit1 remains a verifier verdict',async t=>{

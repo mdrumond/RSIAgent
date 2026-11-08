@@ -1,5 +1,19 @@
 const phases = ['phase1', 'phase2', 'inference'];
 
+// A transport refusal before any actor starts is not an observed original.
+// Ordinary kernel failures still count, including those awaiting investigation.
+const observedOriginal=`(a.session IS NOT NULL OR NOT EXISTS (
+  SELECT 1 FROM events infrastructure WHERE infrastructure.attempt=a.id AND infrastructure.type='preactor-infrastructure'
+) OR EXISTS (
+  SELECT 1 FROM attempts observed WHERE observed.project=a.project AND observed.outcome IN ('passed','failed')
+  AND NOT EXISTS (SELECT 1 FROM events infrastructure WHERE infrastructure.attempt=observed.id
+    AND infrastructure.type='preactor-infrastructure' AND observed.session IS NULL)
+  AND EXISTS (SELECT 1 FROM events post WHERE post.attempt=observed.id AND post.type='postprocess-completed')
+  AND NOT EXISTS (SELECT 1 FROM events settlement WHERE settlement.sequence=(SELECT MAX(sequence) FROM events
+    WHERE attempt=observed.id AND type='failure-settlement')
+    AND CASE WHEN json_valid(settlement.data) THEN COALESCE(json_type(settlement.data,'$.closed')!='true',1) ELSE 1 END)
+))`;
+
 function positive(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -45,7 +59,7 @@ export function campaignProgress(state, config) {
         CASE WHEN json_valid(ad.data) THEN json_extract(ad.data,'$.mode') END AS admission_mode,
         CASE WHEN json_valid(p.spec) THEN json_extract(p.spec,'$.phase') END AS spec_phase,
         s.phase AS supplied_phase,
-        CASE WHEN a.outcome IN ('passed','failed') AND ${acknowledged}
+        CASE WHEN a.outcome IN ('passed','failed') AND ${acknowledged} AND ${observedOriginal}
           AND EXISTS (SELECT 1 FROM events post WHERE post.attempt=a.id AND post.type='postprocess-completed'
             AND json_valid(post.data) AND json_type(post.data)='object')
           AND NOT EXISTS (SELECT 1 FROM events settlement WHERE settlement.sequence=(
@@ -161,7 +175,7 @@ export function currentCampaignEntry(state, config) {
     WHERE json_extract(ad.data,'$.campaign_entry')=? AND json_extract(ad.data,'$.kind')='original'
     AND ${original}
     AND a.outcome IN ('passed','failed')
-    AND ${acknowledged}
+    AND ${acknowledged} AND ${observedOriginal}
     AND EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed'
       AND json_valid(e.data) AND json_type(e.data)='object')
     AND NOT EXISTS (SELECT 1 FROM events e WHERE e.sequence=(SELECT MAX(sequence) FROM events
