@@ -9,7 +9,8 @@ import {State} from '../controller/state.mjs';
 import {campaignElapsed} from '../controller/campaign-budget.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
-import {qualificationGate} from './campaign-manifest.mjs';
+import {qualificationGate,campaignEntryConfig} from './campaign-manifest.mjs';
+import {generationSettings} from '../controller/progress.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import {memorySettings,memoryDecision,sampleCampaignMemory,writeMemoryControl,requestMemoryPause,releaseKnowledgeService} from './campaign-memory.mjs';
 
@@ -65,13 +66,39 @@ export async function localOwnersStopped(config,{stopped=ownerStopped}={}) {
   }finally{state.close();}
 }
 
+// Foreground work only: perpetual A/B and controller/health poll telemetry must
+// not disguise a campaign with no runnable originals. Curriculum elapsed is a
+// bounded construction checkpoint, not the campaign wall clock.
+export async function campaignActivity(state,{stopped=ownerStopped}={}) {
+  const table=name=>Boolean(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
+  const milestone=state.db.prepare(`SELECT MAX(sequence) n FROM events WHERE type IN
+    ('job-admitted','stage-completed','postprocess-completed','campaign-entry-started','campaign-entry-completed')`).get().n;
+  const projects=state.db.prepare('SELECT COUNT(*) n FROM projects').get().n;
+  const lessons=table('recovery_lessons')?state.db.prepare('SELECT COUNT(*) n FROM recovery_lessons WHERE recorded=1').get().n:0;
+  const drafts=table('generation_drafts')?state.db.prepare(`SELECT id,
+    json_extract(data,'$.status') status,
+    MIN(COALESCE(json_extract(data,'$.elapsed'),0),COALESCE(json_extract(data,'$.seconds'),0)) elapsed
+    FROM generation_drafts ORDER BY id`).all():[];
+  const controller=table('control')?state.db.prepare("SELECT value FROM control WHERE key='owner'").get()?.value:null;
+  let active=false;
+  for(const {owner} of state.db.prepare(`SELECT owner FROM attempts a WHERE outcome IS NULL OR
+      NOT EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`).all()) {
+    // Admission initially belongs to the controller until the worker claims it.
+    // A stranded admission is not evidence of an active actor or device compile.
+    if(!owner||owner===controller)continue;
+    const identity=JSON.parse(owner);
+    if(validOwner(identity)&&!await stopped(identity)){active=true;break;}
+  }
+  return {signature:JSON.stringify({milestone,projects,lessons,drafts}),active};
+}
+
 async function nativeSnapshot(config,cli) {
   const status=await cli(['status','--instance',config.root]);
   const state=new State(join(config.root,'state.sqlite'));
   try {
     const control=state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get();
     const value=key=>control?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
-    return {status,budget:value('campaign-budget'),operation:value('operation'),
+    return {status,activity:await campaignActivity(state),budget:value('campaign-budget'),operation:value('operation'),
       paused:Boolean(value('pause')),memoryPause:value('memory-pause'),operatorStopped:Boolean(value('operator-stop')),
       attempts:state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,
       leaseBlocked:state.db.prepare("SELECT data,created FROM events WHERE type='device-lease-blocked' ORDER BY sequence DESC LIMIT 1").get()};
@@ -111,11 +138,12 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
   const closed=providedClosed??(async config=>await nativeClosed(config)&&(await localOwnersStopped(config)).stopped);
   const snapshot=providedSnapshot??(config=>nativeSnapshot(config,cli));
   const owner=await identity(),release=await claim(config,owner);
-  let blockedSince=null,nextReconcile=0,lastLaunch=null,report,memory;
+  let blockedSince=null,nextReconcile=0,lastLaunch=null,report,memory,progressWatch;
   const startedWall=Date.now();
   const settings=config.local_memory?memorySettings(config.local_memory):null,known=new Map();
   const publish=async(state,reason,extra={})=>{
     report={format:1,at:now(),observedAt:new Date().toISOString(),owner,state,reason,sourceRevision,
+      ...(progressWatch?{progressWatch:{...progressWatch,idleElapsed:Math.max(0,now()-progressWatch.since)}}:{}),
       blockedSince,blockedElapsed:blockedSince===null?0:Math.max(0,now()-blockedSince),...(memory?{memory}:{}),...extra};
     await persist(config,report);return report;
   };
@@ -140,6 +168,11 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
     }
     if(prior?.sourceRevision===sourceRevision&&Number.isFinite(prior.blockedSince))
       blockedSince=prior.owner?.boot===owner.boot?Math.min(prior.blockedSince,now()):now()-(prior.blockedElapsed??0);
+    if(prior?.sourceRevision===sourceRevision&&prior.progressWatch) {
+      const previous=prior.progressWatch;
+      progressWatch={...previous,since:prior.owner?.boot===owner.boot
+        ?Math.min(previous.since,now()):now()-(previous.idleElapsed??0)};
+    }
     for(;;) {
       if(signal?.aborted)return await pause('signal');
       try {
@@ -159,6 +192,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
           if(status.wait?.reason==='memory-concurrency-minimum')return await pause('memory-at-minimum');
           // A completed resume may have survived a supervisor crash before its acknowledgement.
           if(memory?.resumePending&&!view.paused&&status.controller?.state==='running') {
+            if(progressWatch)progressWatch.since=now();
             memory={...memory,token:null,resumePending:false,recovered:true,lowSince:null,highSince:null,lastReduction:null};
             await memoryControl(config,memory);await publish('running','memory-recovered');
           }
@@ -182,9 +216,10 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
             try{await memoryRelease(config);}
             catch(error){return await publish('attention-needed','memory-service-release',{checkpointPending:true,errorType:error.name});}
             if(exhausted)return await publish('attention-needed','memory-at-minimum',{checkpointPending:false});
-            memory.lowSince=null;await publish('cooling','memory-pressure');continue;
+            memory.lowSince=null;if(progressWatch)progressWatch.since=now();await publish('cooling','memory-pressure');continue;
           }
           if(memory.token) {
+            if(progressWatch)progressWatch.since=now();
             if(!view.paused||view.memoryPause!==memory.token)return await pause('memory-pause-ownership');
             if(now()-(memory.phaseAt??now())>=1800000)return await publish('attention-needed','memory-recovery-timeout');
             if(memory.resumePending) {
@@ -223,6 +258,18 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(status.controller?.state==='running')blockedSince=null;
         if(blockedSince!==null&&now()-blockedSince>=1800000)return await pause('infrastructure-or-ownership');
         if(status.controller?.state==='running') {
+          const activity=view.activity??{signature:JSON.stringify(status.progress??{}),
+            active:(status.attempts??[]).some(attempt=>attempt.outcome===null)};
+          const entry=status.progress?.currentEntry;
+          const policy=entry?campaignEntryConfig(current,entry.id):current;
+          const waitingExternal=status.wait?.reason==='waiting-inputs'&&entry?.remainingAdmissions>0&&
+            !generationSettings(policy,entry.phase).enabled;
+          if(!progressWatch||activity.active||waitingExternal||activity.signature!==progressWatch.signature)
+            progressWatch={signature:activity.signature,since:now()};
+          if(now()-progressWatch.since>=1800000) {
+            return await pause(entry?.remainingAdmissions===0&&entry.remainingOriginals>0
+              ?'exhausted-admissions-unsettled-originals':'campaign-no-progress');
+          }
           await publish('running',status.wait?.reason??'active',{progress:{currentEntry:status.progress?.currentEntry?.id??null,
             finishedOriginals:status.progress?.finishedOriginals??0,target:status.progress?.target??null},elapsedSeconds:used,availableBytes:available});
         }else if(now()>=nextReconcile) {
