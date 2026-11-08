@@ -767,10 +767,16 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
 for(const stage of ['payload-observe','control-prepare','control-observe','admission-read'])
 test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
   const f=await fixture(t),controls=new Set(),receipts=new Set();let payload,observations=0,aborted=0,blocking=true;
+  const {createServer,connect}=await import('node:net'),sockets=new Set();
+  const server=createServer(socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));});
   const hang=signal=>{
     assert.ok(signal,'cleanup must pass its independent signal into every RPC');
     return new Promise((_,reject)=>{
-      const stop=()=>{aborted++;reject(signal.reason);};
+      // A real open transport keeps the event loop alive, as a CPL request does.
+      const socket=connect(server.address().port,'127.0.0.1');socket.on('error',reject);
+      const stop=()=>{aborted++;socket.destroy();reject(signal.reason);};
       if(signal.aborted)stop();else signal.addEventListener('abort',stop,{once:true});
     });
   };
