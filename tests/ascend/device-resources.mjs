@@ -647,9 +647,10 @@ for(const unknown of [false,true])test(`failed control admission download (${unk
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
 });
 
-test('control-started without a native identity is held instead of redispatched',async t=>{
+test('control-started with an unknown payload submission is held instead of redispatched',async t=>{
   const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
   await held.update({controlStarted:true});
+  await held.event('execution-submitting',{submission:'unknown-control',kind:'run',controlPayload:true,accountingExcluded:true});
   await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
   assert.equal(await f.environment.reconcileLease(),false);
   assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
@@ -664,4 +665,33 @@ test('explicit closed legacy-control migration requires an absent journal and na
     migrateClosedControl:async record=>{checked=true;return record.token===held.token&&record.controlHandle==='remote:fixture:job:legacy-control';}});
   assert.equal(result.closed,true);assert.equal(checked,true);
   assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:legacy-control'));
+});
+
+
+for(const setup of ['none','closed','terminal','unknown','live'])test(`pre-payload control setup ${setup} retains closure gates before host reconciliation`,async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  await held.update({owner:{...held.record.owner,start:'stopped-owner'},controlStarted:true,controlHandle:null});
+  if(setup!=='none'){
+    await held.event('execution-submitting',{submission:'setup',kind:'upload',accountingExcluded:true,purpose:'device-lease-control'});
+    if(setup==='closed')await held.event('execution-submitted',{submission:'setup',closed:true});
+    if(['terminal','live'].includes(setup))await held.event('execution-submitted',{
+      submission:'setup',closed:false,handle:'remote:fixture:transfer:old-setup'});
+  }
+  const environment=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>{
+    if(setup==='live'&&args[0]==='observe'&&args[1]==='remote:fixture:transfer:old-setup')return {state:'running'};
+    return f.context.client(args,settings);
+  }});
+  const result=await environment.reconcileReservation(0);
+  const fenced=['unknown','live'].includes(setup);
+  assert.equal(result.closed,!fenced);
+  const controls=f.calls.filter(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh'));
+  assert.equal(controls.length,fenced?0:1);
+  if(fenced){
+    assert.equal(result.reason,setup==='unknown'?'submission-unknown':'execution-unresolved');
+    const retained=JSON.parse(await readFile(held.receipt,'utf8'));
+    assert.equal(retained.controlStarted,true);assert.equal(retained.controlHandle,null);
+  }else{
+    await assert.rejects(readFile(held.receipt),{code:'ENOENT'});
+    assert.ok(f.events.some(e=>e.type==='execution-submitting'&&e.purpose==='device-lease-control'&&e.controlPayload));
+  }
 });
