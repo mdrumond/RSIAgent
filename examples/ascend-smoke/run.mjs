@@ -43,7 +43,7 @@ export async function fixedProject(root,{python='python3',device='npu:0',actor=f
   const packaged=await projectBundle({source,reference:correct,negatives:[wrong],files:[verifier]},
     `${quote(python)} -B ${quote(verifier)} --mode construction --device cpu`,180,root);
   return {id:actor?'actor-hello':'controller-planned',source,actor_seconds:actor?300:600,
-    goal:actor?`Device hello world only: implement run(x) in answer.py using exactly this tiny PyTorch operation:\n${candidate}\nThe frozen verifier supplies a 16-element tensor on ${device}, synchronizes and checks every value. Follow the canonical workflow; do not research kernels, optimize, profile, benchmark, or generate a curriculum.`:
+    goal:actor?`Device hello world only: implement run(x) in answer.py using exactly this tiny PyTorch operation:\n${candidate}\nThe frozen verifier supplies a 16-element tensor on ${device}, synchronizes and checks every value. Follow the canonical workflow and call rsi_verify at validation to run the frozen check; it stages trusted files automatically. Do not invoke frozen command metadata through rsi_target or discover verifier paths manually. Do not research kernels, optimize, profile, benchmark, or generate a curriculum.`:
       'Fixed controller smoke: implement run(x) in answer.py as x + 1; execute frozen checks and accept. Timings test execution only, with no speedup target.',
     ...(!actor?{performance_goal:{kind:'measurement-only'}}:{}),bundle:packaged.bundle,
     verifier:{files:packaged.files,command:command('correctness'),
