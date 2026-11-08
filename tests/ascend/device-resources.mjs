@@ -695,3 +695,71 @@ for(const setup of ['none','closed','terminal','unknown','live'])test(`pre-paylo
     assert.ok(f.events.some(e=>e.type==='execution-submitting'&&e.purpose==='device-lease-control'&&e.controlPayload));
   }
 });
+
+for(const terminalState of ['failed','completed','observation-unavailable'])test(`cleanup with missing receipt and native ${terminalState} preserves payload identity`,async t=>{
+  const f=await fixture(t);let failedControl,failedAdmission;
+  const client=async(args,settings)=>{
+    if(args[0]==='observe' && args[1]===failedControl)
+      return {state:terminalState,...(terminalState==='completed'?{exit:0}:{reason:{message:'open failed'}})};
+    if(args[0]==='download' && (args[2]===failedAdmission||failedAdmission?.endsWith('/'+args[2])))return {state:'failed',exit:1,handle:'remote:fixture:transfer:missing-admission'};
+    const result=await f.context.client(args,settings);
+    if(!failedControl && args[0]==='run' && !args.includes('--npu') && args[args.indexOf('--file')+1].endsWith('command.sh')){
+      failedControl=result.handle;
+      const script=await readFile(args[args.indexOf('--file')+1],'utf8');
+      const configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+      failedAdmission=configuration.env.RSI_LEASE_RECEIPT;
+    }
+    return result;
+  };
+  const environment=await createEnvironment(f.options,{...f.context,client});
+  await environment.prepare({project:{source:f.source},attempt:{id:'failed-cleanup'}});
+  const result=await environment.execute('payload-once',f.source,{timeout:5});
+  assert.equal(result.settled,terminalState==='failed');
+  assert.equal(result.exitCode,0);
+  if(terminalState==='failed'){
+    assert.equal(f.commands.length,1,'cleanup retry does not rerun payload');
+    const [entry]=await fs.readdir(join(f.context.leaseDirectory,'.closed'));
+    const closed=JSON.parse(await readFile(join(f.context.leaseDirectory,'.closed',entry,'lease.json'),'utf8'));
+    assert.ok(closed.handles.includes(failedControl));
+    assert.notEqual(closed.controlHandle,failedControl);
+    return;
+  }
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+  const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
+  const payloadHandle=retained.payloadHandle;
+  assert.ok(payloadHandle);assert.notEqual(payloadHandle,failedControl);
+  assert.ok(retained.handles.includes(failedControl),'failed cleanup remains observable in the journal');
+  const restarted=await createEnvironment(f.options,{...f.context,client});
+  const first=await restarted.reconcileLease();
+  // A live/unknown control or a completed control with unavailable receipt must
+  // keep its identity. Only a positively failed cleanup is replaceable.
+  assert.equal(first,false);
+  const current=JSON.parse(await readFile(pointer.receipt,'utf8'));
+  assert.equal(current.controlHandle,failedControl);
+  assert.equal(f.calls.filter(a=>a[0]==='run'&&!a.includes('--npu')&&a[a.indexOf('--file')+1].endsWith('command.sh')).length,1);
+});
+
+test('repeated positively failed cleanup stops at elapsed observation allowance without replaying payload',async t=>{
+  const f=await fixture(t),controls=new Set(),receipts=new Set();
+  const client=async(args,settings)=>{
+    if(args[0]==='observe'&&controls.has(args[1]))return {state:'failed',exit:null,reason:{message:'open failed'}};
+    if(args[0]==='download'&&[...receipts].some(path=>path===args[2]||path.endsWith('/'+args[2])))return {state:'failed',exit:1,handle:'remote:fixture:transfer:missing-admission'};
+    const result=await f.context.client(args,settings);
+    if(args[0]==='run'&&!args.includes('--npu')&&args[args.indexOf('--file')+1].endsWith('command.sh')){
+      controls.add(result.handle);
+      const script=await readFile(args[args.indexOf('--file')+1],'utf8');
+      const configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+      receipts.add(configuration.env.RSI_LEASE_RECEIPT);
+    }
+    return result;
+  };
+  const environment=await createEnvironment({...f.options,probeObservationSeconds:1},{...f.context,client});
+  await environment.prepare({project:{source:f.source},attempt:{id:'cleanup-allowance'}});
+  const result=await environment.execute('payload-once',f.source,{timeout:5});
+  assert.equal(result.settled,false);assert.equal(result.exitCode,0);
+  assert.equal(f.commands.length,1);
+  assert.ok(controls.size>=2,'retry happens before elapsed allowance is exhausted');
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+  const retained=JSON.parse(await readFile(pointer.receipt,'utf8'));
+  for(const handle of controls)assert.ok(retained.handles.includes(handle));
+});

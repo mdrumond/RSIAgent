@@ -12,6 +12,7 @@ const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
 const normalize = result => ({ state: terminal.has(result.state) ? 'stopped' :
   ['queued', 'dispatching', 'running', 'retrying', 'cancelling'].includes(result.state) ? 'running' : 'unknown',
+  ...(terminal.has(result.state) ? {nativeState:result.state} : {}),
   ...(Number.isInteger(result.exit) ? { exitCode: result.exit } : {}),
   ...(result.reason == null ? {} : {reason: result.reason}),
   ...(Number.isFinite(result.executionSeconds) && result.executionSeconds >= 0 ? { executionSeconds: result.executionSeconds } : {}) });

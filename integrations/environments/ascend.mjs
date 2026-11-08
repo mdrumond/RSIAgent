@@ -336,7 +336,20 @@ export async function createEnvironment(options, context) {
     await context.event('device-lease-released', {pool:lease.record.pool,
       physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
   }
-  let reconciling;
+  let reconciling, retryFailedControl=false;
+  async function reconcileClosedPayload(signal) {
+    const deadline=performance.now()+observationSeconds*1000;
+    do {
+      signal?.throwIfAborted();
+      retryFailedControl=false;
+      if(await reconcileLease())return true;
+      // Only a positively terminal failed cleanup permits replacement. Unknown
+      // work remains fenced and never triggers another device payload.
+      if(!retryFailedControl)return false;
+      await delay(Math.min(options.leasePollMs??250,Math.max(0,deadline-performance.now())),undefined,{signal});
+    } while(performance.now()<deadline);
+    return false;
+  }
   function reconcileLease(){
     if(!reconciling)reconciling=reconcileCurrent().finally(()=>{reconciling=null;});
     return reconciling;
@@ -390,8 +403,18 @@ export async function createEnvironment(options, context) {
         if(!result.settled)return false;
       }
       if(!lease.record.controlHandle)return false;
-      if((await cleanup.observe(lease.record.controlHandle)).state!=='stopped')return false;
+      const controlState=await cleanup.observe(lease.record.controlHandle);
+      if(controlState.state!=='stopped')return false;
       const receipt=await cleanup.readAdmission(lease.record.controlHandle);
+      if(controlState.nativeState==='failed' && receipt?.token!==lease.token){
+        // A terminal failed cleanup may never have entered its Python payload.
+        // Preserve its exact journal and permit a new token-scoped cleanup on
+        // the next pass; the original device command is never replayed.
+        await preserveControls(dirname(lease.receipt));
+        await lease.update({controlStarted:false,controlHandle:null});
+        retryFailedControl=true;
+        return false;
+      }
       if(receipt?.token===lease.token&&['contended','ownership-mismatch'].includes(receipt.decision)){
         await preserveControls(dirname(lease.receipt));
         await lease.update({controlStarted:false,controlHandle:null});return false;
@@ -530,7 +553,7 @@ export async function createEnvironment(options, context) {
             await releaseLease(lease);
           } else {
             activeLease=null;
-            if(!await reconcileLease())return {...result,settled:false,admissionUnknown:true};
+            if(!await reconcileClosedPayload(signal))return {...result,settled:false,admissionUnknown:true};
           }
           if(admission.decision==='contended'){
             await waitForDevice();
