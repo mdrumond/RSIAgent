@@ -14,7 +14,8 @@ import {readConfig} from '../../cli/instance.mjs';
 import {operate} from '../../cli/runtime.mjs';
 import {setup} from './driver_setup.mjs';
 import {workloads} from '../../cli/campaign-manifest.mjs';
-import {superviseCampaign,claimSupervisor,localOwnersStopped} from '../../cli/campaign-supervisor.mjs';
+import * as supervision from '../../cli/campaign-supervisor.mjs';
+const {superviseCampaign,claimSupervisor,localOwnersStopped,campaignActivity}=supervision;
 
 function qualification() {
   const expected={sourceRevision:'frozen-source'},receipts=[];
@@ -387,4 +388,131 @@ test('new unresolved global reservation checkpoints supervision instead of polli
   const result=await superviseCampaign(options(),f.deps);
   assert.equal(result.state,'attention-needed');assert.equal(result.reason,'device-lease-blocked');
   assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+});
+
+function idleCampaign({remaining=0,active=false,signature='foreground-unchanged'}={}) {
+  return {operation:'campaign',attempts:8,budget:{cycle:'same-cycle',elapsed:123},activity:{signature,active},
+    status:{controller:{state:'running'},wait:{reason:'waiting-inputs'},
+      progress:{done:false,currentEntry:{id:'only',phase:'phase1',remainingAdmissions:remaining,remainingOriginals:8},finishedOriginals:0,target:8}}};
+}
+
+test('live but idle controller checkpoints exhausted admissions instead of consuming the campaign allocation',async t=>{
+  const f=fixture([idleCampaign()]),state=new State(':memory:');t.after(()=>state.close());
+  const me=await processIdentity();
+  state.db.exec('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  state.db.prepare('INSERT INTO control VALUES (?,?)').run('owner',JSON.stringify(me));
+  for(let i=0;i<8;i++) {
+    state.add({id:'original-'+i,goal:'fixture',actor_seconds:60});
+    const attempt=state.admit('original-'+i,me);state.event(attempt.id,'job-admitted',{campaign_entry:'only',kind:'original'});
+  }
+  let polls=0;const snapshot=f.deps.snapshot;
+  f.deps.snapshot=async()=>{
+    const view=await snapshot();view.status.wait.at=++polls;view.status.backgroundTuning={round:polls};
+    state.event(null,'execution-state',{handle:'remote:target:job:probe-'+polls,state:'stopped'});
+    state.event(null,'skill-background-completed',{round:polls});
+    view.activity=await campaignActivity(state);return view;
+  };
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'exhausted-admissions-unsettled-originals');assert.equal(result.state,'attention-needed');
+  assert.equal(result.at,1800000);assert.equal(result.checkpointPending,false);
+  assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+  assert.equal(f.reports[0].elapsedSeconds,123);
+  assert.equal(state.db.prepare('SELECT COUNT(*) n FROM attempts WHERE outcome IS NULL').get().n,8);
+});
+
+test('new durable foreground progress and long active device work keep supervision alive',async()=>{
+  for(const mode of ['milestones','curriculum-checkpoints','active-device']) {
+    const f=fixture([idleCampaign()]);let poll=0;
+    f.deps.snapshot=async()=>poll++>=40?done():idleCampaign({active:mode==='active-device',
+      signature:mode==='active-device'?'same-handle':mode+'-'+Math.floor(poll/10)});
+    const result=await superviseCampaign(options(),f.deps);
+    assert.equal(result.reason,'complete');assert.ok(result.at>1800000);
+    assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+  }
+});
+
+test('durable ledger checkpoints reach the supervisor while repeated observations do not count',async t=>{
+  const state=new State(':memory:');t.after(()=>state.close());
+  state.db.exec('CREATE TABLE generation_drafts(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
+  const f=fixture([idleCampaign({remaining:8})]);f.config.curriculum={generation:{enabled:true}};
+  let polls=0;f.deps.snapshot=async()=>{
+    if(polls++>=40)return done();
+    state.db.prepare('INSERT OR REPLACE INTO generation_drafts VALUES (?,?)')
+      .run('draft',JSON.stringify({status:'draft',seconds:3600,elapsed:polls*60}));
+    return {...idleCampaign({remaining:8}),activity:await campaignActivity(state)};
+  };
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'complete');assert.ok(result.at>1800000);
+});
+
+test('intentional external input stream remains open; stalled enabled generation is bounded',async()=>{
+  const waiting=fixture([...Array(40).fill(idleCampaign({remaining:8})),done()]);
+  assert.equal((await superviseCampaign(options(),waiting.deps)).reason,'complete');
+  const generator=fixture([idleCampaign({remaining:8})]);
+  generator.config.curriculum={generation:{enabled:true}};
+  assert.equal((await superviseCampaign(options(),generator.deps)).reason,'campaign-no-progress');
+});
+
+test('idle elapsed survives supervisor restart and reboot; actual progress resets it',async()=>{
+  for(const boot of ['boot','previous-boot']) {
+    const view=idleCampaign(),f=fixture([view],1000000);
+    f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot},
+      progressWatch:{signature:view.activity.signature,since:boot==='boot'?0:500,idleElapsed:1000000}});
+    const result=await superviseCampaign(options(),f.deps);
+    assert.equal(result.reason,'exhausted-admissions-unsettled-originals');assert.equal(result.at,1840000);
+    assert.equal(result.progressWatch.idleElapsed,1840000);
+  }
+  const f=fixture([idleCampaign({signature:'new-admission'}),done()],2000000);
+  f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},
+    progressWatch:{signature:'old-admission',since:0,idleElapsed:2000000}});
+  assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+  assert.equal(f.reports.find(r=>r.state==='running').progressWatch.idleElapsed,0);
+});
+
+test('operator pause precedes the idle watchdog and unresolved pause preserves checkpoints',async()=>{
+  const paused=fixture([{...idleCampaign(),paused:true}]);
+  assert.equal((await superviseCampaign(options(),paused.deps)).reason,'operator-pause');
+  assert.deepEqual(paused.calls.map(call=>call[0]),['pause']);
+  const pending=fixture([idleCampaign()]);pending.deps.closed=async()=>false;
+  const result=await superviseCampaign(options(),pending.deps);
+  assert.equal(result.reason,'exhausted-admissions-unsettled-originals');assert.equal(result.checkpointPending,true);
+  assert.deepEqual(pending.calls.map(call=>call[0]),['pause']);
+});
+
+test('ledger activity ignores poll and A/B telemetry, recognizes bounded drafts and exact foreground owners',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'supervisor-progress-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+  state.add({id:'original',goal:'fixture',actor_seconds:60});
+  const me=await processIdentity(),attempt=state.admit('original',me);
+  const current=await campaignActivity(state);assert.equal(current.active,true);
+  state.event(null,'execution-state',{handle:'remote:target:job:probe',state:'stopped'});
+  state.event(null,'skill-background-completed',{round:1});
+  assert.deepEqual(await campaignActivity(state),current);
+  state.event(attempt.id,'stage-completed',{stage:'implementation'});
+  assert.notEqual((await campaignActivity(state)).signature,current.signature);
+  state.finish(attempt.id,'failed');state.event(attempt.id,'postprocess-completed',{});
+  assert.equal((await campaignActivity(state)).active,false);
+  state.db.exec('CREATE TABLE generation_drafts(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
+  const write=elapsed=>state.db.prepare('INSERT OR REPLACE INTO generation_drafts VALUES (?,?)').run('draft',JSON.stringify({status:'draft',seconds:1800,elapsed}));
+  write(20);const constructing=await campaignActivity(state);
+  write(21);assert.notEqual((await campaignActivity(state)).signature,constructing.signature);
+  write(1800);const exhausted=await campaignActivity(state);
+  write(1801);assert.deepEqual(await campaignActivity(state),exhausted);
+  // A persisted attempt alone is not active work when its exact owner is stopped.
+  state.add({id:'orphan',goal:'fixture',actor_seconds:60});state.admit('orphan',{...me,start:'old-start'});
+  assert.equal((await campaignActivity(state)).active,false);
+  state.db.exec('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  state.db.prepare('INSERT INTO control VALUES (?,?)').run('owner',JSON.stringify(me));
+  state.add({id:'unclaimed',goal:'fixture',actor_seconds:60});state.admit('unclaimed',me);
+  assert.equal((await campaignActivity(state)).active,false,'a live controller retaining an unclaimed admission is not foreground work');
+  state.db.prepare('UPDATE attempts SET owner=NULL WHERE project=?').run('unclaimed');
+  assert.equal((await campaignActivity(state)).active,false,'ownerless work does not grant an activity exemption');
+});
+
+test('memory checkpoint recovery does not inherit an expired foreground inactivity clock',async()=>{
+  const f=memoryFixture({prior:{limit:2,token:'owned',phaseAt:0}}),load=f.deps.load;
+  f.deps.load=async()=>({...await load(),progressWatch:{signature:JSON.stringify({done:false}),since:-1800000,idleElapsed:1800000}});
+  const result=await superviseCampaign(options(),f.deps);
+  assert.equal(result.reason,'complete');assert.equal(result.memory.recovered,true);
+  assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
 });
