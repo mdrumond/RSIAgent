@@ -343,13 +343,14 @@ export async function createEnvironment(options, context) {
     // token-scoped cleanup that proves its host fence can be released.
     const signal=AbortSignal.timeout(observationSeconds*1000);
     do {
-      signal?.throwIfAborted();
+      if(signal.aborted)return false;
       retryFailedControl=false;
       if(await reconcileLease())return true;
       // Only a positively terminal failed cleanup permits replacement. Unknown
       // work remains fenced and never triggers another device payload.
       if(!retryFailedControl)return false;
-      await delay(Math.min(options.leasePollMs??250,Math.max(0,deadline-performance.now())),undefined,{signal});
+      try{await delay(Math.min(options.leasePollMs??250,Math.max(0,deadline-performance.now())),undefined,{signal});}
+      catch(error){if(signal.aborted)return false;throw error;}
     } while(performance.now()<deadline);
     return false;
   }
