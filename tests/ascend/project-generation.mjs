@@ -20,14 +20,12 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   let verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
     badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`);
-  const python=pytorch?(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3'):'python3';
-  const cpuCommand=`PYTHONPATH=. '${python.replaceAll("'","'\\''")}' ../verify.py`;
-  if(omitConstruction)verifierContent=verifierContent.replace("parent/'reference'","parent/'controls'/'reference'/'deep'");
+  if(omitConstruction||unequalDepth)verifierContent=verifierContent.replace("parent/'reference'","parent/'controls'/'reference'/'deep'");
   const requests=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
   const server=createServer(async(req,res)=>{
@@ -43,7 +41,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
         verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:{entrypoint:'verify.py',args:[performanceCommand]}}:{}),
           ...(performanceCommand!==undefined&&baselineCommand!==null?{baseline_command:{entrypoint:'verify.py',args:[baselineCommand??'--baseline']}}:{}),
           command:{entrypoint:'verify.py',args:pytorch?['--target']:separateCommand?['requires-device-runtime']:[]}},
-        construction_command:cpuCommand}]];
+        construction_command:rawConstruction?'verify.py':{entrypoint:'verify.py',args:[]}}]];
     if(nestedBundle) {
       plan.splice(4,0,['write',{path:'helper.py',content:'factor=2\n'}],
         ['write',{path:'reference/metadata.json',content:'trusted'}],['write',{path:'negative/metadata.json',content:'wrong'}]);
@@ -52,13 +50,14 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       for(const call of plan)if(call[0]==='write')call[1].path='project/task/'+call[1].path;
       const proposal=plan.at(-1)[1];proposal.source='project/task/source';proposal.reference='project/task/reference';
       proposal.negative_controls=['project/task/negative',...Array.from({length:7},(_,i)=>`project/task/negative-${i+1}`)];proposal.verifier.files=['project/task/verify.py'];
+      proposal.construction_command={entrypoint:'project/task/verify.py',args:[]};
       for(const key of ['command','baseline_command','performance_command'])if(proposal.verifier[key])proposal.verifier[key].entrypoint='project/task/verify.py';
       if(unequalDepth) {
         const starter=plan.find(call=>call[0]==='write'&&call[1].path==='project/task/source/answer.py');
         starter[1].path='project/task/src/impl/answer.py';proposal.source='project/task/src/impl';
-        proposal.construction_command=`PYTHONPATH=. '${python}' '${join(root,'drafts',state.db.prepare('SELECT id FROM generation_drafts ORDER BY rowid DESC LIMIT 1').get().id,'project/task/verify.py')}'`;
+
       }
-      if(omitConstruction) {
+      if(omitConstruction||unequalDepth) {
         proposal.reference='project/task/controls/reference/deep';
         for(const call of plan)if(call[0]==='write'&&call[1].path.startsWith('project/task/reference/'))
           call[1].path=call[1].path.replace('project/task/reference/',proposal.reference+'/');
@@ -554,9 +553,10 @@ test('rejected imported closure is not reoffered and interrupted import retains 
 });
 
 
-test('absolute construction paths retain meaning when source and trusted fixtures have unequal depths',async t=>{
+test('structured construction entrypoint validates reference and controls at unequal cwd depths',async t=>{
   const f=await fixture(t,{nestedBundle:true,unequalDepth:true});
   const [spec]=await refillProjects(f.options);assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
+  assert.deepEqual(spec.generation.checks.map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1]);
   const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
   await rm(f.options.path,{recursive:true});
   await validateBundle(imported,join(f.config.root,'unequal-proof'));
@@ -594,4 +594,12 @@ test('slow pre-CPU import hashing consumes and checkpoints the same elapsed allo
   assert.equal(delayed,true);assert.equal(checkpointDuringHash,true);assert.equal(saved,0);
   assert.equal(JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data).spec.bundle.seconds,0);
   await assert.rejects(access(marker),{code:'ENOENT'});
+});
+
+test('raw construction shell path is rejected before any CPU execution',async t=>{
+  const f=await fixture(t,{rawConstruction:true});
+  assert.deepEqual(await refillProjects(f.options),[]);
+  const events=f.state.db.prepare("SELECT type FROM generation_events WHERE type='generation-construction-check'").all();
+  assert.deepEqual(events,[]);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
 });

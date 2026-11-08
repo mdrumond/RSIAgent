@@ -99,7 +99,7 @@ test('curriculum smoke validates and imports exactly one real-tool PyTorch proje
       ['write',{path:'wrong/answer.py',content:'def run(x): return x - 1\n'}],
       ['write',{path:'verify.py',content:"import importlib.util, pathlib, torch\ns=importlib.util.spec_from_file_location('a',pathlib.Path.cwd()/'answer.py')\na=importlib.util.module_from_spec(s);s.loader.exec_module(a)\nx=torch.arange(17,dtype=torch.float32)\nassert torch.equal(a.run(x),torch.tensor(list(range(1,18)),dtype=torch.float32))\n"}],
       ['submit_project',{goal:'Tiny PyTorch x + 1 CPU contract',source:'source',reference:'reference',negative_controls:['wrong'],
-        verifier:{files:['verify.py'],command:{entrypoint:'verify.py',args:[]}},construction_command:`${quote(python)} -B ../verify.py`}]];
+        verifier:{files:['verify.py'],command:{entrypoint:'verify.py',args:[]}}}]];
     let requests=0;const server=createServer(async(req,res)=>{
       let text='';for await(const chunk of req)text+=chunk;
       const body=JSON.parse(text),n=body.messages.filter(message=>message.role==='tool').length;requests++;

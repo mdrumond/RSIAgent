@@ -47,7 +47,7 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
             tool('write',{path:'negative/answer.py',content:'def answer(): return -1\n'}),
             tool('write',{path:'verify.py',content:"import sys\nsys.path.insert(0, '.')\nfrom answer import answer\nsys.exit(0 if answer()==42 else 1)\n"}),
             tool('submit_project',{goal:'unrelated generated arithmetic',source:'source',reference:'reference',
-              negative_controls:['negative'],construction_command:'PYTHONPATH=. python ../verify.py',
+              negative_controls:['negative'],construction_command:{entrypoint:'verify.py',args:[]},
               verifier:{files:['verify.py'],command:{entrypoint:'verify.py',args:[]}}})];
         } else if (prompt.startsWith('Read the failed')) {
           const verifier = 'import importlib.util\nfrom pathlib import Path\n' +

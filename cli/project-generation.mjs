@@ -17,7 +17,7 @@ const entrypoint=Type.Object({entrypoint:Type.String({minLength:1}),args:Type.Ar
 const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1}),
   verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:entrypoint,
     performance_command:Type.Optional(entrypoint),baseline_command:Type.Optional(entrypoint)}),
-  construction_command:Type.Optional(Type.String({minLength:1})),
+  construction_command:Type.Optional(entrypoint),
   reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
 
 // Same bounded event contract as State, scoped exclusively to generation telemetry.
@@ -173,7 +173,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
           `Create an independent verifier outside those trees. Declare each target command as {entrypoint, args}: entrypoint is a frozen Python file path relative to this draft directory and args is an array of literal arguments. RSI derives its command from editable source; do not supply shell commands or cd prefixes. `+
           (deviceGoal?`Keep target acceptance separate from CPU specification validation: an unchanged PyTorch starter must not satisfy the target kernel goal. Provide the target correctness/performance commands for the actor to run later; do not probe target APIs, compile kernels, submit remote jobs or collect device timings to construct this specification.\n`:'')+
-          `When target acceptance needs a device, provide a separate construction_command for CPU proof against the reference and controls. `+
+          `When target acceptance needs a device, provide a separate construction_command as {entrypoint, args}, with the same frozen-file and literal-argument contract, for CPU proof against the reference and controls. Omit construction_command when verifier.command already runs on CPU; the controller uses that entrypoint automatically. `+
           `The construction command (or verifier command when omitted) must accept reference with exit 0 and reject every negative with exit 1. `+
           `CPU construction checks must require no device. Each check executes the SAME command with cwd set to the reference directory, then each negative-control directory. Load the candidate from cwd with the same filename in every tree; never hardcode the reference path in command arguments. Resolve trusted data relative to the frozen verifier file. The source is the actor starting point, not the trusted solution. `+
           `Submit relative artifact paths and the project goal via submit_project. Do not reuse completed implementations. Do not assign project IDs or lineage.`,
@@ -181,14 +181,16 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           execute:async(_id,p)=>{
             const checks=[];
             try {
-              if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command?.trim()))
+              if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command))
                 throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
               if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
                 throw new Error('Generated performance project requires verifier.baseline_command');
               const artifacts=await checkProposal(root,p);
               const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
               validateAcceptance({...p,verifier});
-              const constructionCommand=p.construction_command??entrypointCommand(verifier.entrypoints.command);
+              const construction=p.construction_command===undefined?verifier:
+                compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
+              const constructionCommand=entrypointCommand(construction.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;
               const env=await createEnvironment({mode:'local',localExecution:config.local_execution},{instancePath:root,signal:active,
