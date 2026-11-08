@@ -20,6 +20,9 @@ A5's entire command on the A5 host with its registered runtime and the productio
 local Ascend environment. Deployment and observation use the installed CPL client;
 project execution on A5 does not transfer through SSH. Required host containment,
 provider access and device health must pass independently before launch.
+Device runs default to 128 tasks and 4 GiB per local command; explicit limits may
+be stricter, never looser. Missing containment fails closed. CPU automated tests
+may use their external test guard without making device-execution claims.
 
 - Controller: one fixed project, asymmetric trusted/source paths, original bundle
   removed after import, actual baseline/correctness/performance commands, full Pi

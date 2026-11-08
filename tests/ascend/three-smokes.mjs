@@ -25,6 +25,14 @@ async function actorProfile(path,url) {
       contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
 }
 
+test('device smoke rejects relaxed containment before creating an instance or contacting a provider',async t=>{
+  const path=await root(t),destination=join(path,'must-not-start');
+  await assert.rejects(runSmoke({kind:'controller',profile:{target:'a5',environment,
+    local_execution:{tasks:129,memory_bytes:4*1024**3}},destination}),/require containment/);
+  await assert.rejects(access(destination),{code:'ENOENT'});
+  await rm(path,{recursive:true});
+});
+
 test('fixed controller smoke executes imported commands and full native Pi acceptance without generation',
   {timeout:180000},async t=>{
     const path=await root(t),destination=join(path,'controller');

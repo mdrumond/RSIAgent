@@ -143,6 +143,11 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     assert.equal(profile.environment?.options?.mode,target==='a3'?'cpl':'local',
       'A3 uses the host CPL path; A5 must execute directly on its device host');
   }
+  const localExecution=cpu?profile.local_execution:{tasks:profile.local_execution?.tasks??128,
+    memory_bytes:profile.local_execution?.memory_bytes??4*1024**3};
+  if(!cpu)assert.ok(Number.isSafeInteger(localExecution.tasks)&&localExecution.tasks>=4&&localExecution.tasks<=128&&
+    Number.isSafeInteger(localExecution.memory_bytes)&&localExecution.memory_bytes>=1024**2&&localExecution.memory_bytes<=4*1024**3,
+    'Device smokes require containment of at most 128 tasks and 4 GiB; no uncontained fallback');
   const root=resolve(destination),instance=join(root,'instance'),python=profile.python??'python3';
   await mkdir(root,{recursive:false,mode:0o700});
   const outer=AbortSignal.timeout(900000),active=signal?AbortSignal.any([signal,outer]):outer;
@@ -156,7 +161,7 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
     const settings={...fixture,python,target,projects,install:false,mode:'phase1',recovery:false,concurrency:1,
       actor:scripted?.actor??profile.actor,curriculum_actor:kind==='curriculum'?(profile.curriculum_actor??profile.actor):undefined,
       actor_seconds:300,curriculum_seconds:180,embedding_factory:'ascend_tools.fixture_embeddings:Embeddings',
-      environment:profile.environment,local_execution:profile.local_execution,curriculum,
+      environment:profile.environment,local_execution:localExecution,curriculum,
       skillSettings:{background:false},...(kind==='curriculum'?{campaign_plan:[{id:'curriculum-smoke',phase:'phase1',
         new_projects:1,actor_seconds:300,generation:{topics:['tiny-pytorch'],requirements:{}}}]}:{})};
     delete settings.embeddings;
