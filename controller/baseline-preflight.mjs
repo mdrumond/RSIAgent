@@ -17,6 +17,8 @@ export async function validateTargetBaseline({project,state,attempt,attemptPath,
   signal?.throwIfAborted();await checkVerifier();
   // An uncertain transport or interrupted execution is never a verifier verdict.
   if(!response.settled||!Number.isInteger(response.exitCode))throw new Error('Target baseline execution unresolved');
+  if(response.exitCode===124||response.exitCode<0||response.exitCode>=128)
+    throw new Error('Target baseline interrupted before a verifier verdict');
   const path=join(attemptPath,'baseline-preflight.log');await writeFile(path,output);
   await register(path,'baseline-preflight');
   const evidence={path,sha256:createHash('sha256').update(await readFile(path)).digest('hex')};
