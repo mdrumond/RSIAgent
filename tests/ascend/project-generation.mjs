@@ -23,8 +23,8 @@ import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,
 async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
-  const verifierContent=pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
-    badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`;
+  const verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
+    badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`);
   const python=pytorch?(process.env.RSI_TEST_PYTHON??process.env.PYTHON??'python3'):'python3';
   const cpuCommand=`PYTHONPATH=. '${python.replaceAll("'","'\\''")}' ../verify.py`;
   const requests=[];
@@ -39,9 +39,10 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       ['write',{path:'negative/answer.py',content:pytorch?`def run(x):\n    return x * ${negative===42?2:0}\n`:`answer=${negative}\n`}],
       ['write',{path:'verify.py',content:verifierContent}],
       ['submit_project',{goal,...(performanceGoal!==undefined?{performance_goal:performanceGoal}:{}),source:'source',reference:'reference',negative_controls:['negative'],
-        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:performanceCommand}:{}),
-          ...(performanceCommand!==undefined&&baselineCommand!==null?{baseline_command:baselineCommand??cpuCommand}:{}),command:pytorch?cpuCommand+' --target':separateCommand?'requires-device-runtime':cpuCommand},
-        ...(separateCommand||pytorch?{construction_command:cpuCommand}:{})}]];
+        verifier:{files:['verify.py'],...(performanceCommand!==undefined?{performance_command:{entrypoint:'verify.py',args:[performanceCommand]}}:{}),
+          ...(performanceCommand!==undefined&&baselineCommand!==null?{baseline_command:{entrypoint:'verify.py',args:[baselineCommand??'--baseline']}}:{}),
+          command:{entrypoint:'verify.py',args:pytorch?['--target']:separateCommand?['requires-device-runtime']:[]}},
+        construction_command:cpuCommand}]];
     if(nestedBundle) {
       plan.splice(4,0,['write',{path:'helper.py',content:'factor=2\n'}],
         ['write',{path:'reference/metadata.json',content:'trusted'}],['write',{path:'negative/metadata.json',content:'wrong'}]);
@@ -50,11 +51,11 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       for(const call of plan)if(call[0]==='write')call[1].path='project/task/'+call[1].path;
       const proposal=plan.at(-1)[1];proposal.source='project/task/source';proposal.reference='project/task/reference';
       proposal.negative_controls=['project/task/negative',...Array.from({length:7},(_,i)=>`project/task/negative-${i+1}`)];proposal.verifier.files=['project/task/verify.py'];
+      for(const key of ['command','baseline_command','performance_command'])if(proposal.verifier[key])proposal.verifier[key].entrypoint='project/task/verify.py';
       if(unequalDepth) {
         const starter=plan.find(call=>call[0]==='write'&&call[1].path==='project/task/source/answer.py');
         starter[1].path='project/task/src/impl/answer.py';proposal.source='project/task/src/impl';
         proposal.construction_command=`PYTHONPATH=. '${python}' '${join(root,'drafts',state.db.prepare('SELECT id FROM generation_drafts ORDER BY rowid DESC LIMIT 1').get().id,'project/task/verify.py')}'`;
-        proposal.verifier.command=proposal.construction_command;
       }
     }
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
@@ -95,7 +96,7 @@ test('PyTorch-only SIMT specification is admitted on CPU while target implementa
   assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
   assert.equal(spec.generation.requirements.capabilityEvidence,true);
   assert.deepEqual(spec.performance_goal,{comparison:'non-SIMT baseline'});
-  assert.equal(spec.verifier.performance_command,'actor-target-benchmark');
+  assert.deepEqual(spec.verifier.entrypoints.performance_command.args,['actor-target-benchmark']);
   assert.ok(spec.verifier.baseline_command);
   const imported=await importProject(f.config.root,spec);
   assert.equal(imported.verifier.baseline_command,spec.verifier.baseline_command);
@@ -135,7 +136,7 @@ test('entry topic quotas stage one SIMT benchmark and seven distinct projects wi
   assert.deepEqual(specs.map(spec=>spec.generation.topic),topics);
   assert.ok(specs.every(spec=>spec.actor_seconds===7200&&spec.campaign_entry==='batch'));
   assert.deepEqual(specs[0].performance_goal,performanceGoal);
-  assert.equal(specs[0].verifier.performance_command,performanceCommand);
+  assert.deepEqual(specs[0].verifier.entrypoints.performance_command.args,[performanceCommand]);
   assert.equal(specs[0].generation.requirements.capabilityEvidence,true);
   assert.ok(specs[0].generation.checks.every(check=>check.command!==performanceCommand));
   const before=f.requests.length;
@@ -283,7 +284,7 @@ test('native Pi repairs a rejected negative and resubmits in the same draft sess
 test('separate CPU construction command preserves the actual target verifier',async t=>{
   const f=await fixture(t,{separateCommand:true}),specs=await refillPhase1(f.options);
   assert.equal(specs.length,2);
-  assert.ok(specs.every(s=>s.verifier.command==='requires-device-runtime'));
+  assert.ok(specs.every(s=>s.verifier.entrypoints.command.args[0]==='requires-device-runtime'));
   assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
 });
 
@@ -402,7 +403,7 @@ test('phase2 retains declared performance contracts without executing timing on 
   const f=await fixture(t,{performanceGoal,performanceCommand});campaign(f,'phase2',1);
   const [spec]=await refillProjects(f.options);
   assert.deepEqual(spec.performance_goal,performanceGoal);
-  assert.equal(spec.verifier.performance_command,performanceCommand);
+  assert.deepEqual(spec.verifier.entrypoints.performance_command.args,[performanceCommand]);
   assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
   assert.ok(spec.generation.checks.every(c=>c.command!==performanceCommand));
   f.state.add(spec);assert.deepEqual(f.state.project(spec.id).spec.performance_goal,performanceGoal);
@@ -421,7 +422,7 @@ test('missing performance commands block admission and phase1 does not inherit p
   assert.equal(microbenchmarks.length,2);
   for(const spec of microbenchmarks) {
     assert.equal(spec.phase,'phase1');assert.equal(spec.performance_goal,'declared microbenchmark target');
-    assert.equal(spec.verifier.performance_command,'benchmark');explicit.state.add(spec);
+    assert.deepEqual(spec.verifier.entrypoints.performance_command.args,['benchmark']);explicit.state.add(spec);
   }
 });
 

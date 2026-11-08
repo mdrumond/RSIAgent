@@ -698,10 +698,13 @@ export async function createEnvironment(options, context) {
           projectRoot = resolve(project.sourceDirectory ?? project.source ?? options.projectDirectory ?? '');
           attemptRoot = posix.join(options.remoteDirectory, encodeURIComponent(String(attempt.id)));
           const verifierFiles = (project.verifier?.files ?? []).map(file => resolve(file));
-          let layoutRoot = projectRoot;
+          let layoutRoot = resolve(project.bundle?.root??projectRoot);
+          const insideLayout=file=>{const rel=relative(layoutRoot,file);return rel===''||(!rel.startsWith('../')&&rel!=='..'&&!isAbsolute(rel));};
+          if(!insideLayout(projectRoot))throw new Error('Editable source must be inside its bundle root');
           for (const file of verifierFiles) {
             const rel = relative(projectRoot, file);
             if (rel === '' || (!rel.startsWith('../') && !isAbsolute(rel))) throw new Error('Verifier must be outside editable source');
+            if(project.bundle&&!insideLayout(file))throw new Error('Frozen verifier must be inside its bundle root');
             while (relative(layoutRoot, file).startsWith('../')) layoutRoot = dirname(layoutRoot);
           }
           projectLayout = verifierFiles.length ? posix.join('tree', relative(layoutRoot, projectRoot)) : 'project';
