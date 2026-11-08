@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
-import {mkdtemp,readFile,writeFile,rm,access} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,rm,access,mkdir} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
 import fs from 'node:fs';
 import {syncBuiltinESMExports} from 'node:module';
@@ -11,6 +11,9 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {curriculumRoleHistory} from '../../cli/curriculum.mjs';
+import {smokeBinding} from '../../examples/ascend-smoke/run.mjs';
+import {validateTargetBaseline} from '../../controller/baseline-preflight.mjs';
+import {freezeFiles} from '../../controller/evidence.mjs';
 import {State} from '../../controller/state.mjs';
 import {campaignProgress} from '../../controller/progress.mjs';
 import {RecoveryQueue,admitJob} from '../../controller/recovery.mjs';
@@ -20,8 +23,9 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false}={}) {
-  const root=await mkdtemp(join(tmpdir(),'generation-'));t.after(()=>rm(root,{recursive:true,force:true}));
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false}={}) {
+  const root=await mkdtemp(join(process.env.DRIVER_ARTIFACTS??tmpdir(),'generation-'));
+  t.after(()=>process.env.RSI_GENERATED_SMOKE_PROFILE?undefined:rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
   let verifierContent="import sys\nsys.path.insert(0, '.')\n"+(pytorch?`import sys, pathlib, torch, answer\nif '--target' in sys.argv:\n    pathlib.Path('target-requested').touch()\n    # Actor must replace the CPU-only starter with the target entry point.\n    sys.exit(1 if not hasattr(answer, 'target_entry') else 0)\nx=torch.tensor([[1.,-2.,3.],[0.,4.,-5.]])\nexpected=torch.tensor([[2.,-4.,6.],[0.,8.,-10.]])\nprint('cpu-specification-check')\nsys.exit(0 if torch.equal(answer.run(x), expected) else 1)\n`:
     badVerifier?'pass\n':`${nestedBundle?"from helper import factor\nfrom pathlib import Path\nassert (Path(__file__).parent/'reference'/'metadata.json').read_text() == 'trusted'\nassert (Path(__file__).parent/'negative'/'metadata.json').read_text() == 'wrong'\nassert factor == 2\n":''}from answer import answer\nimport sys\n${mutateVerifier?"with open(__file__, 'a') as f: f.write('# changed\\n')\n":''}${verbose?"print('x'*6000)\n":''}print('cpu-check: '+str(answer))\nsys.exit(0 if answer == 42 else 1)\n`);
@@ -33,7 +37,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length;requests.push(body);
     if(pause || (pauseAfterRejection&&n===5)){waiting();await new Promise(ok=>res.once('close',ok));return;}
     const plan=[
-      ['write',{path:'source/answer.py',content:pytorch?'def run(x):\n    return x + x\n':'answer=0\n'}],
+      ['write',{path:'source/answer.py',content:pytorch?'def run(x):\n    return x + x\n':'answer=42\n'}],
       ['write',{path:'reference/answer.py',content:pytorch?`def run(x):\n    return x * ${positive===42?2:3}\n`:`answer=${positive}\n`}],
       ['write',{path:'negative/answer.py',content:pytorch?`def run(x):\n    return x * ${negative===42?2:0}\n`:`answer=${negative}\n`}],
       ['write',{path:'verify.py',content:verifierContent}],
@@ -42,6 +46,9 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
           ...(performanceCommand!==undefined&&baselineCommand!==null?{baseline_command:{entrypoint:'verify.py',args:[baselineCommand??'--baseline']}}:{}),
           command:{entrypoint:'verify.py',args:pytorch?['--target']:separateCommand?['requires-device-runtime']:[]}},
         construction_command:rawConstruction?'verify.py':{entrypoint:'verify.py',args:[]}}]];
+    if(performanceCommand!==undefined&&!omitBaselineConstruction)plan.at(-1)[1].baseline_construction_command={entrypoint:'verify.py',args:['--baseline-cpu']};
+    if(brokenBaseline) { const verifier=plan.find(call=>call[0]==='write'&&call[1].path==='verify.py')[1];
+      verifier.content="import sys\nif '--baseline-cpu' in sys.argv or '--baseline' in sys.argv:\n    open('missing_baseline_helper.py').read()\n"+verifier.content; }
     if(nestedBundle) {
       plan.splice(4,0,['write',{path:'helper.py',content:'factor=2\n'}],
         ['write',{path:'reference/metadata.json',content:'trusted'}],['write',{path:'negative/metadata.json',content:'wrong'}]);
@@ -51,6 +58,7 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
       const proposal=plan.at(-1)[1];proposal.source='project/task/source';proposal.reference='project/task/reference';
       proposal.negative_controls=['project/task/negative',...Array.from({length:7},(_,i)=>`project/task/negative-${i+1}`)];proposal.verifier.files=['project/task/verify.py'];
       proposal.construction_command={entrypoint:'project/task/verify.py',args:[]};
+      if(proposal.baseline_construction_command)proposal.baseline_construction_command.entrypoint='project/task/verify.py';
       for(const key of ['command','baseline_command','performance_command'])if(proposal.verifier[key])proposal.verifier[key].entrypoint='project/task/verify.py';
       if(unequalDepth) {
         const starter=plan.find(call=>call[0]==='write'&&call[1].path==='project/task/source/answer.py');
@@ -62,6 +70,17 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
         for(const call of plan)if(call[0]==='write'&&call[1].path.startsWith('project/task/reference/'))
           call[1].path=call[1].path.replace('project/task/reference/',proposal.reference+'/');
       }
+    }
+    if(pytorch&&baselineDevice!=='cpu') {
+      const file=plan.find(call=>call[0]==='write'&&call[1].path==='verify.py')[1];
+      file.content=file.content.replace('expected=torch.tensor',"if '--baseline' in sys.argv:\n    import torch_npu\n    x=x.to('npu:0')\nexpected=torch.tensor").replace('torch.equal(answer.run(x), expected)', 'torch.equal(answer.run(x).cpu(), expected)');
+    }
+    if(starterLayout) {
+      for(const call of plan)if(call[0]==='write') {
+        if(call[1].path.endsWith('/answer.py'))call[1].path=call[1].path.replace('/answer.py','/src/answer.py');
+        if(call[1].path==='verify.py')call[1].content=call[1].content.replace("sys.path.insert(0, '.')","sys.path.insert(0, 'src')");
+      }
+      if(starterLayout==='mismatch')plan.at(-1)[1].source='source/src';
     }
     if(omitConstruction)delete plan.at(-1)[1].construction_command;
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
@@ -99,7 +118,7 @@ test('PyTorch-only SIMT specification is admitted on CPU while target implementa
   topicQuota(f,['SIMT']);
   const [spec]=await refillProjects(f.options);
   assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
-  assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.deepEqual(spec.generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
   assert.equal(spec.generation.requirements.capabilityEvidence,true);
   assert.deepEqual(spec.performance_goal,{comparison:'non-SIMT baseline'});
   assert.deepEqual(spec.verifier.entrypoints.performance_command.args,['actor-target-benchmark']);
@@ -174,7 +193,7 @@ test('native Pi constructs projects; real Python controls gate staged specs with
   assert.equal(specs.length,2);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n,0);
-  assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.deepEqual(specs[0].generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
   assert.ok(Object.keys(specs[0].verifier.hashes).length);
   const again=await refillPhase1(f.options);assert.deepEqual(again.map(s=>s.id),specs.map(s=>s.id));
   for(const s of specs)f.state.add(s);
@@ -275,8 +294,8 @@ test('native Pi repairs a rejected negative and resubmits in the same draft sess
     assert.equal(check.kind,'negative');assert.equal(check.exitCode,0);assert.equal(check.expected_exit,1);
     assert.equal(check.cwd,join(f.options.path,spec.id,'negative'));
     assert.ok((await readFile(check.log,'utf8')).length>6000);assert.equal(check.output.length,4000);
-    assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
-    assert.equal(await readFile(join(spec.source,'answer.py'),'utf8'),'answer=0\n');
+    assert.deepEqual(spec.generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
+    assert.equal(await readFile(join(spec.source,'answer.py'),'utf8'),'answer=42\n');
     assert.equal(await readFile(spec.verifier.files[0],'utf8'),f.verifierContent);
   }
   const replies=f.requests.flatMap(r=>r.messages.filter(m=>m.role==='tool'));
@@ -291,7 +310,7 @@ test('separate CPU construction command preserves the actual target verifier',as
   const f=await fixture(t,{separateCommand:true}),specs=await refillPhase1(f.options);
   assert.equal(specs.length,2);
   assert.ok(specs.every(s=>s.verifier.entrypoints.command.args[0]==='requires-device-runtime'));
-  assert.deepEqual(specs[0].generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.deepEqual(specs[0].generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
 });
 
 
@@ -340,7 +359,7 @@ test('phase2 generates a fresh batch ignoring older projects and ready drafts',a
     assert.equal(spec.phase,'phase2');assert.equal(spec.campaign_entry,'fresh');
     assert.equal(spec.goal,goal);
     assert.equal(spec.generation.topic,'end-to-end throughput');
-    assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+    assert.deepEqual(spec.generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
     assert.notEqual(spec.id,'old-project');assert.equal(spec.parent,undefined);
   }
   const plan=[...f.config.campaign_plan,{id:'next',phase:'phase2',new_projects:1}];
@@ -410,7 +429,7 @@ test('phase2 retains declared performance contracts without executing timing on 
   const [spec]=await refillProjects(f.options);
   assert.deepEqual(spec.performance_goal,performanceGoal);
   assert.deepEqual(spec.verifier.entrypoints.performance_command.args,[performanceCommand]);
-  assert.deepEqual(spec.generation.checks.map(c=>c.exitCode),[0,1]);
+  assert.deepEqual(spec.generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
   assert.ok(spec.generation.checks.every(c=>c.command!==performanceCommand));
   f.state.add(spec);assert.deepEqual(f.state.project(spec.id).spec.performance_goal,performanceGoal);
 });
@@ -556,10 +575,11 @@ test('rejected imported closure is not reoffered and interrupted import retains 
 test('structured construction entrypoint validates reference and controls at unequal cwd depths',async t=>{
   const f=await fixture(t,{nestedBundle:true,unequalDepth:true});
   const [spec]=await refillProjects(f.options);assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
-  assert.deepEqual(spec.generation.checks.map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1]);
+  assert.deepEqual(spec.generation.checks.filter(check=>check.kind!=='baseline').map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1,0]);
   const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
   await rm(f.options.path,{recursive:true});
   await validateBundle(imported,join(f.config.root,'unequal-proof'));
+  await writeFile(join(imported.source,'answer.py'),'answer=0\n');
   assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
     error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
 });
@@ -568,10 +588,11 @@ test('omitted construction command uses one frozen entrypoint across unequal fix
   const f=await fixture(t,{nestedBundle:true,unequalDepth:true,omitConstruction:true});
   const [spec]=await refillProjects(f.options);
   assert.ok(spec,JSON.stringify(f.state.db.prepare('SELECT data FROM generation_drafts').all()));
-  assert.deepEqual(spec.generation.checks.map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1]);
+  assert.deepEqual(spec.generation.checks.filter(check=>check.kind!=='baseline').map(check=>check.exitCode),[0,1,1,1,1,1,1,1,1,0]);
   const imported=await importProject(join(f.config.root,'instance'),JSON.parse(JSON.stringify(spec)));
   await rm(f.options.path,{recursive:true});
   await validateBundle(imported,join(f.config.root,'fallback-proof'));
+  await writeFile(join(imported.source,'answer.py'),'answer=0\n');
   assert.throws(()=>execFileSync('bash',['-c',imported.verifier.command],{cwd:imported.source}),
     error=>error.status===1&&error.stdout.toString().trim()==='cpu-check: 0');
 });
@@ -602,4 +623,74 @@ test('raw construction shell path is rejected before any CPU execution',async t=
   const events=f.state.db.prepare("SELECT type FROM generation_events WHERE type='generation-construction-check'").all();
   assert.deepEqual(events,[]);
   assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM projects').get().n,0);
+});
+
+
+test('generated starter with mismatched candidate tree is rejected before import or actor admission',async t=>{
+  const f=await fixture(t,{starterLayout:'mismatch'});
+  const specs=await refillProjects(f.options);
+  assert.deepEqual(specs,[]);
+  const rows=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected'").all();
+  assert.ok(rows.length);for(const row of rows) {
+    const check=JSON.parse(row.data).checks.at(-1);
+    assert.equal(check.kind,'starter');assert.equal(check.exitCode,1);
+  }
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM attempts').get().n,0);
+});
+
+test('generated nested starter survives import staging and real baseline preflight',{timeout:900000},async t=>{
+  const liveFile=process.env.RSI_GENERATED_SMOKE_PROFILE;
+  let live,binding;if(liveFile) {
+    assert.equal(process.env.RSI_ASCEND_SMOKE_LIVE,'1','Live generated smoke requires explicit authorization');
+    live=JSON.parse(await readFile(liveFile));binding=smokeBinding(live,{kind:'controller'});
+    assert.ok(['a3','a5'].includes(binding.target));
+  }
+  const f=await fixture(t,{pytorch:true,starterLayout:'compatible',baselineDevice:live?'npu:0':'cpu',
+    performanceGoal:'Tiny baseline execution analog',performanceCommand:'--performance'});
+  if(live) {f.config.local_execution=binding.localExecution;f.config.target=binding.target;}
+  const [spec]=await refillProjects(f.options);assert.ok(spec);
+  const imported=await importProject(join(f.config.root,'instance'),spec,{localExecution:f.config.local_execution});
+  await rm(f.options.path,{recursive:true});
+  let options,client;
+  if(live)options={...live.environment.options,profile:binding.target,localExecution:binding.localExecution};
+  else {
+    const backendRoot=await mkdtemp(join(tmpdir(),'generated-starter-target-')),backend=await target({root:backendRoot});
+    t.after(async()=>{try{await backend.close();}finally{await rm(backendRoot,{recursive:true,force:true});}});
+    options={mode:'cpl',target:'fixture',runtime:'cpu',workspacePath:backend.workspace,remoteDirectory:'owned',pollMs:1};client=backend.client;
+  }
+  const factory=live?(await import('../../integrations/environments/ascend.mjs')).createEnvironment:createEnvironment;
+  const environment=await factory(options,{instancePath:join(f.config.root,'execution'),...(client?{client}:{}),
+    exclude:async(_label,fn)=>fn(),event:()=>{}});
+  f.state.add(imported);const {attempt}=new RecoveryQueue(f.state).claim(imported.id,1,{id:'test'});
+  await environment.prepare({project:imported,attempt});
+  const attemptPath=join(f.config.root,'preflight');await mkdir(attemptPath);
+  await validateTargetBaseline({project:imported,state:f.state,attempt,attemptPath,
+    execute:(...args)=>environment.execute(...args),checkVerifier:await freezeFiles(imported.verifier.files,imported.source,imported.verifier.hashes),
+    remaining:()=>120,register:async()=>{}});
+  assert.equal(f.state.queryEvents(attempt.id,{types:['baseline-preflight-completed']})[0].data.passed,true);
+  if(environment.reconcileLease)assert.equal(await environment.reconcileLease(),true);
+  t.diagnostic('Generated smoke target: '+(binding?.target??'CPU fixture')+'; artifacts: '+f.config.root);
+  assert.ok(spec.generation.checks.some(check=>check.kind==='starter'&&check.exitCode===0));
+  assert.ok(spec.generation.checks.some(check=>check.kind==='baseline'&&check.exitCode===0));
+  assert.ok(imported.bundle.baseline_construction_command.includes(imported.bundle.root));
+  await rm(join(imported.source,'src'),{recursive:true});
+  await assert.rejects(validateBundle(imported,join(f.config.root,'broken-starter-proof')),/CPU starter failed/);
+});
+
+
+test('generated baseline CPU selftest rejects missing baseline-only dependencies before admission',async t=>{
+  const f=await fixture(t,{brokenBaseline:true,performanceGoal:'timing',performanceCommand:'--performance'});
+  assert.deepEqual(await refillProjects(f.options),[]);
+  const rows=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected'").all();
+  assert.ok(rows.length);for(const row of rows) {
+    const checks=JSON.parse(row.data).checks;
+    assert.ok(checks.some(check=>check.kind==='starter'&&check.exitCode===0));
+    assert.equal(checks.at(-1).kind,'baseline');assert.equal(checks.at(-1).exitCode,1);
+  }
+});
+
+test('new generated performance proposals require a baseline CPU selftest before execution',async t=>{
+  const f=await fixture(t,{omitBaselineConstruction:true,performanceGoal:'timing',performanceCommand:'--performance'});
+  assert.deepEqual(await refillProjects(f.options),[]);
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM generation_events WHERE type='generation-construction-check'").get().n,0);
 });

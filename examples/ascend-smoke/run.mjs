@@ -138,9 +138,7 @@ async function stopKnowledge(instance) {
   }
 }
 
-export async function runSmoke({kind,profile,destination,live=false,device='npu:0',signal}) {
-  assert.ok(['controller','curriculum','actor'].includes(kind));
-  if(kind!=='controller'&&!live)throw Error('Real curriculum/actor smoke requires explicit live authorization');
+export function smokeBinding(profile,{kind,device='npu:0'}={}) {
   const cpu=kind==='curriculum'||device==='cpu',product=profile.environment?.options?.health?.product;
   const target=cpu?'cpu':profile.target??product;
   if(!cpu) {
@@ -157,6 +155,13 @@ export async function runSmoke({kind,profile,destination,live=false,device='npu:
   if(!cpu)assert.ok(Number.isSafeInteger(localExecution.tasks)&&localExecution.tasks>=4&&localExecution.tasks<=128&&
     Number.isSafeInteger(localExecution.memory_bytes)&&localExecution.memory_bytes>=1024**2&&localExecution.memory_bytes<=4*1024**3,
     'Device smokes require containment of at most 128 tasks and 4 GiB; no uncontained fallback');
+  return {target,localExecution};
+}
+
+export async function runSmoke({kind,profile,destination,live=false,device='npu:0',signal}) {
+  assert.ok(['controller','curriculum','actor'].includes(kind));
+  if(kind!=='controller'&&!live)throw Error('Real curriculum/actor smoke requires explicit live authorization');
+  const {target,localExecution}=smokeBinding(profile,{kind,device});
   const root=resolve(destination),instance=join(root,'instance'),python=profile.python??'python3';
   await mkdir(root,{recursive:false,mode:0o700});
   const outer=AbortSignal.timeout(900000),active=signal?AbortSignal.any([signal,outer]):outer;

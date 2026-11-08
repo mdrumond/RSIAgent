@@ -42,7 +42,7 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
         let plan;
         if (prompt.startsWith('Construct ONE fresh original')) {
           plan=[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
-            tool('write',{path:'source/answer.py',content:'def answer(): return 0\n'}),
+            tool('write',{path:'source/answer.py',content:'def answer(): return 42\n'}),
             tool('write',{path:'reference/answer.py',content:'def answer(): return 6 * 7\n'}),
             tool('write',{path:'negative/answer.py',content:'def answer(): return -1\n'}),
             tool('write',{path:'verify.py',content:"import sys\nsys.path.insert(0, '.')\nfrom answer import answer\nsys.exit(0 if answer()==42 else 1)\n"}),
