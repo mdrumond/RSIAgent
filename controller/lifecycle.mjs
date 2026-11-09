@@ -19,7 +19,7 @@ export async function attemptStopped(state,attempt,environment) {
   return operationsStopped(state,attempt,environment);
 }
 export async function operationsStopped(state,attempt,environment) {
-  let events=state.events(attempt.id);
+  let events=state.events(attempt.id,{timestamps:true});
   const completedBash=events.filter(e=>e.type==='native-bash-completed');
   const closedBash=new Set(completedBash.map(e=>e.data.operation));
   // Worker death cannot prove its detached native SDK shell has stopped.
@@ -43,11 +43,12 @@ export async function operationsStopped(state,attempt,environment) {
   for(const [operation,data] of pending) {
     if(!environment.reconcileOperation)return false;
     const proof=await environment.reconcileOperation({operation,events,startElapsed:data.startElapsed});
-    if(!proof.closed || !Number.isFinite(proof.executionSeconds))return false;
-    if(Number.isFinite(data.startElapsed)) {
+    if(Number.isFinite(data.startElapsed) && Number.isFinite(proof.executionSeconds)) {
       elapsed=Math.max(elapsed,data.startElapsed+proof.executionSeconds);
       checkpointExecution(state,attempt.id,elapsed);
-    }else {
+    }
+    if(!proof.closed || !Number.isFinite(proof.executionSeconds))return false;
+    if(!Number.isFinite(data.startElapsed)) {
       const submissions=events.filter(e=>e.type==='execution-submitting' &&
         (e.data.operation??e.data.submission)===operation);
       const actorStarted=events.some(e=>e.type==='execution-starting' &&
@@ -55,7 +56,8 @@ export async function operationsStopped(state,attempt,environment) {
       if(actorStarted || proof.executionSeconds!==0 || !submissions.length ||
           submissions.some(e=>e.data.accountingExcluded!==true))return false;
     }
-    state.event(attempt.id,'execution-reconciled',{operation,closed:true,executionSeconds:proof.executionSeconds});
+    state.event(attempt.id,'execution-reconciled',{operation,closed:true,executionSeconds:proof.executionSeconds,
+      ...(proof.timingEstimated?{timingEstimated:true}:{})});
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
   events=state.events(attempt.id);

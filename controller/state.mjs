@@ -68,9 +68,9 @@ export class State {
     this.db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)')
       .run(attempt,type,JSON.stringify(data),new Date().toISOString());
   }
-  events(id) {
-    return this.db.prepare('SELECT type,data FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
-      .map(row=>({type:row.type,data:JSON.parse(row.data)}));
+  events(id,{timestamps=false}={}) {
+    return this.db.prepare('SELECT type,data,created FROM events WHERE attempt IS ? ORDER BY sequence').all(id)
+      .map(row=>({type:row.type,data:JSON.parse(row.data),...(timestamps?{created:row.created}:{})}));
   }
   // Sequence cursors are exclusive. Descending queries return newest first;
   // reverse their result when displaying a chronological diagnostic tail.

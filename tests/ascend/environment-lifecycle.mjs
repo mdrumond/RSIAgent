@@ -398,7 +398,8 @@ test('SIGKILL after native receipt recovers the same operation and completed dur
   assert.equal((await resumed.reconcileOperation({ operation: 'crash-op', events, startElapsed: 3 })).executionSeconds, 30.125);
   assert.equal(downloads, 1); assert.equal(submissions, 0);
   incomplete = true; await rm(join(receiptDir, 'timing.json'));
-  assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
+  const fallback=await (await createEnvironment(options, context)).reconcileOperation({ operation:'crash-op',events });
+  assert.equal(fallback.closed,true);assert.equal(fallback.timingEstimated,true);assert.ok(fallback.executionSeconds>=0);
   await rm(pending.data.receiptFile);
   assert.equal((await (await createEnvironment(options, context)).reconcileOperation({ operation: 'crash-op', events })).closed, false);
   assert.equal(submissions, 0);
