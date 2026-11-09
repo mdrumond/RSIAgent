@@ -32,9 +32,10 @@ async function fixture(t) {
   return {root,limits,operations};
 }
 
-test('legacy local execution reuses the Pi backend; malformed limits do not dispatch',()=>{
-  const operations={exec:()=>assert.fail('not dispatched')};
-  assert.equal(createLocalExecutionOperations({createLocalBashOperations:()=>operations}),operations);
+test('legacy local execution reuses the Pi backend; malformed limits do not dispatch',async()=>{
+  let calls=0;const operations={exec:async(command,cwd)=>{assert.equal(command,'printf delegated');assert.equal(cwd,'fixture');calls++;return {exitCode:0};}};
+  assert.equal((await createLocalExecutionOperations({createLocalBashOperations:()=>operations}).exec('printf delegated','fixture',{})).exitCode,0);
+  assert.equal(calls,1);
   assert.throws(()=>createLocalExecutionOperations({createLocalBashOperations:()=>operations},{tasks:0}),/limits/);
 });
 
