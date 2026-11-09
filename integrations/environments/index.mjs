@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm,copyFile } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, writeFile, mkdir, rename, realpath, lstat, readlink, rm,copyFile,link } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -270,7 +270,41 @@ export async function createEnvironment(options, context) {
         ...(receipt.outcome?{outcome:receipt.outcome}:{}) };
     } catch { return { state: 'unknown' }; }
   }
-  async function executionTiming(handle, signal) {
+  async function controllerTiming(receipt, state, legacy) {
+    // A persisted monotonic clock survives controller restart on the same host.
+    // Wall time is a conservative fallback across boots and for legacy journals.
+    Object.assign(receipt,await json(join(receipt.dir,'execution.json')));
+    if (!receipt.launch && Number.isFinite(legacy?.wallMs)) receipt.launch={wallMs:legacy.wallMs};
+    if (!Number.isFinite(receipt.launch?.wallMs)) return null;
+    const terminalPath=join(receipt.dir,'controller-terminal-timing.json');
+    let frozen;try {frozen=await json(terminalPath);} catch(error) {if(error.code!=='ENOENT')throw error;}
+    const previous=frozen??receipt.controllerTiming;
+    const terminalBound=Number.isFinite(legacy?.terminalWallMs)&&legacy.terminalWallMs>=receipt.launch.wallMs;
+    let seconds=previous?.executionSeconds??0;
+    if (!previous?.terminal) {
+      let duration=Math.max(0,(Date.now()-receipt.launch.wallMs)/1000);
+      if (terminalBound) duration=Math.max(0,(legacy.terminalWallMs-receipt.launch.wallMs)/1000);
+      else if (receipt.launch.monotonicNs && receipt.launch.boot===
+          (await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim())
+        duration=Math.max(0,Number(process.hrtime.bigint()-BigInt(receipt.launch.monotonicNs))/1e9);
+      seconds=Math.max(seconds,duration);
+    }
+    let timing={executionSeconds:seconds,terminal:previous?.terminal===true||state==='stopped'||terminalBound};
+    if(timing.terminal && !frozen) {
+      // Publish a complete immutable cutoff: a concurrent late observation must
+      // not overwrite the first durable terminal bound.
+      const candidate=terminalPath+'.'+randomUUID();
+      try {
+        await writeFile(candidate,JSON.stringify(timing),{mode:0o600});
+        try {await link(candidate,terminalPath);} catch(error) {if(error.code!=='EEXIST')throw error;}
+        timing=await json(terminalPath);
+      } finally {await rm(candidate,{force:true});}
+    }
+    receipt.controllerTiming=timing;
+    const {dir,...record}=receipt;await save(join(dir,'execution.json'),record);
+    return {executionSeconds:timing.executionSeconds,timingSource:'controller-launch',timingEstimated:true};
+  }
+  async function executionTiming(handle, signal, state, legacy) {
     if (handle.includes(':transfer:')) return { executionSeconds: 0, accountingExcluded: true };
     let receipt = executionReceipts.get(handle);
     if (!receipt) for (const name of await readdir(root)) {
@@ -284,37 +318,42 @@ export async function createEnvironment(options, context) {
       } catch { /* not a setup receipt */ }
       if (receipt) { executionReceipts.set(handle, receipt); break; }
     }
+    // Freeze the first terminal observation before potentially slow downloads.
+    let fallback;
+    try {fallback=receipt?await controllerTiming(receipt,state,legacy):null;} catch { /* accounting failure cannot change native process status */ }
     if (receipt?.timingKey && receipt.spool) {
-      if(receipt.admissionToken){
-        const admission=await readAdmission(handle,{signal});
+      if(state==='stopped' && receipt.admissionToken){
+        let admission;try {admission=await json(join(receipt.dir,'admission.json'));} catch {}
+        if(admission?.token!==receipt.admissionToken)admission=await readAdmission(handle,{signal});
         if(admission?.token===receipt.admissionToken&&admission.decision==='contended')return {executionSeconds:0,accountingExcluded:true};
       }
       const path = join(receipt.dir, 'timing.json');
+      const valid=timing=>timing?.completed===true && timing.key===receipt.timingKey &&
+        Number.isFinite(timing.executionSeconds) && timing.executionSeconds>=0;
       try {
-        let timing;
-        try { timing = await json(path); } catch {
+        let timing;try {timing=await json(path);} catch {}
+        if(!valid(timing) && state==='stopped') {
           const dir = await mkdtemp(join(root, 'timing-'));
           await exclude('transfer', () => transfer(['download', options.target, posix.join(receipt.spool, 'timing.json'), path], dir, signal));
           timing = await json(path);
         }
-        if (timing.completed === true && timing.key === receipt.timingKey && Number.isFinite(timing.executionSeconds) && timing.executionSeconds >= 0)
-          return {executionSeconds:timing.executionSeconds,...(['command','infrastructure'].includes(timing.outcome?.kind)?{outcome:timing.outcome}:{})};
-      } catch { /* terminal work without complete timing is not free work */ }
+        if(valid(timing))return {executionSeconds:timing.executionSeconds,timingSource:'wrapper',
+          ...(['command','infrastructure'].includes(timing.outcome?.kind)?{outcome:timing.outcome}:{})};
+      } catch { /* launch accounting remains available if the receipt cannot be recovered */ }
     }
-    await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration; refuse resume until reconciled' });
+    if(fallback)return fallback;
+    await event('accounting-unresolved', { handle, message: 'No completed same-host execution duration or controller launch timestamp' });
     return { accountingUnresolved: true };
   }
-  async function observe(handle, {signal = context.signal,accountingExcluded = false} = {}) {
+  async function observe(handle, {signal = context.signal,accountingExcluded = false,launch} = {}) {
     check(handle);
     let state;
-    try {
-      state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle,{signal});
-      if (remote && state.state === 'stopped') {
-        if(accountingExcluded === true)Object.assign(state,{executionSeconds:0,accountingExcluded:true});
-        else if(state.executionSeconds === undefined)Object.assign(state, await executionTiming(handle, signal));
-      }
+    try {state = remote ? normalize(await client(['observe', handle], {signal})) : await localState(handle,{signal});}
+    catch {state={state:'unknown'};}
+    if(remote) {
+      if(accountingExcluded===true)Object.assign(state,{executionSeconds:0,accountingExcluded:true});
+      else if(state.executionSeconds===undefined)Object.assign(state,await executionTiming(handle,signal,state.state,launch));
     }
-    catch { state = { state: 'unknown' }; }
     await event('execution-state', { handle, ...state });
     return state;
   }
@@ -572,7 +611,8 @@ export async function createEnvironment(options, context) {
     const args = ['run', options.target, '--file', script, '--receipt-file', receipt];
     if (options.runtime) args.push('--runtime', options.runtime);
     if (opts.resourceId !== undefined) args.push('--npu', String(opts.resourceId));
-    const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, admissionToken:opts.admissionToken, cwd: configuration.cwd };
+    const launch={wallMs:Date.now(),monotonicNs:String(process.hrtime.bigint()),boot:(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim()};
+    const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, launch, admissionToken:opts.admissionToken, cwd: configuration.cwd };
     await save(join(dir, 'execution.json'), receiptData);
     const submitted = await submit(args, receipt, false, false, signal);
     handle = submitted.handle;
@@ -604,6 +644,7 @@ export async function createEnvironment(options, context) {
     }
     return { handle, exitCode: state.exitCode ?? null, settled: state.state === 'stopped',
       ...(state.outcome?{outcome:state.outcome}:{}),
+      ...(state.timingSource?{timingSource:state.timingSource,timingEstimated:state.timingEstimated}:{}),
       ...(state.executionSeconds === undefined ? { accountingUnresolved: true } : { executionSeconds: state.executionSeconds }) };
   }
   // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
@@ -629,23 +670,48 @@ export async function createEnvironment(options, context) {
     const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
     const handles = new Set();
     if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
-    let executionSeconds = 0;
+    let executionSeconds = 0,timingEstimated=false,closed=true,accountingUnresolved=false,accounted=false;
     const excluded=excludedExecutionProofs(events);
-    for (const { data } of pending) {
+    for (const submission of pending) {
+      const {data}=submission;
       const response = events.find(event => ['execution-submitted', 'execution-not-admitted'].includes(event.type) && event.data.submission === data.submission);
       if (response?.type === 'execution-not-admitted' || (response?.data.closed && data.accountingExcluded)) continue;
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
-      if (!handle) return { closed: false, accountingUnresolved: true, handles: [...handles] };
+      if (!handle) {
+        closed=false;accountingUnresolved=true;
+        if(!data.accountingExcluded) {
+          let timing;
+          if(data.receiptFile)try {
+            const dir=dirname(data.receiptFile),name=relative(root,dir);
+            if(name&&!name.startsWith('..')&&!isAbsolute(name)) {
+              const receipt=await json(join(dir,'execution.json'));
+              if(receipt.receiptFile===data.receiptFile)
+                timing=await controllerTiming({...receipt,dir},'unknown',{wallMs:Date.parse(submission.created)});
+            }
+          } catch { /* the original submission remains unidentified and fenced */ }
+          if(!timing&&Number.isFinite(Date.parse(submission.created)))
+            timing={executionSeconds:Math.max(0,(Date.now()-Date.parse(submission.created))/1000),timingEstimated:true};
+          if(timing) {executionSeconds+=timing.executionSeconds;timingEstimated=true;accounted=true;}
+        }
+        continue;
+      }
       check(handle);
       if (handles.has(handle)) continue;
       handles.add(handle);
+      const terminalEvent=events.find(e=>e.type==='execution-state'&&e.data.handle===handle&&e.data.state==='stopped'&&Number.isFinite(Date.parse(e.created)));
+      const launch={wallMs:Date.parse(submission.created),terminalWallMs:Date.parse(terminalEvent?.created)};
       const state = (data.accountingExcluded === true && excluded.get(handle)) ||
-        await observe(handle,{accountingExcluded:data.accountingExcluded === true});
-      if (state.state !== 'stopped' || (!data.accountingExcluded && !Number.isFinite(state.executionSeconds))) return { closed: false, accountingUnresolved: true, handles: [...handles] };
-      if (!data.accountingExcluded) executionSeconds += state.executionSeconds;
+        await observe(handle,{accountingExcluded:data.accountingExcluded === true,launch});
+      if(data.accountingExcluded)accounted=true;
+      else if(Number.isFinite(state.executionSeconds)) {
+        executionSeconds += state.executionSeconds;timingEstimated ||= state.timingEstimated===true;accounted=true;
+      }else accountingUnresolved=true;
+      if(state.state!=='stopped')closed=false;
     }
-    return { closed: true, executionSeconds, handles: [...handles] };
+    return {closed:closed&&!accountingUnresolved,
+      ...((accounted||!accountingUnresolved)?{executionSeconds}:{}),
+      ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles]};
   }
   // Installation eligibility only: never settles work or permits its resumption.
   async function canUpgrade({ attempt, events }) {

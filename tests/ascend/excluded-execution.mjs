@@ -88,8 +88,9 @@ test('unobserved excluded jobs remain fenced until the exact native handle is te
   assert.equal(f.state.queryEvents(f.id,{types:['accounting-unresolved']}).length,0);
 });
 
-test('a terminal payload is never treated as free work when its same-host timing is missing or invalid',async t=>{
+test('a payload without trustworthy launch evidence still requires matching wrapper timing',async t=>{
   const f=await fixture(t),handle=f.submission('payload',{excluded:false});
+  f.state.db.prepare("UPDATE events SET created='unknown' WHERE type='execution-submitting'").run();
   const dir=join(f.root,'.executions','exec-payload');await mkdir(dir);
   await writeFile(join(dir,'execution.json'),JSON.stringify({handle,spool:'owned/a/output',timingKey:'payload-key'}));
   assert.equal(await operationsStopped(f.state,f.state.attempt(f.id),f.environment),false);
