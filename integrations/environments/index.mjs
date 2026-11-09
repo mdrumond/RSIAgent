@@ -242,12 +242,14 @@ export async function createEnvironment(options, context) {
       if(receipt.prelaunch?.closed===true&&receipt.prelaunch.payloadStarted===false)
         return {state:'stopped',...(receipt.outcome?{outcome:receipt.outcome}:{})};
       if(receipt.containment) {
-        if(receipt.containment.closed) {
-          let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
-          return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{}),...(receipt.outcome?{outcome:receipt.outcome}:{})};
+        if(!receipt.containment.closed) {
+          const state=await local.observe(receipt.containment.unit,{signal});
+          if(state.state!=='stopped')return state;
         }
-        const state=await local.observe(receipt.containment.unit,{signal});
-        return state.state==='stopped'?{state:'unknown'}:state;
+        // Cleanup can finish before the worker persists its closed receipt.
+        // Same-boot OS scope closure is also positive descendant-closure proof.
+        let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
+        return {state:'stopped',...(Number.isInteger(exitCode)?{exitCode}:{}),...(receipt.outcome?{outcome:receipt.outcome}:{})};
       }
       const original = (await readFile(join(dir, 'identity'), 'utf8')).trim();
       const pid = Number(original.slice(0, original.indexOf(' ')));
