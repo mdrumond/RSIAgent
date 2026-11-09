@@ -239,6 +239,8 @@ export async function createEnvironment(options, context) {
     try {
       const receipt = await json(join(dir, 'execution.json'));
       if (receipt.boot !== (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()) return { state: 'unknown' };
+      if(receipt.prelaunch?.closed===true&&receipt.prelaunch.payloadStarted===false)
+        return {state:'stopped',...(receipt.outcome?{outcome:receipt.outcome}:{})};
       if(receipt.containment) {
         if(receipt.containment.closed) {
           let exitCode;try{exitCode=Number(await readFile(join(dir,'exit'),'utf8'));}catch{}
@@ -475,8 +477,16 @@ export async function createEnvironment(options, context) {
           outcome:result.outcome});
       }
       catch (error) {
+        const failure={message:error.message,code:error.code??null,syscall:error.syscall??null};
+        const prelaunch=error.localPrelaunch;
+        const outcome={kind:'infrastructure',reason:prelaunch?.closed===true&&prelaunch.payloadStarted===false
+          ?'local-execution-not-started':'local-execution-interrupted'};
+        await save(join(dir,'execution.json'),{...await json(join(dir,'execution.json')),failure,outcome,
+          ...(prelaunch?{prelaunch}:{})});
+        await event('execution-error',{handle,...failure,...(prelaunch?{prelaunch}:{})});
+        if(outcome.reason==='local-execution-not-started')return {handle,exitCode:null,settled:true,outcome};
         const state = await stop(handle,{signal:opts.stopSignal});
-        if (state.state !== 'stopped') throw new Error(`Local execution unresolved: ${handle}`, { cause: error });
+        if (state.state !== 'stopped') throw Object.assign(new Error(`Local execution unresolved: ${handle}: ${error.code??'execution-error'}: ${error.message}`, { cause: error }),{handle});
         return {handle,exitCode:state.exitCode??null,settled:true,
           outcome:{kind:'infrastructure',reason:'local-execution-interrupted'}};
       }

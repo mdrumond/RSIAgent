@@ -1,4 +1,5 @@
 import test from 'node:test';
+import * as sdk from '@earendil-works/pi-coding-agent';
 import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
@@ -42,12 +43,12 @@ print(text[q])
     health:{product:'a5',chip:null,query_timeout_seconds:.5}};
   async function bind(resource,extra={},path=join(root,'instance-'+sequence++)){
     const events=[],handles=new Set();let depth=0;
-    const context={instancePath:path,resource,signal:extra.signal,leaseDirectory:join(root,'leases'),
+    const context={instancePath:path,resource,signal:extra.signal,...(extra.sdk?{sdk:extra.sdk}:{}),leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
         return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
       exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
       event:async(type,data)=>{
-        events.push({type,data});
+        events.push({type,data});await extra.onEvent?.(type,data);
         if(type==='execution-handle'){
           handles.add(data.handle);assert.match(data.handle,/^local:exec-/);
           assert.equal(depth>0,['resource-health','device-lease-control'].includes(data.purpose));
@@ -346,4 +347,35 @@ test('closed cleanup ownership mismatch preserves an orphan fence and retries af
   assert.equal(receipt.token,prior.token);assert.equal(receipt.decision,'ownership-mismatch');
   await rm(fence,{recursive:true});
   assert.equal(await first.environment.reconcileLease(),true);
+});
+
+
+test('local health cancellation after journal publication has positive closure and no payload',async t=>{
+  const f=await fixture(t),abort=new AbortController();
+  const bound=await f.bind(undefined,{signal:abort.signal,onEvent:(type,data)=>{
+    if(type==='execution-handle'&&data.purpose==='resource-health')abort.abort();
+  }});
+  await bound.environment.prepare({project:{source:f.source},attempt:{id:'cancel-health'}});
+  await assert.rejects(bound.environment.execute('touch payload-started',f.source,{timeout:5}),error=>error.closure?.closed===true);
+  assert.equal(await exists(join(f.source,'payload-started')),false);
+  const handle=bound.events.find(event=>event.type==='execution-handle'&&event.data.purpose==='resource-health').data.handle;
+  assert.equal((await bound.environment.observe(handle)).state,'stopped');
+});
+
+test('proven unspawned local lease cleanup retries without replaying the device payload',async t=>{
+  const f=await fixture(t),shell=join(f.root,'missing-shell-interpreter');
+  await writeFile(shell,'#!/missing/interpreter\n',{mode:0o700});
+  let failures=0;const native=sdk.createLocalBashOperations(),broken=sdk.createLocalBashOperations({shellPath:shell});
+  const bridge={...sdk,createLocalBashOperations:()=>({exec:(command,cwd,options)=>{
+    if(command.includes('/control/.executions/')&&failures++===0)return broken.exec(command,cwd,options);
+    return native.exec(command,cwd,options);
+  }})};
+  const bound=await f.bind(undefined,{sdk:bridge});
+  await bound.environment.prepare({project:{source:f.source},attempt:{id:'cleanup-prelaunch'}});
+  const result=await bound.environment.execute("printf x >> payload-count",f.source,{timeout:10});
+  assert.equal(result.settled,true);assert.equal(result.exitCode,0);
+  await until(()=>bound.environment.reconcileLease());
+  assert.ok(failures>=2);assert.equal(await readFile(join(f.source,'payload-count'),'utf8'),'x');
+  assert.ok(bound.events.some(event=>event.type==='execution-error'&&event.data.code==='ENOENT'));
+  assert.equal(bound.events.filter(event=>event.type==='device-lease-released').length,1);
 });

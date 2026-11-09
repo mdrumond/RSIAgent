@@ -416,7 +416,7 @@ export async function createEnvironment(options, context) {
       const controlState=await cleanup.observe(lease.record.controlHandle,{signal:budget.signal});
       if(controlState.state!=='stopped')return false;
       const receipt=await cleanup.readAdmission(lease.record.controlHandle,{signal:budget.signal});
-      if(controlState.nativeState==='failed' && receipt?.token!==lease.token){
+      if((controlState.nativeState==='failed'||controlState.outcome?.reason==='local-execution-not-started')&&receipt?.token!==lease.token){
         // A terminal failed cleanup may never have entered its Python payload.
         // Preserve its exact journal and permit a new token-scoped cleanup on
         // the next pass; the original device command is never replayed.
