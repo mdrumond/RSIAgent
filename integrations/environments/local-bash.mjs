@@ -36,9 +36,16 @@ export function createLocalExecutionOperations(sdk,limits,{signal:cleanupSignal}
     const properties=Object.fromEntries(result.output.trim().split('\n').filter(line=>line.includes('=')).map(line=>{
       const index=line.indexOf('=');return [line.slice(0,index),line.slice(index+1)];
     }));
-    if(properties.LoadState==='not-found')return {state:'stopped'};
     if(result.exitCode!==0)return {state:'unknown'};
-    return {state:['inactive','failed'].includes(properties.ActiveState)?'stopped':'running',cgroup:properties.ControlGroup};
+    const {LoadState:load,ActiveState:active,ControlGroup:cgroup}=properties;
+    if(!load||!active||cgroup===undefined)return {state:'unknown'};
+    // A failed/inactive unit may still retain a populated scope. Only an
+    // explicitly absent control group proves that all its descendants left.
+    if(load==='not-found'&&active==='inactive')return {state:cgroup===''?'stopped':'unknown'};
+    if(load==='loaded'&&['inactive','failed'].includes(active))
+      return {state:cgroup===''?'stopped':'unknown',cgroup};
+    return {state:load==='loaded'&&['active','activating','deactivating','reloading'].includes(active)
+      ?'running':'unknown',cgroup};
   };
   const stop=async(unit,{signal=cleanupSignal}={})=>{
     if(!units.test(unit))throw Error('Owned command scope required');
