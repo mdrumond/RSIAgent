@@ -527,8 +527,8 @@ for(const product of ['a3','a5'])test(`${product} reserved physical device is ex
   const options={...f.options,deviceAffinity:[0,2],backgroundDevice:2};
   const scheduler=await createEnvironment(options,{...f.context,instancePath:join(f.context.instancePath,'scheduler')});
   const slots=await scheduler.resources();
-  assert.equal(slots.length,2);assert.deepEqual(slots.map(row=>row.metadata.hostSlot),[0,1]);
-  assert.deepEqual(slots.map(row=>row.metadata.backgroundSlot),[true,false]);
+  assert.equal(slots.length,4);assert.deepEqual(slots.map(row=>row.metadata.hostSlot),[0,1,2,3]);
+  assert.deepEqual(slots.map(row=>row.metadata.backgroundSlot),[true,false,false,false]);
   assert.deepEqual((await scheduler.inspectDevices()).map(row=>row.metadata.physicalDevice),[0,2]);
   const background=await createEnvironment(options,{...f.context,resource:slots[0],instancePath:join(f.context.instancePath,'background')});
   const foreground=await createEnvironment(options,{...f.context,resource:slots[1],instancePath:join(f.context.instancePath,'foreground')});
@@ -550,7 +550,7 @@ for(const product of ['a3','a5'])test(`${product} reserved physical device is ex
   assert.equal(f.commands.length,previous);
   const disabled=await scheduler.resources();
   assert.deepEqual(disabled.map(row=>[row.id,row.metadata.hostSlot,row.available]),
-    [[slots[0].id,0,false],[slots[1].id,1,true]]);
+    slots.map((row,index)=>[row.id,index,index!==0]));
   assert.deepEqual((await foreground.inspectDevices()).filter(row=>row.available).map(row=>row.metadata.physicalDevice),[0]);
   assert.equal((await foreground.execute('foreground-while-background-disabled',f.source,{timeout:5})).settled,true);
   assert.deepEqual(f.commands.at(-1).devices,[0]);
@@ -558,7 +558,7 @@ for(const product of ['a3','a5'])test(`${product} reserved physical device is ex
   f.setEnabled([]);
   assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),[[slots[0].id,false]]);
   f.setEnabled([0,2]);
-  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),slots.map(row=>[row.id,true]));
+  assert.deepEqual((await scheduler.resources()).map(row=>[row.id,row.available]),slots.slice(0,2).map(row=>[row.id,true]));
 });
 
 test('physical background routing requires explicit scalar membership and valid worker slot',async t=>{

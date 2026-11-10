@@ -7,7 +7,7 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {setup,rows,until} from './driver_setup.mjs';
 import {State} from '../../controller/state.mjs';
-import {bootstrap as instance,readConfig} from '../../cli/instance.mjs';
+import {bootstrap as instance,readConfig,updateConfig} from '../../cli/instance.mjs';
 import {bootstrap,resume,settled} from '../../cli/evaluation.mjs';
 import {bootstrapSettled,managedBootstrap} from '../../cli/evaluation-bootstrap.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
@@ -17,6 +17,7 @@ test('cancelled setup resumes the same frozen sample and runs exactly one canoni
   {timeout:180000},async t=>{
     const f=await setup(t,'recover',['unrelated']);
     const config=await readConfig(f.root),round=join(f.root,'round');await mkdir(round);
+    const machineryMarker=join(f.root,'machinery','cli','frozen-fixture.txt');await writeFile(machineryMarker,'original harness');
     const marker=join(round,'setup-started'),release=join(round,'release'),python=join(round,'python');
     await writeFile(python,`#!/bin/bash\nif [[ "$*" == '-m ascend_tools.restic_install --install' ]]; then\n touch ${quote(marker)}\n while [[ ! -f ${quote(release)} ]]; do sleep 0.05; done\nfi\nexec ${quote(config.python)} "$@"\n`);
     await chmod(python,0o700);
@@ -35,6 +36,10 @@ test('cancelled setup resumes the same frozen sample and runs exactly one canoni
     await assert.rejects(bootstrap({...request,skillVersion:'baseline',config:{...request.config,actor_seconds:119}}),/binding changed/);
     const db=new DatabaseSync(join(f.root,'knowledge.sqlite'));db.exec('CREATE TABLE later(value)');db.close();
     await writeFile(release,'go');
+    // Model an old controller's snapshot, made before provenance was recorded.
+    await updateConfig(join(round,'inputs'),current=>{const next={...current};delete next.evaluation_machinery;return next;});
+    await writeFile(machineryMarker,'upgraded controller');
+    await assert.rejects(bootstrap({...request,instanceRoot:join(round,'unverified-arm')}),{code:'ENOENT'});
     const result=await resume(request);
     assert.equal(result.correct,true);assert.equal(result.attempts.length,1);
     assert.equal(rows(request.instanceRoot,'SELECT count(*) AS n FROM attempts')[0].n,1);
@@ -43,6 +48,11 @@ test('cancelled setup resumes the same frozen sample and runs exactly one canoni
     assert.equal(after.signature,before.signature);assert.equal(after.status,'ready');
     assert.equal(after.handles.length,3); // cancelled restic, resumed restic, dependency installation
     assert.equal(await settled(request),true);
+    assert.equal(await readFile(join(request.instanceRoot,'machinery','cli','frozen-fixture.txt'),'utf8'),'original harness');
+    const second={...request,instanceRoot:join(round,'second-arm')};await bootstrap(second);
+    assert.equal(await readFile(join(second.instanceRoot,'machinery','cli','frozen-fixture.txt'),'utf8'),'original harness');
+    await writeFile(join(round,'inputs','machinery','cli','frozen-fixture.txt'),'tampered harness');
+    await assert.rejects(bootstrap({...request,instanceRoot:join(round,'third-arm')}),/Frozen evaluation machinery changed/);
     f.pass();
   });
 

@@ -11,7 +11,7 @@ const save=async(root,value)=>{
   await rename(temporary,receiptPath(root));
 };
 const environment=(root,event=async()=>{},signal)=>createEnvironment({mode:'local'},
-  {instancePath:root+'-setup',event,exclude:async(_label,fn)=>fn(),signal});
+  {instancePath:root+'-setup',event,exclude:async(_label,fn)=>fn(),signal,recoverPiTimeoutRejection:true});
 async function closed(root,receipt) {
   if(receipt.format!==1 || !receipt.owner?.pid || !receipt.owner.start || !receipt.owner.boot ||
     !['preparing','stopped','ready'].includes(receipt.status) || !Array.isArray(receipt.handles))return false;
