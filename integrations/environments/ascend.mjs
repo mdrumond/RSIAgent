@@ -52,7 +52,7 @@ export async function createEnvironment(options, context) {
     !configuredAffinity?.includes(reserved)||new Set(configuredAffinity).size!==configuredAffinity.length))
     throw new Error('backgroundDevice requires one physical ID in explicit unique deviceAffinity');
   const slot=context.resource?.metadata?.hostSlot;
-  if(reserved!==undefined && context.resource && (!Number.isInteger(slot)||slot<0||slot>=configuredAffinity.length))
+  if(reserved!==undefined && context.resource && (!Number.isInteger(slot)||slot<0))
     throw new Error('Reserved device routing requires scheduler host-slot metadata');
   const affinity=reserved===undefined||!context.resource?configuredAffinity:
     slot===0?[reserved]:configuredAffinity.filter(id=>id!==reserved);
@@ -123,7 +123,8 @@ export async function createEnvironment(options, context) {
     if (!profile) throw new Error('NPU permission profile missing');
     if (!local && (typeof profile.pool !== 'string' || !profile.pool.trim())) throw new Error('CPL NPU profile requires an actual alias-group pool');
     pool = profile.pool ?? 'local:' + options.target;
-    const filter=hostSlots?configuredAffinity:affinity;
+    // Logical scheduler identities survive narrowing the physical dispatch pool.
+    const filter=hostSlots?undefined:affinity;
     return profile.devices.filter(row => row.enabled === true && Number.isInteger(row.id) && row.id >= 0).map(row => row.id).filter(id => !filter || filter.includes(id));
   }
   async function localSnapshot(devices,purpose,emit,budget,signal) {

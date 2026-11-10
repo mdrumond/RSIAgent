@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join, resolve, relative, isAbsolute, posix, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import {createLocalExecutionOperations} from './local-bash.mjs';
+import {createLocalExecutionOperations,isPiMaximumTimeoutRejection} from './local-bash.mjs';
 import {excludedExecutionProofs} from '../../controller/execution-proof.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
@@ -239,6 +239,14 @@ export async function createEnvironment(options, context) {
     try {
       const receipt = await json(join(dir, 'execution.json'));
       if (receipt.boot !== (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()) return { state: 'unknown' };
+      // Only canonical evaluation setup opts into this legacy prelaunch proof.
+      // Preserve the refusal: it proves no process, not a successful command.
+      if(context.recoverPiTimeoutRejection===true&&context.sdk===undefined&&
+          Object.keys(receipt).every(key=>['boot','cwd','failure','outcome'].includes(key))&&
+          typeof receipt.cwd==='string'&&receipt.cwd&&isPiMaximumTimeoutRejection(receipt.failure)&&
+          receipt.outcome?.kind==='infrastructure'&&receipt.outcome.reason==='local-execution-interrupted'&&
+          (await readdir(dir)).every(name=>name==='execution.json'))
+        return {state:'stopped',outcome:receipt.outcome};
       if(receipt.prelaunch?.closed===true&&receipt.prelaunch.payloadStarted===false)
         return {state:'stopped',...(receipt.outcome?{outcome:receipt.outcome}:{})};
       if(receipt.containment) {

@@ -2,7 +2,7 @@ import { managedBootstrap, bootstrapSettled } from './evaluation-bootstrap.mjs';
 import { fingerprint } from '../controller/evidence.mjs';
 import { join, resolve, dirname } from 'node:path';
 import { ownerStopped, operationsStopped, processIdentity } from '../controller/lifecycle.mjs';
-import { bootstrap as createInstance, readConfig } from './instance.mjs';
+import { bootstrap as createInstance, readConfig, updateConfig } from './instance.mjs';
 import { spawn } from 'node:child_process';
 import { open, readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
@@ -13,10 +13,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 export async function bootstrap(request) {
   request.signal?.throwIfAborted();
   const original=await readConfig(request.sourceInstanceRoot);
-  const machinery=join(original.root,'machinery');
+  const inputs=join(dirname(request.instanceRoot),'inputs');
+  let frozen;
+  try{frozen=await readConfig(inputs);}catch(error){if(error.code!=='ENOENT')throw error;}
+  const machinery=join(frozen?inputs:original.root,'machinery');
+  const machineryHash=await fingerprint(machinery);
+  if(frozen?.evaluation_machinery && frozen.evaluation_machinery!==machineryHash)
+    throw new Error('Frozen evaluation machinery changed');
+  if(frozen && !frozen.evaluation_machinery && machineryHash!==await fingerprint(join(original.root,'machinery'))) {
+    // Legacy snapshots acquire provenance only through an existing arm's verified
+    // binding. A new arm cannot bless an unverified snapshot after an upgrade.
+    await readFile(request.instanceRoot+'.bootstrap.json');
+  }
   const binding={source:original.root,projectId:request.projectId,projectIds:request.projectIds,
     skillVersion:request.skillVersion,config:request.config,resource:request.resource,
-    machinery:await fingerprint(machinery),skills:await fingerprint(join(original.root,'skills','versions',request.skillVersion))};
+    machinery:machineryHash,skills:await fingerprint(join(original.root,'skills','versions',request.skillVersion))};
   return managedBootstrap(request.instanceRoot,{binding,signal:request.signal,remainingSeconds:request.remainingSeconds},async initialization=>{
   const ledger=new State(join(original.root,'state.sqlite'));
   try {
@@ -39,11 +50,7 @@ export async function bootstrap(request) {
     ledger.event(null,'evaluation-started',{instanceRoot:request.instanceRoot});
   }finally{ledger.close();}
   // Freeze once per round so both arms see identical memory and starting source.
-  const inputs=join(dirname(request.instanceRoot),'inputs');
-  let frozen;
-  try{frozen=await readConfig(inputs);}
-  catch(error) {
-    if(error.code!=='ENOENT')throw error;
+  if(!frozen) {
     const ids=request.projectIds??[request.projectId];
     const projects=ids.map(id=>{
       const project=original.projects.find(project=>project.id===id);
@@ -54,9 +61,11 @@ export async function bootstrap(request) {
       projects:await Promise.all(projects.map(async project=>({...project,sourceHash:await fingerprint(project.source)})))},signal:request.signal,
       remainingSeconds:request.remainingSeconds},async initialization=>createInstance(inputs,{initialization,python:request.config.python??original.python,baseline:join(original.root,'knowledge.sqlite'),
       skills:join(original.root,'skills','versions',request.skillVersion),
-      environment:original.environment,local_execution:original.local_execution,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')}));
+      evaluation_machinery:binding.machinery,environment:original.environment,local_execution:original.local_execution,projects,install:false,signal:request.signal,machinery:join(original.root,'machinery')}));
     frozen=await readConfig(inputs);
   }
+  if(!frozen.evaluation_machinery)
+    await updateConfig(inputs,current=>({...current,evaluation_machinery:binding.machinery}));
   const project=frozen.projects.find(project=>project.id===request.projectId);
   if(!project)throw new Error('Project not in the frozen evaluation round');
   const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,
@@ -66,7 +75,7 @@ export async function bootstrap(request) {
   await createInstance(request.instanceRoot,{initialization,...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
     skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
-    signal:request.signal,machinery:join(original.root,'machinery')});
+    signal:request.signal,machinery:join(inputs,'machinery')});
   });
 }
 export async function wave({instanceRoot,config,signal,resuming=false,remainingSeconds}) {

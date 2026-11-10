@@ -9,6 +9,15 @@ const notStarted=(error,stage)=>Object.assign(error,{localPrelaunch:{closed:true
 const spawnFailure=error=>typeof error?.syscall==='string'&&error.syscall.startsWith('spawn ')
   ?notStarted(error,'shell-spawn'):error;
 const beforeLaunch=options=>{if(options.signal?.aborted)throw notStarted(Object.assign(new Error('Local execution aborted before launch'),{code:'ABORT_ERR'}),'cancelled');};
+// Pi's command timer uses signed 32-bit milliseconds. An enclosing elapsed
+// allocation can be longer; only the individual SDK request is bounded here.
+const maxPiTimeoutSeconds=2147483647/1000;
+const piOptions=options=>Number.isFinite(options.timeout)&&options.timeout>maxPiTimeoutSeconds
+  ?{...options,timeout:maxPiTimeoutSeconds}:options;
+// Compatibility with receipts made before request clipping. The pinned Pi SDK
+// rejects this argument before calling its shell; it supplies no typed error.
+export const isPiMaximumTimeoutRejection=failure=>failure?.code===null&&failure.syscall===null&&
+  failure.message===`Invalid timeout: maximum is ${maxPiTimeoutSeconds} seconds`;
 
 const units=/^rsi-command-[a-f0-9-]+\.scope$/;
 const counters=text=>Object.fromEntries(text.trim().split('\n').filter(Boolean).map(line=>{
@@ -21,7 +30,7 @@ export function createLocalExecutionOperations(sdk,limits,{signal:cleanupSignal}
   const pi=sdk.createLocalBashOperations();
   if(!limits)return {...pi,async exec(command,cwd,options) {
     beforeLaunch(options);
-    try{return await pi.exec(command,cwd,options);}catch(error){throw spawnFailure(error);}
+    try{return await pi.exec(command,cwd,piOptions(options));}catch(error){throw spawnFailure(error);}
   }};
   const {tasks=128,memory_bytes=4*1024**3}=limits;
   if(!Number.isSafeInteger(tasks)||tasks<4||!Number.isSafeInteger(memory_bytes)||memory_bytes<1024**2)
@@ -75,7 +84,7 @@ export function createLocalExecutionOperations(sdk,limits,{signal:cleanupSignal}
       ...(options.timeout===undefined?[]:['--property=RuntimeMaxSec='+options.timeout+'s']),
       'bash','-c',script].map(quote).join(' ');
     const abort=new AbortController();
-    const execution=Promise.resolve().then(()=>pi.exec(wrapper,cwd,{...options,signal:options.signal?AbortSignal.any([options.signal,abort.signal]):abort.signal}))
+    const execution=Promise.resolve().then(()=>pi.exec(wrapper,cwd,piOptions({...options,signal:options.signal?AbortSignal.any([options.signal,abort.signal]):abort.signal})))
       .then(value=>{result=value;},error=>{failure=spawnFailure(error);}).finally(()=>{done=true;});
     try {
       while(!done) {

@@ -379,3 +379,28 @@ test('proven unspawned local lease cleanup retries without replaying the device 
   assert.ok(bound.events.some(event=>event.type==='execution-error'&&event.data.code==='ENOENT'));
   assert.equal(bound.events.filter(event=>event.type==='device-lease-released').length,1);
 });
+
+test('retained logical host slot survives a smaller physical pool and dispatches only in that pool',async t=>{
+  const f=await fixture(t);f.setEnabled([0,1,2,3,4,5,6,7]);
+  for(let id=0;id<8;id++)f.rows[id]={};await f.update();
+  const prior=await f.bind(undefined,{deviceAffinity:[0,1,2,3,4,5,6,7],backgroundDevice:4});
+  const oldSlots=await prior.environment.resources(),retained=oldSlots[4];
+  const options={deviceAffinity:[4,5,6,7],backgroundDevice:4};
+  const inventory=await f.bind(undefined,options),nextSlots=await inventory.environment.resources();
+  assert.deepEqual(nextSlots.map(r=>r.id),oldSlots.map(r=>r.id));
+  assert.equal(nextSlots.find(r=>r.id===retained.id).metadata.hostSlot,4);
+  const state=new State(join(f.root,'retained.sqlite'));f.onClose(()=>state.close());
+  state.add({id:'p',goal:'Preserve scheduler identity',actor_seconds:30});
+  const {attempt}=new RecoveryQueue(state).claim('p',1,{pid:2147483647,start:'0',boot:'old'},retained.id);
+  state.checkpoint(attempt.id,3.5,'retained-session');
+  const foreground=await f.bind(retained,options);
+  await state.resume(attempt.id,a=>attemptStopped(state,a,foreground.environment),await processIdentity());
+  assert.equal(state.attempt(attempt.id).elapsed,3.5);assert.equal(state.attempt(attempt.id).session,'retained-session');
+  assert.deepEqual((await foreground.environment.inspectDevices()).map(r=>r.metadata.physicalDevice),[5,6,7]);
+  const background=await f.bind(nextSlots[0],options);
+  for(const [binding,expected] of [[foreground,5],[background,4]]){
+    let output='';const result=await binding.environment.execute('printf "%s" "$ASCEND_PHYSICAL_DEVICE"',f.source,{timeout:10,onData:c=>output+=c});
+    assert.equal(result.exitCode,0);assert.equal(output,String(expected));
+    assert.equal(binding.events.filter(e=>e.type==='device-lease-acquired').at(-1).data.physicalDevice,expected);
+  }
+});
