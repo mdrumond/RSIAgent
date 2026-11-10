@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { excludedExecutionProofs } from './execution-proof.mjs';
+import { excludedExecutionProofs, terminalExecutionProofs, isNativeTerminalClosure } from './execution-proof.mjs';
 
 export async function processIdentity(pid=process.pid) {
   const stat=await readFile(`/proc/${pid}/stat`,'utf8');
@@ -73,10 +73,16 @@ export async function operationsStopped(state,attempt,environment) {
   const handles=new Set([...events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle),
     ...events.filter(e=>e.type==='execution-unresolved' && e.data.handle).map(e=>e.data.handle)]);
   const excluded=excludedExecutionProofs(events);
+  const terminal=terminalExecutionProofs(events);
   for (const handle of handles) {
     if (!handle) return false;
-    const proof=excluded.get(handle) ?? await environment.observe(handle,{accountingExcluded:excluded.has(handle)});
+    const proof=terminal.get(handle) ?? excluded.get(handle) ?? await environment.observe(handle,{accountingExcluded:excluded.has(handle)});
     if (proof.state !== 'stopped') return false;
+    // Retain progress even when the next observation exceeds this scan's window.
+    // Local process/scope identities remain live-observed; only immutable native
+    // job and transfer handles can reuse a previous terminal observation.
+    if (!terminal.has(handle) && isNativeTerminalClosure({handle,...proof}))
+      state.event(attempt.id,'execution-state',{handle,state:'stopped',nativeState:proof.nativeState});
   }
   return true;
 }
