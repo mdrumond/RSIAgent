@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,readFile,writeFile,rm,access} from 'node:fs/promises';
 import {join} from 'node:path';
+import {constants} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {processIdentity} from '../../controller/lifecycle.mjs';
@@ -10,6 +11,20 @@ import * as sdk from '@earendil-works/pi-coding-agent';
 import {createLocalExecutionOperations} from '../../integrations/environments/local-bash.mjs';
 import {managedBootstrap,bootstrapSettled} from '../../cli/evaluation-bootstrap.mjs';
 import {evaluateRound} from '../../controller/evaluation-round.mjs';
+
+async function available(t) {
+  let output='';
+  try {
+    const result=await sdk.createLocalBashOperations().exec('systemctl --user show --property=ControlGroup --value',process.cwd(),
+      {timeout:3,onData:chunk=>output+=chunk});
+    const root='/sys/fs/cgroup'+output.trim();
+    if(result.exitCode!==0||!output.startsWith('/'))throw Error('No user manager');
+    await access(root,constants.W_OK);
+    const controllers=await readFile(root+'/cgroup.controllers','utf8');
+    if(!controllers.split(/\s+/).includes('pids')||!controllers.split(/\s+/).includes('memory'))throw Error('No resource delegation');
+    return true;
+  }catch{t.skip('Native containment requires a delegated user systemd cgroup with pids and memory controllers');return false;}
+}
 
 const month=30*24*60*60;
 async function directory(t){const root=await mkdtemp(join(tmpdir(),'local-command-timeouts-'));t.after(()=>rm(root,{recursive:true,force:true}));return root;}
@@ -34,6 +49,7 @@ test('a month-long comparison bootstraps real Pi commands without shrinking the 
 });
 
 for(const limits of [undefined,{tasks:16,memory_bytes:128*1024**2}])test('real Pi accepts a multi-day command allocation '+(limits?'with OS containment':'without OS containment'),async t=>{
+  if(limits && !await available(t))return;
   const root=await directory(t),operations=createLocalExecutionOperations(sdk,limits);let text='';
   const result=await operations.exec('printf accepted',root,{timeout:month,onData:chunk=>text+=chunk});
   assert.equal(result.exitCode,0);assert.equal(text,'accepted');
