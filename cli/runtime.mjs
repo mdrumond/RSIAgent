@@ -34,6 +34,11 @@ function control(state) {
     set:(key,value)=>state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES (?,?)').run(key,JSON.stringify(value))
   };
 }
+function resumesCampaign(ctl) {
+  const operation=ctl.get('operation'),cycle=ctl.get('campaign-budget')?.cycle;
+  // Portable snapshots omit operation ownership, but retain the campaign cycle.
+  return operation==='campaign'||(operation===null&&typeof cycle==='string'&&cycle.length>0);
+}
 async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
   return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal});
@@ -59,7 +64,7 @@ export async function operate(command,config,options={}) {
     recovery:options['no-recovery']?false:config.recovery};
   if(!['phase1','phase2','inference'].includes(config.mode))throw new Error('Unknown execution mode');
   const state=stateFor(config.root), ctl=control(state);
-  if(command==='resume'&&ctl.get('operation')==='campaign')options={...options,continuous:true};
+  if(command==='resume'&&resumesCampaign(ctl))options={...options,continuous:true};
   let owned=false,watcher,campaignClock,budgetTimer,budgetWatcher;
   const schedulerAbort=new AbortController();
   const backgroundAbort=new AbortController();
@@ -105,7 +110,7 @@ export async function operate(command,config,options={}) {
         ctl.get('memory-pause')!==memoryToken||!ctl.get('pause')||ctl.get('operator-stop')))
         throw new Error('Memory resume was superseded by an operator pause or stop');
       ctl.set('owner',owner);
-      if(command!=='resume')ctl.set('operation',options.continuous?'campaign':'wave');
+      if(command!=='resume'||(options.continuous&&ctl.get('operation')===null))ctl.set('operation',options.continuous?'campaign':'wave');
       ctl.set('stop',false);ctl.set('operator-stop',false);ctl.set('pause',false);ctl.set('memory-pause',null);state.db.exec('COMMIT');owned=true;
     }catch(error){state.db.exec('ROLLBACK');throw error;}
     if(options.continuous&&config.campaign_seconds!==undefined) {
@@ -575,7 +580,7 @@ export async function campaign(config,options={}) {
 export async function resume(config,options={}) {
   const state=stateFor(config.root);
   let continuous;
-  try{continuous=control(state).get('operation')==='campaign';}finally{state.close();}
+  try{continuous=resumesCampaign(control(state));}finally{state.close();}
   return continuous?campaign(config,{...options,resume:true}):operate('resume',config,options);
 }
 
