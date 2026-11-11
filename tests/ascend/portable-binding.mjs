@@ -78,11 +78,13 @@ test('portable bind relocates paths and resumes only the retired health prefix w
  await assert.rejects(bindPortable(root,input),/unbound paused/);
 });
 
-for(const kind of ['payload','native-bash','unidentified','unknown-start','wrong-audit','incomplete-audit','foreign-state','wrong-slot','active-request'])test('binding rejects '+kind+' without changing portable checkpoint',async t=>{
+for(const kind of ['payload','native-bash','unidentified','unknown-start','unknown-unresolved','missing-operation','wrong-audit','incomplete-audit','foreign-state','wrong-slot','active-request'])test('binding rejects '+kind+' without changing portable checkpoint',async t=>{
  const f=await fixture(t,{payload:kind==='payload'}),state=new State(join(f.root,'state.sqlite'));
  if(kind==='native-bash')state.event(f.id,'native-bash-started',{operation:'shell'});
  if(kind==='unidentified')state.event(f.id,'execution-submitting',{operation:'x',submission:'x',kind:'run',accountingExcluded:true});
  if(kind==='unknown-start')state.event(f.id,'execution-starting',{operation:'unknown'});
+ if(kind==='unknown-unresolved')state.event(f.id,'execution-unresolved',{operation:'unknown'});
+ if(kind==='missing-operation')state.event(f.id,'execution-unresolved',{});
  if(kind==='active-request')state.db.exec("CREATE TABLE requests(status TEXT);INSERT INTO requests VALUES('queued')");
  if(kind==='wrong-audit')f.input.sourceShutdown.sha256='0'.repeat(64);
  if(kind==='incomplete-audit') {await save(f.input.sourceShutdown.path,{stopped:false,recordedScopes:1,remainingScopesStopped:1});f.input.sourceShutdown.sha256=await hash(f.input.sourceShutdown.path);}

@@ -16,7 +16,8 @@ export function administrativeHealthHistory(events) {
   }
   for(const id of submissions.keys())if(!handles.has(responses.get(id)))throw Error('Unidentified administrative submission');
   for(const {type,data} of events)if(execution(type)&&data.handle&&!handles.has(data.handle))throw Error('Unidentified historical execution');
-  for(const {data} of events.filter(e=>e.type==='execution-starting')) {
+  for(const {data} of events.filter(e=>['execution-starting','execution-unresolved'].includes(e.type))) {
+    if(typeof data.operation!=='string'||!data.operation)throw Error('Unidentified historical operation');
     const identified=events.some(e=>e.type==='execution-handle'&&e.data.operation===data.operation&&handles.has(e.data.handle));
     const closed=events.some(e=>e.type==='execution-settled'&&e.data.operation===data.operation&&
       e.data.setupClosure?.closed===true&&e.data.setupClosure.payloadStarted===false&&
