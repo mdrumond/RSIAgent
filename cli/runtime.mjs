@@ -8,6 +8,7 @@ import { selectAdmission } from '../controller/dispatch.mjs';
 import {campaignBudget} from '../controller/campaign-budget.mjs';
 import { campaignProgress, currentCampaignEntry, generationSettings, syncCampaignPlan, startCampaignEntry, advanceCampaignEntry } from '../controller/progress.mjs';
 import { State } from '../controller/state.mjs';
+import {terminalExecutionProofs,excludedExecutionProofs} from '../controller/execution-proof.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
 import { readConfig,updateConfigImmediate as updateConfig,importProject } from './instance.mjs';
@@ -584,6 +585,26 @@ export async function resume(config,options={}) {
   return continuous?campaign(config,{...options,resume:true}):operate('resume',config,options);
 }
 
+// Retained closure proofs avoid redundant historical native requests during
+// shutdown. Local process identities still need a live stop/observation.
+export async function stopWorkerExecutions(state,id,environment) {
+  if(!environment)return;
+  const events=state.events(id),terminal=terminalExecutionProofs(events),excluded=excludedExecutionProofs(events);
+  const handles=new Set(events.filter(e=>['execution-handle','execution-submitted','execution-unresolved'].includes(e.type))
+    .map(e=>e.data.handle).filter(Boolean));
+  for(const handle of handles) {
+    if(terminal.has(handle))continue;
+    try{await environment.stop(handle,{accountingExcluded:excluded.has(handle)});}
+    catch(error){state.event(id,'stop-observation-error',{message:error.message});}
+  }
+  // Device admission is separate from command closure. Even an entirely closed
+  // command history may retain its lease; an unavailable reconciliation keeps it.
+  if(environment.reconcileLease) {
+    try{if(!await environment.reconcileLease())state.event(id,'stop-lease-unresolved',{});}
+    catch(error){state.event(id,'stop-observation-error',{message:error.message,phase:'lease'});}
+  }
+}
+
 async function worker(root,id) {
   let config=await readConfig(root);const state=stateFor(root),attempt=state.attempt(id);
   const path=join(root,'attempts',id),job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
@@ -592,9 +613,7 @@ async function worker(root,id) {
   const abort=new AbortController(),ctl=control(state);
   const signal=()=>{
     if(interrupted)return;interrupted=true;abort.abort();process.exitCode=130;
-    stopping=(async()=>{if(env)for(const e of state.events(id).filter(e=>e.type==='execution-handle')) {
-      try{await env.stop(e.data.handle);}catch(error){state.event(id,'stop-observation-error',{message:error.message});}
-    }})();
+    stopping=stopWorkerExecutions(state,id,env);
   };
   process.on('SIGTERM',signal);process.on('SIGINT',signal);
   const grace=config.pause_grace_seconds??30;
