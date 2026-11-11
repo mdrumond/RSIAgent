@@ -1,3 +1,4 @@
+import {validateActorLimits} from './budget.mjs';
 const phases = ['phase1', 'phase2', 'inference'];
 
 // A transport refusal before any actor starts is not an observed original.
@@ -99,6 +100,7 @@ export function campaignProgress(state, config) {
 
 
 export function validateCampaignPlan(config) {
+  validateActorLimits(config);
   const plan = config.campaign_plan;
   if (plan === undefined) return;
   if (!Array.isArray(plan) || !plan.length || plan.some(entry => !entry ||

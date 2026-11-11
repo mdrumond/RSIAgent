@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join, resolve } from 'node:path';
 import { bootstrap, readConfig, updateConfig, upgrade, importProject } from './instance.mjs';
+import {phaseActorSeconds} from '../controller/budget.mjs';
 import { State } from '../controller/state.mjs';
 import {schemaOptions as storageOptions} from './storage.mjs';
 
@@ -177,7 +178,10 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
         ?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
       return {controller,mode:config.mode,tuning:await (await import('../controller/evaluation-round.mjs')).tuningStatus(root),
         backgroundTuning:config.skills?.background?await (await import('./skill-background.mjs')).backgroundSkillStatus(config):null,
-        progress,skills:await statusSkills(root,config,state),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all(),
+        progress,skills:await statusSkills(root,config,state),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all().map(project=>config.actor_seconds_by_phase ? {...project,
+          effective_actor_seconds:phaseActorSeconds(config,state.project(project.id).spec.phase??
+            config.campaign_plan?.find(entry=>entry.id===state.project(project.id).spec.campaign_entry)?.phase??config.mode,
+            project.actor_seconds)}:project),
         attempts:state.db.prepare('SELECT id,project,elapsed,outcome,created FROM attempts ORDER BY created DESC').all()};
     } finally {state.close();}
   }
