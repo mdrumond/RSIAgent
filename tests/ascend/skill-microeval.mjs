@@ -69,3 +69,19 @@ test('native Pi tools edit files, retain sessions and record provider usage', {t
  assert.ok(report.results.every(x=>x.correct&&x.toolCalls===1&&x.tokens===36));
  for(const result of report.results){assert.ok((await readFile(result.session,'utf8')).length>0);}
 });
+test('default scopes require matching guidance in both arms before dispatch',async t=>{
+ const f=await fixture(t);await writeFile(join(f.skills.candidate,'skill-map.json'),JSON.stringify({debug:'mapped.md'}));
+ const task={...f.tasks[0]};delete task.scopes;let calls=0;
+ await assert.rejects(runMicroeval({...f,tasks:[task]},{sample:async()=>{calls++;return {};}}),/Unknown skill scope/);
+ assert.equal(calls,0);await assert.rejects(readFile(join(f.directory,'manifest.json')),{code:'ENOENT'});
+});
+test('native provider HTTP authentication failure is inconclusive with diagnostic', {timeout:60000},async t=>{
+ const f=await fixture(t);let requests=0;
+ const server=createServer(async(req,res)=>{for await(const _ of req){}requests++;res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'Fixture authentication rejected',type:'authentication_error'}}));});
+ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const credentials_file=join(f.root,'fixture.env');await writeFile(credentials_file,'MICROEVAL_FIXTURE=fixture\n');
+ const profile={provider:'microeval-http-error',model:'scripted',credential_env:'MICROEVAL_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
+ const report=await runMicroeval({...f,profile,runs:1});assert.equal(requests,2);
+ assert.deepEqual(report.results.map(x=>x.correct),[null,null]);assert.ok(report.results.every(x=>x.error.includes('Fixture authentication rejected')));
+ assert.ok(report.results.every(x=>x.verification.exitCode===undefined));
+});

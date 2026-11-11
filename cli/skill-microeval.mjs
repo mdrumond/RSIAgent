@@ -32,15 +32,18 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
  const manager=sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
   tools:['read','write','edit','bash'],resourceLoader:loader,sessionManager:manager});
- let timedOut=false,failure;const timer=setTimeout(()=>{timedOut=true;void session.abort();},Math.max(1,seconds*1000));
+ let timedOut=false,failure,lastAssistant;
+ const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
+ const timer=setTimeout(()=>{timedOut=true;void session.abort();},Math.max(1,seconds*1000));
  const abort=()=>{void session.abort();};signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();await session.bindExtensions({});session.agent.toolExecution='sequential';
   await session.prompt(`Host-only kernel-engineering microtask. Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
   await session.waitForIdle();signal?.throwIfAborted();
+  if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
  }catch(error){failure=error.message;}
  finally{
-  clearTimeout(timer);signal?.removeEventListener('abort',abort);
+  clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();
   try{await session.exportToJsonl(join(sessionDirectory,'session.native.jsonl'));}
   finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
@@ -57,8 +60,9 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  const inputs={active:await skillInput(skills.active),candidate:await skillInput(skills.candidate)};
  const frozen=[];for(const t of tasks){
   if(!t.prompt||!t.files||!t.files['kernel.py']||!t.checker)throw Error('Runnable task files and independent Python checker required');
-  if(t.scopes&&(!Array.isArray(t.scopes)||t.scopes.some(scope=>!inputs.active.files[scope]||!inputs.candidate.files[scope])))throw Error('Unknown skill scope');
-  frozen.push({id:t.id,kind:t.kind??'unspecified',prompt:t.prompt,scopes:t.scopes??Object.keys(inputs.active.files),files:t.files,checker:await readFile(t.checker,'utf8')});
+  const scopes=t.scopes??Object.keys(inputs.active.files);
+  if(!Array.isArray(scopes)||scopes.some(scope=>!inputs.active.files[scope]||!inputs.candidate.files[scope]))throw Error('Unknown skill scope');
+  frozen.push({id:t.id,kind:t.kind??'unspecified',prompt:t.prompt,scopes,files:t.files,checker:await readFile(t.checker,'utf8')});
  }
  directory=resolve(directory);await mkdir(dirname(directory),{recursive:true});await mkdir(directory); // Refuse replay/refilled elapsed allocations.
  const manifest={format:1,shadow:true,claim:'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
