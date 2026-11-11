@@ -138,7 +138,9 @@ class PackageTests(unittest.TestCase):
                         'https://credential-fixture@example.invalid/repo'], check=True)
         result = pack(self.root, self.package)
         restored = self.base / 'restored'
-        unpack(self.package, restored)
+        receipt = unpack(self.package, restored)
+        retained = json.loads((restored / receipt['source_package']).read_text())
+        self.assertEqual(retained, result)
         with closing(sqlite3.connect(restored / 'knowledge.sqlite')) as db:
             self.assertEqual(db.execute('SELECT id FROM entries').fetchone(), ('active-entry',))
         history = next(r for r in result['repositories'] if r['kind'] == 'knowledge-history')

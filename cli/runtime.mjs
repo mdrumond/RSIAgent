@@ -53,6 +53,7 @@ export async function instanceStopped(config) {
 }
 
 export async function operate(command,config,options={}) {
+  if(config.binding_required&&['wave','resume'].includes(command))throw new Error('Bind the portable campaign before execution');
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
     recovery:options['no-recovery']?false:config.recovery};

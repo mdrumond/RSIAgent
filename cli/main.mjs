@@ -48,7 +48,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const [command,arg]=positionals;
   const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage']};
+  if (values.help || !command) return {commands:['bootstrap','bind','upgrade','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage']};
   const storageAction=command==='storage'?(values.config?JSON.parse(await readFile(values.config,'utf8')):{...values,action:values.action??arg??'inspect'}):null;
   if(storageAction?.action==='unpack')return (await import('./storage.mjs')).runStandalone({...storageAction,signal});
   if (command==='bootstrap') {
@@ -57,6 +57,8 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
       skills:values.skills??config.skills,repository:values.repository??config.repository});
   }
   const config=await readConfig(root);
+  if(command==='bind')return (await import('./portable-binding.mjs')).bindPortable(root,JSON.parse(await readFile(values.config,'utf8')));
+  if(config.binding_required&&['resume','campaign','wave','skill','tune'].includes(command))throw Error('Bind the portable campaign before execution');
   if(command==='storage') {
     if(!config.storage) {
       if(storageAction.action==='inspect')return {available:false};
