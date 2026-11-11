@@ -39,3 +39,35 @@ Storage maintenance serializes mutations for each instance. Restic handles compr
 Automatic backups retain plain working logs so Pi and curriculum agents can continue reading their paths. Removing redundant source files is explicit. Only sealed artifacts whose writers have stopped may be archived. Source deletion requires a published ledger reference, unchanged source identity and verified archive contents. Explicit prune first returns an inventory; apply requires that same inventory. No campaign history is automatically discarded.
 
 Memory and skills share a local Git history without remotes. Memory is staged in KDB at its Git revision before activation. Attempts query their pinned generation; rejected skill proposals and negative findings remain evidence. Binary vectors and deduplicated chunk contents reduce KDB size. Pruning is explicit and preserves pinned or cited evidence.
+
+## Bind a migrated campaign
+
+A restored campaign remains paused and refuses execution until an operator binds
+its destination environment. Retain the original source ledger and a source-host
+shutdown audit alongside the verified package. Run:
+
+```sh
+ascend-rsi bind --instance /path/to/new-instance --config /path/to/binding.json
+```
+
+The binding JSON supplies `python` (absolute destination interpreter),
+`environment` (module and options), fresh `resources` from that environment,
+`packageSha256`, and `sourceState` / `sourceShutdown` objects containing `path`
+and `sha256`. The shutdown audit must report `stopped: true`, an integer
+`recordedScopes`, and `remainingScopesStopped: 0`. Keep machine-specific bindings
+outside source control.
+
+Binding verifies campaign provenance, restores original project freeze flags and
+completed-attempt ownership, relocates retained paths, and maps pending jobs by
+logical `metadata.hostSlot` to exactly one available destination host slot. It
+preserves attempt identities, sessions, outcomes and elapsed allocations, freezes
+the retained campaign clock, records migration evidence, and leaves execution
+paused. The binder claims pending attempts with its actual process identity;
+after it exits, ordinary resume can claim them.
+
+This migration path accepts pending attempts containing only identified local
+administrative resource-health execution. Actor payloads, native shell history,
+unidentified submissions, live destination writers, and ambiguous host slots
+prevent binding. Historical health events remain in the ledger; subsequent
+destination execution retains normal settlement checks. Use normal resume only
+after binding finishes successfully.

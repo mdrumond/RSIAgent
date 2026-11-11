@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { excludedExecutionProofs, terminalExecutionProofs, isNativeTerminalClosure } from './execution-proof.mjs';
+import {destinationExecutionEvents} from './portable-proof.mjs';
 
 export async function processIdentity(pid=process.pid) {
   const stat=await readFile(`/proc/${pid}/stat`,'utf8');
@@ -19,7 +20,7 @@ export async function attemptStopped(state,attempt,environment) {
   return operationsStopped(state,attempt,environment);
 }
 export async function operationsStopped(state,attempt,environment) {
-  let events=state.events(attempt.id,{timestamps:true});
+  let events=destinationExecutionEvents(state.events(attempt.id,{timestamps:true}));
   const completedBash=events.filter(e=>e.type==='native-bash-completed');
   const closedBash=new Set(completedBash.map(e=>e.data.operation));
   // Worker death cannot prove its detached native SDK shell has stopped.
@@ -60,7 +61,7 @@ export async function operationsStopped(state,attempt,environment) {
       ...(proof.timingEstimated?{timingEstimated:true}:{})});
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
-  events=state.events(attempt.id);
+  events=destinationExecutionEvents(state.events(attempt.id));
   const closedThrough=new Map();
   for(const [index,{type,data}] of events.entries()) {
     const operation=data.operation??data.submission;

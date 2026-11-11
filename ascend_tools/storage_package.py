@@ -586,7 +586,9 @@ def unpack(package, dest):
             projects = [json.loads(r[0]) for r in db.execute('SELECT spec FROM projects')]
         result = {'format': 1, 'paused': True, 'binding_required': True,
                   'storage': metadata['campaign'],
-                  'complete': metadata['complete'], 'missing': metadata['missing']}
+                  'complete': metadata['complete'], 'missing': metadata['missing'],
+                  'source_package': 'original-package.json'}
+        _json(stage / 'original-package.json', metadata)
         _json(stage / 'restore.json', result)
         config = _rebase(_load_json(stage / 'instance.json'), metadata['paths'], dest)
         config.update(format=1, paused=True, binding_required=True, environment=None,
