@@ -1,3 +1,4 @@
+import {phaseActorSeconds} from '../controller/budget.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {realpath} from 'node:fs/promises';
@@ -54,7 +55,7 @@ export function campaignEntryConfig(config,entryId) {
   const generation={...config.curriculum?.generation,...entry.generation};
   if(entry.generation)generation.by_phase={...generation.by_phase,
     [entry.phase]:{...generation.by_phase?.[entry.phase],...entry.generation}};
-  return {...config,mode:entry.phase,actor_seconds:entry.actor_seconds??config.actor_seconds,
+  return {...config,mode:entry.phase,actor_seconds:phaseActorSeconds(config,entry.phase,entry.actor_seconds??config.actor_seconds),
     curriculum:{...config.curriculum,generation}};
 }
 

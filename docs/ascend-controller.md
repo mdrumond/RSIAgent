@@ -147,6 +147,15 @@ Pure device-queue waiting, actor setup and data transfer are excluded from actor
 time; thinking, compilation, execution and profiling are charged. A configured
 campaign elapsed allocation also survives controller restarts.
 
+Optional `actor_seconds_by_phase` caps, for example
+`{"phase1":3600,"phase2":14400}`, shorten generated and admitted actor
+allocations, including resumed attempts, investigations and retries. A cap never
+increases a smaller project allocation. Configure caps while paused, then resume;
+completed outcomes, original specifications, source and session files, and already
+charged elapsed time remain intact. An unfinished attempt already beyond its new
+cap settles as exhausted when resumed. Project status retains `actor_seconds` and
+adds `effective_actor_seconds` when caps are configured.
+
 Public commands run as ordinary Node and Python processes. The CLI starts workers
 and the instance KDB directly; no service-manager provisioning is required.
 After a controller interruption, explicitly invoke `resume` to continue from

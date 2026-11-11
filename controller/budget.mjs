@@ -1,5 +1,21 @@
 import { performance } from 'node:perf_hooks';
 
+export function validateActorLimits(config) {
+  const limits=config.actor_seconds_by_phase;
+  if(limits===undefined)return;
+  if(!limits||typeof limits!=='object'||Array.isArray(limits)||
+      Object.entries(limits).some(([phase,seconds])=>!['phase1','phase2','inference'].includes(phase)||
+        !Number.isFinite(seconds)||seconds<=0))
+    throw new Error('actor_seconds_by_phase requires positive elapsed allocations for supported phases');
+}
+
+// Caps never grant additional time or rewrite the original project allocation.
+export function phaseActorSeconds(config,phase,seconds) {
+  validateActorLimits(config);
+  const cap=config.actor_seconds_by_phase?.[phase];
+  return cap===undefined?seconds:Math.min(seconds,cap);
+}
+
 // Admission holds unpublished time until its receipt distinguishes work from queue wait.
 export class ActorClock {
   constructor(seconds, elapsed = 0, now = () => performance.now()) {

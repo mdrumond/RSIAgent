@@ -1,3 +1,4 @@
+import {phaseActorSeconds} from '../controller/budget.mjs';
 import { spawn } from 'node:child_process';
 import { open, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -240,6 +241,7 @@ export async function operate(command,config,options={}) {
       if(job.origin_attempt&&!job.resume)pinnedMode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
       admitted.mode=pinnedMode;
+      admitted.actor_seconds=phaseActorSeconds(config,pinnedMode,admitted.actor_seconds);
       attempt=admitted.attempt;
       launchedAttempts.add(attempt.id);
       assignedResource=resource??admitted.resource;
@@ -681,6 +683,8 @@ async function worker(root,id) {
         await writeFile(file,JSON.stringify(project),{mode:0o600});
       }
     }
+    // A retained investigation project also obeys the current phase cap.
+    project={...project,actor_seconds:phaseActorSeconds(config,job.mode??config.mode,project.actor_seconds)};
     if(!job.finalize) {
       const directory=join(root,'skills','versions',job.skillVersion);
       const skills=JSON.parse(await readFile(join(directory,'skill-map.json'),'utf8'));
