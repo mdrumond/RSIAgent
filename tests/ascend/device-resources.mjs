@@ -88,7 +88,7 @@ print(outputs[query])
   const context = { instancePath, leaseDirectory: join(instancePath,'leases'), client, sdk: { createLocalBashOperations: () => ({}) },
     event: async (type,data) => events.push({ type,...data }), exclude: async (_,fn) => fn() };
   const options = { mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
-    workspacePath: '/registry/workspace', remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
+    workspacePath: instancePath, remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, commands, rows, telemetry,
@@ -826,4 +826,18 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
     assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
   } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
   assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
+});
+
+test('admitted actor command receives persistent scratch and runtime cache defaults',async t=>{
+  const f=await fixture(t);
+  const bound=await createEnvironment(f.options,f.context);
+  await bound.prepare({project:{id:'setup',source:f.source},attempt:{id:'setup'}});
+  f.runWorkload();
+  const resultFile=join(f.context.instancePath,'actor-setup.json');
+  const command=`python3 -c 'import json,os,pathlib; p=pathlib.Path(os.environ["RSI_SCRATCH_DIR"])/"probe"; p.write_text("retained"); json.dump({k:os.environ[k] for k in ["RSI_SCRATCH_DIR","RSI_SETUP_REPORT","TRITON_CACHE_DIR"]},open("${resultFile}","w"))'`;
+  assert.equal((await bound.execute(command,f.source,{timeout:5})).exitCode,0);
+  const paths=JSON.parse(await readFile(resultFile,'utf8'));
+  assert.equal(JSON.parse(await readFile(paths.RSI_SETUP_REPORT,'utf8')).logical_device,0);
+  assert.equal((await bound.execute('test "$(cat "$RSI_SCRATCH_DIR/probe")" = retained',f.source,{timeout:5})).exitCode,0);
+  assert.equal(paths.RSI_SCRATCH_DIR.startsWith(f.options.workspacePath),true);
 });
