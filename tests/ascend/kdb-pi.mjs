@@ -43,10 +43,10 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
         if (Date.now()>deadline) throw new Error(`MCP readiness timeout: ${stderr}`);
         await delay(25);
       }
-      const events=[];
+      const events=[],retrievals=[];
       let blocked=false;
       const bridge=createKdbBridge({url:`${url}/mcp`,attemptId:'pi-attempt',agentDir,
-        target:'a3',event:async(type,data)=>events.push({type,...data})});
+        target:'a3',recordRetrieval:async entry=>retrievals.push(entry),event:async(type,data)=>events.push({type,...data})});
       const extension=pi=>{
         pi.registerTool(bridge.knowledgeTool());
         pi.on('tool_call',async event=>{
@@ -98,6 +98,15 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       const restoredEntry=restored.result.structuredContent.structuredContent;
       assert.equal(restoredEntry.text,'vector addition with aligned loads\n');
       assert.deepEqual(restoredEntry.evidence,data.evidence);
+      assert.equal(retrievals.length,2);
+      assert.equal(events.filter(e=>e.type==='knowledge-retrieval-recorded').length,2);
+      const searched=retrievals.find(r=>r.operation==='mcp__kdb__search');
+      assert.equal(searched.arguments.query,'aligned loads');
+      assert.equal(searched.entries.length,1);
+      assert.equal(searched.entries[0].chunk_id,data.evidence[0].entry_id);
+      const read=retrievals.find(r=>r.operation==='mcp__kdb__read_entry');
+      assert.equal(read.entries[0].text,restoredEntry.text);
+      assert.deepEqual(read.entries[0].evidence,data.evidence);
       const lesson=await ctx.executeTool('mcp__kdb__record_lesson',{
         lesson:'avoid scalar alignment mistakes',outcome:'negative',applicability:'a3',
         evidence:data.evidence,attempt_id:'pi-attempt'});
@@ -113,6 +122,15 @@ test('native Pi MCP retrieval preserves correlation, citations and permission ga
       await assert.rejects(bridge.knowledge.search({query:'loads',attempt_id:'other'},ctx));
       blocked=true;
       await assert.rejects(tool.execute('blocked',{query:'loads',kind:'good'}),/blocked/);
+      assert.equal(retrievals.length,2);
+      await session.extensionRunner.emitToolResult({type:'tool_result',toolName:'mcp__kdb__search',
+        toolCallId:'empty',input:{query:'empty'},content:[],isError:false,
+        structuredContent:{structuredContent:{result:[]}}});
+      assert.equal(retrievals.length,3);assert.deepEqual(retrievals[2].entries,[]);
+      await session.extensionRunner.emitToolResult({type:'tool_result',toolName:'mcp__kdb__search',
+        toolCallId:'unknown-wire',input:{},content:[],isError:false});
+      assert.equal(retrievals.length,3);
+      assert.equal(events.filter(e=>e.type==='knowledge-retrieval-unavailable').length,1);
       // Read persisted service telemetry via SQLite, without opening another service.
       const inspect=spawn(process.env.PYTHON ?? 'python3.12',['-c',
         'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("SELECT count(*) FROM knowledge_events WHERE operation=\'search\' AND attempt_id=\'pi-attempt\'").fetchone()[0])',
