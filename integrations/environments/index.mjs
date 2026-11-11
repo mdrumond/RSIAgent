@@ -196,7 +196,20 @@ for directory, directories, files in os.walk(c['incoming'],followlinks=False):
   elif os.path.islink(source) and os.path.lexists(destination):
    if os.path.isdir(destination): os.rmdir(destination)
    else: os.unlink(destination)
-shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True,symlinks=True)
+def restore_file(source,destination):
+ # Retained incoming files were verified above. Preserve unchanged build inputs
+ # so compiler caches depending on source timestamps/inodes remain useful.
+ if os.path.isfile(destination) and not os.path.islink(destination):
+  before=os.stat(source); after=os.stat(destination)
+  if before.st_size==after.st_size and stat.S_IMODE(before.st_mode)==stat.S_IMODE(after.st_mode):
+   def digest(path):
+    result=hashlib.sha256()
+    with open(path,'rb') as content:
+     for block in iter(lambda:content.read(1024*1024),b''): result.update(block)
+    return result.digest()
+   if digest(source)==digest(destination): return destination
+ return shutil.copy2(source,destination)
+shutil.copytree(c['incoming'],c['project'],dirs_exist_ok=True,symlinks=True,copy_function=restore_file)
 with open(manifest,'w') as f: json.dump(c['files'],f)
 `;
 
@@ -813,9 +826,18 @@ export async function createEnvironment(options, context) {
           await discoverCapabilities();
           const preflight=await client(['preflight',options.target]);
           if(preflight.state!=='completed')throw closedSetupError('CPL preflight failed',{reason:preflight});
-          for (const file of frozen) await exclude('transfer', async () => {
+          if (frozen.length) await exclude('transfer', async () => {
+            // One scoped tree transfer avoids one native transport/setup per
+            // trusted file. It contains only frozen files, never actor source.
             const dir = await mkdtemp(join(root, 'verifier-'));
-            await transfer(['upload', options.target, file.local, file.remote], dir);
+            const tree = join(dir, 'tree');
+            await mkdir(tree);
+            for (const file of frozen) {
+              const destination = join(tree, relative(layoutRoot, file.local));
+              await mkdir(dirname(destination), { recursive: true });
+              await copyFile(file.local, destination);
+            }
+            await transfer(['upload', options.target, tree, posix.join(attemptRoot, 'tree')], dir);
           });
           await event('verifier-staged', { files: frozen.map(({ remote, sha256 }) => ({ path: remote, sha256 })) });
         }

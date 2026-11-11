@@ -126,7 +126,9 @@ test('SSH frozen verifier upload prepares its scoped parent before staging sourc
   const f=await fixture(t);f.control.backend='ssh';const verifier=join(f.root,'oracle.py');
   await writeFile(verifier,"print('independent oracle')\n");
   const environment=await f.connect({},'ssh',[verifier]);
-  assert.equal(f.calls.find(args=>args[0]==='upload'&&args[2]===verifier)[2],verifier);
+  const trustedUploads=f.calls.filter(args=>args[0]==='upload'&&args[3]==='owned/ssh/tree');
+  assert.equal(trustedUploads.length,1);
+  assert.ok(trustedUploads[0][2].endsWith('/tree/'));
   assert.equal(await readFile(join(f.workspace,'owned/ssh/tree/oracle.py'),'utf8'),await readFile(verifier,'utf8'));
   assert.equal(f.runs(false).length,0);
   assert.equal(await f.run('python3 ../oracle.py',environment),'independent oracle\n');
@@ -191,6 +193,44 @@ test('native SDK repeated Bash reuses one upload/manifest but restores source ev
   assert.equal(f.runs(true).length, 2); assert.equal(f.runs(false).length, 2);
   assert.deepEqual(f.events.filter(e => e.type === 'source-staged').map(e => e.reused), [false, true]);
   assert.ok(f.excluded.includes('transfer'));
+});
+
+test('unchanged target inputs retain inode and timestamp while edited inputs are restored',async t=>{
+  const f=await fixture(t);
+  await f.run('true');
+  const target=join(f.workspace,'owned/a/project/value.txt');
+  const oldTime=new Date('2001-01-01T00:00:00Z');
+  await utimes(target,oldTime,oldTime);
+  const before=await stat(target);
+  await f.run('cat value.txt');
+  const unchanged=await stat(target);
+  assert.equal(unchanged.ino,before.ino);
+  assert.equal(unchanged.mtimeMs,before.mtimeMs);
+  await writeFile(target,'bad'); // Same byte length still requires a content check.
+  await utimes(target,oldTime,oldTime);
+  assert.equal(await f.run('cat value.txt'),'one');
+  assert.notEqual((await stat(target)).mtimeMs,before.mtimeMs);
+  await chmod(target,0o600);
+  await f.run('true');
+  assert.equal((await stat(target)).mode & 0o777,(await stat(join(f.source,'value.txt'))).mode & 0o777);
+  assert.equal(f.sourceUploads().length,1);
+});
+
+test('multiple frozen files transfer as one scoped tree and preserve independent verification',async t=>{
+  const f=await fixture(t),verifierRoot=join(f.root,'trusted');
+  await mkdir(verifierRoot);
+  const oracle=join(verifierRoot,'oracle.py'),data=join(verifierRoot,'expected.txt');
+  await writeFile(oracle,"from pathlib import Path\nassert Path(__file__).with_name('expected.txt').read_text()=='one'\nassert Path('value.txt').read_text()=='one'\nprint('verified')\n");
+  await writeFile(data,'one');
+  const env=await f.connect({},'batch',[oracle,data]);
+  const uploads=f.calls.filter(args=>args[0]==='upload');
+  assert.equal(uploads.length,1);
+  assert.equal(uploads[0][3],'owned/batch/tree');
+  assert.equal(await f.run('python3 ../trusted/oracle.py',env,{purpose:'verification'}),'verified\n');
+  await writeFile(join(f.workspace,'owned/batch/tree/trusted/expected.txt'),'tampered');
+  const result=await env.execute('touch payload-must-not-run',f.source,{purpose:'verification'});
+  assert.equal(result.settled,true);assert.equal(result.exitCode,125);
+  await assert.rejects(stat(join(f.workspace,'owned/batch/tree/source/payload-must-not-run')),{code:'ENOENT'});
 });
 
 test('content with preserved timestamp, adds, deletes, file/directory refactors and executable modes invalidate staging', async t => {
