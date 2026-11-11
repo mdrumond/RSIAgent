@@ -144,7 +144,7 @@ test('validated proposal survives interruption before manifest; resume rechecks 
   await rm(resumed.verifier.files[0]);await assert.rejects(investigate(f.options),/Artifact is missing/);assert.equal(f.requests.length,count);
 });
 
-test('public CLI stop before investigation manifest then resume completes same child canonical workflow',{timeout:120000},async t=>{
+for(const retained of [false,true])test(`public CLI resumes the same child with ${retained?'a retained legacy manifest':'interrupted construction'}`,{timeout:120000},async t=>{
   const f=await setup(t,'recover',['recover'],{install:false});await f.run('wave');
   const original=rows(f.root,'SELECT * FROM attempts')[0],frozen=rows(f.root,'SELECT spec FROM projects')[0].spec;
   let resume=false;const wires=[];
@@ -172,11 +172,41 @@ test('public CLI stop before investigation manifest then resume completes same c
   const child=rows(f.root,'SELECT * FROM attempts').find(a=>a.id!==original.id),path=join(f.root,'attempts',child.id);
   assert.equal(child.outcome,null);assert.equal(child.elapsed,0);assert.equal(child.session,null);await assert.rejects(stat(join(path,'project.json')),{code:'ENOENT'});
   const sessions=()=>rows(f.root,`SELECT data FROM events WHERE attempt='${child.id}' AND type='curriculum-session'`).map(e=>JSON.parse(e.data)).filter(e=>e.role==='investigation');
-  const session=sessions()[0].session;resume=true;await f.run('resume');
+  const session=sessions()[0].session;
+  let saved;
+  if(retained) {
+    const base=JSON.parse(frozen),source=join(path,'investigation/source'),file=join(path,'investigation/verify.py');
+    await writeFile(file,"import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']()==42\n");
+    saved=JSON.stringify({...base,source,sourceDirectory:base.source,goal:proposal.goal,
+      bundle:{version:1,root:base.source,reference:base.source,negative_controls:[],construction_command:'parent-construction'},
+      actor_seconds:120,verifier:{files:[file],command:'python ../verify.py'}});
+    await writeFile(join(path,'project.json'),saved);
+    // Capture the actual worker-to-environment request while keeping execution
+    // in the production local adapter. Old workers pass the stale parent paths.
+    await writeFile(join(f.root,'capture-environment.mjs'),`
+      import {writeFile} from 'node:fs/promises';
+      import {createEnvironment as base} from './machinery/integrations/environments/index.mjs';
+      export async function createEnvironment(options,context) {
+        const env=await base(options,context);
+        return {...env,prepare:async args=>{
+          await writeFile(${JSON.stringify(join(f.root,'prepared-project.json'))},JSON.stringify(args.project));
+          return env.prepare(args);
+        }};
+      }`);
+    const environment={...config.environment,module:'capture-environment.mjs'};
+    await writeFile(settings,JSON.stringify({environment}));await f.run('config','--config',settings);
+  }
+  resume=true;await f.run('resume');
   const after=rows(f.root,'SELECT * FROM attempts');assert.equal(after.length,2);assert.equal(after.find(a=>a.id===child.id).outcome,'passed');
   assert.deepEqual(after.find(a=>a.id===original.id),original);assert.equal(rows(f.root,'SELECT spec FROM projects')[0].spec,frozen);
-  assert.equal(sessions().length,2);assert.ok(sessions().every(s=>s.session===session));
-  assert.ok(wires.at(-1).messages.some(m=>m.role==='tool'&&m.content.includes('return 41')));
+  assert.equal(sessions().length,retained?1:2);assert.ok(sessions().every(s=>s.session===session));
+  if(retained) {
+    assert.equal(await readFile(join(path,'project.json'),'utf8'),saved);
+    const prepared=JSON.parse(await readFile(join(f.root,'prepared-project.json'),'utf8'));
+    assert.equal(prepared.bundle,undefined);assert.equal(prepared.sourceDirectory,undefined);
+    assert.equal(prepared.source,join(path,'investigation/source'));
+    assert.deepEqual(prepared.verifier.files,[join(path,'investigation/verify.py')]);
+  }else assert.ok(wires.at(-1).messages.some(m=>m.role==='tool'&&m.content.includes('return 41')));
   const types=rows(f.root,`SELECT type FROM events WHERE attempt='${child.id}'`).map(e=>e.type);
   assert.equal(types.filter(t=>t==='accepted').length,1);assert.equal(types.filter(t=>t==='stage-completed').length,8);
   f.pass();
