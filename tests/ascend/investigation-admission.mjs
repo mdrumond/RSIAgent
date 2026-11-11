@@ -60,6 +60,26 @@ test('native submit rejects missing verifier then accepts write and resubmit in 
   assert.equal((await readdir(join(f.path,'investigation','sessions'))).filter(x=>x.endsWith('.jsonl')).length,1);
 });
 
+test('construction from a bundled parent owns only the new investigation source and verifier',{timeout:15000},async t=>{
+  const verifier="import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n";
+  const f=await fixture(t,[['write',{path:'verify.py',content:verifier}],
+    ['investigation_knowledge',{query:'numeric control',kind:'good'}],
+    ['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]]);
+  Object.assign(f.options.base,{id:'parent',phase:'phase1',campaign_entry:'batch1',sourceDirectory:f.source,
+    performance_goal:{kind:'speedup'},bundle:{version:1,root:f.source,reference:f.source,
+      negative_controls:[],construction_command:'parent-construction',seconds:30}});
+  const before=structuredClone(f.options.base),result=await investigate(f.options);
+  assert.equal(result.source,join(f.path,'investigation','source'));
+  assert.equal(result.bundle,undefined);assert.equal(result.sourceDirectory,undefined);
+  assert.equal(result.performance_goal,undefined);
+  assert.equal(result.id,'parent');assert.equal(result.phase,'phase1');assert.equal(result.campaign_entry,'batch1');
+  assert.deepEqual(f.options.base,before);
+  assert.deepEqual(result.verifier.files,[join(f.path,'investigation','verify.py')]);
+  const run=await promisify(execFile)(process.env.PYTHON??'python3',
+    ['-c',"import runpy; runpy.run_path('../verify.py')"],{cwd:result.source});
+  assert.equal(Number(run.stdout.trim()),42);
+});
+
 for(const verifier of ['sessions','source','source/answer.py','../outside.py'])
   test(`invalid native verifier ${verifier} cannot admit an actor`,{timeout:15000},async t=>{
     const f=await fixture(t,[['submit_investigation',{...proposal,verifier}]]);

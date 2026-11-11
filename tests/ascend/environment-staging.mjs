@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname,basename } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createEnvironment, createEnvironmentTools } from '../../integrations/environments/index.mjs';
+import {normalizeInvestigationProject} from '../../cli/curriculum.mjs';
 
 async function fixture(t) {
   const sdk = await import('@earendil-works/pi-coding-agent');
@@ -101,6 +102,34 @@ async function fixture(t) {
   return { root, source, workspace, sdk, environment, control, context, options, calls, events,
     connect, run, sourceUploads, manifests, runs, excluded, idle: () => Promise.all([...jobs.values()].map(job => job.done)) };
 }
+
+test('retained investigations stage their own verifier despite obsolete parent bundle metadata',async t=>{
+  const f=await fixture(t),root=join(f.root,'investigation'),source=join(root,'source');
+  await cp(f.source,source,{recursive:true});
+  const verifier=join(root,'verify.py');
+  await writeFile(verifier,"from pathlib import Path\nassert Path('value.txt').read_text()=='one'\nprint('independent check passed')\n");
+  const legacy={id:'parent',source,sourceDirectory:f.source,actor_seconds:120,
+    bundle:{version:1,root:f.source,reference:f.source,negative_controls:[],construction_command:'parent-check'},
+    verifier:{files:[verifier],command:'python3 ../verify.py'}};
+  // The old metadata fails before transfer, exactly as the retained campaign did.
+  const old={...legacy};delete old.sourceDirectory;
+  await assert.rejects(f.environment.prepare({project:old,attempt:{id:'child'}}),/Editable source must be inside its bundle root/);
+  const before=JSON.stringify(legacy),project=normalizeInvestigationProject(legacy,f.root);
+  assert.equal(JSON.stringify(legacy),before,'Resume must not rewrite the retained project manifest');
+  await f.environment.prepare({project,attempt:{id:'child'}});
+  let output='';
+  const result=await f.environment.execute(project.verifier.command,source,{onData:data=>{output+=data;}});
+  assert.equal(result.settled,true);assert.equal(result.exitCode,0,output);
+  assert.equal(output.trim(),'independent check passed');
+  assert.equal(await readFile(join(f.workspace,'owned/child/tree/verify.py'),'utf8'),await readFile(verifier,'utf8'));
+  assert.equal(await readFile(join(f.source,'value.txt'),'utf8'),'one');
+  // Normalization is scoped to the owning attempt and cannot waive its trust boundary.
+  assert.throws(()=>normalizeInvestigationProject({...legacy,source:f.source},f.root),/current attempt/);
+  for(const file of [join(source,'value.txt'),join(f.root,'unrelated.py')])
+    assert.throws(()=>normalizeInvestigationProject({...legacy,verifier:{...legacy.verifier,files:[file]}},f.root),/outside editable source/);
+  const moved={...project,bundle:{version:1,root:f.source}};
+  await assert.rejects(f.environment.prepare({project:moved,attempt:{id:'other'}}),/Editable source must be inside its bundle root/);
+});
 
 test('advertised SSH transfers stage directory contents into an existing incoming path and collect synchronously',async t=>{
   const f=await fixture(t);f.control.backend='ssh';

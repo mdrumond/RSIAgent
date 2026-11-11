@@ -131,6 +131,23 @@ function diagnosticContext(state,id,limit) {
   return {session:state.attempt(id)?.session??sessions.at(-1)?.session??null,curriculum_sessions:sessions,
     diagnostics:tail({types:['verification','rejected','failure-recorded','attempt-error'],limit:10}).map(({type,data})=>({type,data})),events};
 }
+// An investigation owns a new source/verifier pair, not the parent's frozen
+// construction bundle. Check that identity before repairing retained metadata.
+export function normalizeInvestigationProject(project,path) {
+  const root=resolve(path,'investigation'),source=resolve(root,'source');
+  const inside=(directory,file)=>{
+    const rel=relative(directory,resolve(file));
+    return rel!== '..'&&!rel.startsWith('..'+sep)&&!rel.startsWith(sep);
+  };
+  if(typeof project.source!=='string'||resolve(project.source)!==source)
+    throw new Error('Investigation source must belong to its current attempt');
+  if(!Array.isArray(project.verifier?.files)||!project.verifier.files.length||
+      project.verifier.files.some(file=>typeof file!=='string'||!inside(root,file)||inside(source,file)))
+    throw new Error('Investigation verifier must stay in its attempt and outside editable source');
+  const {bundle:_parentBundle,sourceDirectory:_parentSource,performance_goal:_parentPerformance,...derived}=project;
+  return derived;
+}
+
 export async function investigate({config,job,base,path,state,bridge,signal}) {
   if(!job.attempt?.id)throw new Error('Investigation requires its current attempt');
   const root=join(path,'investigation');await mkdir(root,{recursive:true});
@@ -165,9 +182,8 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
   if(!proposal)throw new Error('Curriculum did not submit an investigation');
   const verifier=await artifactFile(root,proposal.verifier,source);
   const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
-  const {performance_goal: _parentPerformance, ...investigationBase}=base;
-  return {...investigationBase,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
-    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:`python ${quote(relative(source,verifier))}`}};
+  return normalizeInvestigationProject({...base,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
+    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:`python ${quote(relative(source,verifier))}`}},path);
 }
 
 export async function summarize({config,job,path,state,bridge,passed,signal}) {

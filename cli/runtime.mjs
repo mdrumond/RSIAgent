@@ -675,7 +675,7 @@ async function worker(root,id) {
       let constructed;
       try{constructed=JSON.parse(await readFile(file,'utf8'));}
       catch(error){if(error.code!=='ENOENT')throw error;}
-      if(constructed)project=constructed;
+      if(constructed)project=(await import('./curriculum.mjs')).normalizeInvestigationProject(constructed,path);
       else {
         if(state.attempt(id).session || state.events(id).some(e=>e.type==='task-constructed'))
           throw new Error('Constructed investigation project is missing; cannot reconstruct an actor attempt');
