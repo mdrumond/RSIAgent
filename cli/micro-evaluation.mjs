@@ -31,8 +31,8 @@ export async function compare({pending,signal},dependencies={}) {
  await mkdir(root,{recursive:true});
  const plan=pending.projectIds.flatMap(projectId=>Array.from({length:pending.runs},(_,run)=>(run%2?['candidate','active']:['active','candidate'])
   .map(arm=>({projectId,run,arm,instanceRoot:root})))).flat();
- const checkpoint=async report=>save(join(root,'round.json'),{kind:'micro',status:report.status==='complete'?'completed':report.status==='elapsed'?'exhausted':report.status,
-  allocatedSeconds:pending.evaluationSeconds,elapsedSeconds:report.elapsedSeconds??0,...(report.owner?{runningAt:Date.now()}:{}),
+ const checkpoint=async report=>save(join(root,'round.json'),{kind:'micro',status:['complete','elapsed'].includes(report.status)?'completed':report.status,...(report.status==='elapsed'?{termination:'elapsed'}:{}),
+  allocatedSeconds:pending.evaluationSeconds,elapsedSeconds:report.elapsedSeconds??0,...((report.owner||report.runningSample)?{runningAt:Date.now()}:{}),
   samples:plan.map(sample=>{const result=report.results.find(r=>r.projectId===sample.projectId&&r.run===sample.run&&r.arm===sample.arm);return {...sample,...(result?{result}: {})};})});
  try {
   const report=await runMicroeval({directory:join(root,'micro'),skills:{active:join(pending.sourceInstanceRoot,'skills','versions',pending.active),candidate:join(pending.sourceInstanceRoot,'skills','versions',pending.candidate)},

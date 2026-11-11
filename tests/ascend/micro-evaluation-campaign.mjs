@@ -125,3 +125,28 @@ test('normal abort resumes the actual native Pi session and its edited source',a
  const result=await runMicroeval(options);assert.equal(requests,5);assert.ok(result.results.every(r=>r.correct));assert.equal(result.results[0].session,partial.session);
  assert.equal(result.results[0].tokens,36);assert.ok(result.elapsedSeconds>=before.elapsedSeconds);
 });
+test('elapsed micro comparison terminates inconclusively without renewing its allocation',async t=>{
+ const f=await fixture(t);await restartMicroEvaluation(f.config,{settings:{totalSeconds:.01}});
+ const pending=(await json(join(f.root,'skills/evolution.json'))).pending;pending.config.actor={provider:'fixture',model:'fixture'};
+ let calls=0;const round=await compare({pending},{sample:async()=>{calls++;await new Promise(r=>setTimeout(r,20));return {tokens:10};}});
+ assert.equal(round.status,'completed');assert.equal(round.termination,'elapsed');assert.equal(calls,1);assert.equal(round.allocatedSeconds,.01);
+ const {decide}=await import('../../cli/micro-evaluation.mjs');
+ assert.equal(decide(round.samples.map(x=>({...x.result,...x})),pending.projectIds,pending.runs,pending.config).promote,false);
+ await compare({pending},{sample:async()=>{throw Error('Expired allocation must not dispatch');}});assert.equal(calls,1);
+});
+test('unknown micro execution stays fenced through actual background settlement and restart',async t=>{
+ const f=await fixture(t);await restartMicroEvaluation(f.config);
+ const file=join(f.root,'skills/evolution.json'),evolution=await json(file),pending=evolution.pending;
+ pending.config.actor={provider:'fixture',model:'fixture'};pending.config.skills.runtimeModule=resolve('cli/micro-evaluation.mjs');await writeFile(file,JSON.stringify(evolution));
+ await assert.rejects(compare({pending},{sample:async()=>{throw Error('Unknown native cleanup');}}),/Unknown native cleanup/);
+ const round=await json(join(pending.evaluationRoot,'round.json'));assert.ok(round.runningAt>0);assert.equal(await settled({instanceRoot:pending.evaluationRoot}),false);
+ const {backgroundSkillsSettled}=await import('../../cli/skill-background.mjs');
+ assert.equal(await backgroundSkillsSettled(await readConfig(f.root)),false);
+ const before=await readFile(file,'utf8');await assert.rejects(restartMicroEvaluation(await readConfig(f.root)),/Stop campaign/);assert.equal(await readFile(file,'utf8'),before);
+});
+test('micro allocation grants reject before changing pending, allocations or configuration',async t=>{
+ const f=await fixture(t);await restartMicroEvaluation(f.config);
+ const file=join(f.root,'skills/evolution.json'),before=await readFile(file,'utf8'),config=await readConfig(f.root),beforeConfig=await readFile(join(f.root,'instance.json'),'utf8');
+ await assert.rejects(tune({instanceRoot:f.root,config,background:true,backgroundSeconds:100,evaluationSeconds:500,allocationId:'extra'}),/allocations are fixed/);
+ assert.equal(await readFile(file,'utf8'),before);assert.equal(await readFile(join(f.root,'instance.json'),'utf8'),beforeConfig);
+});

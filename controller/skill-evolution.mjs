@@ -152,6 +152,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     if (error.code !== 'ENOENT') throw error;
     state = { history: [], lastEvaluated: 0, pending: null };
   }
+  if(evaluationSeconds!==undefined&&(current.skills?.microEvaluation||state.pending?.config?.skills?.microEvaluation))
+    throw new Error('Micro evaluation allocations are fixed; restart an explicit new comparison instead');
   let recoveredPromotion;
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;

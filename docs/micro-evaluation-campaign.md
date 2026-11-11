@@ -21,6 +21,12 @@ candidate against active skills. Project IDs, attempts, sessions and campaign
 elapsed allocations are preserved. Future Phase 2 evidence uses the same micro
 policy through the ordinary background pipeline.
 
+Additional `allocationId`/`evaluationSeconds` grants are rejected for micro rounds;
+use an explicit new comparison policy instead. Legacy full-project grants retain
+their existing behavior.
+
+A comparison reaching its elapsed deadline terminates inconclusively with retained
+partial evidence; it does not block later evidence from creating another candidate.
 Completed samples are retained across normal pauses. An interrupted native Pi
 session resumes with its edited source and remaining sample/comparison elapsed
 allocation. A crash leaving unknown in-flight execution remains fenced; a dead
