@@ -36,11 +36,15 @@ export function createKdbBridge({url, attemptId, agentDir, target, generation, r
         parent_tool_call_id: result.parentToolCallId, failed: result.isError,
       });
       if(recordRetrieval&&!result.isError&&['mcp__kdb__search','mcp__kdb__read_entry'].includes(result.toolName)) {
-        const wire=result.result?.structuredContent;
+        const wire=result.structuredContent??result.result?.structuredContent;
         const body=wire?.structuredContent??wire;
-        const entries=Array.isArray(body?.result)?body.result:body?.text?[body]:[];
+        const entries=Array.isArray(body?.result)?body.result:typeof body?.text==='string'?[body]:null;
+        if(wire?.isError||entries===null){
+          await event('knowledge-retrieval-unavailable',{tool_call_id:result.toolCallId,tool:result.toolName});return;
+        }
         await recordRetrieval({toolCall:result.toolCallId,operation:result.toolName,
           arguments:result.input??{},generation:entries[0]?.generation??generation??null,entries});
+        await event('knowledge-retrieval-recorded',{tool_call_id:result.toolCallId,tool:result.toolName,entries:entries.length});
       }
     });
   };
