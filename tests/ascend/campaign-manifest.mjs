@@ -34,7 +34,11 @@ test('Ascend campaign targets admit host slots while preserving the registered t
           assert.deepEqual(args,['npu','list','fixture-'+target]);
           return {state:'completed',profiles:[{target:'fixture-'+target,pool:'fixture',devices:[{enabled:true,id:0}]}]};
         }});
+      // Resource discovery happens before execution workspaces are supplied.
+      assert.equal(config.environment.options.workspacePath,undefined);
+      assert.equal(config.environment.options.remoteDirectory,undefined);
       assert.equal((await env.resources({target:config.target})).length,1);
+      assert.equal((await env.resources({})).length,1);
       assert.deepEqual(await env.resources({target:'unrelated'}),[]);
       assert.equal(supplied.environment.options.profile,target+'-language');
     }

@@ -80,12 +80,12 @@ export async function createEnvironment(options, context) {
   const source = await readFile(new URL('../../ascend_tools/targets/health.py', import.meta.url), 'utf8');
   const healthSha256 = digest(source);
   const setupSource = await readFile(new URL('../../ascend_tools/actor_setup.py', import.meta.url), 'utf8');
-  const setupRoot = local ? join(homedir(), '.cache', 'rsi-actors') :
-    join(options.workspacePath, '.rsi-runtime-cache');
-  const scratchRoot = local ? join(context.instancePath, 'scratch') :
-    join(options.workspacePath, options.remoteDirectory, 'actor-scratch', digest(context.instancePath));
-  const setupConfig = {binding:{target:options.target,runtime:options.runtime,product:options.health.product},
-    cache_root:setupRoot,scratch:scratchRoot};
+  // Resource-only bindings need no execution workspace. Generic prepare owns
+  // its validation; resolve actor paths only when an admitted payload runs.
+  const setupConfig = () => ({binding:{target:options.target,runtime:options.runtime,product:options.health.product},
+    cache_root:local ? join(homedir(), '.cache', 'rsi-actors') : join(options.workspacePath, '.rsi-runtime-cache'),
+    scratch:local ? join(context.instancePath, 'scratch') :
+      join(options.workspacePath, options.remoteDirectory, 'actor-scratch', digest(context.instancePath))});
   const setupInstructions = '\nThe registered runtime already supplies dependencies. Target commands inherit a compatible shared TRITON_CACHE_DIR and persistent per-attempt RSI_SCRATCH_DIR outside editable source. Read $RSI_SETUP_REPORT once for Python/package/compiler identity; reuse these defaults rather than rediscovering or reinstalling the runtime. Put probes/logs in $RSI_SCRATCH_DIR, use absolute paths there, and keep the deliverable in $RSI_SOURCE_DIR (the target editable snapshot). Use native local tools for persistent source edits when remote. Avoid mktemp compiler caches except explicit cold-compilation measurements. CATLASS_DSL_CACHE_DIR remains the initialized runtime setting. Never hardcode physical devices; the harness masks the selected device as logical device 0.';
   const bindings = { ...options.env };
   const environment = await genericEnvironment({ ...options, env: bindings }, commandContext);
@@ -493,6 +493,7 @@ export async function createEnvironment(options, context) {
     instructions:environment.instructions+setupInstructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),
     async execute(command, cwd, opts = {}) {
       if(commandActive)throw Object.assign(new Error('Concurrent device commands on one actor are unsupported'),{code:'CONCURRENT_DEVICE_COMMAND'});
+      const actorSetup=setupConfig();
       commandActive=true;
       try {
       const signal = context.signal && opts.signal ? AbortSignal.any([context.signal, opts.signal]) : opts.signal ?? context.signal;
@@ -551,7 +552,7 @@ export async function createEnvironment(options, context) {
         await context.event('device-lease-acquired', {pool, physicalDevice:physical, receipt:lease.receipt, token:lease.token});
         waiting = false;
         await context.event('device-wait', {pool, waiting:false});
-        const request = {  source, sha256: healthSha256, seconds, devices: [physical], command:`${quote(options.python ?? 'python3')} -c ${quote(setupSource)} ${quote(JSON.stringify(setupConfig))} ${quote(command)}`, hostLease,
+        const request = {  source, sha256: healthSha256, seconds, devices: [physical], command:`${quote(options.python ?? 'python3')} -c ${quote(setupSource)} ${quote(JSON.stringify(actorSetup))} ${quote(command)}`, hostLease,
           lease:{pool,token:lease.token,receipt:lease.receipt},
           configuration: { ...options.health, allow_busy:false, require_idle:timing(opts.purpose) || options.health.require_idle === true } };
         const guarded = `${quote(options.python ?? 'python3')} -c ${quote(probe)} ${quote(JSON.stringify(request))}`;
