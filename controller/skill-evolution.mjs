@@ -152,6 +152,8 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     if (error.code !== 'ENOENT') throw error;
     state = { history: [], lastEvaluated: 0, pending: null };
   }
+  if(evaluationSeconds!==undefined&&(current.skills?.microEvaluation||state.pending?.config?.skills?.microEvaluation))
+    throw new Error('Micro evaluation allocations are fixed; restart an explicit new comparison instead');
   let recoveredPromotion;
   if (state.pending && current.skills.activeVersion === state.pending.candidate) {
     if (!state.pending.manual) state.lastEvaluated = state.pending.projects;
@@ -183,9 +185,11 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
       return { ...decision, evaluate: false, evaluationStatus: state.evaluationStatus ?? 'completed', candidate: state.candidate };
   }
   if (!decision.analyse && !manual && !state.pending && !grant) return recoveredPromotion ?? decision;
+  const microRuntime=(current.skills?.microEvaluation||state.pending?.config?.skills?.microEvaluation)?await import('../cli/micro-evaluation.mjs'):null;
   const preparePending = (candidate, projectIds, fields = {}) => ({ active: current.skills.activeVersion, candidate,
-    projects: new Set(originals(state.history).map(x => x.projectId)).size, projectIds,
-    runs: current.skills?.runsPerArm ?? 2, evaluationSeconds: background ? positiveSeconds(backgroundSeconds) : current.skills?.evaluationSeconds,
+    projects: new Set(originals(state.history).map(x => x.projectId)).size, projectIds:current.skills?.microEvaluation?microRuntime.projectIds():projectIds,
+    runs: current.skills?.microEvaluation?microRuntime.settings(current).runs:current.skills?.runsPerArm??2,
+    evaluationSeconds:current.skills?.microEvaluation?Math.min(microRuntime.settings(current).totalSeconds,background?positiveSeconds(backgroundSeconds):current.skills?.evaluationSeconds??Infinity):background?positiveSeconds(backgroundSeconds):current.skills?.evaluationSeconds,
     evaluationRoot: join(directory, 'evaluations', randomUUID()), sourceInstanceRoot: root,
     config: { ...structuredClone(current), mode }, ...(background ? { resource: backgroundResource } : {}), allocations: [], ...fields });
   if (grant && !state.pending) {
@@ -245,7 +249,9 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
     pending.projectIds ?? current.skills?.tuningProjectIds ??
       [...new Set(originals(state.history).map(x => x.projectId))].sort().slice(0, 2), pending));
   const ids = pending.projectIds, runs = pending.runs;
-  evaluateDecision([], ids, runs);
+  const micro=Boolean(pending.config?.skills?.microEvaluation);
+  const decide=micro?(results,ids,runs)=>microRuntime.decide(results,ids,runs,pending.config):evaluateDecision;
+  decide([], ids, runs);
   if (current.skills.activeVersion !== pending.active) throw new Error('Active skills changed during evaluation');
   if (grant && !state.allocations[allocationId]) {
     const allocation = { id: allocationId, seconds: evaluationSeconds };
@@ -260,7 +266,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   };
   let round;
   try {
-    round = await evaluateRound({ pending, config: pending.config, evaluate, signal, ...clock });
+    round = await (micro?microRuntime.compare:evaluateRound)({ pending, config: pending.config, evaluate, signal, ...clock });
   } catch (error) {
     await retainIncoming();
     throw error;
@@ -274,7 +280,7 @@ export async function tune({ instanceRoot, config, configPath = join(instanceRoo
   }
   const evaluationRoot = pending.evaluationRoot;
   const results = round.samples.map(sample => ({ ...sample.result, ...sample, result: undefined }));
-  let verdict = evaluateDecision(results, ids, runs);
+  let verdict = decide(results, ids, runs);
   await save(join(evaluationRoot, 'decision.json'), { ...verdict, ...pending });
   if (verdict.promote) {
     const latest = publish ? await publish({active:pending.active,candidate:pending.candidate,signal}) : await json(configPath);

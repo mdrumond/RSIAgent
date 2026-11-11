@@ -22,7 +22,7 @@ export async function enqueueCompletedEvaluation(config,evolution) {
   const root=await realpath(config.root),evaluation=await realpath(evolution.lastEvaluationRoot);
   if(!inside(root,evaluation))throw new Error('Evaluation archive escaped campaign root');
   const round=await read(join(evaluation,'round.json'));
-  if(round?.status!=='completed')return false;
+  if(round?.kind==='micro'||round?.status!=='completed')return false;
   const origin=[...(evolution.history??[])].reverse().find(task=>task.phase==='phase2'&&task.kind==='original'&&task.completed);
   if(!origin?.id)throw new Error('Completed evaluation requires originating Phase 2 evidence');
   const state=new State(join(root,'state.sqlite'));
@@ -36,7 +36,7 @@ export async function evaluationArchiveStatus(config,evolution) {
     const all=rows(state),pending=all.filter(row=>row.status!=='complete');
     const root=evolution?.lastEvaluationRoot;
     const untracked=Boolean(config.skills?.archiveEvaluations&&root&&!all.some(row=>row.root===resolve(root))&&
-      (await read(join(root,'round.json')))?.status==='completed');
+      (await read(join(root,'round.json')))?.status==='completed'&&(await read(join(root,'round.json')))?.kind!=='micro');
     return {pending:pending.length,complete:all.length-pending.length,untracked,
       hasWork:Boolean(config.skills?.archiveEvaluations&&(pending.length||untracked)),
       error:pending.find(row=>row.error)?.error??null};

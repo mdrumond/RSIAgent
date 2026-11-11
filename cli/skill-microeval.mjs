@@ -5,6 +5,7 @@ import {resolve,join,relative,dirname,isAbsolute} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
+import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -24,20 +25,22 @@ async function check(python,checker,cwd,seconds,signal){
  try{return await new Promise((done,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>done({correct:code===0,exitCode:code,signal,output,error}));});}
  finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);}
 }
-async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory}){
+async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession}){
+ const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
  const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true});await loader.reload();
- const manager=sdk.SessionManager.create(cwd,sessionDirectory);
+ const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
   tools:['read','write','edit','bash'],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
  const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
- const timer=setTimeout(()=>{timedOut=true;void session.abort();},Math.max(1,seconds*1000));
+ const timer=setTimeout(()=>{timedOut=true;void session.abort();},Math.max(1,seconds*1000-(performance.now()-begun)));
  const abort=()=>{void session.abort();};signal?.addEventListener('abort',abort,{once:true});
  try{
-  signal?.throwIfAborted();await session.bindExtensions({});session.agent.toolExecution='sequential';
+  signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
+  await session.bindExtensions({});session.agent.toolExecution='sequential';
   await session.prompt(`Host-only kernel-engineering microtask. Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
@@ -52,7 +55,7 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,totalSeconds,signal},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,totalSeconds,signal,resume=false,shadow=true},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
@@ -64,38 +67,51 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
   if(!Array.isArray(scopes)||scopes.some(scope=>!inputs.active.files[scope]||!inputs.candidate.files[scope]))throw Error('Unknown skill scope');
   frozen.push({id:t.id,kind:t.kind??'unspecified',prompt:t.prompt,scopes,files:t.files,checker:await readFile(t.checker,'utf8')});
  }
- directory=resolve(directory);await mkdir(dirname(directory),{recursive:true});await mkdir(directory); // Refuse replay/refilled elapsed allocations.
- const manifest={format:1,shadow:true,claim:'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ directory=resolve(directory);await mkdir(dirname(directory),{recursive:true});
+ let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+ if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
+ if(!retained)await mkdir(directory);
+ const manifest={format:1,shadow,claim:'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
- await save(join(directory,'manifest.json'),manifest);await mkdir(join(directory,'frozen'));await save(join(directory,'frozen','tasks.json'),frozen);
+ if(retained){const {createdAt:_old,...old}=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));const {createdAt:_new,...next}=manifest;if(JSON.stringify(old)!==JSON.stringify(next))throw Error('Frozen micro evaluation changed');}
+ else{await save(join(directory,'manifest.json'),manifest);await mkdir(join(directory,'frozen'));await save(join(directory,'frozen','tasks.json'),frozen);}
  for(const [arm,input]of Object.entries(inputs))await writeFile(join(directory,'frozen',arm+'.md'),input.text);
- const report={...manifest,status:'running',results:[]};await save(join(directory,'results.json'),report);
+ const report=retained??{...manifest,status:'running',results:[],partials:{},elapsedSeconds:0};
+ report.status='running';report.owner=await processIdentity();const previousElapsed=report.elapsedSeconds??0;
+ const persist=async()=>{report.elapsedSeconds=previousElapsed+(performance.now()-begun)/1000;await save(join(directory,'results.json'),report);await dependencies.checkpoint?.(report);};
+ await persist();
  const sample=dependencies.sample??nativeSample;
  try{
   for(const task of frozen){
    const checker=join(directory,'frozen',task.id+'.py');await writeFile(checker,task.checker);
    for(let run=0;run<runs;run++)for(const arm of run%2?['candidate','active']:['active','candidate']){
-    signal?.throwIfAborted();const left=(totalSeconds??Infinity)-(performance.now()-begun)/1000;
+    signal?.throwIfAborted();const key=task.id+'/'+run+'/'+arm;
+    if(report.results.some(r=>r.taskId===task.id&&r.run===run&&r.arm===arm))continue;
+    const partial=report.partials?.[key],spent=partial?.elapsedSeconds??0;const left=(totalSeconds??Infinity)-previousElapsed-(performance.now()-begun)/1000;
     if(left<=0){report.status='elapsed';return report;}
-    const allocation=Math.min(seconds,left);const path=join(directory,task.id,`${run}-${arm}`),cwd=join(path,'work');await mkdir(cwd,{recursive:true});
-    for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
+    if(spent>=seconds){report.results.push({...partial,correct:false,timedOut:true});delete report.partials[key];await persist();continue;}
+    const allocation=Math.max(.001,Math.min(seconds-spent,left));const path=join(directory,task.id,`${run}-${arm}`),cwd=join(path,'work');await mkdir(cwd,{recursive:true});
+    if(!partial)for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
+    report.runningSample={key,owner:report.owner};await persist();
     const started=performance.now();let observed,verification;
     try{
-     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,seconds:allocation,signal,sessionDirectory:path});
+     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,seconds:allocation,signal,sessionDirectory:path,resumeSession:partial?.session});
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      verification=remaining>0&&!observed.timedOut&&!observed.error?await check(python,checker,cwd,Math.min(20,remaining),signal):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
-    }catch(error){observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
-    const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:(performance.now()-started)/1000,
+    }catch(error){if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
+    const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
      correct:verification.correct,verification,skillsSha256:inputs[arm].sha256};
-    report.results.push(result);await save(join(directory,'results.json'),report);signal?.throwIfAborted();
+    delete report.runningSample;
+    if(resume&&signal?.aborted){report.partials??={};report.partials[key]=result;}else{report.results.push(result);if(report.partials)delete report.partials[key];}
+    await persist();signal?.throwIfAborted();
    }
   }
   report.status='complete';return report;
  }catch(error){report.status='interrupted';report.error=error.message;throw error;}
- finally{await save(join(directory,'results.json'),report);}
+ finally{delete report.owner;await persist();}
 }
 if(import.meta.main){
  const {values}=parseArgs({options:{config:{type:'string'}}});
