@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import {createLocalExecutionOperations,isPiMaximumTimeoutRejection} from './local-bash.mjs';
 import {excludedExecutionProofs} from '../../controller/execution-proof.mjs';
+import {localHostIdentity,observeRebootClosure} from '../../controller/local-reboot.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const terminal = new Set(['completed', 'failed', 'cancelled']);
@@ -251,7 +252,8 @@ export async function createEnvironment(options, context) {
     const dir = join(root, handle.slice(6));
     try {
       const receipt = await json(join(dir, 'execution.json'));
-      if (receipt.boot !== (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()) return { state: 'unknown' };
+      const host=await localHostIdentity();
+      if (receipt.boot !== host.boot) return await observeRebootClosure(dir,receipt,host)??{state:'unknown'};
       // Only canonical evaluation setup opts into this legacy prelaunch proof.
       // Preserve the refusal: it proves no process, not a successful command.
       if(context.recoverPiTimeoutRejection===true&&context.sdk===undefined&&
@@ -524,7 +526,7 @@ export async function createEnvironment(options, context) {
     let handle;
     if (!remote) {
       handle = `local:${dir.slice(dir.lastIndexOf('/') + 1)}`;
-      const receipt={boot:(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim(),cwd};
+      const hostIdentity=await localHostIdentity(),receipt={boot:hostIdentity.boot,hostIdentity,cwd};
       await save(join(dir,'execution.json'),receipt);
       if (opts.leaseReceipt) opts = {...opts, env:{...opts.env, RSI_LEASE_RECEIPT:join(dir,'admission.json')}};
       await event('execution-handle', { handle });

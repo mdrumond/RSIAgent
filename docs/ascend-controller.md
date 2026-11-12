@@ -448,3 +448,32 @@ and recheck it atomically when claiming the native controller; a newer operator 
 or stop cannot be cleared by a queued recovery. If a retained one-worker cap cannot
 serve foreground work alongside the permanent A/B reservation, supervision checkpoints
 and reports `memory-at-minimum` instead of leaving the campaign silently stalled.
+
+For a verified reboot of the same host, an operator can reconcile explicitly
+listed local command receipts without rewriting their execution records:
+
+```bash
+node cli/main.mjs reconcile-local --instance INSTANCE
+node cli/main.mjs reconcile-local --instance INSTANCE --config reboot.json
+node cli/main.mjs reconcile-local --instance INSTANCE --config reboot.json --apply
+```
+
+The first command reports `currentHost` (boot, architecture and host fingerprint).
+The second validates the attestation without publishing closure; `--apply` writes
+immutable `reboot-closure.json` sidecars while campaign writers are stopped.
+The input has `format: 1`, `kind: "operator-attested-same-host-reboot"`,
+`previousBoot`, the inspected `currentHost`, and these fields:
+
+- `operator`: `sameHost: true`, `migrated: false`, matching `target` and
+  `previousTarget`, `previousArchitecture` using the inspected architecture value,
+  and a nonempty `reason` documenting the custody check.
+- `evidence`: retained provenance files as `{path, sha256}`.
+- `receipts`: exact `{path, sha256}` entries for `.executions/exec-*/execution.json`
+  beneath the instance. No inventory-wide scan or implicit receipt selection runs.
+
+Boot mismatch alone remains unresolved: operators must establish unchanged host
+custody, and cannot use this operation to retire a migrated machine's processes.
+New receipts also stamp host identity and reject a known foreign host. Closure
+preserves any real exit result; absent exit stays an infrastructure interruption,
+with no invented success or duration. Excluded setup retains its existing zero
+accounting policy; payloads without measured accounting remain unresolved.
