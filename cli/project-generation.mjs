@@ -91,6 +91,27 @@ async function checkProposal(root,p) {
   return {source,reference,negatives,files};
 }
 
+export {schema as generationProposalSchema};
+// Shared production admission checks; the oracle uses the identical path.
+export async function compileGenerationProposal(root,p,requirements={}){
+  if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command))
+    throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
+  if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
+    throw new Error('Generated performance project requires verifier.baseline_command');
+  const artifacts=await checkProposal(root,p);
+  const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
+  validateAcceptance({...p,verifier});
+  if(p.verifier?.performance_command&&!p.baseline_construction_command)
+    throw new Error('Generated performance project requires baseline_construction_command');
+  const baseline=p.baseline_construction_command===undefined?undefined:
+    compileVerifierEntries({command:p.baseline_construction_command},{root,files:artifacts.files,required:true});
+  if(baseline&&baseline.entrypoints.command.entrypoint!==verifier.entrypoints.baseline_command?.entrypoint)
+    throw new Error('CPU baseline selftest must use the frozen baseline_command entrypoint');
+  const construction=p.construction_command===undefined?verifier:
+    compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
+  return {artifacts,verifier,baseline,construction};
+}
+
 // Returns staged specs. The caller imports artifacts, admits to State, and updates
 // config/selection; draft rows never count as original attempts or completions.
 export async function refillProjects({config,state,bridge,concurrency,path,signal}) {
@@ -187,21 +208,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           execute:async(_id,p)=>{
             const checks=[];
             try {
-              if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command))
-                throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
-              if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
-                throw new Error('Generated performance project requires verifier.baseline_command');
-              const artifacts=await checkProposal(root,p);
-              const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
-              validateAcceptance({...p,verifier});
-              if(p.verifier?.performance_command&&!p.baseline_construction_command)
-                throw new Error('Generated performance project requires baseline_construction_command');
-              const baseline=p.baseline_construction_command===undefined?undefined:
-                compileVerifierEntries({command:p.baseline_construction_command},{root,files:artifacts.files,required:true});
-              if(baseline&&baseline.entrypoints.command.entrypoint!==verifier.entrypoints.baseline_command?.entrypoint)
-                throw new Error('CPU baseline selftest must use the frozen baseline_command entrypoint');
-              const construction=p.construction_command===undefined?verifier:
-                compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
+              const {artifacts,verifier,baseline,construction}=await compileGenerationProposal(root,p,requirements);
               const constructionCommand=entrypointCommand(construction.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;
