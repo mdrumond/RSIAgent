@@ -35,7 +35,11 @@ export function protectedFingerprint(text,mode='bytes'){
 }
 function lastReceipt(output){return JSON.parse(output.trim().split('\n').at(-1));}
 export async function validateKernelReceipt(verification,cwd){
- const receipt=lastReceipt(verification.output);
+ let receipt;try{receipt=lastReceipt(verification.output);}catch(error){if(verification.exitCode===125)return verification;throw error;}
+ if(verification.exitCode===125){
+  if(receipt.correct===null&&receipt.bucket==='harness'&&receipt.kernelSha256===hash(await readFile(join(cwd,'kernel.py')))&&receipt.evidence&&typeof receipt.evidence==='object'&&!Array.isArray(receipt.evidence)&&typeof receipt.evidence.reason==='string'&&receipt.evidence.reason.trim()&&(receipt.latencySeconds===undefined||receipt.latencySeconds===null))return {...verification,correct:null,receipt};
+  return verification;
+ }
  if(receipt.correct!==true||!Number.isFinite(receipt.latencySeconds)||receipt.latencySeconds<=0||
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
@@ -147,11 +151,11 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
      verification=remaining>0&&!observed.timedOut&&!observed.error?await (task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),signal):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
-     if(task.kind==='a3-kernel'&&verification.correct)verification=await validateKernelReceipt(verification,cwd);
+     if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
-     correct:verification.correct,...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
+     correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
     delete report.runningSample;
     if(resume&&signal?.aborted){report.partials??={};report.partials[key]=result;}else{report.results.push(result);if(report.partials)delete report.partials[key];}
     await persist();signal?.throwIfAborted();

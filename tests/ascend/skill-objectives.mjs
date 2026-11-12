@@ -69,3 +69,12 @@ test('paired replay preserves partial receipts and does not replay uncertain exe
  await assert.rejects(finalizeKernelPairs({directory:f.directory,seconds:20},{measure:()=>{throw Error('replay');}}),/unresolved/);
  const retained=JSON.parse(await readFile(join(f.directory,'results.json')));assert.equal(retained.pairedReplay.startedAt,saved.pairedReplay.startedAt);
 });
+
+test('trusted exit125 harness refusal stays inconclusive while ordinary incorrect kernels fail',async t=>{
+ const f=await fixture(t);await writeFile(f.tasks[0].checker,"import json,sys,pathlib,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\nprint(json.dumps(dict(correct=None,bucket='harness',kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'reason':'foreign process'})))\nsys.exit(125)\n");
+ const refused=await runMicroeval(f,{sample:async()=>({})});assert.ok(refused.results.every(r=>r.correct===null&&r.bucket==='harness'&&!r.latencySeconds));assert.equal(refused.decision.promote,false);assert.equal(refused.decision.reason,'inconclusive');
+ const bad=await fixture(t);await writeFile(bad.tasks[0].checker,"import sys\nsys.exit(1)\n");
+ const incorrect=await runMicroeval(bad,{sample:async()=>({})});assert.ok(incorrect.results.every(r=>r.correct===false&&!r.bucket));assert.equal(incorrect.decision.reason,'incorrect-kernel');
+ const forged=await fixture(t);await writeFile(forged.tasks[0].checker,"import json,sys\nprint(json.dumps(dict(correct=None,bucket='harness',kernelSha256='wrong',evidence={})))\nsys.exit(125)\n");
+ const invalid=await runMicroeval(forged,{sample:async()=>({})});assert.ok(invalid.results.every(r=>r.correct===false&&!r.bucket));
+});
