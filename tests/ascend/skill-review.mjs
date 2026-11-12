@@ -406,3 +406,28 @@ test('a copied log must match its declared SHA256 before the first review starts
  await assert.rejects(runReview({...f.options,stage:'inventory'}));
  await assert.rejects(readFile(join(f.options.output,'review.json')),{code:'ENOENT'});
 });
+
+
+async function demoteFingerprint(file){
+ const state=await load(file);state.signature=state.legacySignature;delete state.fingerprintVersion;delete state.legacySignature;await writeFile(file,JSON.stringify(state));return state;
+}
+
+test('unchanged legacy reviews migrate fingerprints without restarting clocks or replacing results and sessions',async t=>{
+ const f=await fixture(t);for(const stage of ['inventory','classify'])await runReview({...f.options,stage},{classify});
+ const file=join(f.options.output,'review.json'),old=await demoteFingerprint(file),session=join(f.options.output,'retained.native.jsonl');await writeFile(session,JSON.stringify({original:true})+'\n');
+ let replayed=0;await runReview({...f.options,stage:'classify'},{classify:async()=>{replayed++;throw Error('Completed classifications must not replay');}});
+ const migrated=await load(file);assert.equal(replayed,0);assert.equal(migrated.startedAt,old.startedAt);assert.equal(migrated.seconds,old.seconds);assert.deepEqual(migrated.classifications,old.classifications);assert.deepEqual(migrated.candidates,old.candidates);assert.equal(migrated.fingerprintVersion,2);assert.equal(migrated.fingerprintMigrations.length,1);assert.equal(JSON.parse((await readFile(session,'utf8')).trim()).original,true);
+});
+
+test('unprovable legacy job or copied-log changes reject model resume but permit read-only history inspection',async t=>{
+ const {createHash}=await import('node:crypto');
+ for(const changed of ['job','log'])await t.test(changed,async t=>{
+  const f=await fixture(t),db=new State(join(f.source,'state.sqlite')),attempt=db.db.prepare('SELECT id FROM attempts').get().id;
+  const job=join(f.source,'attempts',attempt,'job.json'),log=join(f.source,'evidence','legacy.log');await mkdir(dirname(job),{recursive:true});await writeFile(job,JSON.stringify({kind:'original',mode:'phase1'}));await mkdir(dirname(log),{recursive:true});await writeFile(log,'retained bytes');
+  const sha256=createHash('sha256').update('retained bytes').digest('hex');await writeFile(join(f.source,'evidence-files.json'),JSON.stringify({'/original/legacy.log':{path:'evidence/legacy.log',sha256}}));db.event(attempt,'attempt-error',{message:'Baseline failed',evidence:{path:'/original/legacy.log'}});db.close();
+  await runReview({...f.options,stage:'inventory'});const file=join(f.options.output,'review.json');await demoteFingerprint(file);const original=await readFile(file,'utf8');
+  if(changed==='job')await writeFile(job,JSON.stringify({kind:'retry',mode:'phase1'}));else await writeFile(log,'different bytes');
+  await assert.rejects(runReview({...f.options,stage:'classify'},{classify}));
+  const inspected=await runReview({...f.options,stage:'report'});assert.equal(inspected.legacyInspection,true);assert.equal(inspected.resumeAllowed,false);assert.equal(await readFile(file,'utf8'),original);
+ });
+});

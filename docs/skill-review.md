@@ -31,7 +31,11 @@ Stages `inventory`, `classify`, `propose`, `learn`, `evaluate`, `report` are
 independently runnable. Keep sources, profile, Python, limits and output unchanged
 when resuming. Attempt-job metadata, the evidence index and the actual copied-log
 SHA256 values are also frozen and verified; changed inputs require a fresh review
-snapshot, rather than silently reusing older attribution. The original elapsed deadline spans all invocations; report remains
+snapshot, rather than silently reusing older attribution. Legacy fingerprints
+upgrade only after the old signature matches, actual copied digests verify and
+recomputed effective inventory equals the saved inventory; clocks/results/sessions
+are retained. Unprovable legacy histories remain report-inspectable without model
+resume or mutation of their saved record. The original elapsed deadline spans all invocations; report remains
 available after it expires. Classification and review native sessions, searches,
 evidence, decisions and original references are retained alongside `review.json`.
 Full observations and distinct diagnostic representatives are saved as JSONL files.

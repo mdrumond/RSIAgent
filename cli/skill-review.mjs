@@ -58,6 +58,18 @@ export function validateReviewProposal(result,groups,classifications){
  }
  return result;
 }
+function reviewReport(state){
+ const groups=state.inventory?.groups??[];
+ return {status:state.status,elapsedSeconds:state.elapsedSeconds,remainingSeconds:Math.max(0,state.seconds-(Date.now()-state.startedAt)/1000),failureGroups:groups.length,
+   failureObservations:groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
+   dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
+   reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
+   userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
+   learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
+   candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),
+   stats:state.stats,timings:state.timings??[],claim:'Isolated review; live campaigns unchanged. CPU microbenchmarks do not establish GPU kernel improvement.'};
+
+}
 export async function runReview(options,dependencies={}){
  if(!Array.isArray(options.sources)||!options.sources.length||!options.output)throw Error('Review requires snapshot sources and separate output');
  const output=resolve(options.output),sources=await Promise.all(options.sources.map(async s=>({...(typeof s==='string'?{}:s),root:await realpath(typeof s==='string'?s:s.root)})));
@@ -66,13 +78,28 @@ export async function runReview(options,dependencies={}){
  if(![options.maxCandidates??3,options.maxLearning??2].every(n=>Number.isSafeInteger(n)&&n>=0))throw Error('Nonnegative candidate and learning project targets required');
  const stage=options.stage??'all';if(stage!=='all'&&!stages.includes(stage))throw Error('Unknown review stage');
  await mkdir(output,{recursive:true});
- const frozen=[];for(const source of sources){const cfg=await load(join(source.root,'instance.json'));frozen.push({root:source.root,config:hash(cfg),state:await fileHash(join(source.root,'state.sqlite')),knowledge:await fileHash(join(source.root,'knowledge.sqlite')),guidance:hash(await guidanceEntries(source.root,cfg.skills.activeVersion)),dependencies:await dependentInputs(source.root)});}
+ const frozen=[],inputErrors=[];for(const source of sources){const cfg=await load(join(source.root,'instance.json'));let dependencies;try{dependencies=await dependentInputs(source.root);}catch(error){if(stage!=='report')throw error;inputErrors.push(error.message);}
+ frozen.push({root:source.root,config:hash(cfg),state:await fileHash(join(source.root,'state.sqlite')),knowledge:await fileHash(join(source.root,'knowledge.sqlite')),guidance:hash(await guidanceEntries(source.root,cfg.skills.activeVersion)),dependencies});}
  const lockConfig={root:output,skill_queue_seconds:1};new State(join(output,'state.sqlite')).close();
  return withSkillLock(lockConfig,async()=>{
-  const file=join(output,'review.json'),signature=hash({sources,frozen,profile:options.profile??null,python:options.python??null,seconds,maxCandidates:options.maxCandidates??3,maxLearning:options.maxLearning??2});
+  const file=join(output,'review.json'),identity={sources,frozen,profile:options.profile??null,python:options.python??null,seconds,maxCandidates:options.maxCandidates??3,maxLearning:options.maxLearning??2},signature=hash(identity),
+   legacySignature=hash({...identity,frozen:frozen.map(({dependencies,...legacy})=>legacy)});
   let state=await optional(file);
-  if(state&&state.signature!==signature)throw Error('Frozen review inputs or elapsed allocation changed');
+  if(state&&(state.signature!==signature||inputErrors.length)){
+   let proven=false;
+   if(!inputErrors.length&&state.signature===legacySignature){
+    const current=await inventoryFailures(sources),artifacts=current.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>o.artifacts??[]));
+    proven=hash(current)===hash(state.inventory)&&artifacts.every(a=>typeof a.sha256==='string');
+   }
+   if(proven){
+    (state.fingerprintMigrations??=[]).push({from:state.signature,to:signature,at:new Date().toISOString(),proof:'same-effective-inventory-and-verified-copied-artifact-digests'});state.signature=signature;
+   }else if(stage==='report'&&state.fingerprintVersion!==2){
+    return {...reviewReport(state),legacyInspection:true,resumeAllowed:false,inputErrors:inputErrors.length?inputErrors:['Legacy input identity cannot be proven unchanged; model resume requires a fresh snapshot/review']};
+   }else throw Error(state.fingerprintVersion===2?'Frozen review inputs or elapsed allocation changed':'Legacy review inputs cannot be proven unchanged; inspect report only or use a fresh snapshot');
+  }
+  if(inputErrors.length)throw Error(inputErrors.join('; '));
   state??={format:1,signature,startedAt:Date.now(),seconds,inventory:null,classifications:{},reviews:{},learning:{},candidates:{},errors:[],stats:[]};
+  state.fingerprintVersion=2;state.legacySignature=legacySignature;
   const remaining=()=>Math.max(0,seconds-(Date.now()-state.startedAt)/1000);
   const persist=async()=>{state.elapsedSeconds=(Date.now()-state.startedAt)/1000;await save(file,state);};
   const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
@@ -199,14 +226,7 @@ export async function runReview(options,dependencies={}){
    state.status=remaining()>0?'checkpointed':'elapsed';
   }catch(error){state.errors.push({at:new Date().toISOString(),stage,message:error.message});state.status=signal.aborted?'elapsed':'failed';throw error;}
   finally{clearTimeout(timer);for(const campaign of state.inventory?.campaigns??[])await native.stopReviewKnowledge(join(output,'campaigns',campaign.id));for(const id of Object.keys(state.learning))await native.stopReviewKnowledge(join(output,'learning',id));await persist();}
-  const report={status:state.status,elapsedSeconds:state.elapsedSeconds,remainingSeconds:remaining(),failureGroups:state.inventory.groups.length,
-   failureObservations:state.inventory.groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
-   dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
-   reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
-   userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
-   learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
-   candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),
-   stats:state.stats,timings:state.timings??[],claim:'Isolated review; live campaigns unchanged. CPU microbenchmarks do not establish GPU kernel improvement.'};
+  const report=reviewReport(state);
   await save(join(output,'report.json'),report);return report;
  },{key:'skills-review',signal:options.signal});
 }
