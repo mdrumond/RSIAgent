@@ -58,6 +58,20 @@ test('missing or empty exit never turns a reboot interruption into success or sy
  }
 });
 
+for(const attested of [false,true])test(`old-boot scope stop only observes ${attested?'attested closure':'unknown custody'} and preserves the receipt`,async t=>{
+ const f=await fixture(t),receipt=JSON.parse(await readFile(f.path));
+ receipt.containment={unit:'rsi-command-11111111-1111-1111-1111-111111111111.scope',closed:false};
+ await writeFile(f.path,JSON.stringify(receipt));f.input.receipts[0].sha256=await fileSha256(f.path);
+ const before=await readFile(f.path);
+ if(attested)await attestLocalReboot(f.root,{...f.input,apply:true});
+ const sdk={createLocalBashOperations:()=>({exec:async()=>assert.fail('Old boot scope must not be controlled on this boot')})};
+ const observer=await createEnvironment({mode:'local',localExecution:{tasks:16,memory_bytes:128*1024**2}},
+  {...f.context,sdk});
+ assert.equal((await observer.stop(f.handle)).state,attested?'stopped':'unknown');
+ assert.deepEqual(await readFile(f.path),before);
+ if(attested)assert.equal((await observer.observe(f.handle)).state,'stopped');
+});
+
 for(const scenario of ['migration','foreign boot','foreign host','foreign architecture','changed receipt','changed evidence','not a reboot'])
 test('reconciliation refuses '+scenario+' without publishing closure',async t=>{
  const f=await fixture(t),input=structuredClone(f.input);input.apply=true;

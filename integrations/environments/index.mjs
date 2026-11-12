@@ -389,6 +389,9 @@ export async function createEnvironment(options, context) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
     } else {
       const receipt=await json(join(root,handle.slice(6),'execution.json'));
+      // Scope names and process groups belong to their original boot. An old
+      // command is observed through custody proof, never stopped on this boot.
+      if(receipt.boot!==(await localHostIdentity()).boot)return observe(handle,{signal,accountingExcluded});
       if(receipt.containment) {
         await local.stop(receipt.containment.unit,{signal});
         await save(join(root,handle.slice(6),'execution.json'),{...receipt,containment:{...receipt.containment,closed:true}});
