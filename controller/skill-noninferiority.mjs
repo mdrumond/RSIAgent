@@ -23,7 +23,9 @@ export function evaluateNonInferiority(results, {projectIds, runs = 2, margin = 
     }
     pairs.push(pair);
   }
-  if (pairs.some(pair => !pair.candidate.correct)) return {...report, reason: 'correctness-regression'};
+  if (pairs.some(pair => !pair.candidate.correct)) return {...report,
+    reason: pairs.some(pair => pair.active.correct && !pair.candidate.correct)
+      ? 'correctness-regression' : 'baseline-failed'};
   if (runs < 2) return {...report, reason: 'insufficient-repetitions'};
   report.correctnessImproved = pairs.some(pair => !pair.active.correct);
   for (const metric of metrics) {
