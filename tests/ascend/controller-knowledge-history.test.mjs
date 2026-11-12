@@ -183,17 +183,18 @@ test('Git skill blobs preserve Unicode and trailing whitespace exactly',async t=
 });
 
 
-async function bareFixture(t) {
+async function bareFixture(t,bare=true) {
   const directory=await mkdtemp(join(tmpdir(),'knowledge-bare-'));
   t.after(()=>rm(directory,{recursive:true,force:true}));
   const history=new KnowledgeHistory(directory);
   await history.git(['init','--bare','--initial-branch=memory']);
+  if(!bare)await history.git(['--git-dir='+directory,'config','core.bare','false']);
   return history.init();
 }
 const refs=history=>history.git(['for-each-ref','--format=%(refname) %(objectname)']);
 
-test('legacy bare history reopens without nested initialization and retains skill and memory lineage',async t=>{
-  const history=await bareFixture(t);
+for(const bare of [true,false])test(`owned root history reopens without nested initialization with core.bare=${bare}`,async t=>{
+  const history=await bareFixture(t,bare);
   const memory=await history.commitMemory([lesson('legacy')],callbacks);
   await history.proposeSkill({id:'legacy',skills:{debug:'旧 guidance 🧪\n\n'}});
   const promoted=await history.promoteSkill('legacy'),before=await refs(history);
@@ -207,8 +208,8 @@ test('legacy bare history reopens without nested initialization and retains skil
   assert.deepEqual((await reopened.readRevision(next.revision)).parents,[memory.revision]);
 });
 
-test('split history imports legacy objects without replacing either ref set and remains reachable after GC',async t=>{
-  const legacy=await bareFixture(t);
+for(const bare of [true,false])test(`split history recovers objects without ref replacement with core.bare=${bare}`,async t=>{
+  const legacy=await bareFixture(t,bare);
   await legacy.commitMemory([lesson('legacy')],callbacks);
   await legacy.proposeSkill({id:'baseline',skills:{debug:'旧 baseline 🧪\n\n'}});
   const baseline=await legacy.promoteSkill('baseline'),oldRefs=await refs(legacy);

@@ -282,6 +282,8 @@ test('split legacy bare objects restore the SQLite-mapped promoted baseline with
   const mapped=f.state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get('initial');
   const baseline=await f.history.readRevision(mapped.revision);
   const legacyRefs=await f.history.git(['for-each-ref','--format=%(refname) %(objectname)']);
+  await f.history.git(['--git-dir='+f.history.directory,'config','core.bare','false']);
+  assert.equal(await f.history.git(['--git-dir='+f.history.directory,'rev-parse','--is-bare-repository']),'false');
   const directory=await mkdtemp(join(tmpdir(),'publication-nested-'));t.after(()=>rm(directory,{recursive:true,force:true}));
   const current=await new KnowledgeHistory(directory).init();
   const memory=await current.commitMemory([{id:'current',delivery_id:'current-delivery',lesson:'current memory',evidence_refs:['evidence://current']}],

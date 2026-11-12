@@ -89,19 +89,21 @@ export class KnowledgeHistory {
 
   async init() {
     await mkdir(this.directory, { recursive: true });
-    let bare=false,nested=false;
+    let ownedRoot=false,nested=false;
     try {
       await access(join(this.directory,'HEAD'));
-      bare=await this.git(['--git-dir='+this.directory,'rev-parse','--is-bare-repository'])==='true';
+      // --is-bare-repository reflects worktree discovery/configuration, not
+      // ownership of this retained root object store.
+      ownedRoot=resolve(await this.git(['--git-dir='+this.directory,'rev-parse','--absolute-git-dir']))===this.directory;
     }catch(error){if(error.code!=='ENOENT')throw error;}
     try {await access(join(this.directory,'.git'));nested=true;}
     catch(error){if(error.code!=='ENOENT')throw error;}
     if(nested) {
       if(resolve(await this.git(['rev-parse','--show-toplevel']))!==this.directory)
         throw new Error('Knowledge history is not its own repository');
-    }else if(!bare)await this.git(['init', '--initial-branch=memory']);
+    }else if(!ownedRoot)await this.git(['init', '--initial-branch=memory']);
     if (await this.git(['remote'])) throw new Error('Knowledge history must be remoteless');
-    if(bare&&nested)await this.importLegacyBare();
+    if(ownedRoot&&nested)await this.importLegacyBare();
     if (!(await this.ref('refs/heads/memory'))) {
       if (await this.git(['rev-list', '--all'])) throw new Error('Not an empty knowledge repository');
       const revision = await this.commit(null, { 'memory/.gitkeep': '', 'skills/.gitkeep': '' }, { type: 'initialize' });
