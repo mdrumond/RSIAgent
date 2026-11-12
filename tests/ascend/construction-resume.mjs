@@ -1,3 +1,4 @@
+import {controls,numericControls} from './investigation-fixtures.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
@@ -10,11 +11,11 @@ import {State} from '../../controller/state.mjs';
 import {investigate} from '../../cli/curriculum.mjs';
 import {setup,rows,until} from './driver_setup.mjs';
 
-const proposal={goal:'SMALL arithmetic observation',question:'Does the numeric implementation return42?',verifier:'verify.py'};
-const verifier="import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']==42\n";
+const proposal={goal:'SMALL arithmetic observation',question:'Does the numeric implementation return42?',verifier:'verify.py',controls};
+const verifier="import runpy\nfrom pathlib import Path\nassert runpy.run_path('answer.py')['answer']==42\n";
 async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'construction-resume-')),source=join(root,'original'),path=join(root,'attempt');
-  await mkdir(source);await mkdir(path);await writeFile(join(source,'answer.py'),'answer=0\n');
+  await mkdir(source);await mkdir(path);await numericControls(join(path,'investigation'));await writeFile(join(source,'answer.py'),'answer=0\n');
   const state=new State(join(root,'state.sqlite'));state.add({id:'p',source,goal:'numeric',actor_seconds:30,verifier:{files:[],command:'true'}});
   const attempt=state.admit('p',{}),requests=[];
   const server=createServer(async(req,res)=>{
@@ -157,7 +158,7 @@ for(const retained of [false,true])test(`public CLI resumes the same child with 
     wires.push(body);const n=body.messages.filter(m=>m.role==='tool').length;
     if(n===1&&!resume)return;
     const calls=[['write',{path:'source/answer.py',content:'def answer(): return 41\n'}],['read',{path:'source/answer.py'}],
-      ['write',{path:'verify.py',content:"import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']()==42\n"}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]];
+      ['write',{path:'verify.py',content:"import runpy\nfrom pathlib import Path\nassert runpy.run_path('answer.py')['answer']()==42\n"}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal]];
     const call=calls[n];res.writeHead(200,{'Content-Type':'text/event-stream'});
     const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'constructor',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason}]})+'\n\n');
     if(call){frame({role:'assistant',tool_calls:[{index:0,id:'construction-'+n,type:'function',function:{name:call[0],arguments:JSON.stringify(call[1])}}]});frame({},'tool_calls');}
@@ -176,7 +177,7 @@ for(const retained of [false,true])test(`public CLI resumes the same child with 
   let saved;
   if(retained) {
     const base=JSON.parse(frozen),source=join(path,'investigation/source'),file=join(path,'investigation/verify.py');
-    await writeFile(file,"import runpy\nfrom pathlib import Path\nassert runpy.run_path(str(Path(__file__).parent/'source/answer.py'))['answer']()==42\n");
+    await writeFile(file,"import runpy\nfrom pathlib import Path\nassert runpy.run_path('answer.py')['answer']()==42\n");
     saved=JSON.stringify({...base,source,sourceDirectory:base.source,goal:proposal.goal,
       bundle:{version:1,root:base.source,reference:base.source,negative_controls:[],construction_command:'parent-construction'},
       actor_seconds:120,verifier:{files:[file],command:'python ../verify.py'}});
@@ -196,6 +197,7 @@ for(const retained of [false,true])test(`public CLI resumes the same child with 
     const environment={...config.environment,module:'capture-environment.mjs'};
     await writeFile(settings,JSON.stringify({environment}));await f.run('config','--config',settings);
   }
+  await numericControls(join(path,'investigation'),{callable:true});
   resume=true;await f.run('resume');
   const after=rows(f.root,'SELECT * FROM attempts');assert.equal(after.length,2);assert.equal(after.find(a=>a.id===child.id).outcome,'passed');
   assert.deepEqual(after.find(a=>a.id===original.id),original);assert.equal(rows(f.root,'SELECT spec FROM projects')[0].spec,frozen);

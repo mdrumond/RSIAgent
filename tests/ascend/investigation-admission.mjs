@@ -1,3 +1,4 @@
+import {controls,numericControls} from './investigation-fixtures.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
@@ -16,7 +17,7 @@ async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'investigation-admission-'));
   t.after(()=>rm(root,{recursive:true,force:true}));
   const path=join(root,'attempt'),source=join(root,'original');
-  await mkdir(path);await mkdir(source);
+  await mkdir(path);await mkdir(source);await numericControls(join(path,'investigation'));
   await writeFile(join(source,'answer.py'),'answer=42\n');
   const received=[];
   const server=createServer(async(req,res)=>{
@@ -42,7 +43,7 @@ async function fixture(t,plan) {
   const options={config,path,state,bridge,job:{origin_attempt:attempt.id,attempt,actor_seconds:120},base:{source,goal:'numeric'}};
   return {root,path,source,options,results:()=>received.at(-1)};
 }
-const proposal={goal:'Check exact numeric answer',question:'Does the implementation return42?',verifier:'verify.py'};
+const proposal={goal:'Check exact numeric answer',question:'Does the implementation return42?',verifier:'verify.py',controls};
 
 test('native submit rejects missing verifier then accepts write and resubmit in the same session',{timeout:15000},async t=>{
   const verifier="import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n";
@@ -115,4 +116,81 @@ test('pre-actor failure has readable diagnostics before native summary repairs d
   assert.equal(result.evidence[0].path,join(f.path,'diagnostics.json'));
   assert.equal(result.evidence[0].sha256,createHash('sha256').update(await readFile(result.evidence[0].path)).digest('hex'));
   assert.deepEqual(JSON.parse(await readFile(join(f.path,'findings.json'),'utf8')),result);
+});
+
+const knowledge=[['investigation_knowledge',{query:'numeric control',kind:'good'}],
+  ['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}]];
+
+test('canonical argparse verifier rejects missing argv and accepts corrected submission in the same Pi session',async t=>{
+  const filename="probe 'one'.json";
+  const verifier="import argparse,json\np=argparse.ArgumentParser();p.add_argument('--result',required=True)\na=p.parse_args()\nraise SystemExit(0 if json.load(open(a.result))['answer']==42 else 1)\n";
+  const corrected={...proposal,verifier_args:['--result',filename]};
+  const f=await fixture(t,[['write',{path:'verify.py',content:verifier}],...knowledge,
+    ['submit_investigation',proposal],['submit_investigation',corrected]]);
+  for(const [name,answer] of [['positive',42],['negative',0]])
+    await writeFile(join(f.path,'investigation',name,filename),JSON.stringify({answer}));
+  const result=await investigate(f.options),responses=f.results();
+  assert.match(responses[3].content,/reference failed/);
+  assert.equal(responses[4].content,'Recorded');
+  const events=f.options.state.queryEvents(f.options.job.attempt.id,{types:['curriculum-proposal']});
+  assert.equal(events.length,1);assert.deepEqual(events[0].data.proposal,{...corrected,verifier_command:result.verifier.command});
+  const run=cwd=>promisify(execFile)('bash',['-c',result.verifier.command],{cwd});
+  await run(join(f.path,'investigation','positive'));
+  await assert.rejects(run(join(f.path,'investigation','negative')),error=>error.code===1);
+  await writeFile(join(result.source,filename),JSON.stringify({answer:42}));
+  await run(result.source);
+  await writeFile(join(f.path,'investigation','positive',filename),'not JSON');
+  f.options.job.resume=true;
+  const resumed=await investigate(f.options);
+  assert.equal(resumed.verifier.command,result.verifier.command);
+  assert.deepEqual(f.options.state.queryEvents(f.options.job.attempt.id,{types:['curriculum-proposal']}),events);
+  assert.equal((await readdir(join(f.path,'investigation','sessions'))).filter(x=>x.endsWith('.jsonl')).length,1);
+});
+
+test('positive success alone cannot admit an always-pass investigation verifier',async t=>{
+  const f=await fixture(t,[['write',{path:'verify.py',content:'raise SystemExit(0)\n'}],...knowledge,
+    ['submit_investigation',proposal]]);
+  await assert.rejects(investigate(f.options),/did not submit an investigation/);
+  assert.match(f.results()[3].content,/negative control failed/);
+  assert.equal(f.options.state.queryEvents(f.options.job.attempt.id,{types:['curriculum-proposal']}).length,0);
+});
+
+for(const invalid of [{controls:undefined},{controls:{positive:'source',negative:['negative']}},
+  {controls:{positive:'positive',negative:['positive']}}])
+  test('fresh investigation refuses missing or non-discriminating fixture ownership '+JSON.stringify(invalid),async t=>{
+    const f=await fixture(t,[['write',{path:'verify.py',content:'raise SystemExit(0)\n'}],...knowledge,
+      ['submit_investigation',{...proposal,...invalid}]]);
+    await assert.rejects(investigate(f.options),/did not submit an investigation/);
+    assert.equal(f.options.state.queryEvents(f.options.job.attempt.id,{types:['curriculum-proposal']}).length,0);
+  });
+
+for(const argv of [undefined,['--result',"probe 'one'.json"]])
+  test('legacy persisted investigation resumes without new controls or provider work '+JSON.stringify(argv),async t=>{
+    const f=await fixture(t,[]),root=join(f.path,'investigation');
+    await writeFile(join(root,'verify.py'),'raise SystemExit(0)\n');
+    const old={goal:proposal.goal,question:proposal.question,verifier:'verify.py',...(argv?{verifier_args:argv}:{})};
+    const id=f.options.job.attempt.id;
+    await f.options.state.event(id,'curriculum-proposal',{proposal:old});
+    const before=f.options.state.queryEvents(id,{types:['curriculum-proposal']});
+    f.options.job.resume=true;
+    const result=await investigate(f.options);
+    assert.deepEqual(f.options.state.queryEvents(id,{types:['curriculum-proposal']}),before);
+    assert.equal(f.results(),undefined);
+    assert.equal(result.verifier.command,"python '../verify.py'");
+  });
+
+
+test('control execution consumes the existing curriculum elapsed allocation before admission',async t=>{
+  const verifier="import time\ntime.sleep(30)\nraise SystemExit(0)\n";
+  const f=await fixture(t,[['write',{path:'verify.py',content:verifier}],...knowledge,
+    ['submit_investigation',proposal]]);
+  f.options.config.curriculum_seconds=.8;
+  const started=performance.now();
+  await assert.rejects(investigate(f.options),/elapsed allocation exhausted/);
+  assert.ok((performance.now()-started)/1000<5);
+  const id=f.options.job.attempt.id;
+  assert.equal(f.options.state.queryEvents(id,{types:['curriculum-proposal']}).length,0);
+  const attempt=f.options.state.attempt(id);
+  assert.equal(attempt.elapsed,0);assert.equal(attempt.session,null);
+  assert.equal(f.options.state.queryEvents(id,{types:['curriculum-interrupted']})[0].data.accepted,false);
 });

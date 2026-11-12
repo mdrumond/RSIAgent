@@ -133,6 +133,18 @@ continue to import their declared source and verifier files.
 Both phases can also consume supplied projects; inference consumes supplied projects. An empty supplied backlog waits
 for input; a completed configured target advances the phase sequence.
 
+Fresh `submit_investigation` calls supply `goal`, `question`, `verifier`, optional
+`verifier_args` (an argv array), and `controls: {positive, negative: [...]}`.
+Control directories are direct siblings of `source`. Before recording a proposal,
+the existing local Pi runner executes the exact source-relative verifier command
+in each CPU-only control directory: positive must exit 0 and every negative must
+exit 1. Read candidate inputs from the working directory, not a hardcoded source
+path. Checks consume the investigation's remaining elapsed curriculum allocation;
+rejected submissions can be corrected in the same session. The server records
+`verifier_command` after validation and reuses it unchanged for the actor and
+resumes. Legacy persisted proposals without that field keep their historical
+no-argument command and are not retroactively checked against new controls.
+
 A finished original requires a terminal result, settled execution, acknowledged
 memory and completed postprocessing. Failures count; investigations and extra
 retries do not. Recovery investigates smaller gaps and retains negative evidence.

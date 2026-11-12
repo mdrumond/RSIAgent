@@ -51,15 +51,17 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
               verifier:{files:['verify.py'],command:{entrypoint:'verify.py',args:[]}}})];
         } else if (prompt.startsWith('Read the failed')) {
           const verifier = 'import importlib.util\nfrom pathlib import Path\n' +
-            'p=Path(__file__).parent/"source"/"answer.py"\n' +
+            'p=Path.cwd()/"answer.py"\n' +
             's=importlib.util.spec_from_file_location("candidate",p)\nm=importlib.util.module_from_spec(s)\n' +
             's.loader.exec_module(m)\nactual=m.answer(); expected=sum(6 for _ in range(7))\n' +
             'print({"actual":actual,"expected":expected},flush=True)\nassert actual==expected\n';
-          plan = [tool('write',{path:'verifier.py',content:verifier}),
+          plan = [tool('write',{path:'positive/answer.py',content:'def answer(): return 42\n'}),
+            tool('write',{path:'negative/answer.py',content:'def answer(): return 0\n'}),
+            tool('write',{path:'verifier.py',content:verifier}),
             tool('investigation_knowledge',{query:'independent numeric oracle',kind:'good'}),
             tool('investigation_knowledge',{query:'numeric mismatch recovery',kind:'negative'}),
             tool('submit_investigation',{goal:'SMALL arithmetic observation',
-              question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py'})];
+              question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py',controls:{positive:'positive',negative:['negative']}})];
         } else if (prompt.startsWith('Inspect the native')) {
           const context = JSON.parse(prompt.slice(prompt.indexOf('{'),prompt.lastIndexOf('}')+1));
           const events = context.events;
