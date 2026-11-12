@@ -631,6 +631,7 @@ async function worker(root,id) {
     if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
+    if(config.skills?.review?.enabled===true)(await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
     if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
         const task=tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode});

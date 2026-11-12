@@ -6,6 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import { validateAcceptance } from '../controller/state.mjs';
 import { currentCampaignEntry, generationSettings } from '../controller/progress.mjs';
 import { curriculumSession } from './curriculum.mjs';
+import {claimLearningRequest} from '../controller/skill-review.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectBundle,bundleHashes} from './project-bundle.mjs';
@@ -141,8 +142,12 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
       // One bounded batch per call; rejected proposals cannot spin a provider loop.
       d={id:'generated-'+randomUUID(),batch,status:'draft',phase,campaign_entry,seconds,elapsed:0,
         topic};
+      const atomic=!state.db.isTransaction;if(atomic)state.db.exec('BEGIN IMMEDIATE');
+      try{
+        if(phase==='phase1')d.learningRequest=claimLearningRequest(state,config,{draft:d.id,topic,target:config.target});
+        store.save(d);if(atomic)state.db.exec('COMMIT');
+      }catch(error){if(atomic)state.db.exec('ROLLBACK');throw error;}
       if(quota)reserve(topic,1);
-      store.save(d);
     }
     if(d.status==='ready'){result.push(d.spec);continue;}
     const root=join(resolve(path),d.id);await mkdir(root,{recursive:true});
@@ -167,7 +172,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           `Retain performance goals requested by the curriculum as performance_goal with verifier.performance_command. For every performance command provide verifier.baseline_command: a target-only self-test that executes the SAME PyTorch baseline callable and placement path used by performance_command over ALL frozen timing cases, including warmup and timing calls. It must compare baseline results to the independent reference, run without an optimized candidate, and exit 0 only when all baseline cases execute correctly. The controller runs this gate on the target before starting the actor; do not run it during curriculum construction. For every performance command also submit baseline_construction_command as {entrypoint,args}, using the SAME frozen entrypoint as baseline_command and SAME baseline callable/dependency path with a tiny CPU fixture. This is only a small dependency/numerical selftest: no timing, warmups, repetitions or replay of expensive target timing cases. Do not invent performance requirements or claim CPU construction proves timing.\n`+
           (requirements.performance?`This topic requires a real performance_goal, verifier.performance_command and a separate CPU construction_command.\n`:'')+
           (requirements.capabilityEvidence?`SIMT is the actor's optimization objective. Specify deferred target acceptance that requires actual supported ${config.kernel_language??'target'} SIMT APIs/compiler mapping and comparison against an equivalent non-SIMT/vector baseline on an isolated device. Do not implement or benchmark either device kernel during curriculum construction. CPU construction cannot establish SIMT or timing evidence.\n`:'')+
-          `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
+          `${generation.preprompt??''}\n${d.learningRequest?'Learning request (preserve this topic requirements): '+JSON.stringify(d.learningRequest):''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
           `Use the existing KDB tools and baseline skills at ${join(config.root,'skills','versions',config.skills?.activeVersion??'baseline')}.\n`+
           `Keep the complete project in one dedicated subdirectory, including all verifier helpers, reference data and negative controls, so it can be imported and staged independently of this generation session. List any dependencies outside that project subdirectory explicitly in verifier.files. `+
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
@@ -229,7 +234,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                 target:config.target,...(p.performance_goal!=null?{performance_goal:p.performance_goal}:{}),
                 bundle:{...packaged.bundle,validate_starter:true,...(baseline?{baseline_construction_command:entrypointCommand(baseline.entrypoints.command)}:{}),seconds:Math.max(.001,d.seconds-spent())},
                 verifier:{...verifier,files:artifacts.files,hashes},
-                generation:{draft:d.id,topic:d.topic,requirements,checks}};
+                generation:{draft:d.id,topic:d.topic,requirements,checks,...(d.learningRequest?{learningRequest:d.learningRequest}: {})}};
               d.proposal=p;d.status='ready';delete d.error;checkpoint();
               return reply('Project validated and accepted; finish without further tool calls.');
             }catch(error){
