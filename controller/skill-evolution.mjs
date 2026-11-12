@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { stages } from './workflow.mjs';
 import { evaluateRound, positiveSeconds } from './evaluation-round.mjs';
 import { generateCandidate } from './skill-proposal.mjs';
-import { selectSkillEvidence } from './skill-evidence.mjs';
+import { selectSkillEvidence, skillEventTypes } from './skill-evidence.mjs';
 export { generateCandidate };
 
 const scopes = ['global-kdb', ...stages];
@@ -18,8 +18,7 @@ const save = async (path, value, signal) => {
 const completed = task => task?.completed === true && task.id && task.projectId &&
   ['phase2', 'inference'].includes(task.phase);
 const originals = history => history.filter(task => completed(task) && task.kind === 'original');
-const usageTypes = new Set(['skill-read', 'knowledge-retrieved', 'guidance-contradicted',
-  'failure-recorded', 'verification', 'stage-completed', 'attempt-error', 'rejected', 'accepted']);
+const usageTypes = new Set(skillEventTypes);
 const compactTask = task => ({ id: task.id, projectId: task.projectId, kind: task.kind,
   phase: task.phase, completed: task.completed, outcome: task.outcome, comparisonIdentity: task.comparisonIdentity,
   events: (task.events ?? []).filter(event => usageTypes.has(event.type)) });
@@ -34,8 +33,8 @@ export function cadenceDecision(history, task, lastEvaluated = 0, every = 8, pru
     allowPruning: new Set(counted.map(x => x.id)).size >= pruneAfterTasks };
 }
 
-// Recovery must never override an active user edit with an older candidate.
-export const candidateVersion = (state, active) => state.candidateBase === active ? state.candidate ?? active : active;
+// Candidates are inputs to explicit evaluation arms, never ordinary actor rollout.
+export const candidateVersion = (_state, active) => active;
 
 // Correctness improvements precede timing; every candidate correctness result must pass.
 export function evaluateDecision(results, projectIds, runs = 2) {
