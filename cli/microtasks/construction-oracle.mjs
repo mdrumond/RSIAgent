@@ -16,6 +16,7 @@ export async function constructionOracle({root,proposal,controls=false,seconds=3
    const command=entrypointCommand(construction.entrypoints.command);
    for(const c of [{kind:'reference',cwd:artifacts.reference,expected:0},...artifacts.negatives.map(cwd=>({kind:'negative',cwd,expected:1})),
     {kind:'starter',cwd:artifacts.source,expected:0},...(baseline?[{kind:'baseline',cwd:artifacts.source,expected:0,command:entrypointCommand(baseline.entrypoints.command)}]:[])]){
+    if(Array.isArray(controls)&&!controls.includes(c.kind))continue;
     const remaining=seconds-(performance.now()-begun)/1000;if(remaining<=0)throw Error('Oracle elapsed allocation exhausted');
     const result=await env.execute(c.command??command,c.cwd,{signal,timeout:remaining,onData:()=>{}});checks.push({...c,...result});
     if(!result.settled||result.exitCode!==c.expected)throw Error('CPU construction control rejected');
@@ -25,8 +26,8 @@ export async function constructionOracle({root,proposal,controls=false,seconds=3
  }catch(error){return {admitted:false,stage,error:error.message,checks,claim:'Observed production admission rejection; no repair inferred'};}
 }
 export async function oracleMain(argv=process.argv.slice(2)){
- const {values}=parseArgs({args:argv,options:{root:{type:'string'},proposal:{type:'string'},controls:{type:'boolean'},seconds:{type:'string'}}});
- const result=await constructionOracle({root:values.root??'.',proposal:JSON.parse(await readFile(values.proposal,'utf8')),controls:values.controls??false,seconds:Number(values.seconds??30)});
+ const {values}=parseArgs({args:argv,options:{root:{type:'string'},proposal:{type:'string'},controls:{type:'boolean'},control:{type:'string',multiple:true},seconds:{type:'string'}}});
+ const result=await constructionOracle({root:values.root??'.',proposal:JSON.parse(await readFile(values.proposal,'utf8')),controls:values.controls??values.control??false,seconds:Number(values.seconds??30)});
  console.log(JSON.stringify(result));return result;
 }
 if(import.meta.main)await oracleMain();
