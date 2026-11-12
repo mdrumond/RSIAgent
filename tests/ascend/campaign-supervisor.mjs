@@ -454,9 +454,9 @@ test('intentional external input stream remains open; stalled enabled generation
 });
 
 test('idle elapsed survives supervisor restart and reboot; actual progress resets it',async()=>{
-  for(const boot of ['boot','previous-boot']) {
+  for(const state of ['running','waiting',undefined])for(const boot of ['boot','previous-boot']) {
     const view=idleCampaign(),f=fixture([view],1000000);
-    f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot},
+    f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot},state,
       progressWatch:{signature:view.activity.signature,since:boot==='boot'?0:500,idleElapsed:1000000}});
     const result=await superviseCampaign(options(),f.deps);
     assert.equal(result.reason,'exhausted-admissions-unsettled-originals');assert.equal(result.at,1840000);
@@ -467,6 +467,34 @@ test('idle elapsed survives supervisor restart and reboot; actual progress reset
     progressWatch:{signature:'old-admission',since:0,idleElapsed:2000000}});
   assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
   assert.equal(f.reports.find(r=>r.state==='running').progressWatch.idleElapsed,0);
+});
+
+test('checkpointed infrastructure downtime does not block dispatch of a retained cycle',async()=>{
+  const stopped={...idleCampaign(),status:{controller:{state:'stopped'},progress:{done:false}}};
+  const f=fixture([stopped,idleCampaign(),done()],2000000);
+  f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},state:'attention-needed',
+    blockedSince:-40000000,blockedElapsed:42000000});
+  assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+  assert.deepEqual(f.calls.map(call=>call[0]),['resume','pause']);
+  assert.equal(f.reports[0].elapsedSeconds,123);
+});
+
+test('explicitly resumed checkpoints exclude downtime and retain a full bounded watchdog window',async()=>{
+  for(const state of ['attention-needed','paused','checkpointing','cooling','complete']) {
+    for(const boot of ['boot','previous-boot']) {
+      const view=idleCampaign(),f=fixture([view],2000000);
+      f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot},state,
+        reason:'device-lease-blocked',checkpointPending:false,
+        progressWatch:{signature:view.activity.signature,since:-40000000,idleElapsed:42000000}});
+      const result=await superviseCampaign(options(),f.deps);
+      assert.equal(f.reports[0].state,'running');
+      assert.equal(f.reports[0].progressWatch.idleElapsed,0);
+      assert.equal(f.reports[0].elapsedSeconds,123);
+      assert.equal(result.reason,'exhausted-admissions-unsettled-originals');
+      assert.equal(result.at,3800000);assert.equal(result.progressWatch.idleElapsed,1800000);
+      assert.deepEqual(f.calls.map(call=>call[0]),['pause']);
+    }
+  }
 });
 
 test('operator pause precedes the idle watchdog and unresolved pause preserves checkpoints',async()=>{
