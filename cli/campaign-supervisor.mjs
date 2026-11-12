@@ -166,9 +166,12 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
       if(prior.owner?.boot!==owner.boot){memory.highSince=null;memory.lastReduction=null;memory.phaseAt=now();}
       await memoryControl(config,memory);
     }
-    if(prior?.sourceRevision===sourceRevision&&Number.isFinite(prior.blockedSince))
+    // An explicit checkpoint ends the running watchdog window. A resumed campaign
+    // gets a fresh window; running/crashed supervision retains its elapsed stall.
+    const checkpointed=['checkpointing','paused','attention-needed','cooling','complete'].includes(prior?.state);
+    if(prior?.sourceRevision===sourceRevision&&Number.isFinite(prior.blockedSince)&&!checkpointed)
       blockedSince=prior.owner?.boot===owner.boot?Math.min(prior.blockedSince,now()):now()-(prior.blockedElapsed??0);
-    if(prior?.sourceRevision===sourceRevision&&prior.progressWatch) {
+    if(prior?.sourceRevision===sourceRevision&&prior.progressWatch&&!checkpointed) {
       const previous=prior.progressWatch;
       progressWatch={...previous,since:prior.owner?.boot===owner.boot
         ?Math.min(previous.since,now()):now()-(previous.idleElapsed??0)};
