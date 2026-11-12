@@ -6,7 +6,7 @@ import {setup,rows,until} from './driver_setup.mjs';
 import {readConfig} from '../../cli/instance.mjs';
 import {runBackgroundSkills} from '../../cli/skill-background.mjs';
 
-test('storage-backed recovery selects a prepared candidate while A/B holds the writer lock',
+test('storage-backed recovery selects accepted skills while an unapproved candidate holds the A/B writer lock',
   {timeout:120000},async t=>{
     let release=()=>{},block;
     t.after(async()=>{release();if(block)await rm(block,{force:true});});
@@ -38,14 +38,15 @@ export const createEnvironment=(options,context)=>local(options,{...context,reso
     const candidate=evolution.candidate;
     const mapping=rows(f.root,`SELECT revision FROM storage_skill_versions WHERE version='${candidate}'`)[0];
     assert.ok(mapping?.revision);
+    const accepted=rows(f.root,`SELECT revision FROM storage_skill_versions WHERE version='${initial.skills.activeVersion}'`)[0];
     assert.ok(rows(f.root,"SELECT value FROM control WHERE key='skill-writer'")[0]);
     try {
       await rm(block,{force:true});await recoveryWave.output;
       const recovery=rows(f.root,"SELECT attempt FROM recovery_attempts WHERE kind='investigation'")[0];
       assert.ok(recovery);
       const job=JSON.parse(await readFile(join(f.root,'attempts',recovery.attempt,'job.json'),'utf8'));
-      assert.equal(job.skillVersion,candidate);
-      assert.equal(rows(f.root,`SELECT skill_revision FROM storage_attempts WHERE attempt='${recovery.attempt}'`)[0].skill_revision,mapping.revision);
+      assert.equal(job.skillVersion,initial.skills.activeVersion);
+      assert.equal(rows(f.root,`SELECT skill_revision FROM storage_attempts WHERE attempt='${recovery.attempt}'`)[0].skill_revision,accepted.revision);
       assert.equal(rows(f.root,`SELECT session FROM attempts WHERE id='${original.id}'`)[0].session,original.session);
       assert.equal(rows(f.root,"SELECT count(*) AS n FROM attempts WHERE project='recover'")[0].n,2);
       assert.equal(JSON.parse(await readFile(join(f.root,'skills','evolution.json'),'utf8')).pending.candidate,candidate);

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { Type } from 'typebox';
 import { stages } from './workflow.mjs';
+import {skillObservations,writerEvidence,validateSkillGrounding} from './skill-evidence.mjs';
 
 const scopes = ['global-kdb', ...stages];
 const save = async (path, value) => {
@@ -19,12 +20,15 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('Writer elapsed seconds must be positive');
   const started = performance.now();
   const sdk = native ?? await import('@earendil-works/pi-coding-agent');
+  const observations=(input.history??[]).flatMap(skillObservations);
+  for(const observation of skillObservations(input.context))
+    if(!observations.some(item=>item.reference===observation.reference))observations.push(observation);
   await mkdir(directory, { recursive: true });
   await save(join(directory, 'current-guidance.json'), input.entries ?? []);
-  await save(join(directory, 'current-usage.json'), { context: input.context, userinfo: input.userinfo,
+  await save(join(directory, 'current-usage.json'), writerEvidence({ context: input.context, userinfo: input.userinfo,
     actualEvents: input.actualEvents, evidence: input.evidence,
-    originals: input.originalCount ?? 0, pruneAfterTasks: input.pruneAfterTasks ?? 24 });
-  await writeFile(join(directory, 'usage-history.jsonl'), (input.history ?? []).map(x => JSON.stringify(x)).join('\n'));
+    observations, originals: input.originalCount ?? 0, pruneAfterTasks: input.pruneAfterTasks ?? 24 }));
+  await writeFile(join(directory, 'usage-history.jsonl'), (input.history ?? []).map(x => JSON.stringify(writerEvidence(x))).join('\n'));
   const agentDir = join(directory, 'agent');
   await mkdir(agentDir, { recursive: true });
   const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true } });
@@ -33,19 +37,27 @@ export async function generateCandidate({ directory, input, modelRuntime, model,
   let submitted;
   const id = Type.String({ pattern: '^[a-z0-9-]+$' });
   const contradiction = { contradictoryEvidence: Type.Optional(Type.Array(Type.String())) };
+  const grounding = {
+    evidenceRefs:Type.Optional(Type.Array(Type.String())),
+    response:Type.Optional(Type.Union(['actor-change','report-blocker','reserve-validation-runway','retrieve-scoped-evidence'].map(value=>Type.Literal(value)))),
+    measurements:Type.Optional(Type.Array(Type.Object({reference:Type.String(),durationSeconds:Type.Number({minimum:0})}))),
+  };
   const parameters = Type.Object({ changes: Type.Array(Type.Union([
     Type.Object({ action: Type.Literal('remove'), id, ...contradiction }),
     Type.Object({ action: Type.Literal('upsert'), id, scope: Type.Union(scopes.map(scope => Type.Literal(scope))),
-      text: Type.String({ minLength: 1 }), critical: Type.Boolean(), negative: Type.Boolean(), ...contradiction })
+      text: Type.String({ minLength: 1 }), critical: Type.Boolean(), negative: Type.Boolean(), ...contradiction,...grounding })
   ])) });
   const extension = pi => {
     pi.registerTool({ name: 'submit_changes', label: 'Submit skill changes',
       description: 'Validate and submit candidate guidance. Correct any rejection using the returned reason.',
       parameters, execute: async (_id, { changes }) => {
         signal?.throwIfAborted();
-        await validate(changes);
+        const grounded=validateSkillGrounding(changes,observations);
+        await validate(grounded);
         signal?.throwIfAborted();
-        submitted = changes;
+        await save(join(directory,'validated-changes.json'),grounded);
+        signal?.throwIfAborted();
+        submitted = grounded;
         return { content: [{ type: 'text', text: 'Candidate changes accepted.' }], details: {} };
       } });
     for (const type of ['before_provider_request', 'provider_stream_event'])
@@ -74,6 +86,17 @@ and search positive/negative evidence with mcp__kdb__search; indexed source file
 The evidence field contains the current outcome and references, with optional matching historical success/failure.
 Learn from available evidence even when no successful comparison exists. Do not acquire additional benchmark runs.
 Limit claims to what the referenced execution establishes; a failure observation does not prove an alternative fixes it.
+Use observations as the source of attribution and measured duration. actorClockSeconds is cumulative charged time,
+never an operation duration. Numeric duration claims require measurements with a matching observation reference.
+Stage reflections are actor reports or hypotheses, not independent verification or operation timing.
+For attributed failures supply evidenceRefs and response. Harness-owned leases, receipts, fences, transport and
+runtime qualification are not actor repair targets: response report-blocker means preserve work and report the
+blocker, never inspect, close, delete or edit harness state. Keep that guidance in global-kdb/preflight.
+report-blocker and reserve-validation-runway use trusted concise wording at publication; free text cannot override them.
+Use reserve-validation-runway in global-kdb/preflight so actors reach the first canonical validation before
+spending the allowance on optimisation. Keep the last correct source recoverable; elapsed allocations remain
+the stopping rule. Detailed kernel-specific shapes, reference formulas and compiler workarounds belong in
+searchable target evidence: inject concise applicability/retrieval reminders rather than copying entire cases.
 Propose English guidance prioritizing error avoidance, detection and recovery before performance. Retain negatives.
 Preserve critical guidance unless recorded contradictory evidence supports replacement; unused pruning must meet the original-task threshold in current-usage.json.
 Submit via submit_changes; correct any rejection. A final text response does not publish changes.`);

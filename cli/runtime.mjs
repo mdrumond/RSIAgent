@@ -267,13 +267,8 @@ export async function operate(command,config,options={}) {
           await (await import('../controller/storage-knowledge.mjs')).initializeStorageKnowledge(latest,state);
       }
       let skillVersion=admitted.skillVersion??latest.skills.activeVersion;
-      if(!job.resume && admitted.kind!=='original') {
-        try{
-          const {candidateVersion}=await import('../controller/skill-evolution.mjs');
-          skillVersion=candidateVersion(JSON.parse(await readFile(join(config.root,'skills','evolution.json'),'utf8')),skillVersion);
-        }
-        catch(error){if(error.code!=='ENOENT')throw error;}
-      }
+      // Ordinary originals and recovery actors use the accepted active version.
+      // Explicit evaluation arms supply their own pinned version independently.
       if(!job.resume)state.event(attempt.id,'skills-selected',{version:skillVersion,kind:admitted.kind});
       const storage=CampaignStorage.open(state,config.root);
       if(storage) {

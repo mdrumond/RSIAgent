@@ -32,9 +32,11 @@ export class Workflow {
   }
   async query(query,kind,ctx) {
     if (!['good','negative'].includes(kind)) throw new Error('Query good and negative evidence separately');
+    const started=performance.now();
     const result = await this.search({query,kind},ctx);
     this.facts[kind] = true;
-    await this.event('knowledge-retrieved',{stage:this.stage,query,kind,evidence:result.evidence});
+    await this.event('knowledge-retrieved',{stage:this.stage,query,kind,evidence:result.evidence,
+      durationSeconds:(performance.now()-started)/1000});
     return result.content;
   }
   async validate(signal) {

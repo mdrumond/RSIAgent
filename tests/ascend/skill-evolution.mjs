@@ -389,7 +389,7 @@ test('authoritative user edit supersedes pending candidate without deleting evid
   await assert.rejects(tune({ instanceRoot: root, config, task: task(7), generate: async () => [],
     evaluate: async () => { throw new Error('paused'); } }), /paused/);
   const before = await load(join(root, 'skills', 'evolution.json'));
-  assert.equal(candidateVersion(before, 'baseline'), before.candidate);
+  assert.equal(candidateVersion(before, 'baseline'), 'baseline');
   const edited = { ...config, revision: 1, skills: { ...config.skills, activeVersion: 'user-edit' } };
   const directory = join(root, 'skills', 'versions', 'user-edit');
   await cp(join(root, 'skills', 'versions', 'baseline'), directory, { recursive: true });
@@ -406,7 +406,7 @@ test('authoritative user edit supersedes pending candidate without deleting evid
     generate: async ({ input }) => { assert.equal(input.entries[0].id, 'user-entry'); return []; } });
   const after = await load(join(root, 'skills', 'evolution.json'));
   assert.equal(after.candidateBase, 'user-edit');
-  assert.equal(candidateVersion(after, 'user-edit'), updated.candidate);
+  assert.equal(candidateVersion(after, 'user-edit'), 'user-edit');
 });
 
 test('configured two-original cadence evaluates earlier than default eight with validated thresholds', async t => {
