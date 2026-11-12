@@ -278,6 +278,40 @@ test('standalone role sessions retain phase filters and seal only after writer c
   assert.equal((await f.call({action:'inspect',phase:'phase1',role:'curriculum'})).artifacts.length,0);
 });
 
+test('skill writer streams linked to a completed parent stay open until their own session closes',async t=>{
+ const f=await fixture(t,{finish:false});f.state.finish(f.attempt.id,'passed');
+ const session=join(f.root,'skill-writer.jsonl'),provider=join(f.root,'skill-provider.jsonl');
+ const first='{"type":"session"}\n',later='{"type":"message","content":"appended"}\n';
+ await writeFile(session,first);await writeFile(provider,first);
+ const registered=await f.storage.session(session,{attempt:f.attempt.id,phase:'phase2',role:'skill-writer',provider});
+ assert.deepEqual(await sealClosedArtifacts(f.config,{role:'skill-writer'}),[]);
+ for(const row of f.storage.list({attempt:f.attempt.id}).filter(r=>r.role==='skill-writer')) {
+  assert.equal(row.status,'open');assert.equal(row.sha256,null);
+ }
+ await writeFile(session,first+later);await writeFile(provider,first+later);
+ f.storage.closeSession(session);
+ const sealed=await sealClosedArtifacts(f.config,{role:'skill-writer'});
+ assert.equal(sealed.length,2);assert.ok(sealed.includes(registered.id));
+ const {createHash}=await import('node:crypto');
+ for(const row of f.storage.list({attempt:f.attempt.id}).filter(r=>r.role==='skill-writer')) {
+  assert.equal(row.status,'closed');assert.equal(row.bytes,Buffer.byteLength(first+later));
+  assert.equal(row.sha256,createHash('sha256').update(first+later).digest('hex'));
+ }
+ const verified=await f.call({action:'verify',role:'skill-writer'});
+ assert.equal(verified.length,2);assert.ok(verified.every(row=>row.verified));
+});
+
+test('registered actor streams retain their own stopped attempt closure proof',async t=>{
+ const f=await fixture(t,{finish:false});f.state.finish(f.attempt.id,'passed');
+ const session=join(f.root,'actor.jsonl'),provider=join(f.root,'actor-provider.jsonl');
+ await writeFile(session,'{"type":"session"}\n');await writeFile(provider,'{"type":"provider"}\n');
+ const registered=await f.storage.session(session,{attempt:f.attempt.id,phase:'phase1',provider});
+ assert.equal(f.state.db.prepare('SELECT closed FROM storage_sessions WHERE session=?').get('actor.jsonl').closed,0);
+ assert.deepEqual(await sealClosedArtifacts(f.config,{artifact:registered.id}),[registered.id]);
+ const telemetry=f.storage.list({kind:'provider-telemetry'})[0];
+ assert.deepEqual(await sealClosedArtifacts(f.config,{artifact:telemetry.id}),[telemetry.id]);
+});
+
 test('automatic maintenance submits no empty jobs and reuses a pending request',async t=>{
   const f=await fixture(t,{finish:false});
   const {queueCompression}=await import('../../cli/storage-maintenance.mjs');

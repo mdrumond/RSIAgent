@@ -44,8 +44,13 @@ export async function sealClosedArtifacts(config,action={}) {
       WHERE ${clauses.join(' AND ')} ORDER BY f.id LIMIT ?`).all(...args,limit);
     if(action.after===undefined&&globalScan)state.db.prepare("INSERT OR REPLACE INTO control(key,value) VALUES ('storage-seal-cursor',?)")
       .run(JSON.stringify(rows.at(-1)?.id??''));
+    const openSession=state.db.prepare("SELECT 1 FROM storage_sessions WHERE (session=? OR provider=?) AND closed=0 AND role!='actor'");
     for(const row of rows) {
       if(row.status!=='open'||row.external||row.kind==='source-git')continue;
+      // A role writer can append long after its linked original attempt ended.
+      // Actors belong to the attempt owner checked below; other sessions need
+      // their own closure, never an unrelated parent's completed outcome.
+      if(openSession.get(row.path,row.path))continue;
       if(row.attempt) {
         const attempt=state.attempt(row.attempt);
         if(!attempt?.outcome||!await ownerStopped(attempt.owner)||!failureSettled(state,attempt.id))continue;
