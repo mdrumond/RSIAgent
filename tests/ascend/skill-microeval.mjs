@@ -88,3 +88,35 @@ test('native provider HTTP authentication failure is inconclusive with diagnosti
  assert.deepEqual(report.results.map(x=>x.correct),[null,null]);assert.ok(report.results.every(x=>x.error.includes('Fixture authentication rejected')));
  assert.ok(report.results.every(x=>x.verification.exitCode===undefined));
 });
+
+async function scriptedMicro(t,root,plan){
+ const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),n=body.messages.filter(m=>m.role==='tool').length,tool=plan(n);
+  res.writeHead(200,{'Content-Type':'text/event-stream'});const frame=value=>res.write('data: '+JSON.stringify(value)+'\n\n');
+  frame({id:'scoped-micro',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{role:'assistant',...(tool?{tool_calls:[{index:0,id:'call-'+n,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})},finish_reason:null}]});
+  frame({id:'scoped-micro',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:tool?'tool_calls':'stop'}],usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}});res.end('data: [DONE]\n\n');
+ });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const credentials_file=join(root,'scoped.env');await writeFile(credentials_file,'SCOPED_MICRO=fixture\n');
+ return {provider:'scoped-micro',model:'scripted',credential_env:'SCOPED_MICRO',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
+}
+
+test('native microtask sample abort bounds an oversized Bash timeout and reaps its command', {timeout:20000,skip:process.platform!=='linux'},async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'bash',args:{command:'printf "%s" $$ > command.pid; exec sleep 30',timeout:600}}:null),begun=Date.now();
+ const report=await runMicroeval({...f,profile,runs:1,seconds:2});assert.ok(Date.now()-begun<10000);
+ assert.ok(report.results.every(r=>r.timedOut&&!r.correct));
+ for(const arm of ['active','candidate']){const pid=Number(await readFile(join(f.directory,'repair','0-'+arm,'work','command.pid'),'utf8'));assert.ok(pid>0);await assert.rejects(readFile('/proc/'+pid+'/stat'),{code:'ENOENT'});}
+});
+
+test('native microtask policy blocks outside files and shell workspace searches before execution',async t=>{
+ const f=await fixture(t),outside=join(f.root,'outside.txt'),escaped=join(f.root,'escaped');await writeFile(outside,'unrelated');
+ const plan=[{name:'read',args:{path:outside}},{name:'write',args:{path:outside,content:'overwritten'}},{name:'edit',args:{path:outside,oldText:'unrelated',newText:'changed'}},{name:'bash',args:{command:`cd '${f.root}'; grep -rl unrelated . | head; touch '${escaped}'`}},{name:'bash',args:{command:`grep -rl unrelated '${f.root}' | head; touch '${escaped}'`}},{name:'write',args:{path:'kernel.py',content:'def answer(): return 42\n'}}];
+ const profile=await scriptedMicro(t,f.root,n=>plan[n]),report=await runMicroeval({...f,profile,runs:1});assert.ok(report.results.every(r=>r.correct));await assert.rejects(readFile(escaped),{code:'ENOENT'});assert.equal(await readFile(outside,'utf8'),'unrelated');
+ for(const arm of ['active','candidate']){const blocks=(await readFile(join(f.directory,'repair','0-'+arm,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.deepEqual(blocks.map(b=>b.tool),['read','write','edit','bash','bash']);assert.ok(blocks.every(b=>b.blocked));}
+});
+
+test('bounded native Bash still executes the declared legitimate construction oracle',async t=>{
+ const {constructionFixture}=await import('../../cli/microtasks/hypothesis-fixtures.mjs'),f=await fixture(t),{files,proposal}=constructionFixture();
+ Object.assign(f.tasks[0].files,files,{'proposal.json':JSON.stringify(proposal),'oracle.mjs':`import {oracleMain} from ${JSON.stringify(new URL('../../cli/microtasks/construction-oracle.mjs',import.meta.url).href)}; await oracleMain(['--root',process.cwd(),'--proposal','proposal.json']);\n`});
+ const plan=[{name:'bash',args:{command:`'${process.execPath}' oracle.mjs > oracle-result.json`,timeout:60}},{name:'write',args:{path:'kernel.py',content:'def answer(): return 42\n'}}],profile=await scriptedMicro(t,f.root,n=>plan[n]);
+ const report=await runMicroeval({...f,profile,runs:1});assert.ok(report.results.every(r=>r.correct));
+ for(const arm of ['active','candidate'])assert.equal(JSON.parse(await readFile(join(f.directory,'repair','0-'+arm,'work','oracle-result.json'),'utf8')).admitted,true);
+});

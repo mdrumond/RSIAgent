@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /** Short native-Pi skill comparisons. Shadow artifacts never update a campaign. */
-import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,realpath,appendFile} from 'node:fs/promises';
 import {resolve,join,relative,dirname,isAbsolute} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
+import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -30,14 +31,36 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
- const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true});await loader.reload();
+ const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
+ const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
+ const extension=pi=>{
+  pi.on('tool_call',async event=>{
+   let outside=false;
+   if(['read','write','edit','grep','find','ls'].includes(event.toolName)){
+    const path=resolveToCwd(event.input.path??'.',cwd),canonical=await realpath(path).catch(error=>{if(error.code!=='ENOENT')throw error;return path;});
+    outside=canonical!==taskRoot&&!canonical.startsWith(taskRoot+'/');
+   }
+   // Shell directory changes/searches are unnecessary: native tools already use the task cwd.
+   const shellEscape=event.toolName==='bash'&&/(?:^|[;&|()\n])\s*(?:cd|grep|rg|find)\b/.test(event.input.command);
+   if(!outside&&!shellEscape)return;
+   await appendFile(join(sessionDirectory,'tool-policy.jsonl'),JSON.stringify({tool:event.toolName,blocked:true,toolCallId:event.toolCallId})+'\n');
+   return {block:true,reason:'Keep filesystem work inside the current task. Bash directory changes and shell searches are blocked; use native read/grep/find/ls scoped to this task. Run the declared local oracle command directly without changing directory.'};
+  });
+  pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
+   const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
+   const operation=local.exec(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+   try{return await operation;}finally{pending.delete(operation);}
+  }}}));
+ };
+ const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension]});await loader.reload();
  const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
-  tools:['read','write','edit','bash'],resourceLoader:loader,sessionManager:manager});
+  tools:['read','write','edit','grep','find','ls','bash'],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
  const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
- const timer=setTimeout(()=>{timedOut=true;void session.abort();},Math.max(1,seconds*1000-(performance.now()-begun)));
- const abort=()=>{void session.abort();};signal?.addEventListener('abort',abort,{once:true});
+ let aborting;const interrupt=reason=>{sampleAbort.abort(reason);aborting??=session.abort();void aborting.catch(()=>{});};
+ const timer=setTimeout(()=>{timedOut=true;interrupt(Error('Sample elapsed allocation exhausted'));},Math.max(1,seconds*1000-(performance.now()-begun)));
+ const abort=()=>interrupt(signal.reason??Error('Sample interrupted'));signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
   await session.bindExtensions({});session.agent.toolExecution='sequential';
@@ -47,6 +70,7 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
  }catch(error){failure=error.message;}
  finally{
   clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();
+  sampleAbort.abort(Error('Sample finished'));await Promise.allSettled([...pending]);if(aborting)await aborting;
   try{await session.exportToJsonl(join(sessionDirectory,'session.native.jsonl'));}
   finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
