@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,rm,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {setTimeout as delay} from 'node:timers/promises';
-import {reserveDevice,reconcileDeviceLease,hostLease,hostReconcile} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,reconcileDeviceLease,hostLease,hostReconcile,closeDeviceLease,closedDeviceLease} from '../../integrations/environments/device-leases.mjs';
 import {ActorClock} from '../../controller/budget.mjs';
 
 async function root(t){const path=await mkdtemp(join(tmpdir(),'command-leases-'));t.after(()=>rm(path,{recursive:true,force:true}));return path;}
@@ -118,4 +118,33 @@ test('concurrent reconcilers cannot release or replay another live reconciliatio
   const first=reconcileDeviceLease(lease.receipt,callbacks);await entered;
   assert.equal((await reconcileDeviceLease(lease.receipt,callbacks)).reason,'reconciliation-active');
   finish();assert.equal((await first).closed,true);assert.equal(fences,1);
+});
+
+for(const legacy of [false,true])test(`peer closure during host reconciliation completes the same ${legacy?'legacy':'stable'} token`,async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  const record=JSON.parse(await readFile(lease.receipt,'utf8'));
+  if(legacy){delete record.controlDirectory;await writeFile(lease.receipt,JSON.stringify(record));}
+  const control=legacy?join(lease.receipt,'..','control'):record.controlDirectory;
+  await mkdir(join(control,'.executions','exec-old'),{recursive:true});
+  await writeFile(join(control,'.executions','exec-old','stdout'),'retained output');
+  const result=await reconcileDeviceLease(lease.receipt,{
+    stopped:async()=>true,observe:async()=>({state:'completed'}),
+    reconcileHost:async held=>{await closeDeviceLease(held);return false;}
+  });
+  assert.equal(result.closed,true);
+  const proof=await closedDeviceLease(lease.receipt,lease.token);
+  const journal=legacy?join(proof.path,'control'):proof.controlDirectory;
+  assert.equal(await readFile(join(journal,'.executions','exec-old','stdout'),'utf8'),'retained output');
+  assert.ok(await reserveDevice('pool',0,directory));
+});
+
+test('peer closure during native observation is positive proof rather than a missing receipt error',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  await lease.retain('remote:target:job:payload');
+  const result=await reconcileDeviceLease(lease.receipt,{
+    stopped:async()=>true,
+    observe:async()=>{await closeDeviceLease(lease);return {state:'completed'};},
+    reconcileHost:async held=>{await held.update({controlStarted:true});return true;}
+  });
+  assert.equal(result.closed,true);assert.ok(await reserveDevice('pool',0,directory));
 });

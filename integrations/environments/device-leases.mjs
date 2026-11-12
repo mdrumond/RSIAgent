@@ -49,7 +49,7 @@ export async function closeDeviceLease(lease) {
     const record=JSON.parse(readFileSync(lease.receipt,'utf8'));
     if(record.token!==lease.token)throw new Error('Lease ownership changed');
     const proof={closed:true,receipt:lease.receipt,token:lease.token,pool:record.pool,
-      physicalDevice:record.physicalDevice,handles:record.handles};
+      physicalDevice:record.physicalDevice,handles:record.handles,controlDirectory:record.controlDirectory};
     writeFileSync(join(dirname(lease.receipt),'closure.json'),JSON.stringify(proof),{mode:0o600});
     renameSync(dirname(lease.receipt),path);return proof;
   });
@@ -65,7 +65,7 @@ export async function reserveDevice(pool,physicalDevice,directory=join(homedir()
   const path=join(directory,key),token=randomUUID(),receipt=join(path,'lease.json'),owner=await processIdentity();
   const created=leaseLock(directory,()=>{
     try{mkdirSync(path,{mode:0o700});}catch(error){if(error.code==='EEXIST')return false;throw error;}
-    writeFileSync(receipt,JSON.stringify({version:2,token,pool,physicalDevice,owner,instancePath:metadata.instancePath,handles:[],submissions:[]}),{mode:0o600});
+    writeFileSync(receipt,JSON.stringify({version:2,token,pool,physicalDevice,owner,instancePath:metadata.instancePath,controlDirectory:join(directory,'.journals',token,'control'),handles:[],submissions:[]}),{mode:0o600});
     return true;
   });
   return created?openDeviceLease(receipt,token):null;
@@ -113,8 +113,16 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
       let result;try{result=await observe(handle);}catch{return blocked('execution-unresolved',{handle});}
       if(!['stopped','completed','failed','cancelled'].includes(result?.state))return blocked('execution-unresolved',{handle});
     }
-    if(!await reconcileHost(lease))return blocked('host-fence-unresolved');
+    if(!await reconcileHost(lease)){
+      if(await closedDeviceLease(receipt,before.token))return {closed:true,receipt,token:before.token};
+      return blocked('host-fence-unresolved');
+    }
     await closeDeviceLease(lease);return {closed:true,receipt,token:before.token};
+  }catch(error){
+    // Another checkpoint can close this exact token while an observer is in I/O.
+    // Its positive closure supersedes missing/moved journals, never another token.
+    if(await closedDeviceLease(receipt,before.token))return {closed:true,receipt,token:before.token};
+    throw error;
   }finally{
     try{changeLease(receipt,record=>{
       if(record.token!==before.token||record.reconciliation?.id!==claim.id)return false;

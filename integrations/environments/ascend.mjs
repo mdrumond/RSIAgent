@@ -324,7 +324,25 @@ export async function createEnvironment(options, context) {
   async function control(budget) {
     if(controlEnvironment&&controlToken===activeLease.token&&controlSignal===budget.signal)return controlEnvironment;
     controlToken=activeLease.token;controlSignal=budget.signal;
-    const path=join(dirname(activeLease.receipt),'control'),sourcePath=join(path,'source');
+    // Token-specific journals must not move when the active reservation is archived.
+    // Copy legacy journals before constructing observers; keep original evidence.
+    if(!activeLease.record.controlDirectory){
+      const legacy=join(dirname(activeLease.receipt),'control');
+      const stable=join(dirname(dirname(activeLease.receipt)),'.journals',activeLease.token,'control');
+      await mkdir(stable,{recursive:true});
+      try{await cp(legacy,stable,{recursive:true});}catch(error){if(error.code!=='ENOENT')throw error;}
+      let entries=[];try{entries=await readdir(join(stable,'.executions'),{withFileTypes:true});}catch(error){if(error.code!=='ENOENT')throw error;}
+      for(const entry of entries){
+        if(!entry.isDirectory())continue;
+        const file=join(stable,'.executions',entry.name,'execution.json');
+        let row;try{row=await readJson(file);}catch(error){if(error.code==='ENOENT')continue;throw error;}
+        if(row.receiptFile?.startsWith(legacy+'/')){
+          row.receiptFile=stable+row.receiptFile.slice(legacy.length);await save(file,row);
+        }
+      }
+      await activeLease.update({controlDirectory:stable});
+    }
+    const path=activeLease.record.controlDirectory,sourcePath=join(path,'source');
     await mkdir(sourcePath,{recursive:true});
     controlEnvironment=await genericEnvironment(options,{...commandContext,instancePath:path,signal:budget.signal,stopSignal:budget.signal,client:(args,settings)=>nativeClient(args,settings),event:async(type,data)=>{
       if(type==='execution-output'&&(data.stdout||data.stderr)){
@@ -374,17 +392,19 @@ export async function createEnvironment(options, context) {
   async function reconcileCurrent(budget) {
     let retained;
     try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return true;throw error;}
-    const proof=await closedDeviceLease(retained.receipt,retained.token);
-    if(proof&&proof.pool===retained.pool&&proof.physicalDevice===retained.physicalDevice){
-      await preserveControls(proof.path);
-      await unlink(leasePath);
+    const finishClosed=async()=>{
+      const proof=await closedDeviceLease(retained.receipt,retained.token);
+      if(!proof||proof.pool!==retained.pool||proof.physicalDevice!==retained.physicalDevice)return false;
+      await preserveControls(proof.path,proof.controlDirectory);
+      await unlink(leasePath).catch(error=>{if(error.code!=='ENOENT')throw error;});
       await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token});
       return true;
-    }
-    const lease=await openDeviceLease(retained.receipt,retained.token);
-    if(lease.record.version!==2)return false;
-    activeLease=lease;
+    };
+    if(await finishClosed())return true;
     try {
+      const lease=await openDeviceLease(retained.receipt,retained.token);
+      if(lease.record.version!==2)return false;
+      activeLease=lease;
       const handles=new Set(lease.record.handles);
       for(const row of lease.record.submissions){
         if(row.closed===true)continue;
@@ -396,8 +416,12 @@ export async function createEnvironment(options, context) {
       }
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
       for(const handle of handles)if((await environment.observe(handle,{signal:budget.signal})).state!=='stopped')return false;
-      if(budget.signal.aborted||!await reconcileHostLease(lease,budget))return false;
+      if(budget.signal.aborted||!await reconcileHostLease(lease,budget))return finishClosed();
       await releaseLease(lease);return true;
+    } catch(error) {
+      // Positive token closure also covers a peer archiving during native I/O.
+      if(await finishClosed())return true;
+      throw error;
     } finally {activeLease=null;}
   }
   async function reconcileHostLease(lease,budget) {
@@ -418,7 +442,7 @@ export async function createEnvironment(options, context) {
         const request={devices:[lease.record.physicalDevice],lease:{pool:lease.record.pool,token:lease.token}};
         const code="import os,sys,json,hashlib,time\nc=json.loads(sys.argv[1])\n"+hostReconcile;
         const result=await context.exclude('setup',()=>cleanup.execute(`${quote(options.python??'python3')} -c ${quote(code)} ${quote(JSON.stringify(request))}`,
-          join(dirname(lease.receipt),'control','source'),{timeout:Math.min(seconds,remaining),leaseReceipt:true,
+          join(lease.record.controlDirectory??join(dirname(lease.receipt),'control'),'source'),{timeout:Math.min(seconds,remaining),leaseReceipt:true,
             signal:budget.signal,stopSignal:budget.signal}));
         if(!result.settled)return false;
       }
@@ -430,22 +454,22 @@ export async function createEnvironment(options, context) {
         // A terminal failed cleanup may never have entered its Python payload.
         // Preserve its exact journal and permit a new token-scoped cleanup on
         // the next pass; the original device command is never replayed.
-        await preserveControls(dirname(lease.receipt));
+        await preserveControls(dirname(lease.receipt),lease.record.controlDirectory);
         await lease.update({controlStarted:false,controlHandle:null});
         retryFailedControl=true;
         return false;
       }
       if(receipt?.token===lease.token&&['contended','ownership-mismatch'].includes(receipt.decision)){
-        await preserveControls(dirname(lease.receipt));
+        await preserveControls(dirname(lease.receipt),lease.record.controlDirectory);
         await lease.update({controlStarted:false,controlHandle:null});return false;
       }
       if(receipt?.token!==lease.token||receipt.decision!=='reconciled')return false;
-      await preserveControls(dirname(lease.receipt));
+      await preserveControls(dirname(lease.receipt),lease.record.controlDirectory);
       return true;
   }
-  async function preserveControls(directory) {
+  async function preserveControls(directory,controlDirectory) {
     // Preserve only native execution directories, never another source cache.
-    const journal=join(directory,'control','.executions');
+    const journal=join(controlDirectory??join(directory,'control'),'.executions');
     let entries;try{entries=await readdir(journal,{withFileTypes:true});}
     catch(error){if(error.code==='ENOENT')return;throw error;}
     await mkdir(join(context.instancePath,'.executions'),{recursive:true});
@@ -462,7 +486,7 @@ export async function createEnvironment(options, context) {
         // Existing journals always retain their known native control identity.
         if(lease.record.controlHandle&&proof.migrateClosedControl){
           let missing=false;
-          try{await readdir(join(dirname(lease.receipt),'control','.executions'));}
+          try{await readdir(join(lease.record.controlDirectory??join(dirname(lease.receipt),'control'),'.executions'));}
           catch(error){if(error.code==='ENOENT')missing=true;else throw error;}
           if(missing&&await proof.migrateClosedControl(lease.record)){
             await lease.retain(lease.record.controlHandle);
