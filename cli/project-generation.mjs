@@ -15,11 +15,11 @@ import {compileVerifierEntries,entrypointCommand} from '../controller/project-co
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
 const entrypoint=Type.Object({entrypoint:Type.String({minLength:1}),args:Type.Array(Type.String())});
-const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1}),
-  verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:entrypoint,
+const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1,description:'Relative DIRECTORY containing the editable PyTorch starter; not a Python file path.'}),
+  verifier:Type.Object({files:Type.Array(Type.String({description:'Trusted verifier entrypoint/helper/data FILE outside every source, reference and negative-control directory. Fixture contents are bundled automatically; do not list them here.'}),{minItems:1}),command:entrypoint,
     performance_command:Type.Optional(entrypoint),baseline_command:Type.Optional(entrypoint)}),
   construction_command:Type.Optional(entrypoint),baseline_construction_command:Type.Optional(entrypoint),
-  reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
+  reference:Type.String({minLength:1,description:'Relative DIRECTORY containing the independent CPU reference; not a Python file path.'}),negative_controls:Type.Array(Type.String({minLength:1,description:'Relative DIRECTORY containing an incorrect implementation with the same candidate interface.'}),{minItems:1,maxItems:8})});
 
 // Same bounded event contract as State, scoped exclusively to generation telemetry.
 export function generationEventState(db) {
@@ -76,7 +76,7 @@ async function artifact(root,name,directory=false) {
   const file=await realpath(resolve(root,name));
   if(!inside(await realpath(root),file))throw new Error('Draft artifact escapes its directory');
   const info=await stat(file);
-  if(directory?!info.isDirectory():!info.isFile())throw new Error('Invalid draft artifact: '+name);
+  if(directory?!info.isDirectory():!info.isFile())throw new Error(`Draft artifact ${JSON.stringify(name)} must be a ${directory?'directory':'file'}, but ${JSON.stringify(file)} is ${info.isDirectory()?'a directory':info.isFile()?'a file':'another artifact type'}`);
   return file;
 }
 async function checkProposal(root,p) {
@@ -86,7 +86,8 @@ async function checkProposal(root,p) {
   const trees=[source,reference,...negatives];
   if(trees.some((a,i)=>trees.some((b,j)=>i!==j&&(inside(a,b)||inside(b,a)))))
     throw new Error('Source, reference and controls must be separate trees');
-  if(files.some(f=>trees.some(tree=>inside(tree,f))))throw new Error('Verifier must be outside editable fixtures');
+  const fixtureFiles=files.flatMap(file=>trees.filter(tree=>inside(tree,file)).map(tree=>({file,fixtureDirectory:tree})));
+  if(fixtureFiles.length)throw new Error('Remove fixture-owned files from verifier.files; fixture directories are bundled automatically. Only trusted verifier entrypoints/helpers/data outside every fixture directory belong in verifier.files. Offending files: '+JSON.stringify(fixtureFiles));
   return {source,reference,negatives,files};
 }
 

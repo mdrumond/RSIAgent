@@ -23,7 +23,7 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false,repairFixturePaths=false}={}) {
   const root=await mkdtemp(join(process.env.DRIVER_ARTIFACTS??tmpdir(),'generation-'));
   t.after(()=>process.env.RSI_GENERATED_SMOKE_PROFILE?undefined:rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
@@ -87,6 +87,13 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,r
     }
     if(omitConstruction)delete plan.at(-1)[1].construction_command;
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
+    if(repairFixturePaths){
+      const accepted=structuredClone(plan[4]);
+      plan[4][1].source='source/answer.py';plan[4][1].reference='reference/answer.py';
+      plan[4][1].verifier.files.push('reference/answer.py');
+      const directories=structuredClone(plan[4]);directories[1].source='source';directories[1].reference='reference';
+      plan.push(directories,accepted);
+    }
     if(repair)plan.push(['write',{path:'negative/answer.py',content:'answer=-12345\n'}],plan[4]);
     if(afterAccepted)plan.push(['write',{path:'verify.py',content:'raise Exception("modified")\n'}],
       ['write',{path:'source/answer.py',content:'answer=999\n'}],plan[4]);
@@ -696,4 +703,17 @@ test('new generated performance proposals require a baseline CPU selftest before
   const f=await fixture(t,{omitBaselineConstruction:true,performanceGoal:'timing',performanceCommand:'--performance'});
   assert.deepEqual(await refillProjects(f.options),[]);
   assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM generation_events WHERE type='generation-construction-check'").get().n,0);
+});
+
+
+test('native curriculum corrects file-valued fixtures and fixture-owned verifier entries before admission',async t=>{
+ const f=await fixture(t,{repairFixturePaths:true});topicQuota(f,['arithmetic']);
+ const specs=await refillProjects(f.options);assert.equal(specs.length,1);
+ const events=generationEventState(f.state.db).queryEvents(specs[0].id,{limit:1000});
+ assert.equal(events.filter(e=>e.type==='generation-rejected').length,2);
+ assert.deepEqual(specs[0].generation.checks.filter(c=>c.kind!=='baseline').map(c=>c.exitCode),[0,1,0]);
+ assert.equal(specs[0].verifier.files.some(file=>file.startsWith(specs[0].source+'/')),false);
+ const imported=await importProject(f.config.root,specs[0]);f.state.add(imported);
+ assert.equal(f.state.project(imported.id).status,'queued');
+ assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
 });
