@@ -85,6 +85,7 @@ export async function guidanceEntries(root,version){
 export function validateClassification(value,group,entries){
  if(!value||typeof value!=='object')throw Error('Submit a classification object');
  if(!['actor','harness','specification','provider','unknown'].includes(value.cause))throw Error('cause must be actor, harness, specification, provider or unknown');
+ if(value.bucket!==undefined&&!['harness','correctness','optimization'].includes(value.bucket))throw Error('Unknown failure bucket');
  if(!value.reason?.trim())throw Error('reason must explain the observed evidence; stage labels alone do not establish ownership');
  if(!['covered','uncovered','unknown'].includes(value.coverage))throw Error('coverage must be covered, uncovered or unknown');
  if(!Array.isArray(value.guidanceIds))throw Error('guidanceIds must be an array of existing guidance IDs');
@@ -93,7 +94,7 @@ export function validateClassification(value,group,entries){
  if(value.coverage!=='covered'&&value.guidanceIds.length)throw Error('coverage='+value.coverage+' requires guidanceIds=[]; use covered only when identifying applicable existing guidance');
  const refs=new Set([...group.occurrences,...(group.linkedDiagnostics??[])].map(o=>o.reference));
  if(!Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!refs.has(ref)))throw Error('evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group');
- return {...value,groupId:group.id,intervention:value.cause==='harness'?'user-required':null};
+ return {...value,groupId:group.id,intervention:value.cause==='harness'||value.bucket==='harness'?'user-required':null};
 }
 export function validateClassificationBatch(value,groups,entries){
  const rows=value?.classifications;if(!Array.isArray(rows))throw Error('classifications must be an array with one result per supplied groupId');

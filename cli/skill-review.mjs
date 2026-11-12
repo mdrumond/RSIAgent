@@ -45,7 +45,7 @@ async function forkCampaign(source,directory,options){
 }
 export function validateReviewProposal(result,groups,classifications){
  validateReview(result,groups);if(result.action!=='update')return result;
- const observations=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(classifications[g.id]?.cause==='harness'?{responsibility:'harness'}:{})})));
+ const observations=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(classifications[g.id]?.cause==='harness'||classifications[g.id]?.bucket==='harness'?{responsibility:'harness'}:{})})));
  const responses=['actor-change','report-blocker','reserve-validation-runway','retrieve-scoped-evidence'];
  for(const change of result.changes)if(change.response!==undefined&&!responses.includes(change.response))throw Error('response must be one of '+responses.join(', '));
  try{result.changes=validateSkillGrounding(result.changes,observations);}
@@ -61,6 +61,7 @@ export function validateReviewProposal(result,groups,classifications){
 function reviewReport(state){
  const groups=state.inventory?.groups??[];
  return {status:state.status,elapsedSeconds:state.elapsedSeconds,remainingSeconds:Math.max(0,state.seconds-(Date.now()-state.startedAt)/1000),failureGroups:groups.length,
+   buckets:Object.fromEntries(['harness','correctness','optimization','legacy'].map(bucket=>[bucket,Object.values(state.classifications).filter(c=>(c.bucket??'legacy')===bucket).length])),
    failureObservations:groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
    reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
@@ -82,7 +83,7 @@ export async function runReview(options,dependencies={}){
  frozen.push({root:source.root,config:hash(cfg),state:await fileHash(join(source.root,'state.sqlite')),knowledge:await fileHash(join(source.root,'knowledge.sqlite')),guidance:hash(await guidanceEntries(source.root,cfg.skills.activeVersion)),dependencies});}
  const lockConfig={root:output,skill_queue_seconds:1};new State(join(output,'state.sqlite')).close();
  return withSkillLock(lockConfig,async()=>{
-  const file=join(output,'review.json'),identity={sources,frozen,profile:options.profile??null,python:options.python??null,seconds,maxCandidates:options.maxCandidates??3,maxLearning:options.maxLearning??2},signature=hash(identity),
+  const file=join(output,'review.json'),identity={sources,frozen,...(options.bucketPolicy?{bucketPolicy:true}:{}),profile:options.profile??null,python:options.python??null,seconds,maxCandidates:options.maxCandidates??3,maxLearning:options.maxLearning??2},signature=hash(identity),
    legacySignature=hash({...identity,frozen:frozen.map(({dependencies,...legacy})=>legacy)});
   let state=await optional(file);
   if(state&&(state.signature!==signature||inputErrors.length)){
@@ -118,7 +119,7 @@ export async function runReview(options,dependencies={}){
    const configFor=async id=>forkCampaign(campaigns.get(id),join(output,'campaigns',id),options);
    const rememberLearning=async()=>{for(const [key,review]of Object.entries(state.reviews)){
     for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[])]){
-     const groupIds=lesson.groupIds??review.groupIds,id=hash([key,lesson.question,lesson.requiredEvidence,...(lesson.groupIds?[[...groupIds].sort()]:[])]),intervention=groupIds.some(group=>state.classifications[group]?.cause==='harness')?'user-required':null;
+     const groupIds=lesson.groupIds??review.groupIds,id=hash([key,lesson.question,lesson.requiredEvidence,...(lesson.groupIds?[[...groupIds].sort()]:[])]),intervention=groupIds.some(group=>state.classifications[group]?.intervention==='user-required')?'user-required':null;
      if(state.learning[id]){if(intervention){state.learning[id].intervention=intervention;if(!state.learning[id].result)state.learning[id].status='user-required';await persist();}continue;}
      const request={id,key,target:campaigns.get(review.sourceId).target,intervention,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds};
      state.learning[id]={...request,status:intervention?'user-required':'pending'};await persist();
@@ -132,7 +133,7 @@ export async function runReview(options,dependencies={}){
      const legacy=await optional(join(output,'classifications',first.id,'native-session.json'));
      if(dependencies.classify&&!dependencies.classifyBatch||legacy){
       const group=pending.shift(),directory=join(output,'classifications',group.id);await mkdir(directory,{recursive:true});
-      const result=await invoke('classify',{directory,key:group.id,sourceId:group.sourceId,guidanceVersion:campaign.activeVersion,config:await configFor(group.sourceId),group,entries,validate:r=>validateClassification(r,group,entries)});
+      const result=await invoke('classify',{directory,key:group.id,sourceId:group.sourceId,guidanceVersion:campaign.activeVersion,bucketPolicy:options.bucketPolicy===true,config:await configFor(group.sourceId),group,entries,validate:r=>validateClassification(r,group,entries)});
       state.classifications[group.id]=validateClassification(result,group,entries);
      }else{
       const groups=[];for(let i=0;i<pending.length&&groups.length<8;){
@@ -140,7 +141,7 @@ export async function runReview(options,dependencies={}){
        groups.push(...pending.splice(i,1));
       }
       const key=hash(groups.map(g=>g.id)),directory=join(output,'classification-batches',key);await mkdir(directory,{recursive:true});
-      const result=await invoke('classifyBatch',{directory,key,sourceId:first.sourceId,guidanceVersion:campaign.activeVersion,config:await configFor(first.sourceId),groups,entries,validate:r=>validateClassificationBatch(r,groups,entries)});
+      const result=await invoke('classifyBatch',{directory,key,sourceId:first.sourceId,guidanceVersion:campaign.activeVersion,bucketPolicy:options.bucketPolicy===true,config:await configFor(first.sourceId),groups,entries,validate:r=>validateClassificationBatch(r,groups,entries)});
       for(const row of validateClassificationBatch(result,groups,entries).classifications)state.classifications[row.groupId]=row;
      }
      await persist();
@@ -148,21 +149,21 @@ export async function runReview(options,dependencies={}){
    }
    const buckets=new Map();
    for(const group of state.inventory.groups){const c=state.classifications[group.id];if(!c)continue;
-    for(const id of c.guidanceIds.length?c.guidanceIds:[c.coverage]){const key=group.sourceId+':'+id;
-     const bucket=buckets.get(key)??{key,sourceId:group.sourceId,guidanceId:id,groups:[]};bucket.groups.push(group);buckets.set(key,bucket);}}
+    for(const id of c.guidanceIds.length?c.guidanceIds:[c.coverage]){const key=group.sourceId+':'+id+(c.bucket?':'+c.bucket:'');
+     const bucket=buckets.get(key)??{key,sourceId:group.sourceId,guidanceId:id,...(c.bucket?{objective:c.bucket}:{}),groups:[]};bucket.groups.push(group);buckets.set(key,bucket);}}
    const propose=async()=>{for(const bucket of buckets.values()){
     const completed=state.reviews[bucket.key],learning=Object.entries(state.learning).filter(([,v])=>v.key===bucket.key&&v.result?.status==='verified-cpu');
     if(completed&&(!learning.length||completed.learningRevision===learning.length))continue;
     const config=await configFor(bucket.sourceId),entries=await guidanceEntries(config.root,config.skills.activeVersion),directory=join(output,'proposals',hash([bucket.key,learning.length]));await mkdir(directory,{recursive:true});
     const validate=result=>validateReviewProposal(result,bucket.groups,state.classifications);
-    let result;try{result=validate(await invoke('review',{directory,key:bucket.key,config,groups:bucket.groups,entries,learning,
+    let result;try{result=validate(await invoke('review',{directory,key:bucket.key,objective:bucket.objective,config,groups:bucket.groups,entries,learning,
      classifications:bucket.groups.map(g=>state.classifications[g.id]),validate}));}
     catch(error){
      if(signal.aborted)throw error;
      result={action:'inconclusive',reason:'review-execution-failed',error:{name:error.name,message:error.message},groupIds:bucket.groups.map(g=>g.id)};
      state.errors.push({at:new Date().toISOString(),stage:'propose',bucket:bucket.key,message:error.message});
     }
-    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,directory,learningRevision:learning.length};
+    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,...(bucket.objective?{objective:bucket.objective}:{}),directory,learningRevision:learning.length};
     await rememberLearning();await persist();
    }};if(selected.includes('propose'))await propose();
    if(selected.includes('learn'))for(const [id,request]of Object.entries(state.learning)){
@@ -183,7 +184,7 @@ export async function runReview(options,dependencies={}){
    }
    if(stage==='all'&&Object.values(state.learning).some(r=>r.result?.status==='verified-cpu')){await propose();await rememberLearning();}
    if(selected.includes('evaluate'))for(const [key,review]of Object.entries(state.reviews)){
-    if(review.action!=='update')continue;
+    if(review.action!=='update'||review.objective==='harness')continue;
     const revision=hash(review.changes),legacy=state.candidates[key];
     const candidateKey=legacy&&Array.isArray(legacy.changes)&&hash(legacy.changes)===revision?key:key+':'+revision;
     if(state.candidates[candidateKey]?.decision)continue;
@@ -203,7 +204,7 @@ export async function runReview(options,dependencies={}){
      const version=await writeVersion(directory,updated,join(directory,'skills','versions',campaign.activeVersion));
      candidate=state.candidates[candidateKey]={directory,bucket:key,proposalRevision:revision,active:campaign.activeVersion,version,changes:review.changes};await persist();
     }
-    let result;try{result=await invoke('evaluate',{directory:join(directory,'evaluation'),key:candidateKey,config:await load(join(directory,'instance.json')),
+    let result;try{result=await invoke('evaluate',{directory:join(directory,'evaluation'),key:candidateKey,objective:review.objective,config:await load(join(directory,'instance.json')),
      active:join(directory,'skills','versions',candidate.active),candidate:join(directory,'skills','versions',candidate.version)},900);}
     catch(error){
      if(signal.aborted)throw error;

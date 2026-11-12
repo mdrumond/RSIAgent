@@ -7,6 +7,8 @@ import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
+import {createKdbBridge} from '../integrations/kdb-extension.mjs';
+import {evaluateSkillObjective} from '../controller/skill-objectives.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -17,24 +19,38 @@ async function skillInput(directory){
  for(const [scope,name] of Object.entries(map))files[scope]=await readFile(inside(root,name),'utf8');
  return {files,sha256:hash(JSON.stringify(files)),text:Object.entries(files).map(([scope,text])=>`## ${scope}\n${text}`).join('\n\n')};
 }
-async function check(python,checker,cwd,seconds,signal){
+async function check(python,checker,cwd,seconds,signal,args=[cwd]){
  signal?.throwIfAborted();
- const child=spawn(python,[checker,cwd],{cwd,stdio:['ignore','pipe','pipe'],env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
+ const child=spawn(python,[checker,...args],{cwd,stdio:['ignore','pipe','pipe'],env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
  let output='',error='';child.stdout.on('data',d=>{output=(output+d).slice(-8192);});child.stderr.on('data',d=>{error=(error+d).slice(-8192);});
  const abort=()=>child.kill('SIGKILL');signal?.addEventListener('abort',abort,{once:true});
  const timer=setTimeout(abort,Math.max(1,seconds*1000));
  try{return await new Promise((done,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>done({correct:code===0,exitCode:code,signal,output,error}));});}
  finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);}
 }
-async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession}){
+const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(k=>[k,canonical(value[k])])):value;
+export function protectedFingerprint(text,mode='bytes'){
+ if(!['bytes','json'].includes(mode))throw Error('Protected fingerprint mode must be bytes or json');
+ return hash(mode==='json'?JSON.stringify(canonical(JSON.parse(text))):text);
+}
+function lastReceipt(output){return JSON.parse(output.trim().split('\n').at(-1));}
+export async function validateKernelReceipt(verification,cwd){
+ const receipt=lastReceipt(verification.output);
+ if(receipt.correct!==true||!Number.isFinite(receipt.latencySeconds)||receipt.latencySeconds<=0||
+  receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
+ return {...verification,receipt};
+}
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
+ const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
  const extension=pi=>{
   pi.on('tool_call',async event=>{
+   if(event.toolName.startsWith('mcp__kdb__')&&!['mcp__kdb__search','mcp__kdb__read_entry'].includes(event.toolName))return {block:true,reason:'Evaluation knowledge is read-only: use search or read_entry.'};
    let outside=false;
    if(['read','write','edit','grep','find','ls'].includes(event.toolName)){
     const path=resolveToCwd(event.input.path??'.',cwd),canonical=await realpath(path).catch(error=>{if(error.code!=='ENOENT')throw error;return path;});
@@ -52,10 +68,10 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
    try{return await operation;}finally{pending.delete(operation);}
   }}}));
  };
- const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension]});await loader.reload();
+ const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
-  tools:['read','write','edit','grep','find','ls','bash'],resourceLoader:loader,sessionManager:manager});
+  tools:['read','write','edit','grep','find','ls','bash',...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
  const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
  let aborting;const interrupt=reason=>{sampleAbort.abort(reason);aborting??=session.abort();void aborting.catch(()=>{});};
@@ -63,8 +79,8 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
  const abort=()=>interrupt(signal.reason??Error('Sample interrupted'));signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
-  await session.bindExtensions({});session.agent.toolExecution='sequential';
-  await session.prompt(`Host-only kernel-engineering microtask. Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
+  if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
+  await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
  }catch(error){failure=error.message;}
@@ -79,23 +95,28 @@ async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionD
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,totalSeconds,signal,resume=false,shadow=true},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
+ if(objective==='harness'||tasks.some(t=>t.bucket==='harness'))throw Error('Harness faults require user intervention, not skill A/B');
+ if(tasks.some(t=>t.bucket)&&(!objective||objective==='legacy'))throw Error('Bucketed tasks require an explicit matching objective');
+ if(objective&&!['legacy','correctness','optimization'].includes(objective))throw Error('Unknown skill objective');
  const ids=tasks.map(t=>t.id);if(new Set(ids).size!==ids.length||ids.some(id=>!/^[a-z0-9-]+$/.test(id)))throw Error('Unique task identifiers required');
  const inputs={active:await skillInput(skills.active),candidate:await skillInput(skills.candidate)};
  const frozen=[];for(const t of tasks){
   if(!t.prompt||!t.files||!t.files['kernel.py']||!t.checker)throw Error('Runnable task files and independent Python checker required');
   const scopes=t.scopes??Object.keys(inputs.active.files);
   if(!Array.isArray(scopes)||scopes.some(scope=>!inputs.active.files[scope]||!inputs.candidate.files[scope]))throw Error('Unknown skill scope');
-  frozen.push({id:t.id,kind:t.kind??'unspecified',prompt:t.prompt,scopes,files:t.files,checker:await readFile(t.checker,'utf8')});
+  if(t.bucket!==undefined&&!['correctness','optimization'].includes(t.bucket))throw Error('Invalid task bucket');
+  if(objective&&objective!=='legacy'&&t.bucket&&t.bucket!==objective)throw Error('Task bucket differs from objective');
+  frozen.push({...((t.bucket)?{bucket:t.bucket}:{}),...(t.protectedFiles?{protectedFiles:t.protectedFiles}:{}),...(t.pairedChecker?{pairedChecker:await readFile(t.pairedChecker,'utf8')}:{}),id:t.id,kind:t.kind??'unspecified',prompt:t.prompt,scopes,files:t.files,checker:await readFile(t.checker,'utf8')});
  }
  directory=resolve(directory);await mkdir(dirname(directory),{recursive:true});
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,claim:'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:{url:knowledge.url,readOnly:true}}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -121,21 +142,69 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     report.runningSample={key,owner:report.owner};await persist();
     const started=performance.now();let observed,verification;
     try{
-     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,seconds:allocation,signal,sessionDirectory:path,resumeSession:partial?.session});
+     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:allocation,signal,sessionDirectory:path,resumeSession:partial?.session});
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
-     verification=remaining>0&&!observed.timedOut&&!observed.error?await check(python,checker,cwd,Math.min(20,remaining),signal):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
+     verification=remaining>0&&!observed.timedOut&&!observed.error?await (task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),signal):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     if(task.kind==='a3-kernel'&&verification.correct)verification=await validateKernelReceipt(verification,cwd);
+     for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
-     correct:verification.correct,verification,skillsSha256:inputs[arm].sha256};
+     correct:verification.correct,...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
     delete report.runningSample;
     if(resume&&signal?.aborted){report.partials??={};report.partials[key]=result;}else{report.results.push(result);if(report.partials)delete report.partials[key];}
     await persist();signal?.throwIfAborted();
    }
   }
-  report.status='complete';return report;
+  report.status='complete';if(objective)report.decision=evaluateSkillObjective(report.results,{objective,projectIds:ids,runs,pairedTimings:report.pairedTimings});return report;
  }catch(error){report.status='interrupted';report.error=error.message;throw error;}
  finally{delete report.owner;await persist();}
+}
+/** Final alternating-order replay runs trusted frozen paired checkers, never agent claims. */
+export async function finalizeKernelPairs({directory,python='python3',seconds,signal},dependencies={}){
+ if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive paired replay elapsed allocation required');
+ const report=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));
+ if(report.status!=='complete'||report.runningSample||report.owner&&!await ownerStopped(report.owner))throw Error('Complete settled samples required');
+ if(report.objective!=='optimization')throw Error('Paired replay requires optimization objective');
+ if(report.pairedReplay?.runningPair)throw Error('Paired replay execution remains unresolved');
+ const tasks=JSON.parse(await readFile(join(directory,'frozen','tasks.json'),'utf8'));
+ for(const task of tasks)if(report.tasks.find(t=>t.id===task.id)?.sha256!==hash(JSON.stringify(task)))throw Error('Frozen paired task changed');
+ report.pairedReplay??={startedAt:Date.now(),seconds};
+ if(report.pairedReplay.seconds!==seconds)throw Error('Paired replay allocation changed');
+ report.pairedTimings??=[];await save(join(directory,'results.json'),report);
+ for(const task of tasks)for(let run=0;run<report.runs;run++){
+  signal?.throwIfAborted();
+  const left=seconds-(Date.now()-report.pairedReplay.startedAt)/1000;
+  const pair=Object.fromEntries(['active','candidate'].map(arm=>[arm,report.results.find(r=>r.taskId===task.id&&r.run===run&&r.arm===arm)]));
+  if(!pair.active?.correct||!pair.candidate?.correct)continue;
+  if(!task.pairedChecker)throw Error('Frozen paired checker required');
+  const paths=Object.fromEntries(['active','candidate'].map(arm=>[arm,join(directory,task.id,`${run}-${arm}`,'work')]));
+  for(const arm of ['active','candidate'])if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed before paired replay');
+  const checker=join(directory,'frozen',task.id+'-paired.py');await writeFile(checker,task.pairedChecker);
+  for(const arm of ['active','candidate'])for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed: '+name);
+  if(report.pairedTimings.some(r=>r.projectId===task.id&&r.run===run)||left<=0)continue;
+  report.pairedReplay.runningPair={projectId:task.id,run,owner:await processIdentity()};await save(join(directory,'results.json'),report);
+  const measured=dependencies.measure?await dependencies.measure({task,run,...paths,seconds:left,signal}):await kernelCheck(python,checker,directory,left,signal,[paths.active,paths.candidate]);
+  delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);
+  const receipt=measured.output!==undefined?lastReceipt(measured.output):measured;
+  if(measured.exitCode!==undefined&&measured.exitCode!==0)throw Error('Paired checker failed');
+  if(receipt.correct!==true||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid paired verification receipt');
+  for(const arm of ['active','candidate'])if(receipt[arm+'KernelSha256']!==pair[arm].kernelSha256||!Number.isFinite(receipt[arm+'LatencySeconds'])||receipt[arm+'LatencySeconds']<=0)throw Error('Invalid paired timing identity or latency');
+  for(const arm of ['active','candidate']){
+   if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed during paired replay');
+   for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed during replay: '+name);
+  }
+  report.pairedTimings.push({...receipt,projectId:task.id,run});await save(join(directory,'results.json'),report);
+ }
+ report.decision=evaluateSkillObjective(report.results,{objective:report.objective,projectIds:tasks.map(t=>t.id),runs:report.runs,pairedTimings:report.pairedTimings});
+ await save(join(directory,'results.json'),report);return report;
+}
+async function kernelCheck(python,checker,cwd,seconds,signal,args=[cwd]){
+ const sdk=await import('@earendil-works/pi-coding-agent'),ops=createLocalExecutionOperations(sdk);let output='';
+ const quote=s=>"'"+String(s).replaceAll("'", "'\\''")+"'";
+ const result=await ops.exec([python,checker,...args].map(quote).join(' '),cwd,{timeout:seconds,signal,env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},onData:d=>{output=(output+d).slice(-8192);}});
+ return {correct:result.exitCode===0,exitCode:result.exitCode,output};
 }
 if(import.meta.main){
  const {values}=parseArgs({options:{config:{type:'string'}}});
