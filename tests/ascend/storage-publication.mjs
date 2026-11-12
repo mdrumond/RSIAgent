@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, cp } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, cp, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { State } from '../../controller/state.mjs';
@@ -11,7 +11,7 @@ import { initializeStorageKnowledge, publishStorageMemory, recordStorageSkill } 
 import { deliverLessons } from '../../cli/memory.mjs';
 import { run as edit } from '../../cli/skill-input.mjs';
 
-async function fixture(t) {
+async function fixture(t,{bare=false}={}) {
   const root=await mkdtemp(join(tmpdir(),'publication-'));
   const state=new State(join(root,'state.sqlite')),ledger=new CampaignStorage(state,root);
   await ledger.initialize();
@@ -22,7 +22,9 @@ async function fixture(t) {
   for(const path of Object.values(map))await writeFile(join(directory,path),'baseline guidance');
   await writeFile(join(directory,'skill-map.json'),JSON.stringify(map));
   await writeFile(join(root,'instance.json'),JSON.stringify(config));
-  return {config,state,ledger,history:await new KnowledgeHistory(join(root,'knowledge.git')).init()};
+  const history=new KnowledgeHistory(join(root,'knowledge.git'));
+  if(bare){await mkdir(history.directory);await history.git(['init','--bare','--initial-branch=memory']);}
+  return {config,state,ledger,history:await history.init()};
 }
 const lesson=id=>({id,attempt_id:'attempt',outcome:'passed',findings:`lesson ${id}`,
   evidence:[{collection:'repo',entry_id:'entry',sha256:'abc',start_line:1,end_line:2}]});
@@ -272,4 +274,40 @@ test('missing active skill recovery refuses changed version contents without rep
  assert.equal(await f.history.state('skills'),null);
  assert.equal(f.state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get().revision,original.revision);
  assert.equal(f.state.db.prepare('SELECT revision FROM storage_skill_versions WHERE version=?').get('initial').revision,original.revision);
+});
+
+
+test('split legacy bare objects restore the SQLite-mapped promoted baseline without replacing newer memory',async t=>{
+  const f=await fixture(t,{bare:true});await initializeStorageKnowledge(f.config,f.state);
+  const mapped=f.state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get('initial');
+  const baseline=await f.history.readRevision(mapped.revision);
+  const legacyRefs=await f.history.git(['for-each-ref','--format=%(refname) %(objectname)']);
+  const directory=await mkdtemp(join(tmpdir(),'publication-nested-'));t.after(()=>rm(directory,{recursive:true,force:true}));
+  const current=await new KnowledgeHistory(directory).init();
+  const memory=await current.commitMemory([{id:'current',delivery_id:'current-delivery',lesson:'current memory',evidence_refs:['evidence://current']}],
+    {indexRevision:async revision=>revision,activate:async()=>{}});
+  const memoryRefs=await current.git(['for-each-ref','--format=%(refname) %(objectname)']);
+  await rename(join(directory,'.git'),join(f.history.directory,'.git'));
+  await assert.rejects(f.history.readRevision(mapped.revision),/git rev-parse/);
+  assert.equal(await f.history.state('skills'),null);
+  const initialized=await initializeStorageKnowledge(f.config,f.state);
+  assert.equal(initialized.skills.revision,mapped.revision);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM storage_skill_versions WHERE version=?').get('initial'),mapped);
+  assert.deepEqual(await f.history.state('memory'),memory);
+  assert.deepEqual(await f.history.readRevision(mapped.revision),baseline);
+  assert.equal(await f.history.git(['--git-dir='+f.history.directory,'for-each-ref','--format=%(refname) %(objectname)']),legacyRefs);
+  for(const line of memoryRefs.split('\n')) {
+    const [ref,revision]=line.split(' ');assert.equal(await f.history.ref(ref),revision);
+  }
+  const refs=await f.history.git(['for-each-ref','--format=%(refname) %(objectname)']);
+  await initializeStorageKnowledge(f.config,f.state);
+  assert.equal(await f.history.git(['for-each-ref','--format=%(refname) %(objectname)']),refs);
+  const next=await publishStorageMemory(f.config,lesson(2),{invoke:async(_tool,args)=>({generation:args.revision})});
+  assert.deepEqual((await f.history.readRevision(next.revision)).parents,[memory.revision]);
+  assert.equal((await f.history.readRevision(next.revision)).memory.find(r=>r.id==='current').lesson,'current memory');
+  await cp(join(f.config.root,'skills/versions/initial'),join(f.config.root,'skills/versions/next'),{recursive:true});
+  await writeFile(join(f.config.root,'skills/versions/next/debug.md'),'next guidance');
+  const promoted=await recordStorageSkill(f.config,'next',{promote:true,baseVersion:'initial'});
+  assert.equal((await f.history.readRevision(promoted.revision)).skills['debug.md'],'next guidance');
+  assert.equal((await f.history.state('memory')).revision,next.revision);
 });
