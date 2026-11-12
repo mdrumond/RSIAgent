@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { pipeline } from 'node:stream/promises';
 import { mkdir, mkdtemp, rm, access } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -53,17 +54,56 @@ export class KnowledgeHistory {
     catch (error) { if (error.code === 1 || error.code === 128) return null; throw error; }
   }
 
+  // Older checkpoints used a bare repository at the history root. A previous
+  // initializer could create .git inside it, hiding its objects from newer writes.
+  async importLegacyBare() {
+    const legacy=['--git-dir='+this.directory];
+    if(await this.git([...legacy,'remote']))throw new Error('Knowledge history must be remoteless');
+    const refs=(await this.git([...legacy,'for-each-ref','--format=%(refname) %(objectname)']))
+      .split('\n').filter(Boolean).map(line=>line.split(' '));
+    const missing=[];
+    for(const [ref,revision] of refs) {
+      const alias='refs/knowledge/legacy-bare/'+ref.slice('refs/'.length);
+      const existing=await this.ref(alias);
+      if(existing&&existing!==revision)throw new Error('Legacy knowledge history reference changed: '+ref);
+      if(!existing)missing.push([alias,revision]);
+    }
+    if(!missing.length)return;
+    // Stream binary pack bytes directly between native Git processes. Never
+    // buffer/decode object data in JS or depend on an external object directory.
+    const pack=spawn('git',[...legacy,'-c','pack.threads=1','pack-objects','--window=0','--all','--stdout'],{stdio:['ignore','pipe','pipe']});
+    const index=spawn('git',['-C',this.directory,'index-pack','--stdin'],{stdio:['pipe','ignore','pipe']});
+    const exited=child=>new Promise((ok,fail)=>{
+      let stderr='';child.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-65536);});
+      child.on('error',fail);
+      child.on('close',code=>code===0?ok():fail(new Error('Legacy knowledge object import failed: '+stderr)));
+    });
+    const children=[exited(pack),exited(index)];
+    try {await Promise.all([...children,pipeline(pack.stdout,index.stdin)]);}
+    catch(error) {pack.kill();index.kill();await Promise.allSettled(children);throw error;}
+    // Keep all imported objects reachable without replacing current activation,
+    // memory, skill or delivery refs. The original bare refs remain untouched.
+    await this.git(['update-ref','--stdin'],{input:'start\n'+missing.map(([ref,revision])=>
+      `create ${ref} ${revision}\n`).join('')+'prepare\ncommit\n'});
+  }
+
   async init() {
     await mkdir(this.directory, { recursive: true });
+    let ownedRoot=false,nested=false;
     try {
-      await access(join(this.directory,'.git'));
+      await access(join(this.directory,'HEAD'));
+      // --is-bare-repository reflects worktree discovery/configuration, not
+      // ownership of this retained root object store.
+      ownedRoot=resolve(await this.git(['--git-dir='+this.directory,'rev-parse','--absolute-git-dir']))===this.directory;
+    }catch(error){if(error.code!=='ENOENT')throw error;}
+    try {await access(join(this.directory,'.git'));nested=true;}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    if(nested) {
       if(resolve(await this.git(['rev-parse','--show-toplevel']))!==this.directory)
         throw new Error('Knowledge history is not its own repository');
-    } catch(error) {
-      if(error.code!=='ENOENT')throw error;
-      await this.git(['init', '--initial-branch=memory']);
-    }
+    }else if(!ownedRoot)await this.git(['init', '--initial-branch=memory']);
     if (await this.git(['remote'])) throw new Error('Knowledge history must be remoteless');
+    if(ownedRoot&&nested)await this.importLegacyBare();
     if (!(await this.ref('refs/heads/memory'))) {
       if (await this.git(['rev-list', '--all'])) throw new Error('Not an empty knowledge repository');
       const revision = await this.commit(null, { 'memory/.gitkeep': '', 'skills/.gitkeep': '' }, { type: 'initialize' });

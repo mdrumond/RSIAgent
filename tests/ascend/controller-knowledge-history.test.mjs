@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, rename, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { KnowledgeHistory } from '../../controller/knowledge-history.mjs';
@@ -180,4 +180,79 @@ test('Git skill blobs preserve Unicode and trailing whitespace exactly',async t=
  const history=await fixture(t),text='# Skill\n'+('中文 café 🧪 '.repeat(3000))+'\n\n';
  const proposed=await history.proposeSkill({id:'unicode',skills:{debug:text}});
  assert.ok((await history.readRevision(proposed.revision)).skills['debug.md']===text,'Exact Unicode skill bytes round-trip');
+});
+
+
+async function bareFixture(t,bare=true) {
+  const directory=await mkdtemp(join(tmpdir(),'knowledge-bare-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  const history=new KnowledgeHistory(directory);
+  await history.git(['init','--bare','--initial-branch=memory']);
+  if(!bare)await history.git(['--git-dir='+directory,'config','core.bare','false']);
+  return history.init();
+}
+const refs=history=>history.git(['for-each-ref','--format=%(refname) %(objectname)']);
+
+for(const bare of [true,false])test(`owned root history reopens without nested initialization with core.bare=${bare}`,async t=>{
+  const history=await bareFixture(t,bare);
+  const memory=await history.commitMemory([lesson('legacy')],callbacks);
+  await history.proposeSkill({id:'legacy',skills:{debug:'旧 guidance 🧪\n\n'}});
+  const promoted=await history.promoteSkill('legacy'),before=await refs(history);
+  const reopened=await new KnowledgeHistory(history.directory).init();
+  await assert.rejects(access(join(history.directory,'.git')),{code:'ENOENT'});
+  assert.equal(await refs(reopened),before);
+  assert.deepEqual(await reopened.state('memory'),memory);
+  assert.deepEqual(await reopened.state('skills'),promoted);
+  assert.equal((await reopened.readRevision(promoted.revision)).skills['debug.md'],'旧 guidance 🧪\n\n');
+  const next=await reopened.commitMemory([lesson('next')],callbacks);
+  assert.deepEqual((await reopened.readRevision(next.revision)).parents,[memory.revision]);
+});
+
+for(const bare of [true,false])test(`split history recovers objects without ref replacement with core.bare=${bare}`,async t=>{
+  const legacy=await bareFixture(t,bare);
+  await legacy.commitMemory([lesson('legacy')],callbacks);
+  await legacy.proposeSkill({id:'baseline',skills:{debug:'旧 baseline 🧪\n\n'}});
+  const baseline=await legacy.promoteSkill('baseline'),oldRefs=await refs(legacy);
+  const current=await fixture(t),memory=await current.commitMemory([lesson('new-memory')],callbacks);
+  const currentRefs=await refs(current);
+  await rename(join(current.directory,'.git'),join(legacy.directory,'.git'));
+  const split=new KnowledgeHistory(legacy.directory);
+  await assert.rejects(split.readRevision(baseline.revision),/git rev-parse/);
+  const recovered=await split.init();
+  assert.equal(await recovered.git(['--git-dir='+legacy.directory,'for-each-ref','--format=%(refname) %(objectname)']),oldRefs);
+  for(const line of currentRefs.split('\n')) {
+    const [ref,revision]=line.split(' ');assert.equal(await recovered.ref(ref),revision);
+  }
+  assert.deepEqual(await recovered.state('memory'),memory);
+  assert.equal(await recovered.state('skills'),null);
+  assert.equal((await recovered.readRevision(baseline.revision)).skills['debug.md'],'旧 baseline 🧪\n\n');
+  for(const line of oldRefs.split('\n')) {
+    const [ref,revision]=line.split(' ');
+    assert.equal(await recovered.ref('refs/knowledge/legacy-bare/'+ref.slice(5)),revision);
+  }
+  const allRefs=await refs(recovered);
+  await recovered.init();assert.equal(await refs(recovered),allRefs);
+  await recovered.git(['gc','--prune=now']);
+  assert.equal((await recovered.readRevision(baseline.revision)).event.type,'skill-promotion');
+  await recovered.setState('skills',baseline);
+  await recovered.proposeSkill({id:'next',skills:{debug:'new guidance'}});
+  const promoted=await recovered.promoteSkill('next');
+  assert.deepEqual(await recovered.state('memory'),memory);
+  assert.equal((await recovered.readRevision(promoted.revision)).skills['debug.md'],'new guidance');
+  const next=await recovered.commitMemory([lesson('following')],callbacks);
+  assert.deepEqual((await recovered.readRevision(next.revision)).parents,[memory.revision]);
+  assert.equal((await recovered.readRevision(memory.revision)).memory[0].delivery_id,'new-memory');
+});
+
+test('split history refuses changed legacy aliases and remote repositories without replacing current memory',async t=>{
+  const legacy=await bareFixture(t),current=await fixture(t);
+  const memory=await current.commitMemory([lesson('current')],callbacks);
+  await rename(join(current.directory,'.git'),join(legacy.directory,'.git'));
+  const recovered=await new KnowledgeHistory(legacy.directory).init();
+  await recovered.git(['update-ref','refs/knowledge/legacy-bare/heads/memory',memory.revision]);
+  await assert.rejects(recovered.init(),/Legacy knowledge history reference changed/);
+  assert.deepEqual(await recovered.state('memory'),memory);
+  await recovered.git(['--git-dir='+legacy.directory,'remote','add','origin','/nonexistent/local-only-test']);
+  await assert.rejects(recovered.init(),/remoteless/);
+  assert.deepEqual(await recovered.state('memory'),memory);
 });
