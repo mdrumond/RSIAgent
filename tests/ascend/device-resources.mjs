@@ -467,10 +467,10 @@ test('production CPL profile without canonical pool fails closed',async t=>{
   await assert.rejects(bound.resources(),/actual alias-group pool/);
 });
 
-for(const failure of ['unknown-observe','lost-handle-event'])test(`target reconciliation ${failure} resumes same control handle without replay`,async t=>{
+for(const failure of ['unknown-observe','legacy-unknown-observe','lost-handle-event'])test(`target reconciliation ${failure} resumes same control handle without replay`,async t=>{
   const f=await fixture(t);let controlHandle,broken=true;
   const client=async(args,settings)=>{
-    if(broken&&failure==='unknown-observe'&&args[0]==='observe'&&args[1]===controlHandle)return {state:'observation-unavailable'};
+    if(broken&&failure.endsWith('unknown-observe')&&args[0]==='observe'&&args[1]===controlHandle)return {state:'observation-unavailable'};
     const result=await f.context.client(args,settings);
     if(args[0]==='run'&&!args.includes('--npu')&&args[args.indexOf('--file')+1].endsWith('command.sh'))controlHandle=result.handle;
     return result;
@@ -483,6 +483,21 @@ for(const failure of ['unknown-observe','lost-handle-event'])test(`target reconc
   if(failure==='lost-handle-event')await assert.rejects(bound.execute('payload-once',f.source,{timeout:3}),/lost control/);
   else assert.equal((await bound.execute('payload-once',f.source,{timeout:3})).settled,false);
   const runs=f.calls.filter(a=>a[0]==='run').length;
+  if(failure==='legacy-unknown-observe'){
+    const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+    const held=JSON.parse(await readFile(pointer.receipt,'utf8'));
+    const stable=held.controlDirectory,legacy=join(dirname(pointer.receipt),'control');
+    await fs.rename(stable,legacy);
+    for(const entry of await fs.readdir(join(legacy,'.executions'),{withFileTypes:true})){
+      if(!entry.isDirectory())continue;
+      const file=join(legacy,'.executions',entry.name,'execution.json');
+      let row;try{row=JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code==='ENOENT')continue;throw error;}
+      if(row.receiptFile?.startsWith(stable+'/'))row.receiptFile=legacy+row.receiptFile.slice(stable.length);
+      await writeFile(file,JSON.stringify(row));
+    }
+    for(const row of held.submissions)if(row.receiptFile?.startsWith(stable+'/'))row.receiptFile=legacy+row.receiptFile.slice(stable.length);
+    delete held.controlDirectory;await writeFile(pointer.receipt,JSON.stringify(held));
+  }
   broken=false;const restarted=await createEnvironment(f.options,{...f.context,client});
   assert.deepEqual(await Promise.all([restarted.reconcileLease(),restarted.reconcileLease()]),[true,true]);
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);

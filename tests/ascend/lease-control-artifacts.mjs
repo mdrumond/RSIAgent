@@ -11,6 +11,8 @@ import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {runAttempt} from '../../controller/pi.mjs';
 import {createEnvironment} from '../../integrations/environments/ascend.mjs';
+import {createEnvironment as genericEnvironment} from '../../integrations/environments/index.mjs';
+import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
 
 // Real Pi tools, Ascend event forwarding and campaign artifact registration;
 // only provider responses and the native CPL wire are CPU fixtures.
@@ -81,15 +83,32 @@ for(const product of ['a3','a5'])test(`${product} lease cleanup output remains c
   assert.equal(events.some(e=>e.type==='attempt-error'),false);
   const rows=state.db.prepare("SELECT * FROM storage_artifacts WHERE attempt=? AND kind IN ('execution-stdout','execution-stderr')").all(attempt.id);
   assert.equal(rows.length,4,'payload and control streams are registered');
-  // Closing the global reservation archives its native journal, but campaign
-  // copies must remain independently readable and sealable afterward.
+  // Closing archives the reservation while token-scoped native journals and
+  // independent campaign copies remain readable and sealable.
   const [closed]=await readdir(join(leases,'.closed'));
-  const journal=join(leases,'.closed',closed,'control','.executions');
+  const proof=JSON.parse(await readFile(join(leases,'.closed',closed,'closure.json'),'utf8'));
+  const journal=join(proof.controlDirectory??join(leases,'.closed',closed,'control'),'.executions');
   const nativeStreams=[];for(const execution of await readdir(journal,{withFileTypes:true})){
     if(!execution.isDirectory())continue;
     try{nativeStreams.push(await readFile(join(journal,execution.name,'stdout'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
   }
   assert.ok(nativeStreams.includes('native stdout\n'),'global cleanup journal remains durable');
+  // A late native receipt download must write to the old token's stable journal,
+  // never recreate its archived reservation or alter a newly admitted token.
+  const replacement=await reserveDevice(root,0,leases);
+  assert.ok(replacement,'cleanup freed the physical device');
+  const before=await readFile(replacement.receipt,'utf8');
+  const late=await genericEnvironment({mode:'cpl',target:'fixture',runtime:'registered',instructionFile,
+    workspacePath:'/registry/workspace',remoteDirectory:'owned'},
+    {instancePath:proof.controlDirectory??join(resolve(replacement.receipt,'..'),'control'),client,event:async()=>{},exclude:async(_label,fn)=>fn()});
+  assert.deepEqual(await readdir(resolve(replacement.receipt,'..')),['lease.json'],'late cleanup must not recreate control inside a new reservation');
+  const control=JSON.parse(await readFile(join(leases,'.closed',closed,'lease.json'),'utf8')).controlHandle;
+  assert.equal((await late.readAdmission(control)).decision,'reconciled');
+  assert.equal((await late.observe(control)).state,'stopped');
+  assert.equal(await readFile(replacement.receipt,'utf8'),before);
+  assert.deepEqual(await readdir(resolve(replacement.receipt,'..')),['lease.json']);
+  await replacement.release();
+  assert.ok(await reserveDevice(root,0,leases),'late cleanup cannot poison the next reservation');
   for(const stream of ['stdout','stderr']){
     const path=outputs[0].data[stream];assert.ok(!relative(attemptPath,path).startsWith('..'));
     const row=rows.find(r=>resolve(campaign,r.path)===path);assert.ok(row);assert.equal(row.external,0);

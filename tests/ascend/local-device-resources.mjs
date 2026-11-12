@@ -320,7 +320,7 @@ test('closed cleanup contention retries after the other controller releases its 
   assert.equal(await first.environment.reconcileLease(),false);
   const controls=first.events.filter(e=>e.type==='execution-handle'&&e.data.purpose==='device-lease-control');
   assert.equal(controls.length,1);
-  const receipt=JSON.parse(await readFile(join(prior.receipt,'..','control','.executions',controls[0].data.handle.slice(6),'admission.json'),'utf8'));
+  const receipt=JSON.parse(await readFile(join(prior.record.controlDirectory,'.executions',controls[0].data.handle.slice(6),'admission.json'),'utf8'));
   assert.equal(receipt.token,prior.token);assert.equal(receipt.decision,'contended');
   assert.equal(JSON.parse(await readFile(prior.receipt,'utf8')).controlStarted,false);
   // A second refusal proves the first cleanup left the newer fence intact.
@@ -343,7 +343,7 @@ test('closed cleanup ownership mismatch preserves an orphan fence and retries af
   assert.equal(await first.environment.reconcileLease(),false);
   assert.equal(await readFile(join(fence,'lease.json'),'utf8'),newer);
   const handle=first.events.find(e=>e.type==='execution-handle'&&e.data.purpose==='device-lease-control').data.handle;
-  const receipt=JSON.parse(await readFile(join(prior.receipt,'..','control','.executions',handle.slice(6),'admission.json'),'utf8'));
+  const receipt=JSON.parse(await readFile(join(prior.record.controlDirectory,'.executions',handle.slice(6),'admission.json'),'utf8'));
   assert.equal(receipt.token,prior.token);assert.equal(receipt.decision,'ownership-mismatch');
   await rm(fence,{recursive:true});
   assert.equal(await first.environment.reconcileLease(),true);
