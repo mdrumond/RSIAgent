@@ -67,7 +67,11 @@ export async function nativeLearn({directory,config,request,signal,seconds}){
    environment:{module:fileURLToPath(new URL('../integrations/environments/index.mjs',import.meta.url)),options:{mode:'local'}},campaign_plan:[{id:'learning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},curriculum:{generation:{enabled:true,topics:[request.question],preprompt:'Investigate only this CPU-answerable learning question: '+JSON.stringify(request)+'. Keep fixtures tiny, deterministic and independently checked. Record actual observations, not hypothetical device behavior.'}},skills:{...config.skills,review:{enabled:false}}};
   const bridge=createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:request.id,agentDir:join(directory,'agent')});
   const specs=await refillProjects({config:cfg,state,bridge,concurrency:1,path:join(directory,'drafts'),signal});
-  const draft=specs[0];if(!draft)throw Error('Learning curriculum did not submit a project');
+  const draft=specs[0];if(!draft){
+   const drafts=state.db.prepare('SELECT data FROM generation_drafts').all().map(({data})=>{const d=JSON.parse(data);return {id:d.id,status:d.status,elapsed:d.elapsed,seconds:d.seconds,error:d.error??null};});
+   const observations=state.db.prepare("SELECT sequence,draft,type,data FROM generation_events WHERE type IN ('generation-rejected','generation-construction-check','curriculum-interrupted') ORDER BY sequence").all().map(e=>({...e,data:JSON.parse(e.data)}));
+   return {status:'inconclusive',reason:'curriculum-no-accepted-project',elapsedSeconds:(performance.now()-begun)/1000,drafts,evidence:observations,claim:'No accepted learning project; constructor observations establish no successful repair'};
+  }
   const prior=state.project(draft.id);
   const spec=prior?.spec??await importProject(directory,{...draft,actor_seconds:Math.max(.001,Math.min(300,seconds-(performance.now()-begun)/1000))},{signal});
   if(!prior)state.add(spec);

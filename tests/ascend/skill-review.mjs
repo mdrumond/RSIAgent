@@ -123,3 +123,18 @@ test('learning backlog retains every question while only two CPU projects execut
  assert.equal(report.learning.filter(r=>r.status==='pending').length,1);
  assert.equal(report.learning.filter(r=>r.status==='device-evidence-needed').length,1);
 });
+
+
+test('failed learning stays inconclusive while other learning and candidate evaluation continue',async t=>{
+ const f=await fixture(t);let learned=0,evaluated=0;
+ const questions=[0,1,2].map(n=>({question:'Independent question '+n,hypothesis:'Hypothesis '+n,requiredEvidence:'CPU observation '+n,learningTarget:'cpu'}));
+ const report=await runReview(f.options,{classify,review:async args=>({...update(args),learningRequests:questions}),
+  learn:async()=>{if(++learned===1)throw Error('Constructor configuration rejected');return {status:'verified-cpu',evidence:[{exitCode:0},{exitCode:1}]};},
+  evaluate:async()=>{evaluated++;return evaluation();}});
+ assert.equal(learned,2);assert.equal(evaluated,1);assert.equal(report.candidates[0].published,true);
+ assert.equal(report.learning.filter(r=>r.status==='inconclusive').length,1);
+ assert.equal(report.learning.filter(r=>r.status==='verified-cpu').length,1);
+ assert.equal(report.learning.filter(r=>r.status==='pending').length,1);
+ assert.equal(report.learning.find(r=>r.status==='inconclusive').error.name,'Error');
+ const state=await load(join(f.options.output,'review.json'));assert.equal(state.errors.filter(e=>e.stage==='learn').length,1);
+});

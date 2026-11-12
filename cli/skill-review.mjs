@@ -97,7 +97,12 @@ export async function runReview(options,dependencies={}){
     if(!request.executionStarted&&Object.values(state.learning).filter(r=>r.executionStarted).length>=(options.maxLearning??2))continue;
     request.executionStarted=true;await persist();
     const directory=join(output,'learning',id);await mkdir(directory,{recursive:true});
-    request.result=await invoke('learn',{directory,key:request.key,config:await configFor(state.reviews[request.key].sourceId),request},600);
+    try{request.result=await invoke('learn',{directory,key:request.key,config:await configFor(state.reviews[request.key].sourceId),request},600);}
+    catch(error){
+     if(signal.aborted)throw error;
+     request.result={status:'inconclusive',reason:'learning-execution-failed',error:{name:error.name,message:error.message,...(error.code?{code:error.code}:{})},directory,evidence:[]};
+     state.errors.push({at:new Date().toISOString(),stage:'learn',request:id,message:error.message});
+    }
     request.status=request.result.status;await persist();
    }
    if(stage==='all'&&Object.values(state.learning).some(r=>r.result?.status==='verified-cpu')){await propose();await rememberLearning();}
@@ -135,7 +140,7 @@ export async function runReview(options,dependencies={}){
    failureObservations:state.inventory.groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
    userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
-   learning:Object.values(state.learning).map(({id,status,question})=>({id,status,question})),
+   learning:Object.values(state.learning).map(({id,status,question,result})=>({id,status,question,...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
    candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),
    stats:state.stats,timings:state.timings??[],claim:'Isolated review; live campaigns unchanged. CPU microbenchmarks do not establish GPU kernel improvement.'};
   await save(join(output,'report.json'),report);return report;
