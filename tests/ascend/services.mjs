@@ -1,3 +1,4 @@
+import {controls,numericControls} from './investigation-fixtures.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
@@ -111,7 +112,7 @@ test('native curriculum returns executable source-relative verifier after reloca
   const config=await fixture(t),source=join(config.root,'original');await mkdir(source);await writeFile(join(source,'answer.py'),'answer=42\n');
   const calls=[['write',{path:'verify.py',content:"import runpy\nassert runpy.run_path('answer.py')['answer']==6*7\nprint(42)\n"}],
     ['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],
-    ['submit_investigation',{goal:'independent numeric check',question:'Is the result42?',verifier:'verify.py'}]];
+    ['submit_investigation',{goal:'independent numeric check',question:'Is the result42?',verifier:'verify.py',controls}]];
   const server=createServer(async(req,res)=>{
     let raw='';for await(const data of req)raw+=data;const body=JSON.parse(raw);
     const names=body.tools.map(tool=>tool.function.name);
@@ -126,7 +127,7 @@ test('native curriculum returns executable source-relative verifier after reloca
   t.after(()=>{if(old===undefined)delete process.env.SERVICE_FIXTURE_KEY;else process.env.SERVICE_FIXTURE_KEY=old;});
   config.actor={provider:'service-fixture',model:'scripted',base_url:`http://127.0.0.1:${server.address().port}/v1`,credential_env:'SERVICE_FIXTURE_KEY',
     metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
-  const path=join(config.root,'attempt');await mkdir(path);
+  const path=join(config.root,'attempt');await mkdir(path);await numericControls(join(path,'investigation'));
   const state=new State(join(config.root,'curriculum.sqlite'));t.after(()=>state.close());
   state.add({id:'p',source,goal:'numeric',actor_seconds:120,verifier:{files:[],command:'true'}});
   const attempt=state.admit('p',await processIdentity());
@@ -140,7 +141,7 @@ test('native curriculum returns executable source-relative verifier after reloca
 
 test('native summary and investigation retrieve authoritative diagnostics despite Pi telemetry tail',{timeout:15000},async t=>{
   const config=await fixture(t),path=join(config.root,'attempt'),source=join(config.root,'source');
-  await mkdir(path);await mkdir(source);
+  await mkdir(path);await mkdir(source);await numericControls(join(path,'investigation'));
   const evidence=join(path,'verify.log'),session=join(path,'actor.jsonl');
   await writeFile(evidence,'numeric-check-observed-42');await writeFile(session,'native-actor-diagnostic-17');
   const state=new State(join(config.root,'diagnostics.sqlite'));t.after(()=>state.close());
@@ -165,12 +166,12 @@ test('native summary and investigation retrieve authoritative diagnostics despit
     else {
       const results=tools.slice(0,2).map(m=>typeof m.content==='string'?m.content:JSON.stringify(m.content));
       assert.ok(results[0].includes('native-actor-diagnostic-17'));assert.ok(results[1].includes('numeric-check-observed-42'));
-      if(investigation&&tools.length===2){name='write';args={path:'verify.py',content:'print(42)\n'};}
+      if(investigation&&tools.length===2){name='write';args={path:'verify.py',content:"import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n"};}
       else if(investigation&&[3,4].includes(tools.length)){name='investigation_knowledge';args={query:'numeric acceptance evidence',kind:tools.length===3?'good':'negative'};}
       else if(tools.length===(investigation?5:2)) {
         retrieved.push({session:context.session,evidence:logs});
         name=investigation?'submit_investigation':'record_findings';
-        args=investigation?{goal:'inspect numeric',question:'why acceptance incomplete?',verifier:'verify.py'}:
+        args=investigation?{goal:'inspect numeric',question:'why acceptance incomplete?',verifier:'verify.py',controls}:
           {findings:'Numeric check observed 42; acceptance incomplete.',useful:true,paths:[logs]};
       }
     }

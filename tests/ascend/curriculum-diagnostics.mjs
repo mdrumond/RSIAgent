@@ -1,3 +1,4 @@
+import {controls,numericControls} from './investigation-fixtures.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
@@ -17,7 +18,7 @@ async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'investigation-admission-'));
   t.after(()=>rm(root,{recursive:true,force:true}));
   const path=join(root,'attempt'),source=join(root,'original');
-  await mkdir(path);await mkdir(source);
+  await mkdir(path);await mkdir(source);await numericControls(join(path,'investigation'));
   await writeFile(join(source,'answer.py'),'answer=42\n');
   const received=[],prompts=[];
   let waiting;const waitStarted=new Promise(ok=>waiting=ok);
@@ -49,8 +50,8 @@ async function fixture(t,plan) {
 
 }
 
-const proposal={goal:'Check numeric fact',question:'Is answer42?',verifier:'verify.py'};
-const acceptedPlan=[['write',{path:'verify.py',content:'print(42)\n'}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal],'wait'];
+const proposal={goal:'Check numeric fact',question:'Is answer42?',verifier:'verify.py',controls};
+const acceptedPlan=[['write',{path:'verify.py',content:"import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n"}],['investigation_knowledge',{query:'numeric control',kind:'good'}],['investigation_knowledge',{query:'numeric mismatch',kind:'negative'}],['submit_investigation',proposal],'wait'];
 
 test('elapsed abort retains real session and summary reads it when actor session is absent',{timeout:15000},async t=>{
   const plan=['wait'],f=await fixture(t,plan);
@@ -74,10 +75,10 @@ test('elapsed abort retains real session and summary reads it when actor session
 });
 
 test('valid proposal survives elapsed abort after native submission',{timeout:15000},async t=>{
-  const f=await fixture(t,acceptedPlan);
+  const f=await fixture(t,acceptedPlan);f.options.config.curriculum_seconds=5;
   const spec=await investigate(f.options);
   assert.equal(spec.verifier.files[0],join(f.path,'investigation','verify.py'));
-  assert.equal(await readFile(spec.verifier.files[0],'utf8'),'print(42)\n');
+  assert.equal(await readFile(spec.verifier.files[0],'utf8'),"import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n");
   const stop=f.events.find(e=>e.type==='curriculum-interrupted').data;
   assert.equal(stop.reason,'elapsed-allocation');assert.equal(stop.accepted,true);
 });
@@ -106,7 +107,7 @@ test('external interruption after accepted proposal preserves its valid artifact
   const pending=investigate({...f.options,signal:abort.signal});
   await f.waitStarted;abort.abort();
   const spec=await pending;
-  assert.equal(await readFile(spec.verifier.files[0],'utf8'),'print(42)\n');
+  assert.equal(await readFile(spec.verifier.files[0],'utf8'),"import runpy\nassert runpy.run_path('answer.py')['answer']==42\nprint(42)\n");
   const stopped=f.events.find(e=>e.type==='curriculum-interrupted').data;
   assert.equal(stopped.reason,'external-signal');assert.equal(stopped.accepted,true);
 });

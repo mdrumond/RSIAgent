@@ -1,10 +1,11 @@
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { cp, mkdir, readFile, stat,appendFile } from 'node:fs/promises';
-import { join, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep, dirname } from 'node:path';
 import { modelFromProfile } from '../controller/model.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {State} from '../controller/state.mjs';
+import {projectBundle,validateBundle} from './project-bundle.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 
 // Page telemetry without retaining complete event or native Pi history. The first
@@ -39,7 +40,8 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
       pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
       pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
         {...options,timeout:Math.min(options.timeout??Infinity,remaining())})}}));
-      for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool(entry);
+      for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool({...entry,
+        execute:(id,args,signal,update,ctx)=>entry.execute(id,args,signal,update,ctx,{remainingSeconds:remaining})});
     }]});
   await loader.reload();
   const history=resume?curriculumRoleHistory(state,attemptId,role):{};
@@ -148,6 +150,11 @@ export function normalizeInvestigationProject(project,path) {
   return derived;
 }
 
+function investigationCommand(source,verifier,args=[]) {
+  const quote=value=>"'"+value.replaceAll("'","'\\''")+"'";
+  return ['python',quote(relative(source,verifier)),...args.map(quote)].join(' ');
+}
+
 export async function investigate({config,job,base,path,state,bridge,signal}) {
   if(!job.attempt?.id)throw new Error('Investigation requires its current attempt');
   const root=join(path,'investigation');await mkdir(root,{recursive:true});
@@ -170,20 +177,30 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
     `Repeated failure evidence: ${JSON.stringify(job.failure_pattern??null)}\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.origin_attempt,20))}\n`+
     `Read the recorded native session and diagnostic evidence files before proposing an investigation.\n`+
-    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation and both positive (good) and negative KDB evidence with investigation_knowledge before submitting. Choose a discriminating control and observable outcome that separates competing explanations, rather than retrying the full goal. Preserve the original project and verifier. Submit only the investigation goal, question and verifier filename. Negative results are useful; do not promise the original target will pass.`,
+    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation and both positive (good) and negative KDB evidence with investigation_knowledge before submitting. Choose a discriminating control and observable outcome that separates competing explanations, rather than retrying the full goal. Preserve the original project and verifier. Submit the investigation goal, question, verifier filename and optional verifier_args array. Create CPU-only positive and negative fixture directories as direct siblings of ./source; submit their names as controls. The exact source-relative verifier command must exit 0 on the positive fixture and 1 on every negative fixture. Read candidate inputs from the working directory so this same command checks each fixture and the actor source. Negative results are useful; do not promise the original target will pass.`,
     tool:[knowledgeTool,{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
-      parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1})}),
-      execute:async(_id,args)=>{
-        await artifactFile(root,args.verifier,source);
+      parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1}),
+        verifier_args:Type.Optional(Type.Array(Type.String())),
+        controls:Type.Object({positive:Type.String({minLength:1}),negative:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})})}),
+      execute:async(_id,args,active,_update,_ctx,{remainingSeconds})=>{
+        const verifier=await artifactFile(root,args.verifier,source);
         if(!retrieved.has('good')||!retrieved.has('negative'))throw new Error('Retrieve both good and negative KDB evidence before submitting');
-        await state.event(job.attempt.id,'curriculum-proposal',{proposal:args});
-        proposal=args;return reply();
+        const fixtures=[args.controls.positive,...args.controls.negative].map(name=>resolve(root,name));
+        if(fixtures.some(directory=>dirname(directory)!==root||directory===source))
+          throw new Error('Investigation controls must be direct sibling directories of source');
+        const command=investigationCommand(source,verifier,args.verifier_args);
+        const trusted=await projectBundle({source,reference:fixtures[0],negatives:fixtures.slice(1),files:[verifier]},
+          command,remainingSeconds(),root);
+        await validateBundle({source,...trusted,verifier:{files:trusted.files}},path,
+          {localExecution:config.local_execution,budget:{signal:active??signal??new AbortController().signal,remaining:remainingSeconds}});
+        const validated={...args,verifier_command:command};
+        await state.event(job.attempt.id,'curriculum-proposal',{proposal:validated});
+        proposal=validated;return reply();
       }}]});
   if(!proposal)throw new Error('Curriculum did not submit an investigation');
   const verifier=await artifactFile(root,proposal.verifier,source);
-  const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
   return normalizeInvestigationProject({...base,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
-    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:`python ${quote(relative(source,verifier))}`}},path);
+    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:proposal.verifier_command??investigationCommand(source,verifier)}},path);
 }
 
 export async function summarize({config,job,path,state,bridge,passed,signal}) {
