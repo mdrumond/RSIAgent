@@ -29,6 +29,15 @@ export async function settled({instanceRoot}) {
 export async function compare({pending,signal},dependencies={}) {
  const config=pending.config,policy=settings(config),root=pending.evaluationRoot;
  await mkdir(root,{recursive:true});
+ // An installed catalogue can grow while an older comparison is checkpointed.
+ // Its original IDs and manifest remain frozen; only new rounds use new tasks.
+ if(!Array.isArray(pending.projectIds)||new Set(pending.projectIds).size!==pending.projectIds.length)
+  throw Error('Distinct microtask IDs required');
+ const selected=pending.projectIds.map(id=>{
+  const task=tasks.find(task=>task.id===id);
+  if(!task)throw Error('Unknown frozen microtask: '+id);
+  return task;
+ });
  const plan=pending.projectIds.flatMap(projectId=>Array.from({length:pending.runs},(_,run)=>(run%2?['candidate','active']:['active','candidate'])
   .map(arm=>({projectId,run,arm,instanceRoot:root})))).flat();
  const checkpoint=async report=>save(join(root,'round.json'),{kind:'micro',status:['complete','elapsed'].includes(report.status)?'completed':report.status,...(report.status==='elapsed'?{termination:'elapsed'}:{}),
@@ -36,7 +45,7 @@ export async function compare({pending,signal},dependencies={}) {
   samples:plan.map(sample=>{const result=report.results.find(r=>r.projectId===sample.projectId&&r.run===sample.run&&r.arm===sample.arm);return {...sample,...(result?{result}: {})};})});
  try {
   const report=await runMicroeval({directory:join(root,'micro'),skills:{active:join(pending.sourceInstanceRoot,'skills','versions',pending.active),candidate:join(pending.sourceInstanceRoot,'skills','versions',pending.candidate)},
-   tasks,profile:config.actor,python:config.python,runs:pending.runs,seconds:policy.seconds,totalSeconds:pending.evaluationSeconds,signal,resume:true,shadow:false},
+   tasks:selected,profile:config.actor,python:config.python,runs:pending.runs,seconds:policy.seconds,totalSeconds:pending.evaluationSeconds,signal,resume:true,shadow:false},
    {...dependencies,checkpoint});
   await checkpoint(report);return await read(join(root,'round.json'));
  }catch(error){error.evaluationStopped=await settled({instanceRoot:root});throw error;}

@@ -12,6 +12,7 @@ import {readConfig,updateConfig,upgrade} from '../../cli/instance.mjs';
 import {runMicroeval} from '../../cli/skill-microeval.mjs';
 import {compare,restartMicroEvaluation,settled} from '../../cli/micro-evaluation.mjs';
 import {tasks} from '../../cli/microtasks/tasks.mjs';
+import {recoveryRepair} from './microtask-fixture.mjs';
 import {evaluationArchiveStatus,enqueueCompletedEvaluation} from '../../cli/evaluation-archives.mjs';
 const json=async p=>JSON.parse(await readFile(p,'utf8'));
 const python=process.env.RSI_TEST_PYTHON??'python3';
@@ -30,7 +31,7 @@ def add_rows(storage,rows,columns,pitch,delta):
  return out
 def logical_flatten(storage,shape,strides,offset=0):
  return [storage[offset+sum(i*s for i,s in zip(index,strides))] for index in itertools.product(*(range(n) for n in shape))]
-`;
+`+recoveryRepair;
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'micro-campaign-'));t.after(()=>rm(root,{recursive:true,force:true}));
  for(const version of ['baseline','candidate']){
@@ -77,7 +78,7 @@ test('resumable samples retain completed results, session identity and remaining
  assert.equal(observed.length,3);assert.equal(observed[0].resumeSession,'retained-session');assert.ok(observed[0].seconds<10);assert.equal(result.results.length,4);assert.ok(result.results.every(x=>x.correct));assert.ok(result.elapsedSeconds>=partial.elapsedSeconds);
  result.runningSample={key:'unknown'};await writeFile(join(options.directory,'results.json'),JSON.stringify(result));await assert.rejects(runMicroeval(options),/unresolved/);
 });
-test('actual native Pi comparison completes twelve CPU samples, resumes without provider replay, and stays plain',async t=>{
+test('actual native Pi comparison covers recovery decisions and resumes without provider replay',async t=>{
  const f=await fixture(t);let requests=0;
  const server=createServer(async(req,res)=>{let raw='';for await(const x of req)raw+=x;const body=JSON.parse(raw);requests++;const used=body.messages.some(m=>m.role==='tool');
   res.writeHead(200,{'Content-Type':'text/event-stream'});const frame=x=>res.write('data: '+JSON.stringify(x)+'\n\n');
@@ -88,8 +89,8 @@ test('actual native Pi comparison completes twelve CPU samples, resumes without 
  f.config.actor={provider:'micro-campaign-fixture',model:'scripted',credential_env:'MICRO_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
  await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
  await restartMicroEvaluation(f.config,{settings:{margin:1}});const pending=(await json(join(f.root,'skills/evolution.json'))).pending;
- const round=await compare({pending});assert.equal(round.status,'completed');assert.equal(round.samples.length,12);assert.ok(round.samples.every(x=>x.result.correct&&x.result.tokens===36));assert.equal(requests,24);
- assert.equal(await settled({instanceRoot:pending.evaluationRoot}),true);await compare({pending});assert.equal(requests,24);
+ const round=await compare({pending});assert.equal(round.status,'completed');assert.equal(round.samples.length,16);assert.ok(round.samples.every(x=>x.result.correct&&x.result.tokens===36));assert.equal(requests,32);
+ assert.equal(await settled({instanceRoot:pending.evaluationRoot}),true);await compare({pending});assert.equal(requests,32);
  const config=await readConfig(f.root);assert.equal(await enqueueCompletedEvaluation(config,{lastEvaluationRoot:pending.evaluationRoot}),false);assert.equal((await evaluationArchiveStatus(config,{lastEvaluationRoot:pending.evaluationRoot})).hasWork,false);
  // Pre-completed behavioral results enter the normal promotion/CAS path, never the full-project evaluator.
  const reportPath=join(pending.evaluationRoot,'micro/results.json'),report=await json(reportPath);for(const x of report.results){x.elapsedSeconds=1;x.tokens=10;}await writeFile(reportPath,JSON.stringify(report));
@@ -98,8 +99,23 @@ test('actual native Pi comparison completes twelve CPU samples, resumes without 
  const nextConfig=await updateConfig(f.root,c=>({...c,tune_every:1}));
  const next=await tune({instanceRoot:f.root,config:{...nextConfig,mode:'phase2'},background:true,backgroundSeconds:100,backgroundResource:{id:'slot'},
   task:{id:'next-evidence',projectId:'gdn',kind:'original',phase:'phase2',completed:true,events:[]},generate:async()=>[],evaluate:()=>{throw Error('Heavy evaluator must not run');}});
- assert.notEqual(next.candidate,'candidate');assert.equal(next.evaluationStatus,'completed');assert.equal(requests,48);
+ assert.notEqual(next.candidate,'candidate');assert.equal(next.evaluationStatus,'completed');assert.equal(requests,64);
  assert.equal((await json(join(f.root,'skills/evolution.json'))).history.length,2);
+});
+test('retained three-task comparisons keep their original manifest and never gain new samples',async t=>{
+ const f=await fixture(t);await restartMicroEvaluation(f.config);
+ const pending=(await json(join(f.root,'skills/evolution.json'))).pending;
+ pending.projectIds=tasks.slice(0,3).map(task=>task.id);pending.config.actor={provider:'fixture',model:'fixture'};
+ let calls=0;const sample=async({cwd})=>{calls++;await writeFile(join(cwd,'kernel.py'),fixed);return {tokens:10};};
+ const first=await compare({pending},{sample});assert.equal(first.samples.length,12);assert.equal(calls,12);
+ const manifest=join(pending.evaluationRoot,'micro/manifest.json'),before=await readFile(manifest,'utf8');
+ assert.equal(JSON.parse(before).seconds,90);assert.equal(first.allocatedSeconds,900);
+ const next=await compare({pending},{sample:async()=>{throw Error('Completed native samples must not replay');}});
+ assert.deepEqual(next.samples,first.samples);assert.ok(next.elapsedSeconds>=first.elapsedSeconds);
+ assert.equal(await readFile(manifest,'utf8'),before);
+ pending.projectIds=tasks.map(task=>task.id);
+ await assert.rejects(compare({pending},{sample}),/Frozen micro evaluation changed/);
+ assert.equal(calls,12);assert.equal(await readFile(manifest,'utf8'),before);
 });
 test('official machinery upgrade carries runnable microtask fixtures',async t=>{
  const f=await fixture(t);await upgrade(f.root,resolve('.'));
