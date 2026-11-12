@@ -8,6 +8,7 @@ import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {runMicroeval} from '../../cli/skill-microeval.mjs';
 import {tasks} from '../../examples/skill-microeval/tasks.mjs';
+import {recoveryRepair} from './microtask-fixture.mjs';
 const python=process.env.RSI_TEST_PYTHON??'python3';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'microeval-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -48,8 +49,10 @@ test('preplanned contract checks reject broken source and accept independent rep
  const f=await fixture(t),fixed={
  'argument-cache':'def make_launcher(compile_kernel):\n cache={}\n def launch(x,scale):\n  n=len(x)\n  if n not in cache: cache[n]=compile_kernel(n)\n  return cache[n](x,scale)\n return launch\n',
  'ragged-store':'def add_rows(storage,rows,columns,pitch,delta):\n out=list(storage)\n for r in range(rows):\n  for c in range(columns):out[r*pitch+c]+=delta\n return out\n',
- 'strided-view':'import itertools\ndef logical_flatten(storage,shape,strides,offset=0):\n return [storage[offset+sum(i*s for i,s in zip(index,strides))] for index in itertools.product(*(range(n) for n in shape))]\n'};
- for(const task of tasks){const work=join(f.root,task.id);await mkdir(work);await writeFile(join(work,'kernel.py'),task.files['kernel.py']);
+ 'strided-view':'import itertools\ndef logical_flatten(storage,shape,strides,offset=0):\n return [storage[offset+sum(i*s for i,s in zip(index,strides))] for index in itertools.product(*(range(n) for n in shape))]\n',
+ 'recovery-decisions':recoveryRepair};
+ for(const task of tasks){const work=join(f.root,task.id);await mkdir(work);
+  for(const [name,text]of Object.entries(task.files))await writeFile(join(work,name),text);
   assert.notEqual(spawnSync(python,[task.checker,work]).status,0);
   await writeFile(join(work,'kernel.py'),fixed[task.id]);const checked=spawnSync(python,['-B',task.checker,work],{encoding:'utf8'});assert.equal(checked.status,0,task.id+': '+checked.stderr);
  }
