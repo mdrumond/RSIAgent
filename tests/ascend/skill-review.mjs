@@ -457,3 +457,10 @@ test('bucket review carries configured A3 tasks through fork, native evaluation 
  assert.equal(result.pairedTimings.length,10);assert.equal(result.totalSeconds,30);assert.equal(result.pairedReplay.seconds,15);assert.equal(result.binding.target,'CPU-fixture-not-device-evidence');
  await writeFile(pairedChecker,'changed trusted checker');await assert.rejects(runReview({...options,stage:'evaluate'}),/Frozen review/);
 });
+
+test('explicit harness ownership cannot be routed into correctness A/B',async t=>{
+ const f=await fixture(t);let compared=0;
+ for(const stage of ['inventory'])await runReview({...f.options,bucketPolicy:true,stage});
+ await assert.rejects(runReview({...f.options,bucketPolicy:true,stage:'classify'},{classify:args=>args.validate({cause:'harness',bucket:'correctness',coverage:'uncovered',guidanceIds:[],reason:'Execution wrapper fault',evidenceRefs:[args.group.occurrences[0].reference]}),evaluate:async()=>{compared++;return evaluation();}}),/Harness cause/);
+ const saved=await load(join(f.options.output,'review.json'));assert.equal(Object.keys(saved.classifications).length,0);assert.equal(Object.keys(saved.candidates).length,0);assert.equal(compared,0);
+});

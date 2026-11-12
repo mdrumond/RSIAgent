@@ -85,6 +85,7 @@ export async function guidanceEntries(root,version){
 export function validateClassification(value,group,entries,{requireBucket=false}={}){
  if(!value||typeof value!=='object')throw Error('Submit a classification object');
  if(!['actor','harness','specification','provider','unknown'].includes(value.cause))throw Error('cause must be actor, harness, specification, provider or unknown');
+ if(requireBucket&&value.cause==='harness'&&value.bucket!=='harness')throw Error('Harness cause requires harness bucket and user intervention');
  if(requireBucket&&value.bucket===undefined)throw Error('Explicit failure bucket required by bucketPolicy');
  if(value.bucket!==undefined&&!['harness','correctness','optimization'].includes(value.bucket))throw Error('Unknown failure bucket');
  if(!value.reason?.trim())throw Error('reason must explain the observed evidence; stage labels alone do not establish ownership');
