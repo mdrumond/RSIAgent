@@ -1,5 +1,5 @@
 /** Native Pi/KDB and existing curriculum/evaluation adapters for isolated reviews. */
-import {mkdir,readFile,writeFile,appendFile,cp,symlink} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
 import {modelFromProfile} from '../controller/model.mjs';
@@ -21,18 +21,24 @@ async function reviewEvidence(directory,groups=[]){
  const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
  for(const group of groups){
   const representatives=[...new Map(group.occurrences.map(o=>[diagnosticIdentity(o),o])).values()];
+  const linked=group.linkedDiagnostics??[],linkedFile=join(directory,'evidence',group.id+'-linked-diagnostics.jsonl');
+  await writeFile(linkedFile,linked.map(d=>JSON.stringify(d)).join('\n')+'\n');linked.forEach(d=>required.add(d.reference));
   const all=join(directory,'evidence',group.id+'-occurrences.jsonl'),diagnostics=join(directory,'evidence',group.id+'-diagnostics.jsonl');
   await writeFile(all,group.occurrences.map(o=>JSON.stringify(o)).join('\n')+'\n');
   await writeFile(diagnostics,representatives.map(o=>JSON.stringify(o)).join('\n')+'\n');
   representatives.forEach(o=>required.add(o.reference));
-  previews.push({...group,occurrences:representatives.slice(0,6),occurrenceCount:group.occurrences.length,
+  previews.push({...group,linkedDiagnostics:linked.slice(0,6),linkedDiagnosticCount:linked.length,linkedDiagnosticsFile:linkedFile,occurrences:representatives.slice(0,6),occurrenceCount:group.occurrences.length,
    distinctDiagnostics:representatives.length,fullOccurrences:all,diagnosticsFile:diagnostics});
  }
  return {required,previews};
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[]}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[]}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
+ // Use the pinned Pi path resolver so policy and native filesystem tools agree.
+ const {resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href);
+ const declarations=[directory,...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths];
+ const allowed=await Promise.all([...new Set(declarations)].map(async path=>{try{const canonical=await realpath(path);return {path:canonical,directory:(await stat(canonical)).isDirectory()};}catch(error){if(error.code!=='ENOENT')throw error;return {path:resolve(path),directory:false};}}));
  const evidence=await reviewEvidence(directory,evidenceGroups);
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
  await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
@@ -41,7 +47,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const coverageFile=join(directory,'read-evidence.json');
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const check=async result=>{
-  if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic using native read with offset/limit on diagnosticsFile before submitting; duplicate occurrences need no repeated reads');
+  if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   return validate(result,retrievals);
  };
  const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
@@ -50,10 +56,17 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
  let submitted;
  const extension=pi=>{
+  pi.on('tool_call',async event=>{if(!['read','grep','find','ls'].includes(event.toolName))return;
+   const requested=resolveToCwd(event.input.path??'.',directory);
+   const path=await realpath(requested).catch(error=>{if(error.code!=='ENOENT')throw error;return requested;});
+   if(allowed.some(a=>path===a.path||a.directory&&path.startsWith(a.path+'/')))return;
+   await appendFile(join(directory,'tool-policy.jsonl'),JSON.stringify({tool:event.toolName,path,blocked:true,toolCallId:event.toolCallId})+'\n');
+   return {block:true,reason:'Filesystem inspection is limited to this review directory and explicitly copied evidence/verified learning paths. Read input.json and correct the submitted fields; use KDB MCP search/read_entry for indexed knowledge, not workspace searches.'};
+  });
   pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
    const path=resolve(directory,event.input.path??'');if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
    const text=(event.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
-   for(const ref of evidence.required)if(text.includes(JSON.stringify(ref)))seen.add(ref);
+   for(const ref of evidence.required){const quoted=JSON.stringify(ref);if(text.includes('\"reference\":'+quoted)||text.includes('\"reference\": '+quoted))seen.add(ref);}
    await writeFile(coverageFile,JSON.stringify([...seen]));
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:Type.Unknown()}),
@@ -68,7 +81,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
-  await session.prompt('Read input.json, then read all distinct diagnostics listed by diagnosticsFile using native read offset/limit when the bounded preview is incomplete. Full occurrences remain available in fullOccurrences; duplicate diagnostics need not be reread. Perform exactly its task, using only provided observations and retrieved evidence. Submit the requested JSON result using submit_review. Unknown is valid; never invent cause, successful repairs or measurements. Harness faults require user intervention, not actor repairs.');
+  await session.prompt('Read input.json, then read all distinct diagnostics listed by diagnosticsFile and linkedDiagnosticsFile using native read offset/limit when the bounded preview is incomplete. Full occurrences remain available in fullOccurrences; duplicate diagnostics need not be reread. Filesystem tools may only inspect this review directory and declared copied evidence/verified learning paths; indexed knowledge is available through KDB tools. Correct validation errors directly rather than searching implementation source. Perform exactly its task, using only provided observations and retrieved evidence. Submit the requested JSON result using submit_review. Unknown is valid; never invent cause, successful repairs or measurements. Harness faults require user intervention, not actor repairs.');
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw Error('Review session elapsed allocation exhausted');if(submitted===undefined)throw Error('Review session did not submit');
   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
  }finally{
@@ -77,11 +90,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  }
 }
 export async function nativeClassify(input){
- return reviewSession({...input,evidenceGroups:[input.group],prompt:{task:'Classify this failure group. Return {cause:actor|harness|specification|provider|unknown,reason,coverage:covered|uncovered|unknown,guidanceIds:[],evidenceRefs:[],gap:missing|insufficient|not-followed|unknown}. Cite occurrence references, use existing guidance IDs only. Availability does not establish the actor read a skill. Inspect copied log files in occurrence.artifacts with native read when the message alone cannot establish a cause; do not access original live artifact paths.',group:input.group,entries:input.entries}});
+ return reviewSession({...input,evidenceGroups:[input.group],prompt:{task:'Classify this failure group. Return {cause:actor|harness|specification|provider|unknown,reason,coverage:covered|uncovered|unknown,guidanceIds:[],evidenceRefs:[],gap:missing|insufficient|not-followed|unknown}. Cite occurrence references, use existing guidance IDs only. Availability does not establish the actor read a skill. A pre-actor stage or wrapper label does NOT prove a harness root cause: read the linked same-attempt negative verdicts and copied logs, distinguish invalid specifications/baseline APIs from harness faults, and retain unknown if the actual cause is not established. Inspect copied log files in occurrence.artifacts with native read when the message alone cannot establish a cause; do not access original live artifact paths.',group:input.group,entries:input.entries}});
 }
 export async function nativeReview(input){
  const prompt={task:'Review this guidance bucket using KDB search and read_entry. Return {action:update|learn|no-change,reason,groupIds:[],memoryRefs:["collection:entry_id"],changes:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device,learningRequests:[{question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Include outstanding learning questions even when proposing a supported update. An update requires retrieved supporting memory, not a failure alone. changes are {action:upsert,id,scope,text,critical:boolean,negative:boolean,evidenceRefs:[occurrence references],response:report-blocker (only for harness guidance)}. Prefer one concise new entry supplementing protected baseline. No device performance claims from CPU results. Detailed kernel cases remain searchable; guidance should explain applicability and retrieval. Questions requiring GPU evidence must stay pending if CPU cannot answer. Harness faults may only produce report/preserve guidance. No new benchmark runs.',groups:input.groups,entries:input.entries,classification:input.classifications,learning:input.learning??[]};
- return reviewSession({...input,evidenceGroups:input.groups,knowledge:true,prompt,validate:(result,retrievals)=>{
+ const allowedPaths=(input.learning??[]).flatMap(([,record])=>record.result?.status==='verified-cpu'?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
+ return reviewSession({...input,allowedPaths,evidenceGroups:input.groups,knowledge:true,prompt,validate:(result,retrievals)=>{
   const refs=new Set(retrievals.flatMap(r=>r.entries.map(e=>`${e.collection}:${e.entry_id??e.chunk_id??e.id}`)));
   if(result.action==='update'&&result.memoryRefs?.some(ref=>!refs.has(ref)))throw Error('Memory references must have been retrieved in this session');
   return input.validate(result);

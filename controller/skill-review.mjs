@@ -5,8 +5,14 @@ import {readFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
-const failed=(type,data)=>/error|failed|rejected|unresolved|blocked/.test(type)||type==='failure-recorded'||
- type==='verification'&&(data.correct===false||data.passed===false||data.exitCode>0||data.exit_code>0);
+const negativeVerdict=data=>data&&typeof data==='object'&&(data.passed===false||data.correct===false||
+ ['correctness','performance','verdict','result','verification'].some(key=>negativeVerdict(data[key])));
+const failed=(type,data)=>{
+ const actual=data.exitCode??data.exit_code,expected=data.expected_exit;
+ if(expected===1&&actual===1)return false;
+ return expected!==undefined&&actual!==undefined&&actual!==expected||negativeVerdict(data)||
+  /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid'].includes(type)||type==='verification'&&actual>0;
+};
 const normal=text=>String(text??'').replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/\/[^\s'"<>]+/g,'<path>').slice(0,1500);
 export function diagnosticIdentity(occurrence){
  const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?
@@ -29,18 +35,27 @@ export async function inventoryFailures(sources) {
    const attempts=new Map(db.prepare('SELECT id,project,outcome FROM attempts').all().map(a=>[a.id,a]));
    const jobs=new Map();for(const a of attempts.values())try{jobs.set(a.id,JSON.parse(await readFile(join(root,'attempts',a.id,'job.json'),'utf8')));}catch(e){if(e.code!=='ENOENT')throw e;}
    const reads=new Map([...attempts.keys()].map(id=>[id,db.prepare("SELECT type,data FROM events WHERE attempt=? AND type='skill-read' ORDER BY sequence").all(id).map(e=>JSON.parse(e.data))]));
+   const related=new Map();
+   const verdictPaths=['passed','correct','correctness.passed','performance.passed','result.passed','result.correct','verdict.passed','verdict.correct'];
+   const verdictRows=db.prepare(`SELECT sequence,attempt,type,data,created FROM events WHERE attempt IS NOT NULL AND
+    (type IN ('baseline-preflight-completed','project-invalid','verification') OR ${verdictPaths.map(path=>`json_type(data,'$.${path}')='false'`).join(' OR ')}) ORDER BY sequence`).all();
+   for(const row of verdictRows){const data=JSON.parse(row.data);if(!failed(row.type,data))continue;
+    const records=related.get(row.attempt)??[];records.push({reference:`${sourceId}:events:${row.sequence}`,type:row.type,data,artifacts:artifacts(data)});related.set(row.attempt,records);
+   }
    const campaign={id:sourceId,root,target:config.target??'unknown',activeVersion:config.skills?.activeVersion??'baseline',attempts:attempts.size};
    campaigns.push(campaign);
    const add=(row,journal)=>{
     const data=typeof row.data==='string'?JSON.parse(row.data):row.data,attempt=attempts.get(row.attempt),spec=projects.get(attempt?.project);
     const message=data.message??data.error??data.reason??data.result?.error??row.type;
-    const artifactRefs=artifacts(data);
-    const diagnostic=diagnosticIdentity({data,artifacts:artifactRefs});
+    const linked=(related.get(row.attempt)??[]).filter(d=>d.reference!==`${sourceId}:${journal}:${row.sequence}`);
+    const artifactRefs=artifacts(data),linkedArtifacts=[...new Map(linked.flatMap(d=>d.artifacts).map(a=>[a.path,a])).values()];
+    const diagnostic=diagnosticIdentity({data,relatedDiagnosticRefs:linked.map(d=>d.reference),artifacts:[...artifactRefs,...linkedArtifacts.slice(0,6)]});
     const key=digest([sourceId,row.type,normal(message),diagnostic,
      ['verification','failed-outcome'].includes(row.type)||message==='Actor completed without acceptance'?attempt?.project??row.draft:null]),reference=`${sourceId}:${journal}:${row.sequence}`;
-    const group=groups.get(key)??{id:key,sourceId,target:campaign.target,type:row.type,message:normal(message),occurrences:[]};
+    const group=groups.get(key)??{id:key,sourceId,target:campaign.target,type:row.type,message:normal(message),occurrences:[],linkedDiagnostics:[]};
+    group.linkedDiagnostics=[...new Map([...group.linkedDiagnostics,...linked].map(d=>[d.reference,d])).values()];
     group.occurrences.push({reference,attemptId:row.attempt??null,draftId:row.draft??null,projectId:attempt?.project??null,
-     phase:row.phase??jobs.get(row.attempt)?.mode??spec?.phase??config.mode,kind:jobs.get(row.attempt)?.kind??null,skillVersion:jobs.get(row.attempt)?.config?.skills?.activeVersion??jobs.get(row.attempt)?.skillVersion??null,skillReads:reads.get(row.attempt)??[],created:row.created??null,data,artifacts:artifactRefs});groups.set(key,group);
+     phase:row.phase??jobs.get(row.attempt)?.mode??spec?.phase??config.mode,kind:jobs.get(row.attempt)?.kind??null,skillVersion:jobs.get(row.attempt)?.config?.skills?.activeVersion??jobs.get(row.attempt)?.skillVersion??null,skillReads:reads.get(row.attempt)??[],created:row.created??null,data,relatedDiagnosticRefs:linked.map(d=>d.reference),artifacts:[...artifactRefs,...linkedArtifacts.slice(0,6)]});groups.set(key,group);
    };
    for(const journal of ['events','generation_events'])if(has(db,journal)){
     let cursor=0;while(true){
@@ -68,11 +83,16 @@ export async function guidanceEntries(root,version){
  }
 }
 export function validateClassification(value,group,entries){
- if(!value||!['actor','harness','specification','provider','unknown'].includes(value.cause)||!value.reason?.trim()||
-  !['covered','uncovered','unknown'].includes(value.coverage)||!Array.isArray(value.guidanceIds)||
-  value.guidanceIds.some(id=>!entries.some(e=>e.id===id))||
-  (value.coverage==='covered'?!value.guidanceIds.length:value.guidanceIds.length>0)||
-  !Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!group.occurrences.some(o=>o.reference===ref)))throw Error('Classification requires known guidance and failure evidence');
+ if(!value||typeof value!=='object')throw Error('Submit a classification object');
+ if(!['actor','harness','specification','provider','unknown'].includes(value.cause))throw Error('cause must be actor, harness, specification, provider or unknown');
+ if(!value.reason?.trim())throw Error('reason must explain the observed evidence; stage labels alone do not establish ownership');
+ if(!['covered','uncovered','unknown'].includes(value.coverage))throw Error('coverage must be covered, uncovered or unknown');
+ if(!Array.isArray(value.guidanceIds))throw Error('guidanceIds must be an array of existing guidance IDs');
+ const unknown=value.guidanceIds.filter(id=>!entries.some(e=>e.id===id));if(unknown.length)throw Error('Unknown guidanceIds: '+JSON.stringify(unknown)+'; choose IDs from input.json');
+ if(value.coverage==='covered'&&!value.guidanceIds.length)throw Error('coverage=covered requires at least one existing guidance ID');
+ if(value.coverage!=='covered'&&value.guidanceIds.length)throw Error('coverage='+value.coverage+' requires guidanceIds=[]; use covered only when identifying applicable existing guidance');
+ const refs=new Set([...group.occurrences,...(group.linkedDiagnostics??[])].map(o=>o.reference));
+ if(!Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!refs.has(ref)))throw Error('evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group');
  return {...value,groupId:group.id,intervention:value.cause==='harness'?'user-required':null};
 }
 export function validateReview(value,groups){

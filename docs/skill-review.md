@@ -27,6 +27,11 @@ when resuming. The original elapsed deadline spans all invocations; report remai
 available after it expires. Classification and review native sessions, searches,
 evidence, decisions and original references are retained alongside `review.json`.
 Full observations and distinct diagnostic representatives are saved as JSONL files.
+Native Pi filesystem tools are restricted by a native `tool_call` policy to the
+current review directory and explicitly copied evidence or verified learning paths.
+Broad workspace/config-root searches are blocked before execution; indexed
+knowledge is retrieved through KDB MCP. Classification errors identify the invalid
+field so the reviewer can correct its submission directly.
 Native Pi `read` supports offset/limit paging; submission requires reading every
 distinct diagnostic, while duplicate accounting events require no repeated reads.
 `report.json` shows coverage, user interventions, learning status and candidate
@@ -35,8 +40,11 @@ comparison that exhausts its allowance remains inconclusive and does not block
 other candidates. Unknown execution closure still blocks dispatch. Changed
 proposals receive separate candidate identities and retain previous decisions.
 
-All saved failure observations are inventoried, including those in successful or
-unfinished attempts. Related observations are grouped; absence of a cause is not
+All saved failure observations are inventoried, including explicit negative
+passed/correct verdicts in successful or unfinished attempts. Expected negative
+controls that exit as expected are excluded; unexpected control outcomes remain
+failures. Generic wrapper failures link to actual same-attempt verdicts and copied
+logs, so a pre-actor label is not treated as proof of a harness defect. Related observations are grouped; absence of a cause is not
 proof of a skill gap. Harness faults require user intervention; their learning requests remain in that
 bucket and cannot automatically enter Phase 1. Guidance may teach
 preserving work and reporting them, never repairing harness-owned state.

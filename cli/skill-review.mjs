@@ -79,7 +79,7 @@ export async function runReview(options,dependencies={}){
     const config=await configFor(bucket.sourceId),entries=await guidanceEntries(config.root,config.skills.activeVersion),directory=join(output,'proposals',hash([bucket.key,learning.length]));await mkdir(directory,{recursive:true});
     const validate=result=>{
      validateReview(result,bucket.groups);
-     if(result.action==='update')result.changes=validateSkillGrounding(result.changes,bucket.groups.flatMap(g=>g.occurrences.map(o=>({reference:o.reference,...(state.classifications[g.id].cause==='harness'?{responsibility:'harness'}:{})}))));
+     if(result.action==='update')result.changes=validateSkillGrounding(result.changes,bucket.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(state.classifications[g.id].cause==='harness'?{responsibility:'harness'}:{})}))));
      return result;
     };
     const result=validate(await invoke('review',{directory,key:bucket.key,config,groups:bucket.groups,entries,learning,

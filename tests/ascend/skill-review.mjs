@@ -246,3 +246,54 @@ test('harness learning remains a user intervention and cannot consume a Phase 1 
   assert.equal(claimLearningRequest(state,{skills:{review:{enabled:true}}},{draft:'unused',target:'a3',topic:'debug'}),null);
  }finally{state.close();}
 });
+
+test('negative baseline and stage verdicts retain real diagnostics while expected negative controls do not become failures',async t=>{
+ const f=await fixture(t),state=new State(join(f.source,'state.sqlite')),attempt=state.db.prepare('SELECT id FROM attempts').get().id;
+ const original='/original/campaign/attempts/'+attempt+'/baseline.log',copied=join(f.source,'evidence','baseline.log'),body='RuntimeError: PyTorch baseline dtype mismatch\n';
+ await mkdir(join(f.source,'evidence'));await writeFile(copied,body);
+ const {createHash}=await import('node:crypto'),sha256=createHash('sha256').update(body).digest('hex');
+ await writeFile(join(f.source,'evidence-files.json'),JSON.stringify({[original]:{path:'evidence/baseline.log',sha256,size:body.length}}));
+ const verdict={passed:false,exitCode:1,evidence:{path:original,sha256}};
+ state.event(attempt,'attempt-error',{stage:'baseline-preflight',message:'Generated project target baseline failed before actor startup'});
+ state.event(attempt,'baseline-preflight-completed',verdict);state.event(attempt,'project-invalid',{reason:'target-baseline-failed',...verdict});
+ state.event(attempt,'other-stage-completed',{result:{correct:false}});
+ const write=state.db.prepare('INSERT INTO generation_events(draft,type,data) VALUES (?,?,?)');
+ write.run('matched-negative','generation-construction-check',JSON.stringify({kind:'negative',expected_exit:1,exitCode:1,passed:false}));
+ write.run('bad-positive','generation-construction-check',JSON.stringify({kind:'reference',expected_exit:0,exitCode:1}));
+ write.run('bad-negative','generation-construction-check',JSON.stringify({kind:'negative',expected_exit:1,exitCode:0}));state.close();
+ const inventory=await inventoryFailures(f.options.sources);
+ for(const type of ['baseline-preflight-completed','project-invalid','other-stage-completed'])assert.ok(inventory.groups.some(g=>g.type===type));
+ assert.equal(inventory.groups.some(g=>g.occurrences.some(o=>o.draftId==='matched-negative')),false);
+ for(const draft of ['bad-positive','bad-negative'])assert.ok(inventory.groups.some(g=>g.occurrences.some(o=>o.draftId===draft)));
+ const label=inventory.groups.find(g=>g.type==='attempt-error'),occurrence=label.occurrences[0];
+ assert.equal(occurrence.artifacts[0].path,copied);assert.equal(occurrence.artifacts[0].sha256,sha256);
+ assert.ok(label.linkedDiagnostics.some(d=>d.type==='baseline-preflight-completed'&&d.data.passed===false));
+ const report=await runReview({...f.options,stage:'inventory'});assert.ok(report.failureGroups>3);
+ await runReview({...f.options,stage:'classify'},{classify:async args=>{
+  if(args.group.type==='attempt-error'){
+   const evidence=args.group.linkedDiagnostics.find(d=>d.type==='baseline-preflight-completed');assert.equal(await readFile(evidence.artifacts[0].path,'utf8'),body);
+   return args.validate({cause:'specification',coverage:'covered',guidanceIds:['task-construction-baseline'],reason:'The actual baseline failed its mathematical/API contract',evidenceRefs:[evidence.reference]});
+  }return classify(args);
+ }});
+ const reviewed=await load(join(f.options.output,'review.json'));assert.equal(reviewed.classifications[label.id].cause,'specification');assert.equal(reviewed.classifications[label.id].intervention,null);
+});
+
+test('native Pi blocks an outside workspace grep before execution and accepts corrected classification fields',async t=>{
+ const {nativeClassify}=await import('../../cli/skill-review-native.mjs'),{default:fs}=await import('node:fs'),{syncBuiltinESMExports}=await import('node:module');
+ const f=await fixture(t),group=(await inventoryFailures(f.options.sources)).groups[0],directory=join(f.root,'bounded-native'),outside=join(f.root,'outside-workspace.txt');await writeFile(outside,'Unrelated workspace content');
+ let outsideActions=0;const originalStat=fs.promises.stat;
+ fs.promises.stat=async function(path,...args){if(String(path)===outside)outsideActions++;return originalStat.call(this,path,...args);};syncBuiltinESMExports();
+ t.after(()=>{fs.promises.stat=originalStat;syncBuiltinESMExports();});
+ const invalid={cause:'unknown',coverage:'unknown',guidanceIds:['implementation-baseline'],reason:'Need observed diagnostics',evidenceRefs:[group.occurrences[0].reference]};
+ const entries=[{id:'implementation-baseline',scope:'implementation'}];
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[
+  {name:'read',args:{path:'input.json'}},
+  {name:'submit_review',args:{result:invalid}},
+  {name:'grep',args:{path:outside,pattern:'classification',limit:20}},
+  {name:'submit_review',args:{result:{...invalid,coverage:'covered'}}}
+ ][n]);
+ const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries,seconds:30,validate:r=>validateClassification(r,group,entries)});
+ assert.equal(result.value.coverage,'covered');assert.equal(provider.requests(),5);assert.equal(outsideActions,0);
+ const blocks=(await readFile(join(directory,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+ assert.equal(blocks.length,1);assert.equal(blocks[0].tool,'grep');assert.equal(blocks[0].blocked,true);assert.equal(blocks[0].path,outside);
+});
