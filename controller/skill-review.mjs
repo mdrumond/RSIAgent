@@ -108,6 +108,7 @@ export function validateReview(value,groups){
  if(value.action==='update'&&(!Array.isArray(value.changes)||!value.changes.length||!Array.isArray(value.memoryRefs)||!value.memoryRefs.length))throw Error('Updates require changes and supporting memory references');
  const requests=[...(value.action==='learn'?[value]:[]),...(value.learningRequests??[])];
  if(!Array.isArray(value.learningRequests??[])||requests.some(r=>!['cpu','device'].includes(r.learningTarget)||!r.question?.trim()||!r.hypothesis?.trim()||!r.requiredEvidence?.trim()))throw Error('Learning requires a question, hypothesis and evidence criterion');
+ for(const request of requests)if(request.groupIds!==undefined&&(!Array.isArray(request.groupIds)||!request.groupIds.length||request.groupIds.some(id=>!groups.some(g=>g.id===id))))throw Error('Learning groupIds must be a nonempty subset of the supplied failure-group IDs');
  return value;
 }
 // Called only when a NEW draft is allocated. Existing drafts retain their frozen request.

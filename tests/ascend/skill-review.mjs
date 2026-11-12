@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
 import {inventoryFailures,validateClassification,validateClassificationBatch,claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
-import {runReview} from '../../cli/skill-review.mjs';
+import {runReview,validateReviewProposal} from '../../cli/skill-review.mjs';
 import {run as skillInput} from '../../cli/skill-input.mjs';
 import {evaluateNonInferiority} from '../../controller/skill-noninferiority.mjs';
 import {stages} from '../../controller/workflow.mjs';
@@ -334,4 +334,52 @@ test('batch rollout resumes a pending legacy group session before batching newer
  let singles=0,batches=0;
  await runReview({...f.options,stage:'classify'},{classify:async args=>{singles++;assert.equal(args.group.id,group.id);assert.equal(args.directory,directory);return classify(args);},classifyBatch:async args=>{batches++;return args.validate({classifications:await Promise.all(args.groups.map(async g=>({...await classify({group:g,validate:r=>r}),groupId:g.id})))});}});
  assert.equal(singles,1);assert.equal(batches,1);assert.deepEqual(await load(join(directory,'native-session.json')),retained);
+});
+
+
+test('an inconclusive writer bucket retains its session and does not starve supported candidates',async t=>{
+ const f=await fixture(t);let reviewed=0,evaluated=0,failedSession;
+ const deps={classify:async args=>({...await classify(args),guidanceIds:[args.group.type==='generation-rejected'?'debug-baseline':'implementation-baseline']}),
+  review:async args=>{if(++reviewed===1){failedSession=join(args.directory,'session.native.jsonl');await writeFile(failedSession,JSON.stringify({role:'assistant',partial:true})+'\n');throw new DOMException('Writer elapsed','TimeoutError');}return update(args);},
+  evaluate:async()=>{evaluated++;return evaluation();}};
+ const report=await runReview(f.options,deps);assert.equal(reviewed,2);assert.equal(evaluated,1);assert.equal(report.candidates[0].published,true);
+ assert.equal(report.dispositions.inconclusive,1);assert.equal(report.reviewFailures[0].error.name,'TimeoutError');
+ assert.equal(JSON.parse((await readFile(failedSession,'utf8')).trim()).partial,true);
+ await runReview({...f.options,stage:'propose'},deps);assert.equal(reviewed,2);
+});
+
+test('propose persists learning metadata immediately and report can recover old raw questions without executing them',async t=>{
+ const f=await fixture(t);let learned=0;const deps={classify,review:async args=>({...update(args),learningRequests:[{question:'Unanswered boundary',hypothesis:'Tail behavior differs',requiredEvidence:'CPU controls',learningTarget:'cpu'}]}),learn:async()=>{learned++;throw Error('Metadata stages must not execute learning');}};
+ for(const stage of ['inventory','classify'])await runReview({...f.options,stage},deps);
+ const proposed=await runReview({...f.options,stage:'propose'},deps);assert.equal(proposed.learning.length,1);assert.equal(proposed.learning[0].status,'pending');assert.equal(learned,0);
+ const file=join(f.options.output,'review.json'),legacy=await load(file),started=legacy.startedAt;legacy.learning={};await writeFile(file,JSON.stringify(legacy));
+ const recovered=await runReview({...f.options,stage:'report'},deps);assert.equal(recovered.learning.length,1);assert.equal(learned,0);assert.equal((await load(file)).startedAt,started);
+ const elapsed=await runReview({...f.options,stage:'evaluate'},{...deps,evaluate:async({directory})=>{await mkdir(directory,{recursive:true});await writeFile(join(directory,'results.json'),JSON.stringify({status:'elapsed',elapsedSeconds:900,results:[]}));throw new DOMException('Comparison elapsed','TimeoutError');}});
+ assert.equal(elapsed.learning.length,1);assert.equal(learned,0);assert.equal(elapsed.candidates[0].decision.promote,false);
+});
+
+test('native writer corrects blocker scope before authoritative grounding admits its update',async t=>{
+ const {reviewSession}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'scope-correction');
+ const groups=[{id:'harness',occurrences:[{reference:'harness:event',data:{message:'Missing receipt'},artifacts:[]}]}],classifications={harness:{cause:'harness'}};
+ const proposal={action:'update',reason:'Report evidenced harness blockers',groupIds:['harness'],memoryRefs:['memory:chunk'],changes:[{action:'upsert',id:'safe-blocker',scope:'implementation',text:'Preserve source and report.',critical:false,negative:false,response:'report-blocker',evidenceRefs:['harness:event']}]};
+ const corrected=structuredClone(proposal);corrected.changes[0].scope='preflight';
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[
+  {name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:proposal}},{name:'submit_review',args:{result:corrected}}
+ ][n]);
+ const result=await reviewSession({directory,config:{actor:provider.profile},prompt:{task:'Submit evidence-backed guidance',groups},evidenceGroups:groups,seconds:30,validate:r=>validateReviewProposal(r,groups,classifications)});
+ assert.equal(result.value.changes[0].scope,'preflight');assert.equal(provider.requests(),4);
+ const actor=structuredClone(corrected);actor.changes[0].response='actor-change';actor.changes[0].scope='implementation';assert.equal(validateReviewProposal(actor,groups,{harness:{cause:'actor'}}).changes[0].response,'actor-change');
+ const unknown=structuredClone(corrected),ref='unknown-'+Date.now();unknown.changes[0].evidenceRefs=[ref];assert.throws(()=>validateReviewProposal(unknown,groups,classifications),error=>error.message.includes(ref));
+});
+
+
+test('question-specific origins keep actor learning eligible in a mixed harness bucket',async t=>{
+ const f=await fixture(t);let learned=0;
+ const deps={classify:async args=>({...await classify(args),guidanceIds:['preflight-baseline'],cause:args.group.type==='generation-rejected'?'harness':'actor'}),
+  review:async({groups})=>({action:'no-change',reason:'Different questions need different evidence',groupIds:groups.map(g=>g.id),learningRequests:[
+   {groupIds:[groups.find(g=>g.type!=='generation-rejected').id],question:'CPU conformance',hypothesis:'Boundary differs',requiredEvidence:'CPU controls',learningTarget:'cpu'},
+   {groupIds:[groups.find(g=>g.type==='generation-rejected').id],question:'Harness closure',hypothesis:'Missing receipt',requiredEvidence:'Operator investigation',learningTarget:'cpu'}]}),learn:async()=>{learned++;return {status:'inconclusive',evidence:[]};}};
+ for(const stage of ['inventory','classify','propose'])await runReview({...f.options,stage},deps);
+ const pending=await runReview({...f.options,stage:'report'},deps);assert.equal(pending.learning.find(r=>r.question==='CPU conformance').status,'pending');assert.equal(pending.learning.find(r=>r.question==='Harness closure').status,'user-required');
+ await runReview({...f.options,stage:'learn'},deps);assert.equal(learned,1);
 });

@@ -32,6 +32,21 @@ async function forkCampaign(source,directory,options){
   skills:{activeVersion:source.activeVersion,tuningDisabled:true},environment:{mode:'local'},projects:[],recovery:false,concurrency:1};
  new State(join(directory,'state.sqlite')).close();await save(join(directory,'instance.json'),config);return config;
 }
+export function validateReviewProposal(result,groups,classifications){
+ validateReview(result,groups);if(result.action!=='update')return result;
+ const observations=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(classifications[g.id]?.cause==='harness'?{responsibility:'harness'}:{})})));
+ const responses=['actor-change','report-blocker','reserve-validation-runway','retrieve-scoped-evidence'];
+ for(const change of result.changes)if(change.response!==undefined&&!responses.includes(change.response))throw Error('response must be one of '+responses.join(', '));
+ try{result.changes=validateSkillGrounding(result.changes,observations);}
+ catch(error){
+  const known=new Set(observations.map(o=>o.reference)),unknown=result.changes.flatMap(c=>(c.evidenceRefs??[]).filter(ref=>!known.has(ref)));
+  if(unknown.length)throw new Error('Unknown evidenceRefs: '+JSON.stringify(unknown)+'. Use exact occurrence/linked-diagnostic reference IDs from input.json; KDB references belong in memoryRefs.',{cause:error});
+  const scoped=result.changes.find(c=>['report-blocker','reserve-validation-runway'].includes(c.response)&&!['global-kdb','preflight'].includes(c.scope));
+  if(scoped)throw new Error('response='+scoped.response+" requires scope='global-kdb' or scope='preflight'; change the scope field, not the changes-array order.",{cause:error});
+  throw error;
+ }
+ return result;
+}
 export async function runReview(options,dependencies={}){
  if(!Array.isArray(options.sources)||!options.sources.length||!options.output)throw Error('Review requires snapshot sources and separate output');
  const output=resolve(options.output),sources=await Promise.all(options.sources.map(async s=>({...(typeof s==='string'?{}:s),root:await realpath(typeof s==='string'?s:s.root)})));
@@ -63,6 +78,15 @@ export async function runReview(options,dependencies={}){
    if(!state.inventory)throw Error('Run inventory first');
    const campaigns=new Map(state.inventory.campaigns.map(c=>[c.id,c]));
    const configFor=async id=>forkCampaign(campaigns.get(id),join(output,'campaigns',id),options);
+   const rememberLearning=async()=>{for(const [key,review]of Object.entries(state.reviews)){
+    for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[])]){
+     const groupIds=lesson.groupIds??review.groupIds,id=hash([key,lesson.question,lesson.requiredEvidence,...(lesson.groupIds?[[...groupIds].sort()]:[])]),intervention=groupIds.some(group=>state.classifications[group]?.cause==='harness')?'user-required':null;
+     if(state.learning[id]){if(intervention){state.learning[id].intervention=intervention;if(!state.learning[id].result)state.learning[id].status='user-required';await persist();}continue;}
+     const request={id,key,target:campaigns.get(review.sourceId).target,intervention,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds};
+     state.learning[id]={...request,status:intervention?'user-required':'pending'};await persist();
+    }
+   }
+   };await rememberLearning();
    if(selected.includes('classify')){
     const pending=state.inventory.groups.filter(group=>!state.classifications[group.id]);
     while(pending.length){
@@ -92,24 +116,17 @@ export async function runReview(options,dependencies={}){
     const completed=state.reviews[bucket.key],learning=Object.entries(state.learning).filter(([,v])=>v.key===bucket.key&&v.result?.status==='verified-cpu');
     if(completed&&(!learning.length||completed.learningRevision===learning.length))continue;
     const config=await configFor(bucket.sourceId),entries=await guidanceEntries(config.root,config.skills.activeVersion),directory=join(output,'proposals',hash([bucket.key,learning.length]));await mkdir(directory,{recursive:true});
-    const validate=result=>{
-     validateReview(result,bucket.groups);
-     if(result.action==='update')result.changes=validateSkillGrounding(result.changes,bucket.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(state.classifications[g.id].cause==='harness'?{responsibility:'harness'}:{})}))));
-     return result;
-    };
-    const result=validate(await invoke('review',{directory,key:bucket.key,config,groups:bucket.groups,entries,learning,
-     classifications:bucket.groups.map(g=>state.classifications[g.id]),validate}));
-    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,directory,learningRevision:learning.length};await persist();
-   }};if(selected.includes('propose'))await propose();
-   const rememberLearning=async()=>{for(const [key,review]of Object.entries(state.reviews)){
-    for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[])]){
-     const id=hash([key,lesson.question,lesson.requiredEvidence]),intervention=review.groupIds.some(group=>state.classifications[group]?.cause==='harness')?'user-required':null;
-     if(state.learning[id]){if(intervention){state.learning[id].intervention=intervention;if(!state.learning[id].result)state.learning[id].status='user-required';await persist();}continue;}
-     const request={id,key,target:campaigns.get(review.sourceId).target,intervention,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds:review.groupIds};
-     state.learning[id]={...request,status:intervention?'user-required':'pending'};await persist();
+    const validate=result=>validateReviewProposal(result,bucket.groups,state.classifications);
+    let result;try{result=validate(await invoke('review',{directory,key:bucket.key,config,groups:bucket.groups,entries,learning,
+     classifications:bucket.groups.map(g=>state.classifications[g.id]),validate}));}
+    catch(error){
+     if(signal.aborted)throw error;
+     result={action:'inconclusive',reason:'review-execution-failed',error:{name:error.name,message:error.message},groupIds:bucket.groups.map(g=>g.id)};
+     state.errors.push({at:new Date().toISOString(),stage:'propose',bucket:bucket.key,message:error.message});
     }
-   }
-   };if(selected.includes('learn'))await rememberLearning();
+    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,directory,learningRevision:learning.length};
+    await rememberLearning();await persist();
+   }};if(selected.includes('propose'))await propose();
    if(selected.includes('learn'))for(const [id,request]of Object.entries(state.learning)){
     if(request.result&&request.status!=='postprocessing-pending'||request.status==='device-evidence-needed'||request.intervention==='user-required')continue;
     if(request.learningTarget==='device'){
@@ -174,6 +191,7 @@ export async function runReview(options,dependencies={}){
   const report={status:state.status,elapsedSeconds:state.elapsedSeconds,remainingSeconds:remaining(),failureGroups:state.inventory.groups.length,
    failureObservations:state.inventory.groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
+   reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
    userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
    learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
    candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),

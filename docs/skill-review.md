@@ -59,9 +59,18 @@ A memory-backed update becomes an immutable candidate. Existing protected-guidan
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only
 inside the candidate's isolated instance. Its next fresh actor reads the accepted
 version through the existing skill interface. CPU A/B acceptance does not establish
-GPU kernel improvement. Rejected and inconclusive proposals remain inspectable.
+GPU kernel improvement. Rejected and inconclusive proposals remain inspectable. A writer/provider/item
+timeout is a retained host inconclusive result, not a no-change knowledge finding;
+other buckets and supported candidates continue. A failed frozen bucket is not
+retried without new verified learning. Shared deadline/user cancellation still
+stops the run. Scope/reference validation feedback identifies the fields to fix.
 
-Learning requests carry a question, hypothesis and required evidence. CPU requests
+Learning requests carry a question, hypothesis, originating group IDs and required
+evidence. Every accepted proposal immediately persists all questions before any
+CPU execution; report/recovery also backfills legacy raw proposal questions without
+model calls or a new allocation. Question-specific group IDs keep unrelated actor
+questions eligible in mixed buckets; legacy questions without them conservatively
+inherit their whole bucket. CPU requests
 use the existing curriculum's independent controls and then a normal CPU actor wave;
 verified results feed one further proposal review. Interrupted admitted learning
 projects resume the original actor or postprocessing, preserving source, session
