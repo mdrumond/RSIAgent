@@ -26,12 +26,19 @@ independently runnable. Keep sources, profile, Python, limits and output unchang
 when resuming. The original elapsed deadline spans all invocations; report remains
 available after it expires. Classification and review native sessions, searches,
 evidence, decisions and original references are retained alongside `review.json`.
+Full observations and distinct diagnostic representatives are saved as JSONL files.
+Native Pi `read` supports offset/limit paging; submission requires reading every
+distinct diagnostic, while duplicate accounting events require no repeated reads.
 `report.json` shows coverage, user interventions, learning status and candidate
-outcomes; token/cost telemetry is recorded but never stops work.
+outcomes; token/cost telemetry is recorded but never stops work. A settled
+comparison that exhausts its allowance remains inconclusive and does not block
+other candidates. Unknown execution closure still blocks dispatch. Changed
+proposals receive separate candidate identities and retain previous decisions.
 
 All saved failure observations are inventoried, including those in successful or
 unfinished attempts. Related observations are grouped; absence of a cause is not
-proof of a skill gap. Harness faults require user intervention. Guidance may teach
+proof of a skill gap. Harness faults require user intervention; their learning requests remain in that
+bucket and cannot automatically enter Phase 1. Guidance may teach
 preserving work and reporting them, never repairing harness-owned state.
 
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
@@ -42,7 +49,10 @@ GPU kernel improvement. Rejected and inconclusive proposals remain inspectable.
 
 Learning requests carry a question, hypothesis and required evidence. CPU requests
 use the existing curriculum's independent controls and then a normal CPU actor wave;
-verified results feed one further proposal review. Device questions remain pending.
+verified results feed one further proposal review. Interrupted admitted learning
+projects resume the original actor or postprocessing, preserving source, session
+and elapsed allocation. Failed learning remains inconclusive and does not block
+other candidates. Device questions remain pending.
 Learning does not retroactively resolve or alter the original failed project.
 
 For a later explicit rollout, stage `enqueue` with an explicit `learningInstance`

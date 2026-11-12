@@ -1,5 +1,5 @@
 /** Isolated, resumable failure -> memory -> guidance/learning -> A/B review. */
-import {mkdir,readFile,writeFile,rename,cp,realpath} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,cp,realpath,access,rm} from 'node:fs/promises';
 import {join,resolve,relative,sep} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
@@ -20,7 +20,12 @@ async function forkCampaign(source,directory,options){
  let config=await optional(join(directory,'instance.json'));if(config)return {...config,root:directory};
  const original=await load(join(source.root,'instance.json'));await mkdir(directory,{recursive:true});
  await cp(join(source.root,'skills','versions',source.activeVersion),join(directory,'skills','versions',source.activeVersion),{recursive:true});
- const db=new DatabaseSync(join(source.root,'knowledge.sqlite'),{readOnly:true});try{db.prepare('VACUUM INTO ?').run(join(directory,'knowledge.sqlite'));}finally{db.close();}
+ const knowledge=join(directory,'knowledge.sqlite');
+ try{await access(knowledge);const retained=new DatabaseSync(knowledge,{readOnly:true});try{if(retained.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw Error('Retained review knowledge copy is invalid');}finally{retained.close();}}
+ catch(error){if(error.code!=='ENOENT')throw error;
+  const temporary=join(directory,'knowledge-copy-'+randomUUID()+'.sqlite'),db=new DatabaseSync(join(source.root,'knowledge.sqlite'),{readOnly:true});
+  try{db.prepare('VACUUM INTO ?').run(temporary);await rename(temporary,knowledge);}finally{db.close();await rm(temporary,{force:true});}
+ }
  config={format:1,revision:0,root:directory,mode:'phase1',target:source.target,actor_seconds:300,
   actor:options.profile??original.skill_writer_actor??original.actor,skill_writer_actor:options.profile??original.skill_writer_actor??original.actor,
   python:options.python??original.python,embeddings:options.embeddings??original.embeddings,embedding_factory:options.embedding_factory??original.embedding_factory,
@@ -44,7 +49,7 @@ export async function runReview(options,dependencies={}){
   state??={format:1,signature,startedAt:Date.now(),seconds,inventory:null,classifications:{},reviews:{},learning:{},candidates:{},errors:[],stats:[]};
   const remaining=()=>Math.max(0,seconds-(Date.now()-state.startedAt)/1000);
   const persist=async()=>{state.elapsedSeconds=(Date.now()-state.startedAt)/1000;await save(file,state);};
-  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,...dependencies};
+  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(Error('Review elapsed allocation exhausted')),Math.min(2147483647,remaining()*1000));
   const signal=options.signal?AbortSignal.any([options.signal,controller.signal]):controller.signal;
   const invoke=async(name,input,cap=240)=>{signal.throwIfAborted();if(remaining()<=0)throw Error('Review elapsed allocation exhausted');
@@ -83,14 +88,15 @@ export async function runReview(options,dependencies={}){
    }};if(selected.includes('propose'))await propose();
    const rememberLearning=async()=>{for(const [key,review]of Object.entries(state.reviews)){
     for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[])]){
-     const id=hash([key,lesson.question,lesson.requiredEvidence]);if(state.learning[id])continue;
-     const request={id,key,target:campaigns.get(review.sourceId).target,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds:review.groupIds};
-     state.learning[id]={...request,status:'pending'};await persist();
+     const id=hash([key,lesson.question,lesson.requiredEvidence]),intervention=review.groupIds.some(group=>state.classifications[group]?.cause==='harness')?'user-required':null;
+     if(state.learning[id]){if(intervention){state.learning[id].intervention=intervention;if(!state.learning[id].result)state.learning[id].status='user-required';await persist();}continue;}
+     const request={id,key,target:campaigns.get(review.sourceId).target,intervention,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds:review.groupIds};
+     state.learning[id]={...request,status:intervention?'user-required':'pending'};await persist();
     }
    }
    };if(selected.includes('learn'))await rememberLearning();
    if(selected.includes('learn'))for(const [id,request]of Object.entries(state.learning)){
-    if(request.result||request.status==='device-evidence-needed')continue;
+    if(request.result&&request.status!=='postprocessing-pending'||request.status==='device-evidence-needed'||request.intervention==='user-required')continue;
     if(request.learningTarget==='device'){
      request.status='device-evidence-needed';await persist();continue;
     }
@@ -107,21 +113,35 @@ export async function runReview(options,dependencies={}){
    }
    if(stage==='all'&&Object.values(state.learning).some(r=>r.result?.status==='verified-cpu')){await propose();await rememberLearning();}
    if(selected.includes('evaluate'))for(const [key,review]of Object.entries(state.reviews)){
-    if(review.action!=='update'||state.candidates[key]?.decision)continue;
-    if(!state.candidates[key]&&Object.keys(state.candidates).length>=(options.maxCandidates??3))break;
-    const campaign=campaigns.get(review.sourceId),directory=join(output,'candidates',hash(key));await mkdir(directory,{recursive:true});
-    let candidate=state.candidates[key];
+    if(review.action!=='update')continue;
+    const revision=hash(review.changes),legacy=state.candidates[key];
+    const candidateKey=legacy&&Array.isArray(legacy.changes)&&hash(legacy.changes)===revision?key:key+':'+revision;
+    if(state.candidates[candidateKey]?.decision)continue;
+    if(!state.candidates[candidateKey]&&Object.keys(state.candidates).length>=(options.maxCandidates??3))continue;
+    for(const [oldKey,old]of Object.entries(state.candidates))if(oldKey!==candidateKey&&(old.bucket===key||oldKey===key)&&!old.decision){
+     if(!await ops.evaluationSettled({directory:join(old.directory,'evaluation')}))throw Error('Superseded comparison execution remains unresolved');
+     old.decision={promote:false,reason:'superseded-proposal'};await persist();
+    }
+    const campaign=campaigns.get(review.sourceId),directory=join(output,'candidates',hash(candidateKey));await mkdir(directory,{recursive:true});
+    let candidate=state.candidates[candidateKey];
     if(!candidate){
      const entries=await guidanceEntries(campaign.root,campaign.activeVersion);let updated;
-     try{updated=applyProposal(entries,review.changes,{allowPruning:false,history:[]});}catch(error){state.candidates[key]={directory,decision:{promote:false,reason:'invalid-proposal',error:error.message}};await persist();continue;}
+     try{updated=applyProposal(entries,review.changes,{allowPruning:false,history:[]});}catch(error){state.candidates[candidateKey]={directory,bucket:key,proposalRevision:revision,changes:review.changes,decision:{promote:false,reason:'invalid-proposal',error:error.message}};await persist();continue;}
      await cp(join(campaign.root,'skills','versions',campaign.activeVersion),join(directory,'skills','versions',campaign.activeVersion),{recursive:true});
      const config={...await configFor(review.sourceId),root:directory,skills:{activeVersion:campaign.activeVersion,tuningDisabled:true}};
      new State(join(directory,'state.sqlite')).close();await save(join(directory,'instance.json'),config);
      const version=await writeVersion(directory,updated,join(directory,'skills','versions',campaign.activeVersion));
-     candidate=state.candidates[key]={directory,active:campaign.activeVersion,version,changes:review.changes};await persist();
+     candidate=state.candidates[candidateKey]={directory,bucket:key,proposalRevision:revision,active:campaign.activeVersion,version,changes:review.changes};await persist();
     }
-    const result=await invoke('evaluate',{directory:join(directory,'evaluation'),key,config:await load(join(directory,'instance.json')),
-     active:join(directory,'skills','versions',candidate.active),candidate:join(directory,'skills','versions',candidate.version)},900);
+    let result;try{result=await invoke('evaluate',{directory:join(directory,'evaluation'),key:candidateKey,config:await load(join(directory,'instance.json')),
+     active:join(directory,'skills','versions',candidate.active),candidate:join(directory,'skills','versions',candidate.version)},900);}
+    catch(error){
+     if(signal.aborted)throw error;
+     if(!await ops.evaluationSettled({directory:join(directory,'evaluation')}))throw error;
+     const partial=await optional(join(directory,'evaluation','results.json'));
+     result={decision:{promote:false,reason:error.name==='TimeoutError'?'evaluation-elapsed':'evaluation-failed',error:error.message},report:partial};
+     state.errors.push({at:new Date().toISOString(),stage:'evaluate',candidate:candidateKey,message:error.message});
+    }
     candidate.decision=result.decision;candidate.results=result.report?.results??[];
     if(candidate.decision.promote){const current=await load(join(directory,'instance.json'));
      candidate.published=current.skills.activeVersion===candidate.version||Boolean(await publishSkillVersion(directory,{active:candidate.active,candidate:candidate.version,signal}));}
@@ -131,7 +151,7 @@ export async function runReview(options,dependencies={}){
     if(!options.learningInstance)throw Error('Explicit learningInstance required');
     const destination=await realpath(options.learningInstance);if(sources.some(s=>s.root===destination))throw Error('Cannot enqueue into a review source');
     const config=await load(join(destination,'instance.json'));if(config.skills?.review?.enabled!==true)throw Error('Enable skills.review.enabled before importing requests');
-    const ledger=new State(join(destination,'state.sqlite'));try{for(const request of Object.values(state.learning))if(request.target===config.target&&request.status!=='verified-cpu')enqueueLearningRequest(ledger,request);}finally{ledger.close();}
+    const ledger=new State(join(destination,'state.sqlite'));try{for(const request of Object.values(state.learning))if(request.target===config.target&&request.status!=='verified-cpu'&&request.intervention!=='user-required')enqueueLearningRequest(ledger,request);}finally{ledger.close();}
    }
    state.status=remaining()>0?'checkpointed':'elapsed';
   }catch(error){state.errors.push({at:new Date().toISOString(),stage,message:error.message});state.status=signal.aborted?'elapsed':'failed';throw error;}
@@ -140,7 +160,7 @@ export async function runReview(options,dependencies={}){
    failureObservations:state.inventory.groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
    userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
-   learning:Object.values(state.learning).map(({id,status,question,result})=>({id,status,question,...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
+   learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
    candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),
    stats:state.stats,timings:state.timings??[],claim:'Isolated review; live campaigns unchanged. CPU microbenchmarks do not establish GPU kernel improvement.'};
   await save(join(output,'report.json'),report);return report;

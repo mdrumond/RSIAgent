@@ -8,6 +8,13 @@ const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=
 const failed=(type,data)=>/error|failed|rejected|unresolved|blocked/.test(type)||type==='failure-recorded'||
  type==='verification'&&(data.correct===false||data.passed===false||data.exitCode>0||data.exit_code>0);
 const normal=text=>String(text??'').replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/\/[^\s'"<>]+/g,'<path>').slice(0,1500);
+export function diagnosticIdentity(occurrence){
+ const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?
+  Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([key])=>
+   !/elapsed|duration|monotonic|timestamp|fingerprint|^handle$|^operation$|^owner$|^created$/i.test(key)).map(([key,item])=>[key,stable(item)])):
+  typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/\/[^\s'"<>]+/g,'<path>'):value;
+ return digest([stable(occurrence.data??{}),(occurrence.artifacts??[]).map(a=>a.sha256)]);
+}
 export async function inventoryFailures(sources) {
  const groups=new Map(),campaigns=[];
  for(const source of sources){
@@ -27,10 +34,13 @@ export async function inventoryFailures(sources) {
    const add=(row,journal)=>{
     const data=typeof row.data==='string'?JSON.parse(row.data):row.data,attempt=attempts.get(row.attempt),spec=projects.get(attempt?.project);
     const message=data.message??data.error??data.reason??data.result?.error??row.type;
-    const key=digest([sourceId,row.type,normal(message)]),reference=`${sourceId}:${journal}:${row.sequence}`;
+    const artifactRefs=artifacts(data);
+    const diagnostic=diagnosticIdentity({data,artifacts:artifactRefs});
+    const key=digest([sourceId,row.type,normal(message),diagnostic,
+     ['verification','failed-outcome'].includes(row.type)||message==='Actor completed without acceptance'?attempt?.project??row.draft:null]),reference=`${sourceId}:${journal}:${row.sequence}`;
     const group=groups.get(key)??{id:key,sourceId,target:campaign.target,type:row.type,message:normal(message),occurrences:[]};
     group.occurrences.push({reference,attemptId:row.attempt??null,draftId:row.draft??null,projectId:attempt?.project??null,
-     phase:row.phase??jobs.get(row.attempt)?.mode??spec?.phase??config.mode,kind:jobs.get(row.attempt)?.kind??null,skillVersion:jobs.get(row.attempt)?.config?.skills?.activeVersion??jobs.get(row.attempt)?.skillVersion??null,skillReads:reads.get(row.attempt)??[],created:row.created??null,data,artifacts:artifacts(data)});groups.set(key,group);
+     phase:row.phase??jobs.get(row.attempt)?.mode??spec?.phase??config.mode,kind:jobs.get(row.attempt)?.kind??null,skillVersion:jobs.get(row.attempt)?.config?.skills?.activeVersion??jobs.get(row.attempt)?.skillVersion??null,skillReads:reads.get(row.attempt)??[],created:row.created??null,data,artifacts:artifactRefs});groups.set(key,group);
    };
    for(const journal of ['events','generation_events'])if(has(db,journal)){
     let cursor=0;while(true){
@@ -78,12 +88,13 @@ export function claimLearningRequest(state,config,{draft,topic,target}){
  if(config.skills?.review?.enabled!==true)return null;
  if(!has(state.db,'skill_learning_requests'))return null;
  const row=state.db.prepare(`SELECT id,data FROM skill_learning_requests WHERE status='pending' ORDER BY rowid`).all()
-  .find(row=>{const r=JSON.parse(row.data);return r.target===target&&(r.topic===undefined||r.topic===topic);});
+  .find(row=>{const r=JSON.parse(row.data);return r.intervention!=='user-required'&&r.target===target&&(r.topic===undefined||r.topic===topic);});
  if(!row)return null;
  const changed=state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft=? WHERE id=? AND status='pending'").run(draft,row.id).changes;
  return changed?{...JSON.parse(row.data),id:row.id}:null;
 }
 export function enqueueLearningRequest(state,request){
+ if(request.intervention==='user-required')throw Error('Harness learning requires user intervention, not Phase 1 admission');
  if(!request.question||!request.target||!request.requiredEvidence)throw Error('Invalid learning request');
  state.db.exec(`CREATE TABLE IF NOT EXISTS skill_learning_requests(id TEXT PRIMARY KEY,data TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',draft TEXT)`);
  const id=digest([request.target,request.topic??null,request.question,request.requiredEvidence]);

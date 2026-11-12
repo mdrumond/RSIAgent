@@ -1,6 +1,6 @@
 /** Native Pi/KDB and existing curriculum/evaluation adapters for isolated reviews. */
 import {mkdir,readFile,writeFile,appendFile,cp,symlink} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
 import {modelFromProfile} from '../controller/model.mjs';
 import {ensureKnowledgeService} from './knowledge.mjs';
@@ -14,19 +14,50 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {refillProjects} from './project-generation.mjs';
 import {runMicroeval} from './skill-microeval.mjs';
 import {tasks} from './microtasks/tasks.mjs';
+import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateNonInferiority} from '../controller/skill-noninferiority.mjs';
 
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false}){
+async function reviewEvidence(directory,groups=[]){
+ const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
+ for(const group of groups){
+  const representatives=[...new Map(group.occurrences.map(o=>[diagnosticIdentity(o),o])).values()];
+  const all=join(directory,'evidence',group.id+'-occurrences.jsonl'),diagnostics=join(directory,'evidence',group.id+'-diagnostics.jsonl');
+  await writeFile(all,group.occurrences.map(o=>JSON.stringify(o)).join('\n')+'\n');
+  await writeFile(diagnostics,representatives.map(o=>JSON.stringify(o)).join('\n')+'\n');
+  representatives.forEach(o=>required.add(o.reference));
+  previews.push({...group,occurrences:representatives.slice(0,6),occurrenceCount:group.occurrences.length,
+   distinctDiagnostics:representatives.length,fullOccurrences:all,diagnosticsFile:diagnostics});
+ }
+ return {required,previews};
+}
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[]}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
- await mkdir(agentDir,{recursive:true});await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
- const retrievals=[];
+ await mkdir(agentDir,{recursive:true});
+ const evidence=await reviewEvidence(directory,evidenceGroups);
+ if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
+ await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
+ const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
+ const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
+ const coverageFile=join(directory,'read-evidence.json');
+ const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
+ const check=async result=>{
+  if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic using native read with offset/limit on diagnosticsFile before submitting; duplicate occurrences need no repeated reads');
+  return validate(result,retrievals);
+ };
  const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
- if(prior){const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(()=> '');retrievals.push(...records.split('\n').filter(Boolean).map(line=>JSON.parse(line)));return {value:await validate(JSON.parse(prior),retrievals),retrievals,recovered:true};}
+ if(prior)return {value:await check(JSON.parse(prior)),retrievals,recovered:true};
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
  let submitted;
- const extension=pi=>pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:Type.Unknown()}),
-  execute:async(_id,{result})=>{submitted=await validate(result,retrievals);await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});
+ const extension=pi=>{
+  pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
+   const path=resolve(directory,event.input.path??'');if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
+   const text=(event.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
+   for(const ref of evidence.required)if(text.includes(JSON.stringify(ref)))seen.add(ref);
+   await writeFile(coverageFile,JSON.stringify([...seen]));
+  });
+  pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:Type.Unknown()}),
+  execute:async(_id,{result})=>{submitted=await check(result);await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=JSON.parse(await readFile(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
@@ -37,7 +68,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
-  await session.prompt('Read input.json. Perform exactly its task, using only provided observations and retrieved evidence. Submit the requested JSON result using submit_review. Unknown is valid; never invent cause, successful repairs or measurements. Harness faults require user intervention, not actor repairs.');
+  await session.prompt('Read input.json, then read all distinct diagnostics listed by diagnosticsFile using native read offset/limit when the bounded preview is incomplete. Full occurrences remain available in fullOccurrences; duplicate diagnostics need not be reread. Perform exactly its task, using only provided observations and retrieved evidence. Submit the requested JSON result using submit_review. Unknown is valid; never invent cause, successful repairs or measurements. Harness faults require user intervention, not actor repairs.');
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw Error('Review session elapsed allocation exhausted');if(submitted===undefined)throw Error('Review session did not submit');
   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
  }finally{
@@ -46,41 +77,47 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  }
 }
 export async function nativeClassify(input){
- return reviewSession({...input,prompt:{task:'Classify this failure group. Return {cause:actor|harness|specification|provider|unknown,reason,coverage:covered|uncovered|unknown,guidanceIds:[],evidenceRefs:[],gap:missing|insufficient|not-followed|unknown}. Cite occurrence references, use existing guidance IDs only. Availability does not establish the actor read a skill. Inspect copied log files in occurrence.artifacts with native read when the message alone cannot establish a cause; do not access original live artifact paths.',group:{...input.group,occurrenceCount:input.group.occurrences.length,occurrences:input.group.occurrences.slice(0,6)},entries:input.entries}});
+ return reviewSession({...input,evidenceGroups:[input.group],prompt:{task:'Classify this failure group. Return {cause:actor|harness|specification|provider|unknown,reason,coverage:covered|uncovered|unknown,guidanceIds:[],evidenceRefs:[],gap:missing|insufficient|not-followed|unknown}. Cite occurrence references, use existing guidance IDs only. Availability does not establish the actor read a skill. Inspect copied log files in occurrence.artifacts with native read when the message alone cannot establish a cause; do not access original live artifact paths.',group:input.group,entries:input.entries}});
 }
 export async function nativeReview(input){
- const bounded=groups=>groups.map(g=>({...g,occurrenceCount:g.occurrences.length,occurrences:g.occurrences.length>6?[...g.occurrences.slice(0,3),...g.occurrences.slice(-3)]:g.occurrences}));
- const prompt={task:'Review this guidance bucket using KDB search and read_entry. Return {action:update|learn|no-change,reason,groupIds:[],memoryRefs:["collection:entry_id"],changes:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device,learningRequests:[{question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Include outstanding learning questions even when proposing a supported update. An update requires retrieved supporting memory, not a failure alone. changes are {action:upsert,id,scope,text,critical:boolean,negative:boolean,evidenceRefs:[occurrence references],response:report-blocker (only for harness guidance)}. Prefer one concise new entry supplementing protected baseline. No device performance claims from CPU results. Detailed kernel cases remain searchable; guidance should explain applicability and retrieval. Questions requiring GPU evidence must stay pending if CPU cannot answer. Harness faults may only produce report/preserve guidance. No new benchmark runs.',groups:bounded(input.groups),entries:input.entries,classification:input.classifications,learning:input.learning??[]};
- return reviewSession({...input,knowledge:true,prompt,validate:(result,retrievals)=>{
+ const prompt={task:'Review this guidance bucket using KDB search and read_entry. Return {action:update|learn|no-change,reason,groupIds:[],memoryRefs:["collection:entry_id"],changes:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device,learningRequests:[{question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Include outstanding learning questions even when proposing a supported update. An update requires retrieved supporting memory, not a failure alone. changes are {action:upsert,id,scope,text,critical:boolean,negative:boolean,evidenceRefs:[occurrence references],response:report-blocker (only for harness guidance)}. Prefer one concise new entry supplementing protected baseline. No device performance claims from CPU results. Detailed kernel cases remain searchable; guidance should explain applicability and retrieval. Questions requiring GPU evidence must stay pending if CPU cannot answer. Harness faults may only produce report/preserve guidance. No new benchmark runs.',groups:input.groups,entries:input.entries,classification:input.classifications,learning:input.learning??[]};
+ return reviewSession({...input,evidenceGroups:input.groups,knowledge:true,prompt,validate:(result,retrievals)=>{
   const refs=new Set(retrievals.flatMap(r=>r.entries.map(e=>`${e.collection}:${e.entry_id??e.chunk_id??e.id}`)));
   if(result.action==='update'&&result.memoryRefs?.some(ref=>!refs.has(ref)))throw Error('Memory references must have been retrieved in this session');
   return input.validate(result);
  }});
 }
-export async function nativeLearn({directory,config,request,signal,seconds}){
- const state=new State(join(directory,'state.sqlite'));
- const begun=performance.now();
+export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){
+ const ops={construct:refillProjects,importProject,operate,ensureKnowledgeService,createKdbBridge,...dependencies};
+ const state=new State(join(directory,'state.sqlite')),begun=performance.now();
  try{
-  await cp(join(config.root,'skills'),join(directory,'skills'),{recursive:true});
-  await symlink(join(config.root,'knowledge.sqlite'),join(directory,'knowledge.sqlite')).catch(e=>{if(e.code!=='EEXIST')throw e;});
-  const cfg={...config,root:directory,target:'cpu',mode:'phase1',actor_seconds:Math.min(300,seconds),curriculum_seconds:Math.min(600,seconds),
+  const existing=state.db.prepare('SELECT id FROM projects ORDER BY rowid LIMIT 2').all();
+  if(existing.length>1)throw Error('Learning instance must contain only its original project');
+  let cfg;try{cfg=JSON.parse(await readFile(join(directory,'instance.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+  cfg??={...config,root:directory,target:'cpu',mode:'phase1',actor_seconds:Math.min(300,seconds),curriculum_seconds:Math.min(600,seconds),
    environment:{module:fileURLToPath(new URL('../integrations/environments/index.mjs',import.meta.url)),options:{mode:'local'}},campaign_plan:[{id:'learning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},curriculum:{generation:{enabled:true,topics:[request.question],preprompt:'Investigate only this CPU-answerable learning question: '+JSON.stringify(request)+'. Keep fixtures tiny, deterministic and independently checked. Record actual observations, not hypothetical device behavior.'}},skills:{...config.skills,review:{enabled:false}}};
-  const bridge=createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:request.id,agentDir:join(directory,'agent')});
-  const specs=await refillProjects({config:cfg,state,bridge,concurrency:1,path:join(directory,'drafts'),signal});
-  const draft=specs[0];if(!draft){
-   const drafts=state.db.prepare('SELECT data FROM generation_drafts').all().map(({data})=>{const d=JSON.parse(data);return {id:d.id,status:d.status,elapsed:d.elapsed,seconds:d.seconds,error:d.error??null};});
-   const observations=state.db.prepare("SELECT sequence,draft,type,data FROM generation_events WHERE type IN ('generation-rejected','generation-construction-check','curriculum-interrupted') ORDER BY sequence").all().map(e=>({...e,data:JSON.parse(e.data)}));
-   return {status:'inconclusive',reason:'curriculum-no-accepted-project',elapsedSeconds:(performance.now()-begun)/1000,drafts,evidence:observations,claim:'No accepted learning project; constructor observations establish no successful repair'};
+  let spec=existing.length?state.project(existing[0].id).spec:null;
+  if(!spec){
+   await cp(join(config.root,'skills'),join(directory,'skills'),{recursive:true});
+   await symlink(join(config.root,'knowledge.sqlite'),join(directory,'knowledge.sqlite')).catch(e=>{if(e.code!=='EEXIST')throw e;});
+   const bridge=ops.createKdbBridge({url:await ops.ensureKnowledgeService(config,{signal}),attemptId:request.id,agentDir:join(directory,'agent')});
+   const drafts=await ops.construct({config:cfg,state,bridge,concurrency:1,path:join(directory,'drafts'),signal});
+   if(!drafts[0]){
+    const rows=state.db.prepare('SELECT data FROM generation_drafts').all().map(({data})=>{const d=JSON.parse(data);return {id:d.id,status:d.status,elapsed:d.elapsed,seconds:d.seconds,error:d.error??null};});
+    const observations=state.db.prepare("SELECT sequence,draft,type,data FROM generation_events WHERE type IN ('generation-rejected','generation-construction-check','curriculum-interrupted') ORDER BY sequence").all().map(e=>({...e,data:JSON.parse(e.data)}));
+    return {status:'inconclusive',reason:'curriculum-no-accepted-project',elapsedSeconds:(performance.now()-begun)/1000,drafts:rows,evidence:observations,claim:'No accepted learning project; constructor observations establish no successful repair'};
+   }
+   spec=await ops.importProject(directory,{...drafts[0],actor_seconds:Math.max(.001,Math.min(300,seconds-(performance.now()-begun)/1000))},{signal});
+   state.add(spec);
   }
-  const prior=state.project(draft.id);
-  const spec=prior?.spec??await importProject(directory,{...draft,actor_seconds:Math.max(.001,Math.min(300,seconds-(performance.now()-begun)/1000))},{signal});
-  if(!prior)state.add(spec);
-  cfg.projects=[spec];cfg.curriculum={phase1:[spec.id],generation:{enabled:false}};
+  cfg.actor_seconds=spec.actor_seconds;cfg.projects=[spec];cfg.curriculum={phase1:[spec.id],generation:{enabled:false}};
   await writeFile(join(directory,'instance.json'),JSON.stringify(cfg,null,2));
-  await operate('wave',cfg,{signal,'no-recovery':true});
-  const attempts=state.db.prepare('SELECT id,outcome,elapsed FROM attempts WHERE project=?').all(spec.id);
-  const passed=attempts.some(a=>a.outcome==='passed');
-  return {status:passed?'verified-cpu':'inconclusive',project:spec,evidence:spec.generation.checks,attempts,claim:'Independent CPU verification and actor project evidence only; no GPU claim'};
+  const attempts=()=>state.db.prepare(`SELECT a.id,a.outcome,a.elapsed,a.session,
+   EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed') AS postprocessed FROM attempts a WHERE project=?`).all(spec.id);
+  const previous=attempts();
+  if(!previous.length||previous.some(a=>a.outcome===null||!a.postprocessed))await ops.operate(previous.length?'resume':'wave',cfg,{signal,'no-recovery':true});
+  signal?.throwIfAborted();const completed=attempts(),passed=completed.some(a=>a.outcome==='passed'&&a.postprocessed),unfinished=completed.some(a=>!a.postprocessed);
+  return {status:passed?'verified-cpu':unfinished?'postprocessing-pending':'inconclusive',project:spec,evidence:spec.generation?.checks??[],attempts:completed,claim:'Independent CPU verification and actor project evidence only; no GPU claim'};
  }finally{state.close();}
 }
 export async function nativeEvaluate({directory,active,candidate,config,signal,seconds}){
@@ -95,4 +132,9 @@ export async function stopReviewKnowledge(root){
  if(await ownerStopped(receipt.owner))return;process.kill(receipt.owner.pid,'SIGTERM');
  const end=performance.now()+5000;while(!await ownerStopped(receipt.owner)&&performance.now()<end)await delay(50);
  if(!await ownerStopped(receipt.owner))throw Error('Owned review KDB service remains live: '+root);
+}
+
+export async function evaluationSettled({directory}){
+ let report;try{report=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code==='ENOENT')return true;throw e;}
+ return !report.runningSample&&(!report.owner||await ownerStopped(report.owner));
 }

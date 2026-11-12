@@ -102,16 +102,16 @@ test('native Pi classification submits validated results and resumes without ano
  const value={cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[group.occurrences[0].reference],reason:'Observed failure does not establish cause'};
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests++;
-  const used=body.messages.some(m=>m.role==='tool');res.writeHead(200,{'Content-Type':'text/event-stream'});
+  const used=body.messages.filter(m=>m.role==='tool').length;res.writeHead(200,{'Content-Type':'text/event-stream'});
   const frame=delta=>res.write('data: '+JSON.stringify({id:'review-fixture',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason:null}]})+'\n\n');
-  frame({role:'assistant',...(used?{content:'Done'}:{tool_calls:[{index:0,id:'submit',type:'function',function:{name:'submit_review',arguments:JSON.stringify({result:value})}}]})});
-  res.write('data: '+JSON.stringify({id:'review-fixture',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:used?'stop':'tool_calls'}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}})+'\n\n');res.end('data: [DONE]\n\n');
+  frame({role:'assistant',...(used>1?{content:'Done'}:{tool_calls:[{index:0,id:used?'submit':'read',type:'function',function:used?{name:'submit_review',arguments:JSON.stringify({result:value})}:{name:'read',arguments:JSON.stringify({path:'input.json'})}}]})});
+  res.write('data: '+JSON.stringify({id:'review-fixture',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:used>1?'stop':'tool_calls'}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}})+'\n\n');res.end('data: [DONE]\n\n');
  });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
  const credentials_file=join(f.root,'fixture.env');await writeFile(credentials_file,'REVIEW_FIXTURE=fixture-only\n');
  const profile={provider:'review-fixture',model:'scripted',credential_env:'REVIEW_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
  const input={directory,config:{actor:profile},group,entries:[],seconds:20,validate:r=>validateClassification(r,group,[])};
- const result=await nativeClassify(input);assert.equal(result.value.cause,'unknown');assert.ok(result.stats.tokens.total>0);assert.equal(requests,2);
- await nativeClassify(input);assert.equal(requests,2);
+ const result=await nativeClassify(input);assert.equal(result.value.cause,'unknown');assert.ok(result.stats.tokens.total>0);assert.equal(requests,3);
+ await nativeClassify(input);assert.equal(requests,3);
 });
 
 test('learning backlog retains every question while only two CPU projects execute',async t=>{
@@ -137,4 +137,112 @@ test('failed learning stays inconclusive while other learning and candidate eval
  assert.equal(report.learning.filter(r=>r.status==='pending').length,1);
  assert.equal(report.learning.find(r=>r.status==='inconclusive').error.name,'Error');
  const state=await load(join(f.options.output,'review.json'));assert.equal(state.errors.filter(e=>e.stage==='learn').length,1);
+});
+
+
+test('admitted learning resumes the original actor and source before considering another draft',async t=>{
+ const {nativeLearn}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'learning-resume');await mkdir(directory);
+ const source=join(f.root,'tiny-source');await mkdir(source);await writeFile(join(source,'answer.py'),'answer=1\n');
+ let constructed=0,launched=0,identity,allocation;
+ const ops={ensureKnowledgeService:async()=> 'http://127.0.0.1:1/mcp',createKdbBridge:()=>({}),
+  construct:async()=>{constructed++;return [{id:'tiny',goal:'CPU experiment',source,actor_seconds:60,generation:{checks:[]}}];},importProject:async(_root,spec)=>spec,
+  operate:async(command,cfg)=>{const state=new State(join(directory,'state.sqlite'));try{
+   if(++launched===1){assert.equal(command,'wave');allocation=state.project('tiny').spec.actor_seconds;identity=state.admit('tiny',{pid:1,start:'fixture',boot:'fixture'}).id;
+    state.checkpoint(identity,17.5,'same-native-session');await writeFile(join(source,'answer.py'),'answer=2\n');throw Error('Interrupted after actor launch');}
+   assert.equal(command,'resume');const a=state.attempt(identity);assert.equal(a.elapsed,17.5);assert.equal(a.session,'same-native-session');
+   assert.equal(cfg.actor_seconds,allocation);assert.equal(await readFile(join(source,'answer.py'),'utf8'),'answer=2\n');
+   state.db.prepare("UPDATE attempts SET outcome='passed' WHERE id=?").run(identity);state.event(identity,'postprocess-completed',{});
+  }finally{state.close();}}};
+ const input={directory,config:{...await load(join(f.source,'instance.json')),root:f.source},request:{id:'question',question:'CPU boundary'},seconds:100};
+ await assert.rejects(nativeLearn(input,ops),/Interrupted/);
+ const resumed=await nativeLearn({...input,seconds:30},ops);assert.equal(resumed.status,'verified-cpu');assert.equal(resumed.attempts[0].id,identity);assert.equal(constructed,1);
+ await nativeLearn({...input,seconds:20},ops);assert.equal(launched,2);
+});
+
+test('interrupted fork publication reuses the copied memory database without replacing its contents',async t=>{
+ const f=await fixture(t);await assert.rejects(runReview({...f.options,stage:'classify'},{classify}),/inventory/);
+ await runReview({...f.options,stage:'inventory'});
+ await assert.rejects(runReview({...f.options,stage:'classify'},{classify:async()=>{throw Error('Stopped after fork publication');}}),/Stopped/);
+ const copy=join(f.options.output,'campaigns','a3');await rm(join(copy,'instance.json'));
+ const db=new DatabaseSync(join(copy,'knowledge.sqlite'));db.exec('CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES (\'preserved\')');db.close();
+ await runReview({...f.options,stage:'classify'},{classify});
+ const retained=new DatabaseSync(join(copy,'knowledge.sqlite'),{readOnly:true});try{assert.equal(retained.prepare('SELECT value FROM retained').get().value,'preserved');}finally{retained.close();}
+});
+
+test('a settled comparison timeout retains partial results and does not block the next candidate',async t=>{
+ const f=await fixture(t);let calls=0;
+ const report=await runReview(f.options,{classify:async args=>({...await classify(args),guidanceIds:[args.group.type==='generation-rejected'?'debug-baseline':'implementation-baseline']}),review:async args=>update(args),
+  evaluate:async({directory})=>{if(++calls===1){await mkdir(directory,{recursive:true});await writeFile(join(directory,'results.json'),JSON.stringify({status:'elapsed',elapsedSeconds:900,results:[{correct:true,arm:'active'}]}));throw new DOMException('Comparison elapsed','TimeoutError');}return evaluation();}});
+ assert.equal(calls,2);assert.equal(report.candidates[0].decision.reason,'evaluation-elapsed');assert.equal(report.candidates[1].published,true);
+ const state=await load(join(f.options.output,'review.json'));assert.equal(Object.values(state.candidates)[0].results.length,1);
+});
+
+test('unresolved comparison execution stops dispatch without publishing an inconclusive closure',async t=>{
+ const f=await fixture(t);let calls=0;
+ await assert.rejects(runReview(f.options,{classify,review:async args=>update(args),evaluate:async({directory})=>{calls++;await mkdir(directory,{recursive:true});await writeFile(join(directory,'results.json'),JSON.stringify({runningSample:{key:'uncertain'},results:[]}));throw new DOMException('Comparison elapsed','TimeoutError');}}),{name:'TimeoutError'});
+ const state=await load(join(f.options.output,'review.json'));assert.equal(calls,1);assert.equal(Object.values(state.candidates)[0].decision,undefined);
+});
+
+test('a revised proposal receives a new candidate while prior decisions and versions remain frozen',async t=>{
+ const f=await fixture(t);let comparisons=0;
+ const deps={classify,review:async args=>({...update(args),changes:[{...update(args).changes[0],text:args.learning.length?'Learned revised guidance':'Original evidence-backed guidance'}],learningRequests:[{question:'Boundary question',hypothesis:'Boundary hypothesis',requiredEvidence:'CPU evidence',learningTarget:'cpu'}]}),learn:async()=>({status:'verified-cpu',evidence:[]}),evaluate:async()=>{comparisons++;return evaluation();}};
+ for(const stage of ['inventory','classify','propose','evaluate'])await runReview({...f.options,stage},deps);
+ const first=Object.values((await load(join(f.options.output,'review.json'))).candidates)[0],before=await readFile(join(first.directory,'skills','versions',first.version,'guidance.json'),'utf8');
+ for(const stage of ['learn','propose','evaluate'])await runReview({...f.options,stage},deps);
+ const candidates=Object.values((await load(join(f.options.output,'review.json'))).candidates);assert.equal(candidates.length,2);assert.equal(comparisons,2);assert.notEqual(candidates[0].version,candidates[1].version);
+ assert.equal(await readFile(join(first.directory,'skills','versions',first.version,'guidance.json'),'utf8'),before);assert.equal(candidates[0].decision.promote,true);
+});
+
+async function scriptedReview(t,root,plan){
+ const {createServer}=await import('node:http'),{once}=await import('node:events');let requests=0;
+ const server=createServer(async(req,res)=>{
+  let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),tool=await plan(body,requests++);
+  res.writeHead(200,{'Content-Type':'text/event-stream'});
+  const delta={role:'assistant',...(tool?{tool_calls:[{index:0,id:'review-'+requests,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})};
+  const frame=value=>res.write('data: '+JSON.stringify(value)+'\n\n');
+  frame({id:'review-pages',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason:null}]});
+  frame({id:'review-pages',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:tool?'tool_calls':'stop'}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}});res.end('data: [DONE]\n\n');
+ });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const credentials_file=join(root,'extra.env');await writeFile(credentials_file,'REVIEW_EXTRA=fixture-only\n');
+ return {requests:()=>requests,profile:{provider:'review-extra',model:'scripted',credential_env:'REVIEW_EXTRA',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
+}
+
+test('native reads page beyond the preview before classifying a late distinct failure',async t=>{
+ const {nativeClassify}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'late-diagnostic');
+ const group={id:'late-group',message:'Verification failed',occurrences:Array.from({length:7},(_,i)=>({reference:'failure:'+i,data:{message:i===6?'Incorrect strided layout':'Distinct boundary '+i},artifacts:[]}))};
+ const decision=cause=>({cause,reason:'Observed diagnostic evidence',coverage:'uncovered',guidanceIds:[],evidenceRefs:[cause==='actor'?'failure:6':'failure:0']});
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[
+  {name:'read',args:{path:'input.json'}},
+  {name:'submit_review',args:{result:decision('unknown')}},
+  {name:'read',args:{path:join(directory,'evidence','late-group-diagnostics.jsonl'),offset:7,limit:1}},
+  {name:'submit_review',args:{result:decision('actor')}}
+ ][n]);
+ const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
+ assert.equal(result.value.cause,'actor');assert.equal(provider.requests(),5);
+ assert.equal((await load(join(directory,'read-evidence.json'))).length,7);
+ const full=(await readFile(join(directory,'evidence','late-group-occurrences.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.equal(full.length,7);assert.equal(full.at(-1).reference,'failure:6');
+});
+
+test('a resumed native review validates saved retrieval citations without querying again',async t=>{
+ const {reviewSession}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'retrieval-resume');let phase=0;
+ const provider=await scriptedReview(t,f.root,body=>phase&& !body.messages.some(m=>m.role==='tool')?{name:'submit_review',args:{result:{memoryRefs:['memory:old-entry']}}}:null);
+ const validate=(result,records)=>{assert.ok(records.some(r=>r.entries.some(e=>e.collection==='memory'&&e.chunk_id==='old-entry')));return result;};
+ const input={directory,config:{actor:provider.profile},prompt:{task:'Retain retrieved references'},validate,seconds:30};
+ await assert.rejects(reviewSession(input),/did not submit/);const session=await load(join(directory,'native-session.json'));
+ await writeFile(join(directory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',chunk_id:'old-entry'}]})+'\n');phase=1;
+ const resumed=await reviewSession(input);assert.deepEqual(resumed.value.memoryRefs,['memory:old-entry']);assert.equal(resumed.retrievals.length,1);
+ assert.deepEqual(await load(join(directory,'native-session.json')),session);assert.equal(provider.requests(),3);
+});
+
+
+test('harness learning remains a user intervention and cannot consume a Phase 1 slot',async t=>{
+ const f=await fixture(t);let learned=0;
+ const report=await runReview(f.options,{classify:async args=>({...await classify(args),cause:'harness',coverage:'uncovered',guidanceIds:[]}),
+  review:async({groups})=>({action:'learn',reason:'Harness closure needs operator attention',groupIds:groups.map(g=>g.id),question:'Repair a missing harness receipt?',hypothesis:'Owned execution proof is missing',requiredEvidence:'Operator closure',learningTarget:'cpu'}),
+  learn:async()=>{learned++;throw Error('Harness requests must not reach an actor');}});
+ assert.equal(learned,0);assert.equal(report.learning[0].status,'user-required');assert.equal(report.learning[0].intervention,'user-required');
+ const request=Object.values((await load(join(f.options.output,'review.json'))).learning)[0],state=new State(join(f.root,'harness-queue.sqlite'));try{
+  assert.throws(()=>enqueueLearningRequest(state,request));
+  assert.equal(claimLearningRequest(state,{skills:{review:{enabled:true}}},{draft:'unused',target:'a3',topic:'debug'}),null);
+ }finally{state.close();}
 });
