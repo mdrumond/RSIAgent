@@ -83,7 +83,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const abort=()=>interrupt(signal.reason??Error('Sample interrupted'));signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
-  if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
+  if(bridge)await bridge.knowledge.prepareSession(session,{signal:sampleSignal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
   await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';

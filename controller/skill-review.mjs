@@ -82,9 +82,10 @@ export async function guidanceEntries(root,version){
   return Promise.all(Object.entries(map).map(async([scope,file])=>({id:scope+'-baseline',scope,text:await readFile(join(directory,file),'utf8'),critical:true,negative:false})));
  }
 }
-export function validateClassification(value,group,entries){
+export function validateClassification(value,group,entries,{requireBucket=false}={}){
  if(!value||typeof value!=='object')throw Error('Submit a classification object');
  if(!['actor','harness','specification','provider','unknown'].includes(value.cause))throw Error('cause must be actor, harness, specification, provider or unknown');
+ if(requireBucket&&value.bucket===undefined)throw Error('Explicit failure bucket required by bucketPolicy');
  if(value.bucket!==undefined&&!['harness','correctness','optimization'].includes(value.bucket))throw Error('Unknown failure bucket');
  if(!value.reason?.trim())throw Error('reason must explain the observed evidence; stage labels alone do not establish ownership');
  if(!['covered','uncovered','unknown'].includes(value.coverage))throw Error('coverage must be covered, uncovered or unknown');
@@ -96,12 +97,12 @@ export function validateClassification(value,group,entries){
  if(!Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!refs.has(ref)))throw Error('evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group');
  return {...value,groupId:group.id,intervention:value.cause==='harness'||value.bucket==='harness'?'user-required':null};
 }
-export function validateClassificationBatch(value,groups,entries){
+export function validateClassificationBatch(value,groups,entries,policy){
  const rows=value?.classifications;if(!Array.isArray(rows))throw Error('classifications must be an array with one result per supplied groupId');
  const ids=rows.map(row=>row?.groupId);
  if(rows.length!==groups.length||new Set(ids).size!==groups.length||ids.some(id=>!groups.some(g=>g.id===id)))
   throw Error('classifications must contain exactly one result for EVERY supplied groupId, with no duplicates or unknown IDs');
- return {classifications:rows.map(row=>validateClassification(row,groups.find(g=>g.id===row.groupId),entries))};
+ return {classifications:rows.map(row=>validateClassification(row,groups.find(g=>g.id===row.groupId),entries,policy))};
 }
 export function validateReview(value,groups){
  if(!value||!['update','learn','no-change'].includes(value.action)||!value.reason?.trim()||

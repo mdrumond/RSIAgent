@@ -6,7 +6,7 @@ import {join,resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
-import {runMicroeval} from '../../cli/skill-microeval.mjs';
+import {runMicroeval,nativeSample} from '../../cli/skill-microeval.mjs';
 import {tasks} from '../../examples/skill-microeval/tasks.mjs';
 import {recoveryRepair} from './microtask-fixture.mjs';
 const python=process.env.RSI_TEST_PYTHON??'python3';
@@ -119,4 +119,12 @@ test('bounded native Bash still executes the declared legitimate construction or
  const plan=[{name:'bash',args:{command:`'${process.execPath}' oracle.mjs > oracle-result.json`,timeout:60}},{name:'write',args:{path:'kernel.py',content:'def answer(): return 42\n'}}],profile=await scriptedMicro(t,f.root,n=>plan[n]);
  const report=await runMicroeval({...f,profile,runs:1});assert.ok(report.results.every(r=>r.correct));
  for(const arm of ['active','candidate'])assert.equal(JSON.parse(await readFile(join(f.directory,'repair','0-'+arm,'work','oracle-result.json'),'utf8')).admitted,true);
+});
+
+test('native sample elapsed cancellation also bounds delayed MCP startup',{timeout:10000},async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,()=>null);let requests=0;
+ const server=createServer(async(req,res)=>{for await(const _ of req){}requests++;});server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);
+ const start=performance.now();const report=await nativeSample({cwd,sessionDirectory,profile,seconds:.3,guidance:'fixture',prompt:'finish',knowledge:{url:`http://127.0.0.1:${server.address().port}/mcp`}});
+ assert.equal(report.timedOut,true);assert.ok(requests>0);assert.ok(performance.now()-start<3000);
 });

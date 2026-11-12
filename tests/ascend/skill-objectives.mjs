@@ -66,6 +66,7 @@ test('paired replay preserves partial receipts and does not replay uncertain exe
   if(++count===2)throw Error('interrupted');return {correct:true,activeKernelSha256:report.results[0].kernelSha256,candidateKernelSha256:report.results[0].kernelSha256,activeLatencySeconds:1,candidateLatencySeconds:.9,evidence:{alternating:true}};
  }}),/interrupted/);
  const saved=JSON.parse(await readFile(join(f.directory,'results.json')));assert.equal(saved.pairedTimings.length,1);assert.ok(saved.pairedReplay.runningPair);
+ const {evaluationSettled}=await import('../../cli/skill-review-native.mjs');assert.equal(await evaluationSettled({directory:f.directory}),false);
  await assert.rejects(finalizeKernelPairs({directory:f.directory,seconds:20},{measure:()=>{throw Error('replay');}}),/unresolved/);
  const retained=JSON.parse(await readFile(join(f.directory,'results.json')));assert.equal(retained.pairedReplay.startedAt,saved.pairedReplay.startedAt);
 });

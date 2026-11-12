@@ -39,3 +39,13 @@ export function evaluateSkillObjective(results,{objective,projectIds,runs=2,pair
  return {...report,passes,speedup,tasks:tasks.map(({projectId,logSpeedup})=>({projectId,speedup:Math.exp(logSpeedup)})),promote,
   reason:promote?'kernel-speedup':'insufficient-kernel-speedup'};
 }
+
+export function evaluationSettings(evaluations,objective){
+ const value=evaluations?.[objective];
+ if(!value||!Array.isArray(value.tasks)||value.tasks.length!==5||new Set(value.tasks.map(t=>t.id)).size!==5||
+  !value.binding||typeof value.binding!=='object'||!Object.keys(value.binding).length)throw Error('Five frozen tasks and a registered runtime binding required for '+objective);
+ for(const task of value.tasks)if(task.bucket!==objective||task.kind!=='a3-kernel'||!task.files?.['kernel.py']||!task.checker||!task.prompt||objective==='optimization'&&!task.pairedChecker)throw Error('Runnable objective-matched A3 tasks required');
+ const developmentSeconds=value.developmentSeconds??3600,pairedSeconds=objective==='optimization'?(value.pairedSeconds??900):0;
+ if(!Number.isFinite(developmentSeconds)||developmentSeconds<=0||!Number.isFinite(pairedSeconds)||pairedSeconds<0||objective==='optimization'&&pairedSeconds===0)throw Error('Positive elapsed evaluation allocations required');
+ return {...value,developmentSeconds,pairedSeconds};
+}

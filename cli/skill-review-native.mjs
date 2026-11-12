@@ -12,10 +12,10 @@ import {fileURLToPath} from 'node:url';
 import {ownerStopped} from '../controller/lifecycle.mjs';
 import {setTimeout as delay} from 'node:timers/promises';
 import {refillProjects} from './project-generation.mjs';
-import {runMicroeval} from './skill-microeval.mjs';
+import {runMicroeval,finalizeKernelPairs} from './skill-microeval.mjs';
 import {tasks} from './microtasks/tasks.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
-import {evaluateSkillObjective} from '../controller/skill-objectives.mjs';
+import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
 
 async function reviewEvidence(directory,groups=[]){
  const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
@@ -137,11 +137,15 @@ export async function nativeLearn({directory,config,request,signal,seconds},depe
   return {status:passed?'verified-cpu':unfinished?'postprocessing-pending':'inconclusive',project:spec,evidence:spec.generation?.checks??[],attempts:completed,claim:'Independent CPU verification and actor project evidence only; no GPU claim'};
  }finally{state.close();}
 }
-export async function nativeEvaluate({directory,active,candidate,config,signal,seconds,objective}){
+export async function nativeEvaluate({directory,active,candidate,config,signal,seconds,objective},dependencies={}){
+ const ops={runMicroeval,finalizeKernelPairs,...dependencies},settings=objective&&objective!=='legacy'?evaluationSettings(config.skill_review_evaluations,objective):null;
+ const selected=settings?.tasks??config.skill_review_tasks??tasks;
  let frozen;try{frozen=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
- const report=await runMicroeval({directory,objective,skills:{active,candidate},tasks:config.skill_review_tasks??tasks,profile:config.actor,python:config.python??'python3',runs:2,seconds:objective&&objective!=='legacy'?180:90,
-  totalSeconds:frozen?.totalSeconds??seconds,signal,resume:true,shadow:true});
- return {decision:evaluateSkillObjective(report.results,{objective,projectIds:(config.skill_review_tasks??tasks).map(t=>t.id),runs:2,margin:.05,pairedTimings:report.pairedTimings}),report};
+ if(settings&&frozen&&frozen.totalSeconds!==settings.developmentSeconds)throw Error('Frozen development allocation changed');
+ let report=await ops.runMicroeval({directory,objective,binding:settings?.binding,knowledge:settings?.knowledge,skills:{active,candidate},tasks:selected,profile:config.actor,python:config.python??'python3',runs:2,seconds:settings?180:90,
+  totalSeconds:frozen?.totalSeconds??settings?.developmentSeconds??seconds,signal,resume:true,shadow:true});
+ if(objective==='optimization'&&report.status==='complete')report=await ops.finalizeKernelPairs({directory,python:config.python??'python3',seconds:settings.pairedSeconds,signal});
+ return {decision:evaluateSkillObjective(report.results,{objective,projectIds:selected.map(t=>t.id),runs:2,margin:.05,pairedTimings:report.pairedTimings}),report};
 }
 
 export async function stopReviewKnowledge(root){
@@ -153,5 +157,5 @@ export async function stopReviewKnowledge(root){
 
 export async function evaluationSettled({directory}){
  let report;try{report=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code==='ENOENT')return true;throw e;}
- return !report.runningSample&&(!report.owner||await ownerStopped(report.owner));
+ return !report.runningSample&&!report.pairedReplay?.runningPair&&(!report.owner||await ownerStopped(report.owner));
 }
