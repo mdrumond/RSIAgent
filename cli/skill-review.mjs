@@ -5,7 +5,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../controller/state.mjs';
-import {inventoryFailures,guidanceEntries,validateClassification,validateReview,enqueueLearningRequest} from '../controller/skill-review.mjs';
+import {inventoryFailures,guidanceEntries,validateClassification,validateClassificationBatch,validateReview,enqueueLearningRequest} from '../controller/skill-review.mjs';
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {validateSkillGrounding} from '../controller/skill-evidence.mjs';
 import {publishSkillVersion} from './skills.mjs';
@@ -49,25 +49,40 @@ export async function runReview(options,dependencies={}){
   state??={format:1,signature,startedAt:Date.now(),seconds,inventory:null,classifications:{},reviews:{},learning:{},candidates:{},errors:[],stats:[]};
   const remaining=()=>Math.max(0,seconds-(Date.now()-state.startedAt)/1000);
   const persist=async()=>{state.elapsedSeconds=(Date.now()-state.startedAt)/1000;await save(file,state);};
-  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
+  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(Error('Review elapsed allocation exhausted')),Math.min(2147483647,remaining()*1000));
   const signal=options.signal?AbortSignal.any([options.signal,controller.signal]):controller.signal;
   const invoke=async(name,input,cap=240)=>{signal.throwIfAborted();if(remaining()<=0)throw Error('Review elapsed allocation exhausted');
    const allocation=Math.min(cap,remaining()),bounded=AbortSignal.any([signal,AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
-   const started=performance.now();try{const result=await ops[name]({...input,signal:bounded,seconds:allocation});if(result.stats)state.stats.push({stage:name,key:input.key,...result.stats});return result.value??result;}
-   finally{(state.timings??=[]).push({stage:name,key:input.key,elapsedSeconds:(performance.now()-started)/1000});}};
+   const started=performance.now(),telemetry={stage:name,key:input.key,...(input.groups?{groupCount:input.groups.length,groupIds:input.groups.map(g=>g.id)}:input.group?{groupCount:1,groupIds:[input.group.id]}:{}),...(input.sourceId?{sourceId:input.sourceId,guidanceVersion:input.guidanceVersion}:{})};
+   try{const result=await ops[name]({...input,signal:bounded,seconds:allocation});if(result.stats)state.stats.push({...telemetry,...result.stats});return result.value??result;}
+   finally{(state.timings??=[]).push({...telemetry,elapsedSeconds:(performance.now()-started)/1000});}};
   const selected=stage==='all'?stages.filter(s=>s!=='enqueue'):[stage];
   try{
    if(selected.includes('inventory')&&!state.inventory){state.inventory=await inventoryFailures(sources);await persist();}
    if(!state.inventory)throw Error('Run inventory first');
    const campaigns=new Map(state.inventory.campaigns.map(c=>[c.id,c]));
    const configFor=async id=>forkCampaign(campaigns.get(id),join(output,'campaigns',id),options);
-   if(selected.includes('classify'))for(const group of state.inventory.groups){
-    if(state.classifications[group.id])continue;
-    const campaign=campaigns.get(group.sourceId),entries=await guidanceEntries(campaign.root,campaign.activeVersion);
-    const directory=join(output,'classifications',group.id);await mkdir(directory,{recursive:true});
-    state.classifications[group.id]=await invoke('classify',{directory,key:group.id,config:await configFor(group.sourceId),group,entries,validate:r=>validateClassification(r,group,entries)});
-    state.classifications[group.id]=validateClassification(state.classifications[group.id],group,entries);await persist();
+   if(selected.includes('classify')){
+    const pending=state.inventory.groups.filter(group=>!state.classifications[group.id]);
+    while(pending.length){
+     const first=pending[0],campaign=campaigns.get(first.sourceId),entries=await guidanceEntries(campaign.root,campaign.activeVersion);
+     const legacy=await optional(join(output,'classifications',first.id,'native-session.json'));
+     if(dependencies.classify&&!dependencies.classifyBatch||legacy){
+      const group=pending.shift(),directory=join(output,'classifications',group.id);await mkdir(directory,{recursive:true});
+      const result=await invoke('classify',{directory,key:group.id,sourceId:group.sourceId,guidanceVersion:campaign.activeVersion,config:await configFor(group.sourceId),group,entries,validate:r=>validateClassification(r,group,entries)});
+      state.classifications[group.id]=validateClassification(result,group,entries);
+     }else{
+      const groups=[];for(let i=0;i<pending.length&&groups.length<8;){
+       const group=pending[i];if(group.sourceId!==first.sourceId||await optional(join(output,'classifications',group.id,'native-session.json'))){i++;continue;}
+       groups.push(...pending.splice(i,1));
+      }
+      const key=hash(groups.map(g=>g.id)),directory=join(output,'classification-batches',key);await mkdir(directory,{recursive:true});
+      const result=await invoke('classifyBatch',{directory,key,sourceId:first.sourceId,guidanceVersion:campaign.activeVersion,config:await configFor(first.sourceId),groups,entries,validate:r=>validateClassificationBatch(r,groups,entries)});
+      for(const row of validateClassificationBatch(result,groups,entries).classifications)state.classifications[row.groupId]=row;
+     }
+     await persist();
+    }
    }
    const buckets=new Map();
    for(const group of state.inventory.groups){const c=state.classifications[group.id];if(!c)continue;

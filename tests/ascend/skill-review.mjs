@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
-import {inventoryFailures,validateClassification,claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
+import {inventoryFailures,validateClassification,validateClassificationBatch,claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
 import {runReview} from '../../cli/skill-review.mjs';
 import {run as skillInput} from '../../cli/skill-input.mjs';
 import {evaluateNonInferiority} from '../../controller/skill-noninferiority.mjs';
@@ -296,4 +296,42 @@ test('native Pi blocks an outside workspace grep before execution and accepts co
  assert.equal(result.value.coverage,'covered');assert.equal(provider.requests(),5);assert.equal(outsideActions,0);
  const blocks=(await readFile(join(directory,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
  assert.equal(blocks.length,1);assert.equal(blocks[0].tool,'grep');assert.equal(blocks[0].blocked,true);assert.equal(blocks[0].path,outside);
+});
+
+
+test('native classification batches validate all group IDs and correct missing or duplicate outputs',async t=>{
+ const {nativeClassifyBatch}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'native-batch');
+ const groups=['first','second'].map(id=>({id,occurrences:[{reference:id+':event',data:{message:id+' failure'},artifacts:[]}]}));
+ const rows=groups.map(group=>({groupId:group.id,cause:'unknown',coverage:'uncovered',guidanceIds:[],reason:'The evidence is inconclusive.',evidenceRefs:[group.occurrences[0].reference]}));
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[
+  {name:'read',args:{path:'input.json'}},
+  {name:'submit_review',args:{result:{classifications:rows.slice(0,1)}}},
+  {name:'submit_review',args:{result:{classifications:[rows[0],rows[0]]}}},
+  {name:'submit_review',args:{result:{classifications:rows}}}
+ ][n]);
+ const result=await nativeClassifyBatch({directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])});
+ assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),5);
+});
+
+test('classification batches resume unfinished groups without repeating completed outputs or resetting the deadline',async t=>{
+ const f=await fixture(t),state=new State(join(f.source,'state.sqlite')),attempt=state.db.prepare('SELECT id FROM attempts').get().id;
+ for(let i=0;i<10;i++)state.event(attempt,'failure-recorded',{message:'Distinct failure '+i});state.close();
+ await runReview({...f.options,stage:'inventory'});let calls=0;const batches=[];
+ const classifyBatch=async({groups,entries,validate})=>{batches.push(groups.map(g=>g.id));if(++calls===2)throw Error('Interrupted batch');
+  return {value:validate({classifications:await Promise.all(groups.map(async group=>({...await classify({group,validate:r=>r}),groupId:group.id})))}),stats:{tokens:{total:groups.length*10}}};};
+ await assert.rejects(runReview({...f.options,stage:'classify'},{classifyBatch}),/Interrupted batch/);
+ const before=await load(join(f.options.output,'review.json')),completed=Object.keys(before.classifications);assert.ok(completed.length>1);
+ await runReview({...f.options,stage:'classify'},{classifyBatch});
+ const after=await load(join(f.options.output,'review.json'));assert.equal(after.startedAt,before.startedAt);assert.equal(Object.keys(after.classifications).length,after.inventory.groups.length);
+ assert.ok(batches.at(-1).every(id=>!completed.includes(id)));
+ const recorded=after.timings.find(t=>t.stage==='classifyBatch');assert.equal(recorded.groupCount,recorded.groupIds.length);assert.equal(recorded.sourceId,'a3');assert.equal(recorded.guidanceVersion,'baseline');
+ assert.ok(after.stats.some(s=>s.stage==='classifyBatch'&&s.groupCount===s.groupIds.length));
+});
+
+test('batch rollout resumes a pending legacy group session before batching newer work',async t=>{
+ const f=await fixture(t);await runReview({...f.options,stage:'inventory'});const initial=await load(join(f.options.output,'review.json')),group=initial.inventory.groups[0];
+ const directory=join(f.options.output,'classifications',group.id);await mkdir(directory,{recursive:true});const retained={path:'retained-native-session.jsonl'};await writeFile(join(directory,'native-session.json'),JSON.stringify(retained));
+ let singles=0,batches=0;
+ await runReview({...f.options,stage:'classify'},{classify:async args=>{singles++;assert.equal(args.group.id,group.id);assert.equal(args.directory,directory);return classify(args);},classifyBatch:async args=>{batches++;return args.validate({classifications:await Promise.all(args.groups.map(async g=>({...await classify({group:g,validate:r=>r}),groupId:g.id})))});}});
+ assert.equal(singles,1);assert.equal(batches,1);assert.deepEqual(await load(join(directory,'native-session.json')),retained);
 });

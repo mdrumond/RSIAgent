@@ -21,6 +21,12 @@ Optional `evidence-files.json` maps original artifact paths to copied relative
 
 The actor profile defaults to the snapshot's skill writer or actor; an explicit
 `profile` can override it. Credentials remain in environment/ignored profile files.
+Native classification batches up to eight groups sharing one source and current
+guidance version in a Pi session; every group ID and evidence reference is validated
+before the batch is saved. Existing individual native sessions resume in place.
+Injected single-group classifier adapters remain supported. Timing/token receipts
+include group IDs/counts so throughput can be measured directly.
+
 Stages `inventory`, `classify`, `propose`, `learn`, `evaluate`, `report` are
 independently runnable. Keep sources, profile, Python, limits and output unchanged
 when resuming. The original elapsed deadline spans all invocations; report remains

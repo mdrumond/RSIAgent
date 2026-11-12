@@ -95,6 +95,13 @@ export function validateClassification(value,group,entries){
  if(!Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!refs.has(ref)))throw Error('evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group');
  return {...value,groupId:group.id,intervention:value.cause==='harness'?'user-required':null};
 }
+export function validateClassificationBatch(value,groups,entries){
+ const rows=value?.classifications;if(!Array.isArray(rows))throw Error('classifications must be an array with one result per supplied groupId');
+ const ids=rows.map(row=>row?.groupId);
+ if(rows.length!==groups.length||new Set(ids).size!==groups.length||ids.some(id=>!groups.some(g=>g.id===id)))
+  throw Error('classifications must contain exactly one result for EVERY supplied groupId, with no duplicates or unknown IDs');
+ return {classifications:rows.map(row=>validateClassification(row,groups.find(g=>g.id===row.groupId),entries))};
+}
 export function validateReview(value,groups){
  if(!value||!['update','learn','no-change'].includes(value.action)||!value.reason?.trim()||
   !Array.isArray(value.groupIds)||!value.groupIds.length||value.groupIds.some(id=>!groups.some(g=>g.id===id)))throw Error('Review requires a disposition and known failure groups');
