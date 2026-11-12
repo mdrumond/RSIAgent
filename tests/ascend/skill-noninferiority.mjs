@@ -58,6 +58,22 @@ test('every candidate correctness failure blocks eligibility despite cheaper exe
   assert.equal(decide(results).reason, 'correctness-regression');
   for (const row of results) if (row.arm === 'active') row.correct = false;
   assert.equal(decide(results).promote, false);
+  assert.equal(decide(results).reason, 'baseline-failed');
+});
+
+test('shared baseline failures are inconclusive while mixed genuine regressions stay rejected', () => {
+  const results = observations();
+  results[0].correct = false;results[1].correct = false;
+  const before = structuredClone(results);
+  const shared = decide(results);
+  assert.equal(shared.promote, false);
+  assert.equal(shared.reason, 'baseline-failed');
+  assert.deepEqual(shared.metrics, {});
+  assert.deepEqual(results, before);
+  // A failure on a different active-pass pair remains a real regression.
+  results[3].correct = false;
+  assert.equal(decide(results).reason, 'correctness-regression');
+  assert.equal(decide(results).promote, false);
 });
 
 test('a correctness improvement is reported but does not bypass resource accounting', () => {
