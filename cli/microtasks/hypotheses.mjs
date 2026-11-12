@@ -23,6 +23,13 @@ function fault(kind,n){
  if(kind==='runtime-identity')report.runtime.observed.build='other-'+n;
  if(kind==='candidate-traceback')report.trace=[{path:report.protectedPrefix+'bench.py'},{path:report.candidatePrefix+'kernel.py',error:'Invalid tensor argument'}];
  if(kind==='protected-traceback')report.trace=[{path:report.candidatePrefix+'entry.py'},{path:report.protectedPrefix+'reference.py',error:'Trusted fixture failure'}];
+ if(n===2){
+  if(kind==='lease-ownership'){report.lease='clear';report.trace=[{path:report.candidatePrefix+'kernel.py',error:'Candidate argument failure'}];}
+  if(kind==='runtime-identity'){report.runtime.observed={...report.runtime.expected};report.trace=[{path:report.candidatePrefix+'kernel.py',error:'Candidate argument failure'}];}
+  if(kind==='candidate-traceback')report.trace.at(-1).path=report.protectedPrefix+'reference.py';
+  if(kind==='protected-traceback')report.trace.at(-1).path=report.candidatePrefix+'kernel.py';
+  if(kind==='missing-origin')report.lease='missing-receipt';
+ }
  return report;
 }
 function dtype(kind,n){
@@ -32,7 +39,12 @@ function dtype(kind,n){
  if(kind==='cpu-reference'){report.referenceDtype='float64';report.verification={passed:true,sourceHash:report.sourceHash};}
  if(kind==='frozen-double'){report.required='float64';report.requested='float64';report.baselinePassed=false;report.error='target op rejects double';}
  if(n===1&&kind==='cpu-reference'){report.supported.push('float64');report.requested='float64';report.required='float64';}
- if(n===2&&kind==='cpu-reference')report.verification.sourceHash='older-source';
+ if(n===2){
+  if(kind==='unsupported-source'){report.requested='float32';report.error=null;report.baselinePassed=true;}
+  if(['warning-only','output-regression'].includes(kind)){report.verification={passed:true,sourceHash:report.sourceHash};report.error=null;}
+  if(kind==='cpu-reference')report.verification.sourceHash='older-source';
+  if(kind==='frozen-double'){report.supported.push('float64');report.error=null;report.baselinePassed=true;report.verification={passed:true,sourceHash:report.sourceHash};}
+ }
  return report;
 }
 function brokenConstruction(kind,n){
@@ -64,6 +76,6 @@ export async function prepareHypothesisTasks(directory,{node=process.execPath}={
   const checker=join(directory,id+'.py');await writeFile(checker,'import json\nCONFIG=json.loads('+JSON.stringify(JSON.stringify(config))+')\n'+template);
   tasks.push({id,kind:'hypothesis-case',scopes:h.scopes,prompt,files,checker});metadata.push({id,hypothesis:h.id,case:kind,heldoutVariants:2,checkerSha256:sha(await readFile(checker,'utf8')),publicInputSha256:sha(JSON.stringify(files)),promptSha256:sha(prompt)});
  }
- const manifest={format:1,catalogue:'skill-hypotheses-v1',hypotheses,cases:metadata,oracleSha256:sha(await readFile(oracle,'utf8')),productionAdmissionSha256:sha(await readFile(new URL('../project-generation.mjs',import.meta.url),'utf8')),commandCompilerSha256:sha(await readFile(new URL('../../controller/project-commands.mjs',import.meta.url),'utf8')),claim:'CPU contract/ownership evidence only; no device performance claim'};
+ const manifest={format:1,catalogue:'skill-hypotheses-v2',hypotheses,cases:metadata,oracleSha256:sha(await readFile(oracle,'utf8')),productionAdmissionSha256:sha(await readFile(new URL('../project-generation.mjs',import.meta.url),'utf8')),commandCompilerSha256:sha(await readFile(new URL('../../controller/project-commands.mjs',import.meta.url),'utf8')),claim:'CPU contract/ownership evidence only; no device performance claim'};
  await writeFile(join(directory,'catalogue.json'),JSON.stringify(manifest,null,2));return {tasks,manifest,byHypothesis:Object.fromEntries(hypotheses.map(h=>[h.id,tasks.filter(t=>t.id.startsWith(h.id+'-'))]))};
 }

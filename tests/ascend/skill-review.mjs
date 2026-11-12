@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
 import {inventoryFailures,validateClassification,validateClassificationBatch,claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
@@ -382,4 +382,27 @@ test('question-specific origins keep actor learning eligible in a mixed harness 
  for(const stage of ['inventory','classify','propose'])await runReview({...f.options,stage},deps);
  const pending=await runReview({...f.options,stage:'report'},deps);assert.equal(pending.learning.find(r=>r.question==='CPU conformance').status,'pending');assert.equal(pending.learning.find(r=>r.question==='Harness closure').status,'user-required');
  await runReview({...f.options,stage:'learn'},deps);assert.equal(learned,1);
+});
+
+
+test('resume freezes attempt jobs, evidence indexes and actual copied-log bytes',async t=>{
+ const {createHash}=await import('node:crypto');
+ for(const changed of ['job','index','log'])await t.test(changed,async t=>{
+  const f=await fixture(t),db=new DatabaseSync(join(f.source,'state.sqlite'),{readOnly:true}),attempt=db.prepare('SELECT id FROM attempts').get().id;db.close();
+  const job=join(f.source,'attempts',attempt,'job.json'),log=join(f.source,'evidence','copied.log'),index=join(f.source,'evidence-files.json');
+  await mkdir(dirname(job),{recursive:true});await writeFile(job,JSON.stringify({kind:'original',mode:'phase1',skillVersion:'baseline'}));await mkdir(dirname(log),{recursive:true});await writeFile(log,'original diagnostic');
+  const digest=createHash('sha256').update('original diagnostic').digest('hex');await writeFile(index,JSON.stringify({'/original/log':{path:'evidence/copied.log',sha256:digest}}));
+  await runReview({...f.options,stage:'inventory'});const before=await load(join(f.options.output,'review.json'));
+  if(changed==='job')await writeFile(job,JSON.stringify({kind:'retry',mode:'phase1',skillVersion:'baseline'}));
+  if(changed==='index'){const metadata=await load(index);metadata['/original/log'].size=19;await writeFile(index,JSON.stringify(metadata));}
+  if(changed==='log')await writeFile(log,'changed diagnostic');
+  await assert.rejects(runReview({...f.options,stage:'report'}));assert.equal((await load(join(f.options.output,'review.json'))).startedAt,before.startedAt);
+ });
+});
+
+test('a copied log must match its declared SHA256 before the first review starts',async t=>{
+ const f=await fixture(t);await mkdir(join(f.source,'evidence'));await writeFile(join(f.source,'evidence','bad.log'),'actual bytes');
+ await writeFile(join(f.source,'evidence-files.json'),JSON.stringify({'/original/bad.log':{path:'evidence/bad.log',sha256:'0'.repeat(64)}}));
+ await assert.rejects(runReview({...f.options,stage:'inventory'}));
+ await assert.rejects(readFile(join(f.options.output,'review.json')),{code:'ENOENT'});
 });

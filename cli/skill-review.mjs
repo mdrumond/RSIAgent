@@ -14,6 +14,17 @@ const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function optional(path){try{return await load(path);}catch(e){if(e.code!=='ENOENT')throw e;return null;}}
 async function save(path,value){const tmp=path+'.'+randomUUID();await writeFile(tmp,JSON.stringify(value,null,2)+'\n');await rename(tmp,path);}
 async function fileHash(path){const d=createHash('sha256');for await(const chunk of createReadStream(path))d.update(chunk);return d.digest('hex');}
+async function optionalHash(path){try{return await fileHash(path);}catch(error){if(error.code!=='ENOENT')throw error;return null;}}
+async function dependentInputs(root){
+ const db=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});let attempts;try{attempts=db.prepare('SELECT id FROM attempts ORDER BY id').all();}finally{db.close();}
+ const jobs=[];for(const {id}of attempts)jobs.push({id,sha256:await optionalHash(join(root,'attempts',id,'job.json'))});
+ const indexPath=join(root,'evidence-files.json'),indexHash=await optionalHash(indexPath),logs=[];
+ if(indexHash){const index=await load(indexPath);for(const [original,record]of Object.entries(index).sort(([a],[b])=>a.localeCompare(b)))if(record.path){
+  const actual=await fileHash(join(root,record.path));if(record.sha256&&record.sha256.toLowerCase()!==actual)throw Error('Copied evidence SHA256 mismatch: '+original);
+  logs.push({original,path:record.path,sha256:actual});
+ }}
+ return {jobs,evidenceIndex:indexHash,logs};
+}
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const stages=['inventory','classify','propose','learn','evaluate','report','enqueue'];
 async function forkCampaign(source,directory,options){
@@ -55,7 +66,7 @@ export async function runReview(options,dependencies={}){
  if(![options.maxCandidates??3,options.maxLearning??2].every(n=>Number.isSafeInteger(n)&&n>=0))throw Error('Nonnegative candidate and learning project targets required');
  const stage=options.stage??'all';if(stage!=='all'&&!stages.includes(stage))throw Error('Unknown review stage');
  await mkdir(output,{recursive:true});
- const frozen=[];for(const source of sources){const cfg=await load(join(source.root,'instance.json'));frozen.push({root:source.root,config:hash(cfg),state:await fileHash(join(source.root,'state.sqlite')),knowledge:await fileHash(join(source.root,'knowledge.sqlite')),guidance:hash(await guidanceEntries(source.root,cfg.skills.activeVersion))});}
+ const frozen=[];for(const source of sources){const cfg=await load(join(source.root,'instance.json'));frozen.push({root:source.root,config:hash(cfg),state:await fileHash(join(source.root,'state.sqlite')),knowledge:await fileHash(join(source.root,'knowledge.sqlite')),guidance:hash(await guidanceEntries(source.root,cfg.skills.activeVersion)),dependencies:await dependentInputs(source.root)});}
  const lockConfig={root:output,skill_queue_seconds:1};new State(join(output,'state.sqlite')).close();
  return withSkillLock(lockConfig,async()=>{
   const file=join(output,'review.json'),signature=hash({sources,frozen,profile:options.profile??null,python:options.python??null,seconds,maxCandidates:options.maxCandidates??3,maxLearning:options.maxLearning??2});

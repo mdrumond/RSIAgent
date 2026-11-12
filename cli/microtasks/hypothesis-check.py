@@ -54,7 +54,10 @@ def dtype(report):
 for variant in CONFIG['variants']:
     before = copy.deepcopy(variant)
     if CONFIG['hypothesis'] == 'construction-admissibility':
-        proposal = module.repair_proposal(copy.deepcopy(variant['proposal']))
+        argument = copy.deepcopy(variant['proposal'])
+        original_argument = copy.deepcopy(argument)
+        proposal = module.repair_proposal(argument)
+        assert argument == original_argument, 'proposal argument mutated'
         assert isinstance(proposal, dict)
         for key in ('goal', 'performance_goal'):
             assert proposal.get(key) == variant['proposal'].get(key), ('changed workload', key)

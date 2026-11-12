@@ -6,6 +6,7 @@ import {join,dirname} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {prepareHypothesisTasks,hypotheses,hypothesisForProposal,recoveryDecisionsV2} from '../../cli/microtasks/hypotheses.mjs';
 import {tasks as legacy} from '../../cli/microtasks/tasks.mjs';
+import {constructionOracle} from '../../cli/microtasks/construction-oracle.mjs';
 import {recoveryRepair} from './microtask-fixture.mjs';
 const python=process.env.RSI_TEST_PYTHON??'python3';
 const answers={
@@ -78,4 +79,27 @@ test('new recovery event-order contract accepts timestamp pairs independent of l
  const good=spawnSync(python,['-B',recoveryDecisionsV2.checker,root],{cwd:root,encoding:'utf8'});assert.equal(good.status,0,good.stderr);
  const backwardsList=recoveryRepair.replace("return ends[0]-starts[0]","return None if events[0]['phase']=='end' else ends[0]-starts[0]");
  await writeFile(join(root,'kernel.py'),recoveryDecisionsV2.files['kernel.py']+'\n'+backwardsList);assert.notEqual(spawnSync(python,['-B',old.checker,root],{cwd:root}).status,0);
+});
+
+
+test('every ownership and dtype task rejects the constant answer that fits its public incident',async t=>{
+ const f=await fixture(t);
+ for(const task of f.tasks.filter(t=>!t.id.startsWith('construction-admissibility-'))){
+  const hypothesis=f.manifest.cases.find(c=>c.id===task.id).hypothesis,cwd=await work(f.root,task,'constant',answers[hypothesis]),operation=hypothesis==='fault-ownership'?'route':'triage';
+  const publicAnswer=spawnSync(python,['-B','-c',`import importlib.util,json
+s=importlib.util.spec_from_file_location('candidate','kernel.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+print(json.dumps(m.${operation}(json.load(open('report.json')))))`],{cwd,encoding:'utf8'});assert.equal(publicAnswer.status,0,publicAnswer.stderr);
+  await writeFile(join(cwd,'kernel.py'),`def ${operation}(report): return ${JSON.stringify(JSON.parse(publicAnswer.stdout))}\n`);
+  assert.notEqual(check(task,cwd).status,0,task.id+' must require the answer-changing held-out condition');
+ }
+});
+
+test('a construction repair that mutates its argument is rejected even when its returned proposal admits',async t=>{
+ const f=await fixture(t),task=f.tasks.find(t=>t.id==='construction-admissibility-command-nesting');
+ const mutant=answers['construction-admissibility'].replace(' p=copy.deepcopy(p)\n',''),cwd=await work(f.root,task,'mutation',mutant);
+ const result=spawnSync(python,['-B','-c',`import importlib.util,json
+s=importlib.util.spec_from_file_location('candidate','kernel.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+print(json.dumps(m.repair_proposal(json.load(open('proposal.json')))))`],{cwd,encoding:'utf8'});assert.equal(result.status,0,result.stderr);
+ assert.equal((await constructionOracle({root:cwd,proposal:JSON.parse(result.stdout)})).admitted,true);
+ assert.notEqual(check(task,cwd).status,0);
 });

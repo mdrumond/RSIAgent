@@ -28,7 +28,11 @@ The distinct hypotheses are:
   Catlass DSL or actual Ascend dtype support. Proof freshness and supported-double
   variations prevent inferring validity or a blanket ban from one warning.
 
-Each case has a public incident and two held-out variants. Checkers test behavior,
+The v2 catalogue gives every ownership/dtype case an answer-changing held-out
+condition as well as path/binding variations. Constant public-answer negative
+controls must fail every such case. Construction repair arguments must remain
+unmodified, even when the returned proposal is admissible. Each case has a public
+incident and two held-out variants. Checkers test behavior,
 independent admission and immutable fixture preservation; they do not score prose
 or match proposed skill wording. Positive and negative controls are in
 `tests/ascend/skill-hypotheses.mjs`; production oracle controls are in
@@ -45,7 +49,8 @@ node cli/microtasks/construction-oracle.mjs --root PROJECT --proposal proposal.j
 
 The first command observes schema/static admission only; `--controls` also checks
 reference/negative/starter and CPU baseline behavior using native Pi execution.
-`--control baseline` selects only that actual CPU control and reports its scope in
+`--control baseline` selects only that actual CPU control; unknown or unavailable
+selectors are rejected rather than reporting an unchecked success. It reports its scope in
 `checks`; it does not establish all other controls or device qualification.
 No schema is changed to agree with a proposed lesson.
 
