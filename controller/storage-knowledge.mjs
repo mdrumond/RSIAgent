@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { KnowledgeHistory } from './knowledge-history.mjs';
 import { CampaignStorage } from './storage.mjs';
 import { State } from './state.mjs';
@@ -202,6 +203,18 @@ async function recordSkill({ state, ledger, history }, config, version, options)
   const skills = Object.fromEntries(await Promise.all(Object.entries(map).map(async ([scope, path]) =>
     [scope, await readFile(join(directory, path), 'utf8')])));
   const active=await history.state('skills');
+  if(!active&&options.promote===true&&existing?.decision==='promoted') {
+    // A copied/recovered checkpoint can retain its ledger while losing the
+    // materialized active ref. Restore the recorded decision, including any
+    // later rollback promotion, without inventing a replacement lineage.
+    const snapshot=await history.readRevision(existing.revision);
+    const expected=Object.fromEntries(Object.entries(skills).map(([scope,text])=>[scope+'.md',text]));
+    if(snapshot.event.type!=='skill-promotion'||snapshot.event.metadata?.version!==version||
+        !isDeepStrictEqual(snapshot.skills,expected))throw new Error('Stored skill promotion does not match version');
+    ledger.activate('skills',existing.revision);
+    await history.setState('skills',{revision:existing.revision});
+    return {revision:existing.revision,version,decision:'promoted'};
+  }
   const reactivation=options.promote===true&&existing?.decision==='promoted'&&existing.revision!==active?.revision;
   const proposal = `version-${version}`+(reactivation?`-reactivate-${active.revision.slice(0,12)}`:'');
   let candidate = await history.ref(`refs/heads/skills/${proposal}`);

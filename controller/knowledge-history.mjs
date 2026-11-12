@@ -134,21 +134,23 @@ export class KnowledgeHistory {
       }
       if (new Set(deliveries).size !== deliveries.length) throw new Error('Duplicate delivery id');
       const previous = await Promise.all(deliveries.map(ref => this.ref(ref)));
-      let revision;
-      if (previous.some(Boolean)) {
-        if (!previous.every(ref => ref && ref === previous[0])) throw new Error('Delivery batch overlaps another commit');
-        revision = previous[0];
-        const snapshot = await this.readRevision(revision);
-        if (snapshot.event.deliveries.length !== records.length || records.some(record =>
-          !isDeepStrictEqual(record, snapshot.memory.find(item => item.id === record.id))))
-          throw new Error('Delivery id reused with different records');
-      } else {
-        const parent = await this.ref('refs/heads/memory');
-        revision = await this.commit(parent, files, { type: 'memory', deliveries: records.map(r => r.delivery_id) });
+      // A baseline export or recovered outbox may regroup earlier deliveries.
+      // Validate each immutable receipt, not the incidental original batch size.
+      for (let i=0;i<records.length;i++) if(previous[i]) {
+        const recorded=JSON.parse(await this.git(['show',`${previous[i]}:memory/${records[i].id}.json`]));
+        if(!isDeepStrictEqual(records[i],recorded))throw new Error('Delivery id reused with different records');
+      }
+      const unseen=records.map((record,index)=>({record,index})).filter(({index})=>!previous[index]);
+      const parent=await this.ref('refs/heads/memory');
+      let revision=parent;
+      if(unseen.length) {
+        revision = await this.commit(parent,Object.fromEntries(unseen.map(({record})=>
+          [`memory/${record.id}.json`,files[`memory/${record.id}.json`]])),
+        { type:'memory',deliveries:unseen.map(({record})=>record.delivery_id) });
         // Atomic receipt + branch publication closes the commit/crash/retry window.
         await this.git(['update-ref', '--stdin'], { input:
           `start\nupdate refs/heads/memory ${revision} ${parent}\n` +
-          deliveries.map(ref => `create ${ref} ${revision}\n`).join('') + 'prepare\ncommit\n' });
+          unseen.map(({index}) => `create ${deliveries[index]} ${revision}\n`).join('') + 'prepare\ncommit\n' });
       }
       const active = await this.state('memory');
       if (active?.revision === revision) return active;

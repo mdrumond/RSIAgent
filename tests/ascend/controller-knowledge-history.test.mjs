@@ -98,7 +98,7 @@ test('stale skill candidates cannot replace newer skills; failed promotion resum
   assert.equal((await history.readRevision(latest.revision)).skills['one.md'], 'First');
 });
 
-test('invalid lessons and overlapping delivery batches leave history unchanged', async t => {
+test('invalid lessons and conflicting delivery payloads leave history unchanged', async t => {
   const history = await fixture(t);
   const initial = await history.ref('refs/heads/memory');
   await assert.rejects(history.commitMemory([{ ...lesson('bad'), evidence_refs: [] }], callbacks), /Invalid/);
@@ -106,9 +106,42 @@ test('invalid lessons and overlapping delivery batches leave history unchanged',
   const a = lesson('a');
   const b = { ...lesson('b'), id: 'other' };
   const result = await history.commitMemory([a, b], callbacks);
-  await assert.rejects(history.commitMemory([a], callbacks), /reused/);
-  await assert.rejects(history.commitMemory([a, { ...b, delivery_id: 'c' }], callbacks), /overlaps/);
+  await assert.rejects(history.commitMemory([{...a,lesson:'Changed payload'}], callbacks), /reused/);
   assert.equal(await history.ref('refs/heads/memory'), result.revision);
+});
+
+test('overlapping delivery replay preserves receipts and retries only the latest complete snapshot',async t=>{
+  const history=await fixture(t),a=lesson('a'),b={...lesson('b'),id:'other'};
+  await assert.rejects(history.commitMemory([a],{...callbacks,indexRevision:async()=>{throw Error('offline');}}),/offline/);
+  const first=await history.ref('refs/heads/memory');
+  await assert.rejects(history.commitMemory([a,b],{...callbacks,activate:async()=>{throw Error('activation offline');}}),/activation offline/);
+  const second=await history.ref('refs/heads/memory');assert.notEqual(second,first);
+  const count=await history.git(['rev-list','--count','refs/heads/memory']);
+  const reopened=await new KnowledgeHistory(history.directory).init();let indexed=0;
+  const active=await reopened.commitMemory([b,a],{...callbacks,indexRevision:async(revision,snapshot)=>{
+    indexed++;assert.equal(revision,second);assert.deepEqual(snapshot.memory.map(r=>r.delivery_id).sort(),['a','b']);return revision;
+  }});
+  assert.equal(indexed,1);assert.equal(active.revision,second);
+  assert.equal(await reopened.git(['rev-list','--count','refs/heads/memory']),count);
+  assert.deepEqual(await reopened.commitMemory([a],{indexRevision:()=>assert.fail('already indexed'),activate:()=>assert.fail('already active')}),active);
+  const {createHash}=await import('node:crypto');
+  assert.equal(await reopened.ref('refs/knowledge/deliveries/'+createHash('sha256').update('a').digest('hex')),first);
+  assert.equal(await reopened.ref('refs/knowledge/deliveries/'+createHash('sha256').update('b').digest('hex')),second);
+  await assert.rejects(reopened.commitMemory([{...a,lesson:'conflict'},{...lesson('c'),id:'new'}],callbacks),/reused/);
+  assert.equal(await reopened.ref('refs/heads/memory'),second);
+});
+
+test('mixed replay does not restore an older delivery over a corrected lesson',async t=>{
+ const history=await fixture(t),old=lesson('original');
+ await history.commitMemory([old],callbacks);
+ const corrected=await history.commitMemory([lesson('correction','Corrected guidance')],callbacks);
+ const added={...lesson('new'),id:'another'};
+ const result=await history.commitMemory([old,added],callbacks);
+ const snapshot=await history.readRevision(result.revision);
+ assert.deepEqual(snapshot.parents,[corrected.revision]);
+ assert.equal(snapshot.memory.find(r=>r.id==='health').lesson,'Corrected guidance');
+ assert.equal(snapshot.memory.find(r=>r.id==='another').delivery_id,'new');
+ assert.deepEqual(snapshot.event.deliveries,['new']);
 });
 
 test('process exit during indexing leaves a recoverable commit and delivery receipt', async t => {

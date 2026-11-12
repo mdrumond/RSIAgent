@@ -222,3 +222,54 @@ test('an existing pre-namespace delivery resumes without another memory commit',
   assert.equal(after.revision,before.revision);
   assert.equal((await f.history.readRevision(after.revision)).memory.length,1);
 });
+
+test('initialization adopts separately delivered baseline records without rewriting their history',async t=>{
+ const {DatabaseSync}=await import('node:sqlite');
+ const f=await fixture(t),invoke=async(_tool,args)=>({generation:args.revision});
+ await publishStorageMemory(f.config,lesson(1),{invoke});
+ const second=await publishStorageMemory(f.config,lesson(2),{invoke});
+ const snapshot=await f.history.readRevision(second.revision);
+ const receipts=await f.history.git(['for-each-ref','--format=%(refname) %(objectname)','refs/knowledge/deliveries']);
+ const db=new DatabaseSync(join(f.config.root,'knowledge.sqlite'));
+ db.exec('CREATE TABLE collections(name TEXT,language TEXT);CREATE TABLE chunks(collection TEXT,chunk_id TEXT,path TEXT,start_line INTEGER,end_line INTEGER,text TEXT)');
+ db.prepare('INSERT INTO collections VALUES (?,?)').run('delivered','lesson');
+ for(const record of snapshot.memory)db.prepare('INSERT INTO chunks VALUES (?,?,?,?,?,?)')
+  .run('delivered',record.id,record.id+'.json',1,1,JSON.stringify(record));
+ db.close();
+ const initialized=await initializeStorageKnowledge(f.config,f.state);
+ assert.equal(initialized.baseline.revision,second.revision);
+ assert.deepEqual((await f.history.readRevision(initialized.baseline.revision)).memory,snapshot.memory);
+ assert.equal(await f.history.git(['for-each-ref','--format=%(refname) %(objectname)','refs/knowledge/deliveries']),receipts);
+ assert.deepEqual(await initializeStorageKnowledge(f.config,f.state),initialized);
+});
+
+test('missing active skill ref restores the exact mapped promotion including rollback lineage',async t=>{
+ const f=await fixture(t);await initializeStorageKnowledge(f.config,f.state);
+ const original=await f.history.state('skills');
+ await cp(join(f.config.root,'skills/versions/initial'),join(f.config.root,'skills/versions/new'),{recursive:true});
+ await writeFile(join(f.config.root,'skills/versions/new/debug.md'),'new guidance');
+ const newer={...f.config,skills:{activeVersion:'new'}};
+ await initializeStorageKnowledge(newer,f.state);
+ await initializeStorageKnowledge(f.config,f.state);
+ const rollback=await f.history.state('skills');assert.notEqual(rollback.revision,original.revision);
+ const refs=await f.history.git(['for-each-ref','--format=%(refname) %(objectname)','refs/heads/skills']);
+ await f.history.git(['update-ref','-d','refs/knowledge/active-skills']);
+ f.state.db.prepare("DELETE FROM storage_revisions WHERE name='skills'").run();
+ assert.equal((await f.history.state('skills')),null);
+ const restored=await initializeStorageKnowledge(f.config,f.state);
+ assert.equal(restored.skills.revision,rollback.revision);
+ assert.equal(f.state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get().revision,rollback.revision);
+ assert.equal(await f.history.git(['for-each-ref','--format=%(refname) %(objectname)','refs/heads/skills']),refs);
+ assert.equal(f.state.db.prepare('SELECT revision FROM storage_skill_versions WHERE version=?').get('initial').revision,rollback.revision);
+});
+
+test('missing active skill recovery refuses changed version contents without replacing its decision',async t=>{
+ const f=await fixture(t);await initializeStorageKnowledge(f.config,f.state);
+ const original=await f.history.state('skills');
+ await f.history.git(['update-ref','-d','refs/knowledge/active-skills']);
+ await writeFile(join(f.config.root,'skills/versions/initial/debug.md'),'unrecorded edit');
+ await assert.rejects(initializeStorageKnowledge(f.config,f.state),/does not match version/);
+ assert.equal(await f.history.state('skills'),null);
+ assert.equal(f.state.db.prepare("SELECT revision FROM storage_revisions WHERE name='skills'").get().revision,original.revision);
+ assert.equal(f.state.db.prepare('SELECT revision FROM storage_skill_versions WHERE version=?').get('initial').revision,original.revision);
+});
