@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -6,10 +7,13 @@ import {join,dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
 import {inventoryFailures,validateClassification,validateClassificationBatch,claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
-import {runReview,validateReviewProposal} from '../../cli/skill-review.mjs';
+import {runReview as actualRunReview,validateReviewProposal} from '../../cli/skill-review.mjs';
 import {run as skillInput} from '../../cli/skill-input.mjs';
 import {evaluateNonInferiority} from '../../controller/skill-noninferiority.mjs';
 import {stages} from '../../controller/workflow.mjs';
+const qaAnswer=async()=>({answers:Object.fromEntries(['action','mechanism','example','evidence','objective'].map(topic=>[topic,{text:'Fixture independently assessed '+topic,refs:[]}]))});
+const qaReview=async()=>({verdict:'approved',reason:'Fixture reviewer found no material issue'});
+const runReview=(options,dependencies={})=>actualRunReview(options,{qaAnswer,qaReview,...dependencies});
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'skill-review-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -30,6 +34,24 @@ async function fixture(t){
 const classify=async({group,validate})=>validate({cause:'actor',coverage:'covered',guidanceIds:['implementation-baseline'],evidenceRefs:[group.occurrences[0].reference],reason:'Observed incorrect implementation'});
 const update=({groups})=>({action:'update',reason:'Stored repair evidence applies',groupIds:groups.map(g=>g.id),memoryRefs:['memory:one'],changes:[{action:'upsert',id:'check-boundaries',scope:'implementation',text:'Validate independent boundary cases before tuning.',critical:false,negative:false}]});
 const evaluation=(correct=true,ratio=1)=>({decision:evaluateNonInferiority(['a','b'].flatMap(projectId=>[0,1].flatMap(run=>['active','candidate'].map(arm=>({projectId,run,arm,correct:arm==='active'||correct,elapsedSeconds:arm==='candidate'?ratio:1,tokens:10})))),{projectIds:['a','b'],runs:2})});
+
+test('evaluate-only enforces QA, routes knowledge gaps, and leaves frozen legacy comparisons resumable',async t=>{
+ const f=await fixture(t);let compared=0;
+ const deps={classify,review:async args=>update(args),evaluate:async()=>{compared++;return evaluation();}};
+ for(const stage of ['inventory','classify','propose'])await runReview({...f.options,stage},deps);
+ const blocked=await runReview({...f.options,stage:'evaluate'},{...deps,qaReview:async()=>({verdict:'learn',reason:'Need compiler boundary evidence',learningRequests:[{learningTarget:'device',question:'Which boundary compiles?',hypothesis:'Target layout is constrained',requiredEvidence:'Independent target compile'}]})});
+ assert.equal(compared,0);assert.equal(blocked.candidates.length,0);assert.equal(blocked.learning.length,1);
+ assert.equal(blocked.qa[0].verdict,'learn');
+ // A comparison already frozen before this gate retains its original experiment.
+ const file=join(f.options.output,'review.json'),state=await load(file),[key,review]=Object.entries(state.reviews)[0];
+ const directory=join(f.options.output,'candidates',createHash('sha256').update(JSON.stringify(key)).digest('hex')); await mkdir(join(directory,'evaluation'),{recursive:true});
+ await writeFile(join(directory,'evaluation/manifest.json'),JSON.stringify({format:1,legacy:true}));
+ await writeFile(join(directory,'instance.json'),JSON.stringify({root:directory,skills:{activeVersion:'baseline'}}));
+ state.candidates[key]={directory,bucket:key,changes:review.changes,active:'baseline',version:'legacy'};
+ await writeFile(file,JSON.stringify(state));
+ await runReview({...f.options,stage:'all'},{...deps,qaAnswer:async()=>{throw Error('Legacy must not enter QA');},evaluate:async()=>{compared++;return {decision:{promote:false,reason:'legacy retained'}};}});
+ assert.equal(compared,1);
+});
 
 test('inventory pages all journals and includes observations in passed attempts',async t=>{
  const f=await fixture(t),db=new DatabaseSync(join(f.source,'state.sqlite'));

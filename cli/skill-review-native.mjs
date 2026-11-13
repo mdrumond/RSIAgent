@@ -105,6 +105,31 @@ export async function nativeReview(input){
   return input.validate(result);
  }});
 }
+// QA deliberately reuses retrieved evidence rather than reopening KDB or executing kernels.
+async function qaPrompt(input){
+ let memory=input.memoryEvidence;
+ if(!memory){
+  const records=await readFile(join(input.proposalDirectory??input.directory,'retrievals.jsonl'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';});
+  memory=records.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);
+ }
+ const cited=new Set(input.proposal.memoryRefs??[]);
+ memory=memory.filter(item=>cited.has(item.ref??item.citationId??`${item.collection}:${item.entry_id??item.chunk_id??item.id}`));
+ const refs=new Set((input.proposal.changes??[]).flatMap(change=>change.evidenceRefs??[]));
+ const groups=input.groups.map(group=>({...group,occurrences:group.occurrences.filter(item=>refs.has(item.reference)),linkedDiagnostics:(group.linkedDiagnostics??[]).filter(item=>refs.has(item.reference))})).filter(group=>group.occurrences.length||group.linkedDiagnostics.length);
+ return {proposal:input.proposal,baseline:input.entries,objective:input.objective,target:input.target,groups,memory,
+  questions:{action:'What is the smallest concrete actor edit, and what must remain unchanged?',mechanism:'How does that edit prevent the observed failure?',example:'Give a worked example and a counterexample or applicability boundary.',evidence:'Separate observation, mathematical deduction, and untested claims; state target applicability.',objective:'Is this correctness or optimization? Does the instruction demand unnecessary optimization?'},
+  rules:'Only supplied evidence is available. Do not run benchmarks or search live sources. Unsupported facts must remain explicit questions. Performance hypotheses need not already prove a speedup. The actor sees the skill text, not these answers.'};
+}
+export async function nativeQaAnswer(input,dependencies={}){
+ const prompt=await qaPrompt(input);
+ return (dependencies.session??reviewSession)({...input,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,previousReview:input.previousReview,
+  task:'Answer all five questions. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[]}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
+}
+export async function nativeQaReview(input,dependencies={}){
+ const prompt=await qaPrompt(input);
+ return (dependencies.session??reviewSession)({...input,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,
+  task:'Independently review the draft and five answers against supplied evidence. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
+}
 export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){
  const ops={construct:refillProjects,importProject,operate,ensureKnowledgeService,createKdbBridge,...dependencies};
  const state=new State(join(directory,'state.sqlite')),begun=performance.now();

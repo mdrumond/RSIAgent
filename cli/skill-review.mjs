@@ -11,6 +11,7 @@ import {validateSkillGrounding} from '../controller/skill-evidence.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {evaluationSettings,retrievalIdentity} from '../controller/skill-objectives.mjs';
 import {stages as workflowStages} from '../controller/workflow.mjs';
+import {runProposalQa,qaIdentity} from './skill-review-qa.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function optional(path){try{return await load(path);}catch(e){if(e.code!=='ENOENT')throw e;return null;}}
@@ -28,7 +29,7 @@ async function dependentInputs(root){
  return {jobs,evidenceIndex:indexHash,logs};
 }
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
-const stages=['inventory','classify','propose','learn','evaluate','report','enqueue'];
+const stages=['inventory','classify','propose','qa','learn','evaluate','report','enqueue'];
 async function forkCampaign(source,directory,options){
  let config=await optional(join(directory,'instance.json'));if(config)return {...config,root:directory,...(options.evaluations?{skill_review_evaluations:options.evaluations}:{})};
  const original=await load(join(source.root,'instance.json'));await mkdir(directory,{recursive:true});
@@ -68,6 +69,7 @@ function reviewReport(state){
    buckets:Object.fromEntries(['harness','correctness','optimization','legacy'].map(bucket=>[bucket,Object.values(state.classifications).filter(c=>(c.bucket??'legacy')===bucket).length])),
    failureObservations:groups.reduce((n,g)=>n+g.occurrences.length,0),classified:Object.keys(state.classifications).length,
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
+   qa:Object.entries(state.qa??{}).map(([key,q])=>({key,verdict:q.verdict,reason:q.reason,elapsedSeconds:q.elapsedSeconds,approval:q.approval})),
    reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
    userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
    learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
@@ -114,7 +116,7 @@ export async function runReview(options,dependencies={}){
   state.fingerprintVersion=2;state.legacySignature=legacySignature;
   const remaining=()=>Math.max(0,seconds-(Date.now()-state.startedAt)/1000);
   const persist=async()=>{state.elapsedSeconds=(Date.now()-state.startedAt)/1000;await save(file,state);};
-  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
+  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(Error('Review elapsed allocation exhausted')),Math.min(2147483647,remaining()*1000));
   const signal=options.signal?AbortSignal.any([options.signal,controller.signal]):controller.signal;
   const invoke=async(name,input,cap=240)=>{signal.throwIfAborted();if(remaining()<=0)throw Error('Review elapsed allocation exhausted');
@@ -129,7 +131,7 @@ export async function runReview(options,dependencies={}){
    const campaigns=new Map(state.inventory.campaigns.map(c=>[c.id,c]));
    const configFor=async id=>forkCampaign(campaigns.get(id),join(output,'campaigns',id),options);
    const rememberLearning=async()=>{for(const [key,review]of Object.entries(state.reviews)){
-    for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[])]){
+    for(const lesson of [...(review.action==='learn'?[review]:[]),...(review.learningRequests??[]),...(state.qa?.[key]?.learningRequests??[])]){
      const groupIds=lesson.groupIds??review.groupIds,id=hash([key,lesson.question,lesson.requiredEvidence,...(lesson.groupIds?[[...groupIds].sort()]:[])]),intervention=groupIds.some(group=>state.classifications[group]?.intervention==='user-required')?'user-required':null;
      if(state.learning[id]){if(intervention){state.learning[id].intervention=intervention;if(!state.learning[id].result)state.learning[id].status='user-required';await persist();}continue;}
      const request={id,key,target:campaigns.get(review.sourceId).target,intervention,learningTarget:lesson.learningTarget,question:lesson.question,hypothesis:lesson.hypothesis,requiredEvidence:lesson.requiredEvidence,groupIds};
@@ -177,6 +179,25 @@ export async function runReview(options,dependencies={}){
     state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,...(bucket.objective?{objective:bucket.objective}:{}),directory,learningRevision:learning.length};
     await rememberLearning();await persist();
    }};if(selected.includes('propose'))await propose();
+   const qualify=async key=>{
+    const review=state.reviews[key];if(review.action!=='update'||review.objective==='harness')return null;
+    const retained=Object.entries(state.candidates).find(([id,c])=>(c.bucket===key||id===key)&&Array.isArray(c.changes)&&hash(c.changes)===hash(review.changes));
+    if(retained&&(retained[1].decision||await optional(join(retained[1].directory,'evaluation','manifest.json'))))return {verdict:'grandfathered'};
+    const bucket=buckets.get(key),campaign=campaigns.get(review.sourceId),entries=await guidanceEntries(campaign.root,campaign.activeVersion);
+    const retrievalEvidenceHash=review.directory?await optionalHash(join(review.directory,'retrievals.jsonl')):null;
+    const input={key,proposal:review,proposalDirectory:review.directory,retrievalEvidenceHash,entries,objective:review.objective,target:campaign.target,groups:bucket.groups,
+     classifications:bucket.groups.map(g=>state.classifications[g.id]),config:await configFor(review.sourceId),signal,
+     validateProposal:value=>validateReviewProposal(value,bucket.groups,state.classifications)};
+    const prior=state.qa?.[key];if(prior?.approval===qaIdentity(input))return prior;
+    const directory=join(output,'qa',hash([key,qaIdentity(input)]));
+    const result=await runProposalQa({...input,directory,seconds:remaining()},{
+     qaAnswer:args=>invoke('qaAnswer',args,args.seconds),qaReview:args=>invoke('qaReview',args,args.seconds)});
+    (state.qa??={})[key]=result;
+    if(result.verdict==='approved')state.reviews[key]={...review,...result.proposal};
+    await rememberLearning();await persist();return result;
+   };
+   const qualifyAll=async()=>{for(const key of Object.keys(state.reviews))await qualify(key);};
+   if(selected.includes('qa'))await qualifyAll();
    if(selected.includes('learn'))for(const [id,request]of Object.entries(state.learning)){
     if(request.result&&request.status!=='postprocessing-pending'||request.status==='device-evidence-needed'||request.intervention==='user-required')continue;
     if(request.learningTarget==='device'){
@@ -193,9 +214,12 @@ export async function runReview(options,dependencies={}){
     }
     request.status=request.result.status;await persist();
    }
-   if(stage==='all'&&Object.values(state.learning).some(r=>r.result?.status==='verified-cpu')){await propose();await rememberLearning();}
-   if(selected.includes('evaluate'))for(const [key,review]of Object.entries(state.reviews)){
+   if(stage==='all'&&Object.values(state.learning).some(r=>r.result?.status==='verified-cpu')){await propose();await qualifyAll();await rememberLearning();}
+   if(selected.includes('evaluate'))for(let [key,review]of Object.entries(state.reviews)){
     if(review.action!=='update'||review.objective==='harness')continue;
+    const retained=Object.entries(state.candidates).find(([id,c])=>(c.bucket===key||id===key)&&Array.isArray(c.changes)&&hash(c.changes)===hash(review.changes));
+    const frozen=retained&&await optional(join(retained[1].directory,'evaluation','manifest.json'));
+    if(!frozen){const qa=await qualify(key);if(!['approved','grandfathered'].includes(qa?.verdict))continue;review=state.reviews[key];}
     const revision=hash(review.changes),legacy=state.candidates[key];
     const candidateKey=legacy&&Array.isArray(legacy.changes)&&hash(legacy.changes)===revision?key:key+':'+revision;
     if(state.candidates[candidateKey]?.decision)continue;

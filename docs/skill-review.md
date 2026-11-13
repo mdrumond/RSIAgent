@@ -27,7 +27,7 @@ before the batch is saved. Existing individual native sessions resume in place.
 Injected single-group classifier adapters remain supported. Timing/token receipts
 include group IDs/counts so throughput can be measured directly.
 
-Stages `inventory`, `classify`, `propose`, `learn`, `evaluate`, `report` are
+Stages `inventory`, `classify`, `propose`, `qa`, `learn`, `evaluate`, `report` are
 independently runnable. Keep sources, profile, Python, limits and output unchanged
 when resuming. Attempt-job metadata, the evidence index and the actual copied-log
 SHA256 values are also frozen and verified; changed inputs require a fresh review
@@ -60,6 +60,22 @@ logs, so a pre-actor label is not treated as proof of a harness defect. Related 
 proof of a skill gap. Harness faults require user intervention; their learning requests remain in that
 bucket and cannot automatically enter Phase 1. Guidance may teach
 preserving work and reporting them, never repairing harness-owned state.
+
+Before an unfrozen candidate can enter A/B, `qa` asks the writer five questions:
+concrete edit and unchanged behavior, mechanism, worked example and boundary,
+evidence and target scope, and correctness versus optimization objective. A fresh
+read-only Pi reviewer checks that the actual skill text communicates the answers.
+It can approve, request revision, request CPU/device learning, or remain inconclusive.
+Performance hypotheses do not need an existing speedup measurement to enter A/B.
+
+Each proposal has one 120-second elapsed allowance shared by answers, reviews and
+revisions; resume preserves its clock. QA reuses archived retrieved memory and
+cited diagnostics without running kernels or searching live KDB. Approval binds
+the final changes, baseline, objective, target and evidence contents. Evaluate-only
+runs enforce the same gate; already frozen comparisons and completed decisions
+remain intact. Approval admits evaluation and never activates a skill. Missing
+facts follow the existing learning route; harness faults remain user handled.
+`report.json` includes QA dispositions, elapsed time and approval fingerprints.
 
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only
