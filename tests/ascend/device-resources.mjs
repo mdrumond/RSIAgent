@@ -638,6 +638,44 @@ test('reclaimed token closure lets its original checkpoint resume without touchi
   assert.equal(JSON.parse(await readFile(fresh.receipt,'utf8')).token,fresh.token);
 });
 
+test('a retained displaced receipt closes its original fence without replacing the active reservation',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'},handles:['remote:fixture:job:old-payload']});
+  const active=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const before=await readFile(active.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,true);
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+  await assert.rejects(readFile(old.receipt),{code:'ENOENT'});
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:old-payload'));
+  assert.equal(f.commands.length,0,'only token-scoped cleanup runs, never an actor payload');
+});
+
+for(const mismatch of ['pool','physical','token'])test(`retained reservation ${mismatch} mismatch cannot dispatch cleanup`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'}});
+  const before=await readFile(old.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:mismatch==='token'?'another-token':old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(await readFile(old.receipt,'utf8'),before);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
+for(const blocked of ['live-owner','unknown-submission'])test(`retained reservation preserves ${blocked} closure guard`,async t=>{
+  const f=await fixture(t),old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  if(blocked==='unknown-submission'){
+    await old.update({owner:{...old.record.owner,start:'old-process'}});
+    await old.event('execution-submitting',{submission:'unknown-original',kind:'run'});
+  }
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);
+  assert.equal(result.reason,blocked==='live-owner'?'owner-active':'submission-unknown');
+  assert.equal(JSON.parse(await readFile(old.receipt,'utf8')).token,old.token);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
 for(const unknown of [false,true])test(`failed control admission download (${unknown?'unknown':'closed'} transfer) retains its native handle without replay`,async t=>{
   const f=await fixture(t);let broken=true,controlHandle;
   const client=async(args,settings)=>{
