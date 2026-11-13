@@ -1038,3 +1038,26 @@ test('probe cutoff during its submission journal prevents dispatch with positive
  },client:async(args,settings)=>{if(args[0]==='run')dispatched++;return f.context.client(args,settings);}});
  await assert.rejects(environment.inspectDevices());assert.equal(dispatched,0);assert.ok(f.events.some(event=>event.type==='execution-not-admitted'));
 });
+for(const cleanup of ['closed','unknown','body-cutoff'])test(`cancelled payload without admission reconciles its exact token before settling: ${cleanup}`,async t=>{
+ const f=await fixture(t),body=new AbortController();f.setEnabled([0]);f.setReleaseProof(true);let payloads=0,controls=0;
+ const cancelled='remote:fixture:job:cancelled-before-admission',control='remote:fixture:job:unknown-cleanup';
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:.15},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(2000),client:async(args,settings)=>{
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
+   const script=await readFile(args[args.indexOf('--file')+1],'utf8'),config=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'")),inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
+   if(inner.source){payloads++;if(payloads===1){if(cleanup==='body-cutoff')body.abort();return {state:'queued',handle:cancelled};}}
+   else{controls++;if(cleanup==='unknown')return {state:'queued',handle:control};}
+  }
+  if(args[0]==='cancel'&&args[1]===cancelled)return {state:'cancelled'};
+  if(args[0]==='observe'&&args[1]===cancelled)return {state:'cancelled',exit:null};
+  if(args[0]==='observe'&&args[1]===control)return {state:'observation-unavailable'};
+  return f.context.client(args,settings);
+ }});
+ await environment.prepare({project:{source:f.source},attempt:{id:'cancelled-no-admission'}});
+ const result=await environment.execute('true',f.source,{timeout:10});
+ assert.equal(result.handle,cancelled);assert.equal(result.settled,cleanup!=='unknown');assert.equal(result.admissionUnknown,true);assert.equal(result.admission,undefined);assert.equal(payloads,1);assert.equal(controls,1);
+ if(cleanup!=='unknown'){
+  assert.equal(result.outcome.kind,'infrastructure');assert.ok(f.events.some(event=>event.type==='device-lease-released'));
+  if(cleanup==='body-cutoff'){await assert.rejects(environment.execute('true',f.source,{timeout:10}));assert.equal(payloads,1);}
+  else{const next=await environment.execute('true',f.source,{timeout:10});assert.equal(next.settled,true);assert.equal(payloads,2);}
+ }else{assert.equal(await environment.reconcileLease(),false);assert.equal(payloads,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);}
+});

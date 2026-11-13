@@ -645,7 +645,13 @@ export async function createEnvironment(options, context) {
           });
           const {result,admission}=measured;
           if(!result.settled)return result;
-          if(admission?.token!==lease.token)return {...result,settled:false,admissionUnknown:true};
+          if(admission?.token!==lease.token){
+            // Native cancellation can precede the admission receipt. Closure is
+            // still token-scoped; missing admission never proves device release.
+            activeLease=null;
+            return {...result,settled:await reconcileClosedPayload(),admissionUnknown:true,
+              outcome:{kind:'infrastructure',reason:'device-admission-unavailable'}};
+          }
           if(measured.queueWait){
             excludedMs+=performance.now()-attemptStarted-(excludedMs-attemptExcluded);
             await context.event('execution-state',{handle:result.handle,state:'stopped',executionSeconds:0,accountingExcluded:true});
