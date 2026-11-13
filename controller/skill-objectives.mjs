@@ -49,3 +49,10 @@ export function evaluationSettings(evaluations,objective){
  if(!Number.isFinite(developmentSeconds)||developmentSeconds<=0||!Number.isFinite(pairedSeconds)||pairedSeconds<0||objective==='optimization'&&pairedSeconds===0)throw Error('Positive elapsed evaluation allocations required');
  return {...value,developmentSeconds,pairedSeconds};
 }
+
+// A caller-bound immutable retrieval snapshot may reconnect on a new local port.
+export function retrievalIdentity(knowledge){
+ if(knowledge.identity===undefined)return {url:knowledge.url,readOnly:true};
+ if(typeof knowledge.identity!=='string'||!knowledge.identity.trim())throw Error('Nonempty retrieval snapshot identity required');
+ return {readOnly:true,identity:knowledge.identity};
+}

@@ -442,7 +442,7 @@ test('bucket review carries configured A3 tasks through fork, native evaluation 
  const checker=join(f.root,'verify.py'),pairedChecker=join(f.root,'paired.py');
  await writeFile(checker,"import sys,json,pathlib,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\nprint(json.dumps(dict(correct=True,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),latencySeconds=100,evidence={'fixture':True})))\n");
  await writeFile(pairedChecker,"import sys,json,pathlib,hashlib\na,b=[hashlib.sha256((pathlib.Path(x)/'kernel.py').read_bytes()).hexdigest() for x in sys.argv[1:]]\nprint(json.dumps(dict(correct=True,activeKernelSha256=a,candidateKernelSha256=b,activeLatencySeconds=1,candidateLatencySeconds=.9,evidence={'alternating':True})))\n");
- const evaluations=Object.fromEntries(['correctness','optimization'].map(objective=>[objective,{binding:{target:'CPU-fixture-not-device-evidence'},developmentSeconds:30,pairedSeconds:15,tasks:['a','b','c','d','e'].map(id=>({id,bucket:objective,kind:'a3-kernel',prompt:'Fixture',files:{'kernel.py':'answer=42\n'},checker,pairedChecker}))}]));
+ const evaluations=Object.fromEntries(['correctness','optimization'].map(objective=>[objective,{binding:{target:'CPU-fixture-not-device-evidence'},knowledge:{url:'http://127.0.0.1:1234/mcp',identity:'logical-snapshot'},developmentSeconds:30,pairedSeconds:15,tasks:['a','b','c','d','e'].map(id=>({id,bucket:objective,kind:'a3-kernel',prompt:'Fixture',files:{'kernel.py':'answer=42\n'},checker,pairedChecker}))}]));
  const options={...f.options,bucketPolicy:true,evaluations};let evaluated=0;
  const dependencies={classify:args=>args.validate({cause:'actor',bucket:'optimization',coverage:'covered',guidanceIds:['implementation-baseline'],reason:'Actual timing evidence',evidenceRefs:[args.group.occurrences[0].reference]}),review:async args=>update(args),evaluate:async args=>{
   evaluated++;assert.equal(args.objective,'optimization');assert.equal(args.config.skill_review_evaluations.optimization.tasks.length,5);assert.ok(args.seconds>44&&args.seconds<=45);
@@ -455,6 +455,9 @@ test('bucket review carries configured A3 tasks through fork, native evaluation 
  assert.equal(evaluated,1);assert.equal(report.candidates[0].decision.promote,true);assert.equal(report.candidates[0].published,true);assert.equal(report.buckets.optimization,3);
  const state=await load(join(options.output,'review.json')),candidate=Object.values(state.candidates)[0],result=await load(join(candidate.directory,'evaluation','results.json'));
  assert.equal(result.pairedTimings.length,10);assert.equal(result.totalSeconds,30);assert.equal(result.pairedReplay.seconds,15);assert.equal(result.binding.target,'CPU-fixture-not-device-evidence');
+ for(const settings of Object.values(evaluations))settings.knowledge.url='http://127.0.0.1:5678/mcp';
+ await runReview({...options,stage:'report'});
+ evaluations.optimization.knowledge.identity='different';await assert.rejects(runReview({...options,stage:'report'}),/Frozen review evaluation/);evaluations.optimization.knowledge.identity='logical-snapshot';
  await writeFile(pairedChecker,'changed trusted checker');await assert.rejects(runReview({...options,stage:'evaluate'}),/Frozen review/);
 });
 

@@ -8,7 +8,7 @@ import {parseArgs} from 'node:util';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
-import {evaluateSkillObjective} from '../controller/skill-objectives.mjs';
+import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -120,7 +120,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:{url:knowledge.url,readOnly:true}}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};

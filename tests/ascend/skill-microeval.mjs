@@ -128,3 +128,14 @@ test('native sample elapsed cancellation also bounds delayed MCP startup',{timeo
  const start=performance.now();const report=await nativeSample({cwd,sessionDirectory,profile,seconds:.3,guidance:'fixture',prompt:'finish',knowledge:{url:`http://127.0.0.1:${server.address().port}/mcp`}});
  assert.equal(report.timedOut,true);assert.ok(requests>0);assert.ok(performance.now()-start<3000);
 });
+
+test('stable retrieval identity permits local endpoint reconnect but rejects a different snapshot',async t=>{
+ const f=await fixture(t);let calls=0;
+ const first={url:'http://127.0.0.1:1234/mcp',identity:'frozen-memory-snapshot'};
+ await runMicroeval({...f,knowledge:first},{sample:async({cwd,knowledge})=>{calls++;assert.equal(knowledge.url,first.url);await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');return {};}});
+ const report=await runMicroeval({...f,knowledge:{...first,url:'http://127.0.0.1:5678/mcp'},resume:true},{sample:()=>{throw Error('must not replay');}});
+ assert.equal(report.status,'complete');assert.equal(calls,4);assert.deepEqual(report.knowledge,{readOnly:true,identity:first.identity});
+ await assert.rejects(runMicroeval({...f,knowledge:{...first,identity:'different-snapshot'},resume:true},{sample:()=>{throw Error('must not dispatch');}}),/Frozen micro/);
+ const legacy=await fixture(t);await runMicroeval({...legacy,knowledge:{url:first.url}},{sample:async()=>({})});
+ await assert.rejects(runMicroeval({...legacy,knowledge:{url:'http://127.0.0.1:5678/mcp'},resume:true}),/Frozen micro/);
+});

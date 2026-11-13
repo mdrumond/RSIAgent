@@ -9,7 +9,7 @@ import {inventoryFailures,guidanceEntries,validateClassification,validateClassif
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {validateSkillGrounding} from '../controller/skill-evidence.mjs';
 import {publishSkillVersion} from './skills.mjs';
-import {evaluationSettings} from '../controller/skill-objectives.mjs';
+import {evaluationSettings,retrievalIdentity} from '../controller/skill-objectives.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function optional(path){try{return await load(path);}catch(e){if(e.code!=='ENOENT')throw e;return null;}}
@@ -82,7 +82,7 @@ export async function runReview(options,dependencies={}){
  let frozenEvaluations;
  if(options.evaluations){frozenEvaluations={};for(const objective of Object.keys(options.evaluations)){
   if(!['correctness','optimization'].includes(objective))throw Error('Unknown evaluation objective');
-  const value=evaluationSettings(options.evaluations,objective);frozenEvaluations[objective]={...value,tasks:await Promise.all(value.tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),...(task.pairedChecker?{pairedChecker:await readFile(task.pairedChecker,'utf8')}:{} )})))};
+  const value=evaluationSettings(options.evaluations,objective);frozenEvaluations[objective]={...value,...(value.knowledge?.identity!==undefined?{knowledge:retrievalIdentity(value.knowledge)}:{}),tasks:await Promise.all(value.tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),...(task.pairedChecker?{pairedChecker:await readFile(task.pairedChecker,'utf8')}:{} )})))};
  }}
  if(options.bucketPolicy&&['all','evaluate'].includes(stage))for(const objective of ['correctness','optimization'])evaluationSettings(options.evaluations,objective);
  await mkdir(output,{recursive:true});
