@@ -241,3 +241,23 @@ test('an exhausted interrupted actor proceeds to verification without another ac
  await assert.rejects(runMicroeval({...options,signal:abort.signal},{sample}));
  const result=await runMicroeval(options,{sample});assert.equal(sampled,2);assert.ok(result.results.every(r=>r.correct));
 });
+test('blocked device admission retains reservations and stops before spending another sample',async t=>{
+ const reservations=[{physicalDevice:5,token:'retained-token',receipt:'/retained/lease.json',reason:'submission-unknown',closed:false}];
+ for(const phase of ['sample','verify','observed']){
+  const f=await fixture(t);let calls=0,checks=0;
+  const blocked=()=>Object.assign(Error('Device reservations require reconciliation'),{code:'DEVICE_LEASE_BLOCKED',reservations});
+  const dependencies={sample:async()=>{calls++;if(phase==='sample')throw blocked();return phase==='observed'?{unresolvedExecution:{handle:null,reason:'device-lease-blocked',reservations}}:{};},verify:async()=>{checks++;throw blocked();}};
+  await assert.rejects(runMicroeval({...f,resume:true},dependencies),{code:'RSI_EXECUTION_UNRESOLVED'});
+  const report=JSON.parse(await readFile(join(f.directory,'results.json')));
+  assert.equal(calls,1);assert.equal(checks,phase==='verify'?1:0);assert.equal(report.results.length,0);
+  assert.deepEqual(report.runningSample.unresolvedExecution,{handle:null,reason:'device-lease-blocked',reservations});
+  await assert.rejects(runMicroeval({...f,resume:true},dependencies),/unresolved/);assert.equal(calls,1);
+ }
+});
+test('native target admission failure survives Pi tool handling without further target work',async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .'}}:null);
+ const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);
+ const reservations=[{physicalDevice:5,token:'original',closed:false}];let calls=0;
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>{calls++;throw Object.assign(Error('Device reservation blocked'),{code:'DEVICE_LEASE_BLOCKED',reservations});}}});
+ assert.equal(calls,1);assert.deepEqual(result.unresolvedExecution,{handle:null,reason:'device-lease-blocked',reservations});
+});

@@ -14,6 +14,7 @@ import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 function unknownExecution(error){
+ if(error.code==='DEVICE_LEASE_BLOCKED'||error.reason==='device-lease-blocked'||/Device reservations require reconciliation/i.test(error.message??''))return {handle:null,reason:'device-lease-blocked',reservations:error.reservations??[]};
  if(error.code!=='RSI_EXECUTION_UNRESOLVED'&&!/unresolved|(?:identity|closure) unknown|do not resubmit/i.test(error.message??''))return null;
  return {handle:error.handle??error.message?.match(/remote:[^\s:]+:(?:job|transfer|command|session):[\w-]+|local:[\w-]+/)?.[0]??null};
 }
@@ -167,7 +168,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
     try{
      observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
-     if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:observed.unresolvedExecution.handle});
+     if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      observed.actorCompleted??=!actorSignal.aborted||Boolean(actorDeadline?.aborted&&!sampleSignal.aborted);
      if(verificationSeconds&&(actorDeadline?.aborted||observed.timedOut)&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
      const remaining=allocation-(performance.now()-started)/1000;
