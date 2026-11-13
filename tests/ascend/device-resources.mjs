@@ -13,7 +13,7 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
-import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,closedDeviceLease} from '../../integrations/environments/device-leases.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -642,10 +642,13 @@ test('a retained displaced receipt closes its original fence without replacing t
   const f=await fixture(t);f.setEnabled([0]);
   const old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
   await old.update({owner:{...old.record.owner,start:'old-process'},handles:['remote:fixture:job:old-payload']});
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await old.event('execution-submitting',artifact);
   const active=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
   const before=await readFile(active.receipt,'utf8');
   const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
   assert.equal(result.closed,true);
+  assert.deepEqual(result.unresolvedArtifacts,[artifact]);
   assert.equal(await readFile(active.receipt,'utf8'),before);
   await assert.rejects(readFile(old.receipt),{code:'ENOENT'});
   assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:old-payload'));
@@ -700,10 +703,12 @@ for(const unknown of [false,true])test(`failed control admission download (${unk
     migrateClosedControl:async()=>{migrated=true;return true;}})).closed,false);
   assert.equal(migrated,false,'an existing native journal is not a legacy migration');
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
   broken=false;const recovered=await restarted.reconcileLease();
-  assert.equal(recovered,!unknown);
-  if(unknown){const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
-    assert.equal(JSON.parse(await readFile(pointer.receipt,'utf8')).controlHandle,controlHandle);}
+  assert.equal(recovered,true);
+  if(unknown){const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.some(row=>row.kind==='download'&&!row.handle));
+    assert.equal(JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8')).controlHandle,controlHandle);}
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
 });
 
@@ -721,6 +726,17 @@ test('control-started with an unknown payload submission is held instead of redi
     return true;
   });
   assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
+});
+
+test('the original checkpoint can release its device after host closure while preserving an unidentified output transfer',async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await held.event('execution-submitting',artifact);
+  await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
+  assert.equal(await f.environment.reconcileLease(),true);
+  const released=f.events.find(e=>e.type==='device-lease-released');
+  assert.deepEqual(released.unresolvedArtifacts,[artifact]);
+  assert.equal(f.commands.length,0);
 });
 
 test('a dead owner with an unidentified submission exposes its identity without admitting another payload',async t=>{
@@ -905,7 +921,14 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   blocking=false;
   if(stage==='admission-read') {
     assert.ok(retained.submissions.some(row=>!row.closed&&!row.handle),'an interrupted unacknowledged transfer remains unknown');
-    assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
+    assert.equal(await environment.reconcileLease(),true,'positive host closure can free the device while the output transfer stays unknown');
+    const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.length>0);
+    const archived=JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8'));
+    for(const artifact of proof.unresolvedArtifacts){
+      const original=archived.submissions.find(row=>row.submission===artifact.submission);
+      assert.equal(original.closed,undefined);assert.equal(original.handle,undefined);
+    }
   } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
   assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
 });

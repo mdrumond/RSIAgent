@@ -1,7 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink, cp, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, hostLease, hostReconcile } from './device-leases.mjs';
+import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, artifactDownload, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -362,10 +362,11 @@ export async function createEnvironment(options, context) {
     return controlEnvironment;
   }
   async function releaseLease(lease) {
-    await closeDeviceLease(lease);
+    const proof=await closeDeviceLease(lease);
     await unlink(leasePath);
     await context.event('device-lease-released', {pool:lease.record.pool,
-      physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token});
+      physicalDevice:lease.record.physicalDevice, receipt:lease.receipt, token:lease.token,
+      ...(proof.unresolvedArtifacts?{unresolvedArtifacts:proof.unresolvedArtifacts}: {})});
   }
   let reconciling, retryFailedControl=false;
   async function reconcileClosedPayload() {
@@ -398,7 +399,8 @@ export async function createEnvironment(options, context) {
       if(!proof||proof.pool!==retained.pool||proof.physicalDevice!==retained.physicalDevice)return false;
       await preserveControls(proof.path,proof.controlDirectory);
       await unlink(leasePath).catch(error=>{if(error.code!=='ENOENT')throw error;});
-      await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token});
+      await context.event('device-lease-released',{pool:proof.pool,physicalDevice:proof.physicalDevice,receipt:retained.receipt,token:retained.token,
+        ...(proof.unresolvedArtifacts?{unresolvedArtifacts:proof.unresolvedArtifacts}: {})});
       return true;
     };
     if(await finishClosed())return true;
@@ -411,7 +413,7 @@ export async function createEnvironment(options, context) {
         if(row.closed===true)continue;
         let handle=row.handle;
         if(!handle&&row.receiptFile)try{handle=(await readJson(row.receiptFile)).handle;}catch{}
-        if(!handle)return false;
+        if(!handle){if(artifactDownload(row))continue;return false;}
         if(row.controlPayload&&!lease.record.controlHandle)await lease.update({controlHandle:handle});
         handles.add(handle);
       }

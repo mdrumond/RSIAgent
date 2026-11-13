@@ -45,6 +45,12 @@ an operator can use `environment.reconcileReservation(physicalDevice,
 physical device and token; owner, native-command and host-fence closure checks
 still apply. This reconciles the displaced record in place and does not replace
 the currently active reservation.
+An unidentified output download marked as excluded artifact transfer does not
+retain a physical device once every identified command is terminal and the host
+fence has positively closed. Its submission stays unresolved in the archived
+receipt and the closure proof's `unresolvedArtifacts`; this does not settle the
+original transfer or attempt. Unidentified uploads, device commands and control
+commands continue to block reservation closure.
 
 For campaigns that permanently reserve an A/B device, the private Ascend profile
 sets `backgroundDevice` to one physical ID in its explicit `deviceAffinity`.

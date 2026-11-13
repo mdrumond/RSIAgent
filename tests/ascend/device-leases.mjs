@@ -86,6 +86,35 @@ test('a stopped owner is reclaimed only after every native identity and host fen
   assert.ok(await reserveDevice('pool',0,directory));
 });
 
+test('an unidentified excluded output download remains recorded after positive device closure',async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  const artifact={submission:'lost-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await lease.update({owner:{...lease.record.owner,start:'old-process'},handles:['remote:target:job:payload']});
+  await lease.event('execution-submitting',artifact);
+  const observed=[];
+  const result=await reconcileDeviceLease(lease.receipt,{
+    observe:async handle=>{observed.push(handle);return {state:'completed'};},reconcileHost:async()=>true
+  });
+  assert.equal(result.closed,true);assert.deepEqual(observed,['remote:target:job:payload']);
+  assert.deepEqual(result.unresolvedArtifacts,[artifact]);
+  const proof=await closedDeviceLease(lease.receipt,lease.token);
+  assert.deepEqual(proof.unresolvedArtifacts,[artifact]);
+  const archived=JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8'));
+  assert.deepEqual(archived.submissions,[artifact]);
+  assert.equal(archived.submissions[0].closed,undefined,'the transfer was never declared closed');
+  assert.ok(await reserveDevice('pool',0,directory));
+});
+
+for(const row of [{kind:'run',accountingExcluded:true},{kind:'upload',accountingExcluded:true},{kind:'download',accountingExcluded:false}])test(`unknown ${row.kind}/${row.accountingExcluded} cannot be treated as an output-only artifact`,async t=>{
+  const directory=await root(t),lease=await reserveDevice('pool',0,directory);
+  await lease.update({owner:{...lease.record.owner,start:'old-process'}});
+  await lease.event('execution-submitting',{submission:'unknown',...row});
+  let fenced=0;
+  const result=await reconcileDeviceLease(lease.receipt,{observe:async()=>({state:'completed'}),reconcileHost:async()=>{fenced++;return true;}});
+  assert.equal(result.closed,false);assert.equal(result.reason,'submission-unknown');assert.equal(fenced,0);
+  assert.equal(JSON.parse(await readFile(lease.receipt,'utf8')).token,lease.token);
+});
+
 for(const scenario of ['live-owner','legacy-owner','live-job','unknown-submission','unknown-fence'])test(`reservation reconciliation preserves ${scenario}`,async t=>{
   const directory=await root(t),lease=await reserveDevice('pool',0,directory);
   if(scenario!=='live-owner')await lease.update({owner:scenario==='legacy-owner'?null:{...lease.record.owner,start:'old-process'}});
