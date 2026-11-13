@@ -134,3 +134,10 @@ Resume reuses the fork and remaining allowance. Original files and sessions are
 never overwritten, and actor session totals are marked cumulative because they
 include the fork's original history. Continuations do not promote skills or
 recompute original A/B decisions.
+The initial check defaults to 120 seconds; an explicit `precheckSeconds` may
+lower that cap and is frozen on resume. Verification hooks receive their own
+`signal`/`seconds` plus the full remaining `sampleSignal`/`sampleSeconds`; cached
+target contexts must use the latter for lifetime and the former for each request.
+A3 actor admission requires a negative receipt bound to the current kernel hash
+with candidate-failure evidence. Missing receipts and infrastructure timeouts do
+not justify another model call.

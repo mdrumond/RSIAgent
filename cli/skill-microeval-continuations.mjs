@@ -26,9 +26,10 @@ async function forkSession({source,cwd,sessionDirectory}){
  return sdk.SessionManager.forkFrom(source,cwd,sessionDirectory).getSessionFile();
 }
 /** Dependencies match runMicroeval's native sample/verification hooks. One key per lane is supported. */
-export async function continueMicroevalSamples({originDirectory,directory,sampleKeys,skills,profile,python='python3',seconds=600,verificationSeconds=180,knowledge,signal,resume=true},dependencies={}){
+export async function continueMicroevalSamples({originDirectory,directory,sampleKeys,skills,profile,python='python3',seconds=600,verificationSeconds=180,precheckSeconds=120,knowledge,signal,resume=true},dependencies={}){
  const begun=performance.now();
  if(!Number.isFinite(seconds)||seconds<=0||!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Positive continuation allowance and smaller verification reserve required');
+ if(!Number.isFinite(precheckSeconds)||precheckSeconds<=0||precheckSeconds>120)throw Error('Positive precheck allowance of at most 120 seconds required');
  signal?.throwIfAborted();originDirectory=resolve(originDirectory);directory=resolve(directory);
  if(directory===originDirectory||directory.startsWith(originDirectory+'/'))throw Error('Continuation directory must be separate from the original study');
  const originalManifest=await readFile(join(originDirectory,'manifest.json'),'utf8'),origin=await load(join(originDirectory,'results.json'));
@@ -56,7 +57,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
   const sourceSession=row.session??row.actorObservation?.session;
   selected.push({key,row,task,cwd,sourceSession,identity:{key,resultSha256:hash(JSON.stringify(row)),taskSha256:hash(JSON.stringify(task)),sourceTreeSha256:await treeIdentity(cwd),sessionSha256:sourceSession?hash(await readFile(sourceSession)):null,originalElapsedSeconds:row.elapsedSeconds}});
  }
- const identity={format:1,claim:'diagnostic continuations; no primary rescoring or skill promotion',originDirectory,originManifestSha256:hash(originalManifest),seconds,verificationSeconds,model,skills:manifest.skills,knowledge:manifest.knowledge??null,samples:selected.map(x=>x.identity)};
+ const identity={format:1,claim:'diagnostic continuations; no primary rescoring or skill promotion',originDirectory,originManifestSha256:hash(originalManifest),seconds,verificationSeconds,...(precheckSeconds===120?{}:{precheckSeconds}),model,skills:manifest.skills,knowledge:manifest.knowledge??null,samples:selected.map(x=>x.identity)};
  if(retainedManifest&&JSON.stringify(retainedManifest)!==JSON.stringify(identity))throw Error('Frozen continuation changed');
  if(!retainedManifest){await mkdir(directory);await save(join(directory,'manifest.json'),identity);await mkdir(join(directory,'frozen'));}
  const report=retained??{format:1,claim:identity.claim,status:'running',samples:{}};
@@ -74,7 +75,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
    const left=()=>Math.max(0,seconds-state.originalElapsedSeconds-previous-(performance.now()-started)/1000);
    const charge=()=>{state.extensionElapsedSeconds=previous+(performance.now()-started)/1000;state.elapsedSeconds=state.originalElapsedSeconds+state.extensionElapsedSeconds;};
    if(left()<=0){state.status='elapsed';state.timedOut=true;charge();await persist();continue;}
-   report.runningSample={key,phase:'preparation',owner:report.owner,startedAt:new Date().toISOString(),elapsedBeforeSeconds:state.originalElapsedSeconds+previous};await persist();
+   report.runningSample={key,phase:'preparation',owner:report.owner,startedAt:new Date(Date.now()-(performance.now()-started)).toISOString(),elapsedBeforeSeconds:state.originalElapsedSeconds+previous};await persist();
    try{
     if(!state.prepared){
      await mkdir(home,{recursive:true});await cp(item.cwd,cwd,{recursive:true});
@@ -85,7 +86,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
    }catch(error){charge();state.status='interrupted';delete report.runningSample;await persist();throw error;}
    if(left()<=0){state.status='elapsed';state.timedOut=true;charge();delete report.runningSample;await persist();continue;}
    const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000))),wholeSignal=signal?AbortSignal.any([signal,deadline]):deadline;
-   report.runningSample={key,phase:state.phase,owner:report.owner};await persist();
+   report.runningSample.phase=state.phase;await persist();
    const protectedInputs=async()=>{
     if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
     for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(childPath(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
@@ -94,13 +95,19 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
     await protectedInputs();const allocation=Math.min(cap,left());
     if(allocation<=0)throw Error('Continuation elapsed allocation exhausted');
     const verifySignal=AbortSignal.any([wholeSignal,AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
-    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
+    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal,sampleSignal:wholeSignal,sampleSeconds:left()}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
+    if(value.exitCode===124||value.outcome?.kind==='timeout'||value.outcome?.reason==='elapsed-timeout')value={...value,correct:null,timedOut:true};
     if(task.kind==='a3-kernel'&&(value.correct||value.exitCode===125))value=await validateKernelReceipt(value,cwd);
+    if(task.kind==='a3-kernel'&&value.correct===false){
+     let receipt;try{receipt=JSON.parse((value.output??'').trim().split('\n').at(-1));}catch{}
+     if(receipt?.correct===false&&receipt.kernelSha256===hash(await readFile(join(cwd,'kernel.py')))&&typeof receipt.evidence?.type==='string'&&receipt.evidence.type.trim()&&typeof receipt.evidence?.reason==='string'&&receipt.evidence.reason.trim())value={...value,receipt};
+     else value={...value,correct:null,nativeError:value.error??null,error:'Negative verification lacks matching candidate evidence'};
+    }
     await protectedInputs();return verifySignal.aborted?{...value,correct:null,timedOut:true,error:'Independent verification elapsed allocation exhausted'}:value;
    };
    try{
     if(!state.initialVerification){
-     const checked=await verify(Math.min(120,left()));
+     const checked=await verify(Math.min(precheckSeconds,left()));
      if(!wholeSignal.aborted)state.initialVerification=checked;
      signal?.throwIfAborted();
      if(checked.correct===true){state.verification=checked;state.verificationOnly=true;state.status='complete';state.correct=true;continue;}
@@ -124,6 +131,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
     }
     state.phase='final-verification';report.runningSample.phase=state.phase;await persist();
     state.verification=left()>0?await verify(left()):{correct:null,error:'Continuation elapsed allocation exhausted'};
+    signal?.throwIfAborted();
     state.correct=state.verification.correct;state.status=typeof state.correct==='boolean'?'complete':'inconclusive';
    }catch(error){
     const unknown=unknownExecution(error);

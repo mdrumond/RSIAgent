@@ -7,12 +7,12 @@ import {randomUUID,createHash} from 'node:crypto';
 import {runMicroeval,check} from '../../cli/skill-microeval.mjs';
 import {continueMicroevalSamples} from '../../cli/skill-microeval-continuations.mjs';
 const sha=x=>createHash('sha256').update(x).digest('hex'),python=process.env.RSI_TEST_PYTHON??'python3';
-async function fixture(t,{correct=false,spent=.05}={}){
+async function fixture(t,{correct=false,spent=.05,kind}={}){
  const root=await mkdtemp(join(tmpdir(),'microeval-continuation-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const skills={};for(const arm of ['active','candidate']){const p=join(root,arm);await mkdir(p);await writeFile(join(p,'skill-map.json'),JSON.stringify({implementation:'mapped.md'}));await writeFile(join(p,'mapped.md'),arm+' guidance');skills[arm]=p;}
  const checker=join(root,'checker.py');await writeFile(checker,"import runpy,sys,pathlib\nm=runpy.run_path(str(pathlib.Path(sys.argv[1])/'kernel.py'))\nassert m['answer']()==42\n");
  const originDirectory=join(root,'original'),profile={provider:'fixture',model:'scripted'};
- await runMicroeval({directory:originDirectory,skills,profile,python,runs:1,seconds:1,tasks:[{id:'repair',scopes:['implementation'],prompt:'Repair answer',files:{'kernel.py':`def answer(): return ${correct?42:0}\n`,'case.json':'{"expected":42}'},checker,protectedFiles:{'case.json':'json'}}]},{sample:async args=>{
+ await runMicroeval({directory:originDirectory,skills,profile,python,runs:1,seconds:1,tasks:[{id:'repair',...(kind?{kind}:{}),scopes:['implementation'],prompt:'Repair answer',files:{'kernel.py':`def answer(): return ${correct?42:0}\n`,'case.json':'{"expected":42}'},checker,protectedFiles:{'case.json':'json'}}]},{sample:async args=>{
   const session=join(args.sessionDirectory,'original-session.jsonl');
   await writeFile(session,JSON.stringify({type:'session',version:3,id:randomUUID(),timestamp:new Date().toISOString(),cwd:args.cwd})+'\n'+JSON.stringify({type:'message',id:'first',parentId:null,timestamp:new Date().toISOString(),message:{role:'user',content:'Keep original history',timestamp:Date.now()}})+'\n');return {timedOut:true,session};
  }});
@@ -126,4 +126,50 @@ test('copy preparation is checkpointed and a failed local copy preserves charged
  }}));
  const report=JSON.parse(await readFile(join(f.directory,'results.json'))),row=report.samples['repair/0/active'];
  assert.equal(preparation.key,'repair/0/active');assert.ok(Date.parse(preparation.startedAt));assert.equal(preparation.elapsedBeforeSeconds,.05);assert.equal(report.runningSample,undefined);assert.ok(row.extensionElapsedSeconds>0);assert.equal(row.status,'interrupted');await unchanged(f);
+});
+test('interruption during final verification resumes checking without another actor turn',async t=>{
+ const f=await fixture(t),abort=new AbortController();let checks=0,calls=0;
+ const deps={verify:async args=>{checks++;if(checks===2){abort.abort(Error('final verifier checkpoint'));return {correct:null,error:'cancelled'};}return check(args.python,args.checker,args.cwd,args.seconds,args.signal);},sample:async args=>{calls++;await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {session:args.resumeSession};}};
+ await assert.rejects(continueMicroevalSamples({...f,signal:abort.signal},deps),/final verifier checkpoint/);
+ const interrupted=JSON.parse(await readFile(join(f.directory,'results.json'))).samples['repair/0/active'];assert.equal(interrupted.status,'interrupted');assert.equal(interrupted.actorCompleted,true);assert.ok(interrupted.extensionElapsedSeconds>0);
+ const report=await continueMicroevalSamples(f,deps),row=report.samples['repair/0/active'];assert.equal(row.correct,true);assert.equal(calls,1);assert.equal(checks,3);assert.ok(row.extensionElapsedSeconds>interrupted.extensionElapsedSeconds);await unchanged(f);
+});
+const a3Receipt=async(args,correct)=>({correct,exitCode:correct?0:1,output:JSON.stringify({correct,kernelSha256:sha(await readFile(join(args.cwd,'kernel.py'))),...(correct?{latencySeconds:.001}:{}),evidence:{type:'AssertionError',reason:'fixture comparison'}})});
+test('A3 actor continuation requires a trusted negative receipt bound to the current candidate',async t=>{
+ for(const mode of ['missing','hash','type','reason','valid']){
+  const f=await fixture(t,{kind:'a3-kernel'});let calls=0,checks=0;
+  const report=await continueMicroevalSamples(f,{verify:async args=>{
+   checks++;if(checks>1)return a3Receipt(args,true);if(mode==='missing')return {correct:false,exitCode:1,error:'reference import failed'};
+   const value=await a3Receipt(args,false),wire=JSON.parse(value.output);if(mode==='hash')wire.kernelSha256='older-source';if(mode==='type')delete wire.evidence.type;if(mode==='reason')delete wire.evidence.reason;return {...value,output:JSON.stringify(wire)};
+  },sample:async args=>{calls++;await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {session:args.resumeSession};}}),row=report.samples['repair/0/active'];
+  assert.equal(calls,mode==='valid'?1:0);assert.equal(row.correct,mode==='valid'?true:null);assert.equal(row.status,mode==='valid'?'complete':'inconclusive');await unchanged(f);
+ }
+});
+test('closed wrapper timeouts retry verification without admitting a model',async t=>{
+ for(const timeout of [{exitCode:124},{exitCode:1,outcome:{kind:'timeout'}},{exitCode:1,outcome:{kind:'infrastructure',reason:'elapsed-timeout'}}]){
+  const f=await fixture(t,{correct:true});let checks=0,calls=0;
+  const report=await continueMicroevalSamples(f,{verify:async args=>{checks++;return checks===1?{correct:false,...timeout}:check(args.python,args.checker,args.cwd,args.seconds,args.signal);},sample:async()=>{calls++;}});
+  assert.equal(calls,0);assert.equal(checks,2);assert.equal(report.samples['repair/0/active'].correct,true);assert.equal(report.samples['repair/0/active'].initialVerification.timedOut,true);
+ }
+});
+test('whole-sample timing evidence survives preparation, actor and final-check phases',async t=>{
+ for(const phase of ['initial-verification','actor','final-verification']){
+  const f=await fixture(t),snapshots=[];let setup=false,checks=0;const handle='remote:fixture:job:phase-'+phase;
+  await assert.rejects(continueMicroevalSamples(f,{checkpoint:async report=>{
+   if(!setup&&!report.runningSample){setup=true;await new Promise(r=>setTimeout(r,30));}
+   if(report.runningSample){snapshots.push(structuredClone(report.runningSample));if(report.runningSample.phase==='preparation')assert.ok(Date.now()-Date.parse(report.runningSample.startedAt)>=25);}
+  },verify:async args=>{checks++;if(phase==='initial-verification'||phase==='final-verification'&&checks===2)throw Object.assign(Error('Original native execution unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});return check(args.python,args.checker,args.cwd,args.seconds,args.signal);},sample:async args=>{if(phase==='actor')return {unresolvedExecution:{handle}};await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {session:args.resumeSession};}}),{code:'RSI_EXECUTION_UNRESOLVED'});
+  const report=JSON.parse(await readFile(join(f.directory,'results.json'))),marker=report.runningSample;assert.equal(marker.phase,phase);assert.equal(marker.unresolvedExecution.handle,handle);assert.ok(Date.parse(marker.startedAt));assert.equal(marker.elapsedBeforeSeconds,.05);
+  for(const observed of snapshots){assert.equal(observed.startedAt,marker.startedAt);assert.equal(observed.elapsedBeforeSeconds,.05);}
+ }
+});
+test('a cached target context keeps the parent allowance after the precheck child expires',async t=>{
+ const f=await fixture(t,{correct:true});f.precheckSeconds=.03;let checks=0,calls=0,parent,expiredChild;
+ const report=await continueMicroevalSamples(f,{verify:async args=>{
+  checks++;assert.ok(args.sampleSignal instanceof AbortSignal);assert.ok(args.sampleSeconds>0);
+  if(checks===1){parent=args.sampleSignal;expiredChild=args.signal;assert.notEqual(parent,expiredChild);assert.ok(args.sampleSeconds>args.seconds);await untilAbort(expiredChild);assert.equal(parent.aborted,false);return {correct:false,exitCode:null};}
+  assert.equal(expiredChild.aborted,true);assert.equal(args.sampleSignal,parent);assert.equal(parent.aborted,false);return check(args.python,args.checker,args.cwd,args.seconds,args.signal);
+ },sample:async()=>{calls++;}});
+ assert.equal(checks,2);assert.equal(calls,0);assert.equal(report.samples['repair/0/active'].correct,true);
+ await assert.rejects(continueMicroevalSamples({...f,precheckSeconds:.04}),/Frozen continuation changed/);
 });
