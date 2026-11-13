@@ -61,7 +61,7 @@ for(const closure of ['completed','unknown'])test(`aborted body recovers run rec
   await f.prepare();const result=await f.environment.execute('python answer.py',f.source,{signal:f.abort.signal});
   assert.equal(result.settled,closure==='completed');assert.equal(workload,1);assert.equal(sync,1);
   const cleanup=f.calls.filter(c=>c.args[1]==='remote:fixture:job:work');
-  assert.deepEqual(cleanup.map(c=>c.args[0]),['cancel','observe']);
+  assert.deepEqual(cleanup.map(c=>c.args[0]),closure==='completed'?['cancel','observe','logs']:['cancel','observe']);
   assert.equal(cleanup[0].signal,cleanup[1].signal);
   assert.ok(f.events.some(e=>e.type==='execution-submitted'&&e.data.handle==='remote:fixture:job:work'));
   if(closure==='unknown') {

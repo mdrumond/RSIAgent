@@ -137,9 +137,9 @@ root=os.path.expanduser('~/.local/state/rsi/device-leases-host')
 os.makedirs(root,mode=0o700,exist_ok=True)
 key=hashlib.sha256(json.dumps([c['lease']['pool'],c['devices'][0]],separators=(',',':')).encode()).hexdigest()
 lock=open(root+'/'+key+'.lock','a'); fence=root+'/'+key+'.held'
-def report(decision):
+def report(decision,**facts):
  path=os.environ['RSI_LEASE_RECEIPT']
- with open(path+'.tmp','w') as output: json.dump({'token':c['lease']['token'],'decision':decision},output); output.flush(); os.fsync(output.fileno())
+ with open(path+'.tmp','w') as output: json.dump({'token':c['lease']['token'],'decision':decision,**facts},output); output.flush(); os.fsync(output.fileno())
  os.replace(path+'.tmp',path)
 try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 except BlockingIOError: report('contended'); raise SystemExit(126)
@@ -178,5 +178,6 @@ while True:
   except (FileNotFoundError,ProcessLookupError): pass
  time.sleep(.01)
 os.unlink(fence+'/lease.json'); os.rmdir(fence)
+report('admitted',released=True)
 raise SystemExit(code if code>=0 else 128-code)
 `;
