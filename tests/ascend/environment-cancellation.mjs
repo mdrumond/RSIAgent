@@ -61,7 +61,8 @@ for(const closure of ['completed','unknown'])test(`aborted body recovers run rec
   await f.prepare();const result=await f.environment.execute('python answer.py',f.source,{signal:f.abort.signal});
   assert.equal(result.settled,closure==='completed');assert.equal(workload,1);assert.equal(sync,1);
   const cleanup=f.calls.filter(c=>c.args[1]==='remote:fixture:job:work');
-  assert.deepEqual(cleanup.map(c=>c.args[0]),['cancel','observe']);
+  if(closure==='completed')assert.deepEqual(cleanup.map(c=>c.args[0]),['cancel','observe','logs']);
+  else {assert.equal(cleanup[0].args[0],'cancel');assert.ok(cleanup.slice(1).every(c=>c.args[0]==='observe'));}
   assert.equal(cleanup[0].signal,cleanup[1].signal);
   assert.ok(f.events.some(e=>e.type==='execution-submitted'&&e.data.handle==='remote:fixture:job:work'));
   if(closure==='unknown') {
@@ -153,4 +154,24 @@ for(const state of ['completed','unknown'])test(`initial retained download timeo
   }else{await assert.rejects(f.environment.browse('report.log'),/Transfer unresolved/);assert.equal(f.calls.some(c=>c.args[0]==='fetch'),false);}
   assert.equal(f.calls.filter(c=>c.args[0]==='download').length,1);
   assert.equal(f.calls.filter(c=>c.args[0]==='observe'&&c.args[1]===handle).length,1);
+});
+
+for(const scenario of ['delayed','transient-unknown','never'])test('stop honors its cleanup allowance: '+scenario,async t=>{
+ let cancelledAt,observations=0;
+ const duration=scenario==='delayed'?5200:100;
+ const f=await fixture(t,async(args,signal)=>{
+  if(args[0]==='cancel'){cancelledAt=performance.now();return {state:'cancelling'};}
+  if(args[0]==='observe'){
+   observations++;signal.throwIfAborted();
+   if(scenario!=='never'&&performance.now()-cancelledAt>=duration)return {state:'cancelled'};
+   return {state:scenario==='transient-unknown'?'observation-unavailable':'running'};
+  }
+ });
+ const cleanup=AbortSignal.timeout(scenario==='delayed'?8000:scenario==='never'?150:1000);
+ const started=performance.now(),result=await f.environment.stop('remote:fixture:job:owned',{signal:cleanup});
+ assert.equal(result.state,scenario==='never'?'unknown':'stopped');
+ assert.ok(observations>=2);assert.equal(f.calls.filter(c=>c.args[0]==='cancel').length,1);
+ assert.equal(f.calls.some(c=>c.args[0]==='run'),false);
+ if(scenario==='delayed')assert.ok(performance.now()-started>5000);
+ if(scenario==='never'){assert.equal(cleanup.aborted,true);assert.ok(performance.now()-started<1000);}
 });

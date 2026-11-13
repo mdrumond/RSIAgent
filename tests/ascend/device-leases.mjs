@@ -47,8 +47,10 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   }
   const first=run(`touch '${marker}'; while [ ! -e '${release}' ]; do sleep .01; done`);
   for(let n=0;;n++){try{await readFile(marker);break;}catch{}assert.ok(n<200);await delay(10);}
+  assert.equal(JSON.parse(await readFile(join(directory,'receipt-0'),'utf8')).released,undefined);
   assert.equal((await run('exit 0').done).status,126);
   await writeFile(release,'go');assert.equal((await first.done).status,0);
+  assert.equal(JSON.parse(await readFile(join(directory,'receipt-0'),'utf8')).released,true);
   assert.equal((await run('exit 0').done).status,0);
   // No payload descendants remain when killing this wrapper after completion of health.
   const killed=run('exec sleep 0.2');await delay(80);killed.child.kill('SIGKILL');
@@ -57,7 +59,7 @@ test('target lock excludes a second controller; killed owner leaves durable fenc
   assert.equal((await run('',hostReconcile,'wrong-owner').done).status,125);
   assert.equal((await run('',hostReconcile).done).status,0);
   assert.equal((await run('exit 126').done).status,126);
-  assert.equal(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')).decision,'admitted');
+  assert.deepEqual(JSON.parse(await readFile(join(directory,'receipt-'+(children.length-1)),'utf8')),{token:'owner',decision:'admitted',released:true});
 });
 
 test('admission holds unpublished time then charges only nonqueue work',async()=>{
