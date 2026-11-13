@@ -21,19 +21,19 @@ function sandboxCommand(command,cwd){
   '--proc','/proc','--dev','/dev','--tmpfs','/tmp','--bind',cwd,cwd,'--chdir',cwd,
   '--','bash','-c',command].map(shellQuote).join(' ');
 }
-function unknownExecution(error){
+export function unknownExecution(error){
  if(error.code==='DEVICE_LEASE_BLOCKED'||error.reason==='device-lease-blocked'||/Device reservations require reconciliation/i.test(error.message??''))return {handle:null,reason:'device-lease-blocked',reservations:error.reservations??[]};
  if(error.code!=='RSI_EXECUTION_UNRESOLVED'&&!/unresolved|(?:identity|closure) unknown|do not resubmit/i.test(error.message??''))return null;
  return {handle:error.handle??error.message?.match(/remote:[^\s:]+:(?:job|transfer|command|session):[\w-]+|local:[\w-]+/)?.[0]??null};
 }
 async function save(path,value){const tmp=path+'.'+randomUUID();await writeFile(tmp,JSON.stringify(value,null,2)+'\n');await rename(tmp,path);}
 const inside=(root,name)=>{const path=resolve(root,name),rel=relative(root,path);if(isAbsolute(name)||!rel||rel==='..'||rel.startsWith('../'))throw Error('Task files must be relative descendants');return path;};
-async function skillInput(directory){
+export async function skillInput(directory){
  const root=resolve(directory),map=JSON.parse(await readFile(join(root,'skill-map.json'),'utf8')),files={};
  for(const [scope,name] of Object.entries(map))files[scope]=await readFile(inside(root,name),'utf8');
  return {files,sha256:hash(JSON.stringify(files)),text:Object.entries(files).map(([scope,text])=>`## ${scope}\n${text}`).join('\n\n')};
 }
-async function check(python,checker,cwd,seconds,signal,args=[cwd]){
+export async function check(python,checker,cwd,seconds,signal,args=[cwd]){
  signal?.throwIfAborted();
  const child=spawn(python,[checker,...args],{cwd,stdio:['ignore','pipe','pipe'],env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
  let output='',error='';child.stdout.on('data',d=>{output=(output+d).slice(-8192);});child.stderr.on('data',d=>{error=(error+d).slice(-8192);});
@@ -237,7 +237,7 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
  report.decision=evaluateSkillObjective(report.results,{objective:report.objective,projectIds:tasks.map(t=>t.id),runs:report.runs,pairedTimings:report.pairedTimings});
  await save(join(directory,'results.json'),report);return report;
 }
-async function kernelCheck(python,checker,cwd,seconds,signal,args=[cwd]){
+export async function kernelCheck(python,checker,cwd,seconds,signal,args=[cwd]){
  const sdk=await import('@earendil-works/pi-coding-agent'),ops=createLocalExecutionOperations(sdk);let output='';
  const quote=s=>"'"+String(s).replaceAll("'", "'\\''")+"'";
  const result=await ops.exec([python,checker,...args].map(quote).join(' '),cwd,{timeout:seconds,signal,env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},onData:d=>{output=(output+d).slice(-8192);}});
