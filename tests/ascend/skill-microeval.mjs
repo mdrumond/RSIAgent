@@ -261,3 +261,13 @@ test('native target admission failure survives Pi tool handling without further 
  const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>{calls++;throw Object.assign(Error('Device reservation blocked'),{code:'DEVICE_LEASE_BLOCKED',reservations});}}});
  assert.equal(calls,1);assert.deepEqual(result.unresolvedExecution,{handle:null,reason:'device-lease-blocked',reservations});
 });
+test('sandboxed native Bash can edit its kernel but cannot quarantine shared harness files',async t=>{
+ const f=await fixture(t),outside=join(f.root,'shared-leases'),cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');
+ await mkdir(outside);await mkdir(cwd);await mkdir(sessionDirectory);await writeFile(join(outside,'lease.json'),'original-lease');
+ const command=`mv '${outside}' '${outside}.quarantined'; printf repaired > kernel.py`;
+ const profile=await scriptedMicro(t,f.root,n=>n===0?{name:'bash',args:{command}}:null);
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'repair',localFilesystemSandbox:true});
+ assert.equal(result.error,null);assert.equal(await readFile(join(outside,'lease.json'),'utf8'),'original-lease');
+ await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
+ assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');
+});

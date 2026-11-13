@@ -13,6 +13,14 @@ import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-obje
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
+const shellQuote=value=>"'"+String(value).replaceAll("'","'\\''")+"'";
+function sandboxCommand(command,cwd){
+ // Pi still owns Bash execution and cancellation. Bubblewrap makes the host
+ // read-only while preserving normal writes inside this sample's work tree.
+ return ['bwrap','--die-with-parent','--new-session','--unshare-pid','--ro-bind','/','/',
+  '--proc','/proc','--dev','/dev','--tmpfs','/tmp','--bind',cwd,cwd,'--chdir',cwd,
+  '--','bash','-c',command].map(shellQuote).join(' ');
+}
 function unknownExecution(error){
  if(error.code==='DEVICE_LEASE_BLOCKED'||error.reason==='device-lease-blocked'||/Device reservations require reconciliation/i.test(error.message??''))return {handle:null,reason:'device-lease-blocked',reservations:error.reservations??[]};
  if(error.code!=='RSI_EXECUTION_UNRESOLVED'&&!/unresolved|(?:identity|closure) unknown|do not resubmit/i.test(error.message??''))return null;
@@ -50,7 +58,7 @@ export async function validateKernelReceipt(verification,cwd){
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -83,7 +91,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   }
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
    const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
-   const operation=local.exec(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+   const operation=local.exec(localFilesystemSandbox?sandboxCommand(command,taskRoot):command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
    try{return await operation;}finally{pending.delete(operation);}
   }}}));
  };

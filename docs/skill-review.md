@@ -91,6 +91,11 @@ local-controller studies can supply `runMicroeval` sample/verification hooks and
 `finalizeKernelPairs` measurement hooks using the existing Ascend/CPL environment;
 `nativeSample` accepts its prepared target through `targetEnvironment`. Automatic
 remote dispatch from the public `skills-review` configuration is not implemented.
+Local-controller studies can set `nativeSample.localFilesystemSandbox` to run
+Pi's Bash commands through Bubblewrap with only the sample work directory
+writable and a private temporary directory and process namespace. Bubblewrap
+and namespace support must be available; this option fails closed when they are
+not. It protects the local controller filesystem, not remote target commands.
 
 An optional `verificationSeconds` reserves part of the existing sample window
 for independent checking. Preparation and actor work use the earlier portion;
