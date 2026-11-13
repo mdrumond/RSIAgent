@@ -213,7 +213,9 @@ export async function createEnvironment(options, context) {
         await save(pendingPath, pending);
         await emit('execution-submitting', { submission, receiptFile: receipt, kind: 'run', accountingExcluded: true });
         let submitted;
-        try { submitted = await client(['run', options.target, '--runtime', options.runtime, '--file', file, '--receipt-file', receipt]); }
+        if(observationSignal.aborted){await emit('execution-not-admitted',{submission,closed:true});await unlink(pendingPath);observationSignal.throwIfAborted();}
+        const receiptSignal=context.stopSignal??context.signal;
+        try { submitted = await client(['run', options.target, '--runtime', options.runtime, '--file', file, '--receipt-file', receipt],{signal:receiptSignal}); }
         catch { try { submitted = await readJson(receipt); } catch { /* unknown; retain pending */ } }
         if (submitted?.admitted === false || submitted?.submitted === false) {
           await emit('execution-not-admitted', { submission, closed: true });
@@ -233,6 +235,16 @@ export async function createEnvironment(options, context) {
       }
       await emit('execution-submitted', { submission, handle: pending.handle, closed: false, accountingExcluded: true });
       await context.event('execution-handle', { handle: pending.handle, purpose: 'resource-health' });
+      if(observationSignal.aborted&&context.stopSignal){
+        const cleanupSignal=context.stopSignal;
+        try{await client(['cancel',pending.handle],{signal:cleanupSignal});}catch{}
+        while(!cleanupSignal.aborted){
+          let state;try{state=await client(['observe',pending.handle],{signal:cleanupSignal});}catch{break;}
+          if(terminal.has(state.state)){await context.event('execution-state',{handle:pending.handle,state:'stopped',nativeState:state.state,executionSeconds:0,accountingExcluded:true});break;}
+          try{await delay(options.pollMs??250,undefined,{signal:cleanupSignal});}catch{break;}
+        }
+        observationSignal.throwIfAborted();
+      }
       const elapsed = () => Number(process.hrtime.bigint() - BigInt(pending.startedMonotonic)) / 1e9;
       let observed;
       do {
@@ -420,7 +432,7 @@ export async function createEnvironment(options, context) {
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
       for(const handle of handles)if((await environment.observe(handle,{signal:budget.signal})).state!=='stopped')return false;
       const released=lease.record.payloadHandle
-        ?await environment.readAdmission(lease.record.payloadHandle,{signal:budget.signal}):null;
+        ?await environment.readAdmission(lease.record.payloadHandle,{signal:budget.signal}):lease.record.submissions.find(row=>row.wrapperClosure?.admission?.token===lease.token)?.wrapperClosure.admission;
       const positivelyReleased=released?.token===lease.token && released.decision==='admitted' && released.released===true;
       if(budget.signal.aborted||!positivelyReleased&&!await reconcileHostLease(lease,budget))return finishClosed();
       await releaseLease(lease);return true;
@@ -540,6 +552,13 @@ export async function createEnvironment(options, context) {
     },
     async reconcileOperation(operation){
       const result=await environment.reconcileOperation(operation);
+      if(result.wrapperClosures?.length){
+        try{
+          const retained=await readJson(leasePath),lease=await openDeviceLease(retained.receipt,retained.token);
+          for(const proof of result.wrapperClosures)if(await lease.confirmSubmissionClosed(proof))
+            await context.event('execution-wrapper-closed',{submission:proof.submission,receiptFile:proof.receiptFile,token:lease.token,nativeIdentityMissing:true});
+        }catch(error){if(error.code!=='ENOENT')throw error;}
+      }
       return {...result,closed:result.closed && await reconcileLease()};
     },
     instructions:environment.instructions+setupInstructions+(local?'\nBoth bash and rsi_target execute in the persistent local workspace through the same device admission, masks and execution supervision.':''),

@@ -990,3 +990,51 @@ test('a released receipt from another token still requires the existing host rec
  assert.equal(f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload).length,1);
  assert.ok(f.events.some(e=>e.type==='device-lease-released'));
 });
+test('health submission survives actor cutoff until its native receipt is retained and stopped',async t=>{
+ const f=await fixture(t),body=new AbortController(),cleanup=AbortSignal.timeout(2000),cancelled=[];let dispatched=0;
+ const environment=await createEnvironment(f.options,{...f.context,signal:body.signal,stopSignal:cleanup,client:async(args,settings)=>{
+  if(args[0]==='run'){dispatched++;body.abort();await delay(30,null,{signal:settings?.signal});}
+  if(args[0]==='cancel'){cancelled.push(args[1]);assert.equal(settings.signal.aborted,false);return {state:'cancelled'};}
+  return f.context.client(args,settings);
+ }});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,1);
+ const submitted=f.events.find(event=>event.type==='execution-submitted'&&event.handle);assert.ok(submitted);assert.deepEqual(cancelled,[submitted.handle]);
+ assert.equal(JSON.parse(await readFile(f.lastProbe().receipt,'utf8')).handle,submitted.handle);
+ assert.ok(f.events.some(event=>event.type==='execution-state'&&event.handle===submitted.handle&&event.state==='stopped'));
+});
+test('public operation reconciliation accepts nonce-bound closed wrapper and releases its exact lease without a native ID',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let configuration,payloads=0;
+ const environment=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>{
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
+   const file=args[args.indexOf('--file')+1],script=await readFile(file,'utf8');configuration=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
+   await f.context.client(args,settings);await rm(args[args.indexOf('--receipt-file')+1]);payloads++;throw Error('Reply lost before native ID persisted');
+  }
+  if(args[0]==='download'&&args[2].endsWith('/timing.json')){await writeFile(args[3],JSON.stringify({completed:true,key:configuration.timingKey,executionSeconds:2.575,outcome:{kind:'command'}}));return {state:'completed'};}
+  if(args[0]==='download'&&args[2].endsWith('/exit')){await writeFile(args[3],'0');return {state:'completed'};}
+  return f.context.client(args,settings);
+ }});
+ await environment.prepare({project:{source:f.source},attempt:{id:'lost-wrapper'}});await assert.rejects(environment.execute('true',f.source,{timeout:10}),/identity unknown/);
+ const retained=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
+ const pending=f.events.find(event=>event.type==='execution-submitting'&&event.receiptFile?.endsWith('/submission.json'));
+ const events=f.events.map(({type,...data})=>({type,data}));const proof=await environment.reconcileOperation({operation:pending.submission,events});
+ assert.equal(proof.closed,true);assert.equal(proof.nativeIdentityMissing,true);assert.equal(proof.artifactsUnresolved,true);assert.equal(proof.executionSeconds,2.575);assert.equal(payloads,1);
+ assert.ok(await closedDeviceLease(retained.receipt,retained.token));assert.ok(f.events.some(event=>event.type==='execution-wrapper-closed'));assert.equal(await environment.reconcileLease(),true);
+});
+test('probe observation cutoff during a dispatched handshake retains its identity through independent cleanup',async t=>{
+ const f=await fixture(t),cleanup=AbortSignal.timeout(2000),cancelled=[];let dispatched=0;
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:.04},{...f.context,stopSignal:cleanup,client:async(args,settings)=>{
+  if(args[0]==='run'){dispatched++;await delay(70,null,{signal:settings?.signal});}
+  if(args[0]==='cancel'){cancelled.push(args[1]);assert.equal(settings.signal.aborted,false);return {state:'cancelled'};}
+  return f.context.client(args,settings);
+ }});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,1);
+ const submitted=f.events.find(event=>event.type==='execution-submitted'&&event.handle);assert.ok(submitted);assert.deepEqual(cancelled,[submitted.handle]);
+ assert.equal(JSON.parse(await readFile(f.lastProbe().receipt,'utf8')).handle,submitted.handle);
+});
+test('probe cutoff during its submission journal prevents dispatch with positive no-admission evidence',async t=>{
+ const f=await fixture(t);let dispatched=0;
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:.02},{...f.context,stopSignal:AbortSignal.timeout(1000),event:async(type,data)=>{
+  await f.context.event(type,data);if(type==='execution-submitting')await delay(40);
+ },client:async(args,settings)=>{if(args[0]==='run')dispatched++;return f.context.client(args,settings);}});
+ await assert.rejects(environment.inspectDevices());assert.equal(dispatched,0);assert.ok(f.events.some(event=>event.type==='execution-not-admitted'));
+});

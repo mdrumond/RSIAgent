@@ -30,6 +30,13 @@ export async function openDeviceLease(receipt, token) {
       if(type==='execution-handle'&&data.handle&&!record.handles.includes(data.handle))record.handles.push(data.handle);
       await save();
     },
+    async confirmSubmissionClosed(proof){
+      const row=record.submissions.find(item=>item.submission===proof.submission);
+      if(!row||row.kind!=='run'||row.accountingExcluded===true||row.handle||row.receiptFile!==proof.receiptFile||
+          proof.closed!==true||!proof.timingKey||proof.admissionToken!==token||proof.admission?.token!==token||
+          proof.admission.decision!=='admitted'||proof.admission.released!==true||proof.nativeIdentityMissing!==true)return false;
+      Object.assign(row,{closed:true,wrapperClosure:proof});await save();return true;
+    },
     async update(data){Object.assign(record,data);await save();},
     async release(){
       if(JSON.parse(await readFile(receipt,'utf8')).token!==token)throw new Error('Lease ownership changed');

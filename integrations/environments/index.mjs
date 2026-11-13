@@ -456,7 +456,7 @@ export async function createEnvironment(options, context) {
     }
     return { state: 'unknown' };
   }
-  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal) {
+  async function submit(args, receipt, allowCompleted = false, accountingExcluded = false, signal = context.signal, receiptSignal = context.stopSignal) {
     const rejected = reason => {
       const error = closedSetupError(`CPL ${args[0]} was not admitted`, {notAdmitted:true,reason});
       // A refused artifact download says nothing about earlier payload closure.
@@ -467,7 +467,10 @@ export async function createEnvironment(options, context) {
     const operation = randomUUID();
     await event('execution-submitting', { submission: operation, receiptFile: receipt ?? null, kind: args[0], accountingExcluded });
     let result, cause;
-    try { result = await client(args, {signal}); }
+    if(signal?.aborted){await event('execution-not-admitted',{submission:operation,closed:true});throw Object.assign(rejected(),{cause:signal.reason});}
+    // Admission follows the actor clock; dispatched run receipts use the caller's
+    // independent bounded cleanup allowance before cancellation observes the ID.
+    try { result = await client(args, {signal:args[0]==='run'&&receiptSignal?receiptSignal:signal}); }
     catch (error) {
       cause = error;
       if (receipt) try { result = await json(receipt); } catch { /* absence is not closure */ }
@@ -653,7 +656,7 @@ export async function createEnvironment(options, context) {
       stage = { ...stage, confirmed: false, receiptFile: join(dir, 'sync-submission.json') };
       await save(cachePath, stage);
       let submitted;
-      try { submitted = await submit(args, stage.receiptFile, false, true, signal); }
+      try { submitted = await submit(args, stage.receiptFile, false, true, signal, opts.stopSignal); }
       catch (error) { if (error.code === 'CPL_NOT_ADMITTED') await rm(cachePath); throw error; }
       await event('execution-handle', { handle: submitted.handle, purpose: 'setup' });
       let state;
@@ -662,7 +665,7 @@ export async function createEnvironment(options, context) {
         if (state.state === 'stopped' && state.exitCode !== 0) {
           await rm(cachePath); throw closedSetupError(`Copy failed: ${submitted.handle}`, {handle: submitted.handle, reason: state});
         }
-        if (signal?.aborted) { await stop(submitted.handle,{accountingExcluded:true}); signal.throwIfAborted(); }
+        if (signal?.aborted) { await stop(submitted.handle,{accountingExcluded:true,signal:opts.stopSignal}); signal.throwIfAborted(); }
         if (state.state === 'running') await delay(options.pollMs ?? 250);
       } while (state.state === 'running');
       if (state.state !== 'stopped') throw new Error(`Copy unresolved: ${submitted.handle}`);
@@ -688,7 +691,7 @@ export async function createEnvironment(options, context) {
     const launch={wallMs:Date.now(),monotonicNs:String(process.hrtime.bigint()),boot:(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim()};
     const receiptData = { handle: null, receiptFile: receipt, spool, timingKey, launch, admissionToken:opts.admissionToken, cwd: configuration.cwd };
     await save(join(dir, 'execution.json'), receiptData);
-    const submitted = await submit(args, receipt, false, false, signal);
+    const submitted = await submit(args, receipt, false, false, signal, opts.stopSignal);
     handle = submitted.handle;
     check(handle);
     receiptData.handle = handle;
@@ -743,9 +746,28 @@ export async function createEnvironment(options, context) {
       return await json(path);
     } catch { return null; }
   }
+  // A lost transport ID remains unknown. The original nonce-bound wrapper and
+  // released admission token can nevertheless prove that its payload is closed.
+  async function wrapperClosure(data) {
+    if(!remote||data.kind!=='run'||data.accountingExcluded||!data.receiptFile)return null;
+    const dir=dirname(data.receiptFile),name=relative(root,dir);
+    if(!/^exec-[A-Za-z0-9]+$/.test(name)||data.receiptFile!==join(dir,'submission.json'))return null;
+    try{
+      const receipt=await json(join(dir,'execution.json'));
+      if(receipt.receiptFile!==data.receiptFile||receipt.handle||!receipt.timingKey||!receipt.admissionToken||!receipt.spool)return null;
+      for(const file of ['timing.json','admission.json','exit']){
+        const transferDir=await mkdtemp(join(root,'closure-'));
+        await exclude('transfer',()=>transfer(['download',options.target,posix.join(receipt.spool,file),join(dir,file)],transferDir,context.stopSignal??context.signal));
+      }
+      const timing=await json(join(dir,'timing.json')),admission=await json(join(dir,'admission.json')),exitText=(await readFile(join(dir,'exit'),'utf8')).trim(),exit=Number(exitText);
+      if(timing?.completed!==true||timing.key!==receipt.timingKey||!Number.isFinite(timing.executionSeconds)||timing.executionSeconds<0||!/^[-]?\d+$/.test(exitText)||!Number.isInteger(exit)||admission?.token!==receipt.admissionToken||admission.decision!=='admitted'||admission.released!==true)return null;
+      const proof={closed:true,receiptFile:data.receiptFile,timingKey:receipt.timingKey,admissionToken:receipt.admissionToken,admission,executionSeconds:timing.executionSeconds,exitCode:exit,nativeIdentityMissing:true,artifactsUnresolved:true};
+      await save(join(dir,'wrapper-closure.json'),proof);return proof;
+    }catch{return null;}
+  }
   async function reconcileOperation({ operation, events }) {
     const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
-    const handles = new Set();
+    const handles = new Set(),wrapperClosures=[];
     if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
     let executionSeconds = 0,timingEstimated=false,closed=true,accountingUnresolved=false,accounted=false;
     const excluded=excludedExecutionProofs(events);
@@ -756,6 +778,8 @@ export async function createEnvironment(options, context) {
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
       if (!handle) {
+        const proof=await wrapperClosure(data);
+        if(proof){wrapperClosures.push({...proof,submission:data.submission});executionSeconds+=proof.executionSeconds;accounted=true;continue;}
         closed=false;accountingUnresolved=true;
         if(!data.accountingExcluded) {
           let timing;
@@ -788,7 +812,7 @@ export async function createEnvironment(options, context) {
     }
     return {closed:closed&&!accountingUnresolved,
       ...((accounted||!accountingUnresolved)?{executionSeconds}:{}),
-      ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles]};
+      ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles],...(wrapperClosures.length?{wrapperClosures,nativeIdentityMissing:true,artifactsUnresolved:true}:{})};
   }
   // Installation eligibility only: never settles work or permits its resumption.
   async function canUpgrade({ attempt, events }) {
