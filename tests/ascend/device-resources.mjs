@@ -601,7 +601,14 @@ test('legacy reservation with no owner proof reports actionable blockage without
   const f=await fixture(t);f.setEnabled([0]);
   const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);await held.update({owner:null});
   await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
-  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>error.code==='DEVICE_LEASE_BLOCKED');
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.equal(error.reservations[0].receipt,held.receipt);
+    assert.equal(error.reservations[0].token,held.token);
+    assert.equal(error.reservations[0].physicalDevice,0);
+    assert.equal(error.reservations[0].reason,'owner-unknown');
+    return true;
+  });
   const blocked=f.events.find(e=>e.type==='device-lease-blocked');
   assert.equal(blocked.reservations[0].receipt,held.receipt);assert.equal(blocked.reservations[0].reason,'owner-unknown');
   assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').length,0);
@@ -670,6 +677,28 @@ test('control-started with an unknown payload submission is held instead of redi
   assert.equal(await f.environment.reconcileLease(),false);
   assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
   assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).controlStarted,true);
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'RSI_EXECUTION_UNRESOLVED');
+    assert.deepEqual(error.reservations,[{receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}]);
+    return true;
+  });
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
+});
+
+test('a dead owner with an unidentified submission exposes its identity without admitting another payload',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const receiptFile=join(f.context.instancePath,'lost-submission.json');
+  await held.update({owner:{...held.record.owner,start:'old-process'},handles:['remote:fixture:job:terminal']});
+  await held.event('execution-submitting',{submission:'unidentified-command',receiptFile,kind:'run'});
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.deepEqual(error.reservations,[{physicalDevice:0,closed:false,reason:'submission-unknown',receipt:held.receipt,token:held.token,submission:'unidentified-command',receiptFile}]);
+    return true;
+  });
+  assert.equal(f.commands.length,0);
+  assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).token,held.token);
 });
 
 test('explicit closed legacy-control migration requires an absent journal and native closure',async t=>{
