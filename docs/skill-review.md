@@ -115,3 +115,22 @@ by itself. Exhausted or failed claimed drafts retain their request for inspectio
 they do not automatically create repeated experiments. Successful actor postprocessing
 records linked findings in the request and publishes ordinary memory through the
 existing memory path. No new background scheduler is introduced.
+
+`continueMicroevalSamples` in `cli/skill-microeval-continuations.mjs` creates
+separate diagnostic continuations for settled whole-sample timeouts. Its default
+600-second allowance includes original elapsed work and reserves up to 180
+seconds for final verification. Pass the original `originDirectory`, unchanged
+`skills` and `profile`, a separate `directory`, and optionally selected
+`sampleKeys`. The normal frozen-resume contract and primary decisions are not
+changed. A successful initial recheck needs no actor; a definite candidate
+failure may continue a fork of the original Pi session. An original trial
+without a session requires explicit `actorStarted: false` evidence before first
+actor admission. Unknown execution or reservation identities remain blocked.
+
+Continuations use the same sample/verification hooks as the primary evaluator.
+Their separate manifest pins each selected result, task, work snapshot and
+session; appending unrelated primary results does not invalidate that identity.
+Resume reuses the fork and remaining allowance. Original files and sessions are
+never overwritten, and actor session totals are marked cumulative because they
+include the fork's original history. Continuations do not promote skills or
+recompute original A/B decisions.
