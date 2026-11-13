@@ -161,13 +161,15 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     if(!partial)for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
     report.runningSample={key,owner:report.owner};await persist();
     const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;let observed,verification;
-    const actorAllocation=allocation-Math.min(verificationSeconds,allocation/2),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
+    const actorBudget=seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
+    const actorExhausted=verificationSeconds&&savedActor&&!savedActor.actorCompleted&&spent>=actorBudget;
+    const actorAllocation=Math.max(.001,Math.min(actorBudget-spent,allocation-Math.min(verificationSeconds,allocation/2))),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
     try{
-     observed=partial?.actorObservation?.actorCompleted?{...partial.actorObservation}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
+     observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
      if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:observed.unresolvedExecution.handle});
      observed.actorCompleted??=!actorSignal.aborted||Boolean(actorDeadline?.aborted&&!sampleSignal.aborted);
-     if(actorDeadline?.aborted&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
+     if(verificationSeconds&&(actorDeadline?.aborted||observed.timedOut)&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);

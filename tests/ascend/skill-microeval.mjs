@@ -218,3 +218,26 @@ test('resuming interrupted reserved verification does not allocate another actor
  const result=await runMicroeval(options,dependencies);
  assert.equal(sampled,2);assert.equal(verified,3);assert.ok(result.results.every(r=>r.correct));
 });
+test('an inner actor timeout before the outer actor timer still receives reserved verification',async t=>{
+ for(const answer of [42,0]){
+  const f=await fixture(t);let checked=0;
+  const result=await runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5},{sample:async({cwd,signal})=>{
+   assert.equal(signal.aborted,false);await writeFile(join(cwd,'kernel.py'),`def answer(): return ${answer}\n`);
+   return {timedOut:true,error:'Inner actor timer elapsed'};
+  },verify:async({cwd})=>{checked++;return {correct:spawnSync(f.python,[f.tasks[0].checker,cwd],{timeout:1000}).status===0};}});
+  assert.equal(checked,2);assert.ok(result.results.every(r=>r.correct===(answer===42)&&r.actorTimedOut&&!r.timedOut));
+ }
+});
+test('resume preserves remaining actor time instead of splitting the remaining sample again',async t=>{
+ const f=await fixture(t),abort=new AbortController(),options={...f,runs:1,seconds:1,verificationSeconds:.5,resume:true};
+ await assert.rejects(runMicroeval({...options,signal:abort.signal},{sample:async()=>{await new Promise(resolve=>setTimeout(resolve,40));abort.abort();return {};}}));
+ const retained=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8')),spent=retained.partials['repair/0/active'].elapsedSeconds;
+ const result=await runMicroeval(options,{sample:async({cwd,seconds})=>{if(cwd.endsWith('0-active/work'))assert.ok(seconds+spent<=.501);await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');return {};}});
+ assert.ok(result.results.every(r=>r.correct));
+});
+test('an exhausted interrupted actor proceeds to verification without another actor turn',async t=>{
+ const f=await fixture(t),abort=new AbortController(),options={...f,runs:1,seconds:1,verificationSeconds:.5,resume:true};let sampled=0;
+ const sample=async({cwd,signal})=>{sampled++;await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');if(sampled===1){await untilAbort(signal);abort.abort();return {timedOut:true,error:'Interrupted after actor cutoff'};}return {};};
+ await assert.rejects(runMicroeval({...options,signal:abort.signal},{sample}));
+ const result=await runMicroeval(options,{sample});assert.equal(sampled,2);assert.ok(result.results.every(r=>r.correct));
+});
