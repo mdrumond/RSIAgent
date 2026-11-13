@@ -36,6 +36,21 @@ device-host `bash` and `rsi_target` share that admission path. The command keeps
 its device through compilation, execution and profiling; later commands may
 use another device. Server aliases and runtimes share the registered NPU pool.
 Unknown executions retain their reservations until positively reconciled.
+Reservation failures expose the retained receipt and token in the error's
+`reservations` array; an unknown submission also identifies its original
+submission and receipt file. Preserve that evidence rather than moving or
+deleting shared reservation directories. If a receipt was already displaced,
+an operator can use `environment.reconcileReservation(physicalDevice,
+{receipt, token})` with its retained location. The record must match the pool,
+physical device and token; owner, native-command and host-fence closure checks
+still apply. This reconciles the displaced record in place and does not replace
+the currently active reservation.
+An unidentified output download marked as excluded artifact transfer does not
+retain a physical device once every identified command is terminal and the host
+fence has positively closed. Its submission stays unresolved in the archived
+receipt and the closure proof's `unresolvedArtifacts`; this does not settle the
+original transfer or attempt. Unidentified uploads, device commands and control
+commands continue to block reservation closure.
 
 For campaigns that permanently reserve an A/B device, the private Ascend profile
 sets `backgroundDevice` to one physical ID in its explicit `deviceAffinity`.

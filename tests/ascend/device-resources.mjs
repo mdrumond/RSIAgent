@@ -13,7 +13,7 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
-import {reserveDevice} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,closedDeviceLease,closeDeviceLease} from '../../integrations/environments/device-leases.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -601,7 +601,14 @@ test('legacy reservation with no owner proof reports actionable blockage without
   const f=await fixture(t);f.setEnabled([0]);
   const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);await held.update({owner:null});
   await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
-  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>error.code==='DEVICE_LEASE_BLOCKED');
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.equal(error.reservations[0].receipt,held.receipt);
+    assert.equal(error.reservations[0].token,held.token);
+    assert.equal(error.reservations[0].physicalDevice,0);
+    assert.equal(error.reservations[0].reason,'owner-unknown');
+    return true;
+  });
   const blocked=f.events.find(e=>e.type==='device-lease-blocked');
   assert.equal(blocked.reservations[0].receipt,held.receipt);assert.equal(blocked.reservations[0].reason,'owner-unknown');
   assert.equal(f.events.filter(e=>e.type==='device-lease-acquired').length,0);
@@ -631,6 +638,62 @@ test('reclaimed token closure lets its original checkpoint resume without touchi
   assert.equal(JSON.parse(await readFile(fresh.receipt,'utf8')).token,fresh.token);
 });
 
+test('a retained displaced receipt closes its original fence without replacing the active reservation',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'},handles:['remote:fixture:job:old-payload']});
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await old.event('execution-submitting',artifact);
+  const active=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const before=await readFile(active.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,true);
+  assert.deepEqual(result.unresolvedArtifacts,[artifact]);
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+  await assert.rejects(readFile(old.receipt),{code:'ENOENT'});
+  assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:old-payload'));
+  assert.equal(f.commands.length,0,'only token-scoped cleanup runs, never an actor payload');
+  const calls=f.calls.length;
+  assert.deepEqual(await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token}),result);
+  assert.equal(f.calls.length,calls,'retrying a known closure performs no client work');
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+});
+
+for(const mismatch of ['pool','physical'])test(`an archived retained closure with a different ${mismatch} cannot satisfy a recovery retry`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await closeDeviceLease(old);
+  await f.environment.resources();
+  const calls=f.calls.length;
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(f.calls.length,calls);
+});
+
+for(const mismatch of ['pool','physical','token'])test(`retained reservation ${mismatch} mismatch cannot dispatch cleanup`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await old.update({owner:{...old.record.owner,start:'old-process'}});
+  const before=await readFile(old.receipt,'utf8');
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:mismatch==='token'?'another-token':old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(await readFile(old.receipt,'utf8'),before);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
+for(const blocked of ['live-owner','unknown-submission'])test(`retained reservation preserves ${blocked} closure guard`,async t=>{
+  const f=await fixture(t),old=await reserveDevice(f.context.instancePath,0,join(f.context.instancePath,'quarantined'));
+  if(blocked==='unknown-submission'){
+    await old.update({owner:{...old.record.owner,start:'old-process'}});
+    await old.event('execution-submitting',{submission:'unknown-original',kind:'run'});
+  }
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);
+  assert.equal(result.reason,blocked==='live-owner'?'owner-active':'submission-unknown');
+  assert.equal(JSON.parse(await readFile(old.receipt,'utf8')).token,old.token);
+  assert.equal(f.calls.filter(a=>a[0]!=='npu').length,0);
+});
+
 for(const unknown of [false,true])test(`failed control admission download (${unknown?'unknown':'closed'} transfer) retains its native handle without replay`,async t=>{
   const f=await fixture(t);let broken=true,controlHandle;
   const client=async(args,settings)=>{
@@ -655,10 +718,12 @@ for(const unknown of [false,true])test(`failed control admission download (${unk
     migrateClosedControl:async()=>{migrated=true;return true;}})).closed,false);
   assert.equal(migrated,false,'an existing native journal is not a legacy migration');
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
+  const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
   broken=false;const recovered=await restarted.reconcileLease();
-  assert.equal(recovered,!unknown);
-  if(unknown){const pointer=JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8'));
-    assert.equal(JSON.parse(await readFile(pointer.receipt,'utf8')).controlHandle,controlHandle);}
+  assert.equal(recovered,true);
+  if(unknown){const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.some(row=>row.kind==='download'&&!row.handle));
+    assert.equal(JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8')).controlHandle,controlHandle);}
   assert.equal(f.calls.filter(a=>a[0]==='run').length,runs);
 });
 
@@ -670,6 +735,39 @@ test('control-started with an unknown payload submission is held instead of redi
   assert.equal(await f.environment.reconcileLease(),false);
   assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
   assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).controlStarted,true);
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'RSI_EXECUTION_UNRESOLVED');
+    assert.deepEqual(error.reservations,[{receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}]);
+    return true;
+  });
+  assert.equal(f.calls.filter(a=>a[0]==='run').length,0);
+});
+
+test('the original checkpoint can release its device after host closure while preserving an unidentified output transfer',async t=>{
+  const f=await fixture(t),held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const artifact={submission:'missing-output-download',kind:'download',accountingExcluded:true,receiptFile:null};
+  await held.event('execution-submitting',artifact);
+  await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify({receipt:held.receipt,token:held.token,pool:held.record.pool,physicalDevice:0}));
+  assert.equal(await f.environment.reconcileLease(),true);
+  const released=f.events.find(e=>e.type==='device-lease-released');
+  assert.deepEqual(released.unresolvedArtifacts,[artifact]);
+  assert.equal(f.commands.length,0);
+});
+
+test('a dead owner with an unidentified submission exposes its identity without admitting another payload',async t=>{
+  const f=await fixture(t);f.setEnabled([0]);
+  const held=await reserveDevice(f.context.instancePath,0,f.context.leaseDirectory);
+  const receiptFile=join(f.context.instancePath,'lost-submission.json');
+  await held.update({owner:{...held.record.owner,start:'old-process'},handles:['remote:fixture:job:terminal']});
+  await held.event('execution-submitting',{submission:'unidentified-command',receiptFile,kind:'run'});
+  await f.environment.prepare({project:{source:f.source},attempt:{id:'new'}});
+  await assert.rejects(f.environment.execute('must-not-run',f.source,{timeout:5}),error=>{
+    assert.equal(error.code,'DEVICE_LEASE_BLOCKED');
+    assert.deepEqual(error.reservations,[{physicalDevice:0,closed:false,reason:'submission-unknown',receipt:held.receipt,token:held.token,submission:'unidentified-command',receiptFile}]);
+    return true;
+  });
+  assert.equal(f.commands.length,0);
+  assert.equal(JSON.parse(await readFile(held.receipt,'utf8')).token,held.token);
 });
 
 test('explicit closed legacy-control migration requires an absent journal and native closure',async t=>{
@@ -838,7 +936,14 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   blocking=false;
   if(stage==='admission-read') {
     assert.ok(retained.submissions.some(row=>!row.closed&&!row.handle),'an interrupted unacknowledged transfer remains unknown');
-    assert.equal(await environment.reconcileLease(),false,'transport recovery is not proof that the unacknowledged transfer closed');
+    assert.equal(await environment.reconcileLease(),true,'positive host closure can free the device while the output transfer stays unknown');
+    const proof=await closedDeviceLease(pointer.receipt,pointer.token);
+    assert.ok(proof.unresolvedArtifacts.length>0);
+    const archived=JSON.parse(await readFile(join(proof.path,'lease.json'),'utf8'));
+    for(const artifact of proof.unresolvedArtifacts){
+      const original=archived.submissions.find(row=>row.submission===artifact.submission);
+      assert.equal(original.closed,undefined);assert.equal(original.handle,undefined);
+    }
   } else assert.equal(await environment.reconcileLease(),true,'an expired control context must not poison a later observation');
   assert.equal(f.commands.length,1,'observing late completion must never replay the payload');
 });

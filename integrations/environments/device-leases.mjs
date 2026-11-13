@@ -6,6 +6,11 @@ import {readFileSync,writeFileSync,renameSync,mkdirSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {processIdentity,ownerStopped} from '../../controller/lifecycle.mjs';
 
+// Output downloads cannot launch device work. Their unknown transfer identity
+// still belongs to the original operation, but need not hold a physical device.
+export const artifactDownload=row=>row.kind==='download'&&row.accountingExcluded===true;
+const unresolvedArtifacts=record=>record.submissions.filter(row=>artifactDownload(row)&&row.closed!==true&&!row.handle);
+
 export async function openDeviceLease(receipt, token) {
   const record=JSON.parse(await readFile(receipt,'utf8'));
   if(record.token!==token) throw new Error('Lease ownership changed');
@@ -48,8 +53,10 @@ export async function closeDeviceLease(lease) {
   return leaseLock(dirname(dirname(lease.receipt)),()=>{
     const record=JSON.parse(readFileSync(lease.receipt,'utf8'));
     if(record.token!==lease.token)throw new Error('Lease ownership changed');
+    const artifacts=unresolvedArtifacts(record);
     const proof={closed:true,receipt:lease.receipt,token:lease.token,pool:record.pool,
-      physicalDevice:record.physicalDevice,handles:record.handles,controlDirectory:record.controlDirectory};
+      physicalDevice:record.physicalDevice,handles:record.handles,controlDirectory:record.controlDirectory,
+      ...(artifacts.length?{unresolvedArtifacts:artifacts}: {})};
     writeFileSync(join(dirname(lease.receipt),'closure.json'),JSON.stringify(proof),{mode:0o600});
     renameSync(dirname(lease.receipt),path);return proof;
   });
@@ -92,6 +99,8 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
   try{before=leaseLock(dirname(dirname(receipt)),()=>JSON.parse(readFileSync(receipt,'utf8')));}
   catch(error){if(error.code==='ENOENT')return {closed:false,reason:'missing-receipt',receipt};throw error;}
   const blocked=(reason,extra={})=>({closed:false,reason,receipt,token:before.token,...extra});
+  const closed=proof=>({closed:true,receipt,token:before.token,
+    ...(proof.unresolvedArtifacts?{unresolvedArtifacts:proof.unresolvedArtifacts}: {})});
   if(before.version!==2)return blocked('unsupported-receipt');
   if(!await stopped(before.owner,before))return blocked(before.owner?'owner-active':'owner-unknown');
   if(before.reconciliation&&!await ownerStopped(before.reconciliation.owner))return blocked('reconciliation-active');
@@ -106,7 +115,10 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
       if(row.closed===true)continue;
       let handle=row.handle;
       if(!handle&&row.receiptFile)try{handle=JSON.parse(await readFile(row.receiptFile,'utf8')).handle;}catch{}
-      if(!handle)return blocked('submission-unknown');
+      if(!handle){
+        if(artifactDownload(row))continue;
+        return blocked('submission-unknown',{submission:row.submission,receiptFile:row.receiptFile??null});
+      }
       handles.add(handle);
     }
     for(const handle of handles){
@@ -114,14 +126,17 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
       if(!['stopped','completed','failed','cancelled'].includes(result?.state))return blocked('execution-unresolved',{handle});
     }
     if(!await reconcileHost(lease)){
-      if(await closedDeviceLease(receipt,before.token))return {closed:true,receipt,token:before.token};
+      const proof=await closedDeviceLease(receipt,before.token);
+      if(proof)return closed(proof);
       return blocked('host-fence-unresolved');
     }
-    await closeDeviceLease(lease);return {closed:true,receipt,token:before.token};
+    const proof=await closeDeviceLease(lease);
+    return closed(proof);
   }catch(error){
     // Another checkpoint can close this exact token while an observer is in I/O.
     // Its positive closure supersedes missing/moved journals, never another token.
-    if(await closedDeviceLease(receipt,before.token))return {closed:true,receipt,token:before.token};
+    const proof=await closedDeviceLease(receipt,before.token);
+    if(proof)return closed(proof);
     throw error;
   }finally{
     try{changeLease(receipt,record=>{
