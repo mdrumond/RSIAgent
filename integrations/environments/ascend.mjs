@@ -5,6 +5,7 @@ import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLeas
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
+import { ownerStopped } from '../../controller/lifecycle.mjs';
 
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const digest = text => createHash('sha256').update(text).digest('hex');
@@ -478,8 +479,18 @@ export async function createEnvironment(options, context) {
   }
   async function recoverReservation(physical,proof={}) {
     const budget=cleanupBudget();
-    try{return await reconcileDeviceLease(deviceLeaseReceipt(pool,physical,context.leaseDirectory),{
+    const receipt=proof.receipt??deviceLeaseReceipt(pool,physical,context.leaseDirectory);
+    // A displaced receipt may be reconciled in place, never restored over the
+    // active reservation. Bind its identity before any native cleanup request.
+    const matches=record=>record.pool===pool&&record.physicalDevice===physical&&record.token===proof.token;
+    if(proof.receipt!==undefined){
+      if(typeof proof.token!=='string'||!proof.token)throw new Error('Retained reservation token required');
+      const record=await readJson(receipt);
+      if(!matches(record))return {closed:false,reason:'ownership-changed',receipt,token:proof.token};
+    }
+    try{return await reconcileDeviceLease(receipt,{
       ...proof,
+      stopped:(owner,record)=>(proof.receipt===undefined||matches(record))&&(proof.stopped??ownerStopped)(owner,record),
       observe:handle=>local?environment.observe(handle,{signal:budget.signal}):client(['observe',handle],{signal:budget.signal}),
       reconcileHost:async lease=>{
         // Administrative migration is separate from a failed receipt download.
