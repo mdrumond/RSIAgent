@@ -10,6 +10,7 @@ import {runMicroeval,nativeSample} from '../../cli/skill-microeval.mjs';
 import {tasks} from '../../examples/skill-microeval/tasks.mjs';
 import {recoveryRepair} from './microtask-fixture.mjs';
 const python=process.env.RSI_TEST_PYTHON??'python3';
+function untilAbort(signal){return new Promise(resolve=>{const timer=setTimeout(resolve,2000),done=()=>{clearTimeout(timer);resolve();};if(signal.aborted)done();else signal.addEventListener('abort',done,{once:true});});}
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'microeval-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const skills={};for(const arm of ['active','candidate']){const path=join(root,arm);await mkdir(path);await writeFile(join(path,'skill-map.json'),JSON.stringify({implementation:'mapped.md'}));await writeFile(join(path,'mapped.md'),arm+' guidance');skills[arm]=path;}
@@ -182,4 +183,28 @@ test('native target legacy setup uncertainty stops later tool dispatch',async t=
   const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>{calls++;throw Error(message);}}});
   assert.equal(calls,1);assert.deepEqual(result.unresolvedExecution,{handle:message.includes('remote:')?'remote:fixture:job:source':null});
  }
+});
+test('actor cutoff reserves independent verification within the same elapsed sample',async t=>{
+ for(const answer of [42,0]){
+  const f=await fixture(t);let calls=0;
+  const options={...f,runs:1,seconds:.6,verificationSeconds:.3};
+  const report=await runMicroeval(options,{sample:async({cwd,signal,seconds,verificationReserved})=>{
+   calls++;assert.ok(seconds<=.3&&verificationReserved>0);await writeFile(join(cwd,'kernel.py'),`def answer(): return ${answer}\n`);
+   await untilAbort(signal);
+   return {timedOut:true,error:'Actor elapsed allocation exhausted',tokens:7};
+  }});
+  assert.equal(calls,2);assert.ok(report.results.every(r=>r.correct===(answer===42)&&r.actorTimedOut&&r.actorError&&!r.timedOut&&r.tokens===7));
+  assert.ok(report.results.every(r=>r.elapsedSeconds<.6));
+  await assert.rejects(runMicroeval({...options,resume:true,verificationSeconds:.2}),/Frozen micro/);
+ }
+});
+test('verification reserve never extends the whole sample deadline or hides cancellation',async t=>{
+ const f=await fixture(t);let verifications=0;
+ const report=await runMicroeval({...f,runs:1,seconds:.15,verificationSeconds:.07},{sample:async()=>({}),verify:async({signal})=>{
+  verifications++;await untilAbort(signal);return {correct:true};
+ }});
+ assert.equal(verifications,2);assert.ok(report.results.every(r=>!r.correct&&r.timedOut));
+ const g=await fixture(t),abort=new AbortController();let checked=0;
+ await assert.rejects(runMicroeval({...g,runs:1,verificationSeconds:5,signal:abort.signal,resume:true},{sample:async()=>{abort.abort();return {timedOut:true};},verify:async()=>{checked++;return {correct:true};}}));
+ assert.equal(checked,0);
 });

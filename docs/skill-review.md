@@ -92,6 +92,13 @@ local-controller studies can supply `runMicroeval` sample/verification hooks and
 `nativeSample` accepts its prepared target through `targetEnvironment`. Automatic
 remote dispatch from the public `skills-review` configuration is not implemented.
 
+An optional `verificationSeconds` reserves part of the existing sample window
+for independent checking. Preparation and actor work use the earlier portion;
+after an elapsed actor cutoff, the checker may evaluate the current kernel only
+once all execution is settled. `actorTimedOut` records this cutoff separately
+from the overall sample deadline. The reserve is frozen on resume and adds no
+sample time. Unknown commands still block advancement and replay.
+
 For a later explicit rollout, stage `enqueue` with an explicit `learningInstance`
 imports compatible requests into an opted-in destination. It rejects review source
 instances. Programmatic `enqueueLearningRequest(state, request)` in

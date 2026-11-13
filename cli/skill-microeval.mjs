@@ -49,7 +49,7 @@ export async function validateKernelReceipt(verification,cwd){
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -98,7 +98,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
   if(bridge)await bridge.knowledge.prepareSession(session,{signal:sampleSignal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
-  const preparedContract=targetEnvironment&&kind==='a3-kernel'?`\n\nPrepared microtask contract: the controller owns runtime setup and device health/admission; these are complete. WORKLOAD.md is an archived mathematical contract: historical paths, GOAL.md, verifier commands and full case catalogues in it are context, not files to locate or setup work to repeat. case.json defines this task. Use local native tools to inspect and edit kernel.py, and rsi_target to run the declared python check.py . device check. Do not inspect external verifier/reference trees, provenance or runtime metadata. Use this contract when reusable guidance describes a larger project workflow. Finish with approximately ${Math.min(45,Math.floor(seconds/3))} seconds left for the controller's independent final verification; that verification shares this elapsed allowance.`:'';
+  const preparedContract=targetEnvironment&&kind==='a3-kernel'?`\n\nPrepared microtask contract: the controller owns runtime setup and device health/admission; these are complete. WORKLOAD.md is an archived mathematical contract: historical paths, GOAL.md, verifier commands and full case catalogues in it are context, not files to locate or setup work to repeat. case.json defines this task. Use local native tools to inspect and edit kernel.py, and rsi_target to run the declared python check.py . device check. Do not inspect external verifier/reference trees, provenance or runtime metadata. Use this contract when reusable guidance describes a larger project workflow. ${verificationReserved?'The controller has already reserved independent verification time within the overall sample limit; use this actor allocation for the implementation and declared check.':`Finish with approximately ${Math.min(45,Math.floor(seconds/3))} seconds left for the controller's independent final verification; that verification shares this elapsed allowance.`}`:'';
   await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice. ${targetEnvironment?'The model, files and bash are local. Use rsi_target for compilation and device checks on the prepared remote target; keep persistent edits local.':''}\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}${preparedContract}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
@@ -114,10 +114,11 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
+ if(!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Verification reserve must fit inside the sample elapsed allocation');
  if(objective==='harness'||tasks.some(t=>t.bucket==='harness'))throw Error('Harness faults require user intervention, not skill A/B');
  if(tasks.some(t=>t.bucket)&&(!objective||objective==='legacy'))throw Error('Bucketed tasks require an explicit matching objective');
  if(objective&&!['legacy','correctness','optimization'].includes(objective))throw Error('Unknown skill objective');
@@ -135,7 +136,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -160,9 +161,12 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     if(!partial)for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
     report.runningSample={key,owner:report.owner};await persist();
     const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;let observed,verification;
+    const actorAllocation=allocation-Math.min(verificationSeconds,allocation/2),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
+    const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
     try{
-     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:allocation,signal:sampleSignal,sessionDirectory:path,resumeSession:partial?.session});
+     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sessionDirectory:path,resumeSession:partial?.session});
      if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:observed.unresolvedExecution.handle});
+     if(actorDeadline?.aborted&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);

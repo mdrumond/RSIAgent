@@ -143,7 +143,7 @@ export async function nativeEvaluate({directory,active,candidate,config,signal,s
  const selected=settings?.tasks??config.skill_review_tasks??tasks;
  let frozen;try{frozen=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(settings&&frozen&&frozen.totalSeconds!==settings.developmentSeconds)throw Error('Frozen development allocation changed');
- let report=await ops.runMicroeval({directory,objective,binding:settings?.binding,knowledge:settings?.knowledge,skills:{active,candidate},tasks:selected,profile:config.actor,python:config.python??'python3',runs:2,seconds:settings?180:90,
+ let report=await ops.runMicroeval({directory,objective,binding:settings?.binding,knowledge:settings?.knowledge,skills:{active,candidate},tasks:selected,profile:config.actor,python:config.python??'python3',runs:2,seconds:settings?180:90,verificationSeconds:settings?.verificationSeconds??0,
   totalSeconds:frozen?.totalSeconds??settings?.developmentSeconds??seconds,signal,resume:true,shadow:true});
  if(objective==='optimization'&&report.status==='complete')report=await ops.finalizeKernelPairs({directory,python:config.python??'python3',seconds:settings.pairedSeconds,signal});
  return {decision:evaluateSkillObjective(report.results,{objective,projectIds:selected.map(t=>t.id),runs:2,margin:.05,pairedTimings:report.pairedTimings}),report};
