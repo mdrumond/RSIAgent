@@ -208,3 +208,13 @@ test('verification reserve never extends the whole sample deadline or hides canc
  await assert.rejects(runMicroeval({...g,runs:1,verificationSeconds:5,signal:abort.signal,resume:true},{sample:async()=>{abort.abort();return {timedOut:true};},verify:async()=>{checked++;return {correct:true};}}));
  assert.equal(checked,0);
 });
+test('resuming interrupted reserved verification does not allocate another actor turn',async t=>{
+ const f=await fixture(t),abort=new AbortController();let sampled=0,verified=0;
+ const options={...f,runs:1,seconds:2,verificationSeconds:1,resume:true};
+ const dependencies={sample:async({cwd})=>{sampled++;await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');return {};},verify:async()=>{if(++verified===1)abort.abort();return {correct:true};}};
+ await assert.rejects(runMicroeval({...options,signal:abort.signal},dependencies));
+ const interrupted=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8'));
+ assert.equal(interrupted.partials['repair/0/active'].actorCompleted,true);assert.equal(sampled,1);
+ const result=await runMicroeval(options,dependencies);
+ assert.equal(sampled,2);assert.equal(verified,3);assert.ok(result.results.every(r=>r.correct));
+});
