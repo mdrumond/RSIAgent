@@ -147,6 +147,22 @@ with open(c['spool']+'/exit','w') as f: f.write(str(code))
 with open(c['spool']+'/timing.json.tmp','w') as f:
  json.dump({'completed':True,'executionSeconds':time.monotonic()-started,'key':c['timingKey'],'outcome':outcome},f); f.flush(); os.fsync(f.fileno())
 os.replace(c['spool']+'/timing.json.tmp',c['spool']+'/timing.json')
+if c.get('inlineResult'):
+ with open(c['spool']+'/timing.json') as f: result=json.load(f)
+ result.update(protocol='rsi-command-result-1',exitCode=code if code>=0 else 128-code,inlineOutput=False,admission=None)
+ try:
+  if os.path.getsize(c['spool']+'/admission.json')<=4096:
+   with open(c['spool']+'/admission.json') as f: result['admission']=json.load(f)
+ except (OSError,ValueError): pass
+ if sum(os.path.getsize(c['spool']+'/'+name) for name in ['stdout','stderr'])<=32768:
+  try:
+   for name in ['stdout','stderr']:
+    with open(c['spool']+'/'+name,encoding='utf8',newline='') as f: result[name]=f.read()
+   result['inlineOutput']=len(json.dumps(result,ensure_ascii=False).encode())<=65536
+  except UnicodeError: pass
+  if not result['inlineOutput']:
+   result.pop('stdout',None); result.pop('stderr',None)
+ print(json.dumps(result,ensure_ascii=False),flush=True)
 sys.exit(code if code>=0 else 128-code)
 `;
 
@@ -238,7 +254,7 @@ export async function createEnvironment(options, context) {
     }
     return capabilities;
   }
-  const executionReceipts = new Map();
+  const executionReceipts = new Map(), terminalAttempts = new Set();
   const uploadParents = new Set();
   const instructions = (options.instructionFile ? await exclude('setup', () => readFile(options.instructionFile, 'utf8')) : '') +
     '\nNative bash/read/write/edit operate in the LOCAL project; use them for persistent source edits. rsi_target executes commands in the configured target environment.' +
@@ -329,6 +345,34 @@ export async function createEnvironment(options, context) {
     const {dir,...record}=receipt;await save(join(dir,'execution.json'),record);
     return {executionSeconds:timing.executionSeconds,timingSource:'controller-launch',timingEstimated:true};
   }
+  // Native terminal observation plus the wrapper's nonce permits replacing
+  // several small-file transfers; absent/older results retain file collection.
+  const validTerminal = (data,receipt) => data?.protocol==='rsi-command-result-1' &&
+    data.completed===true && data.key===receipt.timingKey && Number.isInteger(data.exitCode) &&
+    Number.isFinite(data.executionSeconds) && data.executionSeconds>=0 &&
+    ['command','infrastructure'].includes(data.outcome?.kind) &&
+    typeof data.inlineOutput==='boolean' && Object.hasOwn(data,'admission') &&
+    (data.admission===null || typeof data.admission==='object' && !Array.isArray(data.admission)) &&
+    (!data.inlineOutput || typeof data.stdout==='string' && typeof data.stderr==='string');
+  async function cachedTerminal(receipt) {
+    try {const data=await json(join(receipt.dir,'terminal-result.json'));return validTerminal(data,receipt)?data:null;}
+    catch {return null;}
+  }
+  async function terminalResult(handle,receipt,state,signal) {
+    if(state!=='stopped')return null;
+    const cached=await cachedTerminal(receipt);if(cached)return cached;
+    if(terminalAttempts.has(handle))return null;terminalAttempts.add(handle);
+    try {
+      const response=await client(['logs',handle,'--stream','stdout','--tail','1'],{signal});
+      if(typeof response.content!=='string'||Buffer.byteLength(response.content)>65536)return null;
+      const data=JSON.parse(response.content.trim());if(!validTerminal(data,receipt))return null;
+      await save(join(receipt.dir,'timing.json'),data);
+      if(data.admission!==null)await save(join(receipt.dir,'admission.json'),data.admission);
+      if(data.inlineOutput)for(const stream of ['stdout','stderr'])await writeFile(join(receipt.dir,stream),data[stream],{mode:0o600});
+      await save(join(receipt.dir,'terminal-result.json'),data);
+      return data;
+    }catch{return null;}
+  }
   async function executionTiming(handle, signal, state, legacy) {
     if (handle.includes(':transfer:')) return { executionSeconds: 0, accountingExcluded: true };
     let receipt = executionReceipts.get(handle);
@@ -347,6 +391,7 @@ export async function createEnvironment(options, context) {
     let fallback;
     try {fallback=receipt?await controllerTiming(receipt,state,legacy):null;} catch { /* accounting failure cannot change native process status */ }
     if (receipt?.timingKey && receipt.spool) {
+      await terminalResult(handle,receipt,state,signal);
       if(state==='stopped' && receipt.admissionToken){
         let admission;try {admission=await json(join(receipt.dir,'admission.json'));} catch {}
         if(admission?.token!==receipt.admissionToken)admission=await readAdmission(handle,{signal});
@@ -631,7 +676,7 @@ export async function createEnvironment(options, context) {
     const spool = posix.join(runRoot, 'output');
     const timingKey = randomUUID();
     const configuration = { command, timingKey, verifiers: ['verification', 'performance'].includes(opts.purpose) ? frozen.map(file => [posix.join(options.workspacePath, file.remote), file.sha256]) : [], cwd: posix.join(options.workspacePath, destination, subdir),
-      spool: posix.join(options.workspacePath, spool), env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
+      spool: posix.join(options.workspacePath, spool), inlineResult:true, env: { ...options.env, ...targetEnvironment(opts.env) }, timeout: remaining() ?? null };
     if (opts.leaseReceipt) configuration.env.RSI_LEASE_RECEIPT = posix.join(configuration.spool,'admission.json');
     const script = join(dir, 'command.sh');
     const receipt = join(dir, 'submission.json');
@@ -661,7 +706,8 @@ export async function createEnvironment(options, context) {
       try {
         for (const stream of ['stdout', 'stderr']) {
           const path = join(dir, stream);
-          await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir, signal));
+          if(!(await cachedTerminal({...receiptData,dir}))?.inlineOutput)
+            await copy('transfer', () => transfer(['download', options.target, posix.join(spool, stream), path], dir, signal));
           if (opts.onData) for await (const chunk of createReadStream(path)) opts.onData(chunk);
         }
         await event('execution-output', { handle, stdout: join(dir, 'stdout'), stderr: join(dir, 'stderr'), partial: false });
@@ -678,8 +724,8 @@ export async function createEnvironment(options, context) {
   // Token-scoped target protocol receipt; payload stdout/exit codes are not admission evidence.
   async function readAdmission(handle, {signal = context.signal} = {}) {
     check(handle);
-    let dir = !remote ? join(root,handle.slice(6)) : null, execution;
-    if (remote) for (const name of await readdir(root)) {
+    let execution=executionReceipts.get(handle),dir=!remote?join(root,handle.slice(6)):execution?.dir;
+    if (remote&&!dir) for (const name of await readdir(root)) {
       const candidate=join(root,name);
       try {
         const row=await json(join(candidate,'execution.json'));
@@ -688,6 +734,8 @@ export async function createEnvironment(options, context) {
       } catch { /* unrelated execution */ }
     }
     if(!dir) return null;
+    const cached=remote?await cachedTerminal({...execution,dir}):null;
+    if(cached)return cached.admission;
     const path=join(dir,'admission.json');
     try {
       if(remote) await exclude('transfer',()=>transfer(['download',options.target,posix.join(execution.spool,'admission.json'),path],dir,signal));
