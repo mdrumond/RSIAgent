@@ -540,7 +540,15 @@ export async function createEnvironment(options, context) {
       }
       activeExclude=exclude;
       return await serial(async () => {
-        if(!await reconcileLease())throw new Error('Device lease unresolved; observe retained handles before retry');
+        if(!await reconcileLease()){
+          let reservation;
+          try{reservation=await readJson(leasePath);}catch(error){
+            if(error.code!=='ENOENT')throw error;
+            reservation={receipt:leasePath};
+          }
+          throw Object.assign(new Error('Device lease unresolved; observe retained handles before retry'),
+            {code:'RSI_EXECUTION_UNRESOLVED',reservations:[reservation]});
+        }
         for(;;){
         let physical, lease;
         await preflight(async emit => {
@@ -567,7 +575,7 @@ export async function createEnvironment(options, context) {
             if (lease) break;
             if(blocked.length){
               await context.event('device-lease-blocked',{pool,reservations:blocked});
-              throw Object.assign(new Error('Device reservations require reconciliation: '+JSON.stringify(blocked)),{code:'DEVICE_LEASE_BLOCKED'});
+              throw Object.assign(new Error('Device reservations require reconciliation: '+JSON.stringify(blocked)),{code:'DEVICE_LEASE_BLOCKED',reservations:blocked});
             }
             await waitForDevice();
             await exclude('queue-wait', () => delay(options.leasePollMs ?? 250, undefined, {signal}));

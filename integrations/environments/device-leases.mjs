@@ -106,7 +106,7 @@ export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe
       if(row.closed===true)continue;
       let handle=row.handle;
       if(!handle&&row.receiptFile)try{handle=JSON.parse(await readFile(row.receiptFile,'utf8')).handle;}catch{}
-      if(!handle)return blocked('submission-unknown');
+      if(!handle)return blocked('submission-unknown',{submission:row.submission,receiptFile:row.receiptFile??null});
       handles.add(handle);
     }
     for(const handle of handles){
