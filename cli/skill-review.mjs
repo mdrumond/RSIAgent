@@ -215,7 +215,9 @@ export async function runReview(options,dependencies={}){
      const version=await writeVersion(directory,updated,join(directory,'skills','versions',campaign.activeVersion));
      candidate=state.candidates[candidateKey]={directory,bucket:key,proposalRevision:revision,active:campaign.activeVersion,version,changes:review.changes};await persist();
     }
-    let result;try{result=await invoke('evaluate',{directory:join(directory,'evaluation'),key:candidateKey,objective:review.objective,config:await load(join(directory,'instance.json')),
+    const evaluationConfig=await load(join(directory,'instance.json'));
+    if(options.evaluations)evaluationConfig.skill_review_evaluations=options.evaluations;
+    let result;try{result=await invoke('evaluate',{directory:join(directory,'evaluation'),key:candidateKey,objective:review.objective,config:evaluationConfig,
      active:join(directory,'skills','versions',candidate.active),candidate:join(directory,'skills','versions',candidate.version)},review.objective?(()=>{const e=evaluationSettings(options.evaluations,review.objective);return e.developmentSeconds+e.pairedSeconds;})():900);}
     catch(error){
      if(signal.aborted)throw error;

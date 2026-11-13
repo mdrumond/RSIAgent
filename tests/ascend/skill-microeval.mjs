@@ -158,9 +158,9 @@ test('elapsed allowance covers adapter preparation and trusted verification hook
  assert.ok(measured.results.every(r=>r.correct&&r.verification.output==='trusted target check'));
 });
 test('unresolved actor and verifier commands retain identity and stop before the next arm',async t=>{
- for(const phase of ['sample','verify']){
+ for(const phase of ['sample','verify','legacy-prepare','legacy-verify']){
   const f=await fixture(t),handle='remote:fixture:job:unknown-'+phase;let calls=0;
-  const dependencies={sample:async()=>{calls++;return phase==='sample'?{unresolvedExecution:{handle},timedOut:true}:{};},verify:async()=>{throw Object.assign(Error('Target command unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});}};
+  const dependencies={sample:async()=>{calls++;if(phase==='legacy-prepare')throw Error('Copy unresolved: '+handle);return phase==='sample'?{unresolvedExecution:{handle},timedOut:true}:{};},verify:async()=>{if(phase==='legacy-verify')throw Object.assign(Error('Local execution unresolved'),{handle});throw Object.assign(Error('Target command unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});}};
   await assert.rejects(runMicroeval({...f,runs:1,resume:true},dependencies),{code:'RSI_EXECUTION_UNRESOLVED'});
   const retained=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8'));
   assert.equal(calls,1);assert.equal(retained.status,'interrupted');assert.equal(retained.results.length,0);
@@ -174,4 +174,12 @@ test('native target unknown status survives session abort as structured evidence
  const handle='remote:fixture:job:unknown-native';
  const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>({handle,settled:false,exitCode:null})}});
  assert.deepEqual(result.unresolvedExecution,{handle});
+});
+test('native target legacy setup uncertainty stops later tool dispatch',async t=>{
+ for(const message of ['Source synchronization unresolved; observe remote:fixture:job:source','Probe submission identity unknown; do not resubmit']){
+  const f=await fixture(t),profile=await scriptedMicro(t,f.root,()=>({name:'rsi_target',args:{command:'python check.py .'}}));
+  const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);let calls=0;
+  const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>{calls++;throw Error(message);}}});
+  assert.equal(calls,1);assert.deepEqual(result.unresolvedExecution,{handle:message.includes('remote:')?'remote:fixture:job:source':null});
+ }
 });

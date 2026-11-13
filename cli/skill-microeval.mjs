@@ -13,6 +13,10 @@ import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-obje
 import {modelFromProfile} from '../controller/model.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
+function unknownExecution(error){
+ if(error.code!=='RSI_EXECUTION_UNRESOLVED'&&!/unresolved|(?:identity|closure) unknown|do not resubmit/i.test(error.message??''))return null;
+ return {handle:error.handle??error.message?.match(/remote:[^\s:]+:(?:job|transfer|command|session):[\w-]+|local:[\w-]+/)?.[0]??null};
+}
 async function save(path,value){const tmp=path+'.'+randomUUID();await writeFile(tmp,JSON.stringify(value,null,2)+'\n');await rename(tmp,path);}
 const inside=(root,name)=>{const path=resolve(root,name),rel=relative(root,path);if(isAbsolute(name)||!rel||rel==='..'||rel.startsWith('../'))throw Error('Task files must be relative descendants');return path;};
 async function skillInput(directory){
@@ -73,7 +77,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
     const operation=targetEnvironment.execute(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
     try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
-    catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'){unresolvedExecution={handle:error.handle??null};interrupt(error);}throw error;}finally{pending.delete(operation);}
+    catch(error){const unknown=unknownExecution(error);if(unknown){unresolvedExecution=unknown;interrupt(error);}throw error;}finally{pending.delete(operation);}
    }},cwd,sdk);pi.registerTool(target);
   }
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
@@ -164,7 +168,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
      verification=remaining>0&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
-    }catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'){report.runningSample.unresolvedExecution={handle:error.handle??null};throw error;}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
+    }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
      correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};

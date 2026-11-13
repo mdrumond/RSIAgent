@@ -445,14 +445,19 @@ test('bucket review carries configured A3 tasks through fork, native evaluation 
  const evaluations=Object.fromEntries(['correctness','optimization'].map(objective=>[objective,{binding:{target:'CPU-fixture-not-device-evidence'},knowledge:{url:'http://127.0.0.1:1234/mcp',identity:'logical-snapshot'},developmentSeconds:30,pairedSeconds:15,tasks:['a','b','c','d','e'].map(id=>({id,bucket:objective,kind:'a3-kernel',prompt:'Fixture',files:{'kernel.py':'answer=42\n'},checker,pairedChecker}))}]));
  const options={...f.options,bucketPolicy:true,evaluations};let evaluated=0;
  const dependencies={classify:args=>args.validate({cause:'actor',bucket:'optimization',coverage:'covered',guidanceIds:['implementation-baseline'],reason:'Actual timing evidence',evidenceRefs:[args.group.occurrences[0].reference]}),review:async args=>update(args),evaluate:async args=>{
-  evaluated++;assert.equal(args.objective,'optimization');assert.equal(args.config.skill_review_evaluations.optimization.tasks.length,5);assert.ok(args.seconds>44&&args.seconds<=45);
+  evaluated++;if(evaluated===1)throw Error('Interrupted candidate fixture');assert.equal(args.objective,'optimization');assert.equal(args.config.skill_review_evaluations.optimization.tasks.length,5);assert.ok(args.seconds>44&&args.seconds<=45);
+  assert.equal(args.config.skill_review_evaluations.optimization.knowledge.url,'http://127.0.0.1:5678/mcp');
   return nativeEvaluate(args,{runMicroeval:input=>runMicroeval(input,{sample:async()=>({tokens:1})})});
- }};
+ },evaluationSettled:async()=>false};
  for(const stage of ['inventory','classify','propose'])await runReview({...f.options,bucketPolicy:true,stage},dependencies);
  const startedAt=(await load(join(options.output,'review.json'))).startedAt;
+ await assert.rejects(runReview({...options,stage:'evaluate'},dependencies),/Interrupted candidate fixture/);
+ const interrupted=Object.values((await load(join(options.output,'review.json'))).candidates)[0];
+ assert.equal((await load(join(interrupted.directory,'instance.json'))).skill_review_evaluations.optimization.knowledge.url,'http://127.0.0.1:1234/mcp');
+ for(const settings of Object.values(evaluations))settings.knowledge.url='http://127.0.0.1:5678/mcp';
  const report=await runReview({...options,stage:'evaluate'},dependencies);
  assert.equal((await load(join(options.output,'review.json'))).startedAt,startedAt);
- assert.equal(evaluated,1);assert.equal(report.candidates[0].decision.promote,true);assert.equal(report.candidates[0].published,true);assert.equal(report.buckets.optimization,3);
+ assert.equal(evaluated,2);assert.equal(report.candidates[0].version,interrupted.version);assert.equal(report.candidates[0].decision.promote,true);assert.equal(report.candidates[0].published,true);assert.equal(report.buckets.optimization,3);
  const state=await load(join(options.output,'review.json')),candidate=Object.values(state.candidates)[0],result=await load(join(candidate.directory,'evaluation','results.json'));
  assert.equal(result.pairedTimings.length,10);assert.equal(result.totalSeconds,30);assert.equal(result.pairedReplay.seconds,15);assert.equal(result.binding.target,'CPU-fixture-not-device-evidence');
  for(const settings of Object.values(evaluations))settings.knowledge.url='http://127.0.0.1:5678/mcp';
