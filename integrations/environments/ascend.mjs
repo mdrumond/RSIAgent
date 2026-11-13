@@ -479,6 +479,16 @@ export async function createEnvironment(options, context) {
     for(const entry of entries)if(entry.isDirectory())
       await cp(join(journal,entry.name),join(context.instancePath,'.executions',entry.name),{recursive:true});
   }
+  async function retainedClosure(physical,proof) {
+    if(proof?.receipt===undefined)return null;
+    if(typeof proof.token!=='string'||!proof.token)throw new Error('Retained reservation token required');
+    const closed=await closedDeviceLease(proof.receipt,proof.token);
+    if(!closed)return null;
+    if(closed.pool!==pool||closed.physicalDevice!==physical)
+      return {closed:false,reason:'ownership-changed',receipt:proof.receipt,token:proof.token};
+    return {closed:true,receipt:proof.receipt,token:proof.token,
+      ...(closed.unresolvedArtifacts?{unresolvedArtifacts:closed.unresolvedArtifacts}: {})};
+  }
   async function recoverReservation(physical,proof={}) {
     const budget=cleanupBudget();
     const receipt=proof.receipt??deviceLeaseReceipt(pool,physical,context.leaseDirectory);
@@ -486,7 +496,8 @@ export async function createEnvironment(options, context) {
     // active reservation. Bind its identity before any native cleanup request.
     const matches=record=>record.pool===pool&&record.physicalDevice===physical&&record.token===proof.token;
     if(proof.receipt!==undefined){
-      if(typeof proof.token!=='string'||!proof.token)throw new Error('Retained reservation token required');
+      const closed=await retainedClosure(physical,proof);
+      if(closed)return closed;
       const record=await readJson(receipt);
       if(!matches(record))return {closed:false,reason:'ownership-changed',receipt,token:proof.token};
     }
@@ -515,6 +526,7 @@ export async function createEnvironment(options, context) {
     ...environment, resources, inspectDevices,
     reconcileReservation:(physical,proof)=>serial(async()=>{
       if(!Number.isInteger(physical)||physical<0)throw new Error('Physical device required');
+      if(pool){const closed=await retainedClosure(physical,proof);if(closed)return closed;}
       await enabled();return recoverReservation(physical,proof);
     }),
     reconcileLease:()=>commandActive?Promise.resolve(false):reconcileLease(), shellOnTarget:local,
