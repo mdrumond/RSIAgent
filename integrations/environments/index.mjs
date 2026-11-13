@@ -246,9 +246,9 @@ export async function createEnvironment(options, context) {
   if (!remote && options.mode !== 'local') throw new Error('Environment mode must be local or cpl');
   let projectRoot, attemptRoot, projectLayout = 'project', frozen = [];
   let capabilities;
-  async function discoverCapabilities() {
+  async function discoverCapabilities(signal=context.signal) {
     if(!capabilities) {
-      const result=await client(['capabilities',options.target]);
+      const result=await client(['capabilities',options.target],{signal});
       if(result.state!=='available')throw closedSetupError('CPL target unavailable',{reason:result});
       capabilities=result;
     }
@@ -855,7 +855,8 @@ export async function createEnvironment(options, context) {
   return {
     instructions, execute, observe, stop, reconcileOperation, readAdmission,localOperations:local,
     ...(remote ? { canUpgrade } : {}),
-    async prepare({ project, attempt }) {
+    async prepare({ project, attempt, signal=context.signal }) {
+      signal?.throwIfAborted();
       return exclude('setup', async () => {
         if (remote) {
           if (!isAbsolute(options.workspacePath ?? '') || !options.remoteDirectory || isAbsolute(options.remoteDirectory) || options.remoteDirectory.split('/').includes('..')) throw new Error('Configure absolute registry workspacePath and relative task-owned remoteDirectory');
@@ -876,8 +877,8 @@ export async function createEnvironment(options, context) {
           for (const file of verifierFiles) frozen.push({ local: file,
             remote: posix.join(attemptRoot, 'tree', relative(layoutRoot, file)),
             sha256: createHash('sha256').update(await readFile(file)).digest('hex') });
-          await discoverCapabilities();
-          const preflight=await client(['preflight',options.target]);
+          await discoverCapabilities(signal);
+          const preflight=await client(['preflight',options.target],{signal});
           if(preflight.state!=='completed')throw closedSetupError('CPL preflight failed',{reason:preflight});
           if (frozen.length) await exclude('transfer', async () => {
             // One scoped tree transfer avoids one native transport/setup per
@@ -890,7 +891,7 @@ export async function createEnvironment(options, context) {
               await mkdir(dirname(destination), { recursive: true });
               await copyFile(file.local, destination);
             }
-            await transfer(['upload', options.target, tree, posix.join(attemptRoot, 'tree')], dir);
+            await transfer(['upload', options.target, tree, posix.join(attemptRoot, 'tree')], dir,signal);
           });
           await event('verifier-staged', { files: frozen.map(({ remote, sha256 }) => ({ path: remote, sha256 })) });
         }
