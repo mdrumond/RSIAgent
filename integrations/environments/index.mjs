@@ -429,6 +429,8 @@ export async function createEnvironment(options, context) {
   }
   async function stop(handle, {accountingExcluded=false,signal:stopSignal=context.stopSignal}={}) {
     check(handle);
+    // A supplied cleanup signal owns its bounded allowance, independently of
+    // the interrupted body. Callers must bound it; absent one, allow five seconds.
     const signal = stopSignal??AbortSignal.timeout(5000);
     if (remote) {
       try { await client(['cancel', handle], {signal}); } catch { /* observe is authoritative */ }
@@ -447,11 +449,10 @@ export async function createEnvironment(options, context) {
         try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
     }
-    const deadline = performance.now() + 5000;
-    while (performance.now() < deadline) {
+    while (!signal.aborted) {
       const state = await observe(handle, {signal,accountingExcluded});
-      if (state.state !== 'running') return state;
-      await delay(50);
+      if (state.state === 'stopped') return state;
+      try { await delay(50,undefined,{signal}); } catch { break; }
     }
     return { state: 'unknown' };
   }
