@@ -97,6 +97,27 @@ test('CPU learning evidence triggers another proposal, device questions stay pen
  const g=await fixture(t);const deferred=await runReview(g.options,{classify,review:async args=>({action:'learn',reason:'Need device timing',groupIds:args.groups.map(g=>g.id),question:'Does it compile?',hypothesis:'Compiler limitation',requiredEvidence:'Compiler on A3',learningTarget:'device'}),learn:async()=>{throw Error('Must not fabricate CPU proof');}});
  assert.equal(deferred.learning[0].status,'device-evidence-needed');
 });
+test('QA receives verified bucket learning and rechecks admission when its evidence bytes change',async t=>{
+ const f=await fixture(t),source=join(f.root,'learned.py'),checker=join(f.root,'verify.py'),log=join(f.root,'learned.log');
+ await writeFile(source,'result = 1\n');await writeFile(checker,'assert result == 1\n');await writeFile(log,'independent control passed\n');
+ let reviews=0,answers=0,lastEvidence;
+ const deps={classify,review:async args=>{
+  reviews++;return args.learning.length?update(args):{action:'learn',reason:'Unknown boundary',groupIds:args.groups.map(g=>g.id),question:'Which boundary?',hypothesis:'Tail differs',requiredEvidence:'Independent CPU control',learningTarget:'cpu'};
+ },learn:async()=>({status:'verified-cpu',project:{source,verifier:{files:[checker]}},evidence:[{log,exitCode:0}]}),qaAnswer:async args=>{
+  answers++;assert.equal(args.learning.length,1);assert.equal(args.learning[0][1].result.status,'verified-cpu');
+  assert.equal(args.learning[0][1].result.project.source,source);assert.deepEqual(args.learningEvidence.map(item=>item.path),[source,checker,log]);
+  assert.ok(args.learningEvidence.every(item=>/^[0-9a-f]{64}$/.test(item.sha256)));lastEvidence=args.learningEvidence;
+  return qaAnswer(args);
+ }};
+ for(const stage of ['inventory','classify','propose','learn','propose','qa'])await runReview({...f.options,stage},deps);
+ assert.equal(reviews,2);assert.equal(answers,1);
+ const state=await load(join(f.options.output,'review.json')),firstApproval=Object.values(state.qa)[0].approval,firstDigest=lastEvidence.find(item=>item.path===log).sha256;
+ await runReview({...f.options,stage:'qa'},deps);assert.equal(answers,1);
+ await writeFile(log,'independent control now exposes a different boundary\n');
+ await runReview({...f.options,stage:'qa'},deps);assert.equal(answers,2);
+ assert.notEqual(lastEvidence.find(item=>item.path===log).sha256,firstDigest);
+ const revised=await load(join(f.options.output,'review.json'));assert.notEqual(Object.values(revised.qa)[0].approval,firstApproval);
+});
 test('interrupted stage resumes without duplicate classifications or resetting elapsed allowance',async t=>{
  const f=await fixture(t);let calls=0;
  await assert.rejects(runReview({...f.options,stage:'all'},{classify:async args=>{if(++calls===2)throw Error('Interrupted fixture');return classify(args);}}),/Interrupted/);

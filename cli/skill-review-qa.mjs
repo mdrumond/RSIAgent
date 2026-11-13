@@ -18,7 +18,7 @@ export function validateQaVerdict(value){
  return value;
 }
 export function qaIdentity(input,proposal=input.proposal){
- return digest({changes:proposal.changes,memoryRefs:proposal.memoryRefs,baseline:input.entries,objective:input.objective??null,target:input.target,evidence:input.groups,memoryEvidence:input.memoryEvidence??null,retrievalEvidenceHash:input.retrievalEvidenceHash??null});
+ return digest({changes:proposal.changes,memoryRefs:proposal.memoryRefs,baseline:input.entries,objective:input.objective??null,target:input.target,evidence:input.groups,memoryEvidence:input.memoryEvidence??null,learning:input.learning??[],learningEvidence:input.learningEvidence??[],retrievalEvidenceHash:input.retrievalEvidenceHash??null});
 }
 export async function runProposalQa(input,ops){
  await mkdir(input.directory,{recursive:true});const file=join(input.directory,'qa.json');
@@ -54,8 +54,8 @@ export async function runProposalQa(input,ops){
     if(result.changes)proposal=input.validateProposal({...proposal,changes:result.changes,...(result.memoryRefs?{memoryRefs:result.memoryRefs}:{})});
     round.proposal=proposal;round.answers=result.answers;await persist();
    }
-   if(!round.review){round.review=validateQaVerdict(await call('qaReview',{proposal:round.proposal,answers:round.answers,validate:validateQaVerdict}));
-    if(round.review.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:round.review.learningRequests});await persist();}
+   if(!round.review){const validate=value=>{validateQaVerdict(value);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
+    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,validate}));await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){proposal=round.proposal;continue;}
    state.verdict=round.review.verdict;state.reason=round.review.reason;

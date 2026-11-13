@@ -115,19 +115,21 @@ async function qaPrompt(input){
  const cited=new Set(input.proposal.memoryRefs??[]);
  memory=memory.filter(item=>cited.has(item.ref??item.citationId??`${item.collection}:${item.entry_id??item.chunk_id??item.id}`));
  const refs=new Set((input.proposal.changes??[]).flatMap(change=>change.evidenceRefs??[]));
- const groups=input.groups.map(group=>({...group,occurrences:group.occurrences.filter(item=>refs.has(item.reference)),linkedDiagnostics:(group.linkedDiagnostics??[]).filter(item=>refs.has(item.reference))})).filter(group=>group.occurrences.length||group.linkedDiagnostics.length);
+ const groups=input.groups.filter(group=>[...group.occurrences,...(group.linkedDiagnostics??[])].some(item=>refs.has(item.reference))).map(group=>({...group,occurrences:group.occurrences.filter(item=>refs.has(item.reference)),linkedDiagnostics:group.linkedDiagnostics??[]}));
  return {proposal:input.proposal,baseline:input.entries,objective:input.objective,target:input.target,groups,memory,
-  questions:{action:'What is the smallest concrete actor edit, and what must remain unchanged?',mechanism:'How does that edit prevent the observed failure?',example:'Give a worked example and a counterexample or applicability boundary.',evidence:'Separate observation, mathematical deduction, and untested claims; state target applicability.',objective:'Is this correctness or optimization? Does the instruction demand unnecessary optimization?'},
+  learning:input.learning??[],questions:{action:'What is the smallest concrete actor edit, and what must remain unchanged?',mechanism:'How does that edit prevent the observed failure?',example:'Give a worked example and a counterexample or applicability boundary.',evidence:'Separate observation, mathematical deduction, and untested claims; state target applicability.',objective:'Is this correctness or optimization? Does the instruction demand unnecessary optimization?'},
   rules:'Only supplied evidence is available. Do not run benchmarks or search live sources. Unsupported facts must remain explicit questions. Performance hypotheses need not already prove a speedup. The actor sees the skill text, not these answers.'};
 }
 export async function nativeQaAnswer(input,dependencies={}){
  const prompt=await qaPrompt(input);
- return (dependencies.session??reviewSession)({...input,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,previousReview:input.previousReview,
+ const allowedPaths=(input.learning??[]).flatMap(([,record])=>record.result?.status==='verified-cpu'?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
+ return (dependencies.session??reviewSession)({...input,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,previousReview:input.previousReview,
   task:'Answer all five questions. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[]}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
 }
 export async function nativeQaReview(input,dependencies={}){
  const prompt=await qaPrompt(input);
- return (dependencies.session??reviewSession)({...input,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,
+ const allowedPaths=(input.learning??[]).flatMap(([,record])=>record.result?.status==='verified-cpu'?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
+ return (dependencies.session??reviewSession)({...input,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,
   task:'Independently review the draft and five answers against supplied evidence. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
 }
 export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){

@@ -10,7 +10,7 @@ async function fixture(t){
  await writeFile(join(proposalDirectory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',entry_id:'seen',text:'Observed boundary repair'},{collection:'memory',entry_id:'irrelevant',text:'Other fact'}]})+'\n');
  return {root,input:{directory:join(root,'0-qaAnswer'),proposalDirectory,seconds:120,config:{actor:{provider:'fixture',model:'fixture'}},
   proposal:{changes:[{text:'Mask the last tile',evidenceRefs:['failure:1']}],memoryRefs:['memory:seen']},
-  entries:[{id:'baseline',text:'Baseline'}],objective:'correctness',target:'a3',groups:[{id:'group',occurrences:[{reference:'failure:1',message:'Tail mismatch'},{reference:'failure:unrelated',message:'Different failure'}],linkedDiagnostics:[]}]}};
+  entries:[{id:'baseline',text:'Baseline'}],objective:'correctness',target:'a3',groups:[{id:'group',occurrences:[{reference:'failure:1',message:'Tail mismatch'},{reference:'failure:unrelated',message:'Different failure'}],linkedDiagnostics:[{reference:'failure:root',message:'Actual baseline API error'}]}]}};
 }
 test('native writer uses read-only supplied retrieved evidence and invokes admission validation',async t=>{
  const {input}=await fixture(t),answer={answers:{action:{text:'Mask tail',refs:['memory:seen']}}};let validated=0;
@@ -19,6 +19,7 @@ test('native writer uses read-only supplied retrieved evidence and invokes admis
   assert.equal(options.knowledge,false);assert.equal(options.directory,input.directory);
   assert.deepEqual(options.prompt.memory,[{collection:'memory',entry_id:'seen',text:'Observed boundary repair'}]);
   assert.deepEqual(options.evidenceGroups[0].occurrences.map(o=>o.reference),['failure:1']);
+  assert.deepEqual(options.evidenceGroups[0].linkedDiagnostics.map(o=>o.reference),['failure:root']);
   assert.equal(options.seconds,120);return {value:options.validate(answer)};
  }});
  assert.equal(validated,1);assert.equal(result.value.validated,true);
@@ -42,5 +43,13 @@ test('explicit frozen memory evidence replaces archived retrievals without live 
  await nativeQaReview({...input,memoryEvidence,validate:value=>value},{session:async options=>{
   assert.deepEqual(options.prompt.memory,memoryEvidence);assert.equal(options.knowledge,false);
   return {value:options.validate({verdict:'learn',reason:'Missing device boundary',learningRequests:[]})};
+ }});
+});
+test('QA sessions can inspect verified learning used to revise the skill',async t=>{
+ const {input,root}=await fixture(t),source=join(root,'learning.py');await writeFile(source,'assert 2 + 2 == 4');
+ const learning=[['question',{result:{status:'verified-cpu',project:{source},evidence:[{log:source}]}}]];
+ await nativeQaReview({...input,learning,validate:value=>value},{session:async options=>{
+  assert.deepEqual(options.prompt.learning,learning);assert.ok(options.allowedPaths.includes(source));
+  return {value:options.validate({verdict:'approved',reason:'Evidence inspected'})};
  }});
 });

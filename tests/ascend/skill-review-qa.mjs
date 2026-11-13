@@ -70,3 +70,12 @@ test('native submission receives change-validation feedback and can repair withi
  assert.equal(writerCalls,1);assert.deepEqual(reviewed.changes,[{text:'Reuse matching setup',evidenceRefs:['event:1']}]);
  assert.equal(result.verdict,'approved');assert.equal(result.startedAt,1000);assert.equal(result.elapsedSeconds,35);
 });
+test('reviewer can repair malformed learning before submission within the same allocation',async t=>{
+ const input=await fixture(t);let clock=1000;
+ input.validateProposal=value=>{if(value.learningRequests?.some(request=>!request.hypothesis))throw Error('Learning hypothesis required');return value;};
+ const result=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>{clock+=20000;return answers();},qaReview:async({validate,seconds})=>{
+  assert.equal(seconds,100);assert.throws(()=>validate({verdict:'learn',reason:'Missing fact',learningRequests:[{question:'Boundary?'}]}),/hypothesis required/);
+  clock+=10000;return validate({verdict:'learn',reason:'Missing device fact',learningRequests:[{question:'Boundary?',hypothesis:'Target differs',requiredEvidence:'Device comparison',learningTarget:'device'}]});
+ }});
+ assert.equal(result.verdict,'learn');assert.equal(result.elapsedSeconds,30);assert.equal(result.learningRequests.length,1);
+});

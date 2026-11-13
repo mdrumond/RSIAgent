@@ -1,5 +1,5 @@
 /** Isolated, resumable failure -> memory -> guidance/learning -> A/B review. */
-import {mkdir,readFile,writeFile,rename,cp,realpath,access,rm} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,cp,realpath,access,rm,stat,readdir} from 'node:fs/promises';
 import {join,resolve,relative,sep} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
@@ -18,6 +18,15 @@ async function optional(path){try{return await load(path);}catch(e){if(e.code!==
 async function save(path,value){const tmp=path+'.'+randomUUID();await writeFile(tmp,JSON.stringify(value,null,2)+'\n');await rename(tmp,path);}
 async function fileHash(path){const d=createHash('sha256');for await(const chunk of createReadStream(path))d.update(chunk);return d.digest('hex');}
 async function optionalHash(path){try{return await fileHash(path);}catch(error){if(error.code!=='ENOENT')throw error;return null;}}
+async function learningEvidenceHash(path,ancestors=new Set()){
+ try{
+  const resolved=await realpath(path);if(ancestors.has(resolved))throw Error('Cyclic verified learning evidence path');
+  const info=await stat(path);if(!info.isDirectory())return fileHash(path);
+  const nested=new Set([...ancestors,resolved]),children=await readdir(path);children.sort();
+  const contents=[];for(const name of children)contents.push([name,await learningEvidenceHash(join(path,name),nested)]);
+  return hash(contents);
+ }catch(error){if(error.code==='ENOENT')return null;throw error;}
+}
 async function dependentInputs(root){
  const db=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});let attempts;try{attempts=db.prepare('SELECT id FROM attempts ORDER BY id').all();}finally{db.close();}
  const jobs=[];for(const {id}of attempts)jobs.push({id,sha256:await optionalHash(join(root,'attempts',id,'job.json'))});
@@ -184,8 +193,11 @@ export async function runReview(options,dependencies={}){
     const retained=Object.entries(state.candidates).find(([id,c])=>(c.bucket===key||id===key)&&Array.isArray(c.changes)&&hash(c.changes)===hash(review.changes));
     if(retained&&(retained[1].decision||await optional(join(retained[1].directory,'evaluation','manifest.json'))))return {verdict:'grandfathered'};
     const bucket=buckets.get(key),campaign=campaigns.get(review.sourceId),entries=await guidanceEntries(campaign.root,campaign.activeVersion);
+    const learning=Object.entries(state.learning).filter(([,record])=>record.key===key&&record.result?.status==='verified-cpu');
+    const paths=[...new Set(learning.flatMap(([,record])=>[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(item=>item.log?[item.log]:[])].filter(Boolean)))];
+    const learningEvidence=[];for(const path of paths)learningEvidence.push({path,sha256:await learningEvidenceHash(path)});
     const retrievalEvidenceHash=review.directory?await optionalHash(join(review.directory,'retrievals.jsonl')):null;
-    const input={key,proposal:review,proposalDirectory:review.directory,retrievalEvidenceHash,entries,objective:review.objective,target:campaign.target,groups:bucket.groups,
+    const input={key,proposal:review,proposalDirectory:review.directory,retrievalEvidenceHash,learning,learningEvidence,entries,objective:review.objective,target:campaign.target,groups:bucket.groups,
      classifications:bucket.groups.map(g=>state.classifications[g.id]),config:await configFor(review.sourceId),signal,
      validateProposal:value=>validateReviewProposal(value,bucket.groups,state.classifications)};
     const prior=state.qa?.[key];if(prior?.approval===qaIdentity(input))return prior;
