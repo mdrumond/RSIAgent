@@ -467,3 +467,15 @@ test('explicit harness ownership cannot be routed into correctness A/B',async t=
  await assert.rejects(runReview({...f.options,bucketPolicy:true,stage:'classify'},{classify:args=>args.validate({cause:'harness',bucket:'correctness',coverage:'uncovered',guidanceIds:[],reason:'Execution wrapper fault',evidenceRefs:[args.group.occurrences[0].reference]}),evaluate:async()=>{compared++;return evaluation();}}),/Harness cause/);
  const saved=await load(join(f.options.output,'review.json'));assert.equal(Object.keys(saved.classifications).length,0);assert.equal(Object.keys(saved.candidates).length,0);assert.equal(compared,0);
 });
+test('native writer corrects evaluation bucket used as guidance scope before admission',async t=>{
+ const {reviewSession}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'guidance-scope-correction');
+ const groups=[{id:'actor',occurrences:[{reference:'actor:event',data:{message:'Wrong reduction'},artifacts:[]}]}],classifications={actor:{cause:'actor'}};
+ const proposal={action:'update',reason:'Measured repair applies',groupIds:['actor'],memoryRefs:['memory:chunk'],changes:[{action:'upsert',id:'reduction-repair',scope:'correctness',text:'Check reduction axes before broadcasting.',critical:false,negative:false,response:'actor-change',evidenceRefs:['actor:event']}]};
+ const corrected=structuredClone(proposal);corrected.changes[0].scope='implementation';
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[{name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:proposal}},{name:'submit_review',args:{result:corrected}}][n]);
+ const result=await reviewSession({directory,config:{actor:provider.profile},prompt:{task:'Submit evidence-backed guidance',groups},evidenceGroups:groups,seconds:30,validate:r=>validateReviewProposal(r,groups,classifications)});
+ assert.equal(provider.requests(),4);assert.equal(result.value.changes[0].scope,'implementation');assert.equal(proposal.changes[0].scope,'correctness');
+ assert.equal((await load(join(directory,'submission.json'))).changes[0].scope,'implementation');
+ const pending={...proposal,action:'learn',question:'Which reduction axes?',hypothesis:'Axis order matters',requiredEvidence:'Independent check',learningTarget:'cpu'};
+ assert.equal(validateReviewProposal(pending,groups,classifications).action,'learn');assert.equal(pending.changes[0].scope,'correctness');
+});

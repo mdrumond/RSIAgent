@@ -10,6 +10,7 @@ import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {validateSkillGrounding} from '../controller/skill-evidence.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {evaluationSettings,retrievalIdentity} from '../controller/skill-objectives.mjs';
+import {stages as workflowStages} from '../controller/workflow.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function optional(path){try{return await load(path);}catch(e){if(e.code!=='ENOENT')throw e;return null;}}
@@ -46,6 +47,8 @@ async function forkCampaign(source,directory,options){
 }
 export function validateReviewProposal(result,groups,classifications){
  validateReview(result,groups);if(result.action!=='update')return result;
+ const scopes=['global-kdb',...workflowStages];
+ for(const change of result.changes)if(!scopes.includes(change.scope))throw Error('Guidance scope must be one of '+scopes.join(', ')+'. Evaluation buckets correctness, optimization and harness are not workflow guidance scopes.');
  const observations=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>({reference:o.reference,...(classifications[g.id]?.cause==='harness'||classifications[g.id]?.bucket==='harness'?{responsibility:'harness'}:{})})));
  const responses=['actor-change','report-blocker','reserve-validation-runway','retrieve-scoped-evidence'];
  for(const change of result.changes)if(change.response!==undefined&&!responses.includes(change.response))throw Error('response must be one of '+responses.join(', '));
