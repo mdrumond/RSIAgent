@@ -419,7 +419,10 @@ export async function createEnvironment(options, context) {
       }
       // Re-observe exact identities; neither PID disappearance nor a fresh job is proof.
       for(const handle of handles)if((await environment.observe(handle,{signal:budget.signal})).state!=='stopped')return false;
-      if(budget.signal.aborted||!await reconcileHostLease(lease,budget))return finishClosed();
+      const released=lease.record.payloadHandle
+        ?await environment.readAdmission(lease.record.payloadHandle,{signal:budget.signal}):null;
+      const positivelyReleased=released?.token===lease.token && released.decision==='admitted' && released.released===true;
+      if(budget.signal.aborted||!positivelyReleased&&!await reconcileHostLease(lease,budget))return finishClosed();
       await releaseLease(lease);return true;
     } catch(error) {
       // Positive token closure also covers a peer archiving during native I/O.

@@ -46,7 +46,7 @@ print(text[q])
     const context={instancePath:path,resource,signal:extra.signal,...(extra.sdk?{sdk:extra.sdk}:{}),leaseDirectory:join(root,'leases'),
       client:async args=>{calls.push(args);assert.deepEqual(args,['npu','list','local-fixture']);
         return {state:'completed',profiles:[{target:'local-fixture',pool:root,devices:enabled.map(id=>({id,enabled:true}))}]};},
-      exclude:async(label,fn)=>{if(label==='admission')return fn();depth++;try{return await fn();}finally{depth--;}},
+      exclude:async(label,fn)=>{if(label==='admission'){const result=await fn();await extra.onAdmission?.(result,path);return result;}depth++;try{return await fn();}finally{depth--;}},
       event:async(type,data)=>{
         events.push({type,data});await extra.onEvent?.(type,data);
         if(type==='execution-handle'){
@@ -370,7 +370,11 @@ test('proven unspawned local lease cleanup retries without replaying the device 
     if(command.includes('/control/.executions/')&&failures++===0)return broken.exec(command,cwd,options);
     return native.exec(command,cwd,options);
   }})};
-  const bound=await f.bind(undefined,{sdk:bridge});
+  // Simulate an older wrapper receipt so the legacy cleanup launch remains required.
+  const bound=await f.bind(undefined,{sdk:bridge,onAdmission:async({result},path)=>{
+    const receipt=join(path,'.executions',result.handle.slice(6),'admission.json');
+    const data=JSON.parse(await readFile(receipt,'utf8'));delete data.released;await writeFile(receipt,JSON.stringify(data));
+  }});
   await bound.environment.prepare({project:{source:f.source},attempt:{id:'cleanup-prelaunch'}});
   const result=await bound.environment.execute("printf x >> payload-count",f.source,{timeout:10});
   assert.equal(result.settled,true);assert.equal(result.exitCode,0);

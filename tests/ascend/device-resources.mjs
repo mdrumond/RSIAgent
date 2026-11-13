@@ -40,7 +40,7 @@ print(outputs[query])
 `, { mode: 0o700 });
   const calls = [], events = [], commands = [], jobs = new Map(), admissions=new Map();
   let runWorkload = false, onSync = async () => {}, running = false, queued = 0;
-  let waitSignal;
+  let waitSignal,releaseProof,transformAdmission;
   let enabled = [0,1,2,3], disconnect = false, sequence = 0, clockSkew = 0, hideSubmission = false, lastProbe;
   const client = async (args,{signal}={}) => {
     calls.push(args);
@@ -48,7 +48,7 @@ print(outputs[query])
     if (args[0] === 'capabilities') return { state: 'available' };
     if (args[0] === 'preflight') return { state: 'completed' };
     if (args[0] === 'upload') return { state: 'completed' };
-    if (args[0] === 'download') { await writeFile(args[3], admissions.get(args[2]) ?? [...admissions].find(([key])=>key.endsWith('/'+args[2]))?.[1] ?? ''); return { state: 'completed' }; }
+    if (args[0] === 'download') { let value=admissions.get(args[2]) ?? [...admissions].find(([key])=>key.endsWith('/'+args[2]))?.[1] ?? ''; if(value&&transformAdmission&&args[2].endsWith('/admission.json'))value=JSON.stringify(transformAdmission(JSON.parse(value))); await writeFile(args[3],value); return { state: 'completed' }; }
     if (args[0] === 'run') {
       const handle = `remote:fixture:job:${++sequence}`, file = args[args.indexOf('--file')+1];
       let content = '';
@@ -64,7 +64,7 @@ print(outputs[query])
         const config = JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'"));
         const inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
         if(inner.source)commands.push({devices:inner.devices,env:config.env});
-        let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled'};
+        let admission={token:inner.lease.token,decision:inner.source?'admitted':'reconciled',...(inner.source&&releaseProof!==undefined?{released:releaseProof}:{})};
         if(runWorkload){
           const receipt=join(instancePath,'host-admission-'+sequence);
           try { await promisify(execFile)('bash',['-c',config.command],{env:{...process.env,...config.env,RSI_LEASE_RECEIPT:receipt,PATH:bin+':'+process.env.PATH,ASCEND_TEST_TELEMETRY:telemetry}}); }
@@ -92,7 +92,7 @@ print(outputs[query])
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
   return { environment, options, context, source, calls, events, commands, rows, telemetry,
-    setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
+    transformAdmission:fn=>{transformAdmission=fn;},setReleaseProof:value=>{releaseProof=value;}, setEnabled: ids => { enabled = ids; }, disconnect: value => { disconnect = value; }, setClockSkew: seconds => { clockSkew = seconds; }, hideSubmission:value=>{hideSubmission=value;}, lastProbe:()=>lastProbe,
     queued:value=>{queued=value;}, wait:fn=>{waitSignal=fn;},runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
@@ -960,4 +960,33 @@ test('admitted actor command receives persistent scratch and runtime cache defau
   assert.equal(JSON.parse(await readFile(paths.RSI_SETUP_REPORT,'utf8')).logical_device,0);
   assert.equal((await bound.execute('test "$(cat "$RSI_SCRATCH_DIR/probe")" = retained',f.source,{timeout:5})).exitCode,0);
   assert.equal(paths.RSI_SCRATCH_DIR.startsWith(f.options.workspacePath),true);
+});
+
+for(const released of [true,false,'true'])test('only a positive released receipt skips remote fence reconciliation: '+released,async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(released);
+ await f.environment.prepare({project:{source:f.source},attempt:{id:'release'}});
+ const result=await f.environment.execute('true',f.source,{timeout:10});assert.equal(result.settled,true);
+ const controls=f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload);
+ assert.equal(controls.length,released===true?0:1);
+ assert.ok(f.events.some(e=>e.type==='device-lease-released'));
+});
+
+test('released payload evidence cannot close an unresolved owned handle',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let reconcile=false;
+ const environment=await createEnvironment(f.options,{...f.context,exclude:async(label,fn)=>{const result=await fn();if(label==='admission'&&result?.result?.handle){reconcile=true;f.disconnect(true);}return result;}});
+ await environment.prepare({project:{source:f.source},attempt:{id:'unknown-release'}});
+ const result=await environment.execute('true',f.source,{timeout:10});assert.equal(reconcile,true);assert.equal(result.settled,false);
+ assert.equal(f.events.some(e=>e.type==='device-lease-released'),false);
+ f.disconnect(false);assert.equal(await environment.reconcileLease(),true);
+ assert.equal(f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload).length,0);
+});
+
+test('a released receipt from another token still requires the existing host reconciliation',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);f.setReleaseProof(true);let reconciling=false;
+ f.transformAdmission(value=>reconciling&&value.released===true?{...value,token:'other-owner'}:value);
+ const environment=await createEnvironment(f.options,{...f.context,exclude:async(label,fn)=>{const result=await fn();if(label==='admission'&&result?.result?.handle)reconciling=true;return result;}});
+ await environment.prepare({project:{source:f.source},attempt:{id:'foreign-release'}});
+ const result=await environment.execute('true',f.source,{timeout:10});assert.equal(result.settled,true);
+ assert.equal(f.events.filter(e=>e.type==='execution-submitting'&&e.controlPayload).length,1);
+ assert.ok(f.events.some(e=>e.type==='device-lease-released'));
 });
