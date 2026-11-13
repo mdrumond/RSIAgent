@@ -7,7 +7,7 @@ import { State } from '../../controller/state.mjs';
 import { ownerStopped } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/index.mjs';
 import { upgrade } from '../../cli/instance.mjs';
-import { setup, rows, until } from './driver_setup.mjs';
+import { setup, rows, until, waitForStorage } from './driver_setup.mjs';
 
 test('LOCAL interrupted native attempt upgrades and resumes its same session; live orphan still blocks',
   { timeout: 120000 }, async t => {
@@ -22,7 +22,7 @@ test('LOCAL interrupted native attempt upgrades and resumes its same session; li
       return attempt?.session && attempt.elapsed >= 1 && rows(f.root,
         "SELECT 1 FROM events WHERE type='execution-handle'").length;
     });
-    await f.run('stop');await wave.output;
+    await f.run('stop');await wave.output;await waitForStorage(f.root);
     const [interrupted] = rows(f.root, 'SELECT * FROM attempts');
     assert.equal(interrupted.outcome, null);
     assert.equal(await ownerStopped(interrupted.owner), true);
