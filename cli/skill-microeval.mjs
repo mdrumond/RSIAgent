@@ -50,6 +50,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
+ let unresolvedExecution;
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
  const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
@@ -71,8 +72,8 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
    const [target]=await createEnvironmentTools({execute:async(command,path,options)=>{
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
     const operation=targetEnvironment.execute(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
-    try{const result=await operation;if(!result.settled)interrupt(Error('Target execution remains unresolved: '+result.handle));return result;}
-    catch(error){if(/unresolved/i.test(error.message))interrupt(error);throw error;}finally{pending.delete(operation);}
+    try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
+    catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'){unresolvedExecution={handle:error.handle??null};interrupt(error);}throw error;}finally{pending.delete(operation);}
    }},cwd,sdk);pi.registerTool(target);
   }
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
@@ -104,7 +105,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
  const stats=session.getSessionStats();
- return {timedOut,error:failure??null,tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
+ return {timedOut,error:failure??null,...(unresolvedExecution?{unresolvedExecution}:{}),tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
@@ -156,13 +157,14 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;let observed,verification;
     try{
      observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:allocation,signal:sampleSignal,sessionDirectory:path,resumeSession:partial?.session});
+     if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:observed.unresolvedExecution.handle});
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
      verification=remaining>0&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
-    }catch(error){if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
+    }catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'){report.runningSample.unresolvedExecution={handle:error.handle??null};throw error;}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
      correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};

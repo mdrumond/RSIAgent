@@ -157,3 +157,21 @@ test('elapsed allowance covers adapter preparation and trusted verification hook
  const g=await fixture(t);const measured=await runMicroeval({...g,runs:1},{sample:async()=>({}),verify:async({cwd,seconds,signal})=>{assert.ok(seconds>0&&seconds<=g.seconds);assert.ok(signal instanceof AbortSignal);await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');return {correct:true,exitCode:0,output:'trusted target check'};}});
  assert.ok(measured.results.every(r=>r.correct&&r.verification.output==='trusted target check'));
 });
+test('unresolved actor and verifier commands retain identity and stop before the next arm',async t=>{
+ for(const phase of ['sample','verify']){
+  const f=await fixture(t),handle='remote:fixture:job:unknown-'+phase;let calls=0;
+  const dependencies={sample:async()=>{calls++;return phase==='sample'?{unresolvedExecution:{handle},timedOut:true}:{};},verify:async()=>{throw Object.assign(Error('Target command unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});}};
+  await assert.rejects(runMicroeval({...f,runs:1,resume:true},dependencies),{code:'RSI_EXECUTION_UNRESOLVED'});
+  const retained=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8'));
+  assert.equal(calls,1);assert.equal(retained.status,'interrupted');assert.equal(retained.results.length,0);
+  assert.equal(retained.runningSample.unresolvedExecution.handle,handle);
+  await assert.rejects(runMicroeval({...f,runs:1,resume:true},dependencies),/unresolved/);assert.equal(calls,1);
+ }
+});
+test('native target unknown status survives session abort as structured evidence',async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .'}}:null);
+ const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);
+ const handle='remote:fixture:job:unknown-native';
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'check',targetEnvironment:{execute:async()=>({handle,settled:false,exitCode:null})}});
+ assert.deepEqual(result.unresolvedExecution,{handle});
+});
