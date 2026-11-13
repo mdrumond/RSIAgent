@@ -113,3 +113,17 @@ test('a verifier without a definite nonzero candidate exit does not start a mode
  const report=await continueMicroevalSamples(f,{verify:async()=>({correct:false,exitCode:0}),sample:async()=>{calls++;}});
  assert.equal(calls,0);assert.equal(report.samples['repair/0/active'].status,'inconclusive');
 });
+test('unknown work at the elapsed deadline stays blocked rather than appearing settled',async t=>{
+ const f=await fixture(t,{spent:.05});f.seconds=.15;f.verificationSeconds=.02;const handle='remote:fixture:job:deadline-unknown';
+ await assert.rejects(continueMicroevalSamples(f,{verify:async args=>{await untilAbort(args.signal);await new Promise(r=>setTimeout(r,10));throw Object.assign(Error('Native completion unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});}}),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const report=JSON.parse(await readFile(join(f.directory,'results.json'))),row=report.samples['repair/0/active'];
+ assert.equal(row.status,'blocked');assert.equal(row.timedOut,true);assert.equal(row.correct,null);assert.equal(report.runningSample.unresolvedExecution.handle,handle);
+});
+test('copy preparation is checkpointed and a failed local copy preserves charged elapsed time',async t=>{
+ const f=await fixture(t),home=join(f.directory,'repair/0-active');let preparation;
+ await assert.rejects(continueMicroevalSamples(f,{checkpoint:async report=>{
+  if(report.runningSample?.phase==='preparation'&&!preparation){preparation=structuredClone(report.runningSample);await mkdir(home,{recursive:true});await writeFile(join(home,'work'),'blocked-by-local-file');}
+ }}));
+ const report=JSON.parse(await readFile(join(f.directory,'results.json'))),row=report.samples['repair/0/active'];
+ assert.equal(preparation.key,'repair/0/active');assert.ok(Date.parse(preparation.startedAt));assert.equal(preparation.elapsedBeforeSeconds,.05);assert.equal(report.runningSample,undefined);assert.ok(row.extensionElapsedSeconds>0);assert.equal(row.status,'interrupted');await unchanged(f);
+});

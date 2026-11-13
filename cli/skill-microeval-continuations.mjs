@@ -27,6 +27,7 @@ async function forkSession({source,cwd,sessionDirectory}){
 }
 /** Dependencies match runMicroeval's native sample/verification hooks. One key per lane is supported. */
 export async function continueMicroevalSamples({originDirectory,directory,sampleKeys,skills,profile,python='python3',seconds=600,verificationSeconds=180,knowledge,signal,resume=true},dependencies={}){
+ const begun=performance.now();
  if(!Number.isFinite(seconds)||seconds<=0||!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Positive continuation allowance and smaller verification reserve required');
  signal?.throwIfAborted();originDirectory=resolve(originDirectory);directory=resolve(directory);
  if(directory===originDirectory||directory.startsWith(originDirectory+'/'))throw Error('Continuation directory must be separate from the original study');
@@ -62,20 +63,27 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
  report.owner=await processIdentity();report.status='running';
  const persist=async()=>{await save(join(directory,'results.json'),report);await dependencies.checkpoint?.(report);};
  await persist();
+ let firstPending=true;
  try{
   for(const item of selected){
    signal?.throwIfAborted();const {key,row,task}=item;
    let state=report.samples[key];if(['complete','elapsed','inconclusive','harness-invalid'].includes(state?.status))continue;
+   const started=firstPending?begun:performance.now(),previous=state?.extensionElapsedSeconds??0;firstPending=false;
    const home=join(directory,task.id,`${row.run}-${row.arm}`),cwd=join(home,'work'),checker=join(directory,'frozen',task.id+'.py');
-   if(!state){
-    await mkdir(home,{recursive:true});await cp(item.cwd,cwd,{recursive:true});
-    if(await treeIdentity(cwd)!==item.identity.sourceTreeSha256||await treeIdentity(item.cwd)!==item.identity.sourceTreeSha256)throw Error('Original work changed while copying continuation');
-    state=report.samples[key]={key,taskId:task.id,run:row.run,arm:row.arm,originalElapsedSeconds:row.elapsedSeconds,extensionElapsedSeconds:0,status:'pending',phase:'initial-verification'};
-   }
-   await writeFile(checker,task.checker);
-   const started=performance.now(),previous=state.extensionElapsedSeconds;
+   state??=report.samples[key]={key,taskId:task.id,run:row.run,arm:row.arm,originalElapsedSeconds:row.elapsedSeconds,extensionElapsedSeconds:0,status:'pending',phase:'initial-verification'};
    const left=()=>Math.max(0,seconds-state.originalElapsedSeconds-previous-(performance.now()-started)/1000);
-   if(left()<=0){state.status='elapsed';state.timedOut=true;state.elapsedSeconds=state.originalElapsedSeconds+previous;await persist();continue;}
+   const charge=()=>{state.extensionElapsedSeconds=previous+(performance.now()-started)/1000;state.elapsedSeconds=state.originalElapsedSeconds+state.extensionElapsedSeconds;};
+   if(left()<=0){state.status='elapsed';state.timedOut=true;charge();await persist();continue;}
+   report.runningSample={key,phase:'preparation',owner:report.owner,startedAt:new Date().toISOString(),elapsedBeforeSeconds:state.originalElapsedSeconds+previous};await persist();
+   try{
+    if(!state.prepared){
+     await mkdir(home,{recursive:true});await cp(item.cwd,cwd,{recursive:true});
+     if(await treeIdentity(cwd)!==item.identity.sourceTreeSha256||await treeIdentity(item.cwd)!==item.identity.sourceTreeSha256)throw Error('Original work changed while copying continuation');
+     state.prepared=true;
+    }
+    await writeFile(checker,task.checker);
+   }catch(error){charge();state.status='interrupted';delete report.runningSample;await persist();throw error;}
+   if(left()<=0){state.status='elapsed';state.timedOut=true;charge();delete report.runningSample;await persist();continue;}
    const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000))),wholeSignal=signal?AbortSignal.any([signal,deadline]):deadline;
    report.runningSample={key,phase:state.phase,owner:report.owner};await persist();
    const protectedInputs=async()=>{
@@ -119,12 +127,12 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
     state.correct=state.verification.correct;state.status=typeof state.correct==='boolean'?'complete':'inconclusive';
    }catch(error){
     const unknown=unknownExecution(error);
-    if(unknown){report.runningSample.unresolvedExecution=unknown;state.status='blocked';throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',...unknown});}
+    if(unknown){report.runningSample.unresolvedExecution=unknown;state.status='blocked';state.correct=null;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',...unknown});}
     if(signal?.aborted){state.status='interrupted';throw error;}
     state.correct=null;state.error=error.message;state.status=/Protected input|Frozen checker/.test(error.message)?'harness-invalid':'inconclusive';
    }finally{
-    state.extensionElapsedSeconds=previous+(performance.now()-started)/1000;state.elapsedSeconds=state.originalElapsedSeconds+state.extensionElapsedSeconds;
-    if(deadline.aborted){state.timedOut=true;state.correct=null;state.status='elapsed';}
+    charge();
+    if(deadline.aborted){state.timedOut=true;state.correct=null;if(!report.runningSample?.unresolvedExecution)state.status='elapsed';}
     if(!report.runningSample?.unresolvedExecution)delete report.runningSample;
     await persist();
    }
