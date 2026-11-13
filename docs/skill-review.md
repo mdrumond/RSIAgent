@@ -84,6 +84,14 @@ and elapsed allocation. Failed learning remains inconclusive and does not block
 other candidates. Device questions remain pending.
 Learning does not retroactively resolve or alter the original failed project.
 
+The default native evaluator executes on the controller host. A frozen `binding`
+records runtime identity; it does not select or activate a remote runtime. Run
+the controller on the configured device host for this default path. Isolated
+local-controller studies can supply `runMicroeval` sample/verification hooks and
+`finalizeKernelPairs` measurement hooks using the existing Ascend/CPL environment;
+`nativeSample` accepts its prepared target through `targetEnvironment`. Automatic
+remote dispatch from the public `skills-review` configuration is not implemented.
+
 For a later explicit rollout, stage `enqueue` with an explicit `learningInstance`
 imports compatible requests into an opted-in destination. It rejects review source
 instances. Programmatic `enqueueLearningRequest(state, request)` in
