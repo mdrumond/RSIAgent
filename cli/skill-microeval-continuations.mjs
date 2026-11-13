@@ -97,7 +97,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
      signal?.throwIfAborted();
      if(checked.correct===true){state.verification=checked;state.verificationOnly=true;state.status='complete';state.correct=true;continue;}
      if(checked.timedOut){state.verificationOnly=true;state.actorCompleted=true;}
-     else if(checked.correct!==false||!Number.isInteger(checked.exitCode)||checked.exitCode===125){state.verification=checked;state.correct=checked.correct;state.bucket=checked.receipt?.bucket;state.status='inconclusive';continue;}
+     else if(checked.correct!==false||!Number.isInteger(checked.exitCode)||checked.exitCode===0||checked.exitCode===125){state.verification=checked;state.correct=checked.correct;state.bucket=checked.receipt?.bucket;state.status='inconclusive';continue;}
     }
     if(!state.actorCompleted&&left()>verificationSeconds){
      if(!state.session){

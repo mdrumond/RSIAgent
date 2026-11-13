@@ -108,3 +108,8 @@ test('protected-input mutation is retained as a harness fault without admitting 
  const report=await continueMicroevalSamples(f,{verify:async args=>{await writeFile(join(args.cwd,'case.json'),'{"expected":0}');return {correct:false,exitCode:1};},sample:async()=>{calls++;}});
  const row=report.samples['repair/0/active'];assert.equal(row.status,'harness-invalid');assert.equal(row.correct,null);assert.equal(calls,0);assert.equal(await readFile(join(dirname(f.source),'case.json'),'utf8'),'{"expected":42}');await unchanged(f);
 });
+test('a verifier without a definite nonzero candidate exit does not start a model',async t=>{
+ const f=await fixture(t);let calls=0;
+ const report=await continueMicroevalSamples(f,{verify:async()=>({correct:false,exitCode:0}),sample:async()=>{calls++;}});
+ assert.equal(calls,0);assert.equal(report.samples['repair/0/active'].status,'inconclusive');
+});
