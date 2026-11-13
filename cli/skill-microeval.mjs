@@ -6,6 +6,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
+import {createEnvironmentTools} from '../integrations/environments/index.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
 import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
@@ -44,7 +45,7 @@ export async function validateKernelReceipt(verification,cwd){
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -52,7 +53,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
  const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
- const extension=pi=>{
+ const extension=async pi=>{
   pi.on('tool_call',async event=>{
    if(event.toolName.startsWith('mcp__kdb__')&&!['mcp__kdb__search','mcp__kdb__read_entry'].includes(event.toolName))return {block:true,reason:'Evaluation knowledge is read-only: use search or read_entry.'};
    let outside=false;
@@ -66,6 +67,14 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
    await appendFile(join(sessionDirectory,'tool-policy.jsonl'),JSON.stringify({tool:event.toolName,blocked:true,toolCallId:event.toolCallId})+'\n');
    return {block:true,reason:'Keep filesystem work inside the current task. Bash directory changes and shell searches are blocked; use native read/grep/find/ls scoped to this task. Run the declared local oracle command directly without changing directory.'};
   });
+  if(targetEnvironment){
+   const [target]=await createEnvironmentTools({execute:async(command,path,options)=>{
+    const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
+    const operation=targetEnvironment.execute(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+    try{const result=await operation;if(!result.settled)interrupt(Error('Target execution remains unresolved: '+result.handle));return result;}
+    catch(error){if(/unresolved/i.test(error.message))interrupt(error);throw error;}finally{pending.delete(operation);}
+   }},cwd,sdk);pi.registerTool(target);
+  }
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
    const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
    const operation=local.exec(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
@@ -75,7 +84,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
-  tools:['read','write','edit','grep','find','ls','bash',...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
+  tools:['read','write','edit','grep','find','ls','bash',...(targetEnvironment?['rsi_target']:[]),...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
  const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
  let aborting;const interrupt=reason=>{sampleAbort.abort(reason);aborting??=session.abort();void aborting.catch(()=>{});};
@@ -84,7 +93,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
   if(bridge)await bridge.knowledge.prepareSession(session,{signal:sampleSignal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
-  await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice.\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
+  await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice. ${targetEnvironment?'The model, files and bash are local. Use rsi_target for compilation and device checks on the prepared remote target; keep persistent edits local.':''}\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
  }catch(error){failure=error.message;}
@@ -144,16 +153,17 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const allocation=Math.max(.001,Math.min(seconds-spent,left));const path=join(directory,task.id,`${run}-${arm}`),cwd=join(path,'work');await mkdir(cwd,{recursive:true});
     if(!partial)for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
     report.runningSample={key,owner:report.owner};await persist();
-    const started=performance.now();let observed,verification;
+    const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;let observed,verification;
     try{
-     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:allocation,signal,sessionDirectory:path,resumeSession:partial?.session});
+     observed=await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:allocation,signal:sampleSignal,sessionDirectory:path,resumeSession:partial?.session});
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
-     verification=remaining>0&&!observed.timedOut&&!observed.error?await (task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),signal):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     verification=remaining>0&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
+    if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
      correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
     delete report.runningSample;

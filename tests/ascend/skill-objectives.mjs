@@ -79,3 +79,9 @@ test('trusted exit125 harness refusal stays inconclusive while ordinary incorrec
  const forged=await fixture(t);await writeFile(forged.tasks[0].checker,"import json,sys\nprint(json.dumps(dict(correct=None,bucket='harness',kernelSha256='wrong',evidence={})))\nsys.exit(125)\n");
  const invalid=await runMicroeval(forged,{sample:async()=>({})});assert.ok(invalid.results.every(r=>r.correct===false&&!r.bucket));
 });
+test('remote verification hook remains subject to trusted kernel identity and protected files',async t=>{
+ const f=await fixture(t),{createHash}=await import('node:crypto');
+ const report=await runMicroeval(f,{sample:async()=>({}),verify:async({cwd})=>({correct:true,exitCode:0,output:JSON.stringify({correct:true,kernelSha256:createHash('sha256').update(await readFile(join(cwd,'kernel.py'))).digest('hex'),latencySeconds:1,evidence:{handle:'remote:fixture:job:verified'}})})});
+ assert.ok(report.results.every(r=>r.correct));
+ const bad=await fixture(t);const rejected=await runMicroeval(bad,{sample:async()=>({}),verify:async()=>({correct:true,exitCode:0,output:JSON.stringify({correct:true,kernelSha256:'forged',latencySeconds:1,evidence:{}})})});assert.ok(rejected.results.every(r=>r.correct===null));
+});

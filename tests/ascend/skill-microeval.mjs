@@ -139,3 +139,21 @@ test('stable retrieval identity permits local endpoint reconnect but rejects a d
  const legacy=await fixture(t);await runMicroeval({...legacy,knowledge:{url:first.url}},{sample:async()=>({})});
  await assert.rejects(runMicroeval({...legacy,knowledge:{url:'http://127.0.0.1:5678/mcp'},resume:true}),/Frozen micro/);
 });
+test('native Pi keeps local edits/bash and dispatches device commands through existing rsi_target',async t=>{
+ const f=await fixture(t);const profile=await scriptedMicro(t,f.root,n=>[
+  {name:'write',args:{path:'kernel.py',content:'def answer(): return 42\n'}},
+  {name:'bash',args:{command:'printf local > local-marker'}},
+  {name:'rsi_target',args:{command:'python check.py .',timeout:600}}
+ ][n]);
+ let remote=0;const report=await runMicroeval({...f,profile,runs:1},{sample:args=>nativeSample({...args,targetEnvironment:{execute:async(command,cwd,options)=>{
+  remote++;assert.equal(command,'python check.py .');assert.equal(cwd,args.cwd);assert.ok(options.timeout<=args.seconds);assert.ok(options.signal instanceof AbortSignal);options.onData?.(Buffer.from('remote checked\n'));return {handle:'remote:fixture:job:'+remote,settled:true,exitCode:0};
+ }}})});
+ assert.equal(remote,2);assert.ok(report.results.every(r=>r.correct));for(const arm of ['active','candidate'])assert.equal(await readFile(join(f.directory,'repair','0-'+arm,'work/local-marker'),'utf8'),'local');
+});
+test('elapsed allowance covers adapter preparation and trusted verification hooks',async t=>{
+ const f=await fixture(t);let verified=0;
+ const report=await runMicroeval({...f,runs:1,seconds:.05},{sample:async({signal})=>{await new Promise(resolve=>{const timer=setTimeout(resolve,1000);signal.addEventListener('abort',()=>{clearTimeout(timer);resolve();},{once:true});});return {};},verify:async()=>{verified++;return {correct:true};}});
+ assert.equal(verified,0);assert.ok(report.results.every(r=>r.correct===false&&r.timedOut));
+ const g=await fixture(t);const measured=await runMicroeval({...g,runs:1},{sample:async()=>({}),verify:async({cwd,seconds,signal})=>{assert.ok(seconds>0&&seconds<=g.seconds);assert.ok(signal instanceof AbortSignal);await writeFile(join(cwd,'kernel.py'),'def answer(): return 42\n');return {correct:true,exitCode:0,output:'trusted target check'};}});
+ assert.ok(measured.results.every(r=>r.correct&&r.verification.output==='trusted target check'));
+});
