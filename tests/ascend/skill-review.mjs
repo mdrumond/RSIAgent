@@ -479,3 +479,17 @@ test('native writer corrects evaluation bucket used as guidance scope before adm
  const pending={...proposal,action:'learn',question:'Which reduction axes?',hypothesis:'Axis order matters',requiredEvidence:'Independent check',learningTarget:'cpu'};
  assert.equal(validateReviewProposal(pending,groups,classifications).action,'learn');assert.equal(pending.changes[0].scope,'correctness');
 });
+test('traceback ownership survives inventory grouping and native diagnostic deduplication',async t=>{
+ const f=await fixture(t),state=new State(join(f.source,'state.sqlite')),attempt=state.db.prepare('SELECT id FROM attempts').get().id;
+ state.db.exec('DELETE FROM events; DELETE FROM generation_events');
+ for(const path of ['/tmp/work-a/candidate/kernel.py','/tmp/work-b/candidate/kernel.py','/tmp/work-c/trusted/reference.py'])state.event(attempt,'verification',{correct:false,error:`Traceback: File "${path}", line 7: ValueError: incorrect argument`});state.close();
+ const inventory=await inventoryFailures(f.options.sources);assert.equal(inventory.groups.length,2);assert.deepEqual(inventory.groups.map(g=>g.occurrences.length).sort(),[1,2]);
+ const group={id:'ownership',occurrences:inventory.groups.flatMap(g=>g.occurrences)},directory=join(f.root,'ownership-review');
+ const decision={cause:'unknown',reason:'Observed failures have different source ownership',coverage:'uncovered',guidanceIds:[],evidenceRefs:group.occurrences.map(o=>o.reference)};
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[{name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:decision}}][n]);
+ const {nativeClassify}=await import('../../cli/skill-review-native.mjs');await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
+ const input=await load(join(directory,'input.json'));assert.equal(input.group.distinctDiagnostics,2);
+ assert.equal(input.group.occurrences.filter(o=>o.data.error.includes('/candidate/kernel.py')).length,1);
+ assert.equal(input.group.occurrences.filter(o=>o.data.error.includes('/trusted/reference.py')).length,1);
+ assert.equal((await load(join(directory,'read-evidence.json'))).length,2);
+});

@@ -13,12 +13,20 @@ const failed=(type,data)=>{
  return expected!==undefined&&actual!==undefined&&actual!==expected||negativeVerdict(data)||
   /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid'].includes(type)||type==='verification'&&actual>0;
 };
-const normal=text=>String(text??'').replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/\/[^\s'"<>]+/g,'<path>').slice(0,1500);
+// Keep traceback ownership while discarding transient attempt/workspace roots.
+const diagnosticText=text=>String(text??'').replace(/\/[^\s'"<>]+/g,path=>{
+ const parts=path.split('/').filter(Boolean),anchor=parts.findIndex(p=>['candidate','source','src','reference','negative','negatives','trusted','frozen','verifier','verifiers'].includes(p));
+ if(anchor>=0)return '<workspace>/'+parts.slice(anchor).join('/');
+ if(parts[0]==='tmp'&&parts.length>2)return '<workspace>/'+parts.slice(2).join('/');
+ if(parts[0]==='var'&&parts[1]==='tmp'&&parts.length>3)return '<workspace>/'+parts.slice(3).join('/');
+ return path;
+}).replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>');
+const normal=text=>diagnosticText(text).slice(0,1500);
 export function diagnosticIdentity(occurrence){
  const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?
   Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([key])=>
    !/elapsed|duration|monotonic|timestamp|fingerprint|^handle$|^operation$|^owner$|^created$/i.test(key)).map(([key,item])=>[key,stable(item)])):
-  typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/\/[^\s'"<>]+/g,'<path>'):value;
+  typeof value==='string'?diagnosticText(value):value;
  return digest([stable(occurrence.data??{}),(occurrence.artifacts??[]).map(a=>a.sha256)]);
 }
 export async function inventoryFailures(sources) {
