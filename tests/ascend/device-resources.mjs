@@ -13,7 +13,7 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
-import {reserveDevice,closedDeviceLease} from '../../integrations/environments/device-leases.mjs';
+import {reserveDevice,closedDeviceLease,closeDeviceLease} from '../../integrations/environments/device-leases.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -653,6 +653,21 @@ test('a retained displaced receipt closes its original fence without replacing t
   await assert.rejects(readFile(old.receipt),{code:'ENOENT'});
   assert.ok(f.calls.some(a=>a[0]==='observe'&&a[1]==='remote:fixture:job:old-payload'));
   assert.equal(f.commands.length,0,'only token-scoped cleanup runs, never an actor payload');
+  const calls=f.calls.length;
+  assert.deepEqual(await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token}),result);
+  assert.equal(f.calls.length,calls,'retrying a known closure performs no client work');
+  assert.equal(await readFile(active.receipt,'utf8'),before);
+});
+
+for(const mismatch of ['pool','physical'])test(`an archived retained closure with a different ${mismatch} cannot satisfy a recovery retry`,async t=>{
+  const f=await fixture(t);
+  const old=await reserveDevice(mismatch==='pool'?'another-pool':f.context.instancePath,mismatch==='physical'?2:0,join(f.context.instancePath,'quarantined'));
+  await closeDeviceLease(old);
+  await f.environment.resources();
+  const calls=f.calls.length;
+  const result=await f.environment.reconcileReservation(0,{receipt:old.receipt,token:old.token});
+  assert.equal(result.closed,false);assert.equal(result.reason,'ownership-changed');
+  assert.equal(f.calls.length,calls);
 });
 
 for(const mismatch of ['pool','physical','token'])test(`retained reservation ${mismatch} mismatch cannot dispatch cleanup`,async t=>{
