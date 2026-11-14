@@ -235,3 +235,21 @@ test('renaming a change during original-failure reanalysis cannot bypass an iden
  const next=await analyzeBacklog(f,{classify,review:async input=>{const proposal=await review(['new-id'])(input);proposal.changes[0].text=item.proposal.changes[0].text;return proposal;}});
  assert.equal(next.items[0].id,item.id);assert.equal(next.items[0].status,'rejected');assert.equal(f.backlog.claim({base:'baseline'}),null);
 });
+
+
+test('bounded learning pages pass consumed high-priority history and retain pending work until the newer result is analyzed',async t=>{
+ const f=await fixture(t),question={action:'learn',reason:'Need boundary evidence',question:'Which tail is safe?',hypothesis:'Tail differs',requiredEvidence:'Independent CPU result',learningTarget:'cpu'};
+ const initial=await analyzeBacklog(f,{classify,review:async({groups,validate})=>validate({...question,groupIds:groups.map(g=>g.id)})}),item=initial.items[0];
+ const row=f.state.db.prepare('SELECT id,data FROM skill_learning_requests').get();await completeLearning(f,row,'page-proof');
+ await analyzeBacklog(f,{classify,review:async({groups,validate})=>validate({action:'no-change',reason:'Fact already represented',groupIds:groups.map(g=>g.id)})});
+ const consumed=f.backlog.get(item.id),linked=[];
+ for(let i=0;i<101;i++)linked.push(f.backlog.upsert({...consumed,key:'consumed-'+i,id:undefined,status:'learning',priority:90,proposal:{...question,question:'Consumed question '+i}}).id);
+ const newer=f.backlog.upsert({...consumed,key:'newer-learning',id:undefined,status:'learning',priority:1,proposal:{...question,question:'A newer boundary question'},evidence:{...consumed.evidence,learningIdentity:null}});linked.push(newer.id);
+ const data=JSON.parse(f.state.db.prepare('SELECT data FROM skill_learning_requests WHERE id=?').get(row.id).data);data.backlogIds=[item.id,...linked];f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(data),row.id);
+ f.backlog.meta('learning-scan',null);let calls=0;
+ for(let page=0;page<20&&!calls;page++){
+  const result=await analyzeBacklog(f,{classify,review:async input=>{calls++;return review(['newer-supported'])(input);}});
+  if(!calls){assert.equal(result.analyzed,0);assert.equal(f.backlog.meta('learning-pending'),true);}
+ }
+ assert.equal(calls,1);assert.equal(f.backlog.get(newer.id).status,'queued');assert.equal(f.backlog.meta('learning-pending'),false);
+});
