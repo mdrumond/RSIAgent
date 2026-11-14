@@ -143,3 +143,20 @@ test('a passed project without a verification receipt does not qualify device le
  assert.equal(observed[0][1].result.status,'verified-project');assert.equal(f.backlog.get(first.items[0].id).status,'inconclusive');
  const next=await analyzeBacklog(f,{classify,review:()=>{throw Error('Must not repeat answered question');}});assert.equal(next.analyzed,0);
 });
+
+
+test('actual verifier receipt and captured-stream paths expose bounded diagnostic head and tail',async t=>{
+ const f=await fixture(t),correctness=join(f.root,'verify-correctness.log'),performance=join(f.root,'verify-performance.log');
+ await writeFile(correctness,'CORRECTNESS HEADER\n'+'x'.repeat(40000)+'\nFINAL CORRECTNESS FAILURE');await writeFile(performance,'PERFORMANCE HEADER\n'+'y'.repeat(40000)+'\nFINAL PERFORMANCE FAILURE');
+ const a=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;
+ f.state.event(a,'verification',{passed:false,correctness:{passed:false,evidence:correctness},performance:{passed:false,evidence:performance},evidence:{correctness,performance}});
+ f.state.event(a,'attempt-error',{message:'Captured streams',stdout:correctness,stderr:performance});f.state.event(a,'attempt-error',{message:'Raw output is not a filename',stdout:'/compiler/source.cpp\n'+'z'.repeat(6000)});f.backlog.ingest();
+ const {items}=await analyzeBacklog(f,{classify,review:review()});assert.ok(items.some(i=>i.evidence.groups[0].message==='Raw output is not a filename'&&i.evidence.groups[0].occurrences[0].artifacts.length===0));
+ for(const type of ['verification','attempt-error']){
+  const item=items.find(i=>i.evidence.groups[0].type===type&&i.evidence.groups[0].occurrences[0].artifacts.length===2);assert.ok(item);
+  const texts=await Promise.all(item.evidence.groups[0].occurrences[0].artifacts.map(a=>readFile(a.path,'utf8')));
+  assert.ok(texts.some(s=>s.startsWith('CORRECTNESS HEADER')&&s.endsWith('FINAL CORRECTNESS FAILURE')));
+  assert.ok(texts.some(s=>s.startsWith('PERFORMANCE HEADER')&&s.endsWith('FINAL PERFORMANCE FAILURE')));
+  assert.ok(item.evidence.groups[0].occurrences[0].artifacts.every(a=>a.truncated&&a.layout==='head-and-tail'));
+ }
+});
