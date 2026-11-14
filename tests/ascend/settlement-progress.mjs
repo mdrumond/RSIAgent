@@ -122,3 +122,30 @@ test('terminal closure never substitutes for pending operation timing reconcilia
   assert.equal(reconciled,1);assert.equal(state.attempt(id).elapsed,21.25);
   assert.equal(state.attempt(id).outcome,'passed');
 });
+
+test('failed payload settlement persists cleanup custody without claiming transfer or fence release',async t=>{
+ const {state,id,event}=fixture(t);state.db.prepare("UPDATE attempts SET outcome='failed' WHERE id=?").run(id);
+ const handle=remote('cleanup');event('execution-starting',{operation:'legacy',startElapsed:10});
+ event('execution-unresolved',{operation:'legacy',handle:null});event('execution-handle',{handle});
+ const proof={closed:true,payloadClosed:true,executionSeconds:2,handles:[],
+  cleanupPending:{id:'old-token',directory:'/ignored/cleanup'},deferredHandles:[handle],
+  unresolvedArtifacts:[{submission:'output',kind:'download',accountingExcluded:true,receiptFile:null}]};
+ assert.equal(await operationsStopped(state,state.attempt(id),{reconcileOperation:async()=>proof,
+  observe:()=>assert.fail('cleanup remains under separate custody')}),true);
+ assert.equal(state.attempt(id).outcome,'failed');assert.equal(state.attempt(id).elapsed,18.5);
+ const custody=state.events(id).find(e=>e.type==='execution-cleanup-custody').data;
+ assert.equal(custody.cleanup.id,'old-token');assert.equal(custody.unresolvedArtifacts[0].submission,'output');
+ assert.equal(state.events(id).some(e=>e.type==='device-lease-released'),false);
+ assert.equal(await operationsStopped(state,state.attempt(id),{observe:()=>assert.fail('durable custody lost on next scan')}),true);
+});
+
+test('legacy pre-admission closure retains its positive prior-lease proof without lowering elapsed',async t=>{
+ const {state,id,event}=fixture(t);event('execution-starting',{operation:'blocked',startElapsed:10});
+ event('execution-unresolved',{operation:'blocked',handle:null});
+ const priorLeaseClosure={receipt:'/owned/prior/lease.json',token:'prior-token'};
+ assert.equal(await operationsStopped(state,state.attempt(id),{reconcileOperation:async()=>({closed:true,
+  payloadStarted:false,executionSeconds:0,handles:[],priorLeaseClosure})}),true);
+ const proof=state.events(id).find(e=>e.type==='execution-reconciled').data;
+ assert.equal(proof.payloadStarted,false);assert.deepEqual(proof.priorLeaseClosure,priorLeaseClosure);
+ assert.equal(state.attempt(id).elapsed,18.5);assert.equal(state.attempt(id).session,'retained-session.jsonl');
+});

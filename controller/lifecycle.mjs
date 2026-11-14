@@ -57,7 +57,12 @@ export async function operationsStopped(state,attempt,environment) {
       if(actorStarted || proof.executionSeconds!==0 || !submissions.length ||
           submissions.some(e=>e.data.accountingExcluded!==true))return false;
     }
+    if(proof.cleanupPending||proof.unresolvedArtifacts?.length)state.event(attempt.id,'execution-cleanup-custody',{
+      operation,cleanup:proof.cleanupPending??null,handles:proof.deferredHandles??[],
+      unresolvedArtifacts:proof.unresolvedArtifacts??[]});
     state.event(attempt.id,'execution-reconciled',{operation,closed:true,executionSeconds:proof.executionSeconds,
+      ...(proof.payloadStarted===false?{payloadStarted:false}:{}),
+      ...(proof.priorLeaseClosure?{priorLeaseClosure:proof.priorLeaseClosure}:{}),
       ...(proof.timingEstimated?{timingEstimated:true}:{})});
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
@@ -75,8 +80,11 @@ export async function operationsStopped(state,attempt,environment) {
     ...events.filter(e=>e.type==='execution-unresolved' && e.data.handle).map(e=>e.data.handle)]);
   const excluded=excludedExecutionProofs(events);
   const terminal=terminalExecutionProofs(events);
+  const deferred=new Set(events.filter(e=>e.type==='execution-cleanup-custody'&&e.data.cleanup?.id)
+    .flatMap(e=>e.data.handles??[]));
   for (const handle of handles) {
     if (!handle) return false;
+    if(deferred.has(handle))continue;
     const proof=terminal.get(handle) ?? excluded.get(handle) ?? await environment.observe(handle,{accountingExcluded:excluded.has(handle)});
     if (proof.state !== 'stopped') return false;
     // Retain progress even when the next observation exceeds this scan's window.

@@ -767,7 +767,7 @@ export async function createEnvironment(options, context) {
   }
   async function reconcileOperation({ operation, events }) {
     const pending = events.filter(({ type, data }) => type === 'execution-submitting' && (data.operation === operation || data.submission === operation));
-    const handles = new Set(),wrapperClosures=[];
+    const handles = new Set(),wrapperClosures=[],unresolvedArtifacts=[];
     if (!pending.length) return { closed: false, accountingUnresolved: true, handles: [] };
     let executionSeconds = 0,timingEstimated=false,closed=true,accountingUnresolved=false,accounted=false;
     const excluded=excludedExecutionProofs(events);
@@ -778,6 +778,9 @@ export async function createEnvironment(options, context) {
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
       if (!handle) {
+        if(data.kind==='download'&&data.accountingExcluded===true){
+          unresolvedArtifacts.push({...data});continue;
+        }
         const proof=await wrapperClosure(data);
         if(proof){wrapperClosures.push({...proof,submission:data.submission});executionSeconds+=proof.executionSeconds;accounted=true;continue;}
         closed=false;accountingUnresolved=true;
@@ -810,7 +813,10 @@ export async function createEnvironment(options, context) {
       }else accountingUnresolved=true;
       if(state.state!=='stopped')closed=false;
     }
-    return {closed:closed&&!accountingUnresolved,
+    const payloadClosed=closed&&!accountingUnresolved&&(!unresolvedArtifacts.length||
+      pending.some(({data})=>!(data.kind==='download'&&data.accountingExcluded===true)));
+    return {closed:payloadClosed,payloadClosed,
+      ...(unresolvedArtifacts.length?{unresolvedArtifacts}:{}),
       ...((accounted||!accountingUnresolved)?{executionSeconds}:{}),
       ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles],...(wrapperClosures.length?{wrapperClosures,nativeIdentityMissing:true,artifactsUnresolved:true}:{})};
   }
