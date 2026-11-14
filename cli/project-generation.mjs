@@ -11,6 +11,7 @@ import { createEnvironment } from '../integrations/environments/index.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectBundle,bundleHashes} from './project-bundle.mjs';
 import {compileVerifierEntries,entrypointCommand} from '../controller/project-commands.mjs';
+import {readConfig,importProject,updateConfigImmediate} from './instance.mjs';
 
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
@@ -67,7 +68,7 @@ function drafts(state, adoptPhase1=false) {
     pending:(phase,entry,limit)=>state.db.prepare(`SELECT data FROM generation_drafts
       WHERE json_extract(data,'$.status') IN ('draft','ready') AND json_extract(data,'$.phase')=?
       AND json_extract(data,'$.campaign_entry') IS ? ORDER BY rowid LIMIT ?`).all(phase,entry,limit).map(r=>JSON.parse(r.data)),
-    reconcile:()=>state.db.prepare(`UPDATE generation_drafts SET data=json_object('id',id,'status','imported')
+    reconcile:()=>state.db.prepare(`UPDATE generation_drafts SET data=json_set(data,'$.status','imported')
       WHERE json_extract(data,'$.status') IN ('draft','ready') AND EXISTS (SELECT 1 FROM projects WHERE projects.id=generation_drafts.id)`).run(),
     adapter:generationEventState(state.db)};
 }
@@ -114,7 +115,8 @@ export async function compileGenerationProposal(root,p,requirements={}){
 
 // Returns staged specs. The caller imports artifacts, admits to State, and updates
 // config/selection; draft rows never count as original attempts or completions.
-export async function refillProjects({config,state,bridge,concurrency,path,signal}) {
+export async function refillProjects({config,state,bridge,concurrency,path,signal,onReady}) {
+  if(onReady!==undefined&&typeof onReady!=='function')throw new Error('onReady must be a function');
   const entry=currentCampaignEntry(state,config);
   if(config.campaign_plan&&!entry)return [];
   if(entry)config=campaignEntryConfig(config,entry.id);
@@ -171,7 +173,11 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
       }catch(error){if(atomic)state.db.exec('ROLLBACK');throw error;}
       if(quota)reserve(topic,1);
     }
-    if(d.status==='ready'){result.push(d.spec);continue;}
+    if(d.status==='ready'){
+      result.push(d.spec);
+      if(await onReady?.(d.spec)===false)break;
+      continue;
+    }
     const root=join(resolve(path),d.id);await mkdir(root,{recursive:true});
     const started=performance.now(),prior=d.elapsed??0;
     const spent=()=>prior+(performance.now()-started)/1000;
@@ -252,18 +258,64 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
             }
           }}});
       if(d.status!=='ready')throw new Error(d.error??'No project proposal submitted');
-      result.push(d.spec);
     }catch(error){
       if(signal?.aborted){checkpoint();throw error;}
       d.status=bounded.aborted?'exhausted':'invalid';d.error=error.message;checkpoint();
       if(quota)reserve(d.topic,-1);
     }finally{clearInterval(timer);checkpoint();}
+    // Import checkpoints spend the same retained allocation. Never publish
+    // while this construction timer/finally can overwrite their updated row.
+    if(d.status==='ready'){
+      result.push(d.spec);
+      if(await onReady?.(d.spec)===false)break;
+    }
   }
   return result;
 }
 
 // Retain the existing entry point for callers; phase selection is shared.
 export const refillPhase1=refillProjects;
+
+// Ready means CPU construction passed, not that the copied dependency closure
+// is trusted. Only this full import and atomic config publication admit it.
+export async function publishGeneratedProject({config,state,spec,signal}) {
+  signal?.throwIfAborted();
+  if(state.project(spec.id))return true;
+  const eligible=(ledger,current)=>{
+    if(!current.campaign_plan)return current.mode===spec.phase&&!spec.campaign_entry&&generationSettings(current,spec.phase).enabled;
+    const entry=currentCampaignEntry(ledger,current);
+    if(!entry||entry.id!==spec.campaign_entry||entry.phase!==spec.phase)return false;
+    if(!generationSettings(campaignEntryConfig(current,entry.id),spec.phase).enabled)return false;
+    const staged=ledger.db.prepare(`SELECT COUNT(*) n FROM projects p
+      WHERE json_extract(p.spec,'$.campaign_entry')=? AND NOT EXISTS
+        (SELECT 1 FROM attempts a WHERE a.project=p.id)`).get(entry.id).n;
+    return entry.remainingAdmissions>staged;
+  };
+  const latest=await readConfig(config.root);
+  if(!eligible(state,latest))return false;
+  let imported;
+  try {
+    imported=await importProject(config.root,spec,{signal,localExecution:latest.local_execution,
+      checkpoint:seconds=>checkpointGeneratedBundle(state,spec,seconds)});
+  }catch(error){
+    if(!signal?.aborted)rejectGeneratedProject(state,spec,error);
+    throw error;
+  }
+  const changed=new Error('Generated project entry or admission quota changed during import');
+  try {
+    await updateConfigImmediate(config.root,(current,ledger)=>{
+      signal?.throwIfAborted();
+      if(ledger.project(imported.id))return current;
+      if(!eligible(ledger,current))throw changed;
+      ledger.add(imported);
+      ledger.db.prepare("UPDATE generation_drafts SET data=json_set(data,'$.status','imported') WHERE id=?")
+        .run(spec.generation.draft);
+      return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
+        curriculum:{...current.curriculum,[spec.phase]:[...new Set([...(current.curriculum?.[spec.phase]??[]),imported.id])]}};
+    });
+  }catch(error){if(error===changed)return false;throw error;}
+  return true;
+}
 
 // An incomplete imported closure is a rejected specification, not permission to
 // retry the same ready draft with a fresh validation allocation every refill.
