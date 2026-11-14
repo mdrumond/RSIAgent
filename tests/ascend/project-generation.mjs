@@ -179,7 +179,10 @@ test('a later ready draft failing imported negative controls preserves the earli
 
 for(const advance of [false,true])test(`publication rechecks ${advance?'changed entry':'filled quota'} after full import`,async t=>{
   const f=await fixture(t,{importGate:true});
-  f.config.campaign_plan=[{id:'batch',phase:'phase1',new_projects:1},{id:'next',phase:'phase1',new_projects:1}];
+  f.config.campaign_plan=[{id:'batch',phase:'phase1',new_projects:1,generation:{enabled:true}},
+    {id:'next',phase:'phase1',new_projects:1}];
+  if(advance)f.config.curriculum.generation.by_phase={phase1:{enabled:false}};
+  else f.config.curriculum.generation.enabled=false;
   await publicationConfig(f);syncCampaignPlan(f.state,f.config);
   const [spec]=await refillProjects(f.options);
   const publishing=publishGeneratedProject({...f.options,spec});

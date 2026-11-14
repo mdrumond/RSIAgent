@@ -282,10 +282,10 @@ export async function publishGeneratedProject({config,state,spec,signal}) {
   signal?.throwIfAborted();
   if(state.project(spec.id))return true;
   const eligible=(ledger,current)=>{
-    if(!generationSettings(current,spec.phase).enabled)return false;
-    if(!current.campaign_plan)return current.mode===spec.phase&&!spec.campaign_entry;
+    if(!current.campaign_plan)return current.mode===spec.phase&&!spec.campaign_entry&&generationSettings(current,spec.phase).enabled;
     const entry=currentCampaignEntry(ledger,current);
-    if(entry?.id!==spec.campaign_entry||entry.phase!==spec.phase)return false;
+    if(!entry||entry.id!==spec.campaign_entry||entry.phase!==spec.phase)return false;
+    if(!generationSettings(campaignEntryConfig(current,entry.id),spec.phase).enabled)return false;
     const staged=ledger.db.prepare(`SELECT COUNT(*) n FROM projects p
       WHERE json_extract(p.spec,'$.campaign_entry')=? AND NOT EXISTS
         (SELECT 1 FROM attempts a WHERE a.project=p.id)`).get(entry.id).n;
