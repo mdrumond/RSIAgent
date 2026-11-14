@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { syncBuiltinESMExports } from 'node:module';
 import { State } from '../../controller/state.mjs';
 import { RecoveryQueue } from '../../controller/recovery.mjs';
@@ -215,4 +216,27 @@ for(const kind of ['active-own','active-other','expired-own'])test(`public upgra
  }else{
   await run();assert.equal(await fs.readFile(join(f.instance,'machinery/controller/marker.mjs'),'utf8'),'new');
  }
+});
+
+test('public upgrade inspection does not activate queued cleanup from staged machinery',async t=>{
+ const f=await fixture(t),directory=join(f.instance,'cleanup-queue'),launches=join(f.instance,'cleanup-launches'),instructions=join(f.instance,'instructions.md');
+ await fs.writeFile(instructions,'CPU fixture instructions');
+ const {queueDeviceCleanup,cleanupStatus}=await import('../../integrations/environments/device-cleanup.mjs');
+ const dead={pid:2147483647,start:'gone',boot:'gone'};
+ await queueDeviceCleanup(directory,{id:'pending-cleanup',token:'pending-cleanup',receipt:'retained-receipt',pointer:'retained-pointer',campaignRoot:f.instance,deadline:Date.now()+30000},{launch:async()=>dead});
+ const ascend=new URL('../../integrations/environments/ascend.mjs',import.meta.url).href;
+ await fs.writeFile(join(f.release,'integrations/environments/fixture.mjs'),`import {createEnvironment as ascend} from ${JSON.stringify(ascend)};
+import {appendFile} from 'node:fs/promises';import {processIdentity} from ${JSON.stringify(new URL('../../controller/lifecycle.mjs',import.meta.url).href)};
+export async function createEnvironment(options,context){const environment=await ascend({...options,runtime:'cpu',instructionFile:${JSON.stringify(instructions)},health:{product:'a3'}},
+ {...context,leaseDirectory:${JSON.stringify(join(f.instance,'leases'))},sdk:{createLocalBashOperations:()=>({})},client:async()=>({state:'completed'}),
+ cleanupLaunch:async()=>{await appendFile(${JSON.stringify(launches)},'launch\\n');return processIdentity();}});return {...environment,canUpgrade:async()=>true};}`);
+ // Match the queued directory used by the real Ascend constructor.
+ const configuredQueue=join(f.instance,'leases','.cleanup');await fs.mkdir(join(f.instance,'leases'));await fs.rename(directory,configuredQueue);
+ await fs.writeFile(join(f.instance,'device-cleanup-service.json'),JSON.stringify({directory:configuredQueue,owner:dead}));
+ await upgrade(f.instance,f.release);
+ await assert.rejects(fs.readFile(launches),{code:'ENOENT'});
+ assert.equal((await cleanupStatus(configuredQueue))[0].status,'queued');
+ const installed=await import(pathToFileURL(join(f.instance,'machinery/integrations/environments/fixture.mjs')));
+ await installed.createEnvironment(f.options,{instancePath:f.path,campaignRoot:f.instance,event:async()=>{},exclude:async(_label,fn)=>fn()});
+ assert.equal((await fs.readFile(launches,'utf8')).trim(),'launch');
 });

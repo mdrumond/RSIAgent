@@ -69,7 +69,7 @@ export async function createEnvironment(options, context) {
   const leasePath = context.cleanupLeasePath??join(context.instancePath, '.ascend-command-lease.json');
   const asyncCleanup=options.asyncCleanup!==false&&!context.cleanupLeasePath;
   const cleanupQueue=cleanupDirectory(context);
-  if(asyncCleanup)await resumeDeviceCleanup(cleanupQueue,{launch:context.cleanupLaunch});
+  if(asyncCleanup&&context.activateCleanup!==false)await resumeDeviceCleanup(cleanupQueue,{launch:context.cleanupLaunch});
   const commandContext = {...context, client, exclude:(label,fn)=>activeExclude?activeExclude(label,fn):context.exclude(label,fn), event: async (type, data) => {
     if (activeLease && ['execution-submitting','execution-submitted','execution-not-admitted','execution-handle'].includes(type)) {
       await activeLease.event(type,data);

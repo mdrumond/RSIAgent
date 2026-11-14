@@ -32,7 +32,7 @@ export async function queueDeviceCleanup(directory,request,dependencies={}){
   if(retained.request.receipt!==request.receipt||retained.request.token!==request.token||retained.request.pointer!==request.pointer)throw Error('Cleanup identity changed');
  }finally{db.close();}
  let worker,launchError;if(!request.handoffOwner)try{worker=await resumeDeviceCleanup(directory,dependencies);}catch(error){launchError=error.message;}
- if(request.campaignRoot)await writeFile(join(request.campaignRoot,'device-cleanup-service.json'),JSON.stringify({directory,owner:worker?.owner??null}),{mode:0o600});
+ if(request.campaignRoot)await publishCampaignOwner(request.campaignRoot,{directory,owner:worker?.owner??null});
  return {id:request.id,directory,deadline:retained.request.deadline,owner:worker?.owner??null,...(launchError?{launchError}:{})};
 }
 export async function activateDeviceCleanup(directory,id,dependencies={}){
@@ -76,9 +76,13 @@ export async function resumeDeviceCleanup(directory,{launch=launchWorker}={}){
   }catch(error){db.prepare('DELETE FROM worker WHERE ticket=?').run(ticket);throw error;}
  }finally{db.close();}
 }
+async function publishCampaignOwner(root,service){
+ try{await writeFile(join(root,'device-cleanup-service.json'),JSON.stringify(service),{mode:0o600});}
+ catch(error){if(error.code!=='ENOENT')throw error;} // Retired campaigns retain fences without poisoning the shared queue.
+}
 async function publishOwner(db,directory,worker){
  for(const root of new Set(db.prepare("SELECT request FROM jobs WHERE status!='closed'").all().map(row=>JSON.parse(row.request).campaignRoot).filter(Boolean)))
-  await writeFile(join(root,'device-cleanup-service.json'),JSON.stringify({directory,owner:worker.owner}),{mode:0o600});
+  await publishCampaignOwner(root,{directory,owner:worker.owner});
  return worker;
 }
 async function launchWorker(directory,ticket){
@@ -98,7 +102,7 @@ async function runJob(request,signal){
    exclude:async(_label,action)=>action(),event:async(type,data)=>appendFile(request.journal,JSON.stringify({at:new Date().toISOString(),type,data})+'\n')});
  return environment.reconcileLease();
 }
-export async function drainDeviceCleanup(directory,ticket,{run=runJob,parallelism=2,now=Date.now}={}){
+export async function drainDeviceCleanup(directory,ticket,{run=runJob,parallelism=2,now=Date.now,beforeIdleRetirement=async()=>{}}={}){
  if(!Number.isInteger(parallelism)||parallelism<1||parallelism>2)throw Error('Cleanup concurrency must be one or two');
  const db=await database(directory),owner=await processIdentity(),active=new Map();
  try{
@@ -121,7 +125,19 @@ export async function drainDeviceCleanup(directory,ticket,{run=runJob,parallelis
     })().finally(()=>active.delete(row.id));active.set(row.id,task);
    }
    const pending=db.prepare("SELECT MIN(next_at) AS next FROM jobs WHERE status='queued'").get().next;
-   if(!active.size&&pending===null)break;
+   if(!active.size&&pending===null){
+    await beforeIdleRetirement();
+    // Enqueue and retirement serialize on the same SQLite write lock. A producer
+    // either sees this live claim and its row is drained, or sees no claim and
+    // starts a successor. The final old-ticket delete cannot remove that owner.
+    db.exec('BEGIN IMMEDIATE');
+    try{
+     const pending=db.prepare("SELECT 1 FROM jobs WHERE status IN ('queued','running')").get();
+     if(!pending)db.prepare('DELETE FROM worker WHERE ticket=?').run(ticket);
+     db.exec('COMMIT');if(!pending)break;
+    }catch(error){db.exec('ROLLBACK');throw error;}
+    continue;
+   }
    const waiting=new AbortController();
    try{await Promise.race([...active.values(),delay(Math.max(10,Math.min(1000,pending===null?1000:pending-now())),undefined,{signal:waiting.signal})]);}
    finally{waiting.abort();}
