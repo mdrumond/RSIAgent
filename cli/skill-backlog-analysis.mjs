@@ -20,7 +20,7 @@ function allocation(seconds,signal){
  }};
 }
 function artifactPaths(value,key='',paths=[]){
- if(typeof value==='string'&&/^(path|log|stdout_path|stderr_path|evidence|correctness|performance)$/.test(key)&&isAbsolute(value))paths.push(value);
+ if(typeof value==='string'&&/^(path|log|stdout|stderr|stdout_path|stderr_path|evidence|correctness|performance)$/.test(key)&&value.length<=4096&&!/[\r\n]/.test(value)&&isAbsolute(value))paths.push(value);
  else if(value&&typeof value==='object')for(const [k,v]of Object.entries(value))artifactPaths(v,k,paths);
  return paths;
 }
