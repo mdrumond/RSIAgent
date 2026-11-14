@@ -113,6 +113,23 @@ test('evidence ordering and snapshot locations are telemetry, while changed test
  b.revise(h.id,{tests:{cases:['partial-row','partial-column']}});assert.equal(b.get(h.id).revision,2);assert.ok(b.claim({base:'baseline'}));
 });
 
+test('reworded proposal rationales and retrieval scores cannot retry an identical rejected instruction',async t=>{
+ const{b,seed,item}=await fixture(t),proposal={action:'update',reason:'The last tile overwrites its neighbour',memoryRefs:['m:1'],
+  changes:[{action:'upsert',id:'tail',scope:'implementation',text:'Mask stores on the logical row extent',critical:true,negative:false}],learningRequests:[{question:'Is another layout affected?'}]};
+ const evidence={groups:[{id:'same-diagnostic',classification:{reason:'Original review narrative'}}],memoryEvidence:[{collection:'m',entry_id:'1',text:'Observed row overflow',sha256:'same-content',score:.9}]};
+ const h=item('update',seed(),{proposal,evidence}),first=b.claim({base:'baseline'});b.finish(first.run.id,{status:'rejected'});
+ b.revise(h.id,{proposal:{...proposal,reason:'A boundary mask is needed',learningRequests:[]},evidence:{groups:[{id:'same-diagnostic',classification:{reason:'Reworded review narrative'}}],memoryEvidence:[{...evidence.memoryEvidence[0],score:.3,rank:9}]}});
+ const retained=b.get(h.id);assert.equal(retained.status,'rejected');assert.equal(retained.revision,1);assert.equal(retained.proposal.reason,'A boundary mask is needed');assert.equal(retained.evidence.memoryEvidence[0].score,.3);
+ assert.equal(b.claim({base:'baseline'}),null);assert.equal(b.run(first.run.id).snapshot.proposal.reason,proposal.reason);
+ b.revise(h.id,{proposal:{...proposal,changes:[{...proposal.changes[0],text:'Mask both row and column logical extents'}]}});assert.equal(b.get(h.id).revision,2);assert.ok(b.claim({base:'baseline'}));
+});
+
+test('learning identity follows the actual question and evidence criterion rather than review narrative',async t=>{
+ const{b,seed,item}=await fixture(t),proposal={action:'learn',question:'Which layouts need a mask?',hypothesis:'Partial tiles require a mask',requiredEvidence:'Check a partial tile',learningTarget:'device',reason:'Missing observation'};
+ const h=item('learn',seed(),{proposal,status:'learning'});b.revise(h.id,{proposal:{...proposal,reason:'Needs a target experiment',learningRequests:[]},status:'learning'});assert.equal(b.get(h.id).revision,1);
+ b.revise(h.id,{proposal:{...proposal,requiredEvidence:'Check a partial tile and transposed strides'},status:'learning'});assert.equal(b.get(h.id).revision,2);
+});
+
 test('active-version changes require requalification and retain all old experiment evidence',async t=>{
  const{b,seed,item}=await fixture(t),h=item('h',seed());const first=b.claim({base:'baseline'});b.checkpoint(first.run.id,{elapsed:42});
  assert.throws(()=>b.rebase(h.id,'promoted'),/Settle/);assert.throws(()=>b.claim({base:'promoted'}),/Settle/);
