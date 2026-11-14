@@ -419,3 +419,26 @@ test('reaped process proc descriptor reports absence without hiding permission f
     await assert.rejects(readProcessStat(child.pid, async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); }), { code: 'EACCES' });
   } finally { await descriptor.close(); }
 });
+
+for(const kind of ['download','upload','run'])test(`terminal payload retains unidentified ${kind} evidence conservatively`,async t=>{
+ const f=await fixture(t,args=>args[0]==='observe'?{state:'completed',exit:0,executionSeconds:16.793109309859574}:undefined);
+ const events=[{type:'execution-submitting',data:{operation:'legacy',submission:'payload',kind:'run',accountingExcluded:false}},
+  {type:'execution-submitted',data:{submission:'payload',handle:'remote:fake:job:retained-payload'}},
+  {type:'execution-submitting',data:{operation:'legacy',submission:'missing',kind,accountingExcluded:true,receiptFile:null}}];
+ const proof=await f.environment.reconcileOperation({operation:'legacy',events});
+ assert.equal(proof.closed,kind==='download');
+ if(kind==='download'){
+  assert.equal(proof.executionSeconds,16.793109309859574);assert.equal(proof.unresolvedArtifacts[0].submission,'missing');
+  assert.deepEqual(proof.handles,['remote:fake:job:retained-payload']);assert.equal(events.length,3);
+ }
+});
+
+for(const [kind,excluded]of [['download',true],['upload',true],['run',true],['download',false]])test(`standalone unidentified ${kind}/${excluded} retains its own operation boundary`,async t=>{
+ const f=await fixture(t),submission='standalone';
+ const events=[{type:'execution-submitting',data:{submission,kind,accountingExcluded:excluded,receiptFile:null}},
+  {type:'execution-submitted',data:{submission,closed:false,handle:null}}];
+ const proof=await f.environment.reconcileOperation({operation:submission,events});
+ assert.equal(proof.closed,kind==='download'&&excluded);
+ if(proof.closed){assert.equal(proof.payloadStarted,false);assert.equal(proof.executionSeconds,0);
+  assert.equal(proof.unresolvedArtifacts[0].submission,submission);assert.deepEqual(proof.handles,[]);}
+});
