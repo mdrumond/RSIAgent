@@ -124,7 +124,7 @@ export function validateReview(value,groups){
 }
 // Called only when a NEW draft is allocated. Existing drafts retain their frozen request.
 export function claimLearningRequest(state,config,{draft,topic,target}){
- if(config.skills?.review?.enabled!==true)return null;
+ if(config.skills?.review?.enabled!==true&&config.skills?.priority?.enabled!==true)return null;
  if(!has(state.db,'skill_learning_requests'))return null;
  const prioritized=has(state.db,'skill_backlog_items');
  const row=state.db.prepare(`SELECT id,data FROM skill_learning_requests WHERE status='pending' ORDER BY

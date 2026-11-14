@@ -97,7 +97,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   if(!checkpoint.proposalCharged){prior+=Math.max(0,item.preparation?.proposalElapsedSeconds??item.evidence?.proposalElapsedSeconds??0);checkpoint.proposalCharged=true;}
   started=ops.now();
   const spent=()=>prior+(ops.now()-started)/1000;
-  const save=()=>backlog.checkpoint(run.id,{elapsed:spent(),checkpoint});
+  const save=()=>{if(checkpoint.runningAt)checkpoint.runningAt=Date.now();return backlog.checkpoint(run.id,{elapsed:spent(),checkpoint});};
   const left=()=>Math.max(0,Math.min(run.seconds-spent(),remainingCampaign()));
   checkpoint.runningAt=Date.now();save();timer=setInterval(save,1000);
   if(left()<=30){delete checkpoint.runningAt;save();return backlog.finish(run.id,{status:'inconclusive',result:{reason:'hypothesis-elapsed'}});}

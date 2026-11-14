@@ -14,7 +14,7 @@ import {publishSkillVersion} from '../../cli/skills.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'priority-controller-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const config={format:1,root,target:'a3',mode:'phase1',projects:[],concurrency:5,environment:{options:{}},
-  skills:{activeVersion:'baseline',background:true,priority:{enabled:true},review:{enabled:true}}};
+  skills:{activeVersion:'baseline',background:true,priority:{enabled:true}}};
  await writeFile(join(root,'instance.json'),JSON.stringify(config));await mkdir(join(root,'skills'),{recursive:true});
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());state.event(null,'generation-rejected',{message:'bad frozen shape'});
  const backlog=new SkillBacklog(state,{target:'a3'});backlog.ingest();const group=backlog.failures()[0];backlog.acknowledge(group.id);
@@ -143,4 +143,18 @@ test('revised feedback reuses its frozen qualified cases without another learnin
  await writeFile(path,JSON.stringify({status:'ready',target:'a5',objective:'correctness',binding:{target:'a5',environment:{different:true}},tasks}));
  const incompatible=await resolveHypothesisCases({...args,directory:join(f.root,'incompatible-cases')},{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}})});
  assert.equal(incompatible.status,'needs-learning');
+});
+
+test('crash resume charges only time after the latest elapsed checkpoint',async t=>{
+ const f=await fixture(t),item=f.add('crash-clock');let release,started;const ready=new Promise(r=>started=r),gate=new Promise(r=>release=r);
+ let monotonic=0;t.mock.timers.enable({apis:['setInterval','Date'],now:Date.now()});
+ const running=runPrioritySkills(f.config,f.values,{...f.ops,now:()=>monotonic,evaluate:async()=>{started();await gate;return {status:'complete',decision:{promote:false}};}});
+ await ready;monotonic=900000;t.mock.timers.tick(900000);
+ const retained=f.backlog.run(item.id);assert.equal(retained.elapsed,900);assert.equal(retained.checkpoint.runningAt,Date.now());
+ release();await running;
+ // Restore the persisted crash checkpoint, as if no orderly shutdown had happened.
+ f.state.db.prepare("UPDATE skill_backlog_runs SET status='running',elapsed=?,checkpoint=?,owner=NULL WHERE id=?").run(retained.elapsed,JSON.stringify(retained.checkpoint),retained.id);
+ f.backlog.store({...f.backlog.get(item.id),status:'running'});t.mock.timers.tick(10000);
+ let available;await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async args=>{available=args.remainingSeconds;return {status:'complete',decision:{promote:false}};}});
+ assert(available>880&&available<=890,'Only the ten-second uncheckpointed tail is added to 900 seconds');
 });
