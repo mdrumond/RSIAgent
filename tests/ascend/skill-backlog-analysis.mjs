@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -7,17 +8,17 @@ import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from '../../cli/skill-backlog-analysis.mjs';
-async function fixture(t){
+async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'backlog-analysis-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const version=join(root,'skills','versions','baseline');await mkdir(version,{recursive:true});
  const entries=['global-kdb',...stages].map(scope=>({id:scope+'-baseline',scope,text:'Existing '+scope,critical:true,negative:false})),map={};
  for(const entry of entries){map[entry.scope]=entry.scope+'.md';await writeFile(join(version,map[entry.scope]),entry.text);}
  await writeFile(join(version,'skill-map.json'),JSON.stringify(map));await writeFile(join(version,'guidance.json'),JSON.stringify(entries));
- const config={format:1,root,target:'a3',actor:{provider:'fixture',model:'fixture'},skills:{activeVersion:'baseline'}};
+ const config={format:1,root,target,actor:{provider:'fixture',model:'fixture'},skills:{activeVersion:'baseline'}};
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
  state.add({id:'p1',phase:'phase1',actor_seconds:60,goal:'Boundary'});const a=state.admit('p1',{pid:1,start:'fixture',boot:'fixture'});
  state.event(a.id,'job-admitted',{kind:'original',mode:'phase1'});const log=join(root,'verifier.log');await writeFile(log,'Independent tail mismatch');
- state.event(a.id,'verification',{correct:false,evidence:{path:log}});const backlog=new SkillBacklog(state,{target:'a3'});backlog.ingest();
+ state.event(a.id,'verification',{correct:false,evidence:{path:log}});const backlog=new SkillBacklog(state,{target});backlog.ingest();
  return {root,state,backlog,config,log,directory:join(root,'analysis')};
 }
 const change=(id,reference)=>({action:'upsert',id,scope:'implementation',text:'Repair '+id+' only at its documented boundary.',critical:false,negative:false,response:'actor-change',evidenceRefs:[reference]});
@@ -85,7 +86,7 @@ test('verified curriculum learning reopens its linked item with new evidence and
  const source=join(f.root,'learning-source');await mkdir(source);await writeFile(join(source,'kernel.py'),'def run(x): return x');
  f.state.add({id:'learning-project',phase:'phase1',goal:'Actual target evidence',actor_seconds:60,source});const learned=f.state.admit('learning-project',{pid:1,start:'fixture',boot:'fixture'});
  const learnedLog=join(f.root,'learning-verifier.log');await writeFile(learnedLog,'Actual passing target verifier');
- f.state.event(learned.id,'verification',{passed:true,fingerprint:'a'.repeat(64),correctness:{passed:true,exitCode:0,evidence:learnedLog}});f.state.db.prepare("UPDATE attempts SET outcome='passed' WHERE id=?").run(learned.id);f.state.event(learned.id,'postprocess-completed',{});
+ f.state.event(learned.id,'verification',{passed:true,fingerprint:'a'.repeat(64),correctness:{passed:true,exitCode:0,evidence:learnedLog,receipt:{correct:true,kernelSha256:createHash('sha256').update('def run(x): return x').digest('hex'),evidence:{device:'npu:0'}}}});f.state.db.prepare("UPDATE attempts SET outcome='passed' WHERE id=?").run(learned.id);f.state.event(learned.id,'postprocess-completed',{});
  await mkdir(join(f.root,'attempts',learned.id),{recursive:true});await writeFile(join(f.root,'attempts',learned.id,'job.json'),JSON.stringify({config:{target:'a3',environment:{options:{mode:'ascend',runtime:'fixture-runtime'}}}}));
  const data=JSON.parse(request.data);data.findings={attemptId:learned.id,projectId:'learning-project',outcome:'passed'};
  f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',data=? WHERE id=?").run(JSON.stringify(data),request.id);
@@ -159,4 +160,19 @@ test('actual verifier receipt and captured-stream paths expose bounded diagnosti
   assert.ok(texts.some(s=>s.startsWith('PERFORMANCE HEADER')&&s.endsWith('FINAL PERFORMANCE FAILURE')));
   assert.ok(item.evidence.groups[0].occurrences[0].artifacts.every(a=>a.truncated&&a.layout==='head-and-tail'));
  }
+});
+
+
+test('A5 learning requires an explicit matching NPU receipt, not a passing CPU log on an A5 host',async t=>{
+ for(const [kind,device,expected]of [['structured','npu:0','verified-device'],['json','npu:0','verified-device'],['json','cpu','verified-project']])await t.test(kind+' '+device,async t=>{
+  const f=await fixture(t,'a5'),question={action:'learn',reason:'Need target proof',question:'Does it execute on NPU?',hypothesis:'Device executes the kernel',requiredEvidence:'Bound NPU receipt',learningTarget:'device'};
+  await analyzeBacklog(f,{classify,review:async({groups,validate})=>validate({...question,groupIds:groups.map(g=>g.id)})});
+  const source=join(f.root,'learning-source'),code='def run(x): return x';await mkdir(source);await writeFile(join(source,'kernel.py'),code);f.state.add({id:'learning',goal:'Learning',phase:'phase1',actor_seconds:60,source});const a=f.state.admit('learning',{pid:1,start:'fixture',boot:'fixture'});
+  const receipt={correct:true,kernelSha256:createHash('sha256').update(code).digest('hex'),evidence:{device}},log=join(f.root,'learning-verifier.log');await writeFile(log,kind==='json'?'Verifier output\n'+JSON.stringify(receipt)+'\n':'Passed generic verification');
+  f.state.event(a.id,'verification',{passed:true,fingerprint:'a'.repeat(64),correctness:{passed:true,exitCode:0,evidence:log,...(kind==='structured'?{receipt}:{})}});f.state.db.prepare("UPDATE attempts SET outcome='passed' WHERE id=?").run(a.id);f.state.event(a.id,'postprocess-completed',{});
+  await mkdir(join(f.root,'attempts',a.id),{recursive:true});await writeFile(join(f.root,'attempts',a.id,'job.json'),JSON.stringify({config:{target:'a5',environment:{options:{mode:'ascend',runtime:'fixture-a5'}}}}));
+  const row=f.state.db.prepare('SELECT id,data FROM skill_learning_requests').get(),data=JSON.parse(row.data);data.findings={attemptId:a.id,projectId:'learning',outcome:'passed'};f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',data=? WHERE id=?").run(JSON.stringify(data),row.id);
+  let seen;await analyzeBacklog(f,{classify,review:async({groups,learning,validate})=>{seen=learning;return validate({action:'no-change',reason:'Inspect observed receipt',groupIds:groups.map(g=>g.id)});}});
+  assert.equal(seen[0][1].result.status,expected);if(expected==='verified-device')assert.equal(seen[0][1].result.deviceEvidence.device,'npu:0');
+ });
 });
