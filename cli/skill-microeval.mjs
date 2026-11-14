@@ -58,7 +58,7 @@ export async function validateKernelReceipt(verification,cwd){
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleStopSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -176,14 +176,14 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const actorAllocation=Math.max(.001,Math.min(actorBudget-spent,allocation-Math.min(verificationSeconds,allocation/2))),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
     try{
-     observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
+     observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleStopSignal:deadline,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
      if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      observed.actorCompleted??=!actorSignal.aborted||Boolean(actorDeadline?.aborted&&!sampleSignal.aborted);
      if(verificationSeconds&&(actorDeadline?.aborted||observed.timedOut)&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
-     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:deadline,sampleSeconds:allocation}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}

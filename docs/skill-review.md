@@ -119,12 +119,13 @@ after an elapsed actor cutoff, the checker may evaluate the current kernel only
 once all execution is settled. `actorTimedOut` records this cutoff separately
 from the overall sample deadline. The reserve is frozen on resume and adds no
 sample time. Unknown commands still block advancement and replay. Native target
-adapters receive the explicit whole-sample signal as `options.stopSignal` for
-cleanup after the actor cutoff. Honor that signal instead of starting a short
+adapters receive the explicit `sampleStopSignal` allocation deadline as
+`options.stopSignal` for cleanup after the actor cutoff. Honor that signal instead of starting a short
 cleanup timer before potentially lengthy preparation; cleanup spends the remaining
 sample window and may reduce verification time. Legacy native callers without a
-whole-sample signal retain their adapter's existing cleanup policy. Unknown work
-at the whole-sample deadline remains fenced.
+`sampleStopSignal` retain their adapter's existing cleanup policy. External work
+cancellation aborts `signal` and `sampleSignal` while allowing this bounded cleanup
+handoff. Unknown work at the original allocation deadline remains fenced.
 
 For a later explicit rollout, stage `enqueue` with an explicit `learningInstance`
 imports compatible requests into an opted-in destination. It rejects review source

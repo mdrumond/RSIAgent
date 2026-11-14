@@ -271,17 +271,17 @@ test('sandboxed native Bash can edit its kernel but cannot quarantine shared har
  await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
  assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');
 });
-for(const mode of ['reserved-cleanup','whole-deadline','legacy'])test(`native target cleanup follows the retained whole-sample clock: ${mode}`,async t=>{
+for(const mode of ['reserved-cleanup','external-cancel','whole-deadline','legacy'])test(`native target cleanup follows the retained whole-sample clock: ${mode}`,async t=>{
  const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .',timeout:1200}}:null);
  const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);
- const actor=new AbortController(),allocation=new AbortController(),handle='remote:fixture:job:cleanup-'+mode;
+ const actor=new AbortController(),external=new AbortController(),allocation=new AbortController(),workSignal=AbortSignal.any([external.signal,allocation.signal]),handle='remote:fixture:job:cleanup-'+mode;
  let captured,commands=0,cleanupFinished=false;
- const result=await nativeSample({cwd,sessionDirectory,profile,seconds:3,signal:actor.signal,...(mode==='legacy'?{}:{sampleSignal:allocation.signal}),guidance:'fixture',prompt:'check',targetEnvironment:{execute:async(_command,_cwd,options)=>{
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:3,signal:AbortSignal.any([actor.signal,workSignal]),sampleSignal:workSignal,...(mode==='legacy'?{}:{sampleStopSignal:allocation.signal}),guidance:'fixture',prompt:'check',targetEnvironment:{execute:async(_command,_cwd,options)=>{
   commands++;captured=options.stopSignal;
   if(mode==='legacy')return {handle,settled:true,exitCode:0};
   if(options.stopSignal!==allocation.signal)return {handle,settled:false,exitCode:null};
   // Preparation consumed the short actor allowance before remote admission.
-  await new Promise(resolve=>setTimeout(resolve,25));actor.abort(Error('Actor elapsed cutoff'));
+  await new Promise(resolve=>setTimeout(resolve,25));if(mode==='external-cancel')external.abort(Error('External caller cancelled'));else actor.abort(Error('Actor elapsed cutoff'));
   assert.equal(options.signal.aborted,true);assert.equal(options.stopSignal.aborted,false);
   if(mode==='whole-deadline'){
    setTimeout(()=>allocation.abort(Error('Whole sample elapsed cutoff')),25);
@@ -291,5 +291,14 @@ for(const mode of ['reserved-cleanup','whole-deadline','legacy'])test(`native ta
  }}});
  assert.equal(commands,1);assert.equal(captured,mode==='legacy'?undefined:allocation.signal);
  if(mode==='whole-deadline')assert.deepEqual(result.unresolvedExecution,{handle});else assert.equal(result.unresolvedExecution,undefined);
- if(mode==='reserved-cleanup')assert.equal(cleanupFinished,true);
+ if(['reserved-cleanup','external-cancel'].includes(mode))assert.equal(cleanupFinished,true);
+});
+
+test('microeval hands cleanup the existing allocation deadline independently of external work cancellation',async t=>{
+ const f=await fixture(t),external=new AbortController();let calls=0,captured;
+ await assert.rejects(runMicroeval({...f,runs:1,signal:external.signal,resume:true},{sample:async(args)=>{
+  calls++;captured=args;external.abort(Error('User stopped experiment'));return {};
+ }}),/User stopped experiment/);assert.equal(calls,1);
+ assert.ok(captured.sampleStopSignal instanceof AbortSignal);assert.notEqual(captured.sampleStopSignal,captured.sampleSignal);
+ assert.equal(captured.signal.aborted,true);assert.equal(captured.sampleSignal.aborted,true);assert.equal(captured.sampleStopSignal.aborted,false);
 });

@@ -95,7 +95,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
     await protectedInputs();const allocation=Math.min(cap,left());
     if(allocation<=0)throw Error('Continuation elapsed allocation exhausted');
     const verifySignal=AbortSignal.any([wholeSignal,AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
-    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal,sampleSignal:wholeSignal,sampleSeconds:left()}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
+    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal,sampleSignal:wholeSignal,sampleStopSignal:deadline,sampleSeconds:left()}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
     if(value.exitCode===124||value.outcome?.kind==='timeout'||value.outcome?.reason==='elapsed-timeout')value={...value,correct:null,timedOut:true};
     if(task.kind==='a3-kernel'&&(value.correct||value.exitCode===125))value=await validateKernelReceipt(value,cwd);
     if(task.kind==='a3-kernel'&&value.correct===false){
@@ -123,7 +123,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
      }
      state.phase='actor';report.runningSample.phase=state.phase;await persist();
      const actorSeconds=left()-verificationSeconds,actorDeadline=AbortSignal.timeout(Math.max(1,Math.ceil(actorSeconds*1000))),actorSignal=AbortSignal.any([wholeSignal,actorDeadline]);
-     const observed=await (dependencies.sample??nativeSample)({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[row.arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorSeconds,verificationReserved:verificationSeconds,signal:actorSignal,sampleSignal:wholeSignal,sampleSeconds:left(),sessionDirectory:home,resumeSession:state.session});
+     const observed=await (dependencies.sample??nativeSample)({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[row.arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorSeconds,verificationReserved:verificationSeconds,signal:actorSignal,sampleSignal:wholeSignal,sampleStopSignal:deadline,sampleSeconds:left(),sessionDirectory:home,resumeSession:state.session});
      state.actorObservation=observed;state.session=observed.session??state.session;state.actorSessionTotalsIncludeOriginal=true;
      if(observed.unresolvedExecution)throw Object.assign(Error('Continuation target execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      state.actorCompleted=!signal?.aborted;state.actorTimedOut=Boolean(observed.timedOut||actorDeadline.aborted);
