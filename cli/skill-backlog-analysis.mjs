@@ -6,6 +6,7 @@ import {guidanceEntries,validateClassificationBatch,enqueueLearningRequest} from
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
 import {runProposalQa} from './skill-review-qa.mjs';
+import {proposalIdentity,groundingIdentity} from '../controller/skill-backlog.mjs';
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const load=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
 const save=async(path,value)=>{await mkdir(resolve(path,'..'),{recursive:true});const temporary=path+'.tmp';await writeFile(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);};
@@ -97,6 +98,9 @@ function queueLearning(backlog,config,item,requests){
   backlog.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(stored),id);return id;
  });
 }
+function consumeLearning(backlog,contributors){
+ for(const {item,results}of contributors){const current=backlog.get(item.id);if(current)backlog.upsert({...current,evidence:{...current.evidence,learningIdentity:learningIdentity(results)}});}
+}
 function priority(group){return Math.min(90,20+Math.min(30,group.count??group.occurrences.length)+(['execution-unresolved','project-invalid'].includes(group.type)?20:0));}
 
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
@@ -112,16 +116,17 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
  const valid=validateClassificationBatch(classifications,frozen,entries,{requireBucket:true}).classifications,byGroup=Object.fromEntries(valid.map(c=>[c.groupId,c])),created=[];
  for(const group of frozen){
   signal?.throwIfAborted();if(clock.remaining()<=0)break;
+  const learned=learningItems.filter(({item})=>item.groupIds.includes(group.id));
   const classification=byGroup[group.id],base=config.skills.activeVersion,common={groupIds:[group.id],objective:classification.bucket,skill:classification.guidanceIds,
    priority:priority(group),reason:classification.reason,base},evidence={groups:[group]},classificationContext={classifications:{[group.id]:classification}};
   if(classification.intervention==='user-required'){
    created.push(backlog.upsert({...common,key:'harness:'+group.id,proposal:{action:'no-change',reason:classification.reason},evidence,preparation:classificationContext,status:'user-required'}));
-   backlog.acknowledge(group.id,{classification,count:group.count});continue;
+   consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});continue;
   }
-  const learned=learningItems.filter(({item})=>item.groupIds.includes(group.id)),learning=await freezeLearning(config,learned.flatMap(({results})=>results),join(batch,'learning'));
+  const learning=await freezeLearning(config,learned.flatMap(({results})=>results),join(batch,'learning'));
   const proposalDirectory=join(batch,'proposals',group.id);await mkdir(proposalDirectory,{recursive:true});
   const spendFile=join(proposalDirectory,'writing-spend.json'),priorSpent=(await load(spendFile))?.elapsedSeconds??0,begun=performance.now();
-  if(priorSpent>=1800){created.push(backlog.upsert({...common,key:'analysis:'+group.id,proposal:{action:'no-change',reason:'Proposal elapsed allowance exhausted'},evidence,preparation:{...classificationContext,proposalElapsedSeconds:priorSpent},status:'inconclusive'}));backlog.acknowledge(group.id,{classification,count:group.count});continue;}
+  if(priorSpent>=1800){created.push(backlog.upsert({...common,key:'analysis:'+group.id,proposal:{action:'no-change',reason:'Proposal elapsed allowance exhausted'},evidence,preparation:{...classificationContext,proposalElapsedSeconds:priorSpent},status:'inconclusive'}));consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});continue;}
   let review;try{review=validateReviewProposal(await clock.call(ops.review,{directory:proposalDirectory,config,groups:[group],entries,classifications:[classification],learning,
    validate:value=>validateReviewProposal(value,[group],byGroup)},Math.max(.001,1800-priorSpent)),[group],byGroup);}
   finally{await save(spendFile,{elapsedSeconds:priorSpent+(performance.now()-begun)/1000});}
@@ -129,14 +134,14 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   const memoryEvidence=records.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);
   const actualRefs=new Set(memoryEvidence.map(e=>e.ref??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`));
   if(review.action==='update'&&review.memoryRefs.some(ref=>!actualRefs.has(ref)))throw Error('Update requires memory retrieved in this proposal session');
+  const proposalEvidence={...evidence,memoryEvidence,...(learned.length?{learning,learningIdentity:learningIdentity(learned.flatMap(l=>l.results))}:{})};
   if(group.type==='skill-hypothesis-rejected'&&review.action==='update'){
-   const effective=change=>JSON.stringify([change.scope,String(change.text??'').trim().replace(/\s+/g,' '),change.critical===true,change.negative===true,change.response??'actor-change']);
-   const previous=new Set(group.occurrences.flatMap(o=>o.data.previousProposal?.changes??[]).map(effective));
-   const changes=review.changes.filter(change=>!previous.has(effective(change)));
-   review=changes.length?{...review,changes}:{...review,action:'no-change',changes:[],reason:'Rejected effective instruction is unchanged; new knowledge or a substantive revision is required'};
+   const effective=change=>hash(proposalIdentity({action:'update',changes:[change]})),grounding=groundingIdentity({proposal:review,evidence:proposalEvidence});
+   const changes=review.changes.filter(change=>group.occurrences.filter(o=>o.data.previousProposal?.changes?.some(prior=>effective(prior)===effective(change)))
+    .every(o=>o.data.previousEvidence&&grounding!==groundingIdentity({proposal:o.data.previousProposal,evidence:o.data.previousEvidence})));
+   review=changes.length?{...review,changes}:{...review,action:'no-change',changes:[],reason:'Rejected instruction and factual grounding are unchanged; new knowledge or a substantive revision is required'};
   }
   const preparation={...classificationContext,proposalDirectory,proposalElapsedSeconds:(await load(spendFile)).elapsedSeconds};
-  const proposalEvidence={...evidence,memoryEvidence,...(learned.length?{learning,learningIdentity:learningIdentity(learned.flatMap(l=>l.results))}:{})};
   if(group.type==='skill-hypothesis-rejected'&&review.action==='no-change'&&!review.learningRequests?.length)
    created.push(backlog.upsert({...common,key:'feedback:'+group.id,proposal:review,evidence:proposalEvidence,preparation,status:'inconclusive',reason:review.reason}));
   if(review.action==='no-change')for(const {item}of learned)created.push(backlog.upsert({...item,proposal:review,evidence:proposalEvidence,preparation,status:'inconclusive',reason:review.reason}));
@@ -151,7 +156,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    const item=backlog.upsert({...common,key,proposal:{action:'learn',...question},evidence:proposalEvidence,preparation,status:'learning'});
    queueLearning(backlog,config,item,[question]);created.push(item);
   }
-  backlog.acknowledge(group.id,{classification,count:group.count});
+  consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});
  }
  return {analyzed:frozen.filter(g=>!backlog.failure(g.id)?.dirty).length,items:created,elapsedSeconds:clock.elapsed(),remainingSeconds:clock.remaining()};
 }
@@ -177,10 +182,10 @@ export async function prioritizeBacklog({config,backlog,directory,signal,seconds
 
 /** Prepare one candidate against the current baseline; approval admits A/B, never publication. */
 export async function prepareHypothesis({config,backlog,item,directory,signal,remainingSeconds},dependencies={}){
+ if(item.base!==config.skills.activeVersion)throw Error('Rebase and requalify hypothesis against the current active skill');
  const ops=await operations(dependencies),clock=allocation(remainingSeconds,signal),identity=hash([item.id,item.revision,item.base,item.proposal,item.evidence]);
  await mkdir(directory,{recursive:true});const file=join(directory,'preparation.json'),prior=await load(file);
  if(prior){if(prior.identity!==identity)throw Error('Hypothesis preparation inputs changed');return {...prior,recovered:true};}
- if(item.base!==config.skills.activeVersion)throw Error('Rebase and requalify hypothesis against the current active skill');
  if(item.objective==='harness')return {status:'user-required',reason:'Harness faults require user intervention'};
  const groups=item.evidence?.groups??[],classifications=item.preparation?.classifications??{},entries=await guidanceEntries(config.root,item.base);
  const validateProposal=value=>validateReviewProposal(value,groups,classifications),proposal=validateProposal(structuredClone(item.proposal));
