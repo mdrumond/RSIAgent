@@ -57,7 +57,8 @@ export async function runPrioritySkills(config,values,dependencies={}){
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
   const retained=backlog.list({status:'running',limit:1})[0];
   if(!retained){
-   if(backlog.meta('learning-seen')!==learningFingerprint(state)){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
+   const admittedLearning=learningFingerprint(state);
+   if(backlog.meta('learning-seen')!==admittedLearning){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
    // Preserve that progress and existing priorities instead of starving evaluation.
    for(const [name,operation,args]of [['analysis',ops.analyze,{directory:join(directory,'analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
@@ -66,7 +67,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
     try{await operation({config,backlog,signal:values.signal,...args});backlog.meta(name+'-error',null);}
     catch(error){values.signal?.throwIfAborted();backlog.meta(name+'-error',{at:new Date().toISOString(),message:error.message});backlog.meta(name+'-after',Date.now()+60000);}
    }
-   backlog.meta('learning-seen',learningFingerprint(state));
+   backlog.meta('learning-seen',admittedLearning);
    for(const item of backlog.list({status:'needs-review'}))backlog.revise(item.id,{status:'queued'});
   }
   values.signal?.throwIfAborted();

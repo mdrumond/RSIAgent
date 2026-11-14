@@ -8,7 +8,7 @@ import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {runPrioritySkills,prioritySkillStatus} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
 import {resolveHypothesisCases} from '../../cli/skill-priority-cases.mjs';
-import {claimLearningRequest,enqueueLearningRequest} from '../../controller/skill-review.mjs';
+import {claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
 
 async function fixture(t){
@@ -166,4 +166,17 @@ test('pending learning pages keep the background worker eligible and new finding
  f.backlog.meta('learning-scan',{ids:['already-consumed'],offset:1});f.backlog.meta('learning-seen','older findings');
  let scan;await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{scan=f.backlog.meta('learning-scan');assert.equal(f.backlog.meta('learning-pending'),true);f.backlog.meta('learning-pending',false);}});
  assert.equal(scan,null);assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
+});
+
+test('learning outcomes arriving during analysis remain visible for the next scan',async t=>{
+ const f=await fixture(t);f.backlog.meta('learning-seen','[]');
+ await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{
+  const id=enqueueLearningRequest(f.state,{target:'a3',question:'A new boundary',requiredEvidence:'Actual learning result'});
+  claimLearningRequest(f.state,f.config,{draft:'new-draft',target:'a3'});
+  recordLearningOutcome(f.state,{id:'new-project',generation:{draft:'new-draft',learningRequest:{id}}},{id:'new-attempt',outcome:'passed'});
+  f.backlog.meta('learning-pending',false);
+ }});
+ assert.equal((await prioritySkillStatus(f.config)).hasWork,true);
+ await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{assert.equal(f.backlog.meta('learning-scan'),null);f.backlog.meta('learning-pending',false);}});
+ assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
 });
