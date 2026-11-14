@@ -149,3 +149,22 @@ test('legacy pre-admission closure retains its positive prior-lease proof withou
  assert.equal(proof.payloadStarted,false);assert.deepEqual(proof.priorLeaseClosure,priorLeaseClosure);
  assert.equal(state.attempt(id).elapsed,18.5);assert.equal(state.attempt(id).session,'retained-session.jsonl');
 });
+
+for(const kind of ['download','upload'])test(`historical excluded ${kind} identity remains typed after its operation settled`,async t=>{
+ const {state,id,event}=fixture(t),handle=remote('historical','transfer');
+ event('execution-submitting',{submission:'copy',operation:'old',kind,accountingExcluded:true});
+ event('execution-submitted',{submission:'copy',handle});event('execution-handle',{handle});
+ event('execution-settled',{operation:'old'});let observations=0;
+ const closed=await operationsStopped(state,state.attempt(id),{observe:async()=>{observations++;return {state:'unknown'};}});
+ assert.equal(closed,kind==='download');assert.equal(observations,kind==='download'?0:1);
+ assert.equal(state.events(id).some(e=>e.type==='execution-state'&&e.data.state==='stopped'),false);
+});
+
+test('positive archived control custody is durable without marking its native handles stopped',async t=>{
+ const {state,id,event}=fixture(t),handle=remote('archived-control','transfer');event('execution-handle',{handle,purpose:'device-lease-control'});
+ const cleanup={id:'closed-token',closedLease:{receipt:'/owned/lease.json',token:'closed-token'}};
+ assert.equal(await operationsStopped(state,state.attempt(id),{cleanupCustody:async()=>[{cleanup,handles:[handle]}],
+  observe:()=>assert.fail('closed-token control must leave payload fence')}),true);
+ assert.equal(state.events(id).some(e=>e.type==='execution-state'),false);
+ assert.deepEqual(state.events(id).find(e=>e.type==='execution-cleanup-custody').data.cleanup,cleanup);
+});

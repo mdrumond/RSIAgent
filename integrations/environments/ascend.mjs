@@ -410,12 +410,18 @@ export async function createEnvironment(options, context) {
   }
   // Logical settlement may transfer cleanup ownership; it never releases a
   // physical reservation or invents a terminal artifact-transfer observation.
-  async function retainBackgroundCustody(){
+  async function retainBackgroundCustody(events){
     if(!asyncCleanup)return null;
     let retained;try{retained=await readJson(leasePath);}catch(error){if(error.code==='ENOENT')return null;throw error;}
     if(await closedDeviceLease(retained.receipt,retained.token))return null;
     let record;try{record=await readJson(retained.receipt);}catch(error){if(error.code!=='ENOENT')throw error;}
     if(record?.token===retained.token)return deferClosedLease();
+    const acquired=events.find(e=>e.type==='device-lease-acquired'&&e.data.token===retained.token)?.data;
+    const payload=events.find(e=>e.type==='execution-submitting'&&e.data.operation===acquired?.operation&&
+      e.data.kind==='run'&&e.data.accountingExcluded===false&&e.data.purpose!=='device-lease-control');
+    const handle=payload&&events.find(e=>e.type==='execution-submitted'&&e.data.submission===payload.data.submission)?.data.handle;
+    if(!handle||!events.some(e=>e.type==='execution-state'&&e.data.handle===handle&&e.data.state==='stopped'&&
+      ['completed','failed','cancelled'].includes(e.data.nativeState)))return null;
     // The old physical row has changed ownership. Preserve its exact-token
     // obligation in the queue without touching the newer owner's row.
     const pointer=join(context.instancePath,'.device-cleanup',retained.token+'.json');
@@ -639,11 +645,26 @@ export async function createEnvironment(options, context) {
       if(result.state==='stopped'&&!commandActive&&!await deferClosedLease())await reconcileLease();
       return result;
     },
+    async cleanupCustody({events}){
+      const proofs=[];
+      for(const {data}of events.filter(e=>e.type==='device-lease-acquired')){
+        if(typeof data.receipt!=='string'||typeof data.token!=='string')continue;
+        const closed=await closedDeviceLease(data.receipt,data.token);
+        if(!closed)continue;
+        const handles=[...new Set(events.filter(e=>e.type==='execution-handle'&&
+          e.data.purpose==='device-lease-control'&&closed.handles?.includes(e.data.handle)).map(e=>e.data.handle))];
+        if(handles.length)proofs.push({cleanup:{id:data.token,closedLease:{receipt:data.receipt,token:data.token}},handles});
+      }
+      return proofs;
+    },
     async reconcileOperation(operation){
       const controls=operation.events.filter(e=>e.data.purpose==='device-lease-control'&&
         (e.data.operation===operation.operation||e.data.submission===operation.operation));
+      const submissions=operation.events.filter(e=>e.type==='execution-submitting'&&
+        (e.data.operation===operation.operation||e.data.submission===operation.operation));
+      const controlOnly=submissions.length>0&&submissions.every(e=>e.data.purpose==='device-lease-control');
       const result=await blockedBeforePayload(operation)??await environment.reconcileOperation({...operation,
-        events:operation.events.filter(e=>e.data.purpose!=='device-lease-control')});
+        events:controlOnly?operation.events:operation.events.filter(e=>e.data.purpose!=='device-lease-control')});
       if(result.wrapperClosures?.length){
         try{
           const retained=await readJson(leasePath),lease=await openDeviceLease(retained.receipt,retained.token);
@@ -652,8 +673,8 @@ export async function createEnvironment(options, context) {
         }catch(error){if(error.code!=='ENOENT')throw error;}
       }
       if(!result.closed)return result;
-      const cleanup=!commandActive?await retainBackgroundCustody():null;
-      if(!cleanup&&controls.some(e=>e.type==='execution-submitting')){
+      const cleanup=!commandActive?await retainBackgroundCustody(operation.events):null;
+      if(!cleanup&&!controlOnly&&controls.some(e=>e.type==='execution-submitting')){
         const controlProof=await environment.reconcileOperation({...operation,events:operation.events.filter(e=>
           e.data.purpose==='device-lease-control'||['execution-submitted','execution-not-admitted','execution-state'].includes(e.type))});
         if(!controlProof.closed)return {...result,closed:false};

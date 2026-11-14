@@ -777,10 +777,12 @@ export async function createEnvironment(options, context) {
       if (response?.type === 'execution-not-admitted' || (response?.data.closed && data.accountingExcluded)) continue;
       let handle = response?.data.handle;
       if (!handle && data.receiptFile) try { handle = (await json(data.receiptFile)).handle; } catch { /* no identity is not closure */ }
+      if(data.kind==='download'&&data.accountingExcluded===true){
+        if(handle)check(handle);
+        if(!handle||!excluded.get(handle))unresolvedArtifacts.push({...data,...(handle?{handle}:{})});
+        continue;
+      }
       if (!handle) {
-        if(data.kind==='download'&&data.accountingExcluded===true){
-          unresolvedArtifacts.push({...data});continue;
-        }
         const proof=await wrapperClosure(data);
         if(proof){wrapperClosures.push({...proof,submission:data.submission});executionSeconds+=proof.executionSeconds;accounted=true;continue;}
         closed=false;accountingUnresolved=true;

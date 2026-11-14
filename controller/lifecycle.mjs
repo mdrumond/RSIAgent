@@ -67,6 +67,9 @@ export async function operationsStopped(state,attempt,environment) {
     for(const handle of proof.handles??[])state.event(attempt.id,'execution-handle',{operation,handle});
   }
   events=destinationExecutionEvents(state.events(attempt.id));
+  if(environment.cleanupCustody)for(const custody of await environment.cleanupCustody({events})){
+    state.event(attempt.id,'execution-cleanup-custody',custody);events.push({type:'execution-cleanup-custody',data:custody});
+  }
   const closedThrough=new Map();
   for(const [index,{type,data}] of events.entries()) {
     const operation=data.operation??data.submission;
@@ -82,9 +85,16 @@ export async function operationsStopped(state,attempt,environment) {
   const terminal=terminalExecutionProofs(events);
   const deferred=new Set(events.filter(e=>e.type==='execution-cleanup-custody'&&e.data.cleanup?.id)
     .flatMap(e=>e.data.handles??[]));
+  const artifactSubmissions=new Set(events.filter(e=>e.type==='execution-submitting'&&
+    e.data.kind==='download'&&e.data.accountingExcluded===true).map(e=>e.data.submission));
+  const artifactHandles=new Set(events.filter(e=>e.type==='execution-cleanup-custody')
+    .flatMap(e=>e.data.unresolvedArtifacts??[]).filter(row=>row.kind==='download'&&row.accountingExcluded===true)
+    .map(row=>row.handle).filter(Boolean));
+  for(const e of events)if(e.type==='execution-submitted'&&artifactSubmissions.has(e.data.submission)&&e.data.handle)
+    artifactHandles.add(e.data.handle);
   for (const handle of handles) {
     if (!handle) return false;
-    if(deferred.has(handle))continue;
+    if(deferred.has(handle)||artifactHandles.has(handle))continue;
     const proof=terminal.get(handle) ?? excluded.get(handle) ?? await environment.observe(handle,{accountingExcluded:excluded.has(handle)});
     if (proof.state !== 'stopped') return false;
     // Retain progress even when the next observation exceeds this scan's window.
