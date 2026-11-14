@@ -25,6 +25,7 @@ export async function prioritySkillStatus(config){
    active=backlog.list({status:'running',limit:1})[0],run=active&&backlog.run(active.id);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
   return {...status,pending:Boolean(active),resource:run?.checkpoint?.resource,unresolved:Boolean(run?.checkpoint?.unresolved),
+   analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
@@ -54,8 +55,14 @@ export async function runPrioritySkills(config,values,dependencies={}){
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
   const retained=backlog.list({status:'running',limit:1})[0];
   if(!retained){
-   await ops.analyze({config,backlog,directory:join(directory,'analysis'),signal:values.signal,seconds:Math.min(120,remainingCampaign()),limit:10});
-   await ops.prioritize({config,backlog,directory:join(directory,'ranking'),signal:values.signal,seconds:Math.min(60,remainingCampaign())});
+   // A bounded analysis can produce useful items before its last group times out.
+   // Preserve that progress and existing priorities instead of starving evaluation.
+   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:join(directory,'analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
+    ['ranking',ops.prioritize,{directory:join(directory,'ranking'),seconds:Math.min(60,remainingCampaign())}]]){
+    if((backlog.meta(name+'-after')??0)>Date.now())continue;
+    try{await operation({config,backlog,signal:values.signal,...args});backlog.meta(name+'-error',null);}
+    catch(error){values.signal?.throwIfAborted();backlog.meta(name+'-error',{at:new Date().toISOString(),message:error.message});backlog.meta(name+'-after',Date.now()+60000);}
+   }
    backlog.meta('learning-seen',learningFingerprint(state));
    for(const item of backlog.list({status:'needs-review'}))backlog.revise(item.id,{status:'queued'});
   }

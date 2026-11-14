@@ -42,6 +42,12 @@ test('new urgent item waits for the running comparison then goes first',async t=
  release();await running;await runPrioritySkills(f.config,f.values,f.ops);
  assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),['running','urgent']);
 });
+test('partial analysis and ranking timeouts preserve ready work and expose diagnostics',async t=>{
+ const f=await fixture(t);f.add('ready',20);
+ await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{f.add('new-ready',90);throw Error('Analysis elapsed');},prioritize:async()=>{throw Error('Ranking elapsed');}});
+ assert.equal(f.backlog.get('new-ready').status,'rejected');assert.equal(f.backlog.get('ready').status,'queued');
+ const status=await prioritySkillStatus(f.config);assert.equal(status.analysisError.message,'Analysis elapsed');assert.equal(status.rankingError.message,'Ranking elapsed');
+});
 test('operator pause retains comparison identity, preparation and spent allowance',async t=>{
  const f=await fixture(t),item=f.add('resume',1,{preparation:{proposalElapsedSeconds:12}}),abort=new AbortController();
  await assert.rejects(runPrioritySkills(f.config,{...f.values,signal:abort.signal},{...f.ops,evaluate:async()=>{abort.abort(Error('operator pause'));throw abort.signal.reason;}}),/operator pause/);
