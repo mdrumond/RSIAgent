@@ -44,7 +44,20 @@ export function evaluationSettings(evaluations,objective){
  const value=evaluations?.[objective];
  if(!value||!Array.isArray(value.tasks)||value.tasks.length!==5||new Set(value.tasks.map(t=>t.id)).size!==5||
   !value.binding||typeof value.binding!=='object'||!Object.keys(value.binding).length)throw Error('Five frozen tasks and a registered runtime binding required for '+objective);
- for(const task of value.tasks)if(task.bucket!==objective||task.kind!=='a3-kernel'||!task.files?.['kernel.py']||!task.checker||!task.prompt||objective==='optimization'&&!task.pairedChecker)throw Error('Runnable objective-matched A3 tasks required');
+ const target=value.binding.product??(['cpu','a3','a5'].includes(value.binding.target)?value.binding.target:
+  value.tasks.every(task=>task.kind==='a3-kernel')?'a3':null); // Preserve legacy A3 registry-name bindings.
+ if(!['cpu','a3','a5'].includes(target))throw Error('Explicit CPU/A3/A5 evaluation target required');
+ if(target!=='cpu'){
+  const environment=value.binding.environment;
+  if(environment&&(!['local','cpl'].includes(environment.mode)||!environment.target||!environment.runtime||environment.health?.product!==target))throw Error('Registered runtime product differs from evaluation target');
+ }
+ for(const task of value.tasks){
+  const product=task.target??(task.kind==='a3-kernel'?'a3':task.kind==='hypothesis-case'?'cpu':null);
+  if(task.bucket!==objective||product!==target||!task.files?.['kernel.py']||!task.checker||!task.prompt||
+   (target==='cpu'?(task.kind!=='hypothesis-case'||objective!=='correctness'):!['a3-kernel','target-kernel'].includes(task.kind))||
+   objective==='optimization'&&!task.pairedChecker)throw Error('Runnable objective-matched tasks must match their runtime target');
+ }
+
  const developmentSeconds=value.developmentSeconds??3600,pairedSeconds=objective==='optimization'?(value.pairedSeconds??900):0;
  if(value.verificationSeconds!==undefined&&(!Number.isFinite(value.verificationSeconds)||value.verificationSeconds<0||value.verificationSeconds>=180))throw Error('Verification reserve must fit inside the sample elapsed allocation');
  if(!Number.isFinite(developmentSeconds)||developmentSeconds<=0||!Number.isFinite(pairedSeconds)||pairedSeconds<0||objective==='optimization'&&pairedSeconds===0)throw Error('Positive elapsed evaluation allocations required');

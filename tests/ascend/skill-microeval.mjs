@@ -344,3 +344,12 @@ test('resumed elapsed cleanup spend cannot create another work or cleanup turn',
  assert.equal(admitted.length,1);assert.ok(admitted[0].endsWith('0-candidate/work'));
  const row=report.results.find(row=>row.arm==='active');assert.equal(row.elapsedSeconds,1.2);assert.equal(row.timedOut,true);assert.equal(row.correct,false);
 });
+
+test('native target-local Bash uses admitted environment instead of an unmasked host process',async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'bash',args:{command:'printf bypass > host-marker'}}:null);
+ const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session'),cleanup=new AbortController();await mkdir(cwd);await mkdir(sessionDirectory);let calls=0;
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,sampleStopSignal:cleanup.signal,guidance:'fixture',prompt:'check',targetBash:true,targetEnvironment:{execute:async(command,path,options)=>{
+  calls++;assert.equal(command,'printf bypass > host-marker');assert.equal(path,cwd);assert.equal(options.stopSignal,cleanup.signal);options.onData?.(Buffer.from('admitted target execution\n'));return {handle:'local:admitted',settled:true,exitCode:0};
+ }}});
+ assert.equal(result.error,null);assert.equal(calls,1);await assert.rejects(readFile(join(cwd,'host-marker')),{code:'ENOENT'});
+});
