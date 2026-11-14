@@ -19,7 +19,7 @@ async function fixture(t){
 test('ingests every failure source without admitting negative controls or explicit operator pauses',async t=>{
  const{state,b,event,attempt}=await fixture(t);
  attempt('p1','phase1','failed');attempt('p2','phase2','passed');attempt('paused','phase1','failed');
- event('verification',{correct:false,reason:'Invalid ragged store'},'p2');
+ event('verification',{correct:false,reason:'Invalid ragged store',expected_exit:0,exitCode:0},'p2');
  event('attempt-error',{message:'Interrupted',reason:'operator-pause'},'paused');
  event('generation-rejected',{expected_exit:1,exitCode:1});
  state.db.exec('CREATE TABLE generation_events(sequence INTEGER PRIMARY KEY,draft TEXT,type TEXT,data TEXT,created TEXT);CREATE TABLE generation_drafts(id TEXT PRIMARY KEY,data TEXT);');

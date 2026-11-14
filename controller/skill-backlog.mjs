@@ -21,7 +21,7 @@ const negative=data=>data&&typeof data==='object'&&(data.passed===false||data.co
  ['correctness','performance','verification','verdict','result'].some(k=>negative(data[k])));
 function failure(type,data){
  const actual=data.exitCode??data.exit_code,expected=data.expected_exit;
- if(data.operator===true||data.operatorRequested===true||['operator-pause','operator-stop'].includes(data.reason)||expected!==undefined&&actual===expected)return false;
+ if(data.operator===true||data.operatorRequested===true||['operator-pause','operator-stop'].includes(data.reason)||expected!==undefined&&expected!==0&&actual===expected)return false;
  return negative(data)||actual!==undefined&&expected!==undefined&&actual!==expected||
   /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid','generation-invalid','generation-exhausted'].includes(type)||type==='verification'&&actual>0;
 }
