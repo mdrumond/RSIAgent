@@ -176,3 +176,18 @@ test('A5 learning requires an explicit matching NPU receipt, not a passing CPU l
   assert.equal(seen[0][1].result.status,expected);if(expected==='verified-device')assert.equal(seen[0][1].result.deviceEvidence.device,'npu:0');
  });
 });
+
+
+test('rejected comparison feedback cannot enqueue an unchanged effective instruction under a new ID',async t=>{
+ for(const revised of [false,true])await t.test(revised?'substantive revision':'metadata-only revision',async t=>{
+  const f=await fixture(t);await analyzeBacklog(f,{classify,review:review()});
+  const claim=f.backlog.claim({base:'baseline'});f.backlog.finish(claim.run.id,{status:'rejected',result:{reason:'Correctness regression'}});
+  const previous={...claim.item.proposal,changes:[{...claim.item.proposal.changes[0],text:'Mask only the final partial tile.'}]};
+  f.state.event(null,'skill-hypothesis-rejected',{hypothesisId:claim.item.id,groupIds:claim.item.groupIds,previousProposal:previous,objective:'correctness',reason:'Candidate failed a tail case',diagnostics:[{case:'tail',active:true,candidate:false}]});f.backlog.ingest();
+  const result=await analyzeBacklog(f,{classify,review:async input=>{
+   const proposal=await review(['different-id'])(input);proposal.changes[0].text=revised?'Mask both the final partial tile and its load.':'  Mask only  the final partial tile.  ';proposal.reason='Different explanation';return proposal;
+  }});
+  if(revised){assert.equal(result.items[0].status,'queued');assert.equal(f.backlog.claim({base:'baseline'}).item.id,result.items[0].id);}
+  else{assert.equal(result.items[0].proposal.action,'no-change');assert.equal(result.items[0].status,'inconclusive');assert.equal(f.backlog.claim({base:'baseline'}),null);}
+ });
+});

@@ -129,8 +129,16 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   const memoryEvidence=records.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);
   const actualRefs=new Set(memoryEvidence.map(e=>e.ref??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`));
   if(review.action==='update'&&review.memoryRefs.some(ref=>!actualRefs.has(ref)))throw Error('Update requires memory retrieved in this proposal session');
+  if(group.type==='skill-hypothesis-rejected'&&review.action==='update'){
+   const effective=change=>JSON.stringify([change.scope,String(change.text??'').trim().replace(/\s+/g,' '),change.critical===true,change.negative===true,change.response??'actor-change']);
+   const previous=new Set(group.occurrences.flatMap(o=>o.data.previousProposal?.changes??[]).map(effective));
+   const changes=review.changes.filter(change=>!previous.has(effective(change)));
+   review=changes.length?{...review,changes}:{...review,action:'no-change',changes:[],reason:'Rejected effective instruction is unchanged; new knowledge or a substantive revision is required'};
+  }
   const preparation={...classificationContext,proposalDirectory,proposalElapsedSeconds:(await load(spendFile)).elapsedSeconds};
   const proposalEvidence={...evidence,memoryEvidence,...(learned.length?{learning,learningIdentity:learningIdentity(learned.flatMap(l=>l.results))}:{})};
+  if(group.type==='skill-hypothesis-rejected'&&review.action==='no-change'&&!review.learningRequests?.length)
+   created.push(backlog.upsert({...common,key:'feedback:'+group.id,proposal:review,evidence:proposalEvidence,preparation,status:'inconclusive',reason:review.reason}));
   if(review.action==='no-change')for(const {item}of learned)created.push(backlog.upsert({...item,proposal:review,evidence:proposalEvidence,preparation,status:'inconclusive',reason:review.reason}));
   if(review.action==='update')for(const [index,change]of review.changes.entries()){
    const proposal={...review,changes:[change]},priorLearning=learned[index]?.item;
