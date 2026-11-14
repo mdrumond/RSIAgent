@@ -43,7 +43,7 @@ function resumesCampaign(ctl) {
 }
 async function environment(config,path,event,exclude,resource,signal) {
   const module=await import(pathToFileURL(resolve(config.root,config.environment.module)));
-  return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal});
+  return module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{instancePath:path,event,exclude,resource,signal,campaignRoot:config.root});
 }
 export async function instanceStopped(config) {
   const state=stateFor(config.root),ctl=control(state);
@@ -53,6 +53,7 @@ export async function instanceStopped(config) {
     }
     for(const row of state.db.prepare('SELECT owner FROM attempts').all())
       if(!await ownerStopped(row.owner))return false;
+    if(await (await import('../integrations/environments/device-cleanup.mjs')).campaignCleanupPending(config.root))return false;
     if(ctl.get('skill-background-resource') &&
       !await (await import('./skill-background.mjs')).backgroundSkillsSettled(config))return false;
     return true;

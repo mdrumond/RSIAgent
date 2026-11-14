@@ -216,6 +216,8 @@ export async function upgrade(root,machinery) {
   const staged=join(root,'machinery-next-'+randomUUID());
   async function stoppedOwners() {
     await assertPackAvailable(ledger);
+    if(await (await import('../integrations/environments/device-cleanup.mjs')).campaignCleanupPending(root))
+      throw new Error('Stop active device cleanup writers before upgrading');
     if(ledger.db.prepare("SELECT 1 FROM sqlite_master WHERE name='control'").get()) {
       for(const row of ledger.db.prepare("SELECT value FROM control WHERE key IN ('owner','skill-writer','supervisor-owner')").all()) {
         const owner=JSON.parse(row.value);
@@ -240,7 +242,7 @@ export async function upgrade(root,machinery) {
     const module=pending.length?await import(pathToFileURL(plugin)):null;
     for(const attempt of pending) {
       const environment=await module.createEnvironment({...config.environment.options,localExecution:config.local_execution},{
-        instancePath:join(root,'attempts',attempt.id),event:async()=>{},exclude:async(_label,fn)=>fn()});
+        instancePath:join(root,'attempts',attempt.id),activateCleanup:false,event:async()=>{},exclude:async(_label,fn)=>fn()});
       const safe=environment.canUpgrade
         ? await environment.canUpgrade({attempt,events:ledger.events(attempt.id)})
         : await attemptStopped(ledger,attempt,environment);

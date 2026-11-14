@@ -13,6 +13,7 @@ import { State } from '../../controller/state.mjs';
 import { ActorClock } from '../../controller/budget.mjs';
 import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs';
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
+import {queueDeviceCleanup,drainDeviceCleanup,cleanupStatus,cleanupDirectory} from '../../integrations/environments/device-cleanup.mjs';
 import {reserveDevice,closedDeviceLease,closeDeviceLease} from '../../integrations/environments/device-leases.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
@@ -87,7 +88,7 @@ print(outputs[query])
   };
   const context = { instancePath, leaseDirectory: join(instancePath,'leases'), client, sdk: { createLocalBashOperations: () => ({}) },
     event: async (type,data) => events.push({ type,...data }), exclude: async (_,fn) => fn() };
-  const options = { mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
+  const options = { asyncCleanup:false,mode: 'cpl', target: 'fixture', runtime: 'registered', instructionFile,
     workspacePath: instancePath, remoteDirectory: 'owned', pollMs: 0, probeSeconds: 3,
     health: { product: 'a5', chip: null, query_timeout_seconds: .1, ...health } };
   const environment = await createEnvironment(options, context);
@@ -1041,7 +1042,7 @@ test('probe cutoff during its submission journal prevents dispatch with positive
 for(const cleanup of ['closed','unknown','body-cutoff'])test(`cancelled payload without admission reconciles its exact token before settling: ${cleanup}`,async t=>{
  const f=await fixture(t),body=new AbortController();f.setEnabled([0]);f.setReleaseProof(true);let payloads=0,controls=0;
  const cancelled='remote:fixture:job:cancelled-before-admission',control='remote:fixture:job:unknown-cleanup';
- const environment=await createEnvironment({...f.options,probeObservationSeconds:.15},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(2000),client:async(args,settings)=>{
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:2},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(5000),client:async(args,settings)=>{
   if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
    const script=await readFile(args[args.indexOf('--file')+1],'utf8'),config=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'")),inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
    if(inner.source){payloads++;if(payloads===1){if(cleanup==='body-cutoff')body.abort();return {state:'queued',handle:cancelled};}}
@@ -1060,4 +1061,43 @@ for(const cleanup of ['closed','unknown','body-cutoff'])test(`cancelled payload 
   if(cleanup==='body-cutoff'){await assert.rejects(environment.execute('true',f.source,{timeout:10}));assert.equal(payloads,1);}
   else{const next=await environment.execute('true',f.source,{timeout:10});assert.equal(next.settled,true);assert.equal(payloads,2);}
  }else{assert.equal(await environment.reconcileLease(),false);assert.equal(payloads,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);}
+});
+
+test('async cleanup returns known payloads and admits other free devices before token cleanup finishes',async t=>{
+ const f=await fixture(t);f.setEnabled([0,1]);delete f.rows[1].status;await f.update();let ticket,launches=0;
+ const lifecycle=[];const context={...f.context,event:async(type,data)=>{lifecycle.push({type,data:{...data,operation:'actor-target-op'}});await f.context.event(type,data);},cleanupLaunch:async(_directory,key)=>{launches++;ticket=key;return processIdentity();}};
+ const options={...f.options,probeObservationSeconds:3};delete options.asyncCleanup;
+ const environment=await createEnvironment(options,context);
+ await environment.prepare({project:{source:f.source},attempt:{id:'async-actor'}});
+ const first=await environment.execute('true',f.source,{timeout:10});assert.equal(first.settled,true);assert.ok(first.cleanupPending);
+ const second=await environment.execute('true',f.source,{timeout:10});assert.equal(second.settled,true);assert.ok(second.cleanupPending);
+ assert.deepEqual(f.commands.map(command=>command.devices),[[0],[1]]);assert.equal(launches,1);
+ assert.equal(f.events.filter(event=>event.type==='execution-submitting'&&event.purpose==='device-lease-control').length,0);
+ lifecycle.push({type:'execution-settled',data:{operation:'actor-target-op'}});
+ const {operationsStopped}=await import('../../controller/lifecycle.mjs');
+ assert.equal(await operationsStopped({events:()=>lifecycle,queryEvents:()=>[],checkpoint:()=>{}},{id:'actor',elapsed:0},environment),true);
+ const directory=cleanupDirectory(context),pending=await cleanupStatus(directory);assert.equal(pending.length,2);assert.ok(pending.every(row=>row.status==='queued'));
+ const newer={token:'next-command-token',receipt:'next-command-receipt'};await writeFile(join(f.context.instancePath,'.ascend-command-lease.json'),JSON.stringify(newer));
+ let release;const held=new Promise(resolve=>{release=resolve;});let started=0;
+ const draining=drainDeviceCleanup(directory,ticket,{run:async(request,signal)=>{
+  started++;await held;
+  const cleanup=await createEnvironment({...f.options,asyncCleanup:false},{...f.context,cleanupLeasePath:request.pointer,signal,stopSignal:signal,event:async(type,data)=>writeFile(request.journal,JSON.stringify({type,data})+'\n',{flag:'a'})});
+  return cleanup.reconcileLease();
+ }});
+ while(started<2)await delay(5);assert.equal((await cleanupStatus(directory)).filter(row=>row.status==='running').length,2);release();await draining;
+ assert.ok((await cleanupStatus(directory)).every(row=>row.status==='closed'));assert.deepEqual(JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8')),newer);
+ for(const row of pending)assert.ok(await closedDeviceLease(row.request.receipt,row.request.token));
+});
+test('async cleanup never converts an unknown payload into a queued closed command',async t=>{
+ const f=await fixture(t);f.setEnabled([0]);const payloads=new Set();let launches=0;
+ const context={...f.context,cleanupLaunch:async()=>{launches++;return processIdentity();},client:async(args,settings)=>{
+  if(args[0]==='observe'&&payloads.has(args[1]))return {state:'running'};
+  const result=await f.context.client(args,settings);
+  if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh'))payloads.add(result.handle);
+  return result;
+ }};
+ const environment=await createEnvironment({...f.options,asyncCleanup:true},context);await environment.prepare({project:{source:f.source},attempt:{id:'unknown-async'}});
+ const result=await environment.execute('true',f.source,{timeout:.02,stopSignal:AbortSignal.timeout(700)});
+ assert.equal(result.settled,false);assert.equal(result.cleanupPending,undefined);assert.equal(launches,0);assert.deepEqual(await cleanupStatus(cleanupDirectory(context)),[]);
+ assert.ok(JSON.parse(await readFile(join(f.context.instancePath,'.ascend-command-lease.json'),'utf8')).token);
 });

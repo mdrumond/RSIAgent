@@ -99,6 +99,25 @@ function changeLease(receipt,change) {
   });
 }
 
+export async function retainCleanupLease(receipt,token,cleanup){
+ let before;try{before=JSON.parse(await readFile(receipt,'utf8'));}catch(error){if(error.code==='ENOENT')return false;throw error;}
+ if(before.token!==token||before.reconciliation&&!await ownerStopped(before.reconciliation.owner))return false;
+ return changeLease(receipt,record=>{
+  if(JSON.stringify(record)!==JSON.stringify(before))return false;
+  record.cleanup=cleanup;return true;
+ });
+}
+// A durable cleanup job may take custody of its own known-closed payload lease.
+// The atomic comparison excludes a concurrent public recovery claim.
+export async function claimCleanupLease(receipt,token,owner){
+ let before;try{before=JSON.parse(await readFile(receipt,'utf8'));}catch(error){if(error.code==='ENOENT')return false;throw error;}
+ if(before.token!==token||before.cleanup?.id!==token)return false;
+ if(before.reconciliation&&!await ownerStopped(before.reconciliation.owner))return false;
+ return changeLease(receipt,record=>{
+  if(JSON.stringify(record)!==JSON.stringify(before))return false;
+  record.payloadOwner??=record.owner;record.owner=owner;return true;
+ });
+}
 // Closure and fencing are separate proofs. Callers may supply an independently
 // retained owner-closure proof for legacy records without owner metadata.
 export async function reconcileDeviceLease(receipt,{stopped=ownerStopped,observe,reconcileHost}={}) {
