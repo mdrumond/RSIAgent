@@ -617,3 +617,32 @@ test('resumed minimum guard tolerates old wait telemetry until acknowledgement, 
   assert.ok(f.controls.some(control=>control.limit===2&&!control.blocked));
   assert.equal(f.controls.at(-1).limit,1);assert.equal(f.controls.at(-1).blocked,true);
 });
+
+test('running low-memory recovery restores foreground admissions while keeping the A/B slot reserved',async()=>{
+ const {selectAdmission}=await import('../../controller/dispatch.mjs');
+ const running={...fresh(),operation:'campaign',attempts:2,budget:{cycle:'retained',elapsed:123},
+  status:{controller:{state:'running'},progress:{done:false}}};
+ const f=fixture([running]);f.config.concurrency=4;
+ f.config.local_memory={lowBytes:20,softBytes:24,checkpointBytes:28,hardBytes:32,pollMs:2,reduceMs:30,highMs:120,coolMs:6};
+ f.deps.load=async()=>({sourceRevision:'frozen-source',owner:{boot:'boot'},state:'running',memory:{limit:2}});
+ const admissions=[];let limit=2;
+ f.deps.snapshot=async()=>({...running,status:{...running.status,progress:{done:limit===4}}});
+ f.deps.memorySample=async()=>({rssBytes:10,processCount:1});
+ f.deps.memoryControl=async(_config,memory)=>{
+  limit=memory.limit;const workers=[{kind:'background'}],jobs=[{kind:'original'}];let next;
+  while((next=selectAdmission(jobs,{running:workers,concurrency:limit})))workers.push(next);
+  admissions.push(workers.filter(w=>w.kind==='original').length);
+ };
+ assert.equal((await superviseCampaign(options(),f.deps)).reason,'complete');
+ assert.deepEqual([...new Set(admissions)],[1,2,3]);assert.equal(f.config.concurrency,4);
+ assert.equal(running.budget.elapsed,123);assert.deepEqual(f.calls.map(c=>c[0]),['pause']);
+});
+
+test('unknown owned-memory samples clear recovery timing and block admissions',async()=>{
+ const f=memoryFixture({prior:{limit:2,lowSince:-1000}});let clock=0;
+ f.deps.now=()=>clock;f.deps.wait=async()=>{clock+=600000;};
+ f.deps.memorySample=async()=>{throw Error('owned RSS unavailable');};
+ assert.equal((await superviseCampaign(options(),f.deps)).reason,'infrastructure-or-ownership');
+ assert.ok(f.controls.slice(1).every(c=>c.blocked&&c.lowSince===null&&c.limit===2));
+ assert.ok(f.controls.length>1);
+});

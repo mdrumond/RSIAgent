@@ -206,7 +206,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
           }
           let measured;
           try{measured=await memorySample(config,owner,{known});}
-          catch(error){memory={...memory,limit:memory?.limit??Number(current.concurrency??4),blocked:true};await memoryControl(config,memory);throw error;}
+          catch(error){memory={...memory,limit:Math.min(memory?.limit??Number(current.concurrency??4),Number(current.concurrency??4)),lowSince:null,blocked:true};await memoryControl(config,memory);throw error;}
           if(recheckMinimum&&!view.paused&&status.controller?.state==='running'&&
               measured.processCount>0&&measured.rssBytes<settings.lowBytes&&Number(current.concurrency??4)>=2) {
             // Retain one background slot and permit one foreground worker,
@@ -214,7 +214,7 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
             memory={...memory,limit:2,recovered:true};
             recheckMinimum=false;minimumRecoveryPending=true;
           }
-          memory={...memoryDecision(memory,{rssBytes:measured.rssBytes,now:now(),maximum:Number(current.concurrency??4)},settings),...measured};
+          memory={...memoryDecision(memory,{rssBytes:measured.rssBytes,processCount:measured.processCount,now:now(),maximum:Number(current.concurrency??4)},settings),...measured};
           if(minimumWait&&!(minimumRecoveryPending&&memory.limit>1&&memory.action==='run')&&memory.action!=='emergency') {
             memory={...memory,limit:1,blocked:true};await memoryControl(config,memory);
             return await pause('memory-at-minimum');
