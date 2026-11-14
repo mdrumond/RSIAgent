@@ -58,7 +58,7 @@ export async function validateKernelReceipt(verification,cwd){
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -84,7 +84,8 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   if(targetEnvironment){
    const [target]=await createEnvironmentTools({execute:async(command,path,options)=>{
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
-    const operation=targetEnvironment.execute(command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+    // Cleanup may spend the remaining verification reserve, never a fresh clock.
+    const operation=targetEnvironment.execute(command,path,{...options,signal:merged,...(allocationSignal?{stopSignal:allocationSignal}:{}),timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
     try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
     catch(error){const unknown=unknownExecution(error);if(unknown){unresolvedExecution=unknown;interrupt(error);}throw error;}finally{pending.delete(operation);}
    }},cwd,sdk);pi.registerTool(target);

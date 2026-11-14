@@ -271,3 +271,25 @@ test('sandboxed native Bash can edit its kernel but cannot quarantine shared har
  await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
  assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');
 });
+for(const mode of ['reserved-cleanup','whole-deadline','legacy'])test(`native target cleanup follows the retained whole-sample clock: ${mode}`,async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .',timeout:1200}}:null);
+ const cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');await mkdir(cwd);await mkdir(sessionDirectory);
+ const actor=new AbortController(),allocation=new AbortController(),handle='remote:fixture:job:cleanup-'+mode;
+ let captured,commands=0,cleanupFinished=false;
+ const result=await nativeSample({cwd,sessionDirectory,profile,seconds:3,signal:actor.signal,...(mode==='legacy'?{}:{sampleSignal:allocation.signal}),guidance:'fixture',prompt:'check',targetEnvironment:{execute:async(_command,_cwd,options)=>{
+  commands++;captured=options.stopSignal;
+  if(mode==='legacy')return {handle,settled:true,exitCode:0};
+  if(options.stopSignal!==allocation.signal)return {handle,settled:false,exitCode:null};
+  // Preparation consumed the short actor allowance before remote admission.
+  await new Promise(resolve=>setTimeout(resolve,25));actor.abort(Error('Actor elapsed cutoff'));
+  assert.equal(options.signal.aborted,true);assert.equal(options.stopSignal.aborted,false);
+  if(mode==='whole-deadline'){
+   setTimeout(()=>allocation.abort(Error('Whole sample elapsed cutoff')),25);
+   await untilAbort(options.stopSignal);return {handle,settled:false,exitCode:null};
+  }
+  await new Promise(resolve=>setTimeout(resolve,60));assert.equal(options.stopSignal.aborted,false);cleanupFinished=true;return {handle,settled:true,exitCode:124};
+ }}});
+ assert.equal(commands,1);assert.equal(captured,mode==='legacy'?undefined:allocation.signal);
+ if(mode==='whole-deadline')assert.deepEqual(result.unresolvedExecution,{handle});else assert.equal(result.unresolvedExecution,undefined);
+ if(mode==='reserved-cleanup')assert.equal(cleanupFinished,true);
+});
