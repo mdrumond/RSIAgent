@@ -3,8 +3,8 @@ import {mkdir,readFile,writeFile,rename,appendFile,cp} from 'node:fs/promises';
 import {join,dirname,basename,relative,resolve,posix} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {evaluationSettings,evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
-import {runMicroeval,finalizeKernelPairs,nativeSample,skillInput} from './skill-microeval.mjs';
-import {ownerStopped} from '../controller/lifecycle.mjs';
+import {runMicroeval,finalizeKernelPairs,nativeSample,skillInput,check,unknownExecution,validateKernelReceipt} from './skill-microeval.mjs';
+import {ownerStopped,processIdentity} from '../controller/lifecycle.mjs';
 import {createEnvironment} from '../integrations/environments/ascend.mjs';
 const hash=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 const quote=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
@@ -16,6 +16,7 @@ export function prepareHypothesisEvaluation({objective,target,tasks,binding}){
  if(!tasks?.length)return {status:'needs-learning',reason:'No validated hypothesis-relevant evaluation cases'};
  if(product(binding)!==target)return {status:'unsupported',reason:'Evaluation binding differs from hypothesis target'};
  try{
+  if(tasks.some(t=>!/^[a-z0-9-]+$/.test(t.id)))throw Error('Unique task identifiers must be lowercase slugs');
   evaluationSettings({[objective]:{tasks,binding}},objective);
   if(target!=='cpu'&&!binding.environment)throw Error('Campaign registered environment binding required');
   return {status:'ready',objective,target,tasks,binding};
@@ -128,4 +129,45 @@ export async function hypothesisEvaluationSettled({directory,config={},binding,r
   delete report.runningSample;if(report.pairedReplay)delete report.pairedReplay.runningPair;
   await save(file,report);return true;
  }catch{return false;}
+}
+
+/** Qualify a NEW learned test contract before spending model work on either arm. */
+export async function qualifyHypothesisTasks({directory,config,objective,target,tasks,binding,remainingSeconds,signal,resource},dependencies={}){
+ objective??=tasks?.[0]?.bucket;const prepared=prepareHypothesisEvaluation({objective,target,tasks,binding});if(prepared.status!=='ready')return {status:'needs-learning',reason:prepared.reason};
+ if(tasks.some(t=>typeof t.controls?.reference?.files?.['kernel.py']!=='string'||!Array.isArray(t.controls.negatives)||!t.controls.negatives.length||t.controls.negatives.some(c=>typeof c.files?.['kernel.py']!=='string')))return {status:'needs-learning',reason:'Reference and independent negative controls required'};
+ if(!Number.isFinite(remainingSeconds)||remainingSeconds<=0||remainingSeconds>1800)throw Error('Remaining hypothesis elapsed allocation must be in (0,1800]');
+ const begun=performance.now(),available=()=>Math.max(0,remainingSeconds-(performance.now()-begun)/1000);
+ const frozen=await Promise.all(tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),...(task.pairedChecker?{pairedChecker:await readFile(task.pairedChecker,'utf8')}:{})})));
+ const {knowledge,...runtimeBinding}=binding,identity=hash({target,tasks:frozen,binding:runtimeBinding});
+ const micro=join(directory,'micro'),file=join(micro,'results.json');await mkdir(join(micro,'frozen'),{recursive:true});
+ let report=await optional(file);if(report&&report.identity!==identity)throw Error('Frozen qualification contract changed');
+ if(report?.runningSample)throw Object.assign(Error('Qualification execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:report.runningSample.unresolvedExecution?.handle});
+ if(report?.settledInterruption||report?.status==='blocked')return {status:'blocked',reason:report.reason??'Qualification execution interrupted',identity,receipts:report.results};
+ if(report?.status==='qualified')return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
+ report??={kind:'qualification',identity,status:'running',results:[],elapsedSeconds:0};const previous=report.elapsedSeconds;
+ const persist=async()=>{report.elapsedSeconds=previous+(performance.now()-begun)/1000;await save(file,report);};
+ await save(join(directory,'hypothesis.json'),{identity,target,binding:runtimeBinding});report.owner=await processIdentity();await persist();
+ const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),ops=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal,stopSignal:cleanup,localExecution:config.local_execution},dependencies);
+ try{
+  for(const task of frozen){const checker=join(micro,'frozen',task.id+'.py');await writeFile(checker,task.checker);
+   for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){
+    const key=task.id+'/0/'+arm;if(report.results.some(r=>r.key===key))continue;signal?.throwIfAborted();
+    const seconds=Math.min(180,available()-30);if(seconds<=0){report.status='blocked';report.reason='Qualification elapsed allocation exhausted';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    const cwd=join(micro,task.id,'0-'+arm,'work'),files={...task.files,...control.files};await mkdir(cwd,{recursive:true});
+    for(const [name,text]of Object.entries(files)){const path=resolve(cwd,name),rel=relative(cwd,path);if(!rel||rel==='..'||rel.startsWith('../'))throw Error('Control files must remain inside their source');await mkdir(dirname(path),{recursive:true});await writeFile(path,text);}
+    report.runningSample={key,owner:report.owner};await persist();const start=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),work=signal?AbortSignal.any([signal,deadline]):deadline;let verification;
+    try{
+     verification=await (dependencies.verify??ops.verify??(args=>check(config.python??'python3',args.checker,args.cwd,args.seconds,args.signal)))({task,checker,cwd,seconds,signal:work,sampleSignal:work,sampleStopSignal:cleanup});
+     if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen qualification checker changed');
+     for(const [name,text]of Object.entries(files))if(await readFile(join(cwd,name),'utf8')!==text)throw Error('Qualification changed a control source');
+     if(target!=='cpu'&&expectedExit===0&&verification.correct)verification=await validateKernelReceipt(verification,cwd,{requireLatency:false});
+    }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}if(signal?.aborted){delete report.runningSample;throw error;}verification={correct:null,error:error.message};}
+    delete report.runningSample;if(signal?.aborted)signal.throwIfAborted();
+    const passed=!deadline.aborted&&verification.exitCode===expectedExit&&verification.correct===(expectedExit===0);
+    report.results.push({key,expectedExit,passed,elapsedSeconds:(performance.now()-start)/1000,sourceSha256:hash(files),verification});await persist();
+    if(!passed){report.status='blocked';report.reason=expectedExit===0?'Reference control failed':'Negative control was not independently rejected';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+   }
+  }
+  report.status='qualified';return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
+ }finally{delete report.owner;await persist();}
 }

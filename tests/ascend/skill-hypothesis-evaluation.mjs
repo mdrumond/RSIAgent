@@ -4,8 +4,8 @@ import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
-import {prepareHypothesisEvaluation,evaluateHypothesis,hypothesisEvaluationSettled} from '../../cli/skill-hypothesis-evaluation.mjs';
-import {runMicroeval} from '../../cli/skill-microeval.mjs';
+import {prepareHypothesisEvaluation,evaluateHypothesis,hypothesisEvaluationSettled,qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
+import {runMicroeval,check} from '../../cli/skill-microeval.mjs';
 import {evaluationSettings} from '../../controller/skill-objectives.mjs';
 const digest=text=>createHash('sha256').update(text).digest('hex');
 async function fixture(t,{target='cpu',objective='correctness'}={}){
@@ -121,4 +121,45 @@ test('device correctness verifies source identity without demanding latency evid
  }}),nativeSample:async()=>({tokens:1})});
  assert.ok(result.report.results.every(r=>r.correct===true&&r.kernelSha256&&r.latencySeconds===undefined));
  assert.equal(result.decision.reason,'insufficient-correctness-improvement');
+});
+
+const controls=tasks=>tasks.map(t=>({...t,controls:{reference:{files:{'kernel.py':'answer=42\n'}},negatives:[{files:{'kernel.py':'answer=0\n'}}]}}));
+test('new cases need independently passing reference and rejected negative controls before admission',async t=>{
+ const f=await fixture(t);assert.equal((await qualifyHypothesisTasks(f)).status,'needs-learning');f.tasks=controls(f.tasks);
+ const result=await qualifyHypothesisTasks(f);assert.equal(result.status,'qualified');assert.equal(result.receipts.length,10);assert.ok(result.receipts.every(r=>r.passed));
+ const saved=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));const resumed=await qualifyHypothesisTasks({...f,remainingSeconds:800},{verify:()=>{throw Error('Passed control replayed');}});assert.equal(resumed.status,'qualified');assert.equal(resumed.elapsedSeconds,saved.elapsedSeconds);
+ f.tasks[0].controls.negatives[0].files['kernel.py']='answer=1\n';await assert.rejects(qualifyHypothesisTasks({...f,remainingSeconds:700}),/Frozen qualification/);
+});
+test('bad reference, always-passing checker and negative usage errors cannot qualify',async t=>{
+ for(const fault of ['reference','accepts-all','usage']){
+  const f=await fixture(t);f.tasks=controls(f.tasks);
+  if(fault==='reference')f.tasks[0].controls.reference.files['kernel.py']='answer=0\n';
+  if(fault==='accepts-all')await writeFile(f.tasks[0].checker,'raise SystemExit(0)\n');
+  const result=await qualifyHypothesisTasks(f,fault==='usage'?{verify:async args=>({exitCode:args.cwd.includes('negative')?2:0,correct:!args.cwd.includes('negative')})}:{});
+  assert.equal(result.status,'blocked');assert.ok(result.receipts.some(r=>!r.passed));
+ }
+});
+test('A5 control qualification uses the bound environment and trusted source receipts',async t=>{
+ const f=await fixture(t,{target:'a5'});f.tasks=controls(f.tasks);const resource={id:'reserved',metadata:{hostSlot:0}};let commands=0;
+ await writeFile(f.tasks[0].checker,"import sys,pathlib,runpy,json,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\npassed=runpy.run_path(str(p)).get('answer')==42\nprint(json.dumps(dict(correct=passed,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'numeric':True})))\nraise SystemExit(0 if passed else 1)\n");
+ const result=await qualifyHypothesisTasks({...f,resource},{createEnvironment:async(options,context)=>{
+  assert.equal(options.health.product,'a5');assert.equal(context.resource,resource);let checker;
+  return {prepare:async value=>{checker=value.project.verifier.files[0];},execute:async(_command,cwd,opts)=>{commands++;const r=await check(f.config.python,checker,cwd,opts.timeout,opts.signal);opts.onData(r.output);return {...r,settled:true,handle:'local:qualified'};}};
+ }});
+ assert.equal(result.status,'qualified');assert.equal(commands,10);assert.ok(result.receipts.filter(r=>r.expectedExit===0).every(r=>r.verification.receipt.kernelSha256));
+});
+test('unknown qualification execution is retained and positive closure never turns it into a passing control',async t=>{
+ const f=await fixture(t,{target:'a3'});f.tasks=controls(f.tasks);let commands=0;
+ const deps={createEnvironment:async()=>({prepare:async()=>{},execute:async()=>{commands++;return {settled:false,handle:'remote:fixture:job:control-original'};}})};
+ await assert.rejects(qualifyHypothesisTasks(f,deps),{code:'RSI_EXECUTION_UNRESOLVED'});
+ await assert.rejects(qualifyHypothesisTasks({...f,remainingSeconds:800},deps),{code:'RSI_EXECUTION_UNRESOLVED'});assert.equal(commands,1);
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:async()=>({observe:async id=>{assert.equal(id,'remote:fixture:job:control-original');return {state:'stopped',exitCode:0};},reconcileLease:async()=>true})}),true);
+ const result=await qualifyHypothesisTasks({...f,remainingSeconds:700},deps);assert.equal(result.status,'blocked');assert.equal(result.receipts.length,0);assert.equal(commands,1);
+});
+test('qualification resumes unfinished controls while retaining passed receipts and elapsed spend',async t=>{
+ const f=await fixture(t);f.tasks=controls(f.tasks);const abort=new AbortController();let calls=0;
+ await assert.rejects(qualifyHypothesisTasks({...f,signal:abort.signal},{verify:async args=>{if(++calls===2){abort.abort(Error('operator pause'));throw abort.signal.reason;}return check(f.config.python,args.checker,args.cwd,args.seconds,args.signal);}}),/operator pause/);
+ const before=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));assert.equal(before.results.length,1);let resumed=0;
+ const result=await qualifyHypothesisTasks({...f,remainingSeconds:800},{verify:async args=>{resumed++;return check(f.config.python,args.checker,args.cwd,args.seconds,args.signal);}});
+ const after=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));assert.equal(result.status,'qualified');assert.equal(resumed,9);assert.deepEqual(after.results[0],before.results[0]);assert.ok(after.elapsedSeconds>=before.elapsedSeconds);
 });
