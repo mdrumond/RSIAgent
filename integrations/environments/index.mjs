@@ -813,9 +813,11 @@ export async function createEnvironment(options, context) {
       }else accountingUnresolved=true;
       if(state.state!=='stopped')closed=false;
     }
-    const payloadClosed=closed&&!accountingUnresolved&&(!unresolvedArtifacts.length||
-      pending.some(({data})=>!(data.kind==='download'&&data.accountingExcluded===true)));
-    return {closed:payloadClosed,payloadClosed,
+    // An excluded download is read-only: an unidentified transfer remains
+    // unresolved, while the operation itself cannot have launched a payload.
+    const artifactOnly=pending.every(({data})=>data.kind==='download'&&data.accountingExcluded===true);
+    const payloadClosed=closed&&!accountingUnresolved;
+    return {closed:payloadClosed,payloadClosed,...(artifactOnly?{payloadStarted:false}:{}),
       ...(unresolvedArtifacts.length?{unresolvedArtifacts}:{}),
       ...((accounted||!accountingUnresolved)?{executionSeconds}:{}),
       ...(timingEstimated?{timingEstimated}:{}),...(accountingUnresolved?{accountingUnresolved}:{}),handles:[...handles],...(wrapperClosures.length?{wrapperClosures,nativeIdentityMissing:true,artifactsUnresolved:true}:{})};

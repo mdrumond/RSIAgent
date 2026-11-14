@@ -432,3 +432,13 @@ for(const kind of ['download','upload','run'])test(`terminal payload retains uni
   assert.deepEqual(proof.handles,['remote:fake:job:retained-payload']);assert.equal(events.length,3);
  }
 });
+
+for(const [kind,excluded]of [['download',true],['upload',true],['run',true],['download',false]])test(`standalone unidentified ${kind}/${excluded} retains its own operation boundary`,async t=>{
+ const f=await fixture(t),submission='standalone';
+ const events=[{type:'execution-submitting',data:{submission,kind,accountingExcluded:excluded,receiptFile:null}},
+  {type:'execution-submitted',data:{submission,closed:false,handle:null}}];
+ const proof=await f.environment.reconcileOperation({operation:submission,events});
+ assert.equal(proof.closed,kind==='download'&&excluded);
+ if(proof.closed){assert.equal(proof.payloadStarted,false);assert.equal(proof.executionSeconds,0);
+  assert.equal(proof.unresolvedArtifacts[0].submission,submission);assert.deepEqual(proof.handles,[]);}
+});

@@ -55,3 +55,35 @@ test('old-token cleanup custody preserves the newer live physical reservation an
  assert.notEqual(job.status,'closed');assert.equal(f.events.some(e=>e.type==='device-lease-released'),false);
  assert.equal(f.calls(),0);
 });
+
+test('failed attempt settles payload and separate metadata download before admitting the next batch',async t=>{
+ const {State}=await import('../../controller/state.mjs');
+ const {RecoveryQueue}=await import('../../controller/recovery.mjs');
+ const {syncCampaignPlan,advanceCampaignEntry}=await import('../../controller/progress.mjs');
+ const {reconcileFailure}=await import('../../controller/lifecycle.mjs');
+ const {createEnvironment:generic}=await import('../../integrations/environments/index.mjs');
+ const f=await fixture(t),state=new State(':memory:');t.after(()=>state.close());const queue=new RecoveryQueue(state);
+ const config={campaign_plan:[{id:'one',phase:'phase1',new_projects:1},{id:'two',phase:'phase2',new_projects:1}],projects:[]};
+ for(const entry of config.campaign_plan){const p={id:entry.id,goal:'test',actor_seconds:10,phase:entry.phase,campaign_entry:entry.id};config.projects.push(p);state.add(p);}
+ syncCampaignPlan(state,config);const job=queue.claim('one',0),id=job.attempt.id;
+ queue.recordOriginal(id,{passed:false,findings:'failed',evidence:[{collection:'memory',entry_id:'failed'}]},0);
+ queue.acknowledgeLesson(queue.lessons()[0].id);state.event(id,'postprocess-completed',{});
+ const handle='remote:fixture:job:payload';
+ state.event(id,'execution-starting',{operation:'payload',startElapsed:0});
+ state.event(id,'execution-submitting',{operation:'payload',submission:'native',kind:'run',accountingExcluded:false});
+ state.event(id,'execution-submitted',{submission:'native',handle});
+ // Actual legacy second-operation shape has no enclosing operation and no handle.
+ state.event(id,'execution-submitting',{submission:'metadata',kind:'download',accountingExcluded:true,receiptFile:null});
+ state.event(id,'execution-submitted',{submission:'metadata',closed:false,handle:null});
+ state.event(id,'failure-settlement',{closed:false});let terminal=false;
+ const environment=await generic({mode:'cpl',target:'fixture'},{instancePath:f.root,
+  event:async(type,data)=>state.event(id,type,data),exclude:async(_label,fn)=>fn(),
+  client:async args=>{assert.equal(args[0],'observe');return {state:terminal?'completed':'running',exit:0,executionSeconds:2};}});
+ assert.equal(await reconcileFailure(state,id,environment),false);assert.equal(advanceCampaignEntry(state,config),false);
+ terminal=true;assert.equal(await reconcileFailure(state,id,environment),true);
+ assert.equal(state.attempt(id).outcome,'failed');assert.equal(state.attempt(id).elapsed,2);
+ const custody=state.events(id).find(e=>e.type==='execution-cleanup-custody').data;
+ assert.equal(custody.unresolvedArtifacts[0].submission,'metadata');
+ assert.equal(state.events(id).some(e=>e.type==='execution-state'&&e.data.handle==null),false);
+ assert.equal(advanceCampaignEntry(state,config),true);assert.equal(queue.claim('two',1).project.id,'two');
+});
