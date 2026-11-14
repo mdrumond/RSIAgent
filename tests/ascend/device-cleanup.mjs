@@ -65,7 +65,7 @@ test('expired cleanup remains fenced without pretending that a stopped writer is
  assert.equal((await cleanupStatus(root))[0].status,'expired');assert.equal(await campaignCleanupPending(campaign),false);
 });
 test('owned cleanup coordinator survives its submitting process and closes through the existing CPL environment',{timeout:60000},async t=>{
- const {spawn}=await import('node:child_process'),{once}=await import('node:events'),{fileURLToPath}=await import('node:url');
+ const {spawn}=await import('node:child_process'),{once}=await import('node:events'),{fileURLToPath,pathToFileURL}=await import('node:url');
  const root=await fixture(t),leases=join(root,'leases'),lease=await reserveDevice('fixture',0,leases),pointer=join(root,'cleanup-pointer.json'),instructionFile=join(root,'instructions.md');
  await writeFile(pointer,JSON.stringify({receipt:lease.receipt,token:lease.token,pool:'fixture',physicalDevice:0}));await writeFile(instructionFile,'Fixture only');
  const wire=join(root,'wire.json'),clientPath=join(root,'cpl-fixture'),observeGate=join(root,'observe-released');
@@ -95,10 +95,21 @@ print(json.dumps(out))
 `,{mode:0o700});
  await lease.update({cleanup:{id:lease.token}});
  const directory=join(leases,'.cleanup'),job=request(root,lease.token,{receipt:lease.receipt,pointer,leaseDirectory:leases,journal:join(root,'events.jsonl'),campaignRoot:root,deadline:Date.now()+45000,options:{mode:'cpl',target:'fixture',runtime:'cpu',instructionFile,clientPath,workspacePath:'/fixture',remoteDirectory:'owned',probeSeconds:1,health:{product:'a3'}}});
- const producer=join(root,'producer.mjs'),module=fileURLToPath(new URL('../../integrations/environments/device-cleanup.mjs',import.meta.url));
- await writeFile(producer,`import {queueDeviceCleanup} from ${JSON.stringify(module)};console.log(JSON.stringify(await queueDeviceCleanup(${JSON.stringify(directory)},${JSON.stringify(job)})));`);
- const producerChild=spawn(globalThis.process.execPath,[producer],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';producerChild.stdout.on('data',chunk=>stdout+=chunk);producerChild.stderr.on('data',chunk=>stderr+=chunk);const [code]=await once(producerChild,'exit');assert.equal(code,0,stderr);
- const submitted=JSON.parse(stdout.trim());assert.ok(submitted.owner?.pid);assert.notEqual(submitted.owner.pid,producerChild.pid);
+ const producer=join(root,'producer.mjs'),bootstrap=join(root,'fixture-import.mjs'),module=fileURLToPath(new URL('../../integrations/environments/device-cleanup.mjs',import.meta.url));
+ // The detached CPU fixture must not depend on the invoking user's installed
+ // skills. Override only its instruction read in producer/worker processes;
+ // production CPL policy, HOME and all other filesystem reads remain unchanged.
+ await writeFile(bootstrap,`import fs from 'node:fs/promises';import {join} from 'node:path';import {homedir} from 'node:os';import {syncBuiltinESMExports} from 'node:module';
+const read=fs.readFile,skill=join(homedir(),'.agents/skills/remote-access/SKILL.md');
+fs.readFile=(path,...args)=>read(path===skill?${JSON.stringify(instructionFile)}:path,...args);syncBuiltinESMExports();`);
+ await writeFile(producer,`import {queueDeviceCleanup,resumeDeviceCleanup} from ${JSON.stringify(module)};console.log(JSON.stringify(await (process.argv.includes('--resume')?resumeDeviceCleanup(${JSON.stringify(directory)}):queueDeviceCleanup(${JSON.stringify(directory)},${JSON.stringify(job)}))));`);
+ const submit=async(resume=false)=>{
+  const child=spawn(globalThis.process.execPath,[producer,...(resume?['--resume']:[])],{stdio:['ignore','pipe','pipe'],
+   env:{...process.env,NODE_OPTIONS:(process.env.NODE_OPTIONS??'')+' --import='+JSON.stringify(pathToFileURL(bootstrap).href)}});
+  let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+  const [code]=await once(child,'exit');assert.equal(code,0,stderr);return {result:JSON.parse(stdout.trim()),pid:child.pid};
+ };
+ const submission=await submit(),submitted=submission.result;assert.ok(submitted.owner?.pid);assert.notEqual(submitted.owner.pid,submission.pid);
  const {ownerStopped}=await import('../../controller/lifecycle.mjs');let cleanupOwner=submitted.owner;t.after(async()=>{
   if(await ownerStopped(cleanupOwner))return;
   try{globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');}
@@ -115,7 +126,7 @@ print(json.dumps(out))
  await until(async()=>Boolean(JSON.parse(await readFile(lease.receipt,'utf8')).controlHandle),'native handle persisted');
  globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');await until(()=>ownerStopped(cleanupOwner),'first coordinator stopped');
  await writeFile(observeGate,'released');
- const resumed=await resumeDeviceCleanup(directory);cleanupOwner=resumed.owner;assert.notEqual(cleanupOwner.pid,submitted.owner.pid);
+ const resumed=(await submit(true)).result;cleanupOwner=resumed.owner;assert.notEqual(cleanupOwner.pid,submitted.owner.pid);
  assert.equal((await cleanupStatus(directory))[0].request.deadline,job.deadline);
  await until(async()=>(await cleanupStatus(directory))[0].status==='closed','resumed exact-handle cleanup closed');
  assert.equal(await campaignCleanupPending(root),false);
