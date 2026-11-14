@@ -12,7 +12,7 @@ import { State } from '../controller/state.mjs';
 import {terminalExecutionProofs,excludedExecutionProofs} from '../controller/execution-proof.mjs';
 import { processIdentity, ownerStopped, attemptStopped, settleFailure, reconcileFailure, failureSettled } from '../controller/lifecycle.mjs';
 import { nextWave, admitJob, recordOutcome, RecoveryQueue,outcomeRecorded } from '../controller/recovery.mjs';
-import { readConfig,updateConfigImmediate as updateConfig,importProject } from './instance.mjs';
+import { readConfig,updateConfigImmediate as updateConfig } from './instance.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
@@ -399,25 +399,10 @@ export async function operate(command,config,options={}) {
             const path=join(config.root,'curriculum','generation');await mkdir(path,{recursive:true});
             const bridge=createKdbBridge({url:await ensureKnowledgeService(generationConfig,{signal:backgroundAbort.signal}),attemptId:'generation-'+randomUUID(),agentDir:path,target:generationConfig.target,
               event:(type,data)=>state.event(null,type,{...data,role:'generation'})});
-            const specs=await (await import('./project-generation.mjs')).refillProjects({config:generationConfig,state,bridge,
-              concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal});
-            for(const spec of specs) {
-              backgroundAbort.signal.throwIfAborted();
-              if(generationConfig.campaign_plan&&currentCampaignEntry(state,generationConfig)?.id!==spec.campaign_entry)break;
-              if(state.project(spec.id))continue;
-              let imported;const packaging=await import('./project-generation.mjs');
-              try{imported=await importProject(config.root,spec,{signal:backgroundAbort.signal,localExecution:config.local_execution,
-                checkpoint:seconds=>packaging.checkpointGeneratedBundle(state,spec,seconds)});}
-              catch(error){
-                if(!backgroundAbort.signal.aborted)packaging.rejectGeneratedProject(state,spec,error);
-                throw error;
-              }
-              await updateConfig(config.root,(current,ledger)=>{
-                if(!ledger.project(imported.id))ledger.add(imported);
-                return {...current,projects:[...current.projects.filter(p=>p.id!==imported.id),imported],
-                  curriculum:{...current.curriculum,[generationPhase]:[...new Set([...(current.curriculum?.[generationPhase]??[]),imported.id])]}};
-              });
-            }
+            const packaging=await import('./project-generation.mjs');
+            await packaging.refillProjects({config:generationConfig,state,bridge,
+              concurrency:Math.max(1,ctl.get('actor-capacity')??1),path,signal:backgroundAbort.signal,
+              onReady:spec=>packaging.publishGeneratedProject({config:generationConfig,state,spec,signal:backgroundAbort.signal})});
           }catch(error){if(!backgroundAbort.signal.aborted)state.event(null,'generation-error',{message:error.message});}
           finally{nextGeneration=Date.now()+5000;generation=null;}
         })();
