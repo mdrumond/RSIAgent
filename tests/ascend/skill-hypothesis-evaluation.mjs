@@ -11,7 +11,7 @@ const digest=text=>createHash('sha256').update(text).digest('hex');
 async function fixture(t,{target='cpu',objective='correctness'}={}){
  const root=await mkdtemp(join(tmpdir(),'hypothesis-eval-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const skills={};for(const arm of ['active','candidate']){const path=skills[arm]=join(root,arm);await mkdir(path);await writeFile(join(path,'skill-map.json'),JSON.stringify({implementation:'skill.md'}));await writeFile(join(path,'skill.md'),arm);}
- const checker=join(root,'checker.py');await writeFile(checker,"import sys,pathlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\nraise SystemExit(0 if 'answer=42' in p.read_text() else 1)\n");
+ const checker=join(root,'checker.py');await writeFile(checker,"import sys,pathlib,runpy\np=pathlib.Path(sys.argv[1])/'kernel.py'\nraise SystemExit(0 if runpy.run_path(str(p)).get('answer')==42 else 1)\n");
  const binding={target,...(target==='cpu'?{}:{environment:{mode:'local',target:'registered-'+target,runtime:'fixture-runtime',instructionFile:'fixture',health:{product:target}},python:'python3'})};
  const tasks=['one','two','three','four','five'].map(id=>({id,kind:target==='cpu'?'hypothesis-case':'target-kernel',target,bucket:objective,prompt:'Repair answer',checker,...(objective==='optimization'?{pairedChecker:checker}:{}),files:{'kernel.py':'answer=0\n','nested/config.json':'{}'},protectedFiles:{'nested/config.json':'json'}}));
  return {directory:join(root,'evaluation'),skills,config:{actor:{provider:'fixture',model:'fixture'},python:process.env.RSI_TEST_PYTHON??'python3'},objective,target,tasks,binding,remainingSeconds:900};
