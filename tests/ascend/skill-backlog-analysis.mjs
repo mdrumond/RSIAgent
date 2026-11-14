@@ -7,6 +7,7 @@ import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
+import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
 import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from '../../cli/skill-backlog-analysis.mjs';
 async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'backlog-analysis-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -29,6 +30,13 @@ const review=(ids=['tail-mask'])=>async({directory,groups,validate})=>{
 };
 const qaAnswer=async()=>({answers:Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,{text:'Concrete supported '+k,refs:[]}]))});
 const qaReview=async()=>({verdict:'approved',reason:'Actual final instruction contains the mechanism and boundary'});
+async function completeLearning(f,request,label){
+ const source=join(f.root,'learning-'+label);await mkdir(source);await writeFile(join(source,'kernel.py'),'def run(x): return x');
+ const id='learning-'+label;f.state.add({id,source,phase:'phase1',goal:'Independent learned fact',actor_seconds:60});const attempt=f.state.admit(id,{pid:1,start:'fixture',boot:'fixture'});
+ f.state.event(attempt.id,'verification',{passed:true,correctness:{passed:true,exitCode:0}});f.state.db.prepare("UPDATE attempts SET outcome='passed' WHERE id=?").run(attempt.id);f.state.event(attempt.id,'postprocess-completed',{});
+ const data=JSON.parse(request.data);data.findings={attemptId:attempt.id,projectId:id,outcome:'passed'};f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',data=? WHERE id=?").run(JSON.stringify(data),request.id);
+}
+
 
 test('one Phase1 failure admits independent grounded hypotheses and freezes copied evidence',async t=>{
  const f=await fixture(t),result=await analyzeBacklog(f,{classify,review:review(['tail-mask','alignment'])});
@@ -70,6 +78,7 @@ test('Q&A inspects final text; candidates are immutable and reused on resume wit
  const candidate=JSON.parse(await readFile(join(f.root,'skills','versions',result.candidate,'guidance.json'),'utf8'));assert.ok(candidate.some(e=>e.id==='tail-mask'&&e.text==='Mask only the partial tail; preserve full interior tiles.'));
  const resumed=await prepareHypothesis(args,{qaAnswer:async()=>{throw Error('Must not repeat');},qaReview});assert.equal(resumed.candidate,result.candidate);assert.equal(answers,1);
  await assert.rejects(prepareHypothesis({...args,item:{...item,revision:item.revision+1}}),/inputs changed/);
+ await assert.rejects(prepareHypothesis({...args,config:{...f.config,skills:{activeVersion:'new-active'}}}),/Rebase and requalify/);
 });
 
 test('QA knowledge gaps enqueue compatible learning and prohibit premature candidate creation',async t=>{
@@ -128,7 +137,7 @@ test('bounded diagnostic snapshots retain compiler failures at the end of long l
 
 test('completed high-priority history cannot hide queued work from reranking',async t=>{
  const f=await fixture(t),{items:[item]}=await analyzeBacklog(f,{classify,review:review()});
- for(let i=0;i<1001;i++)f.backlog.upsert({...item,key:'historical-'+i,id:undefined,priority:100,status:'rejected'});
+ for(let i=0;i<1001;i++)f.backlog.upsert({...item,key:'historical-'+i,id:undefined,proposal:{...item.proposal,changes:[{...item.proposal.changes[0],text:'Historical instruction '+i}]},priority:100,status:'rejected'});
  let submitted=[];await prioritizeBacklog(f,{session:async({prompt,validate})=>{submitted=prompt.items;return validate({priorities:prompt.items.map(i=>({id:i.id,priority:80,reason:'Actionable queued failure'}))});}});
  assert.deepEqual(submitted.map(i=>i.id),[item.id]);assert.equal(f.backlog.get(item.id).priority,80);
 });
@@ -190,4 +199,39 @@ test('rejected comparison feedback cannot enqueue an unchanged effective instruc
   if(revised){assert.equal(result.items[0].status,'queued');assert.equal(f.backlog.claim({base:'baseline'}).item.id,result.items[0].id);}
   else{assert.equal(result.items[0].proposal.action,'no-change');assert.equal(result.items[0].status,'inconclusive');assert.equal(f.backlog.claim({base:'baseline'}),null);}
  });
+});
+
+
+test('every verified learning contributor is consumed for fewer updates, follow-up questions and harness findings',async t=>{
+ for(const disposition of ['fewer-updates','follow-up','harness'])await t.test(disposition,async t=>{
+  const f=await fixture(t),{items}=await analyzeBacklog(f,{classify,review:review(['mask','alignment'])});
+  const question={learningTarget:'cpu',question:'Which boundary is wrong?',hypothesis:'The tail differs',requiredEvidence:'Independent CPU boundary result'};
+  for(const item of items){const claim=f.backlog.claim({base:'baseline'});assert.equal(claim.item.id,item.id);await prepareHypothesis({...f,item,directory:join(f.root,'prepare',item.id),remainingSeconds:100},{qaAnswer,qaReview:async()=>({verdict:'learn',reason:'Need boundary fact',learningRequests:[question]})});f.backlog.finish(claim.run.id,{status:'learning'});}
+  const request=f.state.db.prepare('SELECT id,data FROM skill_learning_requests').get();await completeLearning(f,request,'initial');
+  const classifyResult=disposition==='harness'?async input=>{const result=await classify(input);result.classifications.forEach(c=>{c.cause='harness';c.bucket='harness';});return input.validate(result);}:classify;
+  await analyzeBacklog(f,{classify:classifyResult,review:disposition==='follow-up'?async({groups,validate})=>validate({action:'learn',reason:'A narrower fact is missing',groupIds:groups.map(g=>g.id),...question,question:'Which alignment also matters?'}):review(['single-supported-revision'])});
+  for(const item of items)assert.ok(f.backlog.get(item.id).evidence.learningIdentity);
+  const next=await analyzeBacklog(f,{classify:()=>{throw Error('Verified results were already consumed');},review:()=>{throw Error('Do not reclassify consumed results');}});assert.equal(next.analyzed,0);
+  if(disposition==='follow-up'){const follow=f.state.db.prepare("SELECT id,data FROM skill_learning_requests WHERE status='pending'").get();assert.ok(follow);await completeLearning(f,follow,'follow-up');const resumed=await analyzeBacklog(f,{classify,review:review(['follow-up-supported'])});assert.ok(resumed.items.some(i=>i.status==='queued'));}
+ });
+});
+
+test('feedback permits unchanged guidance only with genuinely changed factual grounding',async t=>{
+ for(const kind of ['renamed-memory','new-memory','verified-learning'])await t.test(kind,async t=>{
+  const f=await fixture(t),{items:[item]}=await analyzeBacklog(f,{classify,review:review(['original-id'])});const claim=f.backlog.claim({base:'baseline'});f.backlog.finish(claim.run.id,{status:'rejected'});
+  f.state.event(null,'skill-hypothesis-rejected',{hypothesisId:item.id,groupIds:item.groupIds,previousProposal:item.proposal,previousEvidence:{memoryEvidence:item.evidence.memoryEvidence,learningIdentity:null},objective:'correctness',reason:'New rejection reference is not new knowledge',diagnostics:[{case:'tail',candidate:false}]});f.backlog.ingest();
+  if(kind==='verified-learning'){const group=f.backlog.failures().find(g=>g.type==='skill-hypothesis-rejected'),question={question:'Which boundary is proven?',hypothesis:'The tail is proven',requiredEvidence:'Independent CPU fact',learningTarget:'cpu'};const learning=f.backlog.upsert({key:'feedback-learning',groupIds:[group.id],objective:'correctness',base:'baseline',status:'learning',proposal:{action:'learn',...question},evidence:{groups:[group]}});const id=enqueueLearningRequest(f.state,{...question,target:'a3',backlogId:learning.id});await completeLearning(f,f.state.db.prepare('SELECT id,data FROM skill_learning_requests WHERE id=?').get(id),'feedback');}
+  const result=await analyzeBacklog(f,{classify,review:async({directory,groups,validate})=>{
+   await mkdir(directory,{recursive:true});await writeFile(join(directory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',entry_id:'renamed-ref',text:kind==='new-memory'?'Independent new boundary evidence':'Observed boundary repair'}]})+'\n');
+   return validate({...item.proposal,groupIds:groups.map(g=>g.id),memoryRefs:['memory:renamed-ref'],changes:[{...item.proposal.changes[0],id:'renamed-change',evidenceRefs:[groups[0].occurrences[0].reference]}]});
+  }});
+  assert.equal(result.items.some(i=>i.status==='queued'),kind!=='renamed-memory');
+ });
+});
+
+test('renaming a change during original-failure reanalysis cannot bypass an identical rejection',async t=>{
+ const f=await fixture(t),{items:[item]}=await analyzeBacklog(f,{classify,review:review(['old-id'])});const claim=f.backlog.claim({base:'baseline'});f.backlog.finish(claim.run.id,{status:'rejected'});
+ const attempt=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;f.state.event(attempt,'verification',{correct:false,evidence:{path:f.log}});f.backlog.ingest();
+ const next=await analyzeBacklog(f,{classify,review:async input=>{const proposal=await review(['new-id'])(input);proposal.changes[0].text=item.proposal.changes[0].text;return proposal;}});
+ assert.equal(next.items[0].id,item.id);assert.equal(next.items[0].status,'rejected');assert.equal(f.backlog.claim({base:'baseline'}),null);
 });
