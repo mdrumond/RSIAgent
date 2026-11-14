@@ -53,3 +53,10 @@ test('QA sessions can inspect verified learning used to revise the skill',async 
   return {value:options.validate({verdict:'approved',reason:'Evidence inspected'})};
  }});
 });
+
+
+test('QA can inspect copied device learning evidence without presenting it as CPU evidence',async t=>{
+ const {input,root}=await fixture(t),source=join(root,'device-learning');await writeFile(source,'actual device observation');
+ const learning=[['device-question',{result:{status:'verified-device',binding:{target:'a5',runtime:'fixture'},project:{source},evidence:[]}}]];
+ await nativeQaReview({...input,learning,validate:value=>value},{session:async options=>{assert.ok(options.allowedPaths.includes(source));assert.equal(options.prompt.learning[0][1].result.status,'verified-device');return{value:options.validate({verdict:'approved',reason:'Copied device evidence supports instruction'})};}});
+});
