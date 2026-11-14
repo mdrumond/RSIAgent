@@ -169,6 +169,10 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
     // An explicit checkpoint ends the running watchdog window. A resumed campaign
     // gets a fresh window; running/crashed supervision retains its elapsed stall.
     const checkpointed=['checkpointing','paused','attention-needed','cooling','complete'].includes(prior?.state);
+    // Explicit resume after a minimum-cap pause gets a fresh admission decision,
+    // including after a qualified source upgrade. Do not thaw a cooling token.
+    let recheckMinimum=checkpointed&&prior.reason==='memory-at-minimum'&&prior.memory?.limit===1&&!prior.memory.token;
+    let minimumRecoveryPending=false;
     if(prior?.sourceRevision===sourceRevision&&Number.isFinite(prior.blockedSince)&&!checkpointed)
       blockedSince=prior.owner?.boot===owner.boot?Math.min(prior.blockedSince,now()):now()-(prior.blockedElapsed??0);
     if(prior?.sourceRevision===sourceRevision&&prior.progressWatch&&!checkpointed) {
@@ -192,7 +196,8 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
         if(view.paused&&(!memory?.token||view.memoryPause!==memory.token))return await pause('operator-pause');
         if(view.operatorStopped||(status.controller?.stopRequested&&latestRequest?.status==='passed'))return await pause('operator-stop');
         if(settings) {
-          if(status.wait?.reason==='memory-concurrency-minimum')return await pause('memory-at-minimum');
+          const minimumWait=status.wait?.reason==='memory-concurrency-minimum';
+          if(!minimumWait)minimumRecoveryPending=false;
           // A completed resume may have survived a supervisor crash before its acknowledgement.
           if(memory?.resumePending&&!view.paused&&status.controller?.state==='running') {
             if(progressWatch)progressWatch.since=now();
@@ -202,7 +207,18 @@ export async function superviseCampaign({instance,cohort,qualification,sourceRev
           let measured;
           try{measured=await memorySample(config,owner,{known});}
           catch(error){memory={...memory,limit:memory?.limit??Number(current.concurrency??4),blocked:true};await memoryControl(config,memory);throw error;}
+          if(recheckMinimum&&!view.paused&&status.controller?.state==='running'&&
+              measured.processCount>0&&measured.rssBytes<settings.lowBytes&&Number(current.concurrency??4)>=2) {
+            // Retain one background slot and permit one foreground worker,
+            // rather than immediately restoring the full configured maximum.
+            memory={...memory,limit:2,recovered:true};
+            recheckMinimum=false;minimumRecoveryPending=true;
+          }
           memory={...memoryDecision(memory,{rssBytes:measured.rssBytes,now:now(),maximum:Number(current.concurrency??4)},settings),...measured};
+          if(minimumWait&&!(minimumRecoveryPending&&memory.limit>1&&memory.action==='run')&&memory.action!=='emergency') {
+            memory={...memory,limit:1,blocked:true};await memoryControl(config,memory);
+            return await pause('memory-at-minimum');
+          }
           await memoryControl(config,memory);
           if(memory.action==='emergency')return await pause('memory-emergency');
           if(['checkpoint','exhausted'].includes(memory.action)) {
