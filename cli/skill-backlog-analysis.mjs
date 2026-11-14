@@ -98,6 +98,17 @@ function queueLearning(backlog,config,item,requests){
   backlog.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(stored),id);return id;
  });
 }
+function learningPage(backlog){
+ const scan=backlog.meta('learning-scan')??{ids:backlog.db.prepare("SELECT id FROM skill_backlog_items WHERE status='learning' ORDER BY priority DESC,created,rowid").all().map(r=>r.id),offset:0};
+ const ids=scan.ids.slice(scan.offset,scan.offset+20),items=ids.map(id=>backlog.get(id)).filter(item=>item?.status==='learning').map(item=>({item,results:learningFor(backlog,item)}))
+  .filter(({item,results})=>results.length&&learningIdentity(results)!==item.evidence?.learningIdentity);
+ backlog.meta('learning-scan',scan);backlog.meta('learning-pending',ids.length>0);
+ return {items,finish(){
+  const unconsumed=items.some(({item,results})=>learningIdentity(results)!==backlog.get(item.id)?.evidence?.learningIdentity);
+  if(!unconsumed)scan.offset+=ids.length;const pending=unconsumed||scan.offset<scan.ids.length;
+  backlog.meta('learning-scan',pending?scan:null);backlog.meta('learning-pending',pending);
+ }};
+}
 function consumeLearning(backlog,contributors){
  for(const {item,results}of contributors){const current=backlog.get(item.id);if(current)backlog.upsert({...current,evidence:{...current.evidence,learningIdentity:learningIdentity(results)}});}
 }
@@ -106,10 +117,9 @@ function priority(group){return Math.min(90,20+Math.min(30,group.count??group.oc
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,limit=8},dependencies={}){
  const ops=await operations(dependencies),clock=allocation(seconds,signal),entries=await guidanceEntries(config.root,config.skills.activeVersion);
- const dirty=backlog.failures({limit,occurrenceLimit:6}),learningItems=backlog.list({status:'learning',limit:100}).map(item=>({item,results:learningFor(backlog,item)}))
-  .filter(({item,results})=>results.length&&learningIdentity(results)!==item.evidence?.learningIdentity);
+ const dirty=backlog.failures({limit,occurrenceLimit:6}),page=learningPage(backlog),learningItems=page.items;
  const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(Boolean).map(g=>[g.id,g])).values()].slice(0,limit);
- if(!groups.length)return {analyzed:0,items:[],remainingSeconds:clock.remaining()};
+ if(!groups.length){page.finish();return {analyzed:0,items:[],remainingSeconds:clock.remaining()};}
  const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results])])),frozen=await freezeGroups(config.root,groups,batch);
  const classifications=await clock.call(ops.classify,{directory:join(batch,'classify'),config,groups:frozen,entries,bucketPolicy:true,
   validate:value=>validateClassificationBatch(value,frozen,entries,{requireBucket:true})});
@@ -158,7 +168,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   }
   consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});
  }
- return {analyzed:frozen.filter(g=>!backlog.failure(g.id)?.dirty).length,items:created,elapsedSeconds:clock.elapsed(),remainingSeconds:clock.remaining()};
+ page.finish();return {analyzed:frozen.filter(g=>!backlog.failure(g.id)?.dirty).length,items:created,elapsedSeconds:clock.elapsed(),remainingSeconds:clock.remaining()};
 }
 
 /** Rank open work only. Running comparisons retain their frozen inputs and finish first. */
