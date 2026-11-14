@@ -60,7 +60,7 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
  const cleanup=child=>child&&stopSignal?AbortSignal.any([child,stopSignal]):child??stopSignal;
  const make=async(cwd,instancePath,checker,workSignal,cleanupSignal,prepareSignal=workSignal)=>{
   await mkdir(instancePath,{recursive:true});const outputs=new Map(),journal=join(instancePath,'environment-events.jsonl');
-  const event=async(type,data)=>{if(type==='execution-output'&&data.handle)outputs.set(data.handle,data);await appendFile(journal,JSON.stringify({type,data})+'\n');await externalEvent?.(type,data);};
+  const event=async(type,data)=>{if(type==='execution-output'&&data.handle)outputs.set(data.handle,data);await appendFile(journal,JSON.stringify({type,data,created:new Date().toISOString()})+'\n');await externalEvent?.(type,data);};
   const env=await factory(environmentOptions,{instancePath,campaignRoot:root,event,resource,exclude:async(_name,fn)=>fn(),signal:workSignal,stopSignal:cleanup(cleanupSignal)});
   const id='micro-'+hash(instancePath).slice(0,24);
   await env.prepare({project:{id,source:cwd,bundle:{root},verifier:{files:[checker]}},attempt:{id},signal:prepareSignal});
@@ -136,12 +136,12 @@ export async function evaluateHypothesis({directory,config,objective,target,task
  if(available()<=cleanupSeconds)return {status:'elapsed',identity,decision:{objective,promote:false,reason:'inconclusive'}};
  const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),deadline=AbortSignal.timeout(Math.max(1,Math.ceil((available()-cleanupSeconds)*1000))),workSignal=signal?AbortSignal.any([signal,deadline]):deadline;
  const targetOps=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal:workSignal,stopSignal:cleanup,localExecution:config.local_execution,event},dependencies);
- let report;try{report=await (dependencies.runMicroeval??runMicroeval)({directory:join(directory,'micro'),skills,tasks,profile:config.actor,python:config.python??'python3',runs:2,seconds:180,verificationSeconds:binding.verificationSeconds??30,totalSeconds:state.developmentSeconds,objective,binding:runtimeBinding,knowledge,signal:workSignal,resume:true,shadow:true},
+ let report;try{report=await (dependencies.runMicroeval??runMicroeval)({directory:join(directory,'micro'),skills,tasks,profile:config.actor,python:config.python??'python3',runs:2,seconds:180,verificationSeconds:binding.verificationSeconds??30,totalSeconds:state.developmentSeconds,objective,binding:runtimeBinding,knowledge,signal:workSignal,resume:true,shadow:true,requireDevice:target!=='cpu'},
   {...targetOps,...dependencies,sample:dependencies.sample??targetOps.sample,verify:dependencies.verify??targetOps.verify});
- }catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'||signal?.aborted||!deadline.aborted)throw error;report=await optional(join(directory,'micro','results.json'))??{results:[]};report.status='elapsed';}
  if(objective==='optimization'&&report.status==='complete'&&available()>cleanupSeconds){
-  report=await (dependencies.finalizeKernelPairs??finalizeKernelPairs)({directory:join(directory,'micro'),python:config.python??'python3',seconds:state.pairedSeconds,signal:workSignal},{...targetOps,...dependencies});
+  report=await (dependencies.finalizeKernelPairs??finalizeKernelPairs)({directory:join(directory,'micro'),python:config.python??'python3',seconds:state.pairedSeconds,signal:workSignal,requireDevice:target!=='cpu'},{...targetOps,...dependencies});
  }
+ }catch(error){if(error.code==='RSI_EXECUTION_UNRESOLVED'||signal?.aborted||!deadline.aborted)throw error;report=await optional(join(directory,'micro','results.json'))??{results:[]};report.status='elapsed';await save(join(directory,'micro','results.json'),report);}
  const decision=report.status==='complete'&&!workSignal.aborted?evaluateSkillObjective(report.results,{objective,projectIds:tasks.map(t=>t.id),runs:2,pairedTimings:report.pairedTimings}):{objective,promote:false,reason:'inconclusive'};
  return {status:report.status,identity,decision,report,directory};
 }
@@ -153,7 +153,7 @@ export async function hypothesisEvaluationSettled({directory,config={},binding,r
   if(report.owner&&!await ownerStopped(report.owner))return false;
   const marker=report.runningSample??report.pairedReplay?.runningPair;
   if(!marker)return true;
-  const unknown=marker.unresolvedExecution;if(!unknown)return false;
+  const unknown=marker.unresolvedExecution;
   binding??=(await optional(join(directory,'hypothesis.json')))?.binding;
   if(!binding?.environment)return false;
   const parts=report.runningSample?marker.key.split('/'):null;
@@ -164,8 +164,29 @@ export async function hypothesisEvaluationSettled({directory,config={},binding,r
   const env=await (dependencies.createEnvironment??createEnvironment)({...binding.environment,probeObservationSeconds:Math.min(30,binding.environment.probeObservationSeconds??30),...(config.local_execution?{localExecution:config.local_execution}:{})},
    {instancePath,campaignRoot:directory,resource,signal:observationSignal,stopSignal:observationSignal,exclude:async(_name,fn)=>fn(),event:async()=>{}});
   const proofs=[];
-  if(unknown.handle){const state=await env.observe(unknown.handle,{signal:observationSignal});if(state.state!=='stopped')return false;proofs.push({handle:unknown.handle,state});}
-  for(const reservation of unknown.reservations??[]){
+  if(!unknown){
+   const text=await readFile(join(instancePath,'environment-events.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
+   const lines=text.split('\n');if(!text.endsWith('\n'))lines.pop();const events=lines.filter(Boolean).map(line=>JSON.parse(line));
+   const submitted=events.filter(e=>e.type==='execution-submitting'),covered=new Set();
+   for(const operation of new Set(submitted.map(e=>e.data.operation??e.data.submission))){
+    if(!operation||!env.reconcileOperation)return false;const proof=await env.reconcileOperation({operation,events});
+    if(proof.closed!==true){
+     // Accounting may be unavailable even when all known commands are closed;
+     // an unidentified submission still cannot be inferred closed from a PID.
+     const group=submitted.filter(e=>(e.data.operation??e.data.submission)===operation);
+     for(const row of group){const response=events.find(e=>['execution-submitted','execution-not-admitted'].includes(e.type)&&e.data.submission===row.data.submission);
+      if(response?.type==='execution-not-admitted')continue;
+      if(!response?.data.handle)return false;const state=await env.observe(response.data.handle,{signal:observationSignal});if(state.state!=='stopped')return false;covered.add(response.data.handle);proofs.push({handle:response.data.handle,state,nativeClosed:true,accountingUnresolved:proof.accountingUnresolved});
+     }
+    }
+    for(const handle of [...(proof.handles??[]),...(proof.deferredHandles??[])])covered.add(handle);proofs.push({operation,...proof});
+   }
+   for(const handle of new Set(events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle).filter(Boolean))){
+    if(covered.has(handle))continue;const state=await env.observe(handle,{signal:observationSignal});if(state.state!=='stopped')return false;proofs.push({handle,state});
+   }
+  }
+  if(unknown?.handle){const state=await env.observe(unknown.handle,{signal:observationSignal});if(state.state!=='stopped')return false;proofs.push({handle:unknown.handle,state});}
+  for(const reservation of unknown?.reservations??[]){
    if(!Number.isInteger(reservation.physicalDevice)||!reservation.receipt||!reservation.token)return false;
    const proof=await env.reconcileReservation(reservation.physicalDevice,{receipt:reservation.receipt,token:reservation.token});if(proof.closed!==true)return false;proofs.push(proof);
   }
@@ -198,7 +219,7 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
  const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),ops=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal,stopSignal:cleanup,localExecution:config.local_execution},dependencies);
  try{
   if(target!=='cpu'&&!dependencies.verify){
-   const entries=[];for(const task of frozen)for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){const key=task.id+'/0/'+arm;if(!report.results.some(r=>r.key===key))entries.push({key,cwd:task.id+'-'+arm,files:{...task.files,...control.files},checker:task.checker,args:['.'],expectedExit});}
+   const entries=[];for(const task of frozen)for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){const key=task.id+'/0/'+arm;if(!report.results.some(r=>r.key===key))entries.push({key,cwd:task.id+'-'+arm,files:{...task.files,...control.files},checker:task.checker,args:['.'],expectedExit,requireDevice:true});}
    if(entries.length){
     const seconds=available()-30;if(seconds<=0)return {status:'blocked',reason:'Qualification elapsed allocation exhausted',identity,receipts:report.results};
     report.runningSample={key:'qualification/0/batch',owner:report.owner};await persist();const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),work=signal?AbortSignal.any([signal,deadline]):deadline;let rows;
@@ -206,7 +227,7 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
     catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;if(signal?.aborted)throw error;report.status='blocked';report.reason=error.message;return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
     delete report.runningSample;signal?.throwIfAborted();
     for(const row of rows){const entry=entries.find(e=>e.key===row.key),cwd=join(micro,'qualification','0-batch','work',entry.cwd);let verification=row;
-     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false});}catch(error){verification={correct:null,error:error.message};}
+     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false,requireDevice:entry.requireDevice});}catch(error){verification={correct:null,error:error.message};}
      const passed=!deadline.aborted&&row.exitCode===entry.expectedExit&&verification.correct===(entry.expectedExit===0);report.results.push({key:row.key,expectedExit:entry.expectedExit,passed,sourceSha256:hash(entry.files),elapsedSeconds:row.elapsedSeconds,verification});await persist();
     }
     if(rows.length!==entries.length||report.results.some(r=>!r.passed)){report.status='blocked';report.reason='Reference or negative control did not qualify';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
@@ -224,7 +245,7 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
      verification=await (dependencies.verify??ops.verify??(args=>check(config.python??'python3',args.checker,args.cwd,args.seconds,args.signal)))({task,checker,cwd,seconds,signal:work,sampleSignal:work,sampleStopSignal:cleanup});
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen qualification checker changed');
      for(const [name,text]of Object.entries(files))if(await readFile(join(cwd,name),'utf8')!==text)throw Error('Qualification changed a control source');
-     if(target!=='cpu'&&expectedExit===0&&verification.correct)verification=await validateKernelReceipt(verification,cwd,{requireLatency:false});
+     if(target!=='cpu'&&expectedExit===0&&verification.correct)verification=await validateKernelReceipt(verification,cwd,{requireLatency:false,requireDevice:true});
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}if(signal?.aborted){delete report.runningSample;throw error;}verification={correct:null,error:error.message};}
     delete report.runningSample;if(signal?.aborted)signal.throwIfAborted();
     const passed=!deadline.aborted&&verification.exitCode===expectedExit&&verification.correct===(expectedExit===0);

@@ -49,12 +49,13 @@ export function protectedFingerprint(text,mode='bytes'){
  return hash(mode==='json'?JSON.stringify(canonical(JSON.parse(text))):text);
 }
 function lastReceipt(output){return JSON.parse(output.trim().split('\n').at(-1));}
-export async function validateKernelReceipt(verification,cwd,{requireLatency=true}={}){
+export async function validateKernelReceipt(verification,cwd,{requireLatency=true,requireDevice=false}={}){
  let receipt;try{receipt=lastReceipt(verification.output);}catch(error){if(verification.exitCode===125)return verification;throw error;}
  if(verification.exitCode===125){
   if(receipt.correct===null&&receipt.bucket==='harness'&&receipt.kernelSha256===hash(await readFile(join(cwd,'kernel.py')))&&receipt.evidence&&typeof receipt.evidence==='object'&&!Array.isArray(receipt.evidence)&&typeof receipt.evidence.reason==='string'&&receipt.evidence.reason.trim()&&(receipt.latencySeconds===undefined||receipt.latencySeconds===null))return {...verification,correct:null,receipt};
   return verification;
  }
+ if(requireDevice&&!/^npu:\d+$/.test(receipt.evidence?.device??''))throw Error('Trusted NPU device evidence required');
  if(receipt.correct!==true||requireLatency&&(!Number.isFinite(receipt.latencySeconds)||receipt.latencySeconds<=0)||
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
@@ -126,7 +127,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
@@ -152,7 +153,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -193,7 +194,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
      verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(isKernelTask(task.kind)?kernelCheck:check)(python,checker,cwd,isKernelTask(task.kind)?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
-     if(isKernelTask(task.kind)&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd,{requireLatency:objective!=='correctness'});
+     if(isKernelTask(task.kind)&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd,{requireLatency:objective!=='correctness',requireDevice:requireDevice||task.kind==='target-kernel'});
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
@@ -209,7 +210,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  finally{delete report.owner;await persist();}
 }
 /** Final alternating-order replay runs trusted frozen paired checkers, never agent claims. */
-export async function finalizeKernelPairs({directory,python='python3',seconds,signal},dependencies={}){
+export async function finalizeKernelPairs({directory,python='python3',seconds,signal,requireDevice=false},dependencies={}){
  if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive paired replay elapsed allocation required');
  const report=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));
  if(report.status!=='complete'||report.runningSample||report.owner&&!await ownerStopped(report.owner))throw Error('Complete settled samples required');
@@ -224,6 +225,7 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
   const receipt=measured.output!==undefined?lastReceipt(measured.output):measured;
   if(measured.exitCode!==undefined&&measured.exitCode!==0)throw Error('Paired checker failed');
   if(receipt.correct!==true||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid paired verification receipt');
+  if((requireDevice||report.requireDevice||task.kind==='target-kernel')&&!/^npu:\d+$/.test(receipt.evidence.device??''))throw Error('Trusted NPU device evidence required');
   for(const arm of ['active','candidate'])if(receipt[arm+'KernelSha256']!==pair[arm].kernelSha256||!Number.isFinite(receipt[arm+'LatencySeconds'])||receipt[arm+'LatencySeconds']<=0)throw Error('Invalid paired timing identity or latency');
   for(const arm of ['active','candidate']){
    if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed during paired replay');

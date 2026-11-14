@@ -15,7 +15,7 @@ async function fixture(t,{target='cpu',objective='correctness'}={}){
  const skills={};for(const arm of ['active','candidate']){const path=skills[arm]=join(root,arm);await mkdir(path);await writeFile(join(path,'skill-map.json'),JSON.stringify({implementation:'skill.md'}));await writeFile(join(path,'skill.md'),arm);}
  const checker=join(root,'checker.py');await writeFile(checker,"import sys,pathlib,runpy\np=pathlib.Path(sys.argv[1])/'kernel.py'\nraise SystemExit(0 if runpy.run_path(str(p)).get('answer')==42 else 1)\n");
  const binding={target,...(target==='cpu'?{}:{environment:{mode:'local',target:'registered-'+target,runtime:'fixture-runtime',instructionFile:'fixture',health:{product:target}},python:'python3'})};
- const pairedChecker=join(root,'paired.py');if(objective==='optimization')await writeFile(pairedChecker,"import sys,pathlib,json,hashlib\nsha=lambda p:hashlib.sha256((pathlib.Path(p)/'kernel.py').read_bytes()).hexdigest()\nprint(json.dumps(dict(correct=True,activeKernelSha256=sha(sys.argv[1]),candidateKernelSha256=sha(sys.argv[2]),activeLatencySeconds=1,candidateLatencySeconds=.8,evidence={'paired':True})))\n");
+ const pairedChecker=join(root,'paired.py');if(objective==='optimization')await writeFile(pairedChecker,"import sys,pathlib,json,hashlib\nsha=lambda p:hashlib.sha256((pathlib.Path(p)/'kernel.py').read_bytes()).hexdigest()\nprint(json.dumps(dict(correct=True,activeKernelSha256=sha(sys.argv[1]),candidateKernelSha256=sha(sys.argv[2]),activeLatencySeconds=1,candidateLatencySeconds=.8,evidence={'paired':True,'device':'npu:0'})))\n");
  const tasks=['one','two','three','four','five'].map(id=>({id,kind:target==='cpu'?'hypothesis-case':'target-kernel',target,bucket:objective,prompt:'Repair answer',checker,...(objective==='optimization'?{pairedChecker}:{}),files:{'kernel.py':'answer=0\n','nested/config.json':'{}'},protectedFiles:{'nested/config.json':'json'}}));
  return {directory:join(root,'evaluation'),skills,config:{actor:{provider:'fixture',model:'fixture'},python:process.env.RSI_TEST_PYTHON??'python3'},objective,target,tasks,binding,remainingSeconds:900};
 }
@@ -54,7 +54,7 @@ test('A5 samples and paired timings use the registered environment, reserved res
   let checker;return {prepare:async value=>{assert.equal(value.project.bundle.root,f.directory);checker=value.project.verifier.files[0];},execute:async(command,cwd,opts)=>{
    seen.push({purpose:opts.purpose,signal:opts.signal,stopSignal:opts.stopSignal});
    if(opts.purpose==='performance'){const result=fixtureCommand(f.config.python,checker,cwd,opts.timeout);opts.onData(result.output);return {...result,settled:true,handle:'local:fixture'};}
-   const receipt={correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),latencySeconds:1,evidence:{fixture:true}};
+   const receipt={correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),latencySeconds:1,evidence:{fixture:true,device:'npu:0'}};
    opts.onData?.(JSON.stringify(receipt)+'\n');return {settled:true,exitCode:0,handle:'local:fixture'};
   }};
  },nativeSample:async args=>{assert.equal(args.targetBash,true);actorSignals.push(args.sampleStopSignal);await writeFile(join(args.cwd,'kernel.py'),'answer=42\n');return {tokens:1};}};
@@ -113,7 +113,7 @@ test('paired replay retains the unresolved native command and closes without cla
  const f=await fixture(t,{target:'a5',objective:'optimization'});let calls=0;
  const deps={createEnvironment:async()=>({prepare:async()=>{},execute:async(_command,cwd,opts)=>{
   calls++;if(opts.purpose==='performance')return {settled:false,handle:'remote:fixture:job:paired-original'};
-  opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),latencySeconds:1,evidence:{fixture:true}})+'\n');return {settled:true,exitCode:0};
+  opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),latencySeconds:1,evidence:{fixture:true,device:'npu:0'}})+'\n');return {settled:true,exitCode:0};
  }}),nativeSample:async()=>({tokens:1})};
  await assert.rejects(evaluateHypothesis(f,deps),{code:'RSI_EXECUTION_UNRESOLVED'});
  const before=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));assert.equal(before.pairedReplay.runningPair.unresolvedExecution.handle,'remote:fixture:job:paired-original');assert.equal(calls,21);
@@ -123,7 +123,7 @@ test('paired replay retains the unresolved native command and closes without cla
 
 test('device correctness verifies source identity without demanding latency evidence',async t=>{
  const f=await fixture(t,{target:'a5'});const result=await evaluateHypothesis(f,{createEnvironment:async()=>({prepare:async()=>{},execute:async(_command,cwd,opts)=>{
-  opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),evidence:{numeric:true}})+'\n');return {settled:true,exitCode:0};
+  opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),evidence:{numeric:true,device:'npu:0'}})+'\n');return {settled:true,exitCode:0};
  }}),nativeSample:async()=>({tokens:1})});
  assert.ok(result.report.results.every(r=>r.correct===true&&r.kernelSha256&&r.latencySeconds===undefined));
  assert.equal(result.decision.reason,'insufficient-correctness-improvement');
@@ -147,7 +147,7 @@ test('bad reference, always-passing checker and negative usage errors cannot qua
 });
 test('A5 control qualification uses the bound environment and trusted source receipts',async t=>{
  const f=await fixture(t,{target:'a5'});f.tasks=controls(f.tasks);const resource={id:'reserved',metadata:{hostSlot:0}};let commands=0;const counts=[];
- await writeFile(f.tasks[0].checker,"import sys,pathlib,runpy,json,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\npassed=runpy.run_path(str(p)).get('answer')==42\nprint(json.dumps(dict(correct=passed,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'numeric':True})))\nraise SystemExit(0 if passed else 1)\n");
+ await writeFile(f.tasks[0].checker,"import sys,pathlib,runpy,json,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\npassed=runpy.run_path(str(p)).get('answer')==42\nprint(json.dumps(dict(correct=passed,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'numeric':True,'device':'npu:0'})))\nraise SystemExit(0 if passed else 1)\n");
  const deps={createEnvironment:async(options,context)=>{
   assert.equal(options.health.product,'a5');assert.equal(context.resource,resource);let checker;
   return {prepare:async value=>{checker=value.project.verifier.files[0];},execute:async(_command,cwd,opts)=>{commands++;const r=fixtureCommand(f.config.python,checker,cwd,opts.timeout);counts.push(r.output.trim().split('\n').length);opts.onData(r.output);return {...r,settled:true,handle:'local:qualified'};}};
@@ -172,4 +172,44 @@ test('qualification resumes unfinished controls while retaining passed receipts 
  const before=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));assert.equal(before.results.length,1);let resumed=0;
  const result=await qualifyHypothesisTasks({...f,remainingSeconds:800},{verify:async args=>{resumed++;return check(f.config.python,args.checker,args.cwd,args.seconds,args.signal);}});
  const after=JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8'));assert.equal(result.status,'qualified');assert.equal(resumed,9);assert.deepEqual(after.results[0],before.results[0]);assert.ok(after.elapsedSeconds>=before.elapsedSeconds);
+});
+
+test('new NPU tasks reject CPU or absent device evidence in samples and paired results',async t=>{
+ for(const kind of ['target-kernel','a3-kernel'])for(const device of [undefined,'cpu']){
+  const f=await fixture(t,{target:kind==='a3-kernel'?'a3':'a5'}),deps={createEnvironment:async()=>({prepare:async()=>{},execute:async(_command,cwd,opts)=>{opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),evidence:{device}})+'\n');return {settled:true,exitCode:0};}}),nativeSample:async()=>({tokens:1})};
+  f.tasks=f.tasks.map(t=>({...t,kind,target:kind==='a3-kernel'?undefined:t.target}));const result=await evaluateHypothesis(f,deps);assert.ok(result.report.results.every(r=>r.correct===null));assert.equal(result.decision.promote,false);
+  const paired=await fixture(t,{target:kind==='a3-kernel'?'a3':'a5',objective:'optimization'});let phase='sample';
+  const valid={createEnvironment:async()=>({prepare:async()=>{},execute:async(_command,cwd,opts)=>{opts.onData(JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(cwd,'kernel.py'))),latencySeconds:1,evidence:{device:'npu:0'}})+'\n');return {settled:true,exitCode:0};}}),nativeSample:async()=>({}),measureBatch:async({pairs})=>{phase='paired';return pairs.map(p=>({projectId:p.task.id,run:p.run,correct:true,activeKernelSha256:digest('answer=0\n'),candidateKernelSha256:digest('answer=0\n'),activeLatencySeconds:1,candidateLatencySeconds:.8,evidence:{device}}));}};
+  paired.tasks=paired.tasks.map(t=>({...t,kind,target:kind==='a3-kernel'?undefined:t.target}));await assert.rejects(evaluateHypothesis(paired,valid),/NPU device evidence/);assert.equal(phase,'paired');
+  const qualification=await fixture(t,{target:kind==='a3-kernel'?'a3':'a5'});qualification.tasks=controls(qualification.tasks.map(t=>({...t,kind,target:kind==='a3-kernel'?undefined:t.target})));
+  await writeFile(qualification.tasks[0].checker,"import pathlib,sys,runpy,json,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py';ok=runpy.run_path(str(p)).get('answer')==42\nprint(json.dumps(dict(correct=ok,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence="+JSON.stringify(device?{device}:{})+")))\nraise SystemExit(0 if ok else 1)\n");
+  const blocked=await qualifyHypothesisTasks(qualification,{createEnvironment:async()=>{let checker;return {prepare:async p=>{checker=p.project.verifier.files[0];},execute:async(_cmd,cwd,opts)=>{const r=fixtureCommand(qualification.config.python,checker,cwd,opts.timeout);opts.onData(r.output);return {...r,settled:true};}};}});assert.equal(blocked.status,'blocked');
+ }
+});
+test('abrupt bare sample, qualification and paired markers recover only positive journal custody',async t=>{
+ for(const kind of ['sample','qualification','paired']){
+  const f=await fixture(t,{target:'a3'}),micro=join(f.directory,'micro'),owner={pid:2147483647,start:'0',boot:'stopped-fixture'},marker=kind==='paired'?{projectId:'batch',run:0,owner}:{key:kind==='sample'?'one/0/active':'qualification/0/batch',owner};await mkdir(micro,{recursive:true});
+  const file=join(micro,'results.json'),report={status:'interrupted',owner,elapsedSeconds:12.5,results:[],...(kind==='paired'?{pairedReplay:{runningPair:marker}}:{runningSample:marker})};await writeFile(file,JSON.stringify(report));await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));
+  const target=kind==='paired'?join(micro,'paired-target/batch-0/target'):kind==='sample'?join(micro,'one/0-active/target'):join(micro,'qualification/0-batch/target');await mkdir(target,{recursive:true});
+  const handle='remote:fixture:job:crashed-'+kind,events=[{type:'execution-submitting',data:{operation:'original',submission:'original',kind:'run'}},{type:'execution-submitted',data:{submission:'original',handle}},{type:'execution-handle',data:{handle}}];await writeFile(join(target,'environment-events.jsonl'),events.map(JSON.stringify).join('\n')+'\n');let stopped=false,observed=0;
+  const deps={createEnvironment:async()=>({reconcileOperation:async input=>{assert.equal(input.operation,'original');return {closed:false,handles:[handle],accountingUnresolved:true};},observe:async id=>{assert.equal(id,handle);observed++;return {state:stopped?'stopped':'running'};},reconcileLease:async()=>true,execute:()=>{throw Error('Replayed crashed command');}})};
+  assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),false);stopped=true;assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),true);
+  const saved=JSON.parse(await readFile(file,'utf8'));assert.equal(saved.elapsedSeconds,12.5);assert.equal(saved.results.length,0);assert.ok(saved.settledInterruption);assert.equal(observed,2);
+ }
+});
+test('bare prelaunch markers need a positive non-admission proof rather than an absent process',async t=>{
+ const f=await fixture(t,{target:'a3'}),micro=join(f.directory,'micro');await mkdir(micro,{recursive:true});await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));
+ await writeFile(join(micro,'results.json'),JSON.stringify({status:'interrupted',elapsedSeconds:1,results:[],runningSample:{key:'one/0/active'}}));
+ const deps={createEnvironment:async()=>({reconcileOperation:async()=>({closed:true,payloadStarted:false,handles:[]}),reconcileLease:async()=>true,execute:()=>{throw Error('Unexpected launch');}})};
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),false);
+ const target=join(micro,'one/0-active/target');await mkdir(target,{recursive:true});await writeFile(join(target,'environment-events.jsonl'),[{type:'execution-submitting',data:{submission:'never-launched',kind:'run'}},{type:'execution-not-admitted',data:{submission:'never-launched',closed:true}}].map(JSON.stringify).join('\n')+'\n');
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),true);
+});
+test('paired work deadline is inconclusive while external cancellation and unknown execution propagate',async t=>{
+ for(const mode of ['deadline','external','unknown']){
+  const f=await fixture(t,{target:'a5',objective:'optimization'}),abort=new AbortController();let finalizationStarted=false;
+  const invoke=()=>evaluateHypothesis({...f,remainingSeconds:mode==='deadline'?31:900,signal:abort.signal},{runMicroeval:async()=>{const report={status:'complete',results:[]};await mkdir(join(f.directory,'micro'));await writeFile(join(f.directory,'micro/results.json'),JSON.stringify(report));return report;},finalizeKernelPairs:async({signal})=>{finalizationStarted=true;if(mode==='external'){abort.abort(Error('operator cancellation'));throw abort.signal.reason;}if(mode==='unknown')throw Object.assign(Error('unresolved paired command'),{code:'RSI_EXECUTION_UNRESOLVED',handle:'remote:fixture:job:retained'});await new Promise(resolve=>{const keepAlive=setTimeout(resolve,2000);signal.addEventListener('abort',()=>{clearTimeout(keepAlive);resolve();},{once:true});});throw signal.reason;}});
+  if(mode==='deadline'){const result=await invoke();assert.equal(finalizationStarted,true);assert.equal(result.status,'elapsed');assert.equal(result.decision.promote,false);assert.equal(JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8')).status,'elapsed');}
+  else if(mode==='external')await assert.rejects(invoke(),/operator cancellation/);else await assert.rejects(invoke(),{code:'RSI_EXECUTION_UNRESOLVED'});
+ }
 });
