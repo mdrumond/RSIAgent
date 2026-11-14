@@ -79,3 +79,10 @@ test('reviewer can repair malformed learning before submission within the same a
  }});
  assert.equal(result.verdict,'learn');assert.equal(result.elapsedSeconds,30);assert.equal(result.learningRequests.length,1);
 });
+
+
+test('Q&A may cite supplied verified learning references but not invented findings',async t=>{
+ const input=await fixture(t),learning=[['request',{result:{status:'verified-device',evidence:[{reference:'learning:event:1',log:'copied.log'}]}}]];
+ const result=await runProposalQa({...input,learning},{qaAnswer:async()=>{const value=answers();value.answers.evidence.refs=['learning:event:1'];return value;},qaReview:async()=>({verdict:'approved',reason:'Final text grounded in supplied learning'})});
+ assert.equal(result.verdict,'approved');
+});

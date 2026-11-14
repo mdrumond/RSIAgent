@@ -43,7 +43,7 @@ export async function runProposalQa(input,ops){
     return ops[name]({...input,...payload,directory,seconds,signal});
    };
    if(!round.answers){
-    const refs=new Set([...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...(proposal.memoryRefs??[])]);
+    const refs=new Set([...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
     const validate=value=>{
      validateQaAnswers(value,refs);
      if(value.memoryRefs?.some(ref=>!(input.proposal.memoryRefs??[]).includes(ref)))throw Error('QA revisions cannot introduce unretrieved memory references');
