@@ -33,3 +33,9 @@ New campaign comparisons contain sixteen samples at two runs per arm, retaining
 the 90-second per-sample ceiling and 900-second total elapsed allocation. An
 incomplete comparison remains inconclusive. Existing comparisons retain their
 original task IDs and frozen manifest when resumed after a catalogue upgrade.
+
+Target execution cleanup retains a separate 30-second grace beyond a sample's
+work allocation. It can cancel and observe already admitted work; it cannot admit
+actor or verifier work after the original deadline. Late output never turns an
+expired sample into a success. Cleanup time is charged to elapsed telemetry and
+remaining study allocation, including across resume; it does not refill work.

@@ -302,3 +302,45 @@ test('microeval hands cleanup the existing allocation deadline independently of 
  assert.ok(captured.sampleStopSignal instanceof AbortSignal);assert.notEqual(captured.sampleStopSignal,captured.sampleSignal);
  assert.equal(captured.signal.aborted,true);assert.equal(captured.sampleSignal.aborted,true);assert.equal(captured.sampleStopSignal.aborted,false);
 });
+
+test('whole work expiry allows exact-handle cleanup but rejects late verification success',async t=>{
+ const f=await fixture(t),handle='remote:fixture:job:late-verifier';let actors=0,verifiers=0,closed=0;
+ const report=await runMicroeval({...f,runs:1,seconds:.08,totalSeconds:.08,verificationSeconds:.04},{sample:async()=>{actors++;return {};},verify:async args=>{
+  verifiers++;await untilAbort(args.signal);assert.equal(args.sampleStopSignal.aborted,false);
+  await new Promise(resolve=>setTimeout(resolve,20));assert.equal(args.sampleStopSignal.aborted,false);closed++;
+  return {correct:true,exitCode:0,handle};
+ }});
+ assert.equal(actors,1);assert.equal(verifiers,1);assert.equal(closed,1);assert.equal(report.results.length,1);
+ assert.equal(report.results[0].correct,false);assert.equal(report.results[0].timedOut,true);assert.ok(report.results[0].elapsedSeconds>=.08);assert.equal(report.status,'elapsed');
+});
+test('true cleanup grace exhaustion retains the original unknown handle and blocks further admissions',{timeout:40000},async t=>{
+ const f=await fixture(t),handle='remote:fixture:job:grace-exhausted';let actors=0,verifiers=0;
+ await assert.rejects(runMicroeval({...f,runs:1,seconds:.04,totalSeconds:.04,verificationSeconds:.02},{sample:async()=>{actors++;return {};},verify:async args=>{
+  verifiers++;await untilAbort(args.signal);assert.equal(args.sampleStopSignal.aborted,false);
+  await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Cleanup deadline did not expire')),35000);args.sampleStopSignal.addEventListener('abort',()=>{clearTimeout(timer);resolve();},{once:true});});assert.equal(args.sampleStopSignal.aborted,true);throw Object.assign(Error('Exact native execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle});
+ }}),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const report=JSON.parse(await readFile(join(f.directory,'results.json')));assert.equal(actors,1);assert.equal(verifiers,1);assert.equal(report.results.length,0);assert.equal(report.runningSample.unresolvedExecution.handle,handle);
+ assert.ok(report.elapsedSeconds>=30);assert.equal(report.status,'interrupted');
+});
+
+test('native Pi target closes its same handle after whole work cutoff without a second command',async t=>{
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .',timeout:1200}}:null);
+ const handle='remote:fixture:job:whole-expiry-native',requests=[];let verifies=0;
+ const report=await runMicroeval({...f,profile,runs:1,seconds:2,totalSeconds:2,verificationSeconds:1},{sample:args=>nativeSample({...args,targetEnvironment:{execute:async(_command,_cwd,options)=>{
+  requests.push(['execute',handle]);await untilAbort(args.sampleSignal);assert.equal(options.signal.aborted,true);assert.equal(options.stopSignal.aborted,false);
+  requests.push(['cancel',handle]);await new Promise(resolve=>setTimeout(resolve,25));assert.equal(options.stopSignal.aborted,false);requests.push(['closed',handle]);
+  return {handle,settled:true,exitCode:124};
+ }}}),verify:async()=>{verifies++;return {correct:true};}});
+ assert.deepEqual(requests,[['execute',handle],['cancel',handle],['closed',handle]]);assert.equal(verifies,0);assert.equal(report.results.length,1);assert.equal(report.results[0].timedOut,true);assert.equal(report.results[0].correct,false);assert.equal(report.results[0].unresolvedExecution,undefined);
+});
+
+test('resumed elapsed cleanup spend cannot create another work or cleanup turn',async t=>{
+ const f=await fixture(t),abort=new AbortController(),options={...f,runs:1,seconds:1,resume:true};
+ await assert.rejects(runMicroeval({...options,signal:abort.signal},{sample:async()=>{abort.abort();return {};}}));
+ const path=join(f.directory,'results.json'),retained=JSON.parse(await readFile(path));
+ // Retained elapsed cost includes cleanup after the original work allocation.
+ retained.partials['repair/0/active'].elapsedSeconds=1.2;retained.elapsedSeconds=1.2;await writeFile(path,JSON.stringify(retained));
+ const admitted=[];const report=await runMicroeval(options,{sample:async args=>{admitted.push(args.cwd);return {};},verify:async()=>({correct:false})});
+ assert.equal(admitted.length,1);assert.ok(admitted[0].endsWith('0-candidate/work'));
+ const row=report.results.find(row=>row.arm==='active');assert.equal(row.elapsedSeconds,1.2);assert.equal(row.timedOut,true);assert.equal(row.correct,false);
+});

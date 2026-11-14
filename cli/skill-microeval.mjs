@@ -84,7 +84,8 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   if(targetEnvironment){
    const [target]=await createEnvironmentTools({execute:async(command,path,options)=>{
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
-    // Cleanup may spend the remaining verification reserve, never a fresh clock.
+    // Cleanup uses the retained parent allocation plus its cleanup-only grace.
+    // The work signal still forbids any new dispatch after work expires.
     const operation=targetEnvironment.execute(command,path,{...options,signal:merged,...(allocationSignal?{stopSignal:allocationSignal}:{}),timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
     try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
     catch(error){const unknown=unknownExecution(error);if(unknown){unresolvedExecution=unknown;interrupt(error);}throw error;}finally{pending.delete(operation);}
@@ -170,20 +171,23 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const allocation=Math.max(.001,Math.min(seconds-spent,left));const path=join(directory,task.id,`${run}-${arm}`),cwd=join(path,'work');await mkdir(cwd,{recursive:true});
     if(!partial)for(const [name,text]of Object.entries(task.files)){const file=inside(cwd,name);await mkdir(dirname(file),{recursive:true});await writeFile(file,text);}
     report.runningSample={key,owner:report.owner};await persist();
-    const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;let observed,verification;
+    const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;
+    // Allocated once here, before actor/setup/verification; all resumed spend
+    // has already reduced allocation. This never authorizes additional work.
+    const cleanupDeadline=AbortSignal.timeout(Math.max(1,Math.ceil((allocation+30)*1000)));let observed,verification;
     const actorBudget=seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
     const actorExhausted=verificationSeconds&&savedActor&&!savedActor.actorCompleted&&spent>=actorBudget;
     const actorAllocation=Math.max(.001,Math.min(actorBudget-spent,allocation-Math.min(verificationSeconds,allocation/2))),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
     try{
-     observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleStopSignal:deadline,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
+     observed=savedActor&&(savedActor.actorCompleted||actorExhausted)?{...savedActor,...(actorExhausted?{actorCompleted:true,actorTimedOut:true,actorError:savedActor.error??null,timedOut:false,error:null}:{})}:await sample({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorAllocation,verificationReserved:allocation-actorAllocation,signal:actorSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation,sessionDirectory:path,resumeSession:partial?.session});
      if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      observed.actorCompleted??=!actorSignal.aborted||Boolean(actorDeadline?.aborted&&!sampleSignal.aborted);
      if(verificationSeconds&&(actorDeadline?.aborted||observed.timedOut)&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
-     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:deadline,sampleSeconds:allocation}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}

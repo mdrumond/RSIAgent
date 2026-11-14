@@ -86,6 +86,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
    }catch(error){charge();state.status='interrupted';delete report.runningSample;await persist();throw error;}
    if(left()<=0){state.status='elapsed';state.timedOut=true;charge();delete report.runningSample;await persist();continue;}
    const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000))),wholeSignal=signal?AbortSignal.any([signal,deadline]):deadline;
+   const cleanupDeadline=AbortSignal.timeout(Math.max(1,Math.ceil((left()+30)*1000)));
    report.runningSample.phase=state.phase;await persist();
    const protectedInputs=async()=>{
     if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
@@ -95,7 +96,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
     await protectedInputs();const allocation=Math.min(cap,left());
     if(allocation<=0)throw Error('Continuation elapsed allocation exhausted');
     const verifySignal=AbortSignal.any([wholeSignal,AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
-    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal,sampleSignal:wholeSignal,sampleStopSignal:deadline,sampleSeconds:left()}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
+    let value=await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:allocation,signal:verifySignal,sampleSignal:wholeSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:left()}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,allocation,verifySignal));
     if(value.exitCode===124||value.outcome?.kind==='timeout'||value.outcome?.reason==='elapsed-timeout')value={...value,correct:null,timedOut:true};
     if(task.kind==='a3-kernel'&&(value.correct||value.exitCode===125))value=await validateKernelReceipt(value,cwd);
     if(task.kind==='a3-kernel'&&value.correct===false){
@@ -123,7 +124,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
      }
      state.phase='actor';report.runningSample.phase=state.phase;await persist();
      const actorSeconds=left()-verificationSeconds,actorDeadline=AbortSignal.timeout(Math.max(1,Math.ceil(actorSeconds*1000))),actorSignal=AbortSignal.any([wholeSignal,actorDeadline]);
-     const observed=await (dependencies.sample??nativeSample)({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[row.arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorSeconds,verificationReserved:verificationSeconds,signal:actorSignal,sampleSignal:wholeSignal,sampleStopSignal:deadline,sampleSeconds:left(),sessionDirectory:home,resumeSession:state.session});
+     const observed=await (dependencies.sample??nativeSample)({cwd,guidance:task.scopes.map(scope=>`## ${scope}\n${inputs[row.arm].files[scope]}`).join('\n\n'),prompt:task.prompt,profile,kind:task.kind,knowledge,seconds:actorSeconds,verificationReserved:verificationSeconds,signal:actorSignal,sampleSignal:wholeSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:left(),sessionDirectory:home,resumeSession:state.session});
      state.actorObservation=observed;state.session=observed.session??state.session;state.actorSessionTotalsIncludeOriginal=true;
      if(observed.unresolvedExecution)throw Object.assign(Error('Continuation target execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      state.actorCompleted=!signal?.aborted;state.actorTimedOut=Boolean(observed.timedOut||actorDeadline.aborted);
