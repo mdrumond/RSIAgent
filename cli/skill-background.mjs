@@ -31,9 +31,11 @@ export function enqueueSkillEvidence(config, task) {
 
 export async function backgroundSkillStatus(config) {
   const evolution = await read(join(config.root, 'skills', 'evolution.json'));
-  if(config.skills?.priority?.enabled&&!evolution?.pending)
-    return (await import('./skill-priority.mjs')).prioritySkillStatus(config);
   const archives = await evaluationArchiveStatus(config,evolution);
+  if(config.skills?.priority?.enabled&&!evolution?.pending){
+    const status=await (await import('./skill-priority.mjs')).prioritySkillStatus(config);
+    return {...status,archives,hasWork:status.hasWork||!config.skills?.tuningDisabled&&archives.hasWork};
+  }
   const pending = evolution?.pending;
   const round = pending && await read(join(pending.evaluationRoot, 'round.json'));
   const state = new State(join(config.root, 'state.sqlite'));

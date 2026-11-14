@@ -28,6 +28,7 @@ async function fixture(t){
 }
 test('one Phase 1 failure drives multiple comparisons without another Phase 2 completion',async t=>{
  const f=await fixture(t);f.add('first',20);f.add('second',10);
+ assert.equal((await backgroundSkillStatus(f.config)).queued,2);
  await runPrioritySkills(f.config,f.values,f.ops);await runPrioritySkills(f.config,f.values,f.ops);
  assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),['first','second']);
  assert.equal(f.backlog.get('first').status,'rejected');assert.equal(f.backlog.get('second').status,'rejected');
@@ -47,6 +48,16 @@ test('partial analysis and ranking timeouts preserve ready work and expose diagn
  await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{f.add('new-ready',90);throw Error('Analysis elapsed');},prioritize:async()=>{throw Error('Ranking elapsed');}});
  assert.equal(f.backlog.get('new-ready').status,'rejected');assert.equal(f.backlog.get('ready').status,'queued');
  const status=await prioritySkillStatus(f.config);assert.equal(status.analysisError.message,'Analysis elapsed');assert.equal(status.rankingError.message,'Ranking elapsed');
+});
+test('a real rejected comparison feeds new diagnostic evidence back into analysis',async t=>{
+ const f=await fixture(t),item=f.add('first-proposal',20);
+ await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async()=>({status:'complete',decision:{promote:false,reason:'insufficient-correctness-improvement'},
+  report:{results:[{projectId:'tail',run:0,arm:'candidate',correct:false,verification:{error:'Tail case differs'}}]}})});
+ const feedback=f.state.db.prepare("SELECT data FROM events WHERE type='skill-hypothesis-rejected'").get();assert(feedback);
+ assert.equal(JSON.parse(feedback.data).hypothesisId,item.id);
+ f.backlog.ingest();const group=f.backlog.failures().find(g=>g.type==='skill-hypothesis-rejected');assert(group);assert.equal(group.occurrences[0].data.diagnostics[0].projectId,'tail');
+ await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{f.add('revised-proposal',90,{proposal:{changes:[{scope:'implementation',text:'Mask the final tile before loading'}]}});}});
+ assert.equal(f.backlog.get('revised-proposal').status,'rejected');
 });
 test('operator pause retains comparison identity, preparation and spent allowance',async t=>{
  const f=await fixture(t),item=f.add('resume',1,{preparation:{proposalElapsedSeconds:12}}),abort=new AbortController();
@@ -119,4 +130,17 @@ test('learned cases must pass real reference and negative controls before admiss
  assert.notEqual(await readFile(result.tasks[0].checker,'utf8'),await readFile(checker,'utf8'));
  const bad=await resolveHypothesisCases({...args,directory:join(f.root,'bad-cases')},deps);
  assert.equal(bad.status,'needs-learning');assert(bad.learningRequest);
+});
+test('revised feedback reuses its frozen qualified cases without another learning project',async t=>{
+ const f=await fixture(t),home=join(f.root,'skills','priority','hypotheses','prior','cases');await mkdir(home,{recursive:true});
+ const checker=join(home,'checker.py');await writeFile(checker,'raise SystemExit(0)\n');
+ const tasks=Array.from({length:5},(_,n)=>({id:'case-'+n,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Repair the answer',files:{'kernel.py':'answer=0\n'},checker}));
+ const path=join(home,'selected.json');await writeFile(path,JSON.stringify({status:'ready',target:'cpu',objective:'correctness',binding:{target:'cpu'},tasks}));
+ const item=f.add('revision',90,{evidence:{groups:[{occurrences:[{data:{hypothesisId:'prior',evaluation:{path}}}]}]}});
+ const args={config:f.config,backlog:f.backlog,item,directory:join(f.root,'revised-cases'),seconds:10};
+ const result=await resolveHypothesisCases(args,{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async()=>({value:{catalogueId:'previous-0',reason:'Same boundary cases for the substantive revision'}}),qualify:()=>{throw Error('Already qualified suite replayed');}});
+ assert.equal(result.status,'ready');assert.equal(result.tasks.length,5);assert.notEqual(result.tasks[0].checker,checker);
+ await writeFile(path,JSON.stringify({status:'ready',target:'a5',objective:'correctness',binding:{target:'a5',environment:{different:true}},tasks}));
+ const incompatible=await resolveHypothesisCases({...args,directory:join(f.root,'incompatible-cases')},{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}})});
+ assert.equal(incompatible.status,'needs-learning');
 });

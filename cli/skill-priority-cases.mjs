@@ -29,12 +29,27 @@ async function learnedCases(config,backlog,item){
  }
  return {suites,errors};
 }
+async function previousCases(config,item){
+ const suites=[],root=await realpath(join(config.root,'skills','priority','hypotheses')).catch(()=>null);
+ if(!root)return suites;
+ const seen=new Set();
+ for(const group of item.evidence?.groups??[])for(const occurrence of group.occurrences??[]){
+  const path=occurrence.data?.evaluation?.path;if(!path||seen.has(path))continue;
+  try{
+   const file=await realpath(path);if(relative(root,file).startsWith('..'))continue;
+   const suite=JSON.parse(await readFile(file,'utf8'));
+   if(suite.status!=='ready'||suite.target!=='cpu'&&JSON.stringify(suite.binding?.environment)!==JSON.stringify(config.environment.options))continue;
+   seen.add(path);suites.push({...suite,id:'previous-'+suites.length,description:'Previously qualified cases for '+occurrence.data.hypothesisId,learned:false});
+  }catch(error){if(error.code!=='ENOENT')throw error;}
+ }
+ return suites;
+}
 export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event},dependencies={}){
  const started=performance.now();
  await mkdir(directory,{recursive:true});
  try{return JSON.parse(await readFile(join(directory,'selected.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const learned=await learnedCases(config,backlog,item);
- let suites=[...(config.skills?.priority?.evaluations??[]),...learned.suites];
+ let suites=[...(config.skills?.priority?.evaluations??[]),...learned.suites,...await previousCases(config,item)];
  if(item.objective==='correctness'){
   const catalogue=await (dependencies.prepareTasks??prepareHypothesisTasks)(join(directory,'cpu'));
   const ids=new Set((item.proposal.changes??[]).map(change=>change.id));

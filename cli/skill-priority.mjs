@@ -1,5 +1,6 @@
 /** Campaign-local failure backlog; one retained hypothesis owns the background slot. */
 import {mkdir} from 'node:fs/promises';
+import {readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {State} from '../controller/state.mjs';
 import {SkillBacklog} from '../controller/skill-backlog.mjs';
@@ -24,7 +25,8 @@ export async function prioritySkillStatus(config){
   const status=backlog.status(),items=['queued','learning','needs-review','user-required'].flatMap(s=>backlog.list({status:s,limit:20})).sort((a,b)=>b.priority-a.priority),
    active=backlog.list({status:'running',limit:1})[0],run=active&&backlog.run(active.id);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
-  return {...status,pending:Boolean(active),resource:run?.checkpoint?.resource,unresolved:Boolean(run?.checkpoint?.unresolved),
+  const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
+  return {...status,queued,evaluationStatus:active?'running':queued?'deferred':'idle',pending:Boolean(active),resource:run?.checkpoint?.resource,unresolved:Boolean(run?.checkpoint?.unresolved),
    analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
@@ -100,7 +102,17 @@ export async function runPrioritySkills(config,values,dependencies={}){
   checkpoint.runningAt=Date.now();save();timer=setInterval(save,1000);
   if(left()<=30){delete checkpoint.runningAt;save();return backlog.finish(run.id,{status:'inconclusive',result:{reason:'hypothesis-elapsed'}});}
   const budget=AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000))),signal=values.signal?AbortSignal.any([values.signal,budget]):budget;
-  const finish=(status,result)=>{delete checkpoint.runningAt;save();return backlog.finish(run.id,{status,result});};
+  const finish=(status,result)=>{
+   delete checkpoint.runningAt;save();
+   const report=result?.report,diagnostics=report?.results?.filter(r=>r.correct!==true).map(r=>({projectId:r.projectId,run:r.run,arm:r.arm,correct:r.correct,timedOut:r.timedOut,
+    error:r.verification?.error,output:String(r.verification?.output??'').slice(-2000),stderr:String(r.verification?.error??'').slice(-2000)}));
+   const feedback=['rejected','inconclusive'].includes(status)&&report?.results?.length?{hypothesisId:item.id,groupIds:item.groupIds,objective:item.objective,
+    evaluation:{path:join(home,'cases','selected.json')},previousProposal:checkpoint.prepared?.proposal??item.proposal,reason:result.decision?.reason??result.reason,diagnostics,
+    coverage:report.results.length,metrics:result.decision?.tasks??result.decision?.passes}:null;
+   const path=join(home,'feedback.json');
+   if(feedback){const bytes=JSON.stringify(feedback,null,2)+'\n';try{writeFileSync(path,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||readFileSync(path,'utf8')!==bytes)throw error;}}
+   return backlog.atomic(()=>{const done=backlog.finish(run.id,{status,result});if(feedback)state.event(null,'skill-hypothesis-rejected',{...feedback,evidence:{path}});return done;});
+  };
   if(!checkpoint.prepared){
    checkpoint.prepared=await ops.prepare({config,backlog,item,directory:join(home,'prepare'),signal,remainingSeconds:left()});save();
   }
