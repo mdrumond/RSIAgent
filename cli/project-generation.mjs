@@ -6,6 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import { validateAcceptance } from '../controller/state.mjs';
 import { currentCampaignEntry, generationSettings } from '../controller/progress.mjs';
 import { curriculumSession } from './curriculum.mjs';
+import {claimLearningRequest} from '../controller/skill-review.mjs';
 import { createEnvironment } from '../integrations/environments/index.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectBundle,bundleHashes} from './project-bundle.mjs';
@@ -14,11 +15,11 @@ import {compileVerifierEntries,entrypointCommand} from '../controller/project-co
 const reply=text=>({content:[{type:'text',text}],details:{}});
 const inside=(root,file)=>file===root || file.startsWith(root+sep);
 const entrypoint=Type.Object({entrypoint:Type.String({minLength:1}),args:Type.Array(Type.String())});
-const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1}),
-  verifier:Type.Object({files:Type.Array(Type.String(),{minItems:1}),command:entrypoint,
+const schema=Type.Object({goal:Type.String({minLength:1}),performance_goal:Type.Optional(Type.Unknown()),source:Type.String({minLength:1,description:'Relative DIRECTORY containing the editable PyTorch starter; not a Python file path.'}),
+  verifier:Type.Object({files:Type.Array(Type.String({description:'Trusted verifier entrypoint/helper/data FILE outside every source, reference and negative-control directory. Fixture contents are bundled automatically; do not list them here.'}),{minItems:1}),command:entrypoint,
     performance_command:Type.Optional(entrypoint),baseline_command:Type.Optional(entrypoint)}),
   construction_command:Type.Optional(entrypoint),baseline_construction_command:Type.Optional(entrypoint),
-  reference:Type.String({minLength:1}),negative_controls:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})});
+  reference:Type.String({minLength:1,description:'Relative DIRECTORY containing the independent CPU reference; not a Python file path.'}),negative_controls:Type.Array(Type.String({minLength:1,description:'Relative DIRECTORY containing an incorrect implementation with the same candidate interface.'}),{minItems:1,maxItems:8})});
 
 // Same bounded event contract as State, scoped exclusively to generation telemetry.
 export function generationEventState(db) {
@@ -75,7 +76,7 @@ async function artifact(root,name,directory=false) {
   const file=await realpath(resolve(root,name));
   if(!inside(await realpath(root),file))throw new Error('Draft artifact escapes its directory');
   const info=await stat(file);
-  if(directory?!info.isDirectory():!info.isFile())throw new Error('Invalid draft artifact: '+name);
+  if(directory?!info.isDirectory():!info.isFile())throw new Error(`Draft artifact ${JSON.stringify(name)} must be a ${directory?'directory':'file'}, but ${JSON.stringify(file)} is ${info.isDirectory()?'a directory':info.isFile()?'a file':'another artifact type'}`);
   return file;
 }
 async function checkProposal(root,p) {
@@ -85,8 +86,30 @@ async function checkProposal(root,p) {
   const trees=[source,reference,...negatives];
   if(trees.some((a,i)=>trees.some((b,j)=>i!==j&&(inside(a,b)||inside(b,a)))))
     throw new Error('Source, reference and controls must be separate trees');
-  if(files.some(f=>trees.some(tree=>inside(tree,f))))throw new Error('Verifier must be outside editable fixtures');
+  const fixtureFiles=files.flatMap(file=>trees.filter(tree=>inside(tree,file)).map(tree=>({file,fixtureDirectory:tree})));
+  if(fixtureFiles.length)throw new Error('Remove fixture-owned files from verifier.files; fixture directories are bundled automatically. Only trusted verifier entrypoints/helpers/data outside every fixture directory belong in verifier.files. Offending files: '+JSON.stringify(fixtureFiles));
   return {source,reference,negatives,files};
+}
+
+export {schema as generationProposalSchema};
+// Shared production admission checks; the oracle uses the identical path.
+export async function compileGenerationProposal(root,p,requirements={}){
+  if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command))
+    throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
+  if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
+    throw new Error('Generated performance project requires verifier.baseline_command');
+  const artifacts=await checkProposal(root,p);
+  const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
+  validateAcceptance({...p,verifier});
+  if(p.verifier?.performance_command&&!p.baseline_construction_command)
+    throw new Error('Generated performance project requires baseline_construction_command');
+  const baseline=p.baseline_construction_command===undefined?undefined:
+    compileVerifierEntries({command:p.baseline_construction_command},{root,files:artifacts.files,required:true});
+  if(baseline&&baseline.entrypoints.command.entrypoint!==verifier.entrypoints.baseline_command?.entrypoint)
+    throw new Error('CPU baseline selftest must use the frozen baseline_command entrypoint');
+  const construction=p.construction_command===undefined?verifier:
+    compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
+  return {artifacts,verifier,baseline,construction};
 }
 
 // Returns staged specs. The caller imports artifacts, admits to State, and updates
@@ -141,8 +164,12 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
       // One bounded batch per call; rejected proposals cannot spin a provider loop.
       d={id:'generated-'+randomUUID(),batch,status:'draft',phase,campaign_entry,seconds,elapsed:0,
         topic};
+      const atomic=!state.db.isTransaction;if(atomic)state.db.exec('BEGIN IMMEDIATE');
+      try{
+        if(phase==='phase1')d.learningRequest=claimLearningRequest(state,config,{draft:d.id,topic,target:config.target});
+        store.save(d);if(atomic)state.db.exec('COMMIT');
+      }catch(error){if(atomic)state.db.exec('ROLLBACK');throw error;}
       if(quota)reserve(topic,1);
-      store.save(d);
     }
     if(d.status==='ready'){result.push(d.spec);continue;}
     const root=join(resolve(path),d.id);await mkdir(root,{recursive:true});
@@ -167,7 +194,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           `Retain performance goals requested by the curriculum as performance_goal with verifier.performance_command. For every performance command provide verifier.baseline_command: a target-only self-test that executes the SAME PyTorch baseline callable and placement path used by performance_command over ALL frozen timing cases, including warmup and timing calls. It must compare baseline results to the independent reference, run without an optimized candidate, and exit 0 only when all baseline cases execute correctly. The controller runs this gate on the target before starting the actor; do not run it during curriculum construction. For every performance command also submit baseline_construction_command as {entrypoint,args}, using the SAME frozen entrypoint as baseline_command and SAME baseline callable/dependency path with a tiny CPU fixture. This is only a small dependency/numerical selftest: no timing, warmups, repetitions or replay of expensive target timing cases. Do not invent performance requirements or claim CPU construction proves timing.\n`+
           (requirements.performance?`This topic requires a real performance_goal, verifier.performance_command and a separate CPU construction_command.\n`:'')+
           (requirements.capabilityEvidence?`SIMT is the actor's optimization objective. Specify deferred target acceptance that requires actual supported ${config.kernel_language??'target'} SIMT APIs/compiler mapping and comparison against an equivalent non-SIMT/vector baseline on an isolated device. Do not implement or benchmark either device kernel during curriculum construction. CPU construction cannot establish SIMT or timing evidence.\n`:'')+
-          `${generation.preprompt??''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
+          `${generation.preprompt??''}\n${d.learningRequest?'Learning request (preserve this topic requirements): '+JSON.stringify(d.learningRequest):''}\nTarget: ${JSON.stringify(config.target??null)}. Actor elapsed allocation: ${config.actor_seconds}.\n`+
           `Use the existing KDB tools and baseline skills at ${join(config.root,'skills','versions',config.skills?.activeVersion??'baseline')}.\n`+
           `Keep the complete project in one dedicated subdirectory, including all verifier helpers, reference data and negative controls, so it can be imported and staged independently of this generation session. List any dependencies outside that project subdirectory explicitly in verifier.files. `+
           `Create separate directories for editable source, an independently implemented trusted CPU reference, and incorrect negative controls. `+
@@ -181,21 +208,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           execute:async(_id,p)=>{
             const checks=[];
             try {
-              if(requirements.performance&&(p.performance_goal==null||!p.verifier?.performance_command||!p.construction_command))
-                throw new Error('Topic requires a performance goal, target performance command and separate CPU construction command');
-              if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
-                throw new Error('Generated performance project requires verifier.baseline_command');
-              const artifacts=await checkProposal(root,p);
-              const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
-              validateAcceptance({...p,verifier});
-              if(p.verifier?.performance_command&&!p.baseline_construction_command)
-                throw new Error('Generated performance project requires baseline_construction_command');
-              const baseline=p.baseline_construction_command===undefined?undefined:
-                compileVerifierEntries({command:p.baseline_construction_command},{root,files:artifacts.files,required:true});
-              if(baseline&&baseline.entrypoints.command.entrypoint!==verifier.entrypoints.baseline_command?.entrypoint)
-                throw new Error('CPU baseline selftest must use the frozen baseline_command entrypoint');
-              const construction=p.construction_command===undefined?verifier:
-                compileVerifierEntries({command:p.construction_command},{root,files:artifacts.files,required:true});
+              const {artifacts,verifier,baseline,construction}=await compileGenerationProposal(root,p,requirements);
               const constructionCommand=entrypointCommand(construction.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;
@@ -229,7 +242,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
                 target:config.target,...(p.performance_goal!=null?{performance_goal:p.performance_goal}:{}),
                 bundle:{...packaged.bundle,validate_starter:true,...(baseline?{baseline_construction_command:entrypointCommand(baseline.entrypoints.command)}:{}),seconds:Math.max(.001,d.seconds-spent())},
                 verifier:{...verifier,files:artifacts.files,hashes},
-                generation:{draft:d.id,topic:d.topic,requirements,checks}};
+                generation:{draft:d.id,topic:d.topic,requirements,checks,...(d.learningRequest?{learningRequest:d.learningRequest}: {})}};
               d.proposal=p;d.status='ready';delete d.error;checkpoint();
               return reply('Project validated and accepted; finish without further tool calls.');
             }catch(error){

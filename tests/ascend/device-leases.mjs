@@ -179,3 +179,12 @@ test('peer closure during native observation is positive proof rather than a mis
   });
   assert.equal(result.closed,true);assert.ok(await reserveDevice('pool',0,directory));
 });
+test('wrapper closure confirms only the matching token-owned lost submission',async t=>{
+ const lease=await reserveDevice('wrapper-proof',0,await root(t));
+ await lease.event('execution-submitting',{submission:'missing',kind:'run',receiptFile:'/owned/submission.json',accountingExcluded:false});
+ await lease.event('execution-submitting',{submission:'other',kind:'run',receiptFile:'/other/submission.json',accountingExcluded:false});
+ const proof={submission:'missing',receiptFile:'/owned/submission.json',closed:true,timingKey:'random-nonce',admissionToken:lease.token,admission:{token:lease.token,decision:'admitted',released:true},nativeIdentityMissing:true};
+ for(const changed of [{admissionToken:'foreign'},{receiptFile:'/other/submission.json'},{admission:{token:lease.token,decision:'admitted',released:false}}])assert.equal(await lease.confirmSubmissionClosed({...proof,...changed}),false);
+ assert.equal(await lease.confirmSubmissionClosed(proof),true);
+ const record=JSON.parse(await readFile(lease.receipt,'utf8'));assert.equal(record.submissions[0].closed,true);assert.equal(record.submissions[1].closed,undefined);assert.deepEqual(record.handles,[]);
+});

@@ -103,7 +103,7 @@ async function readEntries(directory) {
   }
 }
 
-async function writeVersion(root, entries, source) {
+export async function writeVersion(root, entries, source) {
   const version = randomUUID();
   const directory = join(root, 'skills', 'versions', version);
   await cp(source, directory, { recursive: true, errorOnExist: true, force: false });

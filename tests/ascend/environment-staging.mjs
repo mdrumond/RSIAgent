@@ -100,8 +100,19 @@ async function fixture(t) {
     return output;
   };
   return { root, source, workspace, sdk, environment, control, context, options, calls, events,
-    connect, run, sourceUploads, manifests, runs, excluded, idle: () => Promise.all([...jobs.values()].map(job => job.done)) };
+    connect, run, sourceUploads, manifests, runs, excluded, client:clientFor(workspace),idle: () => Promise.all([...jobs.values()].map(job => job.done)) };
 }
+
+test('preparation cancellation scope does not poison later independent verification',async t=>{
+ const f=await fixture(t),parent=new AbortController(),actor=new AbortController(),seen=[];
+ const env=await createEnvironment(f.options,{...f.context,signal:parent.signal,client:async(args,options)=>{seen.push({operation:args[0],signal:options.signal});return f.client(args,options);}});
+ const verifier=join(f.root,'verifier.py');await writeFile(verifier,'# independent verifier\n');
+ const request={project:{id:'reserved',source:f.source,verifier:{files:[verifier]}},attempt:{id:'reserved'},signal:actor.signal};
+ await env.prepare(request);assert.ok(seen.length>=3);assert.ok(seen.every(x=>x.signal===actor.signal));
+ actor.abort();assert.equal(parent.signal.aborted,false);
+ assert.equal(await f.run('printf verified',env,{signal:parent.signal}),'verified');
+ const calls=seen.length;await assert.rejects(env.prepare(request),{name:'AbortError'});assert.equal(seen.length,calls);
+});
 
 test('retained investigations stage their own verifier despite obsolete parent bundle metadata',async t=>{
   const f=await fixture(t),root=join(f.root,'investigation'),source=join(root,'source');
