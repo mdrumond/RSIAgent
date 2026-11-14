@@ -99,7 +99,11 @@ print(json.dumps(out))
  await writeFile(producer,`import {queueDeviceCleanup} from ${JSON.stringify(module)};console.log(JSON.stringify(await queueDeviceCleanup(${JSON.stringify(directory)},${JSON.stringify(job)})));`);
  const producerChild=spawn(globalThis.process.execPath,[producer],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';producerChild.stdout.on('data',chunk=>stdout+=chunk);producerChild.stderr.on('data',chunk=>stderr+=chunk);const [code]=await once(producerChild,'exit');assert.equal(code,0,stderr);
  const submitted=JSON.parse(stdout.trim());assert.ok(submitted.owner?.pid);assert.notEqual(submitted.owner.pid,producerChild.pid);
- const {ownerStopped}=await import('../../controller/lifecycle.mjs');let cleanupOwner=submitted.owner;t.after(async()=>{if(!await ownerStopped(cleanupOwner))globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');});
+ const {ownerStopped}=await import('../../controller/lifecycle.mjs');let cleanupOwner=submitted.owner;t.after(async()=>{
+  if(await ownerStopped(cleanupOwner))return;
+  try{globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');}
+  catch(error){if(error.code!=='ESRCH'||!await ownerStopped(cleanupOwner))throw error;}
+ });
  assert.equal(await ownerStopped(submitted.owner),false);
  const until=async(check,phase)=>{
   while(Date.now()<job.deadline){if(await check())return;await delay(25);}

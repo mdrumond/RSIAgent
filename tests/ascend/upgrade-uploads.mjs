@@ -194,3 +194,25 @@ test('failed staged activation restores archived machinery and leaves attempt ev
   assert.equal(await fs.readFile(join(f.instance, 'machinery/controller/marker.mjs'), 'utf8'), 'old');
   assert.deepEqual(await f.snapshot(), before);
 });
+
+for(const kind of ['active-own','active-other','expired-own'])test(`public upgrade respects cleanup writer ownership: ${kind}`,async t=>{
+ const f=await fixture(t);f.state.finish(f.attempt.id,'failed');
+ const {queueDeviceCleanup,drainDeviceCleanup}=await import('../../integrations/environments/device-cleanup.mjs');
+ const {main}=await import('../../cli/main.mjs');
+ const directory=join(f.instance,'cleanup-queue'),other=join(f.instance,'other-campaign');await fs.mkdir(other);
+ const campaignRoot=kind==='active-other'?other:f.instance;let ticket;
+ await queueDeviceCleanup(directory,{id:'retained-cleanup',token:'retained-cleanup',receipt:'retained-receipt',pointer:'retained-pointer',
+  campaignRoot,deadline:Date.now()+(kind==='expired-own'?-1:30000)},
+  {launch:async(_directory,key)=>{ticket=key;return processIdentity();}});
+ // Another campaign can share the service while this instance has no live jobs.
+ if(kind==='active-other')await fs.copyFile(join(other,'device-cleanup-service.json'),join(f.instance,'device-cleanup-service.json'));
+ if(kind==='expired-own')await drainDeviceCleanup(directory,ticket,{run:async()=>{throw Error('Expired job must not run');}});
+ const action=join(f.instance,'upgrade.json');await fs.writeFile(action,JSON.stringify({machinery:f.release}));
+ const run=()=>main(['upgrade','--instance',f.instance,'--config',action]);
+ if(kind==='active-own'){
+  await assert.rejects(run(),/active device cleanup writers/);
+  assert.equal(await fs.readFile(join(f.instance,'machinery/controller/marker.mjs'),'utf8'),'old');
+ }else{
+  await run();assert.equal(await fs.readFile(join(f.instance,'machinery/controller/marker.mjs'),'utf8'),'new');
+ }
+});
