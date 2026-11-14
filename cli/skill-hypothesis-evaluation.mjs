@@ -23,6 +23,36 @@ export function prepareHypothesisEvaluation({objective,target,tasks,binding}){
  }catch(error){return {status:'unsupported',reason:error.message};}
 }
 
+// One admitted process runs trusted controls sequentially; it never invokes a model or transport.
+async function trustedBatch({cwd,checker,entries,seconds},execute){
+ await mkdir(cwd,{recursive:true});const plan=[];
+ for(const entry of entries){const source=join(cwd,entry.cwd),expected={};await mkdir(source,{recursive:true});
+  for(const [name,text]of Object.entries(entry.files)){const path=resolve(source,name),rel=relative(source,path);if(!rel||rel==='..'||rel.startsWith('../'))throw Error('Batch source escapes its control directory');await mkdir(dirname(path),{recursive:true});await writeFile(path,text);expected[name]=hash(text);}
+  plan.push({...entry,files:undefined,expected,checkerSha256:hash(entry.checker)});
+ }
+ const script=`import sys,json,base64,pathlib,subprocess,time,tempfile,hashlib
+plan=json.loads(base64.b64decode('${Buffer.from(JSON.stringify(plan)).toString('base64')}')); root=pathlib.Path(sys.argv[1]).resolve(); start=time.monotonic()
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+with tempfile.TemporaryDirectory(prefix='rsi-check-') as temporary:
+ for i,c in enumerate(plan):
+  source=root/c['cwd']; checker=pathlib.Path(temporary)/(str(i)+'.py'); checker.write_text(c['checker']); before={n:sha(source/n) for n in c['expected']}; left=${seconds}-(time.monotonic()-start)
+  if left<=0: break
+  command=[sys.executable,str(checker),*c['args']]; begun=time.monotonic()
+  try:
+   p=subprocess.run(command,cwd=source,capture_output=True,text=True,errors='replace',timeout=min(180,left)); code=p.returncode; output=p.stdout; error=p.stderr
+  except subprocess.TimeoutExpired:
+   code=None; output=''; error='Control elapsed allocation exhausted'
+  after={n:sha(source/n) for n in c['expected']}
+  print(json.dumps({'key':c['key'],'exitCode':code,'output':output[-8192:],'error':error[-2048:],'elapsedSeconds':time.monotonic()-begun,'command':command,'checkerSha256':sha(checker),'sourceFilesSha256':after,'sourceFilesMatch':before==c['expected'] and after==c['expected']}),flush=True)
+  if code is None: break
+`;
+ await mkdir(dirname(checker),{recursive:true});await writeFile(checker,script);const result=await execute();
+ if(result.exitCode!==0)throw Error('Trusted batch command failed');
+ const rows=result.output.trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));const keys=new Set();
+ for(const row of rows){const entry=plan.find(e=>e.key===row.key);if(!entry||keys.has(row.key)||!row.sourceFilesMatch||row.checkerSha256!==entry.checkerSha256)throw Error('Batch control source, checker or identity changed');keys.add(row.key);row.correct=row.exitCode===0;row.handle=result.handle;row.outputEvidence=result.outputEvidence;}
+ return rows;
+}
+
 // Existing Ascend environment owns health, masks, leases, cancellation and CPL transport.
 export function hypothesisTarget({root,binding,resource,signal,stopSignal,localExecution,event:externalEvent},dependencies={}){
  const contexts=new Map(),factory=dependencies.createEnvironment??createEnvironment;
@@ -39,7 +69,7 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
   return {env,outputs,checker:preparedChecker,instructions:env.instructions??''};
  };
  const command=async(context,text,cwd,seconds,workSignal,cleanupSignal,purpose)=>{
-  let output='';const result=await context.env.execute(text,cwd,{timeout:seconds,signal:workSignal,stopSignal:cleanup(cleanupSignal),purpose,onData:d=>{output=(output+d).slice(-65536);}});
+  let output='';const result=await context.env.execute(text,cwd,{timeout:seconds,signal:workSignal,stopSignal:cleanup(cleanupSignal),purpose,onData:d=>{output=(output+d).slice(-1048576);}});
   if(!result.settled)throw Object.assign(Error('Hypothesis execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:result.handle});
   const files=context.outputs.get(result.handle);if(files?.stdout)output=await readFile(files.stdout,'utf8');
   if(environmentOptions.mode!=='local'&&!files?.stdout)throw Error('Trusted target output unavailable: '+result.handle);
@@ -55,6 +85,24 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
   verify:async args=>{
    let context=contexts.get(args.cwd);if(!context){context=await make(args.cwd,join(dirname(args.cwd),'target'),args.checker,args.signal,args.sampleStopSignal??stopSignal);contexts.set(args.cwd,context);}
    return command(context,[binding.python??'python3',context.checker,'.'].map(quote).join(' '),args.cwd,args.seconds,args.signal,args.sampleStopSignal??stopSignal,'verification');
+  },
+  qualifyBatch:async args=>{
+   const cwd=join(args.directory,'micro','qualification','0-batch','work'),checker=join(args.directory,'micro','frozen','qualification-batch.py');
+   return trustedBatch({cwd,checker,entries:args.entries,seconds:args.seconds},async()=>{
+    const begun=performance.now(),context=await make(cwd,join(dirname(cwd),'target'),checker,args.signal,args.sampleStopSignal),left=args.seconds-(performance.now()-begun)/1000;
+    if(left<=0)throw Error('Batch qualification elapsed allocation exhausted during preparation');
+    return command(context,[binding.python??'python3',context.checker,'.'].map(quote).join(' '),cwd,left,args.signal,args.sampleStopSignal,'verification');
+   });
+  },
+  measureBatch:async args=>{
+   const home=join(args.directory,'paired-target','batch-0'),cwd=join(home,'source'),checker=join(args.directory,'frozen','paired-batch.py'),entries=[];
+   for(const pair of args.pairs){const files={};for(const arm of ['active','candidate'])for(const name of Object.keys(pair.task.files))files[arm+'/'+name]=await readFile(join(pair[arm],name),'utf8');entries.push({key:pair.task.id+'/'+pair.run,cwd:pair.task.id+'-'+pair.run,files,checker:pair.task.pairedChecker,args:['active','candidate']});}
+   const rows=await trustedBatch({cwd,checker,entries,seconds:args.seconds},async()=>{
+    const begun=performance.now(),context=await make(cwd,join(home,'target'),checker,args.signal,stopSignal),left=args.seconds-(performance.now()-begun)/1000;
+    if(left<=0)throw Error('Batch paired replay elapsed allocation exhausted during preparation');
+    return command(context,[binding.python??'python3',context.checker,'.'].map(quote).join(' '),cwd,left,args.signal,stopSignal,'performance');
+   });
+   return rows.map(row=>{const pair=args.pairs.find(p=>p.task.id+'/'+p.run===row.key);return {...row,projectId:pair.task.id,run:pair.run};});
   },
   measure:async args=>{
    const evaluation=dirname(dirname(dirname(args.active))),home=join(evaluation,'paired-target',args.task.id+'-'+args.run),cwd=join(home,'source');await mkdir(cwd,{recursive:true});
@@ -149,6 +197,22 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
  await save(join(directory,'hypothesis.json'),{identity,target,binding:runtimeBinding});report.owner=await processIdentity();await persist();
  const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),ops=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal,stopSignal:cleanup,localExecution:config.local_execution},dependencies);
  try{
+  if(target!=='cpu'&&!dependencies.verify){
+   const entries=[];for(const task of frozen)for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){const key=task.id+'/0/'+arm;if(!report.results.some(r=>r.key===key))entries.push({key,cwd:task.id+'-'+arm,files:{...task.files,...control.files},checker:task.checker,args:['.'],expectedExit});}
+   if(entries.length){
+    const seconds=available()-30;if(seconds<=0)return {status:'blocked',reason:'Qualification elapsed allocation exhausted',identity,receipts:report.results};
+    report.runningSample={key:'qualification/0/batch',owner:report.owner};await persist();const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),work=signal?AbortSignal.any([signal,deadline]):deadline;let rows;
+    try{rows=await ops.qualifyBatch({directory,entries,seconds,signal:work,sampleStopSignal:cleanup});}
+    catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;if(signal?.aborted)throw error;report.status='blocked';report.reason=error.message;return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    delete report.runningSample;signal?.throwIfAborted();
+    for(const row of rows){const entry=entries.find(e=>e.key===row.key),cwd=join(micro,'qualification','0-batch','work',entry.cwd);let verification=row;
+     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false});}catch(error){verification={correct:null,error:error.message};}
+     const passed=!deadline.aborted&&row.exitCode===entry.expectedExit&&verification.correct===(entry.expectedExit===0);report.results.push({key:row.key,expectedExit:entry.expectedExit,passed,sourceSha256:hash(entry.files),elapsedSeconds:row.elapsedSeconds,verification});await persist();
+    }
+    if(rows.length!==entries.length||report.results.some(r=>!r.passed)){report.status='blocked';report.reason='Reference or negative control did not qualify';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+   }
+   report.status='qualified';return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
+  }
   for(const task of frozen){const checker=join(micro,'frozen',task.id+'.py');await writeFile(checker,task.checker);
    for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){
     const key=task.id+'/0/'+arm;if(report.results.some(r=>r.key===key))continue;signal?.throwIfAborted();

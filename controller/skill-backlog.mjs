@@ -9,10 +9,23 @@ const semantic=(value,evidence=false)=>{
  if(Array.isArray(value)){const rows=value.map(v=>semantic(v,evidence));return evidence?[...new Map(rows.map(v=>[JSON.stringify(v),v])).entries()].sort(([a],[b])=>a.localeCompare(b)).map(([,v])=>v):rows;}
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([k])=>
   !/^(reference|references|evidenceRefs|groupIds|attemptId|draftId|projectId|created|elapsed|count|occurrences|firstSeen|lastSeen)$/.test(k)&&
-  !(evidence&&/^(path|copiedPath|snapshotPath|archive|proposalDirectory|proposalElapsedSeconds)$/.test(k))).map(([k,v])=>[k,semantic(v,evidence)]));
+  !(evidence&&/^(path|copiedPath|snapshotPath|archive|proposalDirectory|proposalElapsedSeconds|classification|classifications)$/.test(k))).map(([k,v])=>[k,semantic(v,evidence)]));
  return typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>'):value;
 };
-const fingerprint=item=>hash([item.objective,item.skill,semantic(item.proposal),diagnosticIdentity({data:semantic(item.evidence,true)}),item.base,semantic(item.tests??item.evaluation??null,true)]);
+const pick=(value,keys)=>Object.fromEntries(keys.filter(key=>Object.hasOwn(value,key)).map(key=>[key,value[key]]));
+function proposalIdentity(proposal){
+ if(proposal?.action==='update')return {action:'update',changes:(proposal.changes??[]).map(change=>pick(change,['action','id','scope','text','critical','negative','response']))};
+ if(proposal?.action==='learn')return pick(proposal,['action','question','hypothesis','requiredEvidence','learningTarget','target','topic']);
+ return proposal?.action==='no-change'?{action:'no-change'}:proposal;
+}
+function evidenceIdentity(item){
+ const evidence=item.evidence;if(!evidence||!Array.isArray(evidence.memoryEvidence))return evidence;
+ const memoryEvidence=evidence.memoryEvidence.map(entry=>({ref:entry.ref??(entry.collection?`${entry.collection}:${entry.entry_id??entry.chunk_id??entry.id}`:entry.entry_id??entry.chunk_id??entry.id),
+  text:entry.text??entry.content,sha256:entry.sha256??entry.contentHash??entry.hash}));
+ const cited=item.proposal?.memoryRefs;
+ return {...evidence,memoryEvidence:Array.isArray(cited)?memoryEvidence.filter(entry=>cited.includes(entry.ref)):memoryEvidence};
+}
+const fingerprint=item=>hash([item.objective,item.skill,semantic(proposalIdentity(item.proposal)),diagnosticIdentity({data:semantic(evidenceIdentity(item),true)}),item.base,semantic(item.tests??item.evaluation??null,true)]);
 const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0
  WHEN type='execution-state' THEN CASE WHEN json_valid(data) THEN json_extract(data,'$.state')='stopped' AND COALESCE(json_extract(data,'$.accountingExcluded'),0)=0 AND
  (COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0 OR json_extract(data,'$.nativeState')='failed') ELSE 0 END ELSE

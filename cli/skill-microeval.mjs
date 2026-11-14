@@ -220,7 +220,34 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
  report.pairedReplay??={startedAt:Date.now(),seconds};
  if(report.pairedReplay.seconds!==seconds)throw Error('Paired replay allocation changed');
  report.pairedTimings??=[];await save(join(directory,'results.json'),report);
- for(const task of tasks)for(let run=0;run<report.runs;run++){
+ const record=async(task,run,paths,pair,measured)=>{
+  const receipt=measured.output!==undefined?lastReceipt(measured.output):measured;
+  if(measured.exitCode!==undefined&&measured.exitCode!==0)throw Error('Paired checker failed');
+  if(receipt.correct!==true||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid paired verification receipt');
+  for(const arm of ['active','candidate'])if(receipt[arm+'KernelSha256']!==pair[arm].kernelSha256||!Number.isFinite(receipt[arm+'LatencySeconds'])||receipt[arm+'LatencySeconds']<=0)throw Error('Invalid paired timing identity or latency');
+  for(const arm of ['active','candidate']){
+   if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed during paired replay');
+   for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed during replay: '+name);
+  }
+  report.pairedTimings.push({...receipt,...(measured.handle?{verification:{handle:measured.handle,command:measured.command,checkerSha256:measured.checkerSha256,sourceFilesMatch:measured.sourceFilesMatch,sourceFilesSha256:measured.sourceFilesSha256,outputEvidence:measured.outputEvidence}}:{}),projectId:task.id,run});await save(join(directory,'results.json'),report);
+ };
+ if(dependencies.measureBatch){
+  const pending=[];
+  for(const task of tasks)for(let run=0;run<report.runs;run++){
+   const pair=Object.fromEntries(['active','candidate'].map(arm=>[arm,report.results.find(r=>r.taskId===task.id&&r.run===run&&r.arm===arm)]));if(!pair.active?.correct||!pair.candidate?.correct)continue;
+   if(!task.pairedChecker)throw Error('Frozen paired checker required');const paths=Object.fromEntries(['active','candidate'].map(arm=>[arm,join(directory,task.id,`${run}-${arm}`,'work')]));
+   for(const arm of ['active','candidate']){if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed before paired replay');for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed: '+name);}
+   if(!report.pairedTimings.some(r=>r.projectId===task.id&&r.run===run))pending.push({task,run,...paths,pair});
+  }
+  const left=seconds-(Date.now()-report.pairedReplay.startedAt)/1000;
+  if(pending.length&&left>0){
+   signal?.throwIfAborted();report.pairedReplay.runningPair={projectId:'batch',run:0,owner:await processIdentity()};await save(join(directory,'results.json'),report);let rows;
+   try{rows=await dependencies.measureBatch({directory,pairs:pending,seconds:left,signal});}
+   catch(error){const unknown=unknownExecution(error);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);throw error;}
+   delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);signal?.throwIfAborted();const seen=new Set();
+   for(const measured of rows){const job=pending.find(p=>p.task.id===measured.projectId&&p.run===measured.run),key=measured.projectId+'/'+measured.run;if(!job||seen.has(key))throw Error('Unknown or duplicate paired batch receipt');seen.add(key);await record(job.task,job.run,{active:job.active,candidate:job.candidate},job.pair,measured);}
+  }
+ }else for(const task of tasks)for(let run=0;run<report.runs;run++){
   signal?.throwIfAborted();
   const left=seconds-(Date.now()-report.pairedReplay.startedAt)/1000;
   const pair=Object.fromEntries(['active','candidate'].map(arm=>[arm,report.results.find(r=>r.taskId===task.id&&r.run===run&&r.arm===arm)]));
@@ -235,15 +262,7 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
   let measured;try{measured=dependencies.measure?await dependencies.measure({task,run,...paths,seconds:left,signal}):await kernelCheck(python,checker,directory,left,signal,[paths.active,paths.candidate]);}
   catch(error){const unknown=unknownExecution(error);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}throw error;}
   delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);
-  const receipt=measured.output!==undefined?lastReceipt(measured.output):measured;
-  if(measured.exitCode!==undefined&&measured.exitCode!==0)throw Error('Paired checker failed');
-  if(receipt.correct!==true||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid paired verification receipt');
-  for(const arm of ['active','candidate'])if(receipt[arm+'KernelSha256']!==pair[arm].kernelSha256||!Number.isFinite(receipt[arm+'LatencySeconds'])||receipt[arm+'LatencySeconds']<=0)throw Error('Invalid paired timing identity or latency');
-  for(const arm of ['active','candidate']){
-   if(hash(await readFile(join(paths[arm],'kernel.py')))!==pair[arm].kernelSha256)throw Error('Sample kernel changed during paired replay');
-   for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed during replay: '+name);
-  }
-  report.pairedTimings.push({...receipt,projectId:task.id,run});await save(join(directory,'results.json'),report);
+  await record(task,run,paths,pair,measured);
  }
  report.decision=evaluateSkillObjective(report.results,{objective:report.objective,projectIds:tasks.map(t=>t.id),runs:report.runs,pairedTimings:report.pairedTimings});
  await save(join(directory,'results.json'),report);return report;
