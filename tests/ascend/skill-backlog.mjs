@@ -45,6 +45,24 @@ test('fresh diagnostics bypass historical telemetry and watermarks resume after 
  assert.equal(reopened.status().failures,1);assert.equal(reopened.status().ingestion.freshPending,false);
 });
 
+test('terminal command failures remain evidence after successful recovery, excluding polls and controls',async t=>{
+ const{b,event,attempt}=await fixture(t);attempt('recovered','phase1','passed');
+ event('execution-state',{state:'running',exitCode:1},'recovered');
+ event('execution-state',{state:'stopped',exitCode:1,accountingExcluded:true},'recovered');
+ event('execution-state',{state:'stopped',exitCode:1,purpose:'resource-health'},'recovered');
+ event('execution-state',{state:'stopped',exitCode:1,expected_exit:1},'recovered');
+ event('execution-state',{state:'stopped',exitCode:1,handle:'native:failed-compile',message:'Compiler rejected stride'},'recovered');
+ event('execution-state',{state:'stopped',exitCode:0},'recovered');b.ingest();
+ const groups=b.failures();assert.equal(groups.length,1);assert.equal(groups[0].type,'execution-state');assert.equal(groups[0].occurrences[0].attemptId,'recovered');assert.equal(groups[0].occurrences[0].data.handle,'native:failed-compile');
+});
+
+test('an interrupted ingestion transaction cannot advance a cursor past uncaptured evidence',async t=>{
+ const{state,b,event}=await fixture(t);event('attempt-error',{message:'Must survive rollback'});
+ state.db.exec("CREATE TRIGGER fail_capture BEFORE INSERT ON skill_backlog_occurrences BEGIN SELECT RAISE(ABORT,'capture interrupted');END;");
+ assert.throws(()=>b.ingest(),/capture interrupted/);assert.equal(b.status().failures,0);assert.equal(b.status().ingestion.initialPending,true);
+ state.db.exec('DROP TRIGGER fail_capture');b.ingest();assert.equal(b.status().failures,1);assert.equal(b.failures()[0].message,'Must survive rollback');
+});
+
 test('recurrence retains every reference with bounded representatives and acknowledgement avoids lost arrivals',async t=>{
  const{b,event}=await fixture(t);
  for(let i=0;i<25;i++)event('attempt-error',{message:'Same tail mismatch',elapsed:i});

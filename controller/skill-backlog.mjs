@@ -12,7 +12,9 @@ const semantic=(value,evidence=false)=>{
  return typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>'):value;
 };
 const fingerprint=item=>hash([semantic(item.proposal),diagnosticIdentity({data:semantic(item.evidence,true)}),item.base]);
-const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','execution-state','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0 ELSE
+const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0
+ WHEN type='execution-state' THEN CASE WHEN json_valid(data) THEN json_extract(data,'$.state')='stopped' AND COALESCE(json_extract(data,'$.accountingExcluded'),0)=0 AND
+ (COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0 OR json_extract(data,'$.nativeState')='failed') ELSE 0 END ELSE
  (type IN ('failure-recorded','project-invalid') OR type LIKE '%error%' OR type LIKE '%failed%' OR type LIKE '%rejected%' OR type LIKE '%unresolved%' OR type LIKE '%blocked%' OR
  CASE WHEN json_valid(data) THEN (json_type(data,'$.passed')='false' OR json_type(data,'$.correct')='false' OR json_type(data,'$.correctness.passed')='false' OR json_type(data,'$.performance.passed')='false' OR
  json_type(data,'$.verification.passed')='false' OR json_type(data,'$.result.passed')='false' OR json_type(data,'$.result.correct')='false' OR json_type(data,'$.verdict.passed')='false' OR
@@ -21,9 +23,11 @@ const negative=data=>data&&typeof data==='object'&&(data.passed===false||data.co
  ['correctness','performance','verification','verdict','result'].some(k=>negative(data[k])));
 function failure(type,data){
  const actual=data.exitCode??data.exit_code,expected=data.expected_exit;
- if(data.operator===true||data.operatorRequested===true||['operator-pause','operator-stop'].includes(data.reason)||expected!==undefined&&expected!==0&&actual===expected)return false;
+ if(data.operator===true||data.operatorRequested===true||['operator-pause','operator-stop'].includes(data.reason)||expected!==undefined&&expected!==0&&actual===expected||
+  type==='execution-state'&&(data.accountingExcluded===true||['resource-health','device-lease-control'].includes(data.purpose)))return false;
  return negative(data)||actual!==undefined&&expected!==undefined&&actual!==expected||
-  /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid','generation-invalid','generation-exhausted'].includes(type)||type==='verification'&&actual>0;
+  /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid','generation-invalid','generation-exhausted'].includes(type)||type==='verification'&&actual>0||
+  type==='execution-state'&&data.state==='stopped'&&(actual>0||data.nativeState==='failed');
 }
 
 /** Campaign-local durable evidence and hypothesis scheduling. No model calls. */
