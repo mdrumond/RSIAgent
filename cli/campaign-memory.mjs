@@ -14,17 +14,25 @@ export function memorySettings(input) {
     throw Error('Ordered positive local memory thresholds required');
   return settings;
 }
-export function memoryDecision(previous,{rssBytes,now,maximum},settings=memoryDefaults) {
+export function memoryDecision(previous,{rssBytes,processCount,now,maximum},settings=memoryDefaults) {
   if(!Number.isSafeInteger(rssBytes)||rssBytes<0||!Number.isFinite(now)||!Number.isSafeInteger(maximum)||maximum<1)
     throw Error('Measured memory, clock and worker limit required');
   const state={...previous,limit:Math.min(previous?.limit??maximum,maximum)};
-  if(rssBytes>=settings.hardBytes)return {...state,action:'emergency',blocked:true};
+  if(rssBytes>=settings.hardBytes)return {...state,lowSince:null,action:'emergency',blocked:true};
   if(state.token) {
     state.lowSince=rssBytes<settings.lowBytes?(state.lowSince??now):null;
     return {...state,action:state.lowSince!==null&&now-state.lowSince>=settings.coolMs?'resume':'cooling',blocked:true};
   }
   const newlyHigh=state.highSince==null;
-  if(rssBytes<settings.softBytes)return {...state,highSince:null,lastReduction:null,blocked:false,action:'run'};
+  if(rssBytes<settings.softBytes){
+    const freshLow=Number.isSafeInteger(processCount)&&processCount>0&&rssBytes<settings.lowBytes&&!state.resumePending;
+    state.lowSince=freshLow?(state.lowSince??now):null;
+    if(state.limit<maximum&&state.lowSince!==null&&now-state.lowSince>=settings.coolMs){
+      state.limit++;state.lowSince=now;
+    }
+    return {...state,highSince:null,lastReduction:null,blocked:false,action:'run'};
+  }
+  state.lowSince=null;
   state.highSince??=now;
   if(newlyHigh||now-(state.lastReduction??now)>=settings.reduceMs) {
     state.limit=Math.max(1,state.limit-1);state.lastReduction=now;

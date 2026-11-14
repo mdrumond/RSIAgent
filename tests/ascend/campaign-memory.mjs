@@ -110,3 +110,26 @@ test('detached cleanup ownership remains visible to campaign RSS accounting',asy
  const measured=await sampleCampaignMemory({root},await processIdentity()),row=measured.largest.find(row=>row.pid===child.pid);
  assert.equal(row.role,'device-cleanup');assert.ok(row.rssBytes>=8*1024**2);
 });
+
+test('fresh sustained low owned memory restores concurrency one cooling interval at a time',()=>{
+ const decide=(s,now,rssBytes=10,processCount=1,maximum=4)=>memoryDecision(s,{rssBytes,processCount,now,maximum},settings);
+ let s=decide({limit:2},0);assert.equal(s.limit,2);
+ s=decide(s,59);assert.equal(s.limit,2);s=decide(s,60);assert.equal(s.limit,3);
+ s=decide(s,119);assert.equal(s.limit,3);s=decide(s,120);assert.equal(s.limit,4);
+ const afterGap=decide({limit:2,lowSince:0},10000);assert.equal(afterGap.limit,3);
+ assert.equal(decide(afterGap,10000).limit,3);
+ assert.equal(decide(s,10000).limit,4);assert.equal(decide(s,10001,10,1,1).limit,1);
+ assert.equal(decide({limit:1},10000,10,1,1).limit,1);
+});
+
+test('memory recovery requires a new low window after spikes, unknown ownership or pause acknowledgement',()=>{
+ const decide=(s,now,rssBytes=10,processCount=1)=>memoryDecision(s,{rssBytes,processCount,now,maximum:4},settings);
+ for(const sample of [{rssBytes:21,processCount:1},{rssBytes:10,processCount:0},{rssBytes:10}]){
+  let s=decide({limit:2},0);s=memoryDecision(s,{...sample,now:59,maximum:4},settings);
+  s=decide(s,60);assert.equal(s.limit,2);s=decide(s,120);assert.equal(s.limit,3);
+ }
+ let s=decide({limit:3},0);s=decide(s,59,25);assert.equal(s.limit,2);assert.equal(s.blocked,true);
+ s=decide(s,60);s=decide(s,119);assert.equal(s.limit,2);assert.equal(decide(s,120).limit,3);
+ assert.equal(decide({limit:2,lowSince:0,token:'owned'},120).limit,2);
+ assert.equal(decide({limit:2,lowSince:0,resumePending:true},120).limit,2);
+});
