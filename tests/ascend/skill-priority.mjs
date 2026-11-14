@@ -158,3 +158,12 @@ test('crash resume charges only time after the latest elapsed checkpoint',async 
  let available;await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async args=>{available=args.remainingSeconds;return {status:'complete',decision:{promote:false}};}});
  assert(available>880&&available<=890,'Only the ten-second uncheckpointed tail is added to 900 seconds');
 });
+
+test('pending learning pages keep the background worker eligible and new findings restart the scan',async t=>{
+ const f=await fixture(t);f.backlog.meta('learning-seen','[]');
+ assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
+ f.backlog.meta('learning-pending',true);assert.equal((await prioritySkillStatus(f.config)).hasWork,true);
+ f.backlog.meta('learning-scan',{ids:['already-consumed'],offset:1});f.backlog.meta('learning-seen','older findings');
+ let scan;await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{scan=f.backlog.meta('learning-scan');assert.equal(f.backlog.meta('learning-pending'),true);f.backlog.meta('learning-pending',false);}});
+ assert.equal(scan,null);assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
+});

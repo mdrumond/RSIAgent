@@ -31,7 +31,7 @@ export async function prioritySkillStatus(config){
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
-   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||Boolean(active)||items.some(i=>['queued','needs-review'].includes(i.status)))};
+   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active)||items.some(i=>['queued','needs-review'].includes(i.status)))};
  }finally{state.close();}
 }
 export async function prioritySkillsSettled(config,dependencies={}){
@@ -57,6 +57,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
   const retained=backlog.list({status:'running',limit:1})[0];
   if(!retained){
+   if(backlog.meta('learning-seen')!==learningFingerprint(state)){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
    // Preserve that progress and existing priorities instead of starving evaluation.
    for(const [name,operation,args]of [['analysis',ops.analyze,{directory:join(directory,'analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
