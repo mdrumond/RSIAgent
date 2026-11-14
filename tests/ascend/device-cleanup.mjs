@@ -64,11 +64,11 @@ test('expired cleanup remains fenced without pretending that a stopped writer is
  await drainDeviceCleanup(root,ticket,{run:async()=>{throw Error('No elapsed allocation');}});
  assert.equal((await cleanupStatus(root))[0].status,'expired');assert.equal(await campaignCleanupPending(campaign),false);
 });
-test('owned cleanup coordinator survives its submitting process and closes through the existing CPL environment',{timeout:15000},async t=>{
+test('owned cleanup coordinator survives its submitting process and closes through the existing CPL environment',{timeout:60000},async t=>{
  const {spawn}=await import('node:child_process'),{once}=await import('node:events'),{fileURLToPath}=await import('node:url');
  const root=await fixture(t),leases=join(root,'leases'),lease=await reserveDevice('fixture',0,leases),pointer=join(root,'cleanup-pointer.json'),instructionFile=join(root,'instructions.md');
  await writeFile(pointer,JSON.stringify({receipt:lease.receipt,token:lease.token,pool:'fixture',physicalDevice:0}));await writeFile(instructionFile,'Fixture only');
- const wire=join(root,'wire.json'),clientPath=join(root,'cpl-fixture');
+ const wire=join(root,'wire.json'),clientPath=join(root,'cpl-fixture'),observeGate=join(root,'observe-released');
  await writeFile(wire,'{}');await writeFile(clientPath,`#!/usr/bin/env python3
 import json,sys,pathlib,shlex,uuid,time
 args=sys.argv[1:];args.remove('--json');wire=pathlib.Path(${JSON.stringify(wire)})
@@ -85,7 +85,8 @@ if kind=='run':
  if '--receipt-file' in args:pathlib.Path(args[args.index('--receipt-file')+1]).write_text(json.dumps({'handle':handle}))
  out={'state':'queued','handle':handle}
 if kind=='observe':
- if json.loads(wire.read_text()).get('_control_handle')==args[1]:time.sleep(.2)
+ if json.loads(wire.read_text()).get('_control_handle')==args[1]:
+  while not pathlib.Path(${JSON.stringify(observeGate)}).exists():time.sleep(.02)
  out={'state':'completed','exit':0}
 if kind=='logs':out={'state':'completed','content':''}
 if kind=='download':
@@ -93,20 +94,27 @@ if kind=='download':
 print(json.dumps(out))
 `,{mode:0o700});
  await lease.update({cleanup:{id:lease.token}});
- const directory=join(leases,'.cleanup'),job=request(root,lease.token,{receipt:lease.receipt,pointer,leaseDirectory:leases,journal:join(root,'events.jsonl'),campaignRoot:root,deadline:Date.now()+12000,options:{mode:'cpl',target:'fixture',runtime:'cpu',instructionFile,clientPath,workspacePath:'/fixture',remoteDirectory:'owned',probeSeconds:1,health:{product:'a3'}}});
+ const directory=join(leases,'.cleanup'),job=request(root,lease.token,{receipt:lease.receipt,pointer,leaseDirectory:leases,journal:join(root,'events.jsonl'),campaignRoot:root,deadline:Date.now()+45000,options:{mode:'cpl',target:'fixture',runtime:'cpu',instructionFile,clientPath,workspacePath:'/fixture',remoteDirectory:'owned',probeSeconds:1,health:{product:'a3'}}});
  const producer=join(root,'producer.mjs'),module=fileURLToPath(new URL('../../integrations/environments/device-cleanup.mjs',import.meta.url));
  await writeFile(producer,`import {queueDeviceCleanup} from ${JSON.stringify(module)};console.log(JSON.stringify(await queueDeviceCleanup(${JSON.stringify(directory)},${JSON.stringify(job)})));`);
  const producerChild=spawn(globalThis.process.execPath,[producer],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';producerChild.stdout.on('data',chunk=>stdout+=chunk);producerChild.stderr.on('data',chunk=>stderr+=chunk);const [code]=await once(producerChild,'exit');assert.equal(code,0,stderr);
  const submitted=JSON.parse(stdout.trim());assert.ok(submitted.owner?.pid);assert.notEqual(submitted.owner.pid,producerChild.pid);
  const {ownerStopped}=await import('../../controller/lifecycle.mjs');let cleanupOwner=submitted.owner;t.after(async()=>{if(!await ownerStopped(cleanupOwner))globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');});
  assert.equal(await ownerStopped(submitted.owner),false);
- for(let n=0;n<400;n++){const record=JSON.parse(await readFile(lease.receipt,'utf8'));if(record.controlHandle)break;await delay(5);}
- assert.ok(JSON.parse(await readFile(lease.receipt,'utf8')).controlHandle);
- globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');for(let n=0;n<100&&!await ownerStopped(cleanupOwner);n++)await delay(5);
+ const until=async(check,phase)=>{
+  while(Date.now()<job.deadline){if(await check())return;await delay(25);}
+  const log=await readFile(join(directory,'worker.log'),'utf8').catch(error=>error.message);
+  assert.fail(`${phase}: original fixture allocation exhausted\n${log}\n${JSON.stringify(await cleanupStatus(directory))}`);
+ };
+ // Block observation explicitly: slow platform setup cannot race natural closure
+ // before the test has killed the first coordinator with its native ID retained.
+ await until(async()=>Boolean(JSON.parse(await readFile(lease.receipt,'utf8')).controlHandle),'native handle persisted');
+ globalThis.process.kill(-cleanupOwner.pid,'SIGKILL');await until(()=>ownerStopped(cleanupOwner),'first coordinator stopped');
+ await writeFile(observeGate,'released');
  const resumed=await resumeDeviceCleanup(directory);cleanupOwner=resumed.owner;assert.notEqual(cleanupOwner.pid,submitted.owner.pid);
  assert.equal((await cleanupStatus(directory))[0].request.deadline,job.deadline);
- for(let n=0;n<400;n++){if((await cleanupStatus(directory))[0].status==='closed')break;await delay(25);}
- assert.equal((await cleanupStatus(directory))[0].status,'closed',(await readFile(join(directory,'worker.log'),'utf8'))+'\n'+JSON.stringify(await cleanupStatus(directory)));assert.equal(await campaignCleanupPending(root),false);
+ await until(async()=>(await cleanupStatus(directory))[0].status==='closed','resumed exact-handle cleanup closed');
+ assert.equal(await campaignCleanupPending(root),false);
  const {closedDeviceLease}=await import('../../integrations/environments/device-leases.mjs');assert.ok(await closedDeviceLease(lease.receipt,lease.token));assert.equal(JSON.parse(await readFile(wire,'utf8'))._controls,1);
 });
 test('cleanup custody cannot race a live public lease reconciliation claim',async t=>{

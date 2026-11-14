@@ -1042,7 +1042,7 @@ test('probe cutoff during its submission journal prevents dispatch with positive
 for(const cleanup of ['closed','unknown','body-cutoff'])test(`cancelled payload without admission reconciles its exact token before settling: ${cleanup}`,async t=>{
  const f=await fixture(t),body=new AbortController();f.setEnabled([0]);f.setReleaseProof(true);let payloads=0,controls=0;
  const cancelled='remote:fixture:job:cancelled-before-admission',control='remote:fixture:job:unknown-cleanup';
- const environment=await createEnvironment({...f.options,probeObservationSeconds:.15},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(2000),client:async(args,settings)=>{
+ const environment=await createEnvironment({...f.options,probeObservationSeconds:2},{...f.context,signal:body.signal,stopSignal:AbortSignal.timeout(5000),client:async(args,settings)=>{
   if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')){
    const script=await readFile(args[args.indexOf('--file')+1],'utf8'),config=JSON.parse(script.slice(script.lastIndexOf(" '{")+2,-2).replaceAll("'\\''","'")),inner=JSON.parse(config.command.slice(config.command.lastIndexOf(" '{")+2,-1).replaceAll("'\\''","'"));
    if(inner.source){payloads++;if(payloads===1){if(cleanup==='body-cutoff')body.abort();return {state:'queued',handle:cancelled};}}
