@@ -12,6 +12,7 @@ import {createKdbBridge} from '../integrations/kdb-extension.mjs';
 import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 
+export const isKernelTask=kind=>['a3-kernel','target-kernel'].includes(kind);
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const shellQuote=value=>"'"+String(value).replaceAll("'","'\\''")+"'";
 function sandboxCommand(command,cwd){
@@ -48,17 +49,18 @@ export function protectedFingerprint(text,mode='bytes'){
  return hash(mode==='json'?JSON.stringify(canonical(JSON.parse(text))):text);
 }
 function lastReceipt(output){return JSON.parse(output.trim().split('\n').at(-1));}
-export async function validateKernelReceipt(verification,cwd){
+export async function validateKernelReceipt(verification,cwd,{requireLatency=true}={}){
  let receipt;try{receipt=lastReceipt(verification.output);}catch(error){if(verification.exitCode===125)return verification;throw error;}
  if(verification.exitCode===125){
   if(receipt.correct===null&&receipt.bucket==='harness'&&receipt.kernelSha256===hash(await readFile(join(cwd,'kernel.py')))&&receipt.evidence&&typeof receipt.evidence==='object'&&!Array.isArray(receipt.evidence)&&typeof receipt.evidence.reason==='string'&&receipt.evidence.reason.trim()&&(receipt.latencySeconds===undefined||receipt.latencySeconds===null))return {...verification,correct:null,receipt};
   return verification;
  }
- if(receipt.correct!==true||!Number.isFinite(receipt.latencySeconds)||receipt.latencySeconds<=0||
+ if(receipt.correct!==true||requireLatency&&(!Number.isFinite(receipt.latencySeconds)||receipt.latencySeconds<=0)||
   receipt.kernelSha256!==hash(await readFile(join(cwd,'kernel.py')))||!receipt.evidence||typeof receipt.evidence!=='object')throw Error('Invalid trusted kernel verification receipt');
  return {...verification,receipt};
 }
-export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleStopSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,verificationReserved=0,localFilesystemSandbox=false}){
+export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleStopSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,targetBash=false,verificationReserved=0,localFilesystemSandbox=false}){
+ if(targetBash&&!targetEnvironment)throw Error('Admitted target Bash requires a target environment');
  const begun=performance.now();
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
@@ -81,19 +83,18 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
    await appendFile(join(sessionDirectory,'tool-policy.jsonl'),JSON.stringify({tool:event.toolName,blocked:true,toolCallId:event.toolCallId})+'\n');
    return {block:true,reason:'Keep filesystem work inside the current task. Bash directory changes and shell searches are blocked; use native read/grep/find/ls scoped to this task. Run the declared local oracle command directly without changing directory.'};
   });
-  if(targetEnvironment){
-   const [target]=await createEnvironmentTools({execute:async(command,path,options)=>{
+  const executeTarget=async(command,path,options)=>{
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
     // Cleanup uses the retained parent allocation plus its cleanup-only grace.
     // The work signal still forbids any new dispatch after work expires.
     const operation=targetEnvironment.execute(command,path,{...options,signal:merged,...(allocationSignal?{stopSignal:allocationSignal}:{}),timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
     try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
     catch(error){const unknown=unknownExecution(error);if(unknown){unresolvedExecution=unknown;interrupt(error);}throw error;}finally{pending.delete(operation);}
-   }},cwd,sdk);pi.registerTool(target);
-  }
+   };
+  if(targetEnvironment){const [target]=await createEnvironmentTools({execute:executeTarget},cwd,sdk);pi.registerTool(target);}
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
    const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
-   const operation=local.exec(localFilesystemSandbox?sandboxCommand(command,taskRoot):command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+   const operation=targetBash?executeTarget(command,path,{...options,signal:merged}):local.exec(localFilesystemSandbox?sandboxCommand(command,taskRoot):command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
    try{return await operation;}finally{pending.delete(operation);}
   }}}));
  };
@@ -109,8 +110,8 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  try{
   signal?.throwIfAborted();if(performance.now()-begun>=seconds*1000){timedOut=true;throw Error('Sample elapsed allocation exhausted');}
   if(bridge)await bridge.knowledge.prepareSession(session,{signal:sampleSignal});else await session.bindExtensions({});session.agent.toolExecution='sequential';
-  const preparedContract=targetEnvironment&&kind==='a3-kernel'?`\n\nPrepared microtask contract: the controller owns runtime setup and device health/admission; these are complete. WORKLOAD.md is an archived mathematical contract: historical paths, GOAL.md, verifier commands and full case catalogues in it are context, not files to locate or setup work to repeat. case.json defines this task. Use local native tools to inspect and edit kernel.py, and rsi_target to run the declared python check.py . device check. Do not inspect external verifier/reference trees, provenance or runtime metadata. Use this contract when reusable guidance describes a larger project workflow. ${verificationReserved?'The controller has already reserved independent verification time within the overall sample limit; use this actor allocation for the implementation and declared check.':`Finish with approximately ${Math.min(45,Math.floor(seconds/3))} seconds left for the controller's independent final verification; that verification shares this elapsed allowance.`}`:'';
-  await session.prompt(`${kind==='a3-kernel'?'A3 kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice. ${targetEnvironment?'The model, files and bash are local. Use rsi_target for compilation and device checks on the prepared remote target; keep persistent edits local.':''}\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}${preparedContract}`);
+  const preparedContract=targetEnvironment&&isKernelTask(kind)?`\n\nPrepared microtask contract: the controller owns runtime setup and device health/admission; these are complete. WORKLOAD.md is an archived mathematical contract: historical paths, GOAL.md, verifier commands and full case catalogues in it are context, not files to locate or setup work to repeat. case.json defines this task. Use local native tools to inspect and edit kernel.py, and rsi_target to run the declared python check.py . device check. Do not inspect external verifier/reference trees, provenance or runtime metadata. Use this contract when reusable guidance describes a larger project workflow. ${verificationReserved?'The controller has already reserved independent verification time within the overall sample limit; use this actor allocation for the implementation and declared check.':`Finish with approximately ${Math.min(45,Math.floor(seconds/3))} seconds left for the controller's independent final verification; that verification shares this elapsed allowance.`}`:'';
+  await session.prompt(`${isKernelTask(kind)?'Kernel-engineering evaluation on this registered runtime. Compilation and checking count toward elapsed time. KDB retrieval is read-only; never write lessons.':'Host-only kernel-engineering microtask.'} Repair kernel.py in the current directory. Use native tools to inspect, edit and test it. This is not the full RSI workflow; unavailable RSI/KDB tools are not required. Do not inspect or modify files outside this task directory. Finish with the implementation, not just advice. ${targetEnvironment?'The model, files and bash are local. Use rsi_target for compilation and device checks on the prepared remote target; keep persistent edits local.':''}\n\nTask:\n${prompt}\n\nFrozen skill guidance:\n${guidance}${preparedContract}`);
   await session.waitForIdle();signal?.throwIfAborted();
   if(lastAssistant?.stopReason==='error')failure=lastAssistant.errorMessage??'Native provider error';
  }catch(error){failure=error.message;}
@@ -132,6 +133,10 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  if(!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Verification reserve must fit inside the sample elapsed allocation');
  if(objective==='harness'||tasks.some(t=>t.bucket==='harness'))throw Error('Harness faults require user intervention, not skill A/B');
  if(tasks.some(t=>t.bucket)&&(!objective||objective==='legacy'))throw Error('Bucketed tasks require an explicit matching objective');
+ if(tasks.some(t=>t.kind==='target-kernel')){
+  const product=binding?.product??binding?.target;
+  if(!['a3','a5'].includes(product)||binding?.environment?.health?.product!==product||tasks.some(t=>t.kind==='target-kernel'&&t.target!==product))throw Error('Kernel task target differs from registered runtime binding');
+ }
  if(objective&&!['legacy','correctness','optimization'].includes(objective))throw Error('Unknown skill objective');
  const ids=tasks.map(t=>t.id);if(new Set(ids).size!==ids.length||ids.some(id=>!/^[a-z0-9-]+$/.test(id)))throw Error('Unique task identifiers required');
  const inputs={active:await skillInput(skills.active),candidate:await skillInput(skills.candidate)};
@@ -147,7 +152,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -187,8 +192,8 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
      const remaining=allocation-(performance.now()-started)/1000;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
-     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(task.kind==='a3-kernel'?kernelCheck:check)(python,checker,cwd,task.kind==='a3-kernel'?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
-     if(task.kind==='a3-kernel'&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd);
+     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(isKernelTask(task.kind)?kernelCheck:check)(python,checker,cwd,isKernelTask(task.kind)?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     if(isKernelTask(task.kind)&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd,{requireLatency:objective!=='correctness'});
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
@@ -227,7 +232,8 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
   for(const arm of ['active','candidate'])for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(paths[arm],name),'utf8'),mode))throw Error('Protected paired input changed: '+name);
   if(report.pairedTimings.some(r=>r.projectId===task.id&&r.run===run)||left<=0)continue;
   report.pairedReplay.runningPair={projectId:task.id,run,owner:await processIdentity()};await save(join(directory,'results.json'),report);
-  const measured=dependencies.measure?await dependencies.measure({task,run,...paths,seconds:left,signal}):await kernelCheck(python,checker,directory,left,signal,[paths.active,paths.candidate]);
+  let measured;try{measured=dependencies.measure?await dependencies.measure({task,run,...paths,seconds:left,signal}):await kernelCheck(python,checker,directory,left,signal,[paths.active,paths.candidate]);}
+  catch(error){const unknown=unknownExecution(error);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}throw error;}
   delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);
   const receipt=measured.output!==undefined?lastReceipt(measured.output):measured;
   if(measured.exitCode!==undefined&&measured.exitCode!==0)throw Error('Paired checker failed');
