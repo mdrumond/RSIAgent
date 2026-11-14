@@ -51,10 +51,21 @@ function learningFor(backlog,item){
    return [{...r,project:JSON.parse(project.spec),observations:db.prepare("SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','accepted','stage-completed') ORDER BY sequence DESC LIMIT 12").all(attempt.id).map(e=>({reference:'events:'+e.sequence,type:e.type,attemptId:attempt.id,data:JSON.parse(e.data)}))}];
   });
 }
+async function npuLearningReceipt(observations,kernelSha256){
+ if(!kernelSha256)return null;
+ for(const observation of observations){
+  const v=observation.data;if(observation.type!=='verification'||v.passed!==true||!/^[a-f0-9]{64}$/.test(v.fingerprint??'')||v.correctness?.passed!==true||v.correctness?.exitCode!==0)continue;
+  const receipts=[v.correctness.receipt];
+  for(const artifact of observation.artifacts??[])try{receipts.push(JSON.parse((await readFile(artifact.path,'utf8')).trim().split('\n').at(-1)));}catch(error){if(!['ENOENT','SyntaxError'].includes(error.code??error.name))throw error;}
+  for(const receipt of receipts)if(receipt?.correct===true&&receipt.kernelSha256===kernelSha256&&receipt.evidence&&typeof receipt.evidence==='object'&&!Array.isArray(receipt.evidence)&&/^npu:\d+$/.test(receipt.evidence.device??''))
+   return {protocol:'npu-kernel-v1',reference:observation.reference,kernelSha256,device:receipt.evidence.device};
+ }
+ return null;
+}
 async function freezeLearning(config,records,directory){
  const result=[],campaign=await realpath(config.root);
  for(const r of [...new Map(records.map(r=>[r.id,r])).values()]){
-  const destination=join(directory,r.id),retained=await load(join(destination,'learning.json'));if(retained){result.push(retained);continue;}
+  const destination=join(directory,r.id),retained=await load(join(destination,'learning.json'));if(retained){if(retained[1].result.status==='verified-device'&&retained[1].result.deviceEvidence?.protocol!=='npu-kernel-v1')retained[1].result.status='verified-project';result.push(retained);continue;}
   const copied=[],copy=async(path,name)=>{
    if(copied.length>=64)return null;
    let actual;try{actual=await realpath(path);}catch(e){if(e.code==='ENOENT')return null;throw e;}
@@ -70,8 +81,8 @@ async function freezeLearning(config,records,directory){
   const verifier=[];for(const [index,path]of (r.project.verifier?.files??[]).entries()){const target=await copy(path,join('verifier',String(index)+'-'+path.split(sep).at(-1)));if(target)verifier.push(target);else partial=true;}
   const groups=await freezeGroups(config.root,[{id:'learning-'+r.id,occurrences:r.observations,linkedDiagnostics:[]}],join(destination,'diagnostics'));
   let binding=null;try{const job=JSON.parse(await readFile(join(config.root,'attempts',r.data.findings.attemptId,'job.json'),'utf8'));const c=job.config??job;binding={target:c.target??null,environment:c.environment?.options?.mode??null,runtime:c.environment?.options?.runtime??null};}catch(e){if(e.code!=='ENOENT')throw e;}
-  const receipt=groups[0].occurrences.find(o=>o.type==='verification'&&o.data.passed===true&&/^[a-f0-9]{64}$/.test(o.data.fingerprint??'')&&o.data.correctness?.passed===true&&o.data.correctness?.exitCode===0&&o.artifacts.length);
-  const snapshot=[r.id,{result:{status:r.data.learningTarget==='device'?(binding?.target===config.target&&binding?.runtime&&receipt?'verified-device':'verified-project'):'verified-cpu',findings:r.data.findings,question:r.data.question,binding,
+  const receipt=await npuLearningReceipt(groups[0].occurrences,copied.find(a=>a.path===join(source,'kernel.py'))?.sha256);
+  const snapshot=[r.id,{result:{status:r.data.learningTarget==='device'?(binding?.target===config.target&&binding?.runtime&&receipt?'verified-device':'verified-project'):'verified-cpu',findings:r.data.findings,question:r.data.question,binding,...(receipt?{deviceEvidence:receipt}:{}),
    project:{id:r.project.id,source,verifier:{files:verifier},partialEvidence:partial},evidence:[...copied.map(a=>({reference:'source:'+a.sha256,log:a.path,sha256:a.sha256})),...groups[0].occurrences.flatMap(o=>[o,...o.artifacts.map(a=>({reference:o.reference,log:a.path,sha256:a.sha256,truncated:a.truncated}))])]}}];
   await save(join(destination,'learning.json'),snapshot);result.push(snapshot);
  }
