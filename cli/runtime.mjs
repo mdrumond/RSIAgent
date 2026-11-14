@@ -374,9 +374,11 @@ export async function operate(command,config,options={}) {
       }
       if(config.campaign_plan)startCampaignEntry(state,config);
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
+      const priorityPending=options.continuous&&progress.done&&config.skills?.priority?.enabled&&
+        (await (await import('./skill-background.mjs')).backgroundSkillStatus(config)).hasWork;
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
       if(config.campaign_plan && progress.currentEntry)config=campaignEntryConfig(config,progress.currentEntry.id);
-      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)) {
+      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)&&!priorityPending) {
         advanceCampaignEntry(state,config);
         if(progress.done)break;
         continue;
@@ -483,7 +485,7 @@ export async function operate(command,config,options={}) {
         running:activeActors,concurrency:foregroundLimit,freshSinceRecovery}):null;
       if(!job) {
         if(!running.size&&!options.continuous&&!resourceWait)break;
-        if(options.continuous&&progress.done&&!running.size&&!maintenance&&!generation&&
+        if(options.continuous&&progress.done&&!priorityPending&&!running.size&&!maintenance&&!generation&&
           !eligible.some(job=>job.finalize||['investigation','retry'].includes(job.kind)))break;
         ctl.set('wait',resourceWait??{reason:running.size?'actor-capacity':config.campaign_plan?'waiting-inputs':'inputs-or-recovery',at:new Date().toISOString()});
         await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);unavailable.clear();continue;
@@ -617,8 +619,12 @@ async function worker(root,id) {
     if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
-    if(config.skills?.review?.enabled===true)(await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
-    if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
+    if(config.skills?.review?.enabled===true||config.skills?.priority?.enabled===true)(await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
+    if(config.skills?.priority?.enabled) {
+      // Failure journals already contain the evidence. No model/skill lock is
+      // required to make Phase 1, recovery and curriculum failures discoverable.
+      state.event(id,'skill-priority-evidence-ready',{phase:config.mode,kind:job.kind});
+    } else if(config.mode!=='phase1' && !config.skills?.tuningDisabled) {
       try {
         const task=tuningTask({state,attemptId:id,kind:job.kind,phase:config.mode});
         if(config.skills.background) {

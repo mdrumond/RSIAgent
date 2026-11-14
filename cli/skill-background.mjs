@@ -32,6 +32,10 @@ export function enqueueSkillEvidence(config, task) {
 export async function backgroundSkillStatus(config) {
   const evolution = await read(join(config.root, 'skills', 'evolution.json'));
   const archives = await evaluationArchiveStatus(config,evolution);
+  if(config.skills?.priority?.enabled&&!evolution?.pending){
+    const status=await (await import('./skill-priority.mjs')).prioritySkillStatus(config);
+    return {...status,archives,hasWork:status.hasWork||!config.skills?.tuningDisabled&&archives.hasWork};
+  }
   const pending = evolution?.pending;
   const round = pending && await read(join(pending.evaluationRoot, 'round.json'));
   const state = new State(join(config.root, 'state.sqlite'));
@@ -52,6 +56,8 @@ export async function backgroundSkillsSettled(config, { runtime } = {}) {
     if(!await evaluationArchivesSettled(config))return false;
     const evolution = await read(join(config.root, 'skills', 'evolution.json'));
     const pending = evolution?.pending;
+    if(config.skills?.priority?.enabled&&!pending)
+      return (await import('./skill-priority.mjs')).prioritySkillsSettled(config);
     if (!pending) return true;
     const round = await read(join(pending.evaluationRoot, 'round.json'));
     if (round?.runningAt === undefined) return true;
@@ -87,6 +93,8 @@ export async function runBackgroundSkills(config, values = {}) {
     await enqueueCompletedEvaluation(config,evolution);
     await drainEvaluationArchives(config,{signal});
     const pending = evolution?.pending;
+    if(config.skills?.priority?.enabled&&!pending)
+      return (await import('./skill-priority.mjs')).runPrioritySkills(config,values);
     if (pending?.resource && values.resource?.id !== pending.resource.id)
       throw new Error('Resume skill evaluation on its retained resource');
     if (pending && !await backgroundSkillsSettled(config, { runtime: values.runtime }))

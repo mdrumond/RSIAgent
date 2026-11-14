@@ -25,7 +25,7 @@ function workflow({pass, interrupt}) {
   }
   return calls;
 }
-export async function provider(scenario, {nativeSession, workflowForGoal, resolveCall, writerChanges} = {}) {
+export async function provider(scenario, {nativeSession, workflowForGoal, resolveCall, writerChanges, reviewPlan} = {}) {
   const requests = [], failures = [], plans = new Map();
   let originals = 0, writers = 0;
   const server = createServer(async (req,res) => {
@@ -40,7 +40,8 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
       const key = prompt.startsWith('Goal:') ? prompt.split('\n')[0] : prompt;
       if (!count) {
         let plan;
-        if (prompt.startsWith('Construct ONE fresh original')) {
+        if(reviewPlan&&prompt.startsWith('Read input.json'))plan=await reviewPlan(body);
+        else if (prompt.startsWith('Construct ONE fresh original')) {
           plan=[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
             tool('write',{path:'source/answer.py',content:'def answer(): return 42\n'}),
             tool('write',{path:'reference/answer.py',content:'def answer(): return 6 * 7\n'}),
