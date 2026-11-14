@@ -19,7 +19,7 @@ async function fixture(t){
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());state.event(null,'generation-rejected',{message:'bad frozen shape'});
  const backlog=new SkillBacklog(state,{target:'a3'});backlog.ingest();const group=backlog.failures()[0];backlog.acknowledge(group.id);
  const add=(key,priority=1,extra={})=>backlog.upsert({key,priority,reason:'Observed recurring numeric failure',objective:'correctness',skill:'implementation',base:'baseline',
-  groupIds:[group.id],proposal:{action:'update',changes:[{id:key,text:'Mask the final tile'}]},evidence:{},...extra});
+  groupIds:[group.id],proposal:{action:'update',changes:[{id:key,text:'Handle boundary '+key+' before the final tile load'}]},evidence:{},...extra});
  const calls=[];
  const ops={analyze:async()=>{},prioritize:async()=>{},prepare:async({item})=>{calls.push(['prepare',item.key]);return {status:'ready',active:item.base,candidate:'candidate-'+item.key};},
   resolveCases:async()=>({status:'ready',target:'cpu',tasks:[],binding:{target:'cpu'}}),
@@ -38,9 +38,9 @@ test('new urgent item waits for the running comparison then goes first',async t=
  const f=await fixture(t);f.add('running',20);f.add('waiting',10);let release,started;
  const gate=new Promise(r=>release=r),ready=new Promise(r=>started=r);
  const running=runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async args=>{started();await gate;return f.ops.evaluate(args);}});
- await ready;f.add('urgent',100);const status=await prioritySkillStatus(f.config);
+ await ready;try{f.add('urgent',100);const status=await prioritySkillStatus(f.config);
  assert.equal(status.current.id,f.backlog.get('running').id);assert.equal(status.backlog[0].id,f.backlog.get('urgent').id);
- release();await running;await runPrioritySkills(f.config,f.values,f.ops);
+ }finally{release();await running;}await runPrioritySkills(f.config,f.values,f.ops);
  assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),['running','urgent']);
 });
 test('partial analysis and ranking timeouts preserve ready work and expose diagnostics',async t=>{
