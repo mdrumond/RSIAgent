@@ -101,3 +101,12 @@ test('a stubborn owned service requires attention after its shutdown grace witho
   assert.equal(child.exitCode,null);assert.equal(child.signalCode,null);
   assert.deepEqual(await processIdentity(child.pid),owner);
 });
+test('detached cleanup ownership remains visible to campaign RSS accounting',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'cleanup-memory-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ const state=new State(join(root,'state.sqlite'));state.db.exec('CREATE TABLE control(key TEXT PRIMARY KEY,value TEXT)');state.close();
+ const child=spawn(process.execPath,['-e',"globalThis.buffer=Buffer.alloc(8*1024**2,1);console.log('ready');setInterval(()=>{},1000)"],{detached:true,stdio:['ignore','pipe','ignore']});const exit=once(child,'exit');
+ t.after(async()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await exit;});await once(child.stdout,'data');
+ await writeFile(join(root,'device-cleanup-service.json'),JSON.stringify({owner:await processIdentity(child.pid)}));
+ const measured=await sampleCampaignMemory({root},await processIdentity()),row=measured.largest.find(row=>row.pid===child.pid);
+ assert.equal(row.role,'device-cleanup');assert.ok(row.rssBytes>=8*1024**2);
+});

@@ -38,7 +38,7 @@ text={'board':f'NPU ID: {i}\\nChip Name: Ascend950','health':'Health Status: '+r
 'proc-mem':'Process id: 123' if r.get('busy') else 'No process in device.','current-fault-event':f'Fault Event Count: {r.get("faults",0)}'}
 print(text[q])
 `,{mode:0o700});
-  const options={mode:'local',target:'local-fixture',runtime:'inherited-cpu',instructionFile,
+  const options={asyncCleanup:false,mode:'local',target:'local-fixture',runtime:'inherited-cpu',instructionFile,
     probeSeconds:10,probeObservationSeconds:10,env:{PATH:bin+':'+process.env.PATH,LOCAL_HEALTH:telemetry},
     health:{product:'a5',chip:null,query_timeout_seconds:.5}};
   async function bind(resource,extra={},path=join(root,'instance-'+sequence++)){

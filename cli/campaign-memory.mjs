@@ -78,8 +78,9 @@ export async function sampleCampaignMemory(config,owner,{proc='/proc',known=new 
     for(const row of state.db.prepare('SELECT owner FROM attempts WHERE owner IS NOT NULL').all())add(row.owner,'worker');
     if(state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='requests'").get())for(const row of state.db.prepare("SELECT owner FROM requests WHERE owner IS NOT NULL AND status IN ('queued','running')").all())add(row.owner,'request');
   });
-  try{const service=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));
-    if(service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role:'knowledge'});
+  for(const [file,role]of [['knowledge-service.json','knowledge'],['device-cleanup-service.json','device-cleanup']])try{
+    const service=JSON.parse(await readFile(join(config.root,file),'utf8'));
+    if(service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role});
   }catch(error){if(error.code!=='ENOENT')throw error;}
   const rows=new Map();
   await Promise.all((await readdir(proc)).filter(name=>/^\d+$/.test(name)).map(async name=>{
