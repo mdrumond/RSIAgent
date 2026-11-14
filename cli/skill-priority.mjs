@@ -107,7 +107,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    const report=result?.report,diagnostics=report?.results?.filter(r=>r.correct!==true).map(r=>({projectId:r.projectId,run:r.run,arm:r.arm,correct:r.correct,timedOut:r.timedOut,
     error:r.verification?.error,output:String(r.verification?.output??'').slice(-2000),stderr:String(r.verification?.error??'').slice(-2000)}));
    const feedback=['rejected','inconclusive'].includes(status)&&report?.results?.length?{hypothesisId:item.id,groupIds:item.groupIds,objective:item.objective,
-    evaluation:{path:join(home,'cases','selected.json')},previousProposal:checkpoint.prepared?.proposal??item.proposal,reason:result.decision?.reason??result.reason,diagnostics,
+    evaluation:{path:join(home,'cases','selected.json')},previousEvidence:{memoryEvidence:item.evidence?.memoryEvidence??[],learningIdentity:item.evidence?.learningIdentity??null},previousProposal:checkpoint.prepared?.proposal??item.proposal,reason:result.decision?.reason??result.reason,diagnostics,
     coverage:report.results.length,metrics:result.decision?.tasks??result.decision?.passes}:null;
    const path=join(home,'feedback.json');
    if(feedback){const bytes=JSON.stringify(feedback,null,2)+'\n';try{writeFileSync(path,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||readFileSync(path,'utf8')!==bytes)throw error;}}
