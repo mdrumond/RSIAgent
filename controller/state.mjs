@@ -27,6 +27,7 @@ export class State {
       id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id), session TEXT,
       elapsed REAL NOT NULL DEFAULT 0, outcome TEXT, owner TEXT, created TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS active_attempt ON attempts(project) WHERE outcome IS NULL;
+      CREATE INDEX IF NOT EXISTS attempts_project ON attempts(project);
       CREATE TABLE IF NOT EXISTS events (
       sequence INTEGER PRIMARY KEY, attempt TEXT REFERENCES attempts(id), type TEXT NOT NULL,
       data TEXT NOT NULL, created TEXT NOT NULL);
