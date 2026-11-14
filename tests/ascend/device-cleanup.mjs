@@ -150,3 +150,34 @@ test('crash before pointer detachment is recovered only after the recorded hando
  assert.equal(JSON.parse(await readFile(lease.receipt,'utf8')).cleanup.id,lease.token);
  await drainDeviceCleanup(root,ticket,{run:async()=>true});
 });
+
+test('retired campaign does not poison shared cleanup resume or discard its expired fence',async t=>{
+ const root=await fixture(t),retired=join(root,'retired'),current=join(root,'current');await mkdir(retired);await mkdir(current);
+ const lease=await reserveDevice('pool',0,join(root,'leases'));let ticket;
+ const launch=async(_directory,key)=>{ticket=key;return processIdentity();};
+ const old=request(root,lease.token,{campaignRoot:retired,receipt:lease.receipt,deadline:Date.now()-1});
+ await queueDeviceCleanup(root,old,{launch});await drainDeviceCleanup(root,ticket,{run:async()=>{throw Error('Expired fence must not run');}});
+ await rm(retired,{recursive:true});
+ await queueDeviceCleanup(root,request(root,'current',{campaignRoot:current}),{launch});
+ await resumeDeviceCleanup(root,{launch});
+ assert.deepEqual(JSON.parse(await readFile(join(current,'device-cleanup-service.json'),'utf8')).owner,await processIdentity());
+ // A late enqueue/publication for a removed campaign is harmless as well.
+ await queueDeviceCleanup(root,old,{launch});
+ await assert.rejects(readFile(join(retired,'device-cleanup-service.json')),{code:'ENOENT'});
+ const retained=(await cleanupStatus(root)).find(row=>row.id===lease.token);assert.equal(retained.status,'expired');assert.deepEqual(retained.request,old);
+ assert.equal(JSON.parse(await readFile(lease.receipt,'utf8')).token,lease.token);
+ await drainDeviceCleanup(root,ticket,{run:async row=>{assert.equal(row.id,'current');return true;}});
+});
+
+test('enqueue during idle retirement is drained without losing its wake-up or spawning per poll',async t=>{
+ const root=await fixture(t);let ticket,launches=0,injected=false;const seen=[];
+ const launch=async(_directory,key)=>{launches++;ticket=key;return processIdentity();};
+ await queueDeviceCleanup(root,request(root,'first'),{launch});
+ await drainDeviceCleanup(root,ticket,{run:async row=>{seen.push(row.id);return true;},beforeIdleRetirement:async()=>{
+  if(injected)return;injected=true;
+  // Deterministic barrier after the old worker observes empty, before it retires.
+  await queueDeviceCleanup(root,request(root,'late'),{launch});
+ }});
+ assert.deepEqual(seen,['first','late']);assert.equal(launches,1);assert.ok((await cleanupStatus(root)).every(row=>row.status==='closed'));
+ const db=new DatabaseSync(join(root,'queue.sqlite'));assert.equal(db.prepare('SELECT * FROM worker').all().length,0);db.close();
+});
