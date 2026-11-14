@@ -6,12 +6,13 @@ const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=
 const terminal=new Set(['accepted','rejected','inconclusive']);
 const statuses=new Set(['queued','running','needs-review','learning','user-required',...terminal]);
 const semantic=(value,evidence=false)=>{
- if(Array.isArray(value)){const rows=value.map(v=>semantic(v,evidence));return evidence?[...new Map(rows.map(v=>[JSON.stringify(v),v])).values()]:rows;}
+ if(Array.isArray(value)){const rows=value.map(v=>semantic(v,evidence));return evidence?[...new Map(rows.map(v=>[JSON.stringify(v),v])).entries()].sort(([a],[b])=>a.localeCompare(b)).map(([,v])=>v):rows;}
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([k])=>
-  !/^(reference|references|evidenceRefs|groupIds|attemptId|draftId|projectId|created|elapsed|count|occurrences|firstSeen|lastSeen)$/.test(k)).map(([k,v])=>[k,semantic(v,evidence)]));
+  !/^(reference|references|evidenceRefs|groupIds|attemptId|draftId|projectId|created|elapsed|count|occurrences|firstSeen|lastSeen)$/.test(k)&&
+  !(evidence&&/^(path|copiedPath|snapshotPath|archive|proposalDirectory|proposalElapsedSeconds)$/.test(k))).map(([k,v])=>[k,semantic(v,evidence)]));
  return typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>'):value;
 };
-const fingerprint=item=>hash([semantic(item.proposal),diagnosticIdentity({data:semantic(item.evidence,true)}),item.base]);
+const fingerprint=item=>hash([item.objective,item.skill,semantic(item.proposal),diagnosticIdentity({data:semantic(item.evidence,true)}),item.base,semantic(item.tests??item.evaluation??null,true)]);
 const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0
  WHEN type='execution-state' THEN CASE WHEN json_valid(data) THEN json_extract(data,'$.state')='stopped' AND COALESCE(json_extract(data,'$.accountingExcluded'),0)=0 AND
  (COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0 OR json_extract(data,'$.nativeState')='failed') ELSE 0 END ELSE

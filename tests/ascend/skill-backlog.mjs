@@ -105,6 +105,14 @@ test('real new diagnostic evidence can reopen an item while expired work cannot 
  assert.throws(()=>b.checkpoint(next.run.id,{elapsed:-1}),/monotonic/);b.checkpoint(next.run.id,{elapsed:10});assert.throws(()=>b.checkpoint(next.run.id,{elapsed:9}),/monotonic/);
 });
 
+test('evidence ordering and snapshot locations are telemetry, while changed test contracts are revisions',async t=>{
+ const{b,seed,item}=await fixture(t),h=item('h',seed(),{evidence:[{path:'/first/copy',sha256:'one',text:'row boundary'},{path:'/first/other',sha256:'two',text:'column boundary'}]});
+ const first=b.claim({base:'baseline'});b.finish(first.run.id,{status:'rejected'});
+ b.revise(h.id,{preparation:{proposalDirectory:'/new/snapshot',proposalElapsedSeconds:50},evidence:[{path:'/second/other',sha256:'two',text:'column boundary'},{path:'/second/copy',sha256:'one',text:'row boundary'}]});
+ assert.equal(b.get(h.id).status,'rejected');assert.equal(b.get(h.id).revision,1);
+ b.revise(h.id,{tests:{cases:['partial-row','partial-column']}});assert.equal(b.get(h.id).revision,2);assert.ok(b.claim({base:'baseline'}));
+});
+
 test('active-version changes require requalification and retain all old experiment evidence',async t=>{
  const{b,seed,item}=await fixture(t),h=item('h',seed());const first=b.claim({base:'baseline'});b.checkpoint(first.run.id,{elapsed:42});
  assert.throws(()=>b.rebase(h.id,'promoted'),/Settle/);assert.throws(()=>b.claim({base:'promoted'}),/Settle/);
