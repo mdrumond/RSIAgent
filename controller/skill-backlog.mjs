@@ -13,8 +13,9 @@ const semantic=(value,evidence=false)=>{
  return typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>'):value;
 };
 const pick=(value,keys)=>Object.fromEntries(keys.filter(key=>Object.hasOwn(value,key)).map(key=>[key,value[key]]));
-function proposalIdentity(proposal){
- if(proposal?.action==='update')return {action:'update',changes:(proposal.changes??[]).map(change=>pick(change,['action','id','scope','text','critical','negative','response']))};
+export function proposalIdentity(proposal){
+ if(proposal?.action==='update')return {action:'update',changes:(proposal.changes??[]).map(change=>change.action==='remove'?pick(change,['action','id','scope']):
+  {action:change.action,scope:change.scope,text:change.text?.trim().replace(/\s+/g,' '),critical:change.critical??false,negative:change.negative??false})};
  if(proposal?.action==='learn')return pick(proposal,['action','question','hypothesis','requiredEvidence','learningTarget','target','topic']);
  return proposal?.action==='no-change'?{action:'no-change'}:proposal;
 }
@@ -23,9 +24,11 @@ function evidenceIdentity(item){
  const memoryEvidence=evidence.memoryEvidence.map(entry=>({ref:entry.ref??(entry.collection?`${entry.collection}:${entry.entry_id??entry.chunk_id??entry.id}`:entry.entry_id??entry.chunk_id??entry.id),
   text:entry.text??entry.content,sha256:entry.sha256??entry.contentHash??entry.hash}));
  const cited=item.proposal?.memoryRefs;
- return {...evidence,memoryEvidence:Array.isArray(cited)?memoryEvidence.filter(entry=>cited.includes(entry.ref)):memoryEvidence};
+ return {...evidence,memoryEvidence:(Array.isArray(cited)?memoryEvidence.filter(entry=>cited.includes(entry.ref)):memoryEvidence).map(({ref,...facts})=>facts)};
 }
-const fingerprint=item=>hash([item.objective,item.skill,semantic(proposalIdentity(item.proposal)),diagnosticIdentity({data:semantic(evidenceIdentity(item),true)}),item.base,semantic(item.tests??item.evaluation??null,true)]);
+export const groundingIdentity=item=>{const evidence=evidenceIdentity(item);return hash([semantic(evidence?.memoryEvidence,true),evidence?.learningIdentity??diagnosticIdentity({data:semantic(evidence?.learning,true)}),semantic(item.tests??item.evaluation??null,true)]);};
+export const hypothesisIdentity=item=>hash([item.objective,item.skill,semantic(proposalIdentity(item.proposal)),diagnosticIdentity({data:semantic(evidenceIdentity(item),true)}),item.base,semantic(item.tests??item.evaluation??null,true)]);
+const fingerprint=hypothesisIdentity;
 const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0
  WHEN type='execution-state' THEN CASE WHEN json_valid(data) THEN json_extract(data,'$.state')='stopped' AND COALESCE(json_extract(data,'$.accountingExcluded'),0)=0 AND
  (COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0 OR json_extract(data,'$.nativeState')='failed') ELSE 0 END ELSE
@@ -54,6 +57,7 @@ export class SkillBacklog {
    CREATE INDEX IF NOT EXISTS skill_backlog_occurrence_group ON skill_backlog_occurrences(group_id);
    CREATE INDEX IF NOT EXISTS skill_backlog_occurrence_attempt ON skill_backlog_occurrences(attempt);
    CREATE TABLE IF NOT EXISTS skill_backlog_items(id TEXT PRIMARY KEY,key TEXT NOT NULL UNIQUE,data TEXT NOT NULL,status TEXT NOT NULL,priority REAL NOT NULL,created INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS skill_backlog_aliases(key TEXT PRIMARY KEY,item_id TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS skill_backlog_runs(id TEXT PRIMARY KEY,item_id TEXT NOT NULL,revision INTEGER NOT NULL,base TEXT,seconds REAL NOT NULL,elapsed REAL NOT NULL DEFAULT 0,status TEXT NOT NULL,snapshot TEXT NOT NULL,checkpoint TEXT,result TEXT,owner TEXT);
    CREATE UNIQUE INDEX IF NOT EXISTS skill_backlog_one_running ON skill_backlog_runs((1)) WHERE status='running';`);
  }
@@ -68,10 +72,10 @@ export class SkillBacklog {
     const attempt=row.attempt&&this.db.prepare('SELECT project FROM attempts WHERE id=?').get(row.attempt);
     const spec=attempt&&parse(this.db.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project)?.spec??'{}');
     const admission=row.attempt&&this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted' ORDER BY sequence LIMIT 1").get(row.attempt);
-    const job=admission?parse(admission.data):{};
+    const job=admission?parse(admission.data):{},selection=row.attempt&&this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='skills-selected' AND sequence<=? ORDER BY sequence DESC LIMIT 1").get(row.attempt,journal==='events'?row.sequence:Number.MAX_SAFE_INTEGER);
     const diagnostic=diagnosticIdentity({data}),id=hash([this.target,row.type,diagnostic]);
     const reference=`${journal}:${row.sequence}`,occurrence={reference,attemptId:row.attempt??null,draftId:row.draft??null,projectId:attempt?.project??null,
-     phase:row.phase??data.phase??job.mode??spec?.phase??null,kind:job.kind??null,skillVersion:job.skillVersion??job.config?.skills?.activeVersion??null,skillReads:[],artifacts:[],created:row.created??null,data,diagnostic};
+     phase:row.phase??data.phase??job.mode??spec?.phase??null,kind:job.kind??null,skillVersion:(selection&&parse(selection.data).version)??job.skillVersion??job.config?.skills?.activeVersion??null,skillReads:[],artifacts:[],created:row.created??null,data,diagnostic};
     if(!this.db.prepare('INSERT OR IGNORE INTO skill_backlog_occurrences VALUES(?,?,?,?)').run(reference,id,row.attempt??null,JSON.stringify(occurrence)).changes)return;
     const group={id,target:this.target,type:row.type,message:String(data.message??data.error??data.reason??row.type).slice(0,1500)};
     this.db.prepare('INSERT INTO skill_backlog_failures VALUES(?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET dirty=1,fresh=MAX(fresh,excluded.fresh),updated=excluded.updated').run(id,JSON.stringify(group),Number(fresh),this.now());observed++;
@@ -121,21 +125,25 @@ export class SkillBacklog {
  }
  failures({dirty=true,limit=100,occurrenceLimit=20}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures ${dirty?'WHERE dirty=1':''} ORDER BY fresh DESC,updated DESC,rowid LIMIT ?`).all(limit).map(r=>this.failure(r.id,{limit:occurrenceLimit}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
- get(id){const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=?').get(id,id);return row?parse(row.data):null;}
+ get(id){const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,id,id);return row?parse(row.data):null;}
  list({status,limit=100}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items ${status?'WHERE status=?':''} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
  store(item){this.db.prepare('INSERT INTO skill_backlog_items VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,status=excluded.status,priority=excluded.priority')
   .run(item.id,item.key,JSON.stringify(item),item.status,item.priority,item.created);return item;}
+ completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}
  upsert(input){return this.atomic(()=>{
   if(!input.key||!['harness','correctness','optimization'].includes(input.objective)||!Array.isArray(input.groupIds)||!input.groupIds.length)throw Error('Hypothesis key, objective and failure groups required');
   for(const id of input.groupIds)if(!this.db.prepare('SELECT 1 FROM skill_backlog_failures WHERE id=?').get(id))throw Error('Unknown failure group');
-  const prior=this.get(input.key),item={...prior,...input,id:prior?.id??randomUUID(),created:prior?.created??this.now(),priority:input.priority??prior?.priority??0};
-  item.fingerprint=fingerprint(item);const changed=prior&&prior.fingerprint!==item.fingerprint;
+  let prior=this.get(input.key);
+  if(!prior)for(const row of this.db.prepare('SELECT data FROM skill_backlog_items ORDER BY rowid').iterate()){const candidate=parse(row.data);if(fingerprint(candidate)===fingerprint(input)){prior=candidate;break;}}
+  const item={...prior,...input,id:prior?.id??randomUUID(),key:prior?.key??input.key,created:prior?.created??this.now(),priority:input.priority??prior?.priority??0};
+  item.fingerprint=fingerprint(item);const changed=prior&&fingerprint(prior)!==item.fingerprint;
   item.revision=prior?(prior.revision+(changed?1:0)):1;item.status=input.status??'queued';
   if(prior&&!changed&&terminal.has(prior.status))item.status=prior.status;
+  const completed=this.completed(item);if(completed){item.status=completed.status;item.previousRun=completed.id;}
   if(prior?.status==='running')item.status='running';
   if(item.objective==='harness')item.status='user-required';
   if(!statuses.has(item.status)||!Number.isFinite(item.priority))throw Error('Valid status and priority required');
-  return this.store(item);
+  this.store(item);if(input.key!==item.key)this.db.prepare('INSERT OR REPLACE INTO skill_backlog_aliases VALUES(?,?)').run(input.key,item.id);return item;
  });}
  revise(id,patch){const item=this.get(id);if(!item)throw Error('Unknown hypothesis');return this.upsert({...item,...patch,status:patch.status??'queued'});}
  rank(rows){return this.atomic(()=>rows.map(({id,priority,reason})=>{const item=this.get(id);if(!item||!Number.isFinite(priority)||!reason)throw Error('Known hypothesis, priority and reason required');return this.store({...item,priority,reason});}));}
@@ -147,6 +155,7 @@ export class SkillBacklog {
   if(row){const run=this.run(row.id);if(run.base!==base)throw Error('Settle retained comparison before baseline change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
   for(const item of this.list({status:'queued',limit:100})){
    if(item.base!==base){this.rebase(item.id,base);continue;}
+   const completed=this.completed(item);if(completed){this.store({...item,status:completed.status,previousRun:completed.id});continue;}
    const id=randomUUID();this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,status,snapshot,owner) VALUES(?,?,?,?,?,'running',?,?)")
     .run(id,item.id,item.revision,base,seconds,JSON.stringify(item),JSON.stringify(owner??null));this.store({...item,status:'running'});
    return {item:this.get(item.id),run:this.run(id),remaining:seconds,reused:false};
@@ -158,7 +167,7 @@ export class SkillBacklog {
   const run=this.run(id);if(!run||run.status!=='running'||!statuses.has(status)||['running','queued','needs-review'].includes(status))throw Error('Running comparison and final disposition required');
   if(status==='accepted'&&run.elapsed>=run.seconds)throw Error('Expired comparison cannot promote');
   this.db.prepare('UPDATE skill_backlog_runs SET status=?,result=? WHERE id=?').run(status,JSON.stringify(result??null),run.id);
-  const item=this.get(run.item_id);this.store({...item,status:item.revision===run.revision?status:item.objective==='harness'?'user-required':'queued'});return this.run(run.id);
+  const item=this.get(run.item_id),completed=item.revision!==run.revision&&this.completed(item);this.store({...item,status:item.revision===run.revision?status:completed?completed.status:item.objective==='harness'?'user-required':'queued',...(completed?{previousRun:completed.id}:{})});return this.run(run.id);
  });}
  status(){
   const cursors=Object.fromEntries(this.db.prepare("SELECT key,value FROM skill_backlog_meta WHERE key LIKE 'cursor:%'").all().map(r=>[r.key.slice(7),parse(r.value)]));

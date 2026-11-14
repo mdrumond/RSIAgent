@@ -56,6 +56,15 @@ test('terminal command failures remain evidence after successful recovery, exclu
  const groups=b.failures();assert.equal(groups.length,1);assert.equal(groups[0].type,'execution-state');assert.equal(groups[0].occurrences[0].attemptId,'recovered');assert.equal(groups[0].occurrences[0].data.handle,'native:failed-compile');
 });
 
+test('failure provenance uses the skill actually selected before that occurrence',async t=>{
+ const{b,event,attempt}=await fixture(t);attempt('versioned','phase1','passed');
+ event('skills-selected',{version:'first-version'},'versioned');event('attempt-error',{message:'First diagnostic'},'versioned');
+ event('skills-selected',{version:'second-version'},'versioned');event('verification',{correct:false,reason:'Second diagnostic'},'versioned');
+ event('skills-selected',{version:'later-version'},'versioned');b.ingest();
+ const versions=new Map(b.failures().map(group=>[group.message,group.occurrences[0].skillVersion]));
+ assert.equal(versions.get('First diagnostic'),'first-version');assert.equal(versions.get('Second diagnostic'),'second-version');
+});
+
 test('an interrupted ingestion transaction cannot advance a cursor past uncaptured evidence',async t=>{
  const{state,b,event}=await fixture(t);event('attempt-error',{message:'Must survive rollback'});
  state.db.exec("CREATE TRIGGER fail_capture BEFORE INSERT ON skill_backlog_occurrences BEGIN SELECT RAISE(ABORT,'capture interrupted');END;");
@@ -83,7 +92,7 @@ test('mutable drafts and failed outcomes are revisited after their initial nonte
 test('new urgent hypotheses overtake queued work but never preempt a retained comparison',async t=>{
  const{b,seed,item}=await fixture(t),group=seed(),low=item('low',group,{priority:1});
  const first=b.claim({base:'baseline',owner:{pid:1}});assert.equal(first.item.id,low.id);
- const urgent=item('urgent',group,{priority:100});b.checkpoint(first.run.id,{elapsed:120,checkpoint:{runningAt:1000,stage:'qa'}});
+ const urgent=item('urgent',group,{priority:100,proposal:{text:'Fix the reduction identity before optimizing'}});b.checkpoint(first.run.id,{elapsed:120,checkpoint:{runningAt:1000,stage:'qa'}});
  const resumed=b.claim({base:'baseline',seconds:30,owner:{pid:2}});
  assert.equal(resumed.run.id,first.run.id);assert.equal(resumed.remaining,1680);assert.equal(resumed.run.seconds,1800);assert.deepEqual(resumed.run.owner,{pid:2});assert.equal(resumed.run.checkpoint.stage,'qa');
  b.finish(first.run.id,{status:'rejected',result:{correct:false}});assert.equal(b.claim({base:'baseline'}).item.id,urgent.id);
@@ -124,6 +133,31 @@ test('reworded proposal rationales and retrieval scores cannot retry an identica
  b.revise(h.id,{proposal:{...proposal,changes:[{...proposal.changes[0],text:'Mask both row and column logical extents'}]}});assert.equal(b.get(h.id).revision,2);assert.ok(b.claim({base:'baseline'}));
 });
 
+test('a generated instruction ID and queue key cannot buy the same failed hypothesis another experiment',async t=>{
+ const{b,seed,item}=await fixture(t),group=seed(),proposal=id=>({action:'update',memoryRefs:['m:1'],changes:[{action:'upsert',id,scope:'implementation',text:'Mask logical tail stores',critical:true,negative:false}]});
+ const evidence={observation:'An unchanged diagnosed failure',memoryEvidence:[{ref:'m:1',text:'Observed boundary failure',sha256:'same'}]};
+ const h=item('first-key',group,{proposal:proposal('first-name'),evidence}),first=b.claim({base:'baseline'});b.finish(first.run.id,{status:'rejected'});
+ const renamed=proposal('fresh-name');renamed.memoryRefs=['m:2'];renamed.changes[0].text=' Mask  logical\n tail stores ';
+ const duplicate=item('second-key',group,{proposal:renamed,evidence:{...evidence,memoryEvidence:[{ref:'m:2',text:'Observed boundary failure',sha256:'same'}]},priority:100});
+ assert.equal(duplicate.id,h.id);assert.equal(b.get('second-key').id,h.id);assert.equal(duplicate.status,'rejected');assert.equal(b.list().length,1);assert.equal(b.claim({base:'baseline'}),null);
+ const meaningful=item('new-evidence',group,{proposal:proposal('third-name'),evidence:{observation:'Transposed strides introduce a second independent overwrite'}});
+ assert.notEqual(meaningful.id,h.id);assert.equal(b.claim({base:'baseline'}).item.id,meaningful.id);
+});
+
+test('returning from terminal revision A through B to A preserves the first experiment result and allowance',async t=>{
+ const{b,seed,item}=await fixture(t),group=seed(),proposal=text=>({action:'update',changes:[{action:'upsert',id:'instruction',scope:'implementation',text}]});
+ const h=item('hypothesis',group,{proposal:proposal('Instruction A')}),a=b.claim({base:'baseline'});b.checkpoint(a.run.id,{elapsed:73});b.finish(a.run.id,{status:'rejected'});
+ b.revise(h.id,{proposal:proposal('Instruction B')});const z=b.claim({base:'baseline'});b.checkpoint(z.run.id,{elapsed:22});b.finish(z.run.id,{status:'inconclusive'});
+ const returned=b.revise(h.id,{proposal:proposal('Instruction A')});assert.equal(returned.status,'rejected');assert.equal(returned.previousRun,a.run.id);assert.equal(b.claim({base:'baseline'}),null);assert.equal(b.run(a.run.id).elapsed,73);assert.equal(b.run(z.run.id).elapsed,22);
+ b.revise(h.id,{evidence:{observation:'A new independently verified failing boundary'}});const fresh=b.claim({base:'baseline'});assert.equal(fresh.remaining,1800);assert.notEqual(fresh.run.id,a.run.id);
+});
+
+test('removing different existing guidance entries remains a distinct change',async t=>{
+ const{b,seed,item}=await fixture(t),group=seed(),proposal=id=>({action:'update',changes:[{action:'remove',id,scope:'implementation'}]});
+ item('remove-a',group,{proposal:proposal('a')});const a=b.claim({base:'baseline'});b.finish(a.run.id,{status:'rejected'});
+ item('remove-b',group,{proposal:proposal('b')});assert.ok(b.claim({base:'baseline'}));
+});
+
 test('learning identity follows the actual question and evidence criterion rather than review narrative',async t=>{
  const{b,seed,item}=await fixture(t),proposal={action:'learn',question:'Which layouts need a mask?',hypothesis:'Partial tiles require a mask',requiredEvidence:'Check a partial tile',learningTarget:'device',reason:'Missing observation'};
  const h=item('learn',seed(),{proposal,status:'learning'});b.revise(h.id,{proposal:{...proposal,reason:'Needs a target experiment',learningRequests:[]},status:'learning'});assert.equal(b.get(h.id).revision,1);
@@ -138,7 +172,7 @@ test('active-version changes require requalification and retain all old experime
 });
 
 test('priority changes are durable and same-priority work uses oldest insertion first',async t=>{
- const{state,b,seed,item}=await fixture(t),g=seed(),a=item('first',g),c=item('second',g);
+ const{state,b,seed,item}=await fixture(t),g=seed(),a=item('first',g),c=item('second',g,{proposal:{text:'Fix the independent stride assumption'}});
  const reopened=new SkillBacklog(state,{target:'a3'});reopened.rank([{id:c.id,priority:10,reason:'Blocks the current Phase 2'}]);assert.equal(reopened.list()[0].id,c.id);
  reopened.rank([{id:a.id,priority:10,reason:'Equally severe'}]);assert.equal(reopened.claim({base:'baseline'}).item.id,a.id);
 });
