@@ -173,3 +173,12 @@ test('a cached target context keeps the parent allowance after the precheck chil
  assert.equal(checks,2);assert.equal(calls,0);assert.equal(report.samples['repair/0/active'].correct,true);
  await assert.rejects(continueMicroevalSamples({...f,precheckSeconds:.04}),/Frozen continuation changed/);
 });
+
+test('continuation work expiry retains cleanup custody without accepting late verification',async t=>{
+ const f=await fixture(t,{correct:true,spent:.05});f.seconds=.18;f.verificationSeconds=.02;f.precheckSeconds=.1;let checks=0,actors=0;
+ const report=await continueMicroevalSamples(f,{sample:async()=>{actors++;},verify:async args=>{
+  checks++;await untilAbort(args.sampleSignal);assert.equal(args.sampleStopSignal.aborted,false);
+  await new Promise(resolve=>setTimeout(resolve,20));return {correct:true,exitCode:0};
+ }});
+ const row=report.samples['repair/0/active'];assert.equal(checks,1);assert.equal(actors,0);assert.equal(row.status,'elapsed');assert.equal(row.timedOut,true);assert.notEqual(row.correct,true);assert.ok(row.elapsedSeconds>=f.seconds);await unchanged(f);
+});
