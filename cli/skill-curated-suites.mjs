@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 const sha=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const asset=name=>readFile(new URL('./skill-suites/'+name,import.meta.url),'utf8');
+const generatorFingerprint=async()=>sha(await readFile(new URL(import.meta.url),'utf8'));
 export async function curatedPacks(){return JSON.parse(await asset('a3-packs.json')).packs;}
 const mechanisms={
  'reduction-broadcast': /broadcast|reduc(?:ed|tion).*axis|row.*column.*(?:rank|shape)/i,
@@ -18,9 +19,9 @@ export function applicablePack(pack,item){
 }
 export async function curatedCatalogue({config,item}){
  if(config.target!=='a3')return [];
- const core=await asset('kernel-check-core.py'),identity=await asset('runtime-identity.py');
+ const core=await asset('kernel-check-core.py'),identity=await asset('runtime-identity.py'),generator=await generatorFingerprint();
  return (await curatedPacks()).filter(pack=>applicablePack(pack,item)).map(pack=>({id:'curated-'+pack.id,familyKey:'curated-'+pack.id,
-  target:'a3',objective:pack.objective,description:pack.description,mechanism:pack.id,tags:pack.tags,curated:true,descriptorFingerprint:sha({pack,core,identity})}));
+  target:'a3',objective:pack.objective,description:pack.description,mechanism:pack.id,tags:pack.tags,curated:true,descriptorFingerprint:sha({pack,core,identity,generator})}));
 }
 function wrapper(bundle,config,paired=false){
  const action=paired?'m.pair(sys.argv[1],sys.argv[2],CONFIG)':'m.main(sys.argv[1],CONFIG)';
@@ -30,10 +31,10 @@ function wrapper(bundle,config,paired=false){
 export async function prepareCuratedSuites({config,directory,runtimeIdentity,item}){
  if(config.target!=='a3')return [];
  if(!runtimeIdentity?.setup?.packages||!runtimeIdentity.product)throw Error('Actual target runtime identity required');
- const core=await asset('kernel-check-core.py'),identity=await asset('runtime-identity.py'),packs=await curatedPacks(),suites=[];
+ const core=await asset('kernel-check-core.py'),identity=await asset('runtime-identity.py'),generator=await generatorFingerprint(),packs=await curatedPacks(),suites=[];
  for(const pack of packs.filter(pack=>!item||applicablePack(pack,item))){
   const bundle={'kernel-check-core.py':core,'runtime-identity.py':identity,...pack.trusted},familyKey='curated-'+pack.id;
-  const version=sha({pack,bundle,runtimeIdentity}),home=join(directory,familyKey,version);await mkdir(home,{recursive:true});
+  const version=sha({pack,bundle,runtimeIdentity,generator}),home=join(directory,familyKey,version);await mkdir(home,{recursive:true});
   const tasks=[];
   for(const [i,entry]of pack.cases.entries()){
    const id=pack.id+'-'+i,settings={family:pack.family,cases:entry.variants,hypothesis:pack.id,runtimeIdentity};

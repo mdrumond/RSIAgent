@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
-import {join} from 'node:path';
+import {mkdtemp,mkdir,readFile,writeFile,rm,cp} from 'node:fs/promises';
+import {join,basename} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {curatedPacks,prepareCuratedSuites,applicablePack} from '../../cli/skill-curated-suites.mjs';
 import {resolveHypothesisCases,hypothesisCaseReadiness,registerQualifiedSuite} from '../../cli/skill-priority-cases.mjs';
 import {hypothesisTarget,hypothesisEvaluationSettled,qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
-import {validateKernelReceipt} from '../../cli/skill-microeval.mjs';
+import {validateKernelReceipt,runMicroeval} from '../../cli/skill-microeval.mjs';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
@@ -146,4 +147,37 @@ test('CPU selection ignores unrelated shared device suites and A5 configured cas
  const args={...a5,item:{objective:'correctness',proposal:{changes:[{id:'custom-rule',text:'Fix the candidate result'}]}},directory:join(a5.root,'a5-selection'),seconds:30};
  assert.equal((await hypothesisCaseReadiness(args)).ready,true);
  const selected=await resolveHypothesisCases(args,{runtimeIdentity:()=>{throw Error('A5 requested Triton identity');},select:async()=>({value:{catalogueId:suite.id,reason:'Existing target-bound A5 cases'}})});assert.equal(selected.status,'ready');assert.equal(selected.target,'a5');
+});
+
+test('generated tasks execute the real microeval path with all baseline and candidate scopes',async t=>{
+ const f=await fixture(t),suites=await prepareCuratedSuites({...f,directory:join(f.root,'dispatch-packs'),runtimeIdentity:runtime});let totalCalls=0;
+ for(const suite of suites){
+  const skills={},expected={},calls=[],observations=new Map();
+  for(const arm of ['active','candidate']){
+   const home=skills[arm]=join(f.root,suite.id,arm);await mkdir(home,{recursive:true});const map={};expected[arm]={};
+   for(const scope of ['implementation','optimisation','global-kdb','design','experiment-note']){
+    map[scope]=scope+'.md';const record={scope,trial:suite.id,value:scope==='experiment-note'?arm:'unchanged'};expected[arm][scope]=record;await writeFile(join(home,map[scope]),JSON.stringify(record));
+   }
+   await writeFile(join(home,'skill-map.json'),JSON.stringify(map));
+  }
+  const report=await runMicroeval({directory:join(f.root,'micro-'+suite.id),skills,tasks:suite.tasks,profile:{provider:'unit-fixture',model:'unit-fixture'},runs:2,seconds:10,totalSeconds:120,objective:suite.objective,binding:suite.binding,requireDevice:true},{
+   sample:async args=>{
+    const arm=basename(args.sessionDirectory).split('-').at(-1),records=args.guidance.split('\n').filter(line=>line.startsWith('{')).map(JSON.parse);
+    assert.deepEqual(Object.fromEntries(records.map(record=>[record.scope,record])),expected[arm]);
+    const observation={trial:suite.id,arm,scopes:records.map(record=>record.scope)};observations.set(args.cwd,observation);calls.push(arm);totalCalls++;
+    await writeFile(join(args.cwd,'kernel.py'),'observed = '+JSON.stringify(observation)+'\n');return {tokens:1};
+   },
+   verify:async({cwd})=>{const source=await readFile(join(cwd,'kernel.py'),'utf8');assert.deepEqual(JSON.parse(source.slice('observed = '.length)),observations.get(cwd));return {correct:false,exitCode:1,error:null};}
+  });
+  assert.equal(report.status,'complete');assert.equal(calls.length,20);assert.equal(calls.filter(arm=>arm==='candidate').length,10);assert(report.results.every(result=>result.correct===false&&!result.error));
+ }
+ assert.equal(totalCalls,100);
+});
+test('generator revisions invalidate both catalogue descriptors and qualification versions',async t=>{
+ const f=await fixture(t),home=join(f.root,'generator');await mkdir(home);const modulePath=join(home,'generator.mjs');
+ const source=await readFile(new URL('../../cli/skill-curated-suites.mjs',import.meta.url),'utf8');await writeFile(modulePath,source);await cp(new URL('../../cli/skill-suites/',import.meta.url),join(home,'skill-suites'),{recursive:true});
+ const args={config:f.config,directory:join(f.root,'version-packs'),runtimeIdentity:runtime,item:{objective:'correctness',proposal:{changes:[{text:'Restore reduction broadcast axes'}]}}};
+ const first=await import(pathToFileURL(modulePath).href+'?first'),before=(await first.prepareCuratedSuites(args))[0],descriptor=(await first.curatedCatalogue(args))[0];
+ await writeFile(modulePath,source+'\n// Independent generator revision fixture.\n');const second=await import(pathToFileURL(modulePath).href+'?second'),after=(await second.prepareCuratedSuites(args))[0],nextDescriptor=(await second.curatedCatalogue(args))[0];
+ assert.notEqual(before.packVersion,after.packVersion);assert.notEqual(descriptor.descriptorFingerprint,nextDescriptor.descriptorFingerprint);assert.notEqual(before.tasks[0].checker,after.tasks[0].checker);
 });
