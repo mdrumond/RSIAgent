@@ -43,13 +43,16 @@ class RuntimeIdentityControls(unittest.TestCase):
             with patch.dict(os.environ, RSI_SETUP_REPORT=str(report), ASCEND_PHYSICAL_DEVICE='4'), \
                     patch.object(module.subprocess, 'run', return_value=board):
                 first = module.identity()
+                # The probe crosses JSON before a fresh checker recomputes identity.
+                wire_identity = json.loads(json.dumps(first))
+                self.assertEqual(wire_identity, module.identity())
                 identity['python'][1] = ['other-python-path', 30, 40]
                 for data in identity['packages'].values():
                     data[1] = 'relocated-installation'
                     data[3][0][1:] = [999, 1000]
                 identity['compilers']['compiler'][1:] = [999, 1000]
                 report.write_text(json.dumps({'identity': identity}))
-                self.assertEqual(first, module.identity())
+                self.assertEqual(wire_identity, module.identity())
                 compiler.write_text('compiler-v2')
                 second = module.identity()
                 self.assertNotEqual(first, second)
