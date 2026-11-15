@@ -1,5 +1,5 @@
 /** One target-bound hypothesis, frozen inputs, and the caller's remaining elapsed allocation. */
-import {mkdir,readFile,writeFile,rename,appendFile,cp} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,appendFile,cp,readdir} from 'node:fs/promises';
 import {join,dirname,basename,relative,resolve,posix} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {evaluationSettings,evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
@@ -98,6 +98,7 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
    const left=args.seconds-(performance.now()-began)/1000;if(left<=0)throw Error('Sample elapsed allocation exhausted during preparation');
    return (dependencies.nativeSample??nativeSample)({...args,targetBash:environmentOptions.mode==='local',sampleStopSignal:cleanup(args.sampleStopSignal),seconds:left,prompt:args.prompt+'\n\nPrepared target:\n'+context.instructions,targetEnvironment:context.env});
   },
+  sampleSettled:async({cwd})=>{const context=contexts.get(cwd);return Boolean(context?.env.reconcileLease&&await context.env.reconcileLease());},
   verify:async args=>{
    let context=contexts.get(args.cwd);if(!context){context=await make(args.cwd,join(dirname(args.cwd),'target'),args.checker,args.signal,args.sampleStopSignal??stopSignal);contexts.set(args.cwd,context);}
    return command(context,[binding.python??'python3',context.checker,'.'].map(quote).join(' '),args.cwd,args.seconds,args.signal,args.sampleStopSignal??stopSignal,'verification');
@@ -162,59 +163,76 @@ export async function evaluateHypothesis({directory,config,objective,target,task
  return {status:report.status,identity,decision,report,directory};
 }
 
+async function retainedTargets(directory){
+ const targets=[];const dirs=async path=>{try{return (await readdir(path,{withFileTypes:true})).filter(entry=>entry.isDirectory());}catch(error){if(error.code==='ENOENT')return [];throw error;}};
+ const micro=join(directory,'micro');
+ for(const parent of await dirs(micro))if(parent.name!=='frozen')for(const child of await dirs(join(micro,parent.name))){
+  const target=join(micro,parent.name,child.name,'target');
+  if(await optional(join(target,'.ascend-command-lease.json'))||await readFile(join(target,'environment-events.jsonl'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';}))targets.push(target);
+ }
+ return targets;
+}
+async function targetCustody({instancePath,directory,binding,config,resource,signal,unknown},dependencies){
+ const journal=join(instancePath,'environment-events.jsonl'),text=await readFile(journal,'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';});
+ const lines=text.split('\n');if(!text.endsWith('\n'))lines.pop();const events=lines.filter(Boolean).map(line=>JSON.parse(line)),pointer=await optional(join(instancePath,'.ascend-command-lease.json'));
+ const proofs=[],covered=new Set(),terminal=new Map(events.filter(event=>event.type==='execution-state'&&event.data.state==='stopped').map(event=>[event.data.handle,event.data]));
+ let env;const environment=async()=>env??=await (dependencies.createEnvironment??createEnvironment)({...binding.environment,probeObservationSeconds:Math.min(30,binding.environment.probeObservationSeconds??30),...(config.local_execution?{localExecution:config.local_execution}:{})},
+  {instancePath,campaignRoot:directory,resource,signal,stopSignal:signal,exclude:async(_name,fn)=>fn(),event:async()=>{}});
+ const observe=async handle=>{if(terminal.has(handle)){proofs.push({handle,state:terminal.get(handle),journalClosed:true});covered.add(handle);return true;}const state=await (await environment()).observe(handle,{signal});if(state.state!=='stopped')return false;proofs.push({handle,state});covered.add(handle);return true;};
+ const submitted=events.filter(event=>event.type==='execution-submitting');
+ const operations=new Set(events.filter(event=>['execution-starting','execution-submitting'].includes(event.type)).map(event=>event.data.operation??event.data.submission));
+ for(const operation of operations){
+  if(!operation)return null;const group=submitted.filter(event=>(event.data.operation??event.data.submission)===operation);
+  const responses=group.map(row=>events.find(event=>['execution-submitted','execution-not-admitted'].includes(event.type)&&event.data.submission===row.data.submission));
+  if(group.length&&responses.every(response=>response?.type==='execution-not-admitted'&&response.data.closed===true||response?.data.handle&&terminal.has(response.data.handle))){
+   for(const response of responses)if(response.data.handle){covered.add(response.data.handle);proofs.push({handle:response.data.handle,state:terminal.get(response.data.handle),journalClosed:true});}else proofs.push({submission:response.data.submission,notAdmitted:true,closed:true});continue;
+  }
+  const context=await environment();if(!context.reconcileOperation)return null;const proof=await context.reconcileOperation({operation,events});
+  if(proof.closed!==true){
+   if(!group.length)return null;
+   for(const response of responses){if(response?.type==='execution-not-admitted'&&response.data.closed===true)continue;if(!response?.data.handle||!await observe(response.data.handle))return null;}
+  }
+  for(const handle of [...(proof.handles??[]),...(proof.deferredHandles??[])])covered.add(handle);proofs.push({operation,...proof,...(proof.closed!==true?{nativeClosed:true}:{})});
+ }
+ for(const handle of new Set(events.filter(event=>event.type==='execution-handle').map(event=>event.data.handle).filter(Boolean)))if(!covered.has(handle)&&!await observe(handle))return null;
+ if(unknown?.handle&&!covered.has(unknown.handle)&&!await observe(unknown.handle))return null;
+ for(const reservation of unknown?.reservations??[]){if(!Number.isInteger(reservation.physicalDevice)||!reservation.receipt||!reservation.token)return null;const proof=await (await environment()).reconcileReservation(reservation.physicalDevice,{receipt:reservation.receipt,token:reservation.token});if(proof.closed!==true)return null;proofs.push(proof);}
+ if(pointer){
+  if(!pointer.receipt||!pointer.token||!Number.isInteger(pointer.physicalDevice))return null;
+  const context=await environment();if(!context.reconcileLease||!await context.reconcileLease())return null;proofs.push({lease:pointer,closed:true});
+ }else for(const {data}of events.filter(event=>event.type==='device-lease-acquired')){
+  if(events.some(event=>event.type==='device-lease-released'&&event.data.token===data.token&&event.data.receipt===data.receipt||event.type==='device-cleanup-queued'&&event.data.token===data.token)){proofs.push({lease:data,journalClosed:true});continue;}
+  const context=await environment();if(!context.reconcileReservation)return null;const proof=await context.reconcileReservation(data.physicalDevice,{receipt:data.receipt,token:data.token});if(proof.closed!==true)return null;proofs.push(proof);
+ }
+ if(!proofs.length)return null;
+ if(env?.reconcileLease&&!await env.reconcileLease())return null;
+ if(await readFile(journal,'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';})!==text)return null;
+ return {instancePath,journalSha256:hash(text),proofs};
+}
 export async function hypothesisEvaluationSettled({directory,config={},binding,resource,signal},dependencies={}){
  try{
   const continuation=await optional(join(directory,'qualification-continuation.json'));
   if(continuation)return hypothesisEvaluationSettled({directory:continuation.directory,config,binding,resource,signal},dependencies);
-  const file=join(directory,'micro','results.json'),bytes=await readFile(file,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;});
-  if(!bytes)return true;const report=JSON.parse(bytes);
-  if(report.owner&&!await ownerStopped(report.owner))return false;
-  const marker=report.runningSample??report.pairedReplay?.runningPair;
-  if(!marker)return true;
-  const unknown=marker.unresolvedExecution;
-  binding??=(await optional(join(directory,'hypothesis.json')))?.binding;
-  if(!binding?.environment)return false;
-  const parts=report.runningSample?marker.key.split('/'):null;
-  if(parts&&(parts.length!==3||parts.some(p=>!p||p==='..')))return false;
-  const instancePath=parts?join(directory,'micro',parts[0],parts[1]+'-'+parts[2],'target'):
-   join(directory,'micro','paired-target',marker.projectId+'-'+marker.run,'target');
-  const observationSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000);
-  const env=await (dependencies.createEnvironment??createEnvironment)({...binding.environment,probeObservationSeconds:Math.min(30,binding.environment.probeObservationSeconds??30),...(config.local_execution?{localExecution:config.local_execution}:{})},
-   {instancePath,campaignRoot:directory,resource,signal:observationSignal,stopSignal:observationSignal,exclude:async(_name,fn)=>fn(),event:async()=>{}});
-  const proofs=[];
-  if(!unknown){
-   const text=await readFile(join(instancePath,'environment-events.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
-   const lines=text.split('\n');if(!text.endsWith('\n'))lines.pop();const events=lines.filter(Boolean).map(line=>JSON.parse(line));
-   const submitted=events.filter(e=>e.type==='execution-submitting'),covered=new Set();
-   for(const operation of new Set(submitted.map(e=>e.data.operation??e.data.submission))){
-    if(!operation||!env.reconcileOperation)return false;const proof=await env.reconcileOperation({operation,events});
-    if(proof.closed!==true){
-     // Accounting may be unavailable even when all known commands are closed;
-     // an unidentified submission still cannot be inferred closed from a PID.
-     const group=submitted.filter(e=>(e.data.operation??e.data.submission)===operation);
-     for(const row of group){const response=events.find(e=>['execution-submitted','execution-not-admitted'].includes(e.type)&&e.data.submission===row.data.submission);
-      if(response?.type==='execution-not-admitted')continue;
-      if(!response?.data.handle)return false;const state=await env.observe(response.data.handle,{signal:observationSignal});if(state.state!=='stopped')return false;covered.add(response.data.handle);proofs.push({handle:response.data.handle,state,nativeClosed:true,accountingUnresolved:proof.accountingUnresolved});
-     }
-    }
-    for(const handle of [...(proof.handles??[]),...(proof.deferredHandles??[])])covered.add(handle);proofs.push({operation,...proof});
-   }
-   for(const handle of new Set(events.filter(e=>e.type==='execution-handle').map(e=>e.data.handle).filter(Boolean))){
-    if(covered.has(handle))continue;const state=await env.observe(handle,{signal:observationSignal});if(state.state!=='stopped')return false;proofs.push({handle,state});
-   }
+  const file=join(directory,'micro','results.json'),bytes=await readFile(file,'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;});const report=bytes?JSON.parse(bytes):null;
+  if(report?.owner&&!await ownerStopped(report.owner))return false;
+  const marker=report?.runningSample??report?.pairedReplay?.runningPair,targets=new Set(await retainedTargets(directory));
+  let markerTarget;
+  if(marker){const parts=report.runningSample?marker.key.split('/'):null;if(parts&&(parts.length!==3||parts.some(part=>!part||part==='..')))return false;
+   markerTarget=parts?join(directory,'micro',parts[0],parts[1]+'-'+parts[2],'target'):join(directory,'micro','paired-target',marker.projectId+'-'+marker.run,'target');targets.add(markerTarget);}
+  if(!targets.size)return true;
+  binding??=(await optional(join(directory,'hypothesis.json')))?.binding;if(!binding?.environment)return false;
+  const observationSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000),ledgerFile=join(directory,'target-settlements.json'),ledger=await optional(ledgerFile)??{};
+  const closures=[];let markerClosure;
+  for(const instancePath of targets){
+   observationSignal.throwIfAborted();const key=relative(directory,instancePath),journal=await readFile(join(instancePath,'environment-events.jsonl'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';}),pointer=await optional(join(instancePath,'.ascend-command-lease.json'));
+   if(instancePath!==markerTarget&&!pointer&&ledger[key]?.journalSha256===hash(journal)&&await optional(ledger[key].closure)){closures.push(ledger[key].closure);continue;}
+   const proof=await targetCustody({instancePath,directory,binding,config,resource,signal:observationSignal,unknown:instancePath===markerTarget?marker?.unresolvedExecution:null},dependencies);if(!proof)return false;
+   const closure=join(directory,'settled-'+randomUUID()+'.json');await writeFile(closure,JSON.stringify({at:new Date().toISOString(),marker:instancePath===markerTarget?marker:null,...proof},null,2)+'\n',{flag:'wx'});
+   ledger[key]={journalSha256:proof.journalSha256,closure};await save(ledgerFile,ledger);closures.push(closure);if(instancePath===markerTarget)markerClosure=closure;
   }
-  if(unknown?.handle){const state=await env.observe(unknown.handle,{signal:observationSignal});if(state.state!=='stopped')return false;proofs.push({handle:unknown.handle,state});}
-  for(const reservation of unknown?.reservations??[]){
-   if(!Number.isInteger(reservation.physicalDevice)||!reservation.receipt||!reservation.token)return false;
-   const proof=await env.reconcileReservation(reservation.physicalDevice,{receipt:reservation.receipt,token:reservation.token});if(proof.closed!==true)return false;proofs.push(proof);
-  }
-  if(!proofs.length||env.reconcileLease&&!await env.reconcileLease())return false;
-  if(await readFile(file,'utf8')!==bytes)return false; // Never overwrite a concurrent evaluator's checkpoint.
-  const closure=join(directory,'settled-'+randomUUID()+'.json');
-  await writeFile(closure,JSON.stringify({at:new Date().toISOString(),marker,proofs,elapsedSeconds:report.elapsedSeconds},null,2)+'\n',{flag:'wx'});
-  report.settledInterruption={closure,marker};report.status='inconclusive';
-  delete report.runningSample;if(report.pairedReplay)delete report.pairedReplay.runningPair;
-  await save(file,report);return true;
+  if(bytes&&await readFile(file,'utf8')!==bytes)return false;
+  if(marker){report.settledInterruption={closure:markerClosure,closures,marker};report.status='inconclusive';delete report.runningSample;if(report.pairedReplay)delete report.pairedReplay.runningPair;await save(file,report);}
+  return true;
  }catch{return false;}
 }
 
