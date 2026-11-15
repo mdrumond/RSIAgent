@@ -82,7 +82,9 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
   await symlink(join(config.root,'machinery'),join(work.directory,'machinery'),'dir').catch(e=>{if(e.code!=='EEXIST')throw e;});
   await symlink(join(config.root,'knowledge.sqlite'),join(work.directory,'knowledge.sqlite')).catch(e=>{if(e.code!=='EEXIST')throw e;});
   await writeFile(join(work.directory,'instance.json'),JSON.stringify(child));
-  if(!work.inspection){
+  if(work.request.workKind==='suite'){
+   work.routing={kind:'suite-construction',source:'qualified-case-readiness',modelReview:false};save();
+  }else if(!work.inspection){
    work.stage='inspection';save();
    const groups=await freezeGroups(config.root,(work.request.groupIds??[]).map(id=>backlog.failure(id,{limit:2})).filter(Boolean),join(work.directory,'inspection','frozen'));
    const refs=new Set(groups.flatMap(g=>[...(g.occurrences??[]),...(g.linkedDiagnostics??[])].map(o=>o.reference)));

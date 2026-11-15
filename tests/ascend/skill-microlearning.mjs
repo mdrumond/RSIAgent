@@ -87,10 +87,13 @@ for(const oracle of ['correct','always-pass'])test('suite export must pass actua
  await writeFile(join(trusted,'good.py'),'answer=42\n');await writeFile(join(trusted,'bad.py'),'answer=0\n');
  const tasks=Array.from({length:5},(_,n)=>({id:'case-'+n,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Repair boundary answer',files:{'kernel.py':'bad.py'},checker:'checker.py',controls:{reference:{files:{'kernel.py':'good.py'}},negatives:[{files:{'kernel.py':'bad.py'}}]}}));
  const manifest=join(trusted,'skill-evaluation.json');await writeFile(manifest,JSON.stringify({target:'cpu',objective:'correctness',tasks}));
- const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need controls',refs:[]}),
-  construct:async()=>[{id:'suite',goal:'Build suite',source:editable,actor_seconds:20,verifier:{files:[manifest,join(trusted,'checker.py'),join(trusted,'good.py'),join(trusted,'bad.py')]}}],importProject:async(root,spec)=>spec,
+ let constructed=0;
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>{throw Error('Suite work must not invoke factual inspection');},
+  construct:async({config,concurrency})=>{constructed++;assert.equal(concurrency,1);assert.deepEqual(config.resource_ids,[f.resource.id]);return [{id:'suite',goal:'Build suite',source:editable,actor_seconds:20,verifier:{files:[manifest,join(trusted,'checker.py'),join(trusted,'good.py'),join(trusted,'bad.py')]}}];},importProject:async(root,spec)=>spec,
   operate:async(command,config)=>{const child=new State(join(config.root,'state.sqlite'));child.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','suite','passed','now')").run();child.event('attempt','postprocess-completed',{});child.close();},stopped:async()=>true});
- assert.equal(result.status,oracle==='correct'?'verified':'inconclusive');
+ assert.equal(result.status,oracle==='correct'?'verified':'inconclusive');assert.equal(constructed,1);
+ const episode=f.backlog.meta('microlearning-last');assert.equal(episode.seconds,900);assert.deepEqual(episode.resource,f.resource);assert.equal(episode.routing.modelReview,false);assert.equal(episode.inspection,undefined);
+ const qualification=JSON.parse(await readFile(join(episode.directory,'qualification','micro','results.json')));assert.equal(qualification.results.length,oracle==='correct'?10:2);
  const suites=await qualifiedSuites({config:f.config});assert.equal(suites.length,oracle==='correct'?1:0);
  if(suites.length){assert.equal(suites[0].tasks.length,5);assert.equal(suites[0].target,'cpu');}
 });
