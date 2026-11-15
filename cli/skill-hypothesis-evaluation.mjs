@@ -209,10 +209,10 @@ async function targetCustody({instancePath,directory,binding,config,resource,sig
  if(await readFile(journal,'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';})!==text)return null;
  return {instancePath,journalSha256:hash(text),proofs};
 }
-export async function hypothesisEvaluationSettled({directory,config={},binding,resource,signal},dependencies={}){
+export async function hypothesisEvaluationSettled({directory,config={},binding,resource,signal,retirePrePayload=false},dependencies={}){
  try{
   const continuation=await optional(join(directory,'qualification-continuation.json'));
-  if(continuation)return hypothesisEvaluationSettled({directory:continuation.directory,config,binding,resource,signal},dependencies);
+  if(continuation)return hypothesisEvaluationSettled({directory:continuation.directory,config,binding,resource,signal,retirePrePayload},dependencies);
   const file=join(directory,'micro','results.json'),bytes=await readFile(file,'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;});const report=bytes?JSON.parse(bytes):null;
   if(report?.owner&&!await ownerStopped(report.owner))return false;
   const marker=report?.runningSample??report?.pairedReplay?.runningPair,targets=new Set(await retainedTargets(directory));
@@ -222,15 +222,30 @@ export async function hypothesisEvaluationSettled({directory,config={},binding,r
   if(!targets.size)return true;
   binding??=(await optional(join(directory,'hypothesis.json')))?.binding;if(!binding?.environment)return false;
   const observationSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000),ledgerFile=join(directory,'target-settlements.json'),ledger=await optional(ledgerFile)??{};
-  const closures=[];let markerClosure;
+  const closures=[];let markerClosure,reportBytes=bytes;
   for(const instancePath of targets){
    observationSignal.throwIfAborted();const key=relative(directory,instancePath),journal=await readFile(join(instancePath,'environment-events.jsonl'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;return '';}),pointer=await optional(join(instancePath,'.ascend-command-lease.json'));
    if(instancePath!==markerTarget&&!pointer&&ledger[key]?.journalSha256===hash(journal)&&await optional(ledger[key].closure)){closures.push(ledger[key].closure);continue;}
-   const proof=await targetCustody({instancePath,directory,binding,config,resource,signal:observationSignal,unknown:instancePath===markerTarget?marker?.unresolvedExecution:null},dependencies);if(!proof)return false;
+   let proof=await targetCustody({instancePath,directory,binding,config,resource,signal:observationSignal,unknown:instancePath===markerTarget?marker?.unresolvedExecution:null},dependencies);
+   const retirementPointer=pointer??(report?.settledInterruption?.retirementPending?await optional(report.settledInterruption.fence):null);
+   if(!proof&&retirePrePayload&&marker&&instancePath===markerTarget&&retirementPointer){
+    // Fence the scientific comparison durably BEFORE releasing its device. Even
+    // a crash or failed retirement cannot replay/rescore this partial target.
+    if(reportBytes&&await readFile(file,'utf8')!==reportBytes)return false;
+    const fence=join(directory,'pre-payload-retirement-'+hash(instancePath)+'.json');
+    const guard={permanent:true,instancePath,receipt:retirementPointer.receipt,token:retirementPointer.token,marker};
+    const previous=await optional(fence);if(previous&&JSON.stringify(previous)!==JSON.stringify(guard))return false;if(!previous)await save(fence,guard);
+    report.settledInterruption??={retirementPending:true,fence,marker};await save(file,report);reportBytes=await readFile(file,'utf8');
+    const env=await (dependencies.createEnvironment??createEnvironment)({...binding.environment,...(config.local_execution?{localExecution:config.local_execution}:{})},{instancePath,campaignRoot:directory,resource,signal:observationSignal,stopSignal:observationSignal,exclude:async(_name,fn)=>fn(),event:async()=>{}});
+    if(!env.retirePrePayloadCustody)return false;
+    const retired=await env.retirePrePayloadCustody({...retirementPointer,fence});if(retired.closed!==true)return false;
+    proof={instancePath,journalSha256:hash(journal),proofs:[retired]};
+   }
+   if(!proof)return false;
    const closure=join(directory,'settled-'+randomUUID()+'.json');await writeFile(closure,JSON.stringify({at:new Date().toISOString(),marker:instancePath===markerTarget?marker:null,...proof},null,2)+'\n',{flag:'wx'});
    ledger[key]={journalSha256:proof.journalSha256,closure};await save(ledgerFile,ledger);closures.push(closure);if(instancePath===markerTarget)markerClosure=closure;
   }
-  if(bytes&&await readFile(file,'utf8')!==bytes)return false;
+  if(reportBytes&&await readFile(file,'utf8')!==reportBytes)return false;
   if(marker){report.settledInterruption={closure:markerClosure,closures,marker};report.status='inconclusive';delete report.runningSample;if(report.pairedReplay)delete report.pairedReplay.runningPair;await save(file,report);}
   return true;
  }catch{return false;}

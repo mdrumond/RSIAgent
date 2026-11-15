@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import {readFileSync,writeFileSync,renameSync,mkdirSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
@@ -67,6 +67,55 @@ export async function closeDeviceLease(lease) {
     writeFileSync(join(dirname(lease.receipt),'closure.json'),JSON.stringify(proof),{mode:0o600});
     renameSync(dirname(lease.receipt),path);return proof;
   });
+}
+
+// Explicit permanent abandonment, not transfer closure. Legacy execute uploads
+// first stage into an exec-*/incoming directory before any sync or run dispatch.
+export async function retirePrePayloadLease({receipt,token,instancePath,fence}, {observe,stopped=ownerStopped}={}) {
+ const blocked=reason=>({closed:false,reason});
+ const old=await closedDeviceLease(receipt,token);if(old)return old.retiredPrePayload&&old.instancePath===instancePath&&old.fence===fence?old:blocked('different-closure');
+ let bytes;try{bytes=await readFile(receipt,'utf8');}catch(error){if(error.code==='ENOENT')return blocked('missing-receipt');throw error;}
+ const record=JSON.parse(bytes),owner=record.owner;
+ if(record.version!==2||record.token!==token||record.instancePath!==instancePath)return blocked('ownership-mismatch');
+ if(!owner?.pid||!owner.start||!owner.boot||!await stopped(owner))return blocked('owner-not-stopped');
+ if(record.reconciliation&&!await ownerStopped(record.reconciliation.owner))return blocked('reconciliation-active');
+ if(record.payloadHandle||record.controlHandle||record.controlStarted||record.cleanup)return blocked('payload-intent');
+ const rows=record.submissions;if(rows?.length!==1||rows.some(row=>row.kind!=='upload'||row.accountingExcluded!==true||row.controlPayload||row.wrapperClosure))return blocked('non-upload-intent');
+ const journalPath=join(instancePath,'environment-events.jsonl'),journal=await readFile(journalPath,'utf8');
+ if(!journal.endsWith('\n'))return blocked('incomplete-journal');
+ const events=journal.trim().split('\n').filter(Boolean).map(line=>JSON.parse(line)),acquired=events.findIndex(e=>e.type==='device-lease-acquired'&&e.data.receipt===receipt&&e.data.token===token);
+ if(acquired<0)return blocked('missing-admission-provenance');
+ if(events.some(e=>e.type==='execution-starting'))return blocked('unclassified-intent');
+ const after=events.slice(acquired+1),intents=after.filter(e=>['execution-submitting','execution-starting'].includes(e.type));
+ if(intents.length!==rows.length||intents.some(e=>e.type!=='execution-submitting'||!rows.some(row=>row.submission===e.data.submission&&row.kind===e.data.kind&&row.receiptFile===e.data.receiptFile)))return blocked('unclassified-intent');
+ const handles=new Set();
+ for(const row of rows){
+  const name=relative(join(instancePath,'.executions'),row.receiptFile??'');
+  if(!/^exec-[A-Za-z0-9]+\/transfer\.json$/.test(name))return blocked('noncanonical-staging');
+  // A later synchronization manifest or command invalidates the first-upload proof.
+  for(const file of ['execution.json','sync.json'])try{await readFile(join(dirname(row.receiptFile),file));return blocked('later-stage-artifact');}catch(error){if(error.code!=='ENOENT')throw error;}
+  let retained;try{retained=JSON.parse(await readFile(row.receiptFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  const handle=row.handle??retained?.handle;
+  if(handle){if(!/^remote:[^:]+:transfer:[^:]+$/.test(handle))return blocked('non-transfer-handle');handles.add(handle);}
+ }
+ if(after.some(e=>e.type==='execution-handle'&&!handles.has(e.data.handle)))return blocked('unclassified-handle');
+ if((record.handles??[]).some(handle=>!handles.has(handle)))return blocked('unclassified-handle');
+ // Earlier health/setup jobs must already have positive terminal journal proof.
+ for(const e of events.slice(0,acquired))if(e.type==='execution-submitting'&&e.data.kind!=='upload'){
+  const response=events.find(x=>x.type==='execution-submitted'&&x.data.submission===e.data.submission);
+  if(!response?.data.handle||!events.some(x=>x.type==='execution-state'&&x.data.handle===response.data.handle&&x.data.state==='stopped'))return blocked('earlier-execution-unresolved');
+ }
+ const fenceBytes=await readFile(fence,'utf8'),guard=JSON.parse(fenceBytes);
+ if(guard.permanent!==true||guard.instancePath!==instancePath||guard.receipt!==receipt||guard.token!==token)return blocked('missing-permanent-fence');
+ const observations=[];for(const handle of handles){let state;try{state=await observe(handle);}catch{state={state:'unknown'};}observations.push({handle,state});}
+ const hash=value=>createHash('sha256').update(value).digest('hex'),path=closedPath(receipt,token);
+ const proof={closed:true,retiredPrePayload:true,payloadStarted:false,receipt,token,pool:record.pool,physicalDevice:record.physicalDevice,handles:record.handles,controlDirectory:record.controlDirectory,
+  unresolvedArtifacts:rows.map(row=>({...row,fenced:true})),observations,owner,fence,fenceSha256:hash(fenceBytes),leaseSha256:hash(bytes),journalSha256:hash(journal),sourceSha256:hash(await readFile(new URL(import.meta.url))),executorSourceSha256:hash(await readFile(new URL('./index.mjs',import.meta.url))),protocol:'legacy-first-source-upload-v1',instancePath};
+ await mkdir(dirname(path),{recursive:true,mode:0o700});
+ return leaseLock(dirname(dirname(receipt)),()=>{
+  if(readFileSync(receipt,'utf8')!==bytes||readFileSync(journalPath,'utf8')!==journal||readFileSync(fence,'utf8')!==fenceBytes)return blocked('ownership-changed');
+  writeFileSync(join(dirname(receipt),'closure.json'),JSON.stringify(proof),{mode:0o600});renameSync(dirname(receipt),path);return {...proof,path};
+ });
 }
 
 // Atomic mkdir spans instances/runtimes; owner death/expiry never proves closure.

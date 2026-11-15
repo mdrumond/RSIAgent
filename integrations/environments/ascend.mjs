@@ -1,7 +1,7 @@
 import { createEnvironment as genericEnvironment, createCplClient, closedSetupError } from './index.mjs';
 import { readFile, writeFile, mkdir, mkdtemp, rename, unlink, cp, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { reserveDevice, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, artifactDownload, hostLease, hostReconcile } from './device-leases.mjs';
+import { reserveDevice, retirePrePayloadLease, openDeviceLease, deviceLeaseReceipt, reconcileDeviceLease, closedDeviceLease, closeDeviceLease, artifactDownload, hostLease, hostReconcile } from './device-leases.mjs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -639,6 +639,14 @@ export async function createEnvironment(options, context) {
       if(pool){const closed=await retainedClosure(physical,proof);if(closed)return closed;}
       await enabled();return recoverReservation(physical,proof);
     }),
+    async retirePrePayloadCustody({receipt,token,fence}){
+      if(commandActive)return {closed:false,reason:'command-active'};
+      const retained=await readJson(leasePath).catch(error=>{if(error.code!=='ENOENT')throw error;return null;});
+      if(retained&&(retained.receipt!==receipt||retained.token!==token))return {closed:false,reason:'ownership-mismatch'};
+      const proof=await retirePrePayloadLease({receipt,token,fence,instancePath:context.instancePath},{observe:handle=>environment.observe(handle)});
+      if(proof.closed&&retained){if((await readJson(leasePath)).token!==token)throw Error('Lease ownership changed');await unlink(leasePath);}
+      return proof;
+    },
     reconcileLease:async()=>commandActive?false:Boolean(await deferClosedLease())||reconcileLease(), shellOnTarget:local,
     async observe(handle,settings){
       const result=await environment.observe(handle,settings);
