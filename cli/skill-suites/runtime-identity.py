@@ -33,4 +33,4 @@ def identity():
         raise RuntimeError('Device, CANN version and compiler identity required')
     return {'setup': {'binding': report['binding'], 'python': report['python'][0],
                       'machine': report['machine'], 'packages': packages, 'compilers': compilers},
-            'cannVersions': sorted(versions), 'product': product.group(1)}
+            'cannVersions': [list(version) for version in sorted(versions)], 'product': product.group(1)}
