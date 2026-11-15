@@ -132,6 +132,26 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
  };
 }
 
+/** Freeze timing before proposal review; historical roots retain their original wire identity. */
+export async function freezeHypothesisProtocol({directory,target,binding}){
+ const file=join(directory,'evaluation-protocol.json'),saved=await optional(file),state=await optional(join(directory,'hypothesis.json')),manifest=await optional(join(directory,'micro','manifest.json'))??await optional(join(directory,'micro','results.json'));
+ const explicit=binding.verificationSeconds;
+ if(explicit!==undefined&&(!Number.isFinite(explicit)||explicit<0||explicit>=180))throw Error('Verification reserve must fit inside the sample elapsed allocation');
+ if(saved){
+  if(saved.target!==target||saved.explicitVerificationSeconds!==(explicit??null))throw Error('Frozen hypothesis sample timing changed');
+  return {protocol:saved.protocol,verificationSeconds:saved.protocol.verificationSeconds};
+ }
+ if(state||manifest){
+  const verificationSeconds=state?.protocol?.verificationSeconds??manifest?.verificationSeconds??state?.binding?.verificationSeconds??30;
+  if(explicit!==undefined&&explicit!==verificationSeconds)throw Error('Frozen hypothesis sample timing changed');
+  return {protocol:state?.protocol??null,verificationSeconds};
+ }
+ const verificationSeconds=explicit??(target==='cpu'?30:90),protocol={version:1,sampleSeconds:180,actorSeconds:180-verificationSeconds,verificationSeconds,policy:target==='cpu'?'cpu-reserve-v1':'target-transport-reserve-v1'};
+ await mkdir(directory,{recursive:true});const record={target,explicitVerificationSeconds:explicit??null,protocol},bytes=JSON.stringify(record,null,2)+'\n';
+ try{await writeFile(file,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST')throw error;if(await readFile(file,'utf8')!==bytes)throw Error('Frozen hypothesis sample timing changed');}
+ return {protocol,verificationSeconds};
+}
+
 export async function evaluateHypothesis({directory,config,objective,target,tasks,binding,skills,remainingSeconds,signal,resource,event},dependencies={}){
  const started=performance.now(),prepared=prepareHypothesisEvaluation({objective,target,tasks,binding});
  if(prepared.status!=='ready')return {...prepared,decision:{objective,promote:false,reason:prepared.reason}};
@@ -140,7 +160,8 @@ export async function evaluateHypothesis({directory,config,objective,target,task
  const frozen=await Promise.all(tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),...(task.pairedChecker?{pairedChecker:await readFile(task.pairedChecker,'utf8')}:{})})));
  const skillHashes=Object.fromEntries(await Promise.all(Object.entries(skills).map(async([arm,path])=>[arm,(await skillInput(path)).sha256])));
  const {knowledge,...runtimeBinding}=binding;
- const identity=hash({objective,target,binding:runtimeBinding,...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),tasks:frozen,skills:skillHashes});
+ const {protocol,verificationSeconds}=await freezeHypothesisProtocol({directory,target,binding});
+ const identity=hash({objective,target,...(protocol?{protocol}:{}),binding:runtimeBinding,...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),tasks:frozen,skills:skillHashes});
  const file=join(directory,'hypothesis.json'),old=await optional(file);
  if(old&&old.identity!==identity)throw Error('Frozen hypothesis inputs, skill baseline or target changed');
  const interrupted=await optional(join(directory,'micro','results.json'));
@@ -148,12 +169,12 @@ export async function evaluateHypothesis({directory,config,objective,target,task
  const available=()=>Math.max(0,remainingSeconds-(performance.now()-started)/1000),cleanupSeconds=30;
  const work=available()-cleanupSeconds;
  if(work<=0)return {status:'elapsed',identity,decision:{objective,promote:false,reason:'inconclusive'}};
- const state=old??{identity,objective,target,binding:runtimeBinding,allocationSeconds:remainingSeconds,developmentSeconds:work-(objective==='optimization'?Math.min(300,work/3):0),pairedSeconds:objective==='optimization'?Math.min(300,work/3):0};
+ const state=old??{identity,objective,target,...(protocol?{protocol}:{}),binding:runtimeBinding,allocationSeconds:remainingSeconds,developmentSeconds:work-(objective==='optimization'?Math.min(300,work/3):0),pairedSeconds:objective==='optimization'?Math.min(300,work/3):0};
  if(!old)await save(file,state);
  if(available()<=cleanupSeconds)return {status:'elapsed',identity,decision:{objective,promote:false,reason:'inconclusive'}};
  const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),deadline=AbortSignal.timeout(Math.max(1,Math.ceil((available()-cleanupSeconds)*1000))),workSignal=signal?AbortSignal.any([signal,deadline]):deadline;
  const targetOps=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal:workSignal,stopSignal:cleanup,localExecution:config.local_execution,event},dependencies);
- let report;try{report=await (dependencies.runMicroeval??runMicroeval)({directory:join(directory,'micro'),skills,tasks,profile:config.actor,python:config.python??'python3',runs:2,seconds:180,verificationSeconds:binding.verificationSeconds??30,totalSeconds:state.developmentSeconds,objective,binding:runtimeBinding,knowledge,signal:workSignal,resume:true,shadow:true,requireDevice:target!=='cpu'},
+ let report;try{report=await (dependencies.runMicroeval??runMicroeval)({directory:join(directory,'micro'),skills,tasks,profile:config.actor,python:config.python??'python3',runs:2,seconds:180,verificationSeconds,...(protocol?{sampleProtocol:protocol}:{}),totalSeconds:state.developmentSeconds,objective,binding:runtimeBinding,knowledge,signal:workSignal,resume:true,shadow:true,requireDevice:target!=='cpu'},
   {...targetOps,...dependencies,sample:dependencies.sample??targetOps.sample,verify:dependencies.verify??targetOps.verify});
  if(objective==='optimization'&&report.status==='complete'&&available()>cleanupSeconds){
   report=await (dependencies.finalizeKernelPairs??finalizeKernelPairs)({directory:join(directory,'micro'),python:config.python??'python3',seconds:state.pairedSeconds,signal:workSignal,requireDevice:target!=='cpu'},{...targetOps,...dependencies});

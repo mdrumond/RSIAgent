@@ -381,3 +381,11 @@ test('a real native target-tool deadline retains its partial marker until SDK le
  assert.equal(await hypothesisEvaluationSettled({directory:root},deps),false);leaseClosed=true;assert.equal(await hypothesisEvaluationSettled({directory:root},deps),true);
  const after=JSON.parse(await readFile(file,'utf8'));assert.equal(after.runningSample,undefined);assert.deepEqual(after.results,before.results);assert.deepEqual(after.partials,before.partials);assert.equal(after.elapsedSeconds,before.elapsedSeconds);assert.equal(nativeCalls,1);
 });
+test('frozen split protocol uses independent actor and verification deadlines inside the original total',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.5,verificationSeconds:.5};let actors=0,checks=0;
+ const report=await runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5,sampleProtocol:protocol},{sample:async({signal,sampleSignal,seconds,verificationReserved})=>{
+  actors++;assert(seconds<=.5&&seconds>.4);assert(verificationReserved>=.5);await untilAbort(signal);assert.equal(signal.aborted,true);assert.equal(sampleSignal.aborted,false);return {timedOut:true};
+ },verify:async({signal,seconds})=>{checks++;assert.equal(signal.aborted,false);assert(seconds>0&&seconds<=.5);return {correct:true};}});
+ assert.equal(actors,2);assert.equal(checks,2);assert.deepEqual(report.sampleProtocol,protocol);assert(report.results.every(row=>row.allocatedSeconds===1&&row.actorTimedOut&&!row.timedOut&&row.correct));
+ await assert.rejects(runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5,sampleProtocol:{...protocol,actorSeconds:.6}}),/Sample timing protocol differs/);
+});
