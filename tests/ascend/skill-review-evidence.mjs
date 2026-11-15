@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {frozenEvidencePacket,scopedBaseline} from '../../cli/skill-review-evidence.mjs';
@@ -32,10 +32,19 @@ test('a final revised proposal must pass relevance selection again before cached
  const tasks=Array.from({length:5},(_,i)=>({id:'case-'+i,kind:'hypothesis-case',target:'cpu',bucket:'correctness',prompt:'Check boundary',checker,files:{'kernel.py':'answer=0'},controls:{reference:{files:{'kernel.py':'answer=1'}},negatives:[{files:{'kernel.py':'answer=0'}}]}}));
  const config={root,target:'a3',environment:{options:{}},skills:{priority:{evaluations:[{id:'boundary',description:'Boundary contract',target:'cpu',objective:'correctness',binding:{target:'cpu'},tasks}]}}};
  const item={id:'item',objective:'correctness',proposal:{changes:[{id:'boundary',text:'Original boundary'}]},evidence:{groups:[]}};
- const seen=[],deps={prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async({prompt})=>{seen.push(prompt.hypothesis.proposal);return {catalogueId:'boundary',reason:'This boundary is covered'};}};
+ const seen=[],sessions=[],deps={prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async({directory,prompt,validate})=>{
+  const submission=join(directory,'submission.json');
+  try{return validate(JSON.parse(await readFile(submission,'utf8')));}catch(error){if(error.code!=='ENOENT')throw error;}
+  seen.push(prompt.hypothesis.proposal);sessions.push(submission);await mkdir(directory,{recursive:true});
+  const result=validate({catalogueId:'boundary',reason:'This boundary is covered'});await writeFile(submission,JSON.stringify(result));return result;
+ }};
  const args={config,backlog:{db:{prepare:()=>({get:()=>undefined})}},item,directory:join(root,'cases'),seconds:20};
  const first=await resolveHypothesisCases(args,deps);assert.equal(first.status,'ready');
  await resolveHypothesisCases(args,deps);assert.equal(seen.length,1);
  const final={changes:[{id:'boundary',text:'Revised boundary'}]};const second=await resolveHypothesisCases({...args,proposal:final},deps);
  assert.equal(second.status,'ready');assert.equal(seen.length,2);assert.deepEqual(seen[1],final);assert.notEqual(first.proposalIdentity,second.proposalIdentity);
+ await writeFile(checker,'raise SystemExit(1)');
+ const third=await resolveHypothesisCases({...args,proposal:final},deps);
+ assert.equal(third.status,'ready');assert.equal(seen.length,3);assert.notEqual(second.catalogueIdentity,third.catalogueIdentity);
+ assert.equal(new Set(sessions).size,3);for(const file of sessions)assert.equal(JSON.parse(await readFile(file,'utf8')).catalogueId,'boundary');
 });

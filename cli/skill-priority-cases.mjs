@@ -71,12 +71,11 @@ async function previousCases(config,item){
  }
  return suites;
 }
-export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event,proposal=item.proposal},dependencies={}){
+export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event,beforeQualification,proposal=item.proposal},dependencies={}){
  const started=performance.now();
  await mkdir(directory,{recursive:true});
  const proposalIdentity=createHash('sha256').update(JSON.stringify([proposal.changes,item.objective,config.target])).digest('hex');
  const cached=await readFile(join(directory,'selected.json'),'utf8').then(JSON.parse).catch(error=>{if(error.code!=='ENOENT')throw error;return null;});
- if(cached?.proposalIdentity===proposalIdentity)return cached;
  const learned=await learnedCases(config,backlog,item);
  const shared=await qualifiedSuites({config});
  let suites=[...(config.skills?.priority?.evaluations??[]),...learned.suites,...shared.filter(s=>s.target==='cpu'||JSON.stringify(s.binding?.environment)===JSON.stringify(config.environment.options)),...await previousCases(config,item)];
@@ -87,13 +86,16 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
    target:'cpu',objective:'correctness',tasks:catalogue.byHypothesis[h.id].map(t=>({...t,target:'cpu',bucket:'correctness'})),binding:{target:'cpu'}})));
  }
  suites=suites.filter(s=>s.objective===item.objective&&(s.target===config.target||s.target==='cpu'&&item.objective==='correctness'));
+ const catalogueIdentity=digest(await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:await suiteFingerprint(suite)}))));
+ if(cached?.proposalIdentity===proposalIdentity&&cached.catalogueIdentity===catalogueIdentity)return cached;
+ const selectionIdentity=digest([proposalIdentity,catalogueIdentity]);
  const validate=value=>{if(!value||!value.reason?.trim()||value.catalogueId!==null&&!suites.some(s=>s.id===value.catalogueId))throw Error('Choose a supplied matching suite or null with a reason');return value;};
- const selection=suites.length?await (dependencies.select??reviewSession)({directory:join(directory,'selection'),config,signal,seconds:Math.min(60,seconds),
+ const selection=suites.length?await (dependencies.select??reviewSession)({directory:join(directory,'selection',selectionIdentity),config,signal,seconds:Math.min(60,seconds),
   prompt:{task:'Select one hypothesis-relevant evaluation suite or none. Return {catalogueId:null|string,reason}. The cases must directly exercise the proposed skill mechanism and boundaries. CPU contract/report tasks cannot validate device arithmetic, compiler behavior or kernel performance. Do not select merely because scopes overlap.',
    hypothesis:{objective:item.objective,proposal},catalogues:suites.map(({id,description,target,objective})=>({id,description,target,objective}))},validate}):{value:{catalogueId:null,reason:'No target-compatible evaluation suite'}};
  const chosen=validate(selection.value??selection);let suite=suites.find(s=>s.id===chosen.catalogueId);
  if(suite){
-  const frozen=join(directory,'frozen');await mkdir(frozen,{recursive:true});
+  const frozen=join(directory,'frozen',selectionIdentity);await mkdir(frozen,{recursive:true});
   suite={...suite,tasks:await Promise.all(suite.tasks.map(async(task,index)=>{
    const copied={...task};for(const key of ['checker','pairedChecker'])if(task[key]){
     copied[key]=join(frozen,index+'-'+key+'.py');await writeFile(copied[key],await readFile(resolve(config.root,task[key])));
@@ -102,12 +104,14 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
   const prepared=prepareHypothesisEvaluation(suite);
   if(prepared.status==='ready'&&suite.learned){
    const qualify=dependencies.qualify??(await import('./skill-hypothesis-evaluation.mjs')).qualifyHypothesisTasks;
-   const qualification=await qualify({...prepared,directory:qualificationDirectory,config,signal,resource,
+   const actualDirectory=cached?join(qualificationDirectory,selectionIdentity):qualificationDirectory;
+   await beforeQualification?.(actualDirectory);
+   const qualification=await qualify({...prepared,directory:actualDirectory,config,signal,resource,
     remainingSeconds:Math.max(.001,seconds-(performance.now()-started)/1000)});
    if(qualification.status==='qualified')suite.qualification=qualification;
    if(qualification.status!=='qualified'){prepared.status='needs-learning';prepared.reason=qualification.reason??'Reference/negative-control qualification did not pass';}
   }
-  if(prepared.status==='ready'){prepared.proposalIdentity=proposalIdentity;
+  if(prepared.status==='ready'){prepared.proposalIdentity=proposalIdentity;prepared.catalogueIdentity=catalogueIdentity;
    if(suite.learned){Object.assign(prepared,await registerQualifiedSuite({config,suite:{...prepared,mechanism:JSON.stringify(proposal.changes)},qualification:suite.qualification,provenance:{proposalIdentity}}));}
    await writeFile(join(directory,'selected.json'),JSON.stringify(prepared,null,2)+'\n');return prepared;}
   chosen.reason=prepared.reason;
