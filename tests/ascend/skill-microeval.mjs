@@ -265,11 +265,15 @@ test('sandboxed native Bash can edit its kernel but cannot quarantine shared har
  const f=await fixture(t),outside=join(f.root,'shared-leases'),cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');
  await mkdir(outside);await mkdir(cwd);await mkdir(sessionDirectory);await writeFile(join(outside,'lease.json'),'original-lease');
  const command=`mv '${outside}' '${outside}.quarantined'; printf repaired > kernel.py`;
- const profile=await scriptedMicro(t,f.root,n=>n===0?{name:'bash',args:{command}}:null);
+ let requests=0;const profile=await scriptedMicro(t,f.root,n=>{requests++;return n===0?{name:'bash',args:{command}}:null;});
+ // Operational capability proof is independent of the sampler's own preflight.
+ const probe=spawnSync('bwrap',['--die-with-parent','--new-session','--unshare-pid','--ro-bind','/','/','--proc','/proc','--dev','/dev','--tmpfs','/tmp','--bind',cwd,cwd,'--chdir',cwd,'--','bash','-c','true'],{encoding:'utf8',timeout:5000});
  const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'repair',localFilesystemSandbox:true});
- assert.equal(result.error,null);assert.equal(await readFile(join(outside,'lease.json'),'utf8'),'original-lease');
- await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
- assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');
+ const capability=JSON.parse(await readFile(join(sessionDirectory,'sandbox-preflight.json'),'utf8'));assert.equal(capability.available,probe.status===0,JSON.stringify({probe:{status:probe.status,error:probe.error?.code,stderr:probe.stderr},capability}));
+ assert.equal(await readFile(join(outside,'lease.json'),'utf8'),'original-lease');await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
+ if(probe.status===0){assert.equal(result.error,null);assert(requests>0);assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');}
+ else{assert.equal(result.errorCode,'LOCAL_SANDBOX_UNAVAILABLE');assert.equal(result.bucket,'harness');assert.equal(result.toolCalls,0);assert.equal(requests,0);assert.notEqual(capability.exitCode,0);assert.equal(typeof capability.output,'string');await assert.rejects(readFile(join(cwd,'kernel.py')),{code:'ENOENT'});}
+
 });
 for(const mode of ['reserved-cleanup','external-cancel','whole-deadline','legacy'])test(`native target cleanup follows the retained whole-sample clock: ${mode}`,async t=>{
  const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .',timeout:1200}}:null);

@@ -69,6 +69,11 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  let unresolvedExecution;
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
+ if(localFilesystemSandbox&&!targetBash){
+  let output='';const probe=await local.exec(sandboxCommand('true',taskRoot),taskRoot,{timeout:Math.min(5,remaining()),signal:sampleSignal,onData:chunk=>{output=(output+chunk).slice(-4096);}});
+  const capability={kind:'local-filesystem-sandbox',available:probe.exitCode===0,exitCode:probe.exitCode,output};await writeFile(join(sessionDirectory,'sandbox-preflight.json'),JSON.stringify(capability,null,2)+'\n');
+  if(!capability.available)return {timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
+ }
  const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
  const extension=async pi=>{
   pi.on('tool_call',async event=>{
