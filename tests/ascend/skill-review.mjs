@@ -541,3 +541,30 @@ test('traceback ownership survives inventory grouping and native diagnostic dedu
  assert.equal(input.group.occurrences.filter(o=>o.data.error.includes('/trusted/reference.py')).length,1);
  assert.equal((await load(join(directory,'read-evidence.json'))).length,2);
 });
+
+test('native case selection can read concrete curated inventories and protected source evidence',async t=>{
+ const {resolveHypothesisCases}=await import('../../cli/skill-priority-cases.mjs'),{reviewSession}=await import('../../cli/skill-review-native.mjs');
+ const root=await mkdtemp(join(tmpdir(),'native-case-evidence-'));t.after(()=>rm(root,{recursive:true,force:true}));let selectionDirectory,manifest,sourcePath;const observed=[];
+ const provider=await scriptedReview(t,root,async(body,n)=>{
+  if(n){const message=body.messages.filter(m=>m.role==='tool').at(-1);if(message)observed.push({n,text:typeof message.content==='string'?message.content:message.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')});}
+  const input=JSON.parse(await readFile(join(selectionDirectory,'input.json'),'utf8')),catalogue=input.catalogues[0];
+  if(n===0)return {name:'read',args:{path:'input.json'}};
+  if(n===1)return {name:'read',args:{path:catalogue.evidence.manifest}};
+  manifest=JSON.parse(await readFile(catalogue.evidence.manifest,'utf8'));
+  if(n===2){sourcePath=join(catalogue.evidence.directory,manifest.cases[0].reference);return {name:'read',args:{path:sourcePath}};}
+  if(n===3)return {name:'submit_review',args:{result:{catalogueId:catalogue.id,reason:'The inspected cases include empty splits and K=1 with an independent reference'}}};
+  return null;
+ });
+ const config={root,target:'a3',environment:{options:{}},actor:provider.profile,skills:{priority:{}}};
+ const item={id:'case-evidence',objective:'correctness',proposal:{changes:[{scope:'implementation',text:'Initialize split-K scratch and partial-output regions for empty splits'}]}};
+ await assert.rejects(resolveHypothesisCases({config,item,backlog:{db:{prepare:()=>({get:()=>undefined})}},directory:join(root,'cases'),seconds:30},{
+  select:async input=>{selectionDirectory=input.directory;return reviewSession(input);},runtimeIdentity:()=>{throw Object.assign(Error('Stop after actual semantic selection'),{code:'FIXTURE_SELECTION_COMPLETE'});}
+ }),{code:'FIXTURE_SELECTION_COMPLETE'});
+ const input=JSON.parse(await readFile(join(selectionDirectory,'input.json'),'utf8'));
+ assert.equal(input.catalogues[0].cases.length,5);assert(input.frozenEvidence.artifacts.every(artifact=>artifact.available));assert(input.frozenEvidence.observations.some(observation=>observation.type==='case-catalogue'));
+ const observedInput=JSON.parse(observed.find(record=>record.n===1).text),observedManifest=JSON.parse(observed.find(record=>record.n===2).text);
+ assert.equal(observedInput.catalogues[0].cases.length,5);assert(observedManifest.cases.some(entry=>entry.boundaryCases.some(c=>c.split>c.mnk[2])));
+ assert.equal(observed.find(record=>record.n===3).text.trim(),(await readFile(sourcePath,'utf8')).trim());
+ assert.equal(JSON.parse(await readFile(join(selectionDirectory,'submission.json'),'utf8')).catalogueId,'curated-splitk-empty-slots');
+ await assert.rejects(readFile(join(selectionDirectory,'tool-policy.jsonl')),{code:'ENOENT'});
+});

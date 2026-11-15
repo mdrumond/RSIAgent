@@ -125,8 +125,19 @@ test('real readiness enumerates configured and noncurated shared suites ahead of
  assert.equal((await hypothesisCaseReadiness({...f,item})).ready,true);
  for(let i=0;i<7;i++)assert.equal((await hypothesisCaseReadiness({...f,item:{...item,id:'unsupported-'+i,priority:100+i,proposal:{changes:[{id:'different-'+i,text:'Different mechanism'}]}}})).supported,false);
  const qualification=await qualifyHypothesisTasks({...suite,config:f.config,directory:join(f.root,'custom-qualification'),remainingSeconds:120});assert.equal(qualification.status,'qualified');
- await registerQualifiedSuite({config:f.config,suite,qualification});f.config.skills.priority.evaluations=[];
+ await registerQualifiedSuite({config:f.config,suite,qualification,provenance:{qualificationDirectory:join(f.root,'custom-qualification')}});f.config.skills.priority.evaluations=[];
  assert.equal((await hypothesisCaseReadiness({...f,item})).ready,true);
+ const selections=[],args={...f,item,directory:join(f.root,'inspect-qualified'),seconds:30};
+ const deps={select:async({directory,prompt,allowedPaths})=>{
+  selections.push(directory);const catalogue=prompt.catalogues.find(c=>c.id.startsWith('shared-')),manifest=JSON.parse(await readFile(catalogue.evidence.manifest,'utf8'));
+  assert.equal(manifest.qualification.status,'qualified');assert.equal(manifest.qualification.controls.length,10);assert(manifest.qualification.controls.every(control=>control.passed));
+  assert(allowedPaths.includes(catalogue.evidence.directory));const copied=await readFile(join(catalogue.evidence.directory,manifest.qualification.report),'utf8');assert.equal(JSON.parse(copied).status,'qualified');
+  return {value:{catalogueId:catalogue.id,reason:'Inspected actual reference and negative controls'}};
+ },runtimeIdentity:()=>{throw Error('CPU qualified evidence triggered device setup');}};
+ assert.equal((await resolveHypothesisCases(args,deps)).status,'ready');
+ const snapshot=JSON.parse(await readFile(join(f.root,'custom-qualification','micro','results.json'),'utf8'));snapshot.auditNote='Additional stored observation';const next=join(f.root,'next-qualified');await mkdir(join(next,'micro'),{recursive:true});await writeFile(join(next,'micro','results.json'),JSON.stringify(snapshot));
+ await registerQualifiedSuite({config:f.config,suite,qualification,provenance:{qualificationDirectory:next}});
+ assert.equal((await resolveHypothesisCases(args,deps)).status,'ready');assert.equal(selections.length,2);assert.notEqual(selections[0],selections[1]);
 });
 test('verified learned cases are visible to cheap readiness without device probes or model calls',async t=>{
  const f=await fixture(t),item={id:'learned-item',objective:'correctness',proposal:{changes:[{id:'learned-new',text:'Compute the returned answer'}]}},trusted=join(f.root,'trusted');await mkdir(trusted);
