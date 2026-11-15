@@ -119,6 +119,7 @@ export function validateReview(value,groups){
  if(value.action==='update'&&(!Array.isArray(value.changes)||!value.changes.length||!Array.isArray(value.memoryRefs)||!value.memoryRefs.length))throw Error('Updates require changes and supporting memory references');
  const requests=[...(value.action==='learn'?[value]:[]),...(value.learningRequests??[])];
  if(!Array.isArray(value.learningRequests??[])||requests.some(r=>!['cpu','device'].includes(r.learningTarget)||!r.question?.trim()||!r.hypothesis?.trim()||!r.requiredEvidence?.trim()))throw Error('Learning requires a question, hypothesis and evidence criterion');
+ if(requests.some(r=>r.workKind!==undefined&&!['microlearning','phase1'].includes(r.workKind)))throw Error('Learning work kind must be microlearning or phase1');
  for(const request of requests)if(request.groupIds!==undefined&&(!Array.isArray(request.groupIds)||!request.groupIds.length||request.groupIds.some(id=>!groups.some(g=>g.id===id))))throw Error('Learning groupIds must be a nonempty subset of the supplied failure-group IDs');
  return value;
 }
@@ -129,7 +130,7 @@ export function claimLearningRequest(state,config,{draft,topic,target}){
  const prioritized=has(state.db,'skill_backlog_items');
  const row=state.db.prepare(`SELECT id,data FROM skill_learning_requests WHERE status='pending' ORDER BY
   ${prioritized?"COALESCE((SELECT priority FROM skill_backlog_items WHERE id=json_extract(skill_learning_requests.data,'$.backlogId')),json_extract(data,'$.priority'),0) DESC,":""} rowid`).all()
-  .find(row=>{const r=JSON.parse(row.data);return r.intervention!=='user-required'&&r.target===target&&(r.topic===undefined||r.topic===topic);});
+  .find(row=>{const r=JSON.parse(row.data);return r.intervention!=='user-required'&&!['suite','microlearning'].includes(r.workKind)&&r.target===target&&(r.topic===undefined||r.topic===topic);});
  if(!row)return null;
  const changed=state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft=? WHERE id=? AND status='pending'").run(draft,row.id).changes;
  return changed?{...JSON.parse(row.data),id:row.id}:null;

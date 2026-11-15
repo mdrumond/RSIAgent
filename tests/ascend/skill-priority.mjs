@@ -5,10 +5,11 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
-import {runPrioritySkills,prioritySkillStatus} from '../../cli/skill-priority.mjs';
+import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput,wakeQualifiedSuiteWaiters} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
-import {resolveHypothesisCases} from '../../cli/skill-priority-cases.mjs';
+import {resolveHypothesisCases,registerQualifiedSuite} from '../../cli/skill-priority-cases.mjs';
 import {claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
+import {qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
 
 async function fixture(t){
@@ -104,7 +105,7 @@ test('missing relevant cases create prioritized learning, never run generic task
  assert.equal(request.backlogId,item.id);assert.equal(request.priority,90);
  f.add('low',1);const low={...request,question:'Other question',backlogId:f.backlog.get('low').id,priority:1};
  f.state.db.prepare("INSERT INTO skill_learning_requests(id,data) VALUES('low',?)").run(JSON.stringify(low));
- assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft-1',topic:'matmul',target:'a3'}).id,result.learningRequest);
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft-1',topic:'matmul',target:'a3'}),null);
 });
 test('legacy pending comparison keeps the old execution path during opt-in migration',async t=>{
  const f=await fixture(t);await writeFile(join(f.root,'skills','evolution.json'),JSON.stringify({history:[],pending:{evaluationRoot:join(f.root,'old'),projectIds:[],runs:2,evaluationSeconds:100},evaluationStatus:'deferred'}));
@@ -117,7 +118,8 @@ test('learned cases must pass real reference and negative controls before admiss
  const contract={target:'cpu',objective:'correctness',tasks:Array.from({length:5},(_,n)=>({id:'case-'+n,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Repair the computed answer',files:{'kernel.py':'starter.py'},checker:'checker.py',
   controls:{reference:{files:{'kernel.py':'reference.py'}},negatives:[{files:{'kernel.py':'starter.py'}}]}}))};
  const manifest=join(trusted,'skill-evaluation.json');await writeFile(manifest,JSON.stringify(contract));
- f.state.add({id:'learning-project',goal:'Qualify small cases',actor_seconds:30,source:trusted,verifier:{files:[manifest]}});
+ const editable=join(f.root,'editable');await mkdir(editable);
+ f.state.add({id:'learning-project',goal:'Qualify small cases',actor_seconds:30,source:editable,verifier:{files:[manifest,checker,join(trusted,'reference.py'),join(trusted,'starter.py')]}});
  const request=enqueueLearningRequest(f.state,{backlogId:item.id,target:'a3',question:'Qualify cases',requiredEvidence:'Reference and controls',findings:{projectId:'learning-project',outcome:'passed'}});
  f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',draft='draft' WHERE id=?").run(request);
  const admitted=[];let acknowledged;
@@ -181,6 +183,74 @@ test('learning outcomes arriving during analysis remain visible for the next sca
  assert.equal((await prioritySkillStatus(f.config)).hasWork,true);
  await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{assert.equal(f.backlog.meta('learning-scan'),null);f.backlog.meta('learning-pending',false);}});
  assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
+});
+test('missing cases defer to learning without spending QA allowance',async t=>{
+ const f=await fixture(t);f.add('missing-suite');let prepared=false,evaluated=false;
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async()=>({status:'needs-learning',reason:'missing-cases'}),
+  prepare:async()=>{prepared=true;},evaluate:async()=>{evaluated=true;}});
+ assert.equal(prepared,false);assert.equal(evaluated,false);assert.equal(f.backlog.get('missing-suite').status,'learning');
+});
+test('foreground queue uses the existing background worker only when comparisons are exhausted',async t=>{
+ const f=await fixture(t);f.add('ready');let learnt=0;
+ await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
+ assert.equal(learnt,0);
+ await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
+ assert.equal(learnt,1);
+});
+
+test('audited migration preserves claimed projects and queues only pre-evaluation infrastructure continuations',async t=>{
+ const f=await fixture(t),item=f.add('legacy',90),old=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(old.run.id,{elapsed:450,checkpoint:{prepared:{status:'ready',elapsedSeconds:100}}});
+ const request=enqueueLearningRequest(f.state,{target:'a3',backlogId:item.id,question:'Qualify an experiment for implementation: legacy',requiredEvidence:'Five controls'});
+ const claimed=enqueueLearningRequest(f.state,{target:'a3',question:'Already claimed original phase one',requiredEvidence:'Large experiment'});
+ f.state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft='existing-draft' WHERE id=?").run(claimed);
+ f.backlog.finish(old.run.id,{status:'learning',result:{reason:'No target-compatible evaluation suite',learningRequest:request}});
+ const audit=await migratePriorityThroughput(f.config,{procedure:'Enable qualified suite lane v2'});assert.deepEqual(audit.tagged,[request]);assert.deepEqual(audit.continuations,[old.run.id]);
+ assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(claimed).status,'claimed');assert.equal(f.backlog.run(old.run.id).elapsed,450);
+ await runPrioritySkills(f.config,f.values,f.ops);const runs=f.state.db.prepare('SELECT id,elapsed,status FROM skill_backlog_runs ORDER BY rowid').all();
+ assert.equal(runs.length,2);assert.equal(runs[0].status,'learning');assert(runs[1].elapsed>=450);assert.equal(runs[1].status,'rejected');assert.equal(f.backlog.meta('procedural-continuations').length,0);
+ assert.deepEqual(await migratePriorityThroughput(f.config,{procedure:'Repeated migration'}),audit);
+});
+test('legacy cached preparation cannot skip v2 contract review',async t=>{
+ const f=await fixture(t),item=f.add('legacy-ready'),old=f.backlog.claim({base:'baseline'});
+ f.backlog.checkpoint(old.run.id,{elapsed:120,checkpoint:{prepared:{status:'ready',active:'baseline',candidate:'old-candidate',qa:{elapsedSeconds:60}}}});
+ let budget;
+ await runPrioritySkills(f.config,f.values,{...f.ops,prepare:async args=>{budget=args.priorElapsedSeconds;assert(args.evaluationContract);return f.ops.prepare(args);}});
+ assert.equal(budget,60);assert.equal(f.calls.filter(c=>c[0]==='prepare').length,1);assert.equal(f.backlog.get(item.id).status,'rejected');
+});
+test('qualification custody is checkpointed before a revised suite dispatches',async t=>{
+ const f=await fixture(t),item=f.add('revised-suite'),actual=join(f.root,'cases','qualification','new-contract');
+ let checked;
+ await assert.rejects(runPrioritySkills(f.config,f.values,{...f.ops,
+  resolveCases:async({beforeQualification})=>{await beforeQualification(actual);assert.equal(f.backlog.run(item.id).checkpoint.qualificationDirectory,actual);throw Error('qualification transport interrupted');},
+  settled:async({directory})=>{checked=directory;return false;}}),/qualification transport interrupted/);
+ assert.equal(checked,actual);assert.equal(f.backlog.run(item.id).checkpoint.unresolved,true);assert.equal(f.backlog.run(item.id).status,'running');
+ assert.equal(f.calls.length,0);
+});
+
+test('higher priority fresh queued work precedes lower priority procedural continuations',async t=>{
+ const f=await fixture(t);f.add('old-low',10);const old=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(old.run.id,{elapsed:50,checkpoint:{}});f.backlog.finish(old.run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+ f.backlog.meta('procedural-continuations',[{id:old.run.id,procedure:'Upgrade QA',base:'baseline'}]);f.add('fresh-urgent',100);
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.calls.find(c=>c[0]==='prepare')[1],'fresh-urgent');assert.equal(f.backlog.meta('procedural-continuations').length,1);
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.calls.filter(c=>c[0]==='prepare')[1][1],'old-low');
+});
+test('a newly qualified shared suite wakes waiters once and semantic relevance controls reuse',async t=>{
+ const f=await fixture(t),related=f.add('related',20),unrelated=f.add('unrelated',10);
+ for(const item of [related,unrelated]){
+  const run=f.backlog.claim({base:'baseline'});const request=enqueueLearningRequest(f.state,{target:'a3',workKind:'suite',backlogId:item.id,question:'Qualify an experiment for '+item.key,requiredEvidence:'Five references and negatives'});
+  f.backlog.checkpoint(run.run.id,{elapsed:90,checkpoint:{}});f.backlog.finish(run.run.id,{status:'learning',result:{reason:'No target-compatible evaluation suite',learningRequest:request}});
+ }
+ const checker=join(f.root,'checker.py');await writeFile(checker,"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n");
+ const suite={target:'cpu',objective:'correctness',mechanism:'related boundary mechanism',binding:{target:'cpu'},tasks:Array.from({length:5},(_,n)=>({id:'shared-'+n,kind:'hypothesis-case',target:'cpu',bucket:'correctness',prompt:'Check related boundary',checker,files:{'kernel.py':'answer=0'},controls:{reference:{files:{'kernel.py':'answer=42'}},negatives:[{files:{'kernel.py':'answer=0'}}]}}))};
+ const qualification=await qualifyHypothesisTasks({...suite,config:f.config,directory:join(f.root,'shared-qualification'),remainingSeconds:120});assert.equal(qualification.status,'qualified');
+ await registerQualifiedSuite({config:f.config,suite,qualification});
+ assert.equal((await wakeQualifiedSuiteWaiters({config:f.config,backlog:f.backlog})).length,2);assert.equal((await wakeQualifiedSuiteWaiters({config:f.config,backlog:f.backlog})).length,0);
+ let constructed=0,selected=0;
+ const resolver=args=>resolveHypothesisCases(args,{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async({prompt})=>{selected++;return {value:{catalogueId:args.item.key==='related'?prompt.catalogues.find(c=>c.id.startsWith('shared-')).id:null,reason:args.item.key==='related'?'Exercises the boundary mechanism':'Different mechanism'}};}});
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
+ assert.equal(f.backlog.get(related.id).status,'rejected');assert.equal(constructed,0);assert(selected>0);
+ const relatedRequest=JSON.parse(f.state.db.prepare("SELECT data FROM skill_learning_requests WHERE status='satisfied'").get().data);assert.equal(relatedRequest.backlogId,related.id);
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
+ assert.equal(f.backlog.get(unrelated.id).status,'learning');assert.equal(constructed,0);
 });
 test('standalone scheduler checkpoints the exact nested qualification path before dispatch',async t=>{
  const f=await fixture(t);f.add('custody',20);let checked=false;

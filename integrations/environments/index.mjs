@@ -935,7 +935,7 @@ export async function createEnvironment(options, context) {
       });
     },
     async resources(request) {
-      return context.resources ? context.resources(request) : remote ? [] : [{ id: 'local', available: true, metadata: {} }];
+      return context.resources ? context.resources(request) : remote ? [] : [{ id: options.localResourceId ?? 'local', available: true, metadata: {} }];
     },
     async browse(path) {
       if (!remote) return readdir(path, { withFileTypes: true }).then(entries => entries.map(entry => ({ name: entry.name, directory: entry.isDirectory() })));
