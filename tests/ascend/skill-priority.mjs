@@ -35,18 +35,19 @@ test('one Phase 1 failure drives multiple comparisons without another Phase 2 co
  assert.equal(f.backlog.get('first').status,'rejected');assert.equal(f.backlog.get('second').status,'rejected');
  assert.equal((await backgroundSkillStatus(f.config)).pending,false);
 });
-test('new urgent item waits for the running comparison then goes first',async t=>{
+test('new urgent item waits until the selected cohort finishes',async t=>{
  const f=await fixture(t);f.add('running',20);f.add('waiting',10);let release,started;
  const gate=new Promise(r=>release=r),ready=new Promise(r=>started=r);
  const running=runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async args=>{started();await gate;return f.ops.evaluate(args);}});
  await ready;try{f.add('urgent',100);const status=await prioritySkillStatus(f.config);
  assert.equal(status.current.id,f.backlog.get('running').id);assert.equal(status.backlog[0].id,f.backlog.get('urgent').id);
  }finally{release();await running;}await runPrioritySkills(f.config,f.values,f.ops);
- assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),['running','urgent']);
+ assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),['running','waiting']);
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.calls.filter(c=>c[0]==='prepare').at(-1)[1],'urgent');
 });
 test('partial analysis and ranking timeouts preserve ready work and expose diagnostics',async t=>{
- const f=await fixture(t);f.add('ready',20);
- await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{f.add('new-ready',90);throw Error('Analysis elapsed');},prioritize:async()=>{throw Error('Ranking elapsed');}});
+ const f=await fixture(t);
+ await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{f.add('ready',20);f.add('new-ready',90);throw Error('Analysis elapsed');},prioritize:async()=>{throw Error('Ranking elapsed');}});
  assert.equal(f.backlog.get('new-ready').status,'rejected');assert.equal(f.backlog.get('ready').status,'queued');
  const status=await prioritySkillStatus(f.config);assert.equal(status.analysisError.message,'Analysis elapsed');assert.equal(status.rankingError.message,'Ranking elapsed');
 });
@@ -190,8 +191,9 @@ test('missing cases defer to learning without spending QA allowance',async t=>{
   prepare:async()=>{prepared=true;},evaluate:async()=>{evaluated=true;}});
  assert.equal(prepared,false);assert.equal(evaluated,false);assert.equal(f.backlog.get('missing-suite').status,'learning');
 });
-test('foreground queue uses the existing background worker only when comparisons are exhausted',async t=>{
+test('bounded factual learning uses the existing background resource after cohort comparisons',async t=>{
  const f=await fixture(t);f.add('ready');let learnt=0;
+ enqueueLearningRequest(f.state,{target:'a3',question:'Measure a bounded factual boundary',requiredEvidence:'Actual observation',workKind:'microlearning'});
  await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
  assert.equal(learnt,0);
  await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
@@ -260,4 +262,92 @@ test('standalone scheduler checkpoints the exact nested qualification path befor
   assert.equal(JSON.parse(row.checkpoint).qualificationDirectory,actual);checked=true;return {status:'needs-learning',reason:'No cases'};
  }});
  assert.equal(checked,true);
+});
+
+test('five-member cohort finishes despite fresh failures and more urgent hypotheses arriving',async t=>{
+ const f=await fixture(t);for(let i=0;i<6;i++)f.add('chosen-'+i,60-i);let analyzed=0,ranked=0;
+ const ops={...f.ops,analyze:async()=>{analyzed++;},prioritize:async()=>{ranked++;}};
+ for(let i=0;i<5;i++){
+  await runPrioritySkills(f.config,f.values,ops);
+  f.state.event(null,'attempt-error',{message:'New failure '+i});f.add('urgent-'+i,100+i);
+  const status=await prioritySkillStatus(f.config);assert.equal(status.cohort.members.length,5);assert.equal(status.cohort.counts.completed,i+1);
+ }
+ assert.equal(analyzed,0);assert.equal(ranked,0);assert.deepEqual(f.calls.filter(c=>c[0]==='prepare').map(c=>c[1]),Array.from({length:5},(_,i)=>'chosen-'+i));
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(analyzed,1);assert.equal(ranked,1);assert.equal(f.calls.filter(c=>c[0]==='prepare').at(-1)[1],'urgent-4');
+ assert((await prioritySkillStatus(f.config)).cohort.members.every(m=>!m.id.startsWith('chosen-')));
+});
+test('ready cohort cases precede higher-priority unsupported members and unrelated continuations',async t=>{
+ const f=await fixture(t);f.add('unrelated-old',1);const old=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(old.run.id,{elapsed:100});f.backlog.finish(old.run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+ f.backlog.meta('procedural-continuations',[{id:old.run.id,base:'baseline',procedure:'Earlier audited upgrade'}]);
+ for(let i=0;i<5;i++)f.add('member-'+i,90-i);let learned=0;
+ const ops={...f.ops,caseReadiness:async({item})=>({ready:item.key==='member-4'}),resolveCases:async({item})=>item.key==='member-0'?{status:'unsupported',reason:'No matching mechanism'}:f.ops.resolveCases(),learn:async()=>{learned++;}};
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(f.calls.find(c=>c[0]==='prepare')[1],'member-4');
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(f.backlog.get('member-0').status,'inconclusive');assert.equal(learned,0);
+ const status=await prioritySkillStatus(f.config);assert.equal(status.cohort.counts.blocked,1);assert.equal(status.cohort.members.find(m=>m.id===f.backlog.get('member-0').id).reason,'No matching mechanism');
+ assert.equal(f.backlog.meta('procedural-continuations').length,1);assert.equal(f.backlog.run(old.run.id).elapsed,100);
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(f.backlog.get('member-1').status,'rejected');
+});
+test('case qualification for a cohort member precedes a sixth unrelated hypothesis',async t=>{
+ const f=await fixture(t);for(let i=0;i<6;i++)f.add('case-'+i,20-i);const resolved=[];
+ const ops={...f.ops,resolveCases:async({item,beforeQualification})=>{resolved.push(item.key);await beforeQualification(join(f.root,'qualified',item.key));return f.ops.resolveCases();},analyze:()=>{throw Error('New data must wait');}};
+ for(let i=0;i<5;i++)await runPrioritySkills(f.config,f.values,ops);
+ assert.deepEqual([...new Set(resolved)],Array.from({length:5},(_,i)=>'case-'+i));assert.equal(f.backlog.get('case-5').status,'queued');
+});
+test('operator pause retains cohort membership and original continuation spend',async t=>{
+ const f=await fixture(t);f.add('retained',20);f.add('peer',10);const abort=new AbortController();
+ await assert.rejects(runPrioritySkills(f.config,{...f.values,signal:abort.signal},{...f.ops,evaluate:async()=>{abort.abort(Error('pause'));throw abort.signal.reason;}}),/pause/);
+ const first=f.backlog.run(f.backlog.get('retained').id),cohort=f.backlog.meta('hypothesis-cohort');f.backlog.checkpoint(first.id,{elapsed:130,checkpoint:{...first.checkpoint,runningAt:undefined}});
+ f.add('outside-urgent',1000);let remaining;
+ await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async args=>{remaining=args.remainingSeconds;return f.ops.evaluate(args);},analyze:()=>{throw Error('Cohort resumed through analysis');}});
+ assert(remaining<=1670&&remaining>1660);assert.equal(f.backlog.run(first.id).seconds,1800);assert.equal(f.backlog.meta('hypothesis-cohort').id,cohort.id);
+ assert.deepEqual(f.backlog.meta('hypothesis-cohort').members.map(m=>m.id),cohort.members.map(m=>m.id));
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.backlog.get('peer').status,'rejected');assert.equal(f.backlog.get('outside-urgent').status,'queued');
+});
+test('unfinished comparison rebases without renewing elapsed or reusing old-baseline samples',async t=>{
+ const f=await fixture(t);f.add('rebase',20,{preparation:{proposalElapsedSeconds:12}});const abort=new AbortController();
+ await assert.rejects(runPrioritySkills(f.config,{...f.values,signal:abort.signal},{...f.ops,evaluate:async()=>{abort.abort(Error('pause'));throw abort.signal.reason;}}),/pause/);
+ const old=f.backlog.run(f.backlog.get('rebase').id);await mkdir(old.checkpoint.evaluationDirectory,{recursive:true});await writeFile(join(old.checkpoint.evaluationDirectory,'frozen-samples.json'),'["old-baseline-sample"]');
+ f.backlog.checkpoint(old.id,{elapsed:230,checkpoint:{...old.checkpoint,runningAt:undefined,prepared:{...old.checkpoint.prepared,qa:{elapsedSeconds:100}}}});
+ const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));config.skills.activeVersion='promoted';await writeFile(join(f.root,'instance.json'),JSON.stringify(config));
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.backlog.run(old.id).result.reason,'active-skill-changed');
+ let remaining,directory;await runPrioritySkills(f.config,f.values,{...f.ops,prepare:async args=>{assert.equal(args.priorElapsedSeconds,100);return f.ops.prepare(args);},evaluate:async args=>{remaining=args.remainingSeconds;directory=args.directory;return f.ops.evaluate(args);}});
+ const latest=f.state.db.prepare('SELECT id,elapsed,seconds,checkpoint,base FROM skill_backlog_runs ORDER BY rowid DESC LIMIT 1').get();
+ assert.notEqual(latest.id,old.id);assert.equal(latest.base,'promoted');assert.equal(latest.seconds,1800);assert(latest.elapsed>=230);assert(remaining<=1570&&remaining>1560);
+ assert.equal(JSON.parse(latest.checkpoint).requalifiedFrom,old.id);assert.notEqual(directory,old.checkpoint.evaluationDirectory);assert.equal(f.backlog.run(old.id).elapsed,230);assert.equal(await readFile(join(old.checkpoint.evaluationDirectory,'frozen-samples.json'),'utf8'),'["old-baseline-sample"]');
+});
+test('settled infrastructure failure blocks one member and allows its peer without automatic retry',async t=>{
+ const f=await fixture(t);f.add('failed-qa',30);f.add('peer',20);const ops={...f.ops,prepare:async args=>args.item.key==='failed-qa'?{status:'inconclusive',retryable:true,reason:'qa-execution-failed',qa:{elapsedSeconds:90}}:f.ops.prepare(args)};
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(f.backlog.get('failed-qa').status,'inconclusive');
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(f.backlog.get('peer').status,'rejected');assert.equal(f.state.db.prepare("SELECT count(*) n FROM skill_backlog_runs WHERE item_id=?").get(f.backlog.get('failed-qa').id).n,1);
+});
+test('idle factual learning cannot claim a legacy bespoke-suite request',async t=>{
+ const f=await fixture(t),suite=enqueueLearningRequest(f.state,{target:'a3',question:'Build an old suite',workKind:'suite',requiredEvidence:'Five cases'}),fact=enqueueLearningRequest(f.state,{target:'a3',question:'Check a small archived fact',workKind:'microlearning',requiredEvidence:'Observation'});let picked;
+ await runPrioritySkills(f.config,f.values,{...f.ops,learn:async args=>{picked=args.requestIds;return {status:'verified'};}});
+ assert.deepEqual(picked,[fact]);assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(suite).status,'pending');
+});
+test('two campaigns retain independent cohorts even with identical hypothesis keys',async t=>{
+ const a=await fixture(t),b=await fixture(t);for(let i=0;i<3;i++){a.add('same-'+i,30-i);b.add('same-'+i,30-i);}
+ await runPrioritySkills(a.config,a.values,a.ops);await runPrioritySkills(b.config,b.values,b.ops);
+ const before=b.backlog.meta('hypothesis-cohort');await runPrioritySkills(a.config,a.values,a.ops);
+ assert.deepEqual(b.backlog.meta('hypothesis-cohort'),before);assert.notEqual(a.backlog.meta('hypothesis-cohort').id,before.id);
+ assert.equal(a.backlog.get('same-1').status,'rejected');assert.equal(b.backlog.get('same-1').status,'queued');
+});
+test('an obsolete procedural continuation blocks explicitly and is not selected again',async t=>{
+ const f=await fixture(t),item=f.add('obsolete',20),old=f.backlog.claim({base:'baseline'});f.backlog.finish(old.run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+ const continued=f.backlog.continue(old.run.id,{base:'baseline',procedure:'Earlier valid procedure'});f.backlog.finish(continued.id,{status:'rejected',result:{reason:'Scientifically rejected'}});
+ f.backlog.meta('procedural-continuations',[{id:old.run.id,base:'baseline',procedure:'Stale queue entry'}]);await runPrioritySkills(f.config,f.values,f.ops);
+ assert.equal(f.backlog.meta('procedural-continuations').length,0);assert.equal((await prioritySkillStatus(f.config)).cohort.counts.blocked,1);assert.equal(f.backlog.get(item.id).status,'rejected');
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.state.db.prepare('SELECT count(*) n FROM skill_backlog_runs').get().n,2);
+});
+test('supported premade qualification precedes unrelated unsupported hypotheses',async t=>{
+ const f=await fixture(t);for(let i=0;i<105;i++)f.add('unknown-'+i,200-i);f.add('premade',1);let qualified;
+ await runPrioritySkills(f.config,f.values,{...f.ops,caseReadiness:async({item})=>({ready:false,supported:item.key==='premade'}),resolveCases:async({item,beforeQualification})=>{qualified=item.key;await beforeQualification(join(f.root,'pack-qualification'));return f.ops.resolveCases();}});
+ assert.equal(qualified,'premade');assert.equal(f.backlog.get('premade').status,'rejected');assert.equal(f.backlog.get('unknown-0').status,'queued');assert.equal(f.backlog.meta('hypothesis-cohort').members.length,5);
+});
+test('unresolved case qualification retains its slot until positive closure, then peers proceed',async t=>{
+ const f=await fixture(t);f.add('qualifying',30);f.add('peer',20);let dispatched;
+ const blocked=await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async({beforeQualification})=>{dispatched=join(f.root,'actual-qualification');await beforeQualification(dispatched);return {status:'blocked',reason:'Native command unknown'};},settled:async({directory})=>{assert.equal(directory,dispatched);return false;}});
+ assert.equal(blocked.status,'blocked');assert.equal(f.backlog.get('qualifying').status,'running');assert.equal(f.backlog.run(f.backlog.get('qualifying').id).checkpoint.unresolved,true);assert.equal(f.backlog.get('peer').status,'queued');
+ await runPrioritySkills(f.config,f.values,f.ops);await runPrioritySkills(f.config,f.values,f.ops);
+ assert.equal(f.backlog.get('qualifying').status,'rejected');assert.equal(f.backlog.get('peer').status,'rejected');
 });

@@ -12,6 +12,8 @@ import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlo
 import {evaluateHypothesis,hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
 import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
 import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs';
+import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetainedCohort} from './skill-cohort.mjs';
+const caseReadiness=async args=>(await import('./skill-priority-cases.mjs')).hypothesisCaseReadiness?.(args)??{ready:false};
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
 const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,tasks:cases.tasks.map(task=>{
@@ -32,12 +34,12 @@ export async function prioritySkillStatus(config){
   const learningWork=backlog.meta('microlearning-active'),learningQueue=pendingMicrolearning(backlog);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
   const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
-  return {...status,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:(backlog.meta('procedural-continuations')??[]).length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
+  return {...status,cohort:cohortStatus(backlog),activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:(backlog.meta('procedural-continuations')??[]).length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
    analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
-   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||(backlog.meta('procedural-continuations')??[]).length>0||learningQueue.length>0||items.some(i=>['queued','needs-review'].includes(i.status)))};
+   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||(backlog.meta('procedural-continuations')??[]).length>0||learningQueue.some(request=>request.workKind!=='suite')||items.some(i=>['queued','needs-review'].includes(i.status)))};
  }finally{state.close();}
 }
 export async function prioritySkillsSettled(config,dependencies={}){
@@ -53,7 +55,7 @@ export async function prioritySkillsSettled(config,dependencies={}){
 }
 export async function runPrioritySkills(config,values,dependencies={}){
  const ops={analyze:analyzeBacklog,prioritize:prioritizeBacklog,prepare:prepareHypothesis,evaluate:evaluateHypothesis,
-  learn:runMicrolearning,resolveCases:resolveHypothesisCases,publish:publishSkillVersion,settled:hypothesisEvaluationSettled,now:()=>performance.now(),...dependencies};
+  learn:runMicrolearning,caseReadiness,resolveCases:resolveHypothesisCases,publish:publishSkillVersion,settled:hypothesisEvaluationSettled,now:()=>performance.now(),...dependencies};
  const {state,backlog}=open(config),directory=join(config.root,'skills','priority');await mkdir(directory,{recursive:true});
  const campaignEnd=ops.now()+values.remainingSeconds*1000,remainingCampaign=()=>Math.max(0,(campaignEnd-ops.now())/1000);
  let selected,checkpoint,timer,started,prior;
@@ -65,7 +67,9 @@ export async function runPrioritySkills(config,values,dependencies={}){
   if(backlog.meta('microlearning-active'))return await ops.learn({config,backlog,...values});
   await wakeQualifiedSuiteWaiters({config,backlog});
   const retained=backlog.list({status:'running',limit:1})[0];
-  if(!retained){
+  if(retained)attachRetainedCohort(backlog,backlog.run(retained.id));
+  const cohort=refreshCohort(backlog);
+  if(!retained&&(!cohort||cohort.status==='complete')&&(cohort?.status==='complete'||!hasCohortCandidates(backlog,config.skills.activeVersion))){
    const admittedLearning=learningFingerprint(state);
    if(backlog.meta('learning-seen')!==admittedLearning){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
@@ -100,13 +104,12 @@ export async function runPrioritySkills(config,values,dependencies={}){
     return {status:'needs-review'};
    }
   }
-  if(!retained){const queue=backlog.meta('procedural-continuations')??[];
-   queue.sort((a,b)=>(backlog.get(backlog.run(b.id)?.item_id)?.priority??0)-(backlog.get(backlog.run(a.id)?.item_id)?.priority??0));
-   const fresh=backlog.list({status:'queued'}).find(item=>item.base===config.skills.activeVersion);
-   while(queue.length){if(fresh&&(backlog.get(backlog.run(queue[0].id)?.item_id)?.priority??0)<fresh.priority)break;const next=queue.shift();backlog.meta('procedural-continuations',queue);if(next.base!==config.skills.activeVersion)continue;try{backlog.continue(next.id,{...next,owner});break;}catch(error){state.event(null,'skill-continuation-skipped',{id:next.id,reason:error.message});}}
+  selected=retained?backlog.claim({base:config.skills.activeVersion,owner}):await claimCohort(backlog,config,owner,ops.caseReadiness);
+  if(!selected){
+   const requests=pendingMicrolearning(backlog).filter(request=>request.workKind!=='suite');
+   return requests.length?await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign(),requestIds:requests.map(r=>r.id)}):{status:'idle',reason:'No applicable cohort comparison or bounded factual learning'};
   }
-  selected=backlog.claim({base:config.skills.activeVersion,owner});
-  if(!selected)return await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign()});
+  attachRetainedCohort(backlog,selected.run);
   const {run}=selected,item=run.snapshot,home=join(directory,'hypotheses',run.id);await mkdir(home,{recursive:true});
   checkpoint={...run.checkpoint,resource:values.resource};
   prior=run.elapsed+(checkpoint.runningAt?Math.max(0,Date.now()-checkpoint.runningAt)/1000:0);
@@ -132,9 +135,13 @@ export async function runPrioritySkills(config,values,dependencies={}){
   const qualificationDirectory=join(home,'cases','qualification');
   checkpoint.qualificationDirectory??=qualificationDirectory;save();
   const beforeQualification=async directory=>{checkpoint.qualificationDirectory=directory;save();};
+  const finishCases=async cases=>{
+   if(!await ops.settled({directory:checkpoint.qualificationDirectory,config,resource:values.resource})){checkpoint.unresolved=true;save();return {status:'blocked',reason:'Case qualification execution remains unresolved'};}
+   return finish(cases.status==='needs-learning'?'learning':'inconclusive',cases);
+  };
   let cases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared?.status==='ready'?checkpoint.prepared.proposal??item.proposal:item.proposal,directory:join(home,'cases'),qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
-  if(cases.status!=='ready')return finish('learning',cases);
+  if(cases.status!=='ready')return await finishCases(cases);
   satisfySuiteRequests(backlog,item.id,cases);
   const contractKey=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');
   if(!checkpoint.prepared||checkpoint.prepared.retryable||checkpoint.reviewedContract!==contractKey){
@@ -143,18 +150,19 @@ export async function runPrioritySkills(config,values,dependencies={}){
    checkpoint.reviewedContract=contractKey;save();
   }
   if(checkpoint.prepared.status!=='ready'){
-   if(checkpoint.prepared.retryable){delete checkpoint.runningAt;save();return {status:'deferred',reason:checkpoint.prepared.reason};}
+   if(checkpoint.prepared.retryable)return finish('inconclusive',checkpoint.prepared);
    return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
   }
   const reviewedCases=JSON.stringify(evaluationContract(cases));
   cases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
-  if(cases.status!=='ready')return finish('learning',cases);
+  if(cases.status!=='ready')return await finishCases(cases);
   if(JSON.stringify(evaluationContract(cases))!==reviewedCases&&checkpoint.prepared.proposal){
    checkpoint.prepared=await ops.prepare({config,backlog,item:{...item,proposal:checkpoint.prepared.proposal},directory:join(home,'final-contract'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:checkpoint.prepared.qa?.elapsedSeconds??checkpoint.prepared.elapsedSeconds??0});checkpoint.reviewedContract=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');save();
    if(checkpoint.prepared.status!=='ready')return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
    const finalCases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory,resource:values.resource,signal,seconds:left()});
-   if(finalCases.status!=='ready'||JSON.stringify(evaluationContract(finalCases))!==JSON.stringify(evaluationContract(cases)))return finish('learning',{reason:'Final proposal requires a different qualified contract'});
+   if(finalCases.status!=='ready')return await finishCases(finalCases);
+   if(JSON.stringify(evaluationContract(finalCases))!==JSON.stringify(evaluationContract(cases)))return finish('learning',{reason:'Final proposal requires a different qualified contract'});
   }
   await recordCandidate(config,checkpoint.prepared,{reason:'awaiting-evaluation',signal});
   checkpoint.evaluationDirectory=join(home,'evaluation');checkpoint.evaluation={binding:cases.binding,resource:values.resource};save();
@@ -181,7 +189,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(!values.signal?.aborted&&settled&&!promoted)backlog.finish(selected.run.id,{status:'inconclusive',result:{reason:error.message}});
   }
   throw error;
- }finally{clearInterval(timer);state.close();}
+ }finally{clearInterval(timer);refreshCohort(backlog);state.close();}
 }
 
 /** Explicit one-time procedural migration; claimed foreground projects and old run records stay intact. */

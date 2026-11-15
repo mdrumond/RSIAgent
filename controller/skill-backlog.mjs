@@ -149,11 +149,11 @@ export class SkillBacklog {
  rank(rows){return this.atomic(()=>rows.map(({id,priority,reason})=>{const item=this.get(id);if(!item||!Number.isFinite(priority)||!reason)throw Error('Known hypothesis, priority and reason required');return this.store({...item,priority,reason});}));}
  rebase(id,base){return this.atomic(()=>{const item=this.get(id);if(!item)throw Error('Unknown hypothesis');if(item.base===base)return item;if(item.status==='running')throw Error('Settle running comparison before rebasing');return this.revise(id,{base,status:'needs-review',reason:'Active skill changed; requalification required'});});}
  run(id){const row=this.db.prepare("SELECT * FROM skill_backlog_runs WHERE id=? OR (item_id=? AND status='running') ORDER BY rowid DESC LIMIT 1").get(id,id);return row?{...row,snapshot:parse(row.snapshot),checkpoint:row.checkpoint&&parse(row.checkpoint),result:row.result&&parse(row.result),owner:row.owner&&parse(row.owner)}:null;}
- claim({base,seconds=1800,owner}={}){return this.atomic(()=>{
+ claim({base,seconds=1800,owner,itemId}={}){return this.atomic(()=>{
   if(!Number.isFinite(seconds)||seconds<=0||seconds>1800)throw Error('Hypothesis allowance must fit 1800 elapsed seconds');
   let row=this.db.prepare("SELECT id FROM skill_backlog_runs WHERE status='running'").get();
   if(row){const run=this.run(row.id);if(run.base!==base)throw Error('Settle retained comparison before baseline change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
-  for(const item of this.list({status:'queued',limit:100})){
+  for(const item of itemId?[this.get(itemId)].filter(item=>item?.status==='queued'):this.list({status:'queued',limit:100})){
    if(item.base!==base){this.rebase(item.id,base);continue;}
    const completed=this.completed(item);if(completed){this.store({...item,status:completed.status,previousRun:completed.id});continue;}
    const id=randomUUID();this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,status,snapshot,owner) VALUES(?,?,?,?,?,'running',?,?)")
@@ -178,6 +178,19 @@ export class SkillBacklog {
   this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,elapsed,status,snapshot,checkpoint,owner) VALUES(?,?,?,?,?,?,'running',?,?,?)")
    .run(next,previous.item_id,previous.revision,base,previous.seconds,previous.elapsed,JSON.stringify(previous.snapshot),JSON.stringify(checkpoint),JSON.stringify(owner??null));
   this.store({...this.get(previous.item_id),status:'running'});return this.run(next);
+ });}
+ /** A baseline change invalidates samples, not the unfinished cohort's elapsed allocation. */
+ requalify(id,{base,owner,procedure}={}){return this.atomic(()=>{
+  const previous=this.run(id),item=previous&&this.get(previous.item_id),member=this.meta('hypothesis-cohort')?.members?.find(m=>m.id===previous?.item_id&&m.status==='pending'&&(m.runId===id||m.requalify===id||m.continuation?.id===id));
+  if(!member||!previous||previous.status==='running'||['accepted','rejected'].includes(previous.status)||!procedure?.trim()||!base||previous.base===base||
+   previous.elapsed>=previous.seconds||this.db.prepare('SELECT id FROM skill_backlog_runs WHERE item_id=? ORDER BY rowid DESC LIMIT 1').get(previous.item_id)?.id!==id||
+   this.db.prepare("SELECT 1 FROM skill_backlog_runs WHERE status='running'").get()||hypothesisIdentity({...item,base:previous.base})!==hypothesisIdentity(previous.snapshot))throw Error('Only latest unchanged unfinished work may requalify after a baseline change');
+  const rebased=this.rebase(item.id,base),next=randomUUID(),checkpoint={requalifiedFrom:id,continuationProcedure:procedure,proposalCharged:previous.checkpoint?.proposalCharged??false,
+   priorQaElapsedSeconds:previous.checkpoint?.prepared?.qa?.elapsedSeconds??previous.checkpoint?.prepared?.elapsedSeconds??previous.checkpoint?.priorQaElapsedSeconds??0};
+  if(this.completed(rebased))throw Error('Hypothesis already completed against the new baseline');
+  this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,elapsed,status,snapshot,checkpoint,owner) VALUES(?,?,?,?,?,?,'running',?,?,?)")
+   .run(next,item.id,rebased.revision,base,previous.seconds,previous.elapsed,JSON.stringify(rebased),JSON.stringify(checkpoint),JSON.stringify(owner??null));
+  this.store({...rebased,status:'running'});return this.run(next);
  });}
  checkpoint(id,{elapsed,checkpoint}={}){return this.atomic(()=>{const run=this.run(id);if(!run||run.status!=='running'||!Number.isFinite(elapsed)||elapsed<run.elapsed)throw Error('Running comparison and monotonic elapsed time required');this.db.prepare('UPDATE skill_backlog_runs SET elapsed=?,checkpoint=? WHERE id=?').run(elapsed,JSON.stringify(checkpoint??run.checkpoint),run.id);return this.run(run.id);});}
  finish(id,{status,result}={}){return this.atomic(()=>{
