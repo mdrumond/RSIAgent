@@ -399,3 +399,16 @@ test('actual catalogue readiness admits a scoped custom CPU suite ahead of unrel
  assert.equal(claimed.item.id,ready.id);assert.equal(claimed.run.item_id,ready.id);assert.equal(f.backlog.run(claimed.run.id).status,'running');
  assert.equal(f.backlog.get('unrelated-6').status,'queued');assert.equal(f.backlog.meta('hypothesis-cohort').id,cohort.id);
 });
+test('operator-authorized case handoff repair resumes the same cohort under its original budgets',async t=>{
+ const f=await fixture(t);f.add('handoff-a',20);f.add('handoff-b',10);let clock=0;
+ const broken={...f.ops,now:()=>clock,resolveCases:async()=>{clock+=10000;return {status:'unsupported',missingCapability:true,reason:'Suite cases were omitted from selector input'};}};
+ await runPrioritySkills(f.config,f.values,broken);await runPrioritySkills(f.config,f.values,broken);
+ const cohort=f.backlog.meta('hypothesis-cohort'),oldRows=cohort.members.map(member=>f.state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(member.runId)),repair={fromRevision:'a'.repeat(40),toRevision:'b'.repeat(40),evidence:{path:'/tmp/curated-selection-repair.json',sha256:'c'.repeat(64)}};
+ const queue=cohort.members.map(member=>({id:member.runId,base:'baseline',procedure:'Validated operator-authorized case-selection handoff repair',caseSelectionRepair:repair}));
+ f.backlog.meta('procedural-continuations',queue);f.backlog.meta('hypothesis-cohort',{...cohort,status:'running',members:cohort.members.map((member,i)=>{const resumed={...member,status:'pending',continuation:queue[i]};delete resumed.runId;delete resumed.reason;return resumed;})});
+ const ops={...f.ops,analyze:()=>{throw Error('Repaired cohort must resume before new analysis');}};
+ await runPrioritySkills(f.config,f.values,ops);await runPrioritySkills(f.config,f.values,ops);
+ assert.deepEqual(oldRows.map(row=>f.state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(row.id)),oldRows);assert.equal(f.backlog.meta('hypothesis-cohort').id,cohort.id);assert.equal((await prioritySkillStatus(f.config)).cohort.counts.completed,2);
+ for(const row of oldRows){const next=f.state.db.prepare("SELECT seconds,elapsed,checkpoint FROM skill_backlog_runs WHERE json_extract(checkpoint,'$.continuedFrom')=?").get(row.id);assert.equal(next.seconds,row.seconds);assert(next.elapsed>=row.elapsed);assert.equal(row.elapsed,10);assert.deepEqual(JSON.parse(next.checkpoint).caseSelectionRepair,repair);}
+ assert.equal(f.calls.filter(call=>call[0]==='evaluate').length,2);assert.equal(f.backlog.meta('procedural-continuations').length,0);
+});

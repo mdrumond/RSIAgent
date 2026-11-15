@@ -1,4 +1,5 @@
 import {createHash,randomUUID} from 'node:crypto';
+import {isAbsolute} from 'node:path';
 import {diagnosticIdentity} from './skill-review.mjs';
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const parse=value=>JSON.parse(value);
@@ -163,17 +164,24 @@ export class SkillBacklog {
   return null;
  });}
  /** Explicit procedural continuation; prior records stay immutable and time is never renewed. */
- continue(id,{procedure,owner,base,missingCases=false}={}){return this.atomic(()=>{
+ continue(id,{procedure,owner,base,missingCases=false,caseSelectionRepair}={}){return this.atomic(()=>{
   const previous=this.run(id),reason=previous?.result?.reason;
+  if(caseSelectionRepair!==undefined){
+   const {fromRevision,toRevision,evidence}=caseSelectionRepair??{};
+   if(!/^[a-f0-9]{40}$/.test(fromRevision??'')||!/^[a-f0-9]{40}$/.test(toRevision??'')||fromRevision===toRevision||
+    !isAbsolute(evidence?.path??'')||!/^[a-f0-9]{64}$/.test(evidence?.sha256??''))throw Error('Case-selection repair requires distinct revisions and immutable evidence path/hash');
+  }
+  const repair=caseSelectionRepair!==undefined&&previous?.status==='inconclusive'&&previous.result?.status==='unsupported'&&previous.result?.missingCapability===true&&
+   !previous.checkpoint?.prepared&&!previous.checkpoint?.reviewedContract&&!previous.checkpoint?.unresolved&&!previous.checkpoint?.publicationApproved&&!(previous.checkpoint?.priorQaElapsedSeconds>0);
   if(!previous||previous.status==='running'||!procedure?.trim()||previous.base!==base||
    previous.checkpoint?.evaluationDirectory||previous.result?.report?.results?.length||
-   !(['qa-elapsed','qa-execution-failed','missing-cases','No target-compatible evaluation suite'].includes(reason)||missingCases&&previous.status==='learning'&&previous.result?.learningRequest))throw Error('Only audited pre-evaluation infrastructure failures may continue');
+   !(caseSelectionRepair!==undefined?repair:['qa-elapsed','qa-execution-failed','missing-cases','No target-compatible evaluation suite'].includes(reason)||missingCases&&previous.status==='learning'&&previous.result?.learningRequest))throw Error('Only audited pre-evaluation infrastructure failures may continue');
   const latest=this.db.prepare('SELECT id FROM skill_backlog_runs WHERE item_id=? ORDER BY rowid DESC LIMIT 1').get(previous.item_id);
   if(latest?.id!==id||fingerprint(this.get(previous.item_id))!==fingerprint(previous.snapshot))throw Error('Only the latest unchanged hypothesis may continue');
   if(this.db.prepare("SELECT 1 FROM skill_backlog_runs WHERE status='running'").get())throw Error('Background comparison already running');
   if(previous.elapsed>=previous.seconds)throw Error('Original hypothesis allowance exhausted');
   if(this.db.prepare("SELECT 1 FROM skill_backlog_runs WHERE json_extract(checkpoint,'$.continuedFrom')=?").get(id))throw Error('Continuation already exists');
-  const next=randomUUID(),checkpoint={...previous.checkpoint,continuedFrom:id,continuationProcedure:procedure,continuationAt:new Date(this.now()).toISOString()};
+  const next=randomUUID(),checkpoint={...previous.checkpoint,continuedFrom:id,continuationProcedure:procedure,continuationAt:new Date(this.now()).toISOString(),...(repair?{caseSelectionRepair:structuredClone(caseSelectionRepair)}:{})};
   checkpoint.priorQaElapsedSeconds=previous.checkpoint?.prepared?.qa?.elapsedSeconds??previous.checkpoint?.prepared?.elapsedSeconds??0;delete checkpoint.runningAt;delete checkpoint.prepared;
   this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,elapsed,status,snapshot,checkpoint,owner) VALUES(?,?,?,?,?,?,'running',?,?,?)")
    .run(next,previous.item_id,previous.revision,base,previous.seconds,previous.elapsed,JSON.stringify(previous.snapshot),JSON.stringify(checkpoint),JSON.stringify(owner??null));

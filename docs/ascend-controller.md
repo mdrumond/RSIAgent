@@ -517,3 +517,12 @@ elapsed allocations and completed samples; a new active skill invalidates old
 baseline samples without renewing the unfinished hypothesis allowance. Existing
 claimed learning resumes normally; idle learning admits bounded factual requests
 rather than old unclaimed suite-construction requests.
+
+
+An operator may authorize a case-selection handoff repair with immutable code
+revision and evidence provenance. This continuation is limited to an unchanged,
+pre-Q&A hypothesis that ended inconclusive because its suite was unsupported;
+scored comparisons, rejected candidates and unresolved execution are excluded.
+The new checkpoint records the repair and carries the original elapsed spend and
+allocation. It does not overwrite the previous outcome or automatically retry
+scientific rejections.

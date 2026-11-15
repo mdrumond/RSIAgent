@@ -187,3 +187,32 @@ test('a revised hypothesis cannot alter an already frozen experiment snapshot',a
  assert.equal(b.run(old.run.id).snapshot.proposal.text,'Mask tail stores');b.finish(old.run.id,{status:'rejected'});assert.equal(b.get(h.id).status,'queued');
  const next=b.claim({base:'baseline'});assert.equal(next.run.revision,2);assert.equal(next.run.snapshot.proposal.text,'New supported instruction');
 });
+
+test('audited case-selection repair preserves unchanged hypothesis history and original allocation',async t=>{
+ const {state,b,seed,item}=await fixture(t),h=item('handoff',seed()),old=b.claim({base:'baseline'}).run;
+ b.checkpoint(old.id,{elapsed:125,checkpoint:{proposalCharged:true,resource:{id:'reserved'}}});b.finish(old.id,{status:'inconclusive',result:{status:'unsupported',missingCapability:true,reason:'Case details were not delivered to the selector'}});
+ const frozen=state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(old.id),repair={fromRevision:'a'.repeat(40),toRevision:'b'.repeat(40),evidence:{path:'/tmp/selection-repair-proof.json',sha256:'c'.repeat(64)}};
+ const continued=b.continue(old.id,{base:'baseline',procedure:'Operator-authorized handoff repair after validated code change',caseSelectionRepair:repair});
+ assert.equal(continued.item_id,h.id);assert.equal(continued.seconds,1800);assert.equal(continued.elapsed,125);assert.equal(continued.checkpoint.continuedFrom,old.id);assert.deepEqual(continued.checkpoint.caseSelectionRepair,repair);
+ repair.evidence.sha256='d'.repeat(64);assert.equal(b.run(continued.id).checkpoint.caseSelectionRepair.evidence.sha256,'c'.repeat(64));assert.deepEqual(state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(old.id),frozen);
+ assert.equal(b.claim({base:'baseline'}).remaining,1675);
+});
+test('case-selection repair refuses scientific outcomes, QA work, unresolved custody and malformed provenance',async t=>{
+ const repair={fromRevision:'a'.repeat(40),toRevision:'b'.repeat(40),evidence:{path:'/tmp/selection-repair-proof.json',sha256:'c'.repeat(64)}};
+ for(const [name,status,checkpoint,result]of [
+  ['rejected','rejected',{}, {status:'unsupported',missingCapability:true}],
+  ['evaluated','inconclusive',{}, {status:'unsupported',missingCapability:true,report:{results:[{correct:false}]}}],
+  ['evaluation-directory','inconclusive',{evaluationDirectory:'/tmp/evaluated'}, {status:'unsupported',missingCapability:true}],
+  ['qa','inconclusive',{prepared:{status:'inconclusive',qa:{elapsedSeconds:30}}}, {status:'unsupported',missingCapability:true,reason:'qa-elapsed'}],
+  ['prior-qa','inconclusive',{priorQaElapsedSeconds:30}, {status:'unsupported',missingCapability:true}],
+  ['unresolved','inconclusive',{unresolved:true}, {status:'unsupported',missingCapability:true}],
+  ['unsupported-without-proof','inconclusive',{}, {status:'unsupported',missingCapability:false}]
+ ]){
+  const {state,b,seed,item}=await fixture(t);item(name,seed());const old=b.claim({base:'baseline'}).run;b.checkpoint(old.id,{elapsed:50,checkpoint});b.finish(old.id,{status,result});
+  assert.throws(()=>b.continue(old.id,{base:'baseline',procedure:'Explicit operator repair',caseSelectionRepair:repair}),/Only audited pre-evaluation/);assert.equal(state.db.prepare('SELECT count(*) n FROM skill_backlog_runs').get().n,1);
+ }
+ for(const invalid of [{...repair,toRevision:repair.fromRevision},{...repair,evidence:{path:'relative.json',sha256:'c'.repeat(64)}},{...repair,evidence:{path:'/tmp/proof',sha256:'not-a-hash'}},{}]){
+  const {b,seed,item}=await fixture(t);item('invalid-provenance',seed());const old=b.claim({base:'baseline'}).run;b.finish(old.id,{status:'inconclusive',result:{status:'unsupported',missingCapability:true}});
+  assert.throws(()=>b.continue(old.id,{base:'baseline',procedure:'Explicit repair',caseSelectionRepair:invalid}),/immutable evidence/);
+ }
+});
