@@ -526,3 +526,11 @@ scored comparisons, rejected candidates and unresolved execution are excluded.
 The new checkpoint records the repair and carries the original elapsed spend and
 allocation. It does not overwrite the previous outcome or automatically retry
 scientific rejections.
+
+
+Recovery of a stopped background worker may ask the existing SDK to retire only
+canonical pre-payload upload custody for an interrupted device evaluation. A
+permanent comparison fence forces an inconclusive outcome without replay or
+rescoring; its elapsed spend and prior samples remain intact. Live workers,
+qualification and ordinary evaluation do not receive this retirement permission,
+and unknown native work remains blocked until positive closure is established.

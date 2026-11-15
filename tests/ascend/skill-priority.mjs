@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
-import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput,wakeQualifiedSuiteWaiters} from '../../cli/skill-priority.mjs';
+import {runPrioritySkills,prioritySkillStatus,prioritySkillsSettled,migratePriorityThroughput,wakeQualifiedSuiteWaiters} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
 import {resolveHypothesisCases,registerQualifiedSuite,hypothesisCaseReadiness} from '../../cli/skill-priority-cases.mjs';
 import {selectCohort,claimCohort} from '../../cli/skill-cohort.mjs';
@@ -411,4 +411,34 @@ test('operator-authorized case handoff repair resumes the same cohort under its 
  assert.deepEqual(oldRows.map(row=>f.state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(row.id)),oldRows);assert.equal(f.backlog.meta('hypothesis-cohort').id,cohort.id);assert.equal((await prioritySkillStatus(f.config)).cohort.counts.completed,2);
  for(const row of oldRows){const next=f.state.db.prepare("SELECT seconds,elapsed,checkpoint FROM skill_backlog_runs WHERE json_extract(checkpoint,'$.continuedFrom')=?").get(row.id);assert.equal(next.seconds,row.seconds);assert(next.elapsed>=row.elapsed);assert.equal(row.elapsed,10);assert.deepEqual(JSON.parse(next.checkpoint).caseSelectionRepair,repair);}
  assert.equal(f.calls.filter(call=>call[0]==='evaluate').length,2);assert.equal(f.backlog.meta('procedural-continuations').length,0);
+});
+
+test('stopped interrupted evaluation recovery opts into SDK retirement and advances its cohort without rescore',async t=>{
+ const f=await fixture(t);f.add('interrupted-device',30);f.add('peer',20);const abort=new AbortController(),binding={target:'a3',environment:{mode:'cpl',target:'fixture',runtime:'fixture'}};
+ await assert.rejects(runPrioritySkills(f.config,{...f.values,signal:abort.signal},{...f.ops,resolveCases:async()=>({status:'ready',target:'a3',tasks:[],binding}),evaluate:async()=>{abort.abort(Error('Worker exit'));throw abort.signal.reason;},settled:async()=>false}),/Worker exit/);
+ const old=f.backlog.run(f.backlog.get('interrupted-device').id),directory=old.checkpoint.evaluationDirectory,dead={pid:2147483647,start:'1',boot:'retired-worker'};
+ f.backlog.checkpoint(old.id,{elapsed:123,checkpoint:{...old.checkpoint,unresolved:true,runningAt:undefined}});f.state.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(dead),old.id);
+ await mkdir(join(directory,'micro'),{recursive:true});const file=join(directory,'micro','results.json'),samples=[{taskId:'completed-before-interruption',correct:false,elapsedSeconds:17}],report={status:'interrupted',elapsedSeconds:97,results:samples,runningSample:{key:'partial/0/active',owner:dead}};await writeFile(file,JSON.stringify(report));
+ const checks=[],settled=async args=>{checks.push(args);assert.equal(args.retirePrePayload,true);assert.equal(args.directory,directory);const current=JSON.parse(await readFile(file,'utf8'));current.status='inconclusive';current.settledInterruption={fence:'SDK-permanent-comparison-fence'};delete current.runningSample;await writeFile(file,JSON.stringify(current));return true;};
+ assert.equal(await prioritySkillsSettled(f.config,{settled}),true);
+ const ops={...f.ops,settled,analyze:()=>{throw Error('Recovery must finish its selected cohort first');},prepare:async args=>{assert.notEqual(args.item.key,'interrupted-device');return f.ops.prepare(args);}};
+ await runPrioritySkills(f.config,f.values,ops);
+ const done=f.backlog.run(old.id);assert.equal(done.status,'inconclusive');assert.equal(done.result.reason,'execution-interrupted');assert.equal(done.seconds,1800);assert(done.elapsed>=123);assert.deepEqual(done.result.report.results,samples);assert.equal(done.result.report.elapsedSeconds,97);assert.equal(f.calls.filter(call=>call[0]==='evaluate').length,0);
+ await runPrioritySkills(f.config,f.values,{...ops,settled:async args=>{assert.notEqual(args.retirePrePayload,true);return true;}});
+ assert.equal(f.backlog.get('peer').status,'rejected');assert.equal(f.calls.filter(call=>call[0]==='evaluate').length,1);assert.equal(checks.length,2);const after=JSON.parse(await readFile(file,'utf8'));assert.deepEqual(after.results,samples);assert.equal(after.elapsedSeconds,97);
+});
+test('retirement permission excludes qualification and live or ordinary evaluations; unknown native work stays blocked',async t=>{
+ const dead={pid:2147483647,start:'1',boot:'retired-worker'};
+ for(const kind of ['qualification','ordinary','live','unknown-native']){
+  const f=await fixture(t),item=f.add('retained-'+kind),{run}=f.backlog.claim({base:'baseline'}),evaluationDirectory=join(f.root,'retained-evaluation'),qualificationDirectory=join(f.root,'retained-qualification');
+  f.backlog.checkpoint(run.id,{elapsed:42,checkpoint:{resource:f.values.resource,...(kind==='qualification'?{qualificationDirectory}:{evaluationDirectory,evaluation:{binding:{target:'a3',environment:{mode:'cpl'}}}}),unresolved:kind!=='ordinary'}});
+  if(kind!=='live')f.state.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(dead),run.id);
+  else f.state.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(await (await import('../../controller/lifecycle.mjs')).processIdentity()),run.id);
+  let calls=0;const settled=async args=>{calls++;assert.equal(args.retirePrePayload,kind==='unknown-native');return false;};
+  assert.equal(await prioritySkillsSettled(f.config,{settled}),false);assert.equal(calls,1);
+  if(kind==='unknown-native'){
+   const result=await runPrioritySkills(f.config,f.values,{...f.ops,settled,analyze:()=>{throw Error('Unknown native work must not admit new work');},prepare:()=>{throw Error('Unknown native work must not rescore');}});
+   assert.equal(result.status,'blocked');assert.equal(f.backlog.get(item.id).status,'running');assert(f.backlog.run(run.id).elapsed>=42);assert.equal(f.backlog.run(run.id).seconds,1800);assert.equal(f.calls.length,0);
+  }
+ }
 });

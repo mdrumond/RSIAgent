@@ -1,6 +1,6 @@
 /** Campaign-local failure backlog; one retained hypothesis owns the background slot. */
 import {createHash} from 'node:crypto';
-import {mkdir} from 'node:fs/promises';
+import {mkdir,readFile} from 'node:fs/promises';
 import {readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {State} from '../controller/state.mjs';
@@ -16,6 +16,12 @@ import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetaine
 const caseReadiness=async args=>(await import('./skill-priority-cases.mjs')).hypothesisCaseReadiness?.(args)??{ready:false};
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
+const recoveryRetirement=async run=>Boolean(run?.checkpoint?.unresolved&&run.checkpoint.evaluationDirectory&&run.checkpoint.evaluation?.binding?.environment&&run.owner&&await ownerStopped(run.owner));
+async function settledInterruption(checkpoint){
+ if(!checkpoint?.evaluationDirectory)return null;
+ try{const report=JSON.parse(await readFile(join(checkpoint.evaluationDirectory,'micro','results.json'),'utf8'));return report.settledInterruption?report:null;}
+ catch(error){if(error.code!=='ENOENT')throw error;return null;}
+}
 const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,tasks:cases.tasks.map(task=>{
  const result={...task};for(const key of ['checker','pairedChecker'])if(task[key])result[key]=createHash('sha256').update(readFileSync(task[key])).digest('hex');return result;
 })});
@@ -48,7 +54,7 @@ export async function prioritySkillsSettled(config,dependencies={}){
   const item=backlog.list({status:'running',limit:1})[0],run=item&&backlog.run(item.id);
   if(!await microlearningSettled(config,backlog.meta('microlearning-active'),dependencies))return false;
   if(!run)return true;
-  if(executionDirectory(run.checkpoint))return await (dependencies.settled??hypothesisEvaluationSettled)({directory:executionDirectory(run.checkpoint),config,resource:run.checkpoint.resource,...run.checkpoint.evaluation});
+  if(executionDirectory(run.checkpoint))return await (dependencies.settled??hypothesisEvaluationSettled)({directory:executionDirectory(run.checkpoint),config,resource:run.checkpoint.resource,...run.checkpoint.evaluation,retirePrePayload:await recoveryRetirement(run)});
   // instanceStopped independently checks the writer identity. Preparation has no device command.
   return true;
  }finally{state.close();}
@@ -92,8 +98,12 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(old.checkpoint?.unresolved){
     const cp=old.checkpoint,elapsed=old.elapsed+(cp.runningAt?Math.max(0,Date.now()-cp.runningAt)/1000:0);
     cp.runningAt=Date.now();backlog.checkpoint(old.id,{elapsed,checkpoint:cp});
-    if(!await ops.settled({directory:executionDirectory(cp),config,resource:cp.resource,...cp.evaluation}))return {status:'blocked',reason:'Retained evaluation execution remains unresolved'};
-    delete cp.unresolved;delete cp.runningAt;backlog.checkpoint(old.id,{elapsed,checkpoint:cp});
+    const closed=await ops.settled({directory:executionDirectory(cp),config,resource:cp.resource,...cp.evaluation,retirePrePayload:await recoveryRetirement(old)}),charged=elapsed+Math.max(0,Date.now()-cp.runningAt)/1000;
+    if(closed){delete cp.unresolved;delete cp.runningAt;}else cp.runningAt=Date.now();
+    backlog.checkpoint(old.id,{elapsed:charged,checkpoint:cp});
+    if(!closed)return {status:'blocked',reason:'Retained evaluation execution remains unresolved'};
+    const interrupted=await settledInterruption(cp);
+    if(interrupted)return backlog.finish(old.id,{status:'inconclusive',result:{reason:'execution-interrupted',decision:{objective:old.snapshot.objective,promote:false,reason:'execution-interrupted'},report:interrupted}});
    }
    if(old.base!==config.skills.activeVersion){
     if(executionDirectory(old.checkpoint)&&!await ops.settled({directory:executionDirectory(old.checkpoint),config,resource:old.checkpoint.resource,...old.checkpoint.evaluation}))return {status:'blocked',reason:'Stale-baseline execution remains unresolved'};
