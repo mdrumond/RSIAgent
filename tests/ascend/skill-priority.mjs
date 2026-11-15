@@ -215,3 +215,12 @@ test('legacy cached preparation cannot skip v2 contract review',async t=>{
  await runPrioritySkills(f.config,f.values,{...f.ops,prepare:async args=>{budget=args.priorElapsedSeconds;assert(args.evaluationContract);return f.ops.prepare(args);}});
  assert.equal(budget,60);assert.equal(f.calls.filter(c=>c[0]==='prepare').length,1);assert.equal(f.backlog.get(item.id).status,'rejected');
 });
+test('qualification custody is checkpointed before a revised suite dispatches',async t=>{
+ const f=await fixture(t),item=f.add('revised-suite'),actual=join(f.root,'cases','qualification','new-contract');
+ let checked;
+ await assert.rejects(runPrioritySkills(f.config,f.values,{...f.ops,
+  resolveCases:async({beforeQualification})=>{await beforeQualification(actual);assert.equal(f.backlog.run(item.id).checkpoint.qualificationDirectory,actual);throw Error('qualification transport interrupted');},
+  settled:async({directory})=>{checked=directory;return false;}}),/qualification transport interrupted/);
+ assert.equal(checked,actual);assert.equal(f.backlog.run(item.id).checkpoint.unresolved,true);assert.equal(f.backlog.run(item.id).status,'running');
+ assert.equal(f.calls.length,0);
+});
