@@ -115,3 +115,26 @@ test('native Pi uses stock file tools, preserves protected files and submits JSO
 test('large elapsed allocations do not overflow native timer limits into immediate expiry',async t=>{
  const f=await fixture(t);f.options.seconds=3_000_000;const role=f.deps.role;f.deps.role=async args=>{assert.equal(args.signal.aborted,false);return role(args);};const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.status,'complete');assert.equal(r.verdict.promote,true);
 });
+
+test('explicit compatibility basis propagates to frozen inputs, both model roles and result',async t=>{
+ const f=await fixture(t);f.options.project.successBasis='compile-and-correct';f.design.successBasis='compile-and-correct';const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.successBasis,'compile-and-correct');assert.equal(r.verdict.successBasis,'compile-and-correct');assert.equal(r.reason,'compatibility-success-improved');for(const role of f.calls.filter(c=>c.submission))assert.equal(JSON.parse(role.files['input.json']).project.successBasis,'compile-and-correct');assert.equal(JSON.parse(await readFile(join(f.options.directory,'frozen.json'),'utf8')).project.successBasis,'compile-and-correct');
+});
+test('resource allowance outcomes are not numerical failures; explicit compatibility can score them',async t=>{
+ for(const successBasis of [undefined,'compile-and-correct']){
+  const f=await fixture(t);if(successBasis){f.options.project.successBasis=successBasis;f.design.successBasis=successBasis;}const batch=f.deps.target.qualifyBatch;f.deps.target.qualifyBatch=async args=>(await batch(args)).map(row=>{if(!row.key.endsWith('/baseline'))return row;const value=JSON.parse(row.output);value.evidence={kind:'case-resource-allowance',reason:'The declared case allowance expired after confirmed child closure'};return {...row,output:JSON.stringify(value)};});
+  const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.verdict.promote,Boolean(successBasis));assert.equal(r.reason,successBasis?'compatibility-success-improved':'inconclusive');assert.equal(r.results.find(row=>row.arm==='baseline').correct,successBasis?false:null);
+ }
+});
+test('compatibility basis cannot score infrastructure or unknown outcomes as source failures',async t=>{
+ for(const kind of ['infrastructure','unknown-execution']){
+  const f=await fixture(t);f.options.project.successBasis='compile-and-correct';f.design.successBasis='compile-and-correct';const batch=f.deps.target.qualifyBatch;f.deps.target.qualifyBatch=async args=>(await batch(args)).map(row=>{if(!row.key.endsWith('/baseline'))return row;const value=JSON.parse(row.output);value.evidence={kind,reason:'Execution status not established'};return {...row,output:JSON.stringify(value)};});
+  const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.verdict.promote,false);assert.equal(r.reason,'inconclusive');assert(r.results.some(row=>row.correct===null));
+ }
+});
+test('success basis is a frozen admission choice, not a model-redefinable metric',async t=>{
+ const f=await fixture(t);assert.throws(()=>validateSkillProject({...f.options.project,successBasis:'latency'}));assert.throws(()=>validateSkillTestDesign({...f.design,successBasis:'compile-and-correct'},{project:f.options.project,evidence:f.options.evidence}));
+});
+
+test('explicit compatibility cannot turn unknown command custody into a scored failure',async t=>{
+ const f=await fixture(t);f.options.project.successBasis='compile-and-correct';f.design.successBasis='compile-and-correct';f.deps.target.qualifyBatch=async()=>{throw Object.assign(Error('Execution closure unknown'),{code:'RSI_EXECUTION_UNRESOLVED',handle:'remote:test:job:compatibility'});};f.deps.settled=async()=>false;const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.status,'unresolved');assert.equal(r.verdict.promote,false);assert.equal(r.verdict.successBasis,'compile-and-correct');assert.equal(r.error.handle,'remote:test:job:compatibility');
+});

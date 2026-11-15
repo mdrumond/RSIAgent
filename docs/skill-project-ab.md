@@ -24,6 +24,11 @@ smaller allocation. Thirty seconds within that allocation are reserved for closu
 The prepared project contains:
 
 - `id`, `objective: 'correctness'`, `target: 'a3' | 'a5'`, and a public `prompt`.
+- Optional `successBasis`: `numerical-contract` (default) or
+  `compile-and-correct`. The latter measures producing correct outputs within the
+  same predeclared elapsed compatibility allowance; it does not measure kernel
+  speedup or establish that a timeout is a numerical mismatch. The allowance
+  must be part of the trusted frozen case/contract, not selected after outcomes.
 - A UTF-8 `files` mapping containing `kernel.py` and any public contract files.
 - Exactly five `cases: [{ id, parameters }]`, with distinct IDs and parameter
   sets. Changing property order does not create a distinct parameter set.
@@ -36,7 +41,11 @@ stdout line is a JSON receipt containing `correct`, `kernelSha256` and `evidence
 A full pass requires exit 0, `correct: true`, an NPU `evidence.device` and all five
 public IDs in `evidence.checkedCases`; additional seed variants are allowed.
 A definitive source failure requires exit 1, `correct: false` and a nonempty
-`evidence.reason`. Missing receipts, mismatched source/checker hashes, incomplete
+`evidence.reason`. Typed `evidence.kind: 'case-resource-allowance'` stays unscored
+under the default numerical basis. It can count as a completed compatibility
+failure only for an explicitly frozen `compile-and-correct` project. Unknown
+execution, harness/infrastructure outcomes and missing receipts remain unscored
+under either basis. Missing receipts, mismatched source/checker hashes, incomplete
 coverage and infrastructure refusals remain unscored. Reference/negative controls
 must be empirically discriminating. A historical negative that now passes is an
 uninformative result requiring learning, never a reason to manufacture a failure.
@@ -57,6 +66,10 @@ baseline/candidate, then candidate/baseline. Each gets the same starter, cases,
 contract and elapsed allocation, differing only in guidance. Each edits only
 `kernel.py`; trusted external verification then checks the whole project. Five
 cases are correlated observations of a proposal, not five independent actors.
+
+The result and verdict retain `successBasis`; an eligible compatibility gain is
+reported as `compatibility-success-improved`, separately from
+`correctness-improved`.
 
 `result.verdict.promote` is only a shadow recommendation: both candidate proposals
 must fully pass and at least one baseline must genuinely fail. A baseline ceiling,
