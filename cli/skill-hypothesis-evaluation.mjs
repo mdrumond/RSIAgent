@@ -76,6 +76,22 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
   return {correct:result.exitCode===0,exitCode:result.exitCode,output,handle:result.handle,outputEvidence:files??null};
  };
  return {
+  runtimeIdentity:async args=>{
+   const micro=join(args.directory,'micro'),cwd=join(micro,'runtime','0-probe','work'),checker=join(micro,'frozen','runtime.py'),file=join(micro,'results.json');
+   await mkdir(cwd,{recursive:true});await mkdir(dirname(checker),{recursive:true});
+   const source=await readFile(new URL('./skill-suites/runtime-identity.py',import.meta.url),'utf8');
+   await writeFile(checker,source+'\nprint(json.dumps(identity(),sort_keys=True))\n');
+   await save(join(args.directory,'hypothesis.json'),{binding});
+   const report={owner:await processIdentity(),runningSample:{key:'runtime/0/probe'},results:[]};await save(file,report);
+   try{
+    const began=performance.now(),context=await make(cwd,join(dirname(cwd),'target'),checker,args.signal,args.sampleStopSignal);
+    const left=args.seconds-(performance.now()-began)/1000;if(left<=0)throw Error('Runtime identity allocation exhausted');
+    const result=await command(context,[binding.python??'python3',context.checker].map(quote).join(' '),cwd,left,args.signal,args.sampleStopSignal,'verification');
+    if(result.exitCode!==0)throw Error('Fresh target runtime identity unavailable');
+    return JSON.parse(result.output);
+   }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;throw error;}
+   finally{if(!report.runningSample?.unresolvedExecution)delete report.runningSample;delete report.owner;await save(file,report);}
+  },
   sample:async args=>{
    const began=performance.now(),evaluation=dirname(dirname(dirname(args.cwd))),taskId=basename(dirname(dirname(args.cwd)));
    const context=await make(args.cwd,join(args.sessionDirectory,'target'),join(evaluation,'frozen',taskId+'.py'),args.sampleSignal??args.signal,args.sampleStopSignal,args.signal);contexts.set(args.cwd,context);

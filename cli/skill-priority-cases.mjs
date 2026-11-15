@@ -6,8 +6,9 @@ import {mkdir,readFile,writeFile,realpath,readdir} from 'node:fs/promises';
 import {join,resolve,relative} from 'node:path';
 import {prepareHypothesisTasks} from './microtasks/hypotheses.mjs';
 import {reviewSession} from './skill-review-native.mjs';
-import {enqueueLearningRequest} from '../controller/skill-review.mjs';
-import {prepareHypothesisEvaluation} from './skill-hypothesis-evaluation.mjs';
+import {prepareHypothesisEvaluation,hypothesisTarget} from './skill-hypothesis-evaluation.mjs';
+import {curatedPacks,applicablePack,prepareCuratedSuites} from './skill-curated-suites.mjs';
+import {randomUUID} from 'node:crypto';
 
 const digest=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 export async function suiteFingerprint(suite,baseDirectory=process.cwd()){
@@ -66,6 +67,20 @@ async function previousCases(config,item){
  }
  return suites;
 }
+const cpuMechanisms={
+ 'fault-ownership':/(?:traceback|fault|runtime).{0,80}(?:owner|attribut|origin|classif)|(?:owner|attribut|origin|classif|distinguish).{0,80}(?:traceback|fault|runtime)/i,
+ 'construction-admissibility':/(?:construct|bundle|proposal).{0,80}(?:admiss|layout|verifier|baseline)|(?:admiss|fixture ownership).{0,80}(?:construct|bundle|proposal)/i,
+ 'dtype-triage':/(?:dtype|float64|double).{0,80}(?:triage|unsupported|reject)|(?:triage|unsupported|reject).{0,80}(?:dtype|float64|double)/i
+};
+const applicableCpu=(hypothesis,proposal)=>hypothesis.proposalIds.some(id=>(proposal?.changes??[]).some(change=>change.id===id))||cpuMechanisms[hypothesis.id]?.test(JSON.stringify(proposal?.changes??proposal));
+export async function hypothesisCaseReadiness({config,item}){
+ const packs=config.target==='a3'?(await curatedPacks()).filter(pack=>applicablePack(pack,item)):[];
+ const shared=await qualifiedSuites({config});
+ const families=packs.map(pack=>'curated-'+pack.id);
+ const {hypotheses}=await import('./microtasks/hypotheses.mjs');
+ const cpu=item.objective==='correctness'&&hypotheses.some(h=>applicableCpu(h,item.proposal));
+ return {ready:cpu||shared.some(s=>families.includes(s.familyKey)),supported:cpu||packs.length>0,families};
+}
 export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event,beforeQualification,proposal=item.proposal},dependencies={}){
  const started=performance.now();
  await mkdir(directory,{recursive:true});
@@ -74,14 +89,24 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
  const learned=await learnedCases(config,backlog,item);
  const shared=await qualifiedSuites({config});
  let suites=[...(config.skills?.priority?.evaluations??[]),...learned.suites,...shared.filter(s=>s.target==='cpu'||JSON.stringify(s.binding?.environment)===JSON.stringify(config.environment.options)),...await previousCases(config,item)];
+ const applicable=config.target==='a3'?(await curatedPacks()).filter(pack=>applicablePack(pack,{...item,proposal})):[];
+ let runtimeIdentity;
+ if(applicable.length||suites.some(s=>s.target===config.target&&s.target!=='cpu'&&s.objective===item.objective)){
+  const probeDirectory=join(directory,'runtime-'+randomUUID());await beforeQualification?.(probeDirectory);
+  const binding={target:config.target,environment:config.environment.options};
+  const probe=dependencies.runtimeIdentity??(args=>hypothesisTarget({root:probeDirectory,binding,resource,signal,stopSignal:signal,localExecution:config.local_execution,event},dependencies).runtimeIdentity(args));
+  runtimeIdentity=await probe({directory:probeDirectory,seconds:Math.min(60,Math.max(.001,seconds-(performance.now()-started)/1000)),signal});
+  suites=suites.filter(s=>s.target==='cpu'||!s.curated); // Current curated versions are materialized from source, never stale stored bindings.
+  suites.push(...await (dependencies.curatedSuites??prepareCuratedSuites)({config,directory:join(config.root,'skills','priority','curated'),runtimeIdentity,item:{...item,proposal}}));
+ }
+
  if(item.objective==='correctness'){
   const catalogue=await (dependencies.prepareTasks??prepareHypothesisTasks)(join(directory,'cpu'));
-  const ids=new Set((proposal.changes??[]).map(change=>change.id));
-  suites.push(...catalogue.manifest.hypotheses.filter(h=>h.proposalIds?.some(id=>ids.has(id))).map(h=>({id:'cpu-'+h.id,description:h.id+'; CPU report/contract behavior only, not device arithmetic or latency',
+  suites.push(...catalogue.manifest.hypotheses.filter(h=>applicableCpu(h,proposal)).map(h=>({id:'cpu-'+h.id,description:h.id+'; cases: '+h.cases.join(', ')+'; CPU report/contract behavior only, not device arithmetic or latency',
    target:'cpu',objective:'correctness',tasks:catalogue.byHypothesis[h.id].map(t=>({...t,target:'cpu',bucket:'correctness'})),binding:{target:'cpu'}})));
  }
  suites=suites.filter(s=>s.objective===item.objective&&(s.target===config.target||s.target==='cpu'&&item.objective==='correctness'));
- const catalogueIdentity=digest(await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:await suiteFingerprint(suite,config.root)}))));
+ const catalogueIdentity=digest({runtimeIdentity,suites:await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:await suiteFingerprint(suite,config.root)})))});
  if(cached?.proposalIdentity===proposalIdentity&&cached.catalogueIdentity===catalogueIdentity)return cached;
  const selectionIdentity=digest([proposalIdentity,catalogueIdentity]);
  const validate=value=>{if(!value||!value.reason?.trim()||value.catalogueId!==null&&!suites.some(s=>s.id===value.catalogueId))throw Error('Choose a supplied matching suite or null with a reason');return value;};
@@ -97,29 +122,23 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
    }return copied;
   }))};
   const prepared=prepareHypothesisEvaluation(suite);
-  if(prepared.status==='ready'&&suite.learned){
+  if(prepared.status==='ready'&&(suite.learned||suite.curated||suite.target!=='cpu'&&JSON.stringify(suite.binding?.runtimeIdentity)!==JSON.stringify(runtimeIdentity))){
    const qualify=dependencies.qualify??(await import('./skill-hypothesis-evaluation.mjs')).qualifyHypothesisTasks;
-   const actualDirectory=cached?join(qualificationDirectory,selectionIdentity):qualificationDirectory;
+   if(suite.target!=='cpu')prepared.binding={...prepared.binding,runtimeIdentity};
+   const actualDirectory=suite.curated?join(config.root,'skills','priority','suites',suite.familyKey,suite.packVersion,'qualification'):cached?join(qualificationDirectory,selectionIdentity):qualificationDirectory;
    await beforeQualification?.(actualDirectory);
    const qualification=await qualify({...prepared,directory:actualDirectory,config,signal,resource,
     remainingSeconds:Math.max(.001,seconds-(performance.now()-started)/1000)});
-   if(qualification.status==='qualified')suite.qualification=qualification;
+   if(qualification.status==='qualified'){suite.qualification=qualification;suite.qualificationDirectory=actualDirectory;}
    if(qualification.status!=='qualified'){prepared.status='needs-learning';prepared.reason=qualification.reason??'Reference/negative-control qualification did not pass';}
   }
   if(prepared.status==='ready'){prepared.proposalIdentity=proposalIdentity;prepared.catalogueIdentity=catalogueIdentity;
-   if(suite.learned){Object.assign(prepared,await registerQualifiedSuite({config,suite:{...prepared,mechanism:JSON.stringify(proposal.changes)},qualification:suite.qualification,provenance:{proposalIdentity}}));}
+   if(suite.learned||suite.curated){Object.assign(prepared,await registerQualifiedSuite({config,suite:{...prepared,...(suite.curated?{familyKey:suite.familyKey,packVersion:suite.packVersion,curated:true,tags:suite.tags}:{}),mechanism:suite.mechanism??JSON.stringify(proposal.changes)},qualification:suite.qualification,provenance:{proposalIdentity,qualificationDirectory:suite.qualificationDirectory,qualificationReport:join(suite.qualificationDirectory,'micro','results.json')}}));}
    await writeFile(join(directory,'selected.json'),JSON.stringify(prepared,null,2)+'\n');return prepared;}
   chosen.reason=prepared.reason;
  }
  if(learned.errors.length)await event?.('skill-evaluation-qualification-failed',{hypothesis:item.id,errors:learned.errors});
- const requiredEvidence='Supply a trusted verifier/skill-evaluation.json with {target,objective,tasks:[{id,kind,target,bucket,prompt,files,checker,pairedChecker?,controls:{reference:{files},negatives:[{files}]}}]} for exactly five small independent cases. files maps sample-relative names to UTF-8 file paths relative to that manifest; include kernel.py and all fixtures. Supply a correct reference and at least one incorrect control per case. Checkers are standalone, accept a sample directory, and must accept the reference and reject each negative control. Device checkers emit the existing trusted kernel receipt, with paired checkers for optimization. Construction generates only PyTorch references/specifications; actors implement device kernels. No CPU-only proof of device behavior. '+chosen.reason+' '+learned.errors.join('; ');
- const id=enqueueLearningRequest({db:backlog.db},{target:config.target,question:'Qualify an experiment for '+item.skill+': '+JSON.stringify(proposal),
-  hypothesis:JSON.stringify(proposal),requiredEvidence,learningTarget:config.target==='cpu'?'cpu':'device',backlogId:item.id,priority:item.priority,groupIds:item.groupIds});
- const stored=JSON.parse(backlog.db.prepare('SELECT data FROM skill_learning_requests WHERE id=?').get(id).data);
- stored.workKind='suite';stored.familyKey=createHash('sha256').update(JSON.stringify([config.target,item.objective,item.skill,proposal.changes.map(c=>[c.scope,c.response,c.text])])).digest('hex');
- stored.backlogIds=[...new Set([stored.backlogId,...(stored.backlogIds??[]),item.id])];
- backlog.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(stored),id);
- return {status:'needs-learning',reason:chosen.reason,learningRequest:id};
+ return {status:'unsupported',reason:chosen.reason,missingCapability:true,errors:learned.errors};
 }
 
 /** Suite learning is complete only after its protected export passes reference/negative controls. */

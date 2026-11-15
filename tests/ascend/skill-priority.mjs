@@ -97,16 +97,12 @@ test('restart recovers an already committed promotion without evaluating again',
  await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:()=>{throw Error('Accepted comparison replayed');}});
  assert.equal(f.backlog.get('committed').status,'accepted');
 });
-test('missing relevant cases create prioritized learning, never run generic tasks',async t=>{
+test('missing relevant cases report a capability gap without constructing another project',async t=>{
  const f=await fixture(t),item=f.add('new-mechanism',90);
  const result=await resolveHypothesisCases({config:f.config,backlog:f.backlog,item,directory:join(f.root,'cases'),seconds:5},
   {prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}})});
- assert.equal(result.status,'needs-learning');
- const row=f.state.db.prepare('SELECT data FROM skill_learning_requests WHERE id=?').get(result.learningRequest),request=JSON.parse(row.data);
- assert.equal(request.backlogId,item.id);assert.equal(request.priority,90);
- f.add('low',1);const low={...request,question:'Other question',backlogId:f.backlog.get('low').id,priority:1};
- f.state.db.prepare("INSERT INTO skill_learning_requests(id,data) VALUES('low',?)").run(JSON.stringify(low));
- assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft-1',topic:'matmul',target:'a3'}),null);
+ assert.equal(result.status,'unsupported');assert.equal(result.missingCapability,true);
+ assert.equal(f.state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get()?f.state.db.prepare('SELECT COUNT(*) n FROM skill_learning_requests').get().n:0,0);
 });
 test('legacy pending comparison keeps the old execution path during opt-in migration',async t=>{
  const f=await fixture(t);await writeFile(join(f.root,'skills','evolution.json'),JSON.stringify({history:[],pending:{evaluationRoot:join(f.root,'old'),projectIds:[],runs:2,evaluationSeconds:100},evaluationStatus:'deferred'}));
@@ -130,11 +126,11 @@ test('learned cases must pass real reference and negative controls before admiss
  const report=JSON.parse(await readFile(join(args.directory,'qualification','micro','results.json'),'utf8'));
  assert.equal(report.status,'qualified');assert.equal(report.results.length,10);assert(report.results.every(r=>r.passed));
  await writeFile(checker,'raise SystemExit(0)\n');
- assert.equal((await resolveHypothesisCases(args,deps)).status,'needs-learning');
+ assert.equal((await resolveHypothesisCases(args,deps)).status,'unsupported');
  assert.equal(admitted[0],join(args.directory,'qualification'));assert(admitted[1].startsWith(join(args.directory,'qualification')+'/'));assert.notEqual(admitted[0],admitted[1]);
  assert.notEqual(await readFile(result.tasks[0].checker,'utf8'),await readFile(checker,'utf8'));
  const bad=await resolveHypothesisCases({...args,directory:join(f.root,'bad-cases')},deps);
- assert.equal(bad.status,'needs-learning');assert(bad.learningRequest);
+ assert.equal(bad.status,'unsupported');assert.equal(bad.missingCapability,true);
 });
 test('revised feedback reuses its frozen qualified cases without another learning project',async t=>{
  const f=await fixture(t),home=join(f.root,'skills','priority','hypotheses','prior','cases');await mkdir(home,{recursive:true});
@@ -147,7 +143,7 @@ test('revised feedback reuses its frozen qualified cases without another learnin
  assert.equal(result.status,'ready');assert.equal(result.tasks.length,5);assert.notEqual(result.tasks[0].checker,checker);
  await writeFile(path,JSON.stringify({status:'ready',target:'a5',objective:'correctness',binding:{target:'a5',environment:{different:true}},tasks}));
  const incompatible=await resolveHypothesisCases({...args,directory:join(f.root,'incompatible-cases')},{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}})});
- assert.equal(incompatible.status,'needs-learning');
+ assert.equal(incompatible.status,'unsupported');
 });
 
 test('crash resume charges only time after the latest elapsed checkpoint',async t=>{
