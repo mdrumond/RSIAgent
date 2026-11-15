@@ -9,12 +9,12 @@ import {ownerStopped,processIdentity} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlog-analysis.mjs';
-import {evaluateHypothesis,hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
+import {evaluateHypothesis,hypothesisEvaluationSettled,freezeHypothesisProtocol} from './skill-hypothesis-evaluation.mjs';
 import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
 import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs';
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
-const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,tasks:cases.tasks.map(task=>{
+const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,...(cases.protocol?{protocol:cases.protocol}:{}),tasks:cases.tasks.map(task=>{
  const result={...task};for(const key of ['checker','pairedChecker'])if(task[key])result[key]=createHash('sha256').update(readFileSync(task[key])).digest('hex');return result;
 })});
 async function recordCandidate(config,prepared,options){
@@ -129,12 +129,14 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(feedback){const bytes=JSON.stringify(feedback,null,2)+'\n';try{writeFileSync(path,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||readFileSync(path,'utf8')!==bytes)throw error;}}
    return backlog.atomic(()=>{const done=backlog.finish(run.id,{status,result});if(feedback)state.event(null,'skill-hypothesis-rejected',{...feedback,evidence:{path}});return done;});
   };
+  const freezeCases=async cases=>{const {protocol}=await freezeHypothesisProtocol({directory:join(home,'evaluation'),target:cases.target,binding:cases.binding});return {...cases,...(protocol?{protocol}:{})};};
   const qualificationDirectory=join(home,'cases','qualification');
   checkpoint.qualificationDirectory??=qualificationDirectory;save();
   const beforeQualification=async directory=>{checkpoint.qualificationDirectory=directory;save();};
   let cases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared?.status==='ready'?checkpoint.prepared.proposal??item.proposal:item.proposal,directory:join(home,'cases'),qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
+  cases=await freezeCases(cases);
   satisfySuiteRequests(backlog,item.id,cases);
   const contractKey=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');
   if(!checkpoint.prepared||checkpoint.prepared.retryable||checkpoint.reviewedContract!==contractKey){
@@ -150,10 +152,12 @@ export async function runPrioritySkills(config,values,dependencies={}){
   cases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
+  cases=await freezeCases(cases);
   if(JSON.stringify(evaluationContract(cases))!==reviewedCases&&checkpoint.prepared.proposal){
    checkpoint.prepared=await ops.prepare({config,backlog,item:{...item,proposal:checkpoint.prepared.proposal},directory:join(home,'final-contract'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:checkpoint.prepared.qa?.elapsedSeconds??checkpoint.prepared.elapsedSeconds??0});checkpoint.reviewedContract=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');save();
    if(checkpoint.prepared.status!=='ready')return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
-   const finalCases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory,resource:values.resource,signal,seconds:left()});
+   let finalCases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory,resource:values.resource,signal,seconds:left()});
+   if(finalCases.status==='ready')finalCases=await freezeCases(finalCases);
    if(finalCases.status!=='ready'||JSON.stringify(evaluationContract(finalCases))!==JSON.stringify(evaluationContract(cases)))return finish('learning',{reason:'Final proposal requires a different qualified contract'});
   }
   await recordCandidate(config,checkpoint.prepared,{reason:'awaiting-evaluation',signal});

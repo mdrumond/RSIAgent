@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join,resolve} from 'node:path';
+import {join,resolve,dirname} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
@@ -265,11 +265,15 @@ test('sandboxed native Bash can edit its kernel but cannot quarantine shared har
  const f=await fixture(t),outside=join(f.root,'shared-leases'),cwd=join(f.root,'work'),sessionDirectory=join(f.root,'session');
  await mkdir(outside);await mkdir(cwd);await mkdir(sessionDirectory);await writeFile(join(outside,'lease.json'),'original-lease');
  const command=`mv '${outside}' '${outside}.quarantined'; printf repaired > kernel.py`;
- const profile=await scriptedMicro(t,f.root,n=>n===0?{name:'bash',args:{command}}:null);
+ let requests=0;const profile=await scriptedMicro(t,f.root,n=>{requests++;return n===0?{name:'bash',args:{command}}:null;});
+ // Operational capability proof is independent of the sampler's own preflight.
+ const probe=spawnSync('bwrap',['--die-with-parent','--new-session','--unshare-pid','--ro-bind','/','/','--proc','/proc','--dev','/dev','--tmpfs','/tmp','--bind',cwd,cwd,'--chdir',cwd,'--','bash','-c','true'],{encoding:'utf8',timeout:5000});
  const result=await nativeSample({cwd,sessionDirectory,profile,seconds:5,guidance:'fixture',prompt:'repair',localFilesystemSandbox:true});
- assert.equal(result.error,null);assert.equal(await readFile(join(outside,'lease.json'),'utf8'),'original-lease');
- await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
- assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');
+ const capability=JSON.parse(await readFile(join(sessionDirectory,'sandbox-preflight.json'),'utf8'));assert.equal(capability.available,probe.status===0,JSON.stringify({probe:{status:probe.status,error:probe.error?.code,stderr:probe.stderr},capability}));
+ assert.equal(await readFile(join(outside,'lease.json'),'utf8'),'original-lease');await assert.rejects(readFile(join(outside+'.quarantined','lease.json')),{code:'ENOENT'});
+ if(probe.status===0){assert.equal(result.error,null);assert(requests>0);assert.equal(await readFile(join(cwd,'kernel.py'),'utf8'),'repaired');}
+ else{assert.equal(result.errorCode,'LOCAL_SANDBOX_UNAVAILABLE');assert.equal(result.bucket,'harness');assert.equal(result.toolCalls,0);assert.equal(requests,0);assert.notEqual(capability.exitCode,0);assert.equal(typeof capability.output,'string');await assert.rejects(readFile(join(cwd,'kernel.py')),{code:'ENOENT'});}
+
 });
 for(const mode of ['reserved-cleanup','external-cancel','whole-deadline','legacy'])test(`native target cleanup follows the retained whole-sample clock: ${mode}`,async t=>{
  const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .',timeout:1200}}:null);
@@ -352,4 +356,69 @@ test('native target-local Bash uses admitted environment instead of an unmasked 
   calls++;assert.equal(command,'printf bypass > host-marker');assert.equal(path,cwd);assert.equal(options.stopSignal,cleanup.signal);options.onData?.(Buffer.from('admitted target execution\n'));return {handle:'local:admitted',settled:true,exitCode:0};
  }}});
  assert.equal(result.error,null);assert.equal(calls,1);await assert.rejects(readFile(join(cwd,'host-marker')),{code:'ENOENT'});
+});
+
+test('a real native target-tool deadline retains its partial marker until SDK lease closure is proved',async t=>{
+ const {hypothesisEvaluationSettled}=await import('../../cli/skill-hypothesis-evaluation.mjs'),{processIdentity}=await import('../../controller/lifecycle.mjs');
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .'}}:null),root=join(f.root,'hypothesis'),directory=join(root,'micro');await mkdir(root);
+ const binding={target:'a3',environment:{mode:'local',target:'fixture',runtime:'fixture',health:{product:'a3'}}};await writeFile(join(root,'hypothesis.json'),JSON.stringify({binding}));
+ let nativeCalls=0,leaseClosed=false,target;const tasks=[{...f.tasks[0],id:'prior'},{...f.tasks[0],kind:'a3-kernel'}];
+ await assert.rejects(runMicroeval({...f,directory,profile,tasks,runs:1,seconds:.6,totalSeconds:2,resume:true,binding},{
+  sample:async args=>{
+   if(args.kind==='unspecified'){await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {tokens:1};}
+   return nativeSample({...args,targetEnvironment:{execute:async(_command,cwd,options)=>{
+    nativeCalls++;target=join(dirname(cwd),'target');await mkdir(target,{recursive:true});const handle='remote:fixture:job:deadline-setup',lease={receipt:join(root,'lease.json'),token:'deadline-owned',pool:'fixture',physicalDevice:4,owner:await processIdentity()};
+    await writeFile(join(target,'.ascend-command-lease.json'),JSON.stringify(lease));
+    const events=[{type:'device-lease-acquired',data:lease},{type:'execution-submitting',data:{operation:'setup',submission:'setup'}},{type:'execution-submitted',data:{submission:'setup',handle}},{type:'execution-handle',data:{handle}}];
+    await writeFile(join(target,'environment-events.jsonl'),events.map(JSON.stringify).join('\n')+'\n');await untilAbort(options.signal);
+    events.push({type:'execution-state',data:{handle,state:'stopped',nativeState:'cancelled'}});await writeFile(join(target,'environment-events.jsonl'),events.map(JSON.stringify).join('\n')+'\n');return {settled:true,exitCode:124,handle};
+   }}});
+  },verify:async args=>{const result=spawnSync(f.python,[args.checker,args.cwd],{encoding:'utf8'});return {correct:result.status===0,exitCode:result.status,output:result.stdout,error:result.stderr};},
+  sampleSettled:async()=>false
+ }),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const file=join(directory,'results.json'),before=JSON.parse(await readFile(file,'utf8'));assert.equal(nativeCalls,1);assert.equal(before.results.length,2);assert(before.results.every(result=>result.correct));assert.equal(before.runningSample.key,'repair/0/active');assert.equal(before.runningSample.needsClosure,true);assert(before.partials['repair/0/active'].timedOut);
+ const deps={createEnvironment:async(_options,context)=>{assert.equal(context.instancePath,target);return {reconcileLease:async()=>{if(leaseClosed)await rm(join(target,'.ascend-command-lease.json'),{force:true});return leaseClosed;}};}};
+ assert.equal(await hypothesisEvaluationSettled({directory:root},deps),false);leaseClosed=true;assert.equal(await hypothesisEvaluationSettled({directory:root},deps),true);
+ const after=JSON.parse(await readFile(file,'utf8'));assert.equal(after.runningSample,undefined);assert.deepEqual(after.results,before.results);assert.deepEqual(after.partials,before.partials);assert.equal(after.elapsedSeconds,before.elapsedSeconds);assert.equal(nativeCalls,1);
+});
+test('frozen split protocol uses independent actor and verification deadlines inside the original total',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.5,verificationSeconds:.5};let actors=0,checks=0;
+ const report=await runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5,sampleProtocol:protocol},{sample:async({signal,sampleSignal,seconds,verificationReserved})=>{
+  actors++;assert(seconds<=.5&&seconds>.4);assert(verificationReserved>=.5);await untilAbort(signal);assert.equal(signal.aborted,true);assert.equal(sampleSignal.aborted,false);return {timedOut:true};
+ },verify:async({signal,seconds})=>{checks++;assert.equal(signal.aborted,false);assert(seconds>0&&seconds<=.5);return {correct:true};}});
+ assert.equal(actors,2);assert.equal(checks,2);assert.deepEqual(report.sampleProtocol,protocol);assert(report.results.every(row=>row.allocatedSeconds===1&&row.actorTimedOut&&!row.timedOut&&row.correct));
+ await assert.rejects(runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5,sampleProtocol:{...protocol,actorSeconds:.6}}),/Sample timing protocol differs/);
+});
+test('new verification phase refuses late correctness while legacy verification may use remaining actor time',async t=>{
+ for(const fresh of [true,false]){
+  const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.8,verificationSeconds:.2};let checks=0;
+  const report=await runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.2,...(fresh?{sampleProtocol:protocol}:{})},{sample:async()=>({}),verify:async args=>{
+   checks++;assert.equal(args.signal===args.sampleSignal,!fresh);assert(fresh?args.seconds<=.2:args.seconds>.8);
+   if(fresh){await untilAbort(args.signal);assert.equal(args.sampleSignal.aborted,false);}return {correct:true};
+  }});
+  assert.equal(checks,2);assert(report.results.every(row=>row.correct===!fresh));if(fresh)assert(report.results.every(row=>row.verificationTimedOut&&!row.timedOut));
+ }
+});
+test('a verification-only target cutoff retains its marker and partial until positive SDK custody proof',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.8,verificationSeconds:.2};let actors=0,closures=0;
+ const tasks=f.tasks.map(task=>({...task,kind:'target-kernel',target:'a3',bucket:'correctness'}));
+ await assert.rejects(runMicroeval({...f,tasks,runs:1,seconds:1,verificationSeconds:.2,sampleProtocol:protocol,objective:'correctness',binding:{target:'a3',environment:{health:{product:'a3'}}}},{sample:async()=>{actors++;return {};},verify:async args=>{
+  await untilAbort(args.signal);assert.equal(args.sampleSignal.aborted,false);return {correct:false};
+ },sampleSettled:async args=>{closures++;assert.equal(args.signal.aborted,false);return false;}}),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const report=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8'));assert.equal(actors,1);assert.equal(closures,1);assert.equal(report.results.length,0);assert.equal(report.runningSample.needsClosure,true);assert.equal(report.partials['repair/0/active'].verificationTimedOut,true);assert.equal(report.partials['repair/0/active'].correct,false);
+ await assert.rejects(runMicroeval({...f,tasks,runs:1,seconds:1,verificationSeconds:.2,sampleProtocol:protocol,resume:true,objective:'correctness',binding:{target:'a3',environment:{health:{product:'a3'}}}},{sample:()=>assert.fail('Unresolved verifier cannot advance')}),/execution remains unresolved/);
+});
+test('an explicit zero reserve preserves whole-sample verification compatibility',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:1,verificationSeconds:0};let checks=0;
+ const report=await runMicroeval({...f,runs:1,seconds:1,sampleProtocol:protocol},{sample:async()=>({}),verify:async args=>{checks++;assert(args.seconds>.8);assert.equal(args.signal,args.sampleSignal);return {correct:true};}});
+ assert.equal(checks,2);assert(report.results.every(row=>row.correct));
+});
+test('resuming new-protocol verification preserves its spent phase allowance without another actor turn',async t=>{
+ const f=await fixture(t),external=new AbortController(),protocol={version:1,sampleSeconds:1,actorSeconds:.6,verificationSeconds:.4},options={...f,runs:1,seconds:1,verificationSeconds:.4,sampleProtocol:protocol,resume:true};let actors=0,checks=0;
+ await assert.rejects(runMicroeval({...options,signal:external.signal},{sample:async()=>{actors++;return {};},verify:async args=>{
+  setTimeout(()=>external.abort(Error('Pause during verification')),100);await untilAbort(args.signal);return {correct:false};
+ }}),/Pause during verification/);
+ const before=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8')),spent=before.partials['repair/0/active'].verificationElapsedSeconds;assert(spent>=.09&&spent<.4);
+ const report=await runMicroeval(options,{sample:async()=>{actors++;return {};},verify:async args=>{checks++;if(checks===1)assert(args.seconds<=.4-spent&&args.seconds>0);return {correct:true};}});
+ assert.equal(actors,2);assert.equal(checks,2);assert(report.results[0].verificationElapsedSeconds>=spent);assert(report.results.every(row=>row.correct));
 });

@@ -69,6 +69,11 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  let unresolvedExecution;
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
+ if(localFilesystemSandbox&&!targetBash){
+  let output='';const probe=await local.exec(sandboxCommand('true',taskRoot),taskRoot,{timeout:Math.min(5,remaining()),signal:sampleSignal,onData:chunk=>{output=(output+chunk).slice(-4096);}});
+  const capability={kind:'local-filesystem-sandbox',available:probe.exitCode===0,exitCode:probe.exitCode,output};await writeFile(join(sessionDirectory,'sandbox-preflight.json'),JSON.stringify(capability,null,2)+'\n');
+  if(!capability.available)return {timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
+ }
  const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
  const extension=async pi=>{
   pi.on('tool_call',async event=>{
@@ -127,11 +132,12 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,sampleProtocol,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
  if(!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Verification reserve must fit inside the sample elapsed allocation');
+ if(sampleProtocol&&(sampleProtocol.sampleSeconds!==seconds||sampleProtocol.verificationSeconds!==verificationSeconds||sampleProtocol.actorSeconds!==seconds-verificationSeconds))throw Error('Sample timing protocol differs from elapsed allocation');
  if(objective==='harness'||tasks.some(t=>t.bucket==='harness'))throw Error('Harness faults require user intervention, not skill A/B');
  if(tasks.some(t=>t.bucket)&&(!objective||objective==='legacy'))throw Error('Bucketed tasks require an explicit matching objective');
  if(tasks.some(t=>t.kind==='target-kernel')){
@@ -153,7 +159,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(sampleProtocol?{sampleProtocol}:{}),...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -180,8 +186,8 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     const started=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),sampleSignal=signal?AbortSignal.any([signal,deadline]):deadline;
     // Allocated once here, before actor/setup/verification; all resumed spend
     // has already reduced allocation. This never authorizes additional work.
-    const cleanupDeadline=AbortSignal.timeout(Math.max(1,Math.ceil((allocation+30)*1000)));let observed,verification;
-    const actorBudget=seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
+    const cleanupDeadline=AbortSignal.timeout(Math.max(1,Math.ceil((allocation+30)*1000)));let observed,verification,verificationDeadline,verificationStarted,verificationAllocation,verificationTimedOut=false;
+    const actorBudget=sampleProtocol?.actorSeconds??seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
     const actorExhausted=verificationSeconds&&savedActor&&!savedActor.actorCompleted&&spent>=actorBudget;
     const actorAllocation=Math.max(.001,Math.min(actorBudget-spent,allocation-Math.min(verificationSeconds,allocation/2))),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;
@@ -190,16 +196,24 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
      if(observed.unresolvedExecution)throw Object.assign(Error('Micro evaluation execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',...observed.unresolvedExecution});
      observed.actorCompleted??=!actorSignal.aborted||Boolean(actorDeadline?.aborted&&!sampleSignal.aborted);
      if(verificationSeconds&&(actorDeadline?.aborted||observed.timedOut)&&!sampleSignal.aborted)observed={...observed,actorTimedOut:true,actorError:observed.error??null,timedOut:false,error:null};
-     const remaining=allocation-(performance.now()-started)/1000;
+     const remaining=allocation-(performance.now()-started)/1000,verificationLeft=sampleProtocol&&verificationSeconds>0?Math.max(0,Math.min(remaining,verificationSeconds-(partial?.verificationElapsedSeconds??0))):remaining;
+     if(sampleProtocol&&verificationSeconds>0){verificationStarted=performance.now();verificationAllocation=verificationLeft;verificationTimedOut=verificationLeft<=0;if(verificationLeft>0)verificationDeadline=AbortSignal.timeout(Math.max(1,Math.ceil(verificationLeft*1000)));}
+     const verificationSignal=verificationDeadline?AbortSignal.any([sampleSignal,verificationDeadline]):sampleSignal;
      if(hash(await readFile(checker,'utf8'))!==hash(task.checker))throw Error('Frozen checker changed');
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed: '+name);
-     verification=remaining>0&&!sampleSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:remaining,signal:sampleSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(isKernelTask(task.kind)?kernelCheck:check)(python,checker,cwd,isKernelTask(task.kind)?remaining:Math.min(20,remaining),sampleSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
+     verification=verificationLeft>0&&!verificationSignal.aborted&&!observed.timedOut&&!observed.error?await (dependencies.verify?dependencies.verify({task,python,checker,cwd,seconds:verificationLeft,signal:verificationSignal,sampleSignal,sampleStopSignal:cleanupDeadline,sampleSeconds:allocation}):(isKernelTask(task.kind)?kernelCheck:check)(python,checker,cwd,isKernelTask(task.kind)?verificationLeft:Math.min(20,verificationLeft),verificationSignal)):{correct:observed.error&&!observed.timedOut?null:false,error:'Sample elapsed allocation or native session failed'};
      if(isKernelTask(task.kind)&&(verification.correct||verification.exitCode===125))verification=await validateKernelReceipt(verification,cwd,{requireLatency:objective!=='correctness',requireDevice:requireDevice||task.kind==='target-kernel'});
      for(const [name,mode]of Object.entries(task.protectedFiles??{}))if(protectedFingerprint(task.files[name],mode)!==protectedFingerprint(await readFile(inside(cwd,name),'utf8'),mode))throw Error('Protected input changed during verification: '+name);
     }catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED',handle:unknown.handle});}if(resume&&!observed)throw error;observed??={tokens:null,cost:null};verification={correct:null,error:error.message};}
+    if(sampleProtocol&&verificationSeconds>0&&(verificationTimedOut||verificationDeadline?.aborted||verificationStarted!==undefined&&performance.now()-verificationStarted>=verificationAllocation*1000)){verificationTimedOut=true;verification={correct:false,error:'Independent verification elapsed allocation exhausted'};}
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
-     ...(verificationSeconds?{actorObservation:observed}:{}),correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
+     ...(verificationSeconds?{actorObservation:observed}:{}),...(sampleProtocol?{verificationElapsedSeconds:(partial?.verificationElapsedSeconds??0)+(verificationStarted===undefined?0:(performance.now()-verificationStarted)/1000),verificationTimedOut}:{}),correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
+    if(isKernelTask(task.kind)&&(sampleSignal.aborted||observed.timedOut||observed.actorTimedOut||verificationTimedOut)){
+     report.partials??={};report.partials[key]=result;report.runningSample.needsClosure=true;report.runningSample.unresolvedExecution={reason:'sample-deadline-closure'};await persist();
+     let closed=false;try{closed=await dependencies.sampleSettled?.({cwd,task,signal:cleanupDeadline,sampleStopSignal:cleanupDeadline});}catch(error){report.runningSample.unresolvedExecution=unknownExecution(error)??{reason:error.message};throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}finally{result.elapsedSeconds=spent+(performance.now()-started)/1000;await persist();}
+     if(closed!==true)throw Object.assign(Error('Target sample deadline closure remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED'});
+    }
     delete report.runningSample;
     if(resume&&signal?.aborted){report.partials??={};report.partials[key]=result;}else{report.results.push(result);if(report.partials)delete report.partials[key];}
     await persist();signal?.throwIfAborted();
@@ -245,7 +259,7 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
   if(pending.length&&left>0){
    signal?.throwIfAborted();report.pairedReplay.runningPair={projectId:'batch',run:0,owner:await processIdentity()};await save(join(directory,'results.json'),report);let rows;
    try{rows=await dependencies.measureBatch({directory,pairs:pending,seconds:left,signal});}
-   catch(error){const unknown=unknownExecution(error);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);throw error;}
+   catch(error){const unknown=unknownExecution(error)??(requireDevice&&signal?.aborted?{reason:'paired-deadline-closure'}:null);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);throw error;}
    delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);signal?.throwIfAborted();const seen=new Set();
    for(const measured of rows){const job=pending.find(p=>p.task.id===measured.projectId&&p.run===measured.run),key=measured.projectId+'/'+measured.run;if(!job||seen.has(key))throw Error('Unknown or duplicate paired batch receipt');seen.add(key);await record(job.task,job.run,{active:job.active,candidate:job.candidate},job.pair,measured);}
   }
