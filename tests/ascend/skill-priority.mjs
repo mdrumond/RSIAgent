@@ -182,3 +182,12 @@ test('learning outcomes arriving during analysis remain visible for the next sca
  await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{assert.equal(f.backlog.meta('learning-scan'),null);f.backlog.meta('learning-pending',false);}});
  assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
 });
+test('standalone scheduler checkpoints the exact nested qualification path before dispatch',async t=>{
+ const f=await fixture(t);f.add('custody',20);let checked=false;
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async({beforeQualification,directory})=>{
+  const actual=join(directory,'qualification','content-identity');await beforeQualification(actual);
+  const row=f.state.db.prepare("SELECT checkpoint FROM skill_backlog_runs WHERE status='running'").get();
+  assert.equal(JSON.parse(row.checkpoint).qualificationDirectory,actual);checked=true;return {status:'needs-learning',reason:'No cases'};
+ }});
+ assert.equal(checked,true);
+});

@@ -122,7 +122,8 @@ export async function runPrioritySkills(config,values,dependencies={}){
   await recordCandidate(config,checkpoint.prepared,{reason:'awaiting-evaluation',signal});
   checkpoint.qualificationDirectory=join(home,'cases','qualification');save();
   const cases=await ops.resolveCases({config,backlog,item,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
-   resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
+   resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data),
+   beforeQualification:async directory=>{checkpoint.qualificationDirectory=directory;save();}});
   if(cases.status!=='ready')return finish('learning',cases);
   checkpoint.evaluationDirectory=join(home,'evaluation');checkpoint.evaluation={binding:cases.binding,resource:values.resource};save();
   const result=await ops.evaluate({directory:checkpoint.evaluationDirectory,config,objective:item.objective,target:cases.target,
