@@ -11,7 +11,7 @@ import {publishSkillVersion} from './skills.mjs';
 import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlog-analysis.mjs';
 import {evaluateHypothesis,hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
 import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
-import {resolveHypothesisCases} from './skill-priority-cases.mjs';
+import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs';
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
 const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,tasks:cases.tasks.map(task=>{
@@ -63,6 +63,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&ops.now()<ingestionEnd);
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
   if(backlog.meta('microlearning-active'))return await ops.learn({config,backlog,...values});
+  await wakeQualifiedSuiteWaiters({config,backlog});
   const retained=backlog.list({status:'running',limit:1})[0];
   if(!retained){
    const admittedLearning=learningFingerprint(state);
@@ -101,7 +102,8 @@ export async function runPrioritySkills(config,values,dependencies={}){
   }
   if(!retained){const queue=backlog.meta('procedural-continuations')??[];
    queue.sort((a,b)=>(backlog.get(backlog.run(b.id)?.item_id)?.priority??0)-(backlog.get(backlog.run(a.id)?.item_id)?.priority??0));
-   while(queue.length){const next=queue.shift();backlog.meta('procedural-continuations',queue);if(next.base!==config.skills.activeVersion)continue;try{backlog.continue(next.id,{...next,owner});break;}catch(error){state.event(null,'skill-continuation-skipped',{id:next.id,reason:error.message});}}
+   const fresh=backlog.list({status:'queued'}).find(item=>item.base===config.skills.activeVersion);
+   while(queue.length){if(fresh&&(backlog.get(backlog.run(queue[0].id)?.item_id)?.priority??0)<fresh.priority)break;const next=queue.shift();backlog.meta('procedural-continuations',queue);if(next.base!==config.skills.activeVersion)continue;try{backlog.continue(next.id,{...next,owner});break;}catch(error){state.event(null,'skill-continuation-skipped',{id:next.id,reason:error.message});}}
   }
   selected=backlog.claim({base:config.skills.activeVersion,owner});
   if(!selected)return await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign()});
@@ -133,6 +135,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   let cases=await ops.resolveCases({config,backlog,item,beforeQualification,proposal:checkpoint.prepared?.status==='ready'?checkpoint.prepared.proposal??item.proposal:item.proposal,directory:join(home,'cases'),qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
+  satisfySuiteRequests(backlog,item.id,cases);
   const contractKey=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');
   if(!checkpoint.prepared||checkpoint.prepared.retryable||checkpoint.reviewedContract!==contractKey){
    const previous=checkpoint.prepared,qaElapsed=previous?.qa?.elapsedSeconds??previous?.elapsedSeconds??checkpoint.priorQaElapsedSeconds??0;
@@ -203,4 +206,32 @@ export async function migratePriorityThroughput(config,{procedure,base=config.sk
   const audit={procedure,base,at:new Date().toISOString(),tagged,continuations:queue.map(q=>q.id)};
   backlog.atomic(()=>{backlog.meta('procedural-continuations',queue);backlog.meta('throughput-migration',audit);state.event(null,'skill-throughput-migrated',audit);});return audit;});
  }finally{state.close();}
+}
+
+function satisfySuiteRequests(backlog,itemId,cases){
+ if(!backlog.db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get())return;
+ for(const row of backlog.db.prepare("SELECT id,data FROM skill_learning_requests WHERE status='pending'").all()){
+  const request=JSON.parse(row.data);if(request.workKind!=='suite'||request.backlogId!==itemId&&!request.backlogIds?.includes(itemId))continue;
+  backlog.db.prepare("UPDATE skill_learning_requests SET status='satisfied',data=? WHERE id=? AND status='pending'").run(JSON.stringify({...request,satisfiedBy:{kind:'qualified-catalogue',identity:cases.identity??cases.proposalIdentity,at:new Date().toISOString()}}),row.id);
+ }
+}
+/** A new qualified catalogue permits one relevance retry, using the original hypothesis allowance. */
+export async function wakeQualifiedSuiteWaiters({config,backlog}){
+ const suites=(await qualifiedSuites({config})).filter(s=>s.target==='cpu'||s.target===config.target&&JSON.stringify(s.binding?.environment)===JSON.stringify(config.environment?.options));
+ const identity=createHash('sha256').update(JSON.stringify(suites.map(s=>s.qualification.fingerprint).sort())).digest('hex');
+ if(!suites.length||backlog.meta('qualified-suite-wake')===identity)return [];
+ const queue=backlog.meta('procedural-continuations')??[],existing=new Set(queue.map(q=>q.id)),seen=new Set(),added=[];
+ if(backlog.db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get())for(const {id}of backlog.db.prepare('SELECT id FROM skill_backlog_runs ORDER BY rowid DESC').all()){
+  const run=backlog.run(id);if(seen.has(run.item_id))continue;seen.add(run.item_id);
+  if(run.status!=='learning'||run.base!==config.skills.activeVersion||run.elapsed>=run.seconds||run.checkpoint?.evaluationDirectory||run.result?.report?.results?.length||!run.result?.learningRequest||existing.has(id)||
+   !suites.some(s=>s.objective===run.snapshot.objective))continue;
+  const item=backlog.get(run.item_id);if(!item||item.fingerprint!==run.snapshot.fingerprint)continue;
+  const row=backlog.db.prepare("SELECT data FROM skill_learning_requests WHERE id=? AND status='pending'").get(run.result.learningRequest),request=row&&JSON.parse(row.data);
+  if(!request||request.workKind!=='suite'||request.backlogId!==run.item_id||!request.question?.startsWith('Qualify an experiment for '))continue;
+  let qualification;try{qualification=JSON.parse(readFileSync(join(run.checkpoint?.qualificationDirectory??join(config.root,'skills','priority','hypotheses',run.id,'cases','qualification'),'micro','results.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  if(qualification?.runningSample||qualification?.results?.length)continue;
+  queue.push({id,base:run.base,missingCases:true,procedure:'Qualified catalogue '+identity+' published; recheck semantic relevance'});added.push(id);
+ }
+ backlog.atomic(()=>{backlog.meta('procedural-continuations',queue);backlog.meta('qualified-suite-wake',identity);backlog.db.prepare("INSERT INTO events(type,data,created) VALUES('skill-catalogue-woke-waiters',?,?)").run(JSON.stringify({identity,runs:added}),new Date().toISOString());});
+ return added;
 }

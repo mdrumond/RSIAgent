@@ -5,10 +5,11 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
-import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput} from '../../cli/skill-priority.mjs';
+import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput,wakeQualifiedSuiteWaiters} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
-import {resolveHypothesisCases} from '../../cli/skill-priority-cases.mjs';
+import {resolveHypothesisCases,registerQualifiedSuite} from '../../cli/skill-priority-cases.mjs';
 import {claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
+import {qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
 
 async function fixture(t){
@@ -223,4 +224,30 @@ test('qualification custody is checkpointed before a revised suite dispatches',a
   settled:async({directory})=>{checked=directory;return false;}}),/qualification transport interrupted/);
  assert.equal(checked,actual);assert.equal(f.backlog.run(item.id).checkpoint.unresolved,true);assert.equal(f.backlog.run(item.id).status,'running');
  assert.equal(f.calls.length,0);
+});
+
+test('higher priority fresh queued work precedes lower priority procedural continuations',async t=>{
+ const f=await fixture(t);f.add('old-low',10);const old=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(old.run.id,{elapsed:50,checkpoint:{}});f.backlog.finish(old.run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+ f.backlog.meta('procedural-continuations',[{id:old.run.id,procedure:'Upgrade QA',base:'baseline'}]);f.add('fresh-urgent',100);
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.calls.find(c=>c[0]==='prepare')[1],'fresh-urgent');assert.equal(f.backlog.meta('procedural-continuations').length,1);
+ await runPrioritySkills(f.config,f.values,f.ops);assert.equal(f.calls.filter(c=>c[0]==='prepare')[1][1],'old-low');
+});
+test('a newly qualified shared suite wakes waiters once and semantic relevance controls reuse',async t=>{
+ const f=await fixture(t),related=f.add('related',20),unrelated=f.add('unrelated',10);
+ for(const item of [related,unrelated]){
+  const run=f.backlog.claim({base:'baseline'});const request=enqueueLearningRequest(f.state,{target:'a3',workKind:'suite',backlogId:item.id,question:'Qualify an experiment for '+item.key,requiredEvidence:'Five references and negatives'});
+  f.backlog.checkpoint(run.run.id,{elapsed:90,checkpoint:{}});f.backlog.finish(run.run.id,{status:'learning',result:{reason:'No target-compatible evaluation suite',learningRequest:request}});
+ }
+ const checker=join(f.root,'checker.py');await writeFile(checker,"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n");
+ const suite={target:'cpu',objective:'correctness',mechanism:'related boundary mechanism',binding:{target:'cpu'},tasks:Array.from({length:5},(_,n)=>({id:'shared-'+n,kind:'hypothesis-case',target:'cpu',bucket:'correctness',prompt:'Check related boundary',checker,files:{'kernel.py':'answer=0'},controls:{reference:{files:{'kernel.py':'answer=42'}},negatives:[{files:{'kernel.py':'answer=0'}}]}}))};
+ const qualification=await qualifyHypothesisTasks({...suite,config:f.config,directory:join(f.root,'shared-qualification'),remainingSeconds:120});assert.equal(qualification.status,'qualified');
+ await registerQualifiedSuite({config:f.config,suite,qualification});
+ assert.equal((await wakeQualifiedSuiteWaiters({config:f.config,backlog:f.backlog})).length,2);assert.equal((await wakeQualifiedSuiteWaiters({config:f.config,backlog:f.backlog})).length,0);
+ let constructed=0,selected=0;
+ const resolver=args=>resolveHypothesisCases(args,{prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async({prompt})=>{selected++;return {value:{catalogueId:args.item.key==='related'?prompt.catalogues.find(c=>c.id.startsWith('shared-')).id:null,reason:args.item.key==='related'?'Exercises the boundary mechanism':'Different mechanism'}};}});
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
+ assert.equal(f.backlog.get(related.id).status,'rejected');assert.equal(constructed,0);assert(selected>0);
+ const relatedRequest=JSON.parse(f.state.db.prepare("SELECT data FROM skill_learning_requests WHERE status='satisfied'").get().data);assert.equal(relatedRequest.backlogId,related.id);
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
+ assert.equal(f.backlog.get(unrelated.id).status,'learning');assert.equal(constructed,0);
 });

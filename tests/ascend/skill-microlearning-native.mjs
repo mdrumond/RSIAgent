@@ -19,11 +19,12 @@ test('reserved microlearning executes a preplanned project through native Pi and
  const source=join(f.root,'preplanned','source'),trusted=join(f.root,'preplanned','trusted');await mkdir(source,{recursive:true});await mkdir(trusted);
  await writeFile(join(source,'answer.py'),'def answer(): return 0\n');const verifier=join(trusted,'verify.py');
  await writeFile(verifier,"import importlib.util\nfrom pathlib import Path\ns=importlib.util.spec_from_file_location('candidate',Path.cwd()/'answer.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\nassert m.answer()==sum(6 for _ in range(7))\n");
- const backlog=new SkillBacklog(state,{target:'cpu'});enqueueLearningRequest(state,{target:'cpu',workKind:'microlearning',learningTarget:'cpu',question:'Check arithmetic oracle',requiredEvidence:'Independent Python checker'});
+ config.target='a3';config.environment={module:join(f.root,'machinery','integrations','environments','ascend.mjs'),options:{mode:'local',health:{product:'a3'}}};
+ const backlog=new SkillBacklog(state,{target:'a3'});enqueueLearningRequest(state,{target:'a3',workKind:'microlearning',learningTarget:'cpu',question:'Check arithmetic oracle',requiredEvidence:'Independent Python checker'});
  const url=await ensureNative(config),before=JSON.parse(await readFile(join(f.root,'knowledge-service.json')));
- const result=await native.runMicrolearning({config,backlog,resource:{id:'local'},remainingSeconds:900},{inspect:async()=>({status:'experiment',answer:'Execute the tiny checker',refs:[]}),
+ const result=await native.runMicrolearning({config,backlog,resource:{id:'reserved-parent-a3-slot'},remainingSeconds:900},{inspect:async()=>({status:'experiment',answer:'Execute the tiny checker',refs:[]}),
   construct:async()=>[{id:'tiny',goal:'unrelated tiny arithmetic oracle',source,actor_seconds:90,verifier:{files:[verifier],command:{entrypoint:verifier,args:[]}}}]});
- assert.equal(result.status,'verified');const child=await readConfig(result.findings.instanceRoot);assert.deepEqual(child.resource_ids,['local']);
+ assert.equal(result.status,'verified');const child=await readConfig(result.findings.instanceRoot);assert.deepEqual(child.resource_ids,['reserved-parent-a3-slot']);assert.equal(child.target,'cpu');assert.equal(child.environment.options.mode,'local');
  assert.equal(await microlearningSettled(config,{directory:child.root}),true);
  const childState=new State(join(child.root,'state.sqlite'));try{
   assert.equal(childState.db.prepare("SELECT COUNT(*) n FROM attempts WHERE outcome='passed'").get().n,1);

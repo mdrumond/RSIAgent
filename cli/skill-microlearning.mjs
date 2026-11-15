@@ -1,5 +1,6 @@
 /** One bounded child on the campaign's already reserved background resource. */
 import {mkdir,readFile,writeFile,cp,symlink} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
 import {join,resolve,sep} from 'node:path';
 import {State} from '../controller/state.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
@@ -29,8 +30,10 @@ export function validateArchivalInspection(value,{refs,request,retrievals=[]}){
 export function microlearningConfig(config,{directory,request,resource,seconds}){
  if(!resource?.id)throw Error('Microlearning requires the admitted background resource');
  const picked=Object.fromEntries(['actor','curriculum_actor','python','kernel_language','environment','local_execution','delivery','postprocessing','knowledge','pause_grace_seconds'].filter(k=>config[k]!==undefined).map(k=>[k,config[k]]));
+ const cpu=request.learningTarget==='cpu';
+ if(cpu){delete picked.kernel_language;picked.environment={module:fileURLToPath(new URL('../integrations/environments/index.mjs',import.meta.url)),options:{mode:'local',localResourceId:resource.id}};}
  if(picked.environment?.module)picked.environment={...picked.environment,module:resolve(config.root,picked.environment.module)};
- return {...picked,format:1,root:directory,target:config.target,mode:'phase1',concurrency:1,resource_ids:[resource.id],actor_seconds:seconds,curriculum_seconds:seconds,
+ return {...picked,format:1,root:directory,target:cpu?'cpu':config.target,mode:'phase1',concurrency:1,resource_ids:[resource.id],actor_seconds:seconds,curriculum_seconds:seconds,
   campaign_plan:[{id:'microlearning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},
   curriculum:{generation:{enabled:true,topics:[request.question],preprompt:'Investigate only this bounded learning question. Preserve independent reference and negative controls; report actual observations: '+JSON.stringify(request)}},
   campaign_seconds:seconds,skills:{activeVersion:config.skills.activeVersion,background:false,tuningDisabled:true,review:{enabled:false},priority:{enabled:false}},recovery:false};
