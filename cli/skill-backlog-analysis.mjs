@@ -5,6 +5,8 @@ import {join,resolve,sep,isAbsolute} from 'node:path';
 import {guidanceEntries,validateClassificationBatch,enqueueLearningRequest} from '../controller/skill-review.mjs';
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
+import {realpathSync,existsSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
 import {runProposalQa} from './skill-review-qa.mjs';
 import {proposalIdentity,groundingIdentity} from '../controller/skill-backlog.mjs';
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
@@ -43,13 +45,21 @@ async function freezeGroups(root,groups,directory){
  await save(file,frozen);return frozen;
 }
 const learningIdentity=results=>hash(results.map(r=>({id:r.id,question:r.data.question,findings:r.data.findings,learningTarget:r.data.learningTarget})));
-function learningFor(backlog,item){
+function learningFor(backlog,item,campaignRoot){
  const db=backlog.db;if(!db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get())return [];
  return db.prepare("SELECT id,data,status FROM skill_learning_requests WHERE status='verified' AND (json_extract(data,'$.backlogId')=? OR EXISTS(SELECT 1 FROM json_each(data,'$.backlogIds') WHERE value=?))").all(item.id,item.id).map(r=>({...r,data:JSON.parse(r.data)}))
   .filter(r=>r.data.findings?.outcome==='passed').flatMap(r=>{
-   const f=r.data.findings,attempt=db.prepare('SELECT id,project,outcome FROM attempts WHERE id=?').get(f.attemptId),project=attempt&&db.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project);
-   if(!project||attempt.project!==f.projectId||attempt.outcome!=='passed'||!db.prepare("SELECT 1 FROM events WHERE attempt=? AND type='postprocess-completed'").get(attempt.id))return [];
-   return [{...r,project:JSON.parse(project.spec),observations:db.prepare("SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','accepted','stage-completed') ORDER BY sequence DESC LIMIT 12").all(attempt.id).map(e=>({reference:'events:'+e.sequence,type:e.type,attemptId:attempt.id,data:JSON.parse(e.data)}))}];
+   const f=r.data.findings;let child,source=db;
+   try{
+    if(f.instanceRoot){
+     const campaign=realpathSync(campaignRoot),root=realpathSync(f.instanceRoot);
+     if(!root.startsWith(campaign+sep)||!existsSync(join(root,'state.sqlite')))return [];
+     child=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});source=child;
+    }
+    const attempt=source.prepare('SELECT id,project,outcome FROM attempts WHERE id=?').get(f.attemptId),project=attempt&&source.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project);
+    if(!project||attempt.project!==f.projectId||attempt.outcome!=='passed'||!source.prepare("SELECT 1 FROM events WHERE attempt=? AND type='postprocess-completed'").get(attempt.id))return [];
+    return [{...r,project:JSON.parse(project.spec),observations:source.prepare("SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','accepted','stage-completed') ORDER BY sequence DESC LIMIT 12").all(attempt.id).map(e=>({reference:(f.instanceRoot?'learning:'+r.id+':':'')+'events:'+e.sequence,type:e.type,attemptId:attempt.id,data:JSON.parse(e.data)}))}];
+   }catch(error){if(error.code!=='ENOENT')throw error;return [];}finally{child?.close();}
   });
 }
 async function npuLearningReceipt(observations,kernelSha256){
@@ -81,7 +91,7 @@ async function freezeLearning(config,records,directory){
   if(r.project.source)await visit(r.project.source);else partial=true;
   const verifier=[];for(const [index,path]of (r.project.verifier?.files??[]).entries()){const target=await copy(path,join('verifier',String(index)+'-'+path.split(sep).at(-1)));if(target)verifier.push(target);else partial=true;}
   const groups=await freezeGroups(config.root,[{id:'learning-'+r.id,occurrences:r.observations,linkedDiagnostics:[]}],join(destination,'diagnostics'));
-  let binding=null;try{const job=JSON.parse(await readFile(join(config.root,'attempts',r.data.findings.attemptId,'job.json'),'utf8'));const c=job.config??job;binding={target:c.target??null,environment:c.environment?.options?.mode??null,runtime:c.environment?.options?.runtime??null};}catch(e){if(e.code!=='ENOENT')throw e;}
+  let binding=null;try{const job=JSON.parse(await readFile(join(r.data.findings.instanceRoot??config.root,'attempts',r.data.findings.attemptId,'job.json'),'utf8'));const c=job.config??job;binding={target:c.target??null,environment:c.environment?.options?.mode??null,runtime:c.environment?.options?.runtime??null};}catch(e){if(e.code!=='ENOENT')throw e;}
   const receipt=await npuLearningReceipt(groups[0].occurrences,copied.find(a=>a.path===join(source,'kernel.py'))?.sha256);
   const snapshot=[r.id,{result:{status:r.data.learningTarget==='device'?(binding?.target===config.target&&binding?.runtime&&receipt?'verified-device':'verified-project'):'verified-cpu',findings:r.data.findings,question:r.data.question,binding,...(receipt?{deviceEvidence:receipt}:{}),
    project:{id:r.project.id,source,verifier:{files:verifier},partialEvidence:partial},evidence:[...copied.map(a=>({reference:'source:'+a.sha256,log:a.path,sha256:a.sha256})),...groups[0].occurrences.flatMap(o=>[o,...o.artifacts.map(a=>({reference:o.reference,log:a.path,sha256:a.sha256,truncated:a.truncated}))])]}}];
@@ -98,9 +108,9 @@ function queueLearning(backlog,config,item,requests){
   backlog.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(stored),id);return id;
  });
 }
-function learningPage(backlog){
+function learningPage(backlog,config){
  const scan=backlog.meta('learning-scan')??{ids:backlog.db.prepare("SELECT id FROM skill_backlog_items WHERE status='learning' ORDER BY priority DESC,created,rowid").all().map(r=>r.id),offset:0};
- const ids=scan.ids.slice(scan.offset,scan.offset+20),items=ids.map(id=>backlog.get(id)).filter(item=>item?.status==='learning').map(item=>({item,results:learningFor(backlog,item)}))
+ const ids=scan.ids.slice(scan.offset,scan.offset+20),items=ids.map(id=>backlog.get(id)).filter(item=>item?.status==='learning').map(item=>({item,results:learningFor(backlog,item,config.root)}))
   .filter(({item,results})=>results.length&&learningIdentity(results)!==item.evidence?.learningIdentity);
  backlog.meta('learning-scan',scan);backlog.meta('learning-pending',ids.length>0);
  return {items,finish(){
@@ -117,7 +127,7 @@ function priority(group){return Math.min(90,20+Math.min(30,group.count??group.oc
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,limit=8},dependencies={}){
  const ops=await operations(dependencies),clock=allocation(seconds,signal),entries=await guidanceEntries(config.root,config.skills.activeVersion);
- const dirty=backlog.failures({limit,occurrenceLimit:6}),page=learningPage(backlog),learningItems=page.items;
+ const dirty=backlog.failures({limit,occurrenceLimit:6}),page=learningPage(backlog,config),learningItems=page.items;
  const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(Boolean).map(g=>[g.id,g])).values()].slice(0,limit);
  if(!groups.length){page.finish();return {analyzed:0,items:[],remainingSeconds:clock.remaining()};}
  const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results])])),frozen=await freezeGroups(config.root,groups,batch);
@@ -182,18 +192,18 @@ export async function prioritizeBacklog({config,backlog,directory,signal,seconds
  const ops=await operations(dependencies),clock=allocation(seconds,signal),input=items.map(i=>({id:i.id,objective:i.objective,skill:i.skill,priority:i.priority,reason:i.reason,
   proposal:i.proposal,evidence:i.evidence?.groups?.map(g=>({id:g.id,type:g.type,message:g.message,count:g.count}))}));
  const validate=value=>{
-  const rows=value?.priorities;if(!Array.isArray(rows)||rows.length!==items.length||new Set(rows.map(r=>r.id)).size!==items.length||rows.some(r=>!items.some(i=>i.id===r.id)||!Number.isFinite(r.priority)||r.priority<0||r.priority>100||!r.reason?.trim()))throw Error('Rank every open hypothesis once with priority 0–100 and evidence-supported reason');return rows;
+  const rows=Array.isArray(value)?value:value?.priorities;if(!Array.isArray(rows)||rows.length!==items.length||new Set(rows.map(r=>r.id)).size!==items.length||rows.some(r=>!items.some(i=>i.id===r.id)||!Number.isFinite(r.priority)||r.priority<0||r.priority>100||!r.reason?.trim()))throw Error('Rank every open hypothesis once with priority 0–100 and evidence-supported reason');return {priorities:rows};
  };
  const rows=await clock.call(ops.session,{directory:join(directory,hash(input)),config,knowledge:false,
   prompt:{task:'Rank every open hypothesis by expected impact: severity, recurrence, recoverable wasted elapsed time, evidence strength, and readiness. New urgent evidence may rank above all existing work. Do not use cumulative actor clocks as measured operation duration. Return {priorities:[{id,priority:0..100,reason}]}. Keep each reason to at most two short sentences and cite supplied evidence references when available; do not write an essay. Harness problems remain user handled; do not invent evidence.',items:input},validate});
- const ranked=validate(Array.isArray(rows)?{priorities:rows}:rows),result=backlog.rank(ranked);
+ const ranked=validate(Array.isArray(rows)?{priorities:rows}:rows),result=backlog.rank(ranked.priorities);
  for(const item of items)seen[item.id]=signature(item);backlog.meta('priority-inputs',seen);backlog.meta('priority-cursor',cursor+20>=ordered.length?0:cursor+20);return result;
 }
 
 /** Prepare one candidate against the current baseline; approval admits A/B, never publication. */
-export async function prepareHypothesis({config,backlog,item,directory,signal,remainingSeconds},dependencies={}){
+export async function prepareHypothesis({config,backlog,item,directory,signal,remainingSeconds,evaluationContract,resumeFrom,priorElapsedSeconds},dependencies={}){
  if(item.base!==config.skills.activeVersion)throw Error('Rebase and requalify hypothesis against the current active skill');
- const ops=await operations(dependencies),clock=allocation(remainingSeconds,signal),identity=hash([item.id,item.revision,item.base,item.proposal,item.evidence]);
+ const ops=await operations(dependencies),clock=allocation(remainingSeconds,signal),identity=hash([item.id,item.revision,item.base,item.proposal,item.evidence,evaluationContract??null]);
  await mkdir(directory,{recursive:true});const file=join(directory,'preparation.json'),prior=await load(file);
  if(prior){if(prior.identity!==identity)throw Error('Hypothesis preparation inputs changed');return {...prior,recovered:true};}
  if(item.objective==='harness')return {status:'user-required',reason:'Harness faults require user intervention'};
@@ -204,10 +214,10 @@ export async function prepareHypothesis({config,backlog,item,directory,signal,re
  if(proposal.memoryRefs.some(ref=>!cited.has(ref)))throw Error('Hypothesis memory evidence is missing');
  const qa=await runProposalQa({directory:join(directory,'qa'),config,proposal,groups,entries,objective:item.objective,target:config.target,
   memoryEvidence:item.evidence.memoryEvidence??[],proposalDirectory:item.preparation?.proposalDirectory,learning:item.evidence.learning??[],validateProposal,
-  signal,seconds:Math.min(120,clock.remaining())},{qaAnswer:args=>clock.call(ops.qaAnswer,args,args.seconds),qaReview:args=>clock.call(ops.qaReview,args,args.seconds)});
+  signal,evaluationContract,resumeFrom,priorElapsedSeconds,seconds:Math.min(300,clock.remaining())},{qaAnswer:args=>clock.call(ops.qaAnswer,args,args.seconds),qaReview:args=>clock.call(ops.qaReview,args,args.seconds)});
  if(qa.verdict!=='approved'){
   queueLearning(backlog,config,item,qa.learningRequests??[]);
-  return {status:qa.verdict==='learn'?'learning':'inconclusive',qa,reason:qa.reason,elapsedSeconds:clock.elapsed()};
+  return {status:qa.verdict==='learn'?'learning':'inconclusive',qa,retryable:qa.retryable===true,reason:qa.reason,elapsedSeconds:clock.elapsed()};
  }
  if(clock.remaining()<=0)throw Error('Hypothesis preparation elapsed allocation exhausted');
  const final=validateProposal(qa.proposal),updated=applyProposal(entries,final.changes,{allowPruning:false,history:[]});

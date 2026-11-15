@@ -2,6 +2,7 @@
 import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
+import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
 import {ensureKnowledgeService} from './knowledge.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
@@ -42,6 +43,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const allowed=await Promise.all([...new Set(declarations)].map(async path=>{try{const canonical=await realpath(path);return {path:canonical,directory:(await stat(canonical)).isDirectory()};}catch(error){if(error.code!=='ENOENT')throw error;return {path:resolve(path),directory:false};}}));
  const evidence=await reviewEvidence(directory,evidenceGroups);
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
+ prompt={...prompt,frozenEvidence:await frozenEvidencePacket(evidenceGroups)};
  await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
  const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
  const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -52,7 +54,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   return validate(result,retrievals);
  };
  const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
- if(prior)return {value:await check(JSON.parse(prior)),retrievals,recovered:true};
+ if(prior){const value=await check(JSON.parse(prior));if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));return {value,retrievals,recovered:true};}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
  let submitted;
@@ -116,15 +118,15 @@ async function qaPrompt(input){
  memory=memory.filter(item=>cited.has(item.ref??item.citationId??`${item.collection}:${item.entry_id??item.chunk_id??item.id}`));
  const refs=new Set((input.proposal.changes??[]).flatMap(change=>change.evidenceRefs??[]));
  const groups=input.groups.filter(group=>[...group.occurrences,...(group.linkedDiagnostics??[])].some(item=>refs.has(item.reference))).map(group=>({...group,occurrences:group.occurrences.filter(item=>refs.has(item.reference)),linkedDiagnostics:group.linkedDiagnostics??[]}));
- return {proposal:input.proposal,baseline:input.entries,objective:input.objective,target:input.target,groups,memory,
-  learning:input.learning??[],questions:{action:'What is the smallest concrete actor edit, and what must remain unchanged?',mechanism:'How does that edit prevent the observed failure?',example:'Give a worked example and a counterexample or applicability boundary.',evidence:'Separate observation, mathematical deduction, and untested claims; state target applicability.',objective:'Is this correctness or optimization? Does the instruction demand unnecessary optimization?'},
+ return {proposal:input.proposal,baseline:scopedBaseline(input.entries,input.proposal),objective:input.objective,target:input.target,groups,memory,
+  learning:input.learning??[],evaluationContract:input.evaluationContract??null,questions:{action:'What is the smallest concrete actor edit, and what must remain unchanged?',mechanism:'How does that edit prevent the observed failure?',example:'Give a worked example and a counterexample or applicability boundary.',evidence:'Separate observation, mathematical deduction, and untested claims; state target applicability.',objective:'Is this correctness or optimization? Does the instruction demand unnecessary optimization?'},
   rules:'Only supplied evidence is available. Do not run benchmarks or search live sources. Unsupported facts must remain explicit questions. Performance hypotheses need not already prove a speedup. The actor sees the skill text, not these answers.'};
 }
 export async function nativeQaAnswer(input,dependencies={}){
  const prompt=await qaPrompt(input);
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
  return (dependencies.session??reviewSession)({...input,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,previousReview:input.previousReview,
-  task:'Answer all five questions. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[]}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
+  task:'Answer all five questions concisely, at most two short sentences per answer. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[]}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
 }
 export async function nativeQaReview(input,dependencies={}){
  const prompt=await qaPrompt(input);

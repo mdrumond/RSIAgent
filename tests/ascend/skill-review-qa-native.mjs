@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {nativeQaAnswer,nativeQaReview} from '../../cli/skill-review-native.mjs';
@@ -59,4 +59,12 @@ test('QA can inspect copied device learning evidence without presenting it as CP
  const {input,root}=await fixture(t),source=join(root,'device-learning');await writeFile(source,'actual device observation');
  const learning=[['device-question',{result:{status:'verified-device',binding:{target:'a5',runtime:'fixture'},project:{source},evidence:[]}}]];
  await nativeQaReview({...input,learning,validate:value=>value},{session:async options=>{assert.ok(options.allowedPaths.includes(source));assert.equal(options.prompt.learning[0][1].result.status,'verified-device');return{value:options.validate({verdict:'approved',reason:'Copied device evidence supports instruction'})};}});
+});
+test('native cached submissions replay validation without opening a provider session',async t=>{
+ const {reviewSession}=await import('../../cli/skill-review-native.mjs');
+ const {root}=await fixture(t),directory=join(root,'ranking');await mkdir(directory);
+ await writeFile(join(directory,'submission.json'),JSON.stringify([{id:'one',priority:80,reason:'Observed recurrence'}]));
+ let validations=0;
+ const result=await reviewSession({directory,config:{},prompt:{},seconds:1,validate:value=>{validations++;return {priorities:Array.isArray(value)?value:value.priorities};}});
+ assert.equal(result.recovered,true);assert.equal(validations,1);assert.equal(result.value.priorities[0].priority,80);assert.equal(JSON.parse(await readFile(join(directory,'submission.json'))).priorities[0].id,'one');
 });
