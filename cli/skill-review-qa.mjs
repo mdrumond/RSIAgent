@@ -18,29 +18,43 @@ export function validateQaVerdict(value){
  return value;
 }
 export function qaIdentity(input,proposal=input.proposal){
- return digest({changes:proposal.changes,memoryRefs:proposal.memoryRefs,baseline:input.entries,objective:input.objective??null,target:input.target,evidence:input.groups,memoryEvidence:input.memoryEvidence??null,learning:input.learning??[],learningEvidence:input.learningEvidence??[],retrievalEvidenceHash:input.retrievalEvidenceHash??null});
+ return digest({changes:proposal.changes,memoryRefs:proposal.memoryRefs,baseline:input.entries,objective:input.objective??null,target:input.target,evidence:input.groups,memoryEvidence:input.memoryEvidence??null,learning:input.learning??[],learningEvidence:input.learningEvidence??[],retrievalEvidenceHash:input.retrievalEvidenceHash??null,evaluationContract:input.evaluationContract??null});
 }
 export async function runProposalQa(input,ops){
- await mkdir(input.directory,{recursive:true});const file=join(input.directory,'qa.json');
+ await mkdir(input.directory,{recursive:true});let file=join(input.directory,'qa.json');
  let state;try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const identity=qaIdentity(input),now=ops.now??Date.now;
+ if(state&&state.format!==2){const legacy=state;file=join(input.directory,'qa-v2.json');try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;state={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:legacy.elapsedSeconds??0,draft:input.proposal,rounds:[],resumeFrom:join(input.directory,'qa.json')};}}
+ if(!state&&input.resumeFrom){const legacy=JSON.parse(await readFile(input.resumeFrom,'utf8'));state={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:Math.max(input.priorElapsedSeconds??0,legacy.elapsedSeconds??0,legacy.inFlight?.reservedThrough??0),draft:input.proposal,rounds:[],resumeFrom:input.resumeFrom};}
  if(state&&state.inputIdentity!==identity)throw Error('QA input changed; use a new proposal QA directory');
- state??={format:1,inputIdentity:identity,startedAt:now(),seconds:120,draft:input.proposal,rounds:[]};
- const persist=async()=>{const tmp=file+'.tmp';await writeFile(tmp,JSON.stringify(state,null,2)+'\n');await rename(tmp,file);};
- const remaining=()=>Math.max(0,state.seconds-(now()-state.startedAt)/1000);
- if(state.verdict)return state;
+ state??={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
+ // Reserve a bounded slice before provider work. A hard loss charges that slice,
+ // never paused wall time; graceful completion releases the unused reservation.
+ const begun=now(),charged=Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0);
+ delete state.inFlight;
+ const elapsed=()=>charged+Math.max(0,(now()-begun)/1000);
+ let writes=Promise.resolve();
+ const persist=()=>{state.elapsedSeconds=elapsed();const snapshot=JSON.stringify(state,null,2)+'\n';writes=writes.then(async()=>{const tmp=file+'.tmp';await writeFile(tmp,snapshot);await rename(tmp,file);});return writes;};
+ const remaining=()=>Math.max(0,state.seconds-elapsed());
+ if(state.verdict&&!state.retryable)return state;
+ if(state.retryable){delete state.verdict;delete state.reason;delete state.error;delete state.reasonKind;delete state.retryable;}
  let proposal=state.rounds.at(-1)?.proposal??state.draft;
  try{
   while(remaining()>0){
+   if(state.rounds.length>=2&&state.rounds.at(-1)?.review?.verdict==='revise'){state.verdict='inconclusive';state.reason='qa-revision-limit';state.reasonKind='scientific';break;}
    const round=state.rounds.at(-1)?.review?.verdict==='revise'||!state.rounds.length?{proposal}:state.rounds.at(-1);
    if(round!==state.rounds.at(-1)){state.rounds.push(round);await persist();}
    const index=state.rounds.length-1;
    const call=async(name,payload)=>{
     if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
-    input.signal?.throwIfAborted();const seconds=Math.min(remaining(),input.seconds??120);
+    input.signal?.throwIfAborted();const seconds=Math.min(remaining(),input.seconds??300);
     const signal=AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000)))]);
-    const directory=join(input.directory,`${index}-${name}`);await mkdir(directory,{recursive:true});
-    return ops[name]({...input,...payload,directory,seconds,signal});
+    const directory=join(input.directory,'sessions',state.protocol,identity,`${index}-${name}`);await mkdir(directory,{recursive:true});
+    const reserve=()=>{state.inFlight={stage:name,reservedThrough:Math.min(state.seconds,elapsed()+5)};return persist();};
+    await reserve();let checkpointError;
+    const heartbeat=setInterval(()=>{void reserve().catch(error=>{checkpointError=error;});},1000);
+    try{const result=await ops[name]({...input,...payload,directory,seconds,signal});if(checkpointError)throw checkpointError;return result;}
+    finally{clearInterval(heartbeat);await writes;delete state.inFlight;await persist();}
    };
    if(!round.answers){
     const refs=new Set([...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
@@ -66,7 +80,7 @@ export async function runProposalQa(input,ops){
   if(!state.verdict){state.verdict='inconclusive';state.reason='qa-elapsed';}
  }catch(error){
   if(input.signal?.aborted){await persist();throw error;}
-  state.verdict='inconclusive';state.reason=remaining()<=0||error.name==='TimeoutError'?'qa-elapsed':'qa-execution-failed';state.error={name:error.name,message:error.message};
+  state.verdict='inconclusive';state.reason=remaining()<=0||error.name==='TimeoutError'?'qa-elapsed':'qa-execution-failed';state.reasonKind='infrastructure';state.retryable=remaining()>0;state.error={name:error.name,message:error.message};
  }
- state.elapsedSeconds=(now()-state.startedAt)/1000;await persist();return state;
+ state.reasonKind??=state.reason==='qa-elapsed'?'infrastructure':'scientific';state.retryable??=false;await persist();return state;
 }

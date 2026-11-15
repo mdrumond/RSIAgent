@@ -253,3 +253,15 @@ test('bounded learning pages pass consumed high-priority history and retain pend
  }
  assert.equal(calls,1);assert.equal(f.backlog.get(newer.id).status,'queued');assert.equal(f.backlog.meta('learning-pending'),false);
 });
+test('ranking cache replay normalizes legacy arrays and persists an idempotent object',async t=>{
+ const f=await fixture(t);await analyzeBacklog(f,{classify,review:review(['cached-rank'])});
+ let cached,providerCalls=0;
+ const session=async({prompt,validate})=>{
+  if(cached)return {value:validate(JSON.parse(cached))};
+  providerCalls++;const old=prompt.items.map(item=>({id:item.id,priority:95,reason:'Severe observed failure'}));
+  cached=JSON.stringify(validate(old));return {value:JSON.parse(cached)};
+ };
+ await prioritizeBacklog(f,{session});await prioritizeBacklog(f,{session});
+ assert.equal(providerCalls,1);assert.equal(Array.isArray(JSON.parse(cached).priorities),true);assert.equal(f.backlog.list()[0].priority,95);
+ await assert.rejects(prioritizeBacklog(f,{session:async({validate})=>validate({priorities:[]})}));assert.equal(f.backlog.list()[0].priority,95);
+});
