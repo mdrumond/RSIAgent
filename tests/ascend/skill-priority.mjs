@@ -118,7 +118,8 @@ test('learned cases must pass real reference and negative controls before admiss
  const contract={target:'cpu',objective:'correctness',tasks:Array.from({length:5},(_,n)=>({id:'case-'+n,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Repair the computed answer',files:{'kernel.py':'starter.py'},checker:'checker.py',
   controls:{reference:{files:{'kernel.py':'reference.py'}},negatives:[{files:{'kernel.py':'starter.py'}}]}}))};
  const manifest=join(trusted,'skill-evaluation.json');await writeFile(manifest,JSON.stringify(contract));
- f.state.add({id:'learning-project',goal:'Qualify small cases',actor_seconds:30,source:trusted,verifier:{files:[manifest]}});
+ const editable=join(f.root,'editable');await mkdir(editable);
+ f.state.add({id:'learning-project',goal:'Qualify small cases',actor_seconds:30,source:editable,verifier:{files:[manifest,checker,join(trusted,'reference.py'),join(trusted,'starter.py')]}});
  const request=enqueueLearningRequest(f.state,{backlogId:item.id,target:'a3',question:'Qualify cases',requiredEvidence:'Reference and controls',findings:{projectId:'learning-project',outcome:'passed'}});
  f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',draft='draft' WHERE id=?").run(request);
  const admitted=[];let acknowledged;

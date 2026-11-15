@@ -1,3 +1,4 @@
+import {loadSkillEvaluation} from './skill-evaluation-contract.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { cp, mkdir, readFile, writeFile, realpath, stat, rename, rm } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
@@ -283,7 +284,7 @@ async function importProjectFiles(root,spec,{continuing=false,signal,localExecut
   if(!spec.source || !spec.goal || !(spec.actor_seconds>0) || typeof spec.verifier?.command!=='string' || !spec.verifier.files?.length)
     throw new Error('Project requires goal, source folder, elapsed allocation and frozen verifier command/files');
   if(!/^[a-zA-Z0-9_-]+$/.test(spec.id))throw new Error('Project id must be a folder-safe identifier');
-  signal?.throwIfAborted();await checkBundle(spec);
+  signal?.throwIfAborted();await checkBundle(spec);await loadSkillEvaluation(spec,{required:spec.generation?.learningRequest?.workKind==='suite'});
   const source=await realpath(spec.source),files=spec.verifier.files;
   const hash=path=>fileDigest(path,{signal});
   const expected={};

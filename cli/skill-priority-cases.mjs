@@ -1,8 +1,9 @@
 /** Select relevant frozen cases; missing evidence becomes curriculum work, never a generic fallback. */
+import {loadSkillEvaluation} from './skill-evaluation-contract.mjs';
 import {DatabaseSync} from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {mkdir,readFile,writeFile,realpath,readdir} from 'node:fs/promises';
-import {join,resolve,dirname,relative} from 'node:path';
+import {join,resolve,relative} from 'node:path';
 import {prepareHypothesisTasks} from './microtasks/hypotheses.mjs';
 import {reviewSession} from './skill-review-native.mjs';
 import {enqueueLearningRequest} from '../controller/skill-review.mjs';
@@ -43,13 +44,7 @@ async function learnedCases(config,backlog,item,requests){
   const spec=JSON.parse(project.spec),file=spec.verifier?.files?.find(p=>p.endsWith('/skill-evaluation.json'));
   if(!file){errors.push('Learning project '+request.findings.projectId+' supplied no trusted skill-evaluation.json');continue;}
   try{
-  const root=await realpath(dirname(file)),contract=JSON.parse(await readFile(file,'utf8'));
-  const inside=async name=>{const path=await realpath(resolve(root,name));if(relative(root,path).startsWith('..'))throw Error('Learning evaluation files must stay within the trusted verifier');return path;};
-  const files=async values=>Object.fromEntries(await Promise.all(Object.entries(values??{}).map(async([name,path])=>[name,await readFile(await inside(path),'utf8')])));
-  const tasks=await Promise.all((contract.tasks??[]).map(async task=>({...task,
-   checker:await inside(task.checker),...(task.pairedChecker?{pairedChecker:await inside(task.pairedChecker)}:{}),
-   files:await files(task.files),controls:{reference:{files:await files(task.controls?.reference?.files)},
-    negatives:await Promise.all((task.controls?.negatives??[]).map(async control=>({files:await files(control.files)})))}})));
+  const {contract,tasks}=await loadSkillEvaluation(spec,{required:true});
   suites.push({id:'learning-'+request.findings.projectId,description:request.question,target:contract.target,objective:contract.objective,tasks,
    learned:true,binding:contract.target==='cpu'?{target:'cpu'}:{target:config.target,environment:config.environment.options}});
   }catch(error){errors.push('Learning project '+request.findings.projectId+': '+error.message);}

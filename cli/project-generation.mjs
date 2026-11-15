@@ -1,3 +1,4 @@
+import {loadSkillEvaluation} from './skill-evaluation-contract.mjs';
 import { Type } from 'typebox';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, stat } from 'node:fs/promises';
@@ -100,6 +101,7 @@ export async function compileGenerationProposal(root,p,requirements={}){
   if(p.verifier?.performance_command&&!p.verifier?.baseline_command)
     throw new Error('Generated performance project requires verifier.baseline_command');
   const artifacts=await checkProposal(root,p);
+  await loadSkillEvaluation({source:artifacts.source,verifier:{files:artifacts.files}},{required:requirements.skillEvaluation===true});
   const verifier=compileVerifierEntries(p.verifier,{root,source:artifacts.source,files:artifacts.files,required:true});
   validateAcceptance({...p,verifier});
   if(p.verifier?.performance_command&&!p.baseline_construction_command)
@@ -214,7 +216,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
           execute:async(_id,p)=>{
             const checks=[];
             try {
-              const {artifacts,verifier,baseline,construction}=await compileGenerationProposal(root,p,requirements);
+              const {artifacts,verifier,baseline,construction}=await compileGenerationProposal(root,p,{...requirements,skillEvaluation:generation.requireSkillEvaluation===true});
               const constructionCommand=entrypointCommand(construction.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;

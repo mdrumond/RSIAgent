@@ -35,7 +35,7 @@ export function microlearningConfig(config,{directory,request,resource,seconds})
  if(picked.environment?.module)picked.environment={...picked.environment,module:resolve(config.root,picked.environment.module)};
  return {...picked,format:1,root:directory,target:cpu?'cpu':config.target,mode:'phase1',concurrency:1,resource_ids:[resource.id],actor_seconds:seconds,curriculum_seconds:seconds,
   campaign_plan:[{id:'microlearning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},
-  curriculum:{generation:{enabled:true,topics:[request.question],preprompt:'Investigate only this bounded learning question. Preserve independent reference and negative controls; report actual observations: '+JSON.stringify(request)}},
+  curriculum:{generation:{enabled:true,requireSkillEvaluation:request.workKind==='suite',topics:[request.question],preprompt:'Investigate only this bounded learning question. Preserve independent reference and negative controls; report actual observations. For suite work, export protected verifier/skill-evaluation.json before submission: exactly five cases with reference and negative controls; every path is relative to that manifest directory and every dependency must be declared in verifier.files. Use UTF-8 text/JSON or seed-generated fixtures, never binary tensor files. Request: '+JSON.stringify(request)}},
   campaign_seconds:seconds,skills:{activeVersion:config.skills.activeVersion,background:false,tuningDisabled:true,review:{enabled:false},priority:{enabled:false}},recovery:false};
 }
 export async function microlearningSettled(config,work,dependencies={}){
@@ -104,8 +104,9 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
    let spec=projects.length?state.project(projects[0].id).spec:null;
    if(!spec&&left()>0){
     const bridge=ops.createKdbBridge({url,attemptId:work.id,agentDir:join(work.directory,'agent')});
+    work.stage='construction';save();
     const drafts=await ops.construct({config:child,state,bridge,concurrency:1,path:join(work.directory,'drafts'),signal:active});
-    if(drafts[0]){spec=await ops.importProject(work.directory,{...drafts[0],phase:'phase1',campaign_entry:'microlearning',actor_seconds:Math.max(.001,left())},{signal:active});state.add(spec);}
+    if(drafts[0]){spec=await ops.importProject(work.directory,{...drafts[0],phase:'phase1',campaign_entry:'microlearning',generation:{...drafts[0].generation,learningRequest:work.request},actor_seconds:Math.max(.001,left())},{signal:active});state.add(spec);}
    }
    if(spec&&left()>0){
     child.projects=[spec];child.curriculum={phase1:[spec.id],generation:{enabled:false}};child.actor_seconds=Math.min(spec.actor_seconds,left());
