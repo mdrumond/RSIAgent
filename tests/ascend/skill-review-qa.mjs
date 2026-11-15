@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runProposalQa,qaIdentity,qaTopics} from '../../cli/skill-review-qa.mjs';
@@ -26,8 +26,8 @@ test('learning and inconclusive material issues never receive approval',async t=
 test('elapsed allowance is shared across revisions and retained on interruption',async t=>{
  const input=await fixture(t);let clock=1000,calls=0;
  const result=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>{clock+=50000;return answers();},qaReview:async()=>{calls++;clock+=20000;return {verdict:'revise',reason:'Missing boundary',issues:['Boundary']};}});
- assert.equal(result.verdict,'inconclusive');assert.equal(result.reason,'qa-elapsed');assert.equal(calls,1);assert.equal(result.startedAt,1000);
- const saved=JSON.parse(await readFile(join(input.directory,'qa.json')));assert.equal(saved.seconds,120);
+ assert.equal(result.verdict,'inconclusive');assert.equal(result.reason,'qa-revision-limit');assert.equal(calls,2);assert.equal(result.startedAt,1000);
+ const saved=JSON.parse(await readFile(join(input.directory,'qa.json')));assert.equal(saved.seconds,300);
 });
 test('invented answer evidence is rejected before independent assessment',async t=>{
  const input=await fixture(t);let reviewed=false;
@@ -41,7 +41,7 @@ test('interruption resumes the same proposal clock without refilling its allowan
  }}),/External stop/);
  let allowance;
  const resumed=await runProposalQa(input,{now:()=>clock,qaAnswer:async({seconds})=>{allowance=seconds;return answers();},qaReview:async()=>({verdict:'approved',reason:'No material issue'})});
- assert.equal(allowance,30);assert.equal(resumed.startedAt,1000);assert.equal(resumed.verdict,'approved');
+ assert.equal(allowance,210);assert.equal(resumed.startedAt,1000);assert.equal(resumed.verdict,'approved');
 });
 test('writer revisions cannot introduce memory that was never retrieved',async t=>{
  const input=await fixture(t);let reviewed=false;
@@ -60,12 +60,12 @@ test('native submission receives change-validation feedback and can repair withi
   return value;
  };
  const result=await runProposalQa(input,{now:()=>clock,qaAnswer:async({validate,seconds})=>{
-  writerCalls++;assert.equal(seconds,120);clock+=20000;
+  writerCalls++;assert.equal(seconds,300);clock+=20000;
   assert.throws(()=>validate({...answers(),changes:[{text:'Reuse setup',evidenceRefs:['memory:1']}]}),/Unknown occurrence/);
   clock+=15000;
   return validate({...answers(),changes:[{text:'Reuse matching setup',evidenceRefs:['event:1']}]});
  },qaReview:async({proposal,seconds})=>{
-  reviewed=proposal;assert.equal(seconds,85);return {verdict:'approved',reason:'Corrected evidence and scoped instruction'};
+  reviewed=proposal;assert.equal(seconds,265);return {verdict:'approved',reason:'Corrected evidence and scoped instruction'};
  }});
  assert.equal(writerCalls,1);assert.deepEqual(reviewed.changes,[{text:'Reuse matching setup',evidenceRefs:['event:1']}]);
  assert.equal(result.verdict,'approved');assert.equal(result.startedAt,1000);assert.equal(result.elapsedSeconds,35);
@@ -74,7 +74,7 @@ test('reviewer can repair malformed learning before submission within the same a
  const input=await fixture(t);let clock=1000;
  input.validateProposal=value=>{if(value.learningRequests?.some(request=>!request.hypothesis))throw Error('Learning hypothesis required');return value;};
  const result=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>{clock+=20000;return answers();},qaReview:async({validate,seconds})=>{
-  assert.equal(seconds,100);assert.throws(()=>validate({verdict:'learn',reason:'Missing fact',learningRequests:[{question:'Boundary?'}]}),/hypothesis required/);
+  assert.equal(seconds,280);assert.throws(()=>validate({verdict:'learn',reason:'Missing fact',learningRequests:[{question:'Boundary?'}]}),/hypothesis required/);
   clock+=10000;return validate({verdict:'learn',reason:'Missing device fact',learningRequests:[{question:'Boundary?',hypothesis:'Target differs',requiredEvidence:'Device comparison',learningTarget:'device'}]});
  }});
  assert.equal(result.verdict,'learn');assert.equal(result.elapsedSeconds,30);assert.equal(result.learningRequests.length,1);
@@ -85,4 +85,21 @@ test('Q&A may cite supplied verified learning references but not invented findin
  const input=await fixture(t),learning=[['request',{result:{status:'verified-device',evidence:[{reference:'learning:event:1',log:'copied.log'}]}}]];
  const result=await runProposalQa({...input,learning},{qaAnswer:async()=>{const value=answers();value.answers.evidence.refs=['learning:event:1'];return value;},qaReview:async()=>({verdict:'approved',reason:'Final text grounded in supplied learning'})});
  assert.equal(result.verdict,'approved');
+});
+test('paused wall time is excluded and caller interruption retains charged review work',async t=>{
+ const input=await fixture(t),stop=new AbortController();let time=0;
+ await assert.rejects(runProposalQa({...input,signal:stop.signal},{now:()=>time,qaAnswer:async()=>{time+=40000;stop.abort(Error('pause'));throw stop.signal.reason;}}),/pause/);
+ time+=90000000;
+ const result=await runProposalQa(input,{now:()=>time,qaAnswer:async({seconds})=>{assert.equal(seconds,260);return answers();},qaReview:async()=>({verdict:'approved',reason:'Supported'})});
+ assert.equal(result.elapsedSeconds,40);assert.equal(result.protocol,'skill-qa-v2');
+});
+test('case contract changes invalidate approval identity',async t=>{
+ const input=await fixture(t);assert.notEqual(qaIdentity({...input,evaluationContract:{id:'first'}}),qaIdentity({...input,evaluationContract:{id:'other'}}));
+});
+
+test('legacy timeout remains immutable and a v2 continuation charges its original spend',async t=>{
+ const input=await fixture(t),file=join(input.directory,'qa.json'),legacy=JSON.stringify({format:1,elapsedSeconds:120,verdict:'inconclusive',reason:'qa-elapsed'});
+ await writeFile(file,legacy);
+ const result=await runProposalQa(input,{qaAnswer:async({seconds})=>{assert(seconds<=180&&seconds>179);return answers();},qaReview:async()=>({verdict:'approved',reason:'Supported'})});
+ assert.equal(result.verdict,'approved');assert.equal(await readFile(file,'utf8'),legacy);assert.equal(JSON.parse(await readFile(join(input.directory,'qa-v2.json'))).protocol,'skill-qa-v2');
 });
