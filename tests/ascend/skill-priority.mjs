@@ -7,7 +7,8 @@ import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput,wakeQualifiedSuiteWaiters} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
-import {resolveHypothesisCases,registerQualifiedSuite} from '../../cli/skill-priority-cases.mjs';
+import {resolveHypothesisCases,registerQualifiedSuite,hypothesisCaseReadiness} from '../../cli/skill-priority-cases.mjs';
+import {selectCohort,claimCohort} from '../../cli/skill-cohort.mjs';
 import {claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
 import {qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
@@ -381,4 +382,20 @@ test('read-only status excludes stale outside-cohort continuations before cleanu
  const config={...f.config,skills:{...f.config.skills,activeVersion:'promoted'}},status=await prioritySkillStatus(config);
  assert.equal(status.continuationQueued,0);assert.equal(status.hasWork,false);assert.equal(f.backlog.meta('procedural-continuations').length,1,'Observation leaves cleanup to the controller');assert.equal(f.backlog.run(run.id).elapsed,120);
  f.state.event(null,'attempt-error',{message:'New actionable failure'});assert.equal((await prioritySkillStatus(config)).hasWork,true);
+});
+
+test('actual catalogue readiness admits a scoped custom CPU suite ahead of unrelated high-priority work',async t=>{
+ const f=await fixture(t);for(let i=0;i<7;i++)f.add('unrelated-'+i,100+i);
+ const ready=f.add('custom-low-priority',1,{proposal:{action:'update',changes:[{id:'custom-rule',scope:'implementation',text:'Compute the returned integer from the supplied report'}]}}),checker=join(f.root,'custom-checker.py');
+ await writeFile(checker,"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n");
+ const suite={id:'custom-cpu',target:'cpu',objective:'correctness',proposalIds:['custom-rule'],backlogIds:[ready.id],scopes:['implementation'],binding:{target:'cpu'},
+  tasks:Array.from({length:5},(_,i)=>({id:'custom-'+i,kind:'hypothesis-case',target:'cpu',bucket:'correctness',prompt:'Repair the computed integer',checker,files:{'kernel.py':'answer=0'},controls:{reference:{files:{'kernel.py':'answer=42'}},negatives:[{files:{'kernel.py':'answer=0'}}]}}))};
+ assert.equal((await qualifyHypothesisTasks({...suite,config:f.config,directory:join(f.root,'custom-qualification'),remainingSeconds:120})).status,'qualified');
+ f.config.skills.priority.evaluations=[suite];
+ const cohort=await selectCohort(f.backlog,f.config,hypothesisCaseReadiness);
+ assert.equal(cohort.members.length,5);assert.equal(cohort.members[0].id,ready.id);assert.equal(cohort.members[0].ready,true);
+ assert.equal(cohort.members.some(member=>member.id===f.backlog.get('unrelated-0').id),false);
+ const claimed=await claimCohort(f.backlog,f.config,undefined,hypothesisCaseReadiness);
+ assert.equal(claimed.item.id,ready.id);assert.equal(claimed.run.item_id,ready.id);assert.equal(f.backlog.run(claimed.run.id).status,'running');
+ assert.equal(f.backlog.get('unrelated-6').status,'queued');assert.equal(f.backlog.meta('hypothesis-cohort').id,cohort.id);
 });
