@@ -41,11 +41,11 @@ test('a failed check forks the real Pi history and repairs only the continuation
  assert.equal(calls,1);assert.equal(report.samples['repair/0/active'].correct,true);assert.deepEqual(await readFile(f.session),before);assert.equal((await readFile(f.source,'utf8')).trim(),'def answer(): return 0');await unchanged(f);
 });
 test('original elapsed time reduces the actor allowance and final verification stays inside the remainder',async t=>{
- const f=await fixture(t,{spent:.24});f.seconds=.5;f.verificationSeconds=.08;let allocation;
+ const f=await fixture(t,{spent:.6});f.seconds=1.2;f.verificationSeconds=.25;let allocation;
  const report=await continueMicroevalSamples(f,{sample:async args=>{
-  allocation=args.seconds;assert.ok(args.sampleSeconds<=.26);await untilAbort(args.signal);await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {timedOut:true,session:args.resumeSession};
+  allocation=args.seconds;assert.ok(args.sampleSeconds<=.6);await untilAbort(args.signal);await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {timedOut:true,session:args.resumeSession};
  }}),row=report.samples['repair/0/active'];
- assert.ok(allocation>0&&allocation<.18);assert.equal(row.actorTimedOut,true);assert.equal(row.correct,true);assert.ok(row.elapsedSeconds>=.24);assert.ok(row.elapsedSeconds<.6);await unchanged(f);
+ assert.ok(allocation>0&&allocation<.35);assert.equal(row.actorTimedOut,true);assert.equal(row.correct,true);assert.ok(row.elapsedSeconds>=.6);assert.ok(row.elapsedSeconds<1.4);await unchanged(f);
 });
 test('controlled interruption resumes the same fork with less time and without repeating the initial check',async t=>{
  const f=await fixture(t),abort=new AbortController();let calls=0,checks=0,forks=0,firstAllocation,session;
