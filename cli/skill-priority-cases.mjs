@@ -71,7 +71,7 @@ async function previousCases(config,item){
  }
  return suites;
 }
-export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event,proposal=item.proposal},dependencies={}){
+export async function resolveHypothesisCases({config,backlog,item,directory,qualificationDirectory=join(directory,'qualification'),resource,signal,seconds,event,beforeQualification,proposal=item.proposal},dependencies={}){
  const started=performance.now();
  await mkdir(directory,{recursive:true});
  const proposalIdentity=createHash('sha256').update(JSON.stringify([proposal.changes,item.objective,config.target])).digest('hex');
@@ -104,7 +104,9 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
   const prepared=prepareHypothesisEvaluation(suite);
   if(prepared.status==='ready'&&suite.learned){
    const qualify=dependencies.qualify??(await import('./skill-hypothesis-evaluation.mjs')).qualifyHypothesisTasks;
-   const qualification=await qualify({...prepared,directory:cached?join(qualificationDirectory,selectionIdentity):qualificationDirectory,config,signal,resource,
+   const actualDirectory=cached?join(qualificationDirectory,selectionIdentity):qualificationDirectory;
+   await beforeQualification?.(actualDirectory);
+   const qualification=await qualify({...prepared,directory:actualDirectory,config,signal,resource,
     remainingSeconds:Math.max(.001,seconds-(performance.now()-started)/1000)});
    if(qualification.status==='qualified')suite.qualification=qualification;
    if(qualification.status!=='qualified'){prepared.status='needs-learning';prepared.reason=qualification.reason??'Reference/negative-control qualification did not pass';}

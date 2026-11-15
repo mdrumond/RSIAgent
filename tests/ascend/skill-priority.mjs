@@ -120,13 +120,15 @@ test('learned cases must pass real reference and negative controls before admiss
  f.state.add({id:'learning-project',goal:'Qualify small cases',actor_seconds:30,source:trusted,verifier:{files:[manifest]}});
  const request=enqueueLearningRequest(f.state,{backlogId:item.id,target:'a3',question:'Qualify cases',requiredEvidence:'Reference and controls',findings:{projectId:'learning-project',outcome:'passed'}});
  f.state.db.prepare("UPDATE skill_learning_requests SET status='verified',draft='draft' WHERE id=?").run(request);
- const args={config:f.config,backlog:f.backlog,item,directory:join(f.root,'learned-cases'),seconds:120};
- const deps={prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async()=>({value:{catalogueId:'learning-learning-project',reason:'These controls exercise the hypothesis'}})};
+ const admitted=[];let acknowledged;
+ const args={config:f.config,backlog:f.backlog,item,directory:join(f.root,'learned-cases'),seconds:120,beforeQualification:async directory=>{await Promise.resolve();acknowledged=directory;admitted.push(directory);}};
+ const deps={prepareTasks:async()=>({manifest:{hypotheses:[]},byHypothesis:{}}),select:async()=>({value:{catalogueId:'learning-learning-project',reason:'These controls exercise the hypothesis'}}),qualify:async input=>{assert.equal(acknowledged,input.directory);acknowledged=null;return (await import('../../cli/skill-hypothesis-evaluation.mjs')).qualifyHypothesisTasks(input);}};
  const result=await resolveHypothesisCases(args,deps);assert.equal(result.status,'ready');
  const report=JSON.parse(await readFile(join(args.directory,'qualification','micro','results.json'),'utf8'));
  assert.equal(report.status,'qualified');assert.equal(report.results.length,10);assert(report.results.every(r=>r.passed));
  await writeFile(checker,'raise SystemExit(0)\n');
  assert.equal((await resolveHypothesisCases(args,deps)).status,'needs-learning');
+ assert.equal(admitted[0],join(args.directory,'qualification'));assert(admitted[1].startsWith(join(args.directory,'qualification')+'/'));assert.notEqual(admitted[0],admitted[1]);
  assert.notEqual(await readFile(result.tasks[0].checker,'utf8'),await readFile(checker,'utf8'));
  const bad=await resolveHypothesisCases({...args,directory:join(f.root,'bad-cases')},deps);
  assert.equal(bad.status,'needs-learning');assert(bad.learningRequest);
