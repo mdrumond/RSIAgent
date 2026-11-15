@@ -39,3 +39,17 @@ test('suite requests require export but ordinary projects without a sidecar rema
  await assert.rejects(importProject(join(f.root,'instance'),f.spec()),/requires a protected/);
  await compileGenerationProposal(f.root,f.proposal);const ordinary=f.spec();delete ordinary.generation;assert(await importProject(join(f.root,'instance'),ordinary));
 });
+
+for(const target of ['a3','a5'])test('public admission preserves device '+target+' task kinds without executing NPU code',async t=>{
+ const f=await fixture(t);f.contract.target=target;for(const task of f.contract.tasks){task.target=target;task.kind='target-kernel';}await f.save();
+ await compileGenerationProposal(f.root,f.proposal,{skillEvaluation:true});const imported=await importProject(join(f.root,'instance'),f.spec());
+ assert.equal((await loadSkillEvaluation(imported)).tasks[0].kind,'target-kernel');
+ for(const task of f.contract.tasks)task.kind='hypothesis-case';await f.save();
+ await assert.rejects(compileGenerationProposal(f.root,f.proposal,{skillEvaluation:true}),/device target-kernel/);
+ await assert.rejects(importProject(join(f.root,'instance'),f.spec()),/device target-kernel/);
+});
+test('legacy A3 kernel task metadata retains inferred A3 target compatibility',async t=>{
+ const f=await fixture(t);f.contract.target='a3';for(const task of f.contract.tasks){delete task.target;task.kind='a3-kernel';}await f.save();
+ await compileGenerationProposal(f.root,f.proposal,{skillEvaluation:true});const imported=await importProject(join(f.root,'instance'),f.spec());
+ assert.equal((await loadSkillEvaluation(imported)).tasks[0].kind,'a3-kernel');
+});
