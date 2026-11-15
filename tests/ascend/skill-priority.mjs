@@ -344,7 +344,7 @@ test('an obsolete procedural continuation blocks explicitly and is not selected 
 });
 test('supported premade qualification precedes unrelated unsupported hypotheses',async t=>{
  const f=await fixture(t);for(let i=0;i<105;i++)f.add('unknown-'+i,200-i);f.add('premade',1);let qualified;
- await runPrioritySkills(f.config,f.values,{...f.ops,caseReadiness:async({item})=>({ready:false,supported:item.key==='premade'}),resolveCases:async({item,beforeQualification})=>{qualified=item.key;await beforeQualification(join(f.root,'pack-qualification'));return f.ops.resolveCases();}});
+ await runPrioritySkills(f.config,f.values,{...f.ops,caseReadiness:async({item,backlog})=>{assert.equal(backlog.db.location(),f.backlog.db.location());return {ready:false,supported:item.key==='premade'};},resolveCases:async({item,beforeQualification})=>{qualified=item.key;await beforeQualification(join(f.root,'pack-qualification'));return f.ops.resolveCases();}});
  assert.equal(qualified,'premade');assert.equal(f.backlog.get('premade').status,'rejected');assert.equal(f.backlog.get('unknown-0').status,'queued');assert.equal(f.backlog.meta('hypothesis-cohort').members.length,5);
 });
 test('unresolved case qualification retains its slot until positive closure, then peers proceed',async t=>{
@@ -353,4 +353,32 @@ test('unresolved case qualification retains its slot until positive closure, the
  assert.equal(blocked.status,'blocked');assert.equal(f.backlog.get('qualifying').status,'running');assert.equal(f.backlog.run(f.backlog.get('qualifying').id).checkpoint.unresolved,true);assert.equal(f.backlog.get('peer').status,'queued');
  await runPrioritySkills(f.config,f.values,f.ops);await runPrioritySkills(f.config,f.values,f.ops);
  assert.equal(f.backlog.get('qualifying').status,'rejected');assert.equal(f.backlog.get('peer').status,'rejected');
+});
+test('promotion retires outside-cohort continuations without renewing or modifying historical trials',async t=>{
+ const f=await fixture(t),queue=[];
+ for(let i=0;i<6;i++){
+  f.add('legacy-'+i,60-i);const {run}=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(run.id,{elapsed:100+i});f.backlog.finish(run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+  queue.push({id:run.id,base:'baseline',procedure:'Earlier audited infrastructure continuation'});
+ }
+ const oldRows=queue.map(({id})=>f.state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(id));f.backlog.meta('procedural-continuations',queue);f.add('promoter',100);
+ await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async()=>({status:'complete',decision:{promote:true,reason:'correctness-improved'}})});
+ const current={...JSON.parse(await readFile(join(f.root,'instance.json'),'utf8')),root:f.root},status=await prioritySkillStatus(current);
+ assert.equal(status.cohort.counts.pending,4);assert.equal(status.continuationQueued,4,'Only selected pending members remain admissible after promotion');
+ for(let i=0;i<4;i++)await runPrioritySkills(current,f.values,f.ops);
+ const retired=f.state.db.prepare("SELECT data FROM events WHERE type='skill-continuation-retired'").all().map(row=>JSON.parse(row.data));
+ assert.deepEqual(new Set(retired.map(row=>row.id)),new Set(queue.slice(4).map(row=>row.id)));assert(retired.every(row=>row.reason==='active-skill-changed-outside-cohort'));
+ assert.deepEqual(queue.map(({id})=>f.state.db.prepare('SELECT * FROM skill_backlog_runs WHERE id=?').get(id)),oldRows);
+ for(let i=4;i<6;i++){const item=f.backlog.get('legacy-'+i);assert.equal(item.base,'baseline');assert.equal(f.state.db.prepare('SELECT count(*) n FROM skill_backlog_runs WHERE item_id=?').get(item.id).n,1);}
+ let analyses=0;const ops={...f.ops,analyze:async()=>{analyses++;f.backlog.meta('learning-pending',false);for(const group of f.backlog.failures())f.backlog.acknowledge(group.id);}};
+ await runPrioritySkills(current,f.values,ops);assert.equal(f.backlog.meta('procedural-continuations').length,0);assert.equal((await prioritySkillStatus(current)).hasWork,false);
+ f.state.event(null,'attempt-error',{message:'New post-promotion diagnostic'});
+ await runPrioritySkills(current,f.values,{...ops,analyze:async()=>{await ops.analyze();f.add('new-post-promotion',100,{base:current.skills.activeVersion});}});
+ assert.equal(analyses,2);assert.equal(f.backlog.get('new-post-promotion').status,'rejected');
+});
+test('read-only status excludes stale outside-cohort continuations before cleanup',async t=>{
+ const f=await fixture(t);f.add('old-baseline');const {run}=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(run.id,{elapsed:120});f.backlog.finish(run.id,{status:'inconclusive',result:{reason:'qa-elapsed'}});
+ f.backlog.meta('procedural-continuations',[{id:run.id,base:'baseline',procedure:'Previous infrastructure upgrade'}]);f.backlog.meta('learning-seen','[]');
+ const config={...f.config,skills:{...f.config.skills,activeVersion:'promoted'}},status=await prioritySkillStatus(config);
+ assert.equal(status.continuationQueued,0);assert.equal(status.hasWork,false);assert.equal(f.backlog.meta('procedural-continuations').length,1,'Observation leaves cleanup to the controller');assert.equal(f.backlog.run(run.id).elapsed,120);
+ f.state.event(null,'attempt-error',{message:'New actionable failure'});assert.equal((await prioritySkillStatus(config)).hasWork,true);
 });

@@ -12,7 +12,7 @@ import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlo
 import {evaluateHypothesis,hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
 import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
 import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs';
-import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetainedCohort} from './skill-cohort.mjs';
+import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetainedCohort,admissibleContinuations,retireStaleContinuations} from './skill-cohort.mjs';
 const caseReadiness=async args=>(await import('./skill-priority-cases.mjs')).hypothesisCaseReadiness?.(args)??{ready:false};
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
@@ -32,14 +32,14 @@ export async function prioritySkillStatus(config){
   const status=backlog.status(),items=['queued','learning','needs-review','user-required'].flatMap(s=>backlog.list({status:s,limit:20})).sort((a,b)=>b.priority-a.priority),
    active=backlog.list({status:'running',limit:1})[0],run=active&&backlog.run(active.id);
   const learningWork=backlog.meta('microlearning-active'),learningQueue=pendingMicrolearning(backlog);
-  const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
+  const changed=backlog.meta('learning-seen')!==learningFingerprint(state),cohort=cohortStatus(backlog),continuations=admissibleContinuations(backlog,config.skills.activeVersion);
   const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
-  return {...status,cohort:cohortStatus(backlog),activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:(backlog.meta('procedural-continuations')??[]).length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
+  return {...status,cohort,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:continuations.length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
    analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
-   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||(backlog.meta('procedural-continuations')??[]).length>0||learningQueue.some(request=>request.workKind!=='suite')||items.some(i=>['queued','needs-review'].includes(i.status)))};
+   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork||cohort?.counts.pending)||continuations.length>0||learningQueue.some(request=>request.workKind!=='suite')||items.some(i=>['queued','needs-review'].includes(i.status)))};
  }finally{state.close();}
 }
 export async function prioritySkillsSettled(config,dependencies={}){
@@ -65,6 +65,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&ops.now()<ingestionEnd);
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
   if(backlog.meta('microlearning-active'))return await ops.learn({config,backlog,...values});
+  retireStaleContinuations(backlog,config.skills.activeVersion);
   await wakeQualifiedSuiteWaiters({config,backlog});
   const retained=backlog.list({status:'running',limit:1})[0];
   if(retained)attachRetainedCohort(backlog,backlog.run(retained.id));

@@ -24,9 +24,28 @@ export function cohortStatus(backlog){
  return {...cohort,counts,nextAction:active?'resume-comparison':pending?'resolve-cases-and-compare':'analyze-new-evidence',
   deferredEvidence:Math.max(0,backlog.status().failures-cohort.failureCount)};
 }
+function continuationRetirement(backlog,entry,base){
+ const run=backlog.run(entry.id);if(!run||!backlog.get(run.item_id))return 'hypothesis-unavailable';
+ if(run.elapsed>=run.seconds)return 'original-allowance-exhausted';
+ const retained=backlog.meta(key)?.members.some(member=>member.status==='pending'&&(member.continuation?.id===entry.id||member.requalify===entry.id));
+ if(!retained&&(entry.base!==base||run.base!==base))return 'active-skill-changed-outside-cohort';
+ return null;
+}
+export const admissibleContinuations=(backlog,base)=>(backlog.meta('procedural-continuations')??[]).filter(entry=>!continuationRetirement(backlog,entry,base));
+/** Retire scheduling references, never the immutable hypothesis records they reference. */
+export function retireStaleContinuations(backlog,base){return backlog.atomic(()=>{
+ const queue=backlog.meta('procedural-continuations')??[],retired=queue.flatMap(entry=>{
+  const reason=continuationRetirement(backlog,entry,base);return reason?[{id:entry.id,previousBase:entry.base,activeBase:base,reason}]:[];
+ });
+ if(retired.length){
+  const ids=new Set(retired.map(entry=>entry.id));backlog.meta('procedural-continuations',queue.filter(entry=>!ids.has(entry.id)));
+  for(const entry of retired)backlog.db.prepare("INSERT INTO events(type,data,created) VALUES('skill-continuation-retired',?,?)").run(JSON.stringify(entry),new Date().toISOString());
+ }
+ return retired;
+});}
 function candidates(backlog,base){
  const choices=new Map([...backlog.list({status:'queued',limit:Number.MAX_SAFE_INTEGER}),...backlog.list({status:'needs-review',limit:Number.MAX_SAFE_INTEGER})].map(item=>[item.id,{item}]));
- for(const continuation of backlog.meta('procedural-continuations')??[]){
+ for(const continuation of admissibleContinuations(backlog,base)){
   const run=backlog.run(continuation.id),item=run&&backlog.get(run.item_id);
   if(item&&continuation.base===base&&run.elapsed<run.seconds&&!choices.has(item.id))choices.set(item.id,{item,continuation});
  }
@@ -38,7 +57,7 @@ export async function selectCohort(backlog,config,readiness){
  if(cohort?.status==='complete'){backlog.meta('hypothesis-cohort-last',cohort);backlog.meta(key,null);cohort=null;}
  if(!cohort){
   const choices=candidates(backlog,config.skills.activeVersion);
-  for(const choice of choices)Object.assign(choice,await readiness({config,item:choice.item}));
+  for(const choice of choices)Object.assign(choice,await readiness({config,item:choice.item,backlog}));
   choices.sort((a,b)=>Number(Boolean(b.ready))-Number(Boolean(a.ready))||Number(Boolean(b.supported))-Number(Boolean(a.supported))||b.item.priority-a.item.priority||a.item.created-b.item.created);
   if(!choices.length)return null;
   cohort={id:randomUUID(),base:config.skills.activeVersion,createdAt:new Date().toISOString(),status:'running',failureCount:backlog.status().failures,
@@ -50,7 +69,7 @@ export async function selectCohort(backlog,config,readiness){
 export async function claimCohort(backlog,config,owner,readiness){
  const cohort=await selectCohort(backlog,config,readiness);if(!cohort)return null;
  const pending=cohort.members.filter(m=>m.status==='pending');
- for(const member of pending)Object.assign(member,await readiness({config,item:backlog.get(member.id)}));
+ for(const member of pending)Object.assign(member,await readiness({config,item:backlog.get(member.id),backlog}));
  pending.sort((a,b)=>Number(Boolean(b.ready))-Number(Boolean(a.ready))||Number(Boolean(b.supported))-Number(Boolean(a.supported))||b.priority-a.priority);
  for(const member of pending){
   try{
