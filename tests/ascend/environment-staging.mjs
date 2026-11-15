@@ -497,3 +497,36 @@ test('completed excluded parent and sync jobs do not need payload timing or a lo
   assert.equal(f.sourceUploads().length,1);
   assert.equal(f.runs(false).length,1);
 });
+
+for(const terminalState of ['cancelled','failed'])test(`closed old ${terminalState} source sync yields one fresh staging and one payload in the same request`,async t=>{
+ const f=await fixture(t);f.control.failSync=true;f.control.disconnected=true;
+ await assert.rejects(f.environment.execute('touch must-not-run',f.source),/unresolved/);await f.idle();assert.equal(f.runs(false).length,0);
+ const cache=join(f.root,'.executions','source-staging.json'),old=JSON.parse(await readFile(cache,'utf8')),receiptBytes=await readFile(old.receiptFile,'utf8'),handle=JSON.parse(receiptBytes).handle;
+ const oldUpload=f.sourceUploads()[0][3],signal=AbortSignal.timeout(5000);let observations=0;
+ f.control.disconnected=false;await writeFile(join(f.source,'value.txt'),'current-files');
+ const env=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>{
+  assert.equal(settings.signal,signal);if(args[0]==='observe'&&args[1]===handle){observations++;return {state:terminalState,exit:terminalState==='failed'?17:null};}return f.client(args,settings);
+ }});
+ await env.prepare({project:{id:'p',source:f.source},attempt:{id:'a'},signal});
+ assert.equal(await f.run('cat value.txt',env,{signal,timeout:5}),'current-files');assert.equal(observations,1);
+ assert.equal(f.sourceUploads().length,2);assert.equal(f.manifests().length,2);assert.equal(f.runs(true).length,2);assert.equal(f.runs(false).length,1);
+ assert.notEqual(f.sourceUploads()[1][3],oldUpload);assert.equal(await readFile(old.receiptFile,'utf8'),receiptBytes);
+ const current=JSON.parse(await readFile(cache,'utf8'));assert.equal(current.confirmed,true);assert.notEqual(current.receiptFile,old.receiptFile);
+ const retired=f.events.filter(e=>e.type==='source-staging-retired');assert.equal(retired.length,1);assert.equal(retired[0].handle,handle);assert.equal(retired[0].reason.state,'stopped');assert.equal(retired[0].reason.nativeState,terminalState);
+});
+test('replacing a positively closed old sync does not retry a failing current copy',async t=>{
+ const f=await fixture(t);f.control.failSync=true;f.control.disconnected=true;await assert.rejects(f.environment.execute('touch old-payload',f.source),/unresolved/);await f.idle();
+ const cache=JSON.parse(await readFile(join(f.root,'.executions','source-staging.json'),'utf8')),oldHandle=JSON.parse(await readFile(cache.receiptFile,'utf8')).handle;
+ f.control.disconnected=false;f.control.failSync=true;
+ const env=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>args[0]==='observe'&&args[1]===oldHandle?{state:'cancelled',exit:null}:f.client(args,settings)});
+ await env.prepare({project:{id:'p',source:f.source},attempt:{id:'a'}});
+ await assert.rejects(env.execute('touch new-payload',f.source),/Copy failed/);assert.equal(f.sourceUploads().length,2);assert.equal(f.runs(true).length,2);assert.equal(f.runs(false).length,0);assert.equal(f.events.filter(e=>e.type==='source-staging-retired').length,1);
+});
+for(const state of ['running','observation-unavailable'])test(`unclosed retained sync ${state} cannot start another staging or payload`,async t=>{
+ const f=await fixture(t);f.control.failSync=true;f.control.disconnected=true;await assert.rejects(f.environment.execute('touch old-payload',f.source),/unresolved/);await f.idle();
+ const cache=join(f.root,'.executions','source-staging.json'),bytes=await readFile(cache,'utf8'),old=JSON.parse(bytes),handle=JSON.parse(await readFile(old.receiptFile,'utf8')).handle;
+ const count=f.calls.filter(args=>['upload','run'].includes(args[0])).length;
+ const env=await createEnvironment(f.options,{...f.context,client:async(args,settings)=>args[0]==='observe'&&args[1]===handle?{state}:f.client(args,settings)});
+ await env.prepare({project:{id:'p',source:f.source},attempt:{id:'a'}});await assert.rejects(env.execute('touch new-payload',f.source),/Source synchronization unresolved/);
+ assert.equal(f.calls.filter(args=>['upload','run'].includes(args[0])).length,count);assert.equal(await readFile(cache,'utf8'),bytes);assert.equal(f.events.some(e=>e.type==='source-staging-retired'),false);
+});

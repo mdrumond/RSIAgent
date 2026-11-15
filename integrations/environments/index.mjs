@@ -630,9 +630,12 @@ export async function createEnvironment(options, context) {
         if (!receipt?.handle) throw new Error('Source synchronization submission unresolved; retain native receipt');
         const state = await observe(receipt.handle, {signal,accountingExcluded:true});
         if (state.state !== 'stopped') throw new Error(`Source synchronization unresolved; observe ${receipt.handle}`);
-        if (state.exitCode !== 0) { await rm(cachePath); throw closedSetupError(`Source synchronization failed: ${receipt.handle}`, {handle: receipt.handle, reason: state}); }
-        retained.confirmed = true;
-        await save(cachePath, retained);
+        if (state.exitCode !== 0) {
+          // The previous sync is positively closed. Retire its cache, never its
+          // native identity; this request stages current files into its new dir.
+          await event('source-staging-retired', {handle:receipt.handle,receiptFile:retained.receiptFile,reason:state,incoming:retained.incoming,key:retained.key});
+          await rm(cachePath);retained=null;
+        } else {retained.confirmed = true;await save(cachePath, retained);}
       }
       const reused = Boolean(snapshot.cacheable && retained?.confirmed && retained.key === key);
       let stage = reused ? retained : { key, cacheable: snapshot.cacheable,
