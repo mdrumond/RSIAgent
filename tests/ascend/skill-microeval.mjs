@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join,resolve} from 'node:path';
+import {join,resolve,dirname} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
@@ -352,4 +352,28 @@ test('native target-local Bash uses admitted environment instead of an unmasked 
   calls++;assert.equal(command,'printf bypass > host-marker');assert.equal(path,cwd);assert.equal(options.stopSignal,cleanup.signal);options.onData?.(Buffer.from('admitted target execution\n'));return {handle:'local:admitted',settled:true,exitCode:0};
  }}});
  assert.equal(result.error,null);assert.equal(calls,1);await assert.rejects(readFile(join(cwd,'host-marker')),{code:'ENOENT'});
+});
+
+test('a real native target-tool deadline retains its partial marker until SDK lease closure is proved',async t=>{
+ const {hypothesisEvaluationSettled}=await import('../../cli/skill-hypothesis-evaluation.mjs'),{processIdentity}=await import('../../controller/lifecycle.mjs');
+ const f=await fixture(t),profile=await scriptedMicro(t,f.root,n=>n===0?{name:'rsi_target',args:{command:'python check.py .'}}:null),root=join(f.root,'hypothesis'),directory=join(root,'micro');await mkdir(root);
+ const binding={target:'a3',environment:{mode:'local',target:'fixture',runtime:'fixture',health:{product:'a3'}}};await writeFile(join(root,'hypothesis.json'),JSON.stringify({binding}));
+ let nativeCalls=0,leaseClosed=false,target;const tasks=[{...f.tasks[0],id:'prior'},{...f.tasks[0],kind:'a3-kernel'}];
+ await assert.rejects(runMicroeval({...f,directory,profile,tasks,runs:1,seconds:.6,totalSeconds:2,resume:true,binding},{
+  sample:async args=>{
+   if(args.kind==='unspecified'){await writeFile(join(args.cwd,'kernel.py'),'def answer(): return 42\n');return {tokens:1};}
+   return nativeSample({...args,targetEnvironment:{execute:async(_command,cwd,options)=>{
+    nativeCalls++;target=join(dirname(cwd),'target');await mkdir(target,{recursive:true});const handle='remote:fixture:job:deadline-setup',lease={receipt:join(root,'lease.json'),token:'deadline-owned',pool:'fixture',physicalDevice:4,owner:await processIdentity()};
+    await writeFile(join(target,'.ascend-command-lease.json'),JSON.stringify(lease));
+    const events=[{type:'device-lease-acquired',data:lease},{type:'execution-submitting',data:{operation:'setup',submission:'setup'}},{type:'execution-submitted',data:{submission:'setup',handle}},{type:'execution-handle',data:{handle}}];
+    await writeFile(join(target,'environment-events.jsonl'),events.map(JSON.stringify).join('\n')+'\n');await untilAbort(options.signal);
+    events.push({type:'execution-state',data:{handle,state:'stopped',nativeState:'cancelled'}});await writeFile(join(target,'environment-events.jsonl'),events.map(JSON.stringify).join('\n')+'\n');return {settled:true,exitCode:124,handle};
+   }}});
+  },verify:async args=>{const result=spawnSync(f.python,[args.checker,args.cwd],{encoding:'utf8'});return {correct:result.status===0,exitCode:result.status,output:result.stdout,error:result.stderr};},
+  sampleSettled:async()=>false
+ }),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const file=join(directory,'results.json'),before=JSON.parse(await readFile(file,'utf8'));assert.equal(nativeCalls,1);assert.equal(before.results.length,2);assert(before.results.every(result=>result.correct));assert.equal(before.runningSample.key,'repair/0/active');assert.equal(before.runningSample.needsClosure,true);assert(before.partials['repair/0/active'].timedOut);
+ const deps={createEnvironment:async(_options,context)=>{assert.equal(context.instancePath,target);return {reconcileLease:async()=>{if(leaseClosed)await rm(join(target,'.ascend-command-lease.json'),{force:true});return leaseClosed;}};}};
+ assert.equal(await hypothesisEvaluationSettled({directory:root},deps),false);leaseClosed=true;assert.equal(await hypothesisEvaluationSettled({directory:root},deps),true);
+ const after=JSON.parse(await readFile(file,'utf8'));assert.equal(after.runningSample,undefined);assert.deepEqual(after.results,before.results);assert.deepEqual(after.partials,before.partials);assert.equal(after.elapsedSeconds,before.elapsedSeconds);assert.equal(nativeCalls,1);
 });

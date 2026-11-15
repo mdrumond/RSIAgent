@@ -245,3 +245,37 @@ test('a crash after recording a failed control cannot turn its partial checkpoin
  const file=join(f.directory,'micro/results.json'),report=JSON.parse(await readFile(file,'utf8'));report.status='running';report.results=report.results.slice(0,1);report.results[0].passed=false;report.results[0].verification={correct:false,exitCode:1,output:'fixture numerical failure'};await writeFile(file,JSON.stringify(report));
  const result=await qualifyHypothesisTasks({...f,remainingSeconds:800},{verify:()=>{throw Error('Known failed control was retried');}});assert.equal(result.status,'blocked');assert.equal(result.receipts.length,1);assert.equal(result.receipts[0].passed,false);
 });
+
+test('legacy marker-free elapsed targets retain custody despite a live lease owner and preserve scientific bytes',async t=>{
+ const {processIdentity,ownerStopped}=await import('../../controller/lifecycle.mjs');const f=await fixture(t,{target:'a3'}),target=join(f.directory,'micro','one','0-active','target');await mkdir(target,{recursive:true});
+ const pointer=join(target,'.ascend-command-lease.json'),owner=await processIdentity();assert.equal(await ownerStopped(owner),false);
+ await writeFile(pointer,JSON.stringify({receipt:join(f.directory,'owned-lease.json'),token:'owned',pool:'fixture',physicalDevice:4,owner}));
+ const handle='remote:fixture:job:partial-upload',events=[{type:'device-lease-acquired',data:{receipt:join(f.directory,'owned-lease.json'),token:'owned',physicalDevice:4}},
+  {type:'execution-submitting',data:{operation:'setup',submission:'upload'}},{type:'execution-submitted',data:{submission:'upload',handle}},{type:'execution-handle',data:{handle}}];
+ const journal=join(target,'environment-events.jsonl');await writeFile(journal,events.map(JSON.stringify).join('\n')+'\n');
+ const report={status:'elapsed',results:[{projectId:'completed',correct:false,elapsedSeconds:12}],elapsedSeconds:48,partials:{'one/0/active':{timedOut:true,elapsedSeconds:48,allocatedSeconds:47}}};const file=join(f.directory,'micro/results.json'),bytes=JSON.stringify(report);await writeFile(file,bytes);await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));
+ let terminal=false,released=false,reconciled=0;
+ const deps={createEnvironment:async(_options,context)=>{assert.equal(context.instancePath,target);return {reconcileOperation:async()=>({closed:false,handles:[handle],accountingUnresolved:true}),observe:async id=>{assert.equal(id,handle);return {state:terminal?'stopped':'running'};},reconcileLease:async()=>{reconciled++;if(released)await rm(pointer,{force:true});return released;}};}};
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),false);terminal=true;assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),false);released=true;
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),true);assert(reconciled>0);assert.equal(await readFile(file,'utf8'),bytes);
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:()=>{throw Error('Stable closed custody repeated remote observations');}}),true);
+ events.push({type:'execution-submitting',data:{operation:'unknown-setup',submission:'unknown'}});await writeFile(journal,events.map(JSON.stringify).join('\n')+'\n');
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},deps),false);assert.equal(await readFile(file,'utf8'),bytes);
+});
+test('a marker-free setup start without identifiable admission cannot be inferred closed from known handles',async t=>{
+ const f=await fixture(t,{target:'a3'}),target=join(f.directory,'micro','one','0-active','target');await mkdir(target,{recursive:true});await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));
+ await writeFile(join(f.directory,'micro/results.json'),JSON.stringify({status:'elapsed',results:[],elapsedSeconds:1}));
+ await writeFile(join(target,'environment-events.jsonl'),[{type:'execution-starting',data:{operation:'unidentified'}},{type:'execution-handle',data:{handle:'remote:fixture:job:known'}},{type:'execution-state',data:{handle:'remote:fixture:job:known',state:'stopped'}}].map(JSON.stringify).join('\n')+'\n');
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:async()=>({reconcileOperation:async()=>({closed:false}),observe:async()=>({state:'stopped'}),reconcileLease:()=>{throw Error('Unidentified admission cannot be released');}})}),false);
+});
+
+test('multi-target settlement links the interrupted marker to its exact target proof',async t=>{
+ const f=await fixture(t,{target:'a3'}),markerTarget=join(f.directory,'micro','one','0-active','target');
+ for(const id of ['one','two']){
+  const target=join(f.directory,'micro',id,'0-active','target');await mkdir(target,{recursive:true});const handle='remote:fixture:job:'+id;
+  await writeFile(join(target,'environment-events.jsonl'),[{type:'execution-submitting',data:{submission:id}},{type:'execution-submitted',data:{submission:id,handle}},{type:'execution-handle',data:{handle}},{type:'execution-state',data:{handle,state:'stopped',nativeState:'completed'}}].map(JSON.stringify).join('\n')+'\n');
+ }
+ await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));const file=join(f.directory,'micro/results.json');await writeFile(file,JSON.stringify({status:'interrupted',elapsedSeconds:17,results:[],runningSample:{key:'one/0/active'}}));
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:()=>{throw Error('Recorded closed handles should not be replayed');}}),true);
+ const report=JSON.parse(await readFile(file,'utf8')),closure=JSON.parse(await readFile(report.settledInterruption.closure,'utf8'));assert.equal(closure.instancePath,markerTarget);assert.equal(report.settledInterruption.closures.length,2);assert.equal(report.elapsedSeconds,17);
+});

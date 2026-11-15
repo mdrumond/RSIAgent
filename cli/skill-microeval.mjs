@@ -200,6 +200,11 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     if(deadline.aborted){observed.timedOut=true;verification={correct:false,error:'Sample elapsed allocation exhausted'};}
     const result={projectId:task.id,taskId:task.id,kind:task.kind,scopes:task.scopes,run,arm,allocatedSeconds:allocation,...observed,elapsedSeconds:spent+(performance.now()-started)/1000,
      ...(verificationSeconds?{actorObservation:observed}:{}),correct:verification.correct,...(verification.receipt?.bucket?{bucket:verification.receipt.bucket}:{}),...(verification.receipt?{kernelSha256:verification.receipt.kernelSha256,latencySeconds:verification.receipt.latencySeconds}:{}),verification,skillsSha256:inputs[arm].sha256};
+    if(isKernelTask(task.kind)&&(sampleSignal.aborted||observed.timedOut||observed.actorTimedOut)){
+     report.partials??={};report.partials[key]=result;report.runningSample.needsClosure=true;report.runningSample.unresolvedExecution={reason:'sample-deadline-closure'};await persist();
+     let closed=false;try{closed=await dependencies.sampleSettled?.({cwd,task,signal:cleanupDeadline,sampleStopSignal:cleanupDeadline});}catch(error){report.runningSample.unresolvedExecution=unknownExecution(error)??{reason:error.message};throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}finally{result.elapsedSeconds=spent+(performance.now()-started)/1000;await persist();}
+     if(closed!==true)throw Object.assign(Error('Target sample deadline closure remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED'});
+    }
     delete report.runningSample;
     if(resume&&signal?.aborted){report.partials??={};report.partials[key]=result;}else{report.results.push(result);if(report.partials)delete report.partials[key];}
     await persist();signal?.throwIfAborted();
@@ -245,7 +250,7 @@ export async function finalizeKernelPairs({directory,python='python3',seconds,si
   if(pending.length&&left>0){
    signal?.throwIfAborted();report.pairedReplay.runningPair={projectId:'batch',run:0,owner:await processIdentity()};await save(join(directory,'results.json'),report);let rows;
    try{rows=await dependencies.measureBatch({directory,pairs:pending,seconds:left,signal});}
-   catch(error){const unknown=unknownExecution(error);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);throw error;}
+   catch(error){const unknown=unknownExecution(error)??(requireDevice&&signal?.aborted?{reason:'paired-deadline-closure'}:null);if(unknown){report.pairedReplay.runningPair.unresolvedExecution=unknown;await save(join(directory,'results.json'),report);throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);throw error;}
    delete report.pairedReplay.runningPair;await save(join(directory,'results.json'),report);signal?.throwIfAborted();const seen=new Set();
    for(const measured of rows){const job=pending.find(p=>p.task.id===measured.projectId&&p.run===measured.run),key=measured.projectId+'/'+measured.run;if(!job||seen.has(key))throw Error('Unknown or duplicate paired batch receipt');seen.add(key);await record(job.task,job.run,{active:job.active,candidate:job.candidate},job.pair,measured);}
   }
