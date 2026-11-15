@@ -881,6 +881,9 @@ test('repeated positively failed cleanup stops at elapsed observation allowance 
 for(const stage of ['payload-observe','control-prepare','control-observe','admission-read','upload-parent','transfer'])
 test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains its fence`,async t=>{
   const f=await fixture(t),controls=new Set(),parents=new Set(),receipts=new Set();
+  // Exercise the real CPU health parser before the narrow cleanup clock. Slow
+  // interpreter startup is setup work, not the hung-RPC behavior under test.
+  f.setEnabled([0]);await f.environment.inspectDevices();const healthHandle=f.lastProbe().handle;let reusedHealth=0;
   const heldTransfer='remote:fixture:transfer:held-cleanup-upload';
   let payload,observations=0,aborted=0,blocking=true,freshCancellation=0;
   const {createServer,connect}=await import('node:net'),sockets=new Set();
@@ -897,6 +900,10 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
     });
   };
   const client=async(args,{signal}={})=>{
+    if(args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('probe.sh')){
+      reusedHealth++;await writeFile(args[args.indexOf('--receipt-file')+1],JSON.stringify({handle:healthHandle}));
+      return {handle:healthHandle,state:'queued'};
+    }
     if(stage==='upload-parent'&&args[0]==='capabilities'&&f.commands.length)return {state:'available',backend:'ssh'};
     if(blocking&&stage==='transfer'&&args[0]==='upload'&&f.commands.length)
       return {state:'running',handle:heldTransfer};
@@ -924,7 +931,7 @@ test(`one independent cleanup deadline bounds a hung ${stage} RPC and retains it
   const environment=await createEnvironment({...f.options,probeObservationSeconds:1},{...f.context,client});
   await environment.prepare({project:{source:f.source},attempt:{id:'bounded-cleanup'}});
   const start=performance.now(),result=await environment.execute('payload-once',f.source,{timeout:5});
-  assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
+  assert.equal(reusedHealth,1);assert.equal(result.settled,false);assert.equal(result.exitCode,0);assert.ok(aborted>0);
   assert.equal(freshCancellation,0,'cleanup cancellation must not start a fresh RPC budget after its deadline');
   assert.ok(performance.now()-start<5000,'a hung cleanup must not receive fresh per-RPC observation windows');
   assert.equal(f.commands.length,1);assert.equal(f.events.some(event=>event.type==='device-lease-released'),false);
