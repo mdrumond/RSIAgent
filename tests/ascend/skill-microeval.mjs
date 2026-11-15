@@ -389,3 +389,36 @@ test('frozen split protocol uses independent actor and verification deadlines in
  assert.equal(actors,2);assert.equal(checks,2);assert.deepEqual(report.sampleProtocol,protocol);assert(report.results.every(row=>row.allocatedSeconds===1&&row.actorTimedOut&&!row.timedOut&&row.correct));
  await assert.rejects(runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.5,sampleProtocol:{...protocol,actorSeconds:.6}}),/Sample timing protocol differs/);
 });
+test('new verification phase refuses late correctness while legacy verification may use remaining actor time',async t=>{
+ for(const fresh of [true,false]){
+  const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.8,verificationSeconds:.2};let checks=0;
+  const report=await runMicroeval({...f,runs:1,seconds:1,verificationSeconds:.2,...(fresh?{sampleProtocol:protocol}:{})},{sample:async()=>({}),verify:async args=>{
+   checks++;assert.equal(args.signal===args.sampleSignal,!fresh);assert(fresh?args.seconds<=.2:args.seconds>.8);
+   if(fresh){await untilAbort(args.signal);assert.equal(args.sampleSignal.aborted,false);}return {correct:true};
+  }});
+  assert.equal(checks,2);assert(report.results.every(row=>row.correct===!fresh));if(fresh)assert(report.results.every(row=>row.verificationTimedOut&&!row.timedOut));
+ }
+});
+test('a verification-only target cutoff retains its marker and partial until positive SDK custody proof',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:.8,verificationSeconds:.2};let actors=0,closures=0;
+ const tasks=f.tasks.map(task=>({...task,kind:'target-kernel',target:'a3',bucket:'correctness'}));
+ await assert.rejects(runMicroeval({...f,tasks,runs:1,seconds:1,verificationSeconds:.2,sampleProtocol:protocol,objective:'correctness',binding:{target:'a3',environment:{health:{product:'a3'}}}},{sample:async()=>{actors++;return {};},verify:async args=>{
+  await untilAbort(args.signal);assert.equal(args.sampleSignal.aborted,false);return {correct:false};
+ },sampleSettled:async args=>{closures++;assert.equal(args.signal.aborted,false);return false;}}),{code:'RSI_EXECUTION_UNRESOLVED'});
+ const report=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8'));assert.equal(actors,1);assert.equal(closures,1);assert.equal(report.results.length,0);assert.equal(report.runningSample.needsClosure,true);assert.equal(report.partials['repair/0/active'].verificationTimedOut,true);assert.equal(report.partials['repair/0/active'].correct,false);
+ await assert.rejects(runMicroeval({...f,tasks,runs:1,seconds:1,verificationSeconds:.2,sampleProtocol:protocol,resume:true,objective:'correctness',binding:{target:'a3',environment:{health:{product:'a3'}}}},{sample:()=>assert.fail('Unresolved verifier cannot advance')}),/execution remains unresolved/);
+});
+test('an explicit zero reserve preserves whole-sample verification compatibility',async t=>{
+ const f=await fixture(t),protocol={version:1,sampleSeconds:1,actorSeconds:1,verificationSeconds:0};let checks=0;
+ const report=await runMicroeval({...f,runs:1,seconds:1,sampleProtocol:protocol},{sample:async()=>({}),verify:async args=>{checks++;assert(args.seconds>.8);assert.equal(args.signal,args.sampleSignal);return {correct:true};}});
+ assert.equal(checks,2);assert(report.results.every(row=>row.correct));
+});
+test('resuming new-protocol verification preserves its spent phase allowance without another actor turn',async t=>{
+ const f=await fixture(t),external=new AbortController(),protocol={version:1,sampleSeconds:1,actorSeconds:.6,verificationSeconds:.4},options={...f,runs:1,seconds:1,verificationSeconds:.4,sampleProtocol:protocol,resume:true};let actors=0,checks=0;
+ await assert.rejects(runMicroeval({...options,signal:external.signal},{sample:async()=>{actors++;return {};},verify:async args=>{
+  setTimeout(()=>external.abort(Error('Pause during verification')),100);await untilAbort(args.signal);return {correct:false};
+ }}),/Pause during verification/);
+ const before=JSON.parse(await readFile(join(f.directory,'results.json'),'utf8')),spent=before.partials['repair/0/active'].verificationElapsedSeconds;assert(spent>=.09&&spent<.4);
+ const report=await runMicroeval(options,{sample:async()=>{actors++;return {};},verify:async args=>{checks++;if(checks===1)assert(args.seconds<=.4-spent&&args.seconds>0);return {correct:true};}});
+ assert.equal(actors,2);assert.equal(checks,2);assert(report.results[0].verificationElapsedSeconds>=spent);assert(report.results.every(row=>row.correct));
+});
