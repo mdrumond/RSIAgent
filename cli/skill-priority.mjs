@@ -16,11 +16,15 @@ import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetaine
 const caseReadiness=async args=>(await import('./skill-priority-cases.mjs')).hypothesisCaseReadiness?.(args)??{ready:false};
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
-const recoveryRetirement=async run=>Boolean(run?.checkpoint?.unresolved&&run.checkpoint.evaluationDirectory&&run.checkpoint.evaluation?.binding?.environment&&run.owner&&await ownerStopped(run.owner));
-async function settledInterruption(checkpoint){
+async function evaluationReport(checkpoint){
  if(!checkpoint?.evaluationDirectory)return null;
- try{const report=JSON.parse(await readFile(join(checkpoint.evaluationDirectory,'micro','results.json'),'utf8'));return report.settledInterruption?report:null;}
+ try{return JSON.parse(await readFile(join(checkpoint.evaluationDirectory,'micro','results.json'),'utf8'));}
  catch(error){if(error.code!=='ENOENT')throw error;return null;}
+}
+const interruptedReport=report=>Boolean(report?.runningSample||report?.pairedReplay?.runningPair||report?.status==='interrupted');
+async function recoveryRetirement(run){
+ if(!run?.checkpoint?.evaluationDirectory||!run.checkpoint.evaluation?.binding?.environment||!run.owner||!await ownerStopped(run.owner))return false;
+ return Boolean(run.checkpoint.unresolved||interruptedReport(await evaluationReport(run.checkpoint)));
 }
 const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,...(cases.protocol?{protocol:cases.protocol}:{}),tasks:cases.tasks.map(task=>{
  const result={...task};for(const key of ['checker','pairedChecker'])if(task[key])result[key]=createHash('sha256').update(readFileSync(task[key])).digest('hex');return result;
@@ -95,15 +99,16 @@ export async function runPrioritySkills(config,values,dependencies={}){
   if(retained){
    const old=backlog.run(retained.id);
    if(old.owner&&!await ownerStopped(old.owner)&&JSON.stringify(old.owner)!==JSON.stringify(owner))return {status:'blocked',reason:'Retained hypothesis owner remains live'};
-   if(old.checkpoint?.unresolved){
+   const persistedReport=await evaluationReport(old.checkpoint);
+   if(old.checkpoint?.unresolved||interruptedReport(persistedReport)||persistedReport?.settledInterruption){
     const cp=old.checkpoint,elapsed=old.elapsed+(cp.runningAt?Math.max(0,Date.now()-cp.runningAt)/1000:0);
     cp.runningAt=Date.now();backlog.checkpoint(old.id,{elapsed,checkpoint:cp});
     const closed=await ops.settled({directory:executionDirectory(cp),config,resource:cp.resource,...cp.evaluation,retirePrePayload:await recoveryRetirement(old)}),charged=elapsed+Math.max(0,Date.now()-cp.runningAt)/1000;
-    if(closed){delete cp.unresolved;delete cp.runningAt;}else cp.runningAt=Date.now();
+    if(closed){delete cp.unresolved;delete cp.runningAt;}else{cp.unresolved=true;cp.runningAt=Date.now();}
     backlog.checkpoint(old.id,{elapsed:charged,checkpoint:cp});
     if(!closed)return {status:'blocked',reason:'Retained evaluation execution remains unresolved'};
-    const interrupted=await settledInterruption(cp);
-    if(interrupted)return backlog.finish(old.id,{status:'inconclusive',result:{reason:'execution-interrupted',decision:{objective:old.snapshot.objective,promote:false,reason:'execution-interrupted'},report:interrupted}});
+    const interrupted=await evaluationReport(cp);
+    if(interrupted?.settledInterruption)return backlog.finish(old.id,{status:'inconclusive',result:{reason:'execution-interrupted',decision:{objective:old.snapshot.objective,promote:false,reason:'execution-interrupted'},report:interrupted}});
    }
    if(old.base!==config.skills.activeVersion){
     if(executionDirectory(old.checkpoint)&&!await ops.settled({directory:executionDirectory(old.checkpoint),config,resource:old.checkpoint.resource,...old.checkpoint.evaluation}))return {status:'blocked',reason:'Stale-baseline execution remains unresolved'};
