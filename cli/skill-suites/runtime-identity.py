@@ -11,9 +11,13 @@ def identity():
     report = json.loads(Path(os.environ['RSI_SETUP_REPORT']).read_text())['identity']
     if not all(name in report['packages'] for name in ('torch', 'torch-npu', 'triton')):
         raise RuntimeError('A3 Torch-NPU and Triton packages required')
+    digests = {}
     def digest(path):
-        with Path(path).open('rb') as stream:
-            return hashlib.file_digest(stream, 'sha256').hexdigest()
+        path = Path(path).resolve()
+        if path not in digests:
+            with path.open('rb') as stream:
+                digests[path] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        return digests[path]
 
     packages = {name: {'version': data[0], 'record': data[2],
                       'sources': [digest(stamp[0]) for stamp in data[3]]}

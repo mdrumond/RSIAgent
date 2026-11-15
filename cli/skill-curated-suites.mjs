@@ -16,6 +16,12 @@ export function applicablePack(pack,item){
  const proposal=item.proposal??{},text=JSON.stringify(proposal.changes??proposal);
  return pack.objective===item.objective&&mechanisms[pack.id]?.test(text);
 }
+export async function curatedCatalogue({config,item}){
+ if(config.target!=='a3')return [];
+ const core=await asset('kernel-check-core.py'),identity=await asset('runtime-identity.py');
+ return (await curatedPacks()).filter(pack=>applicablePack(pack,item)).map(pack=>({id:'curated-'+pack.id,familyKey:'curated-'+pack.id,
+  target:'a3',objective:pack.objective,description:pack.description,mechanism:pack.id,tags:pack.tags,curated:true,descriptorFingerprint:sha({pack,core,identity})}));
+}
 function wrapper(bundle,config,paired=false){
  const action=paired?'m.pair(sys.argv[1],sys.argv[2],CONFIG)':'m.main(sys.argv[1],CONFIG)';
  return 'import importlib.util,json,pathlib,sys,tempfile\nBUNDLE=json.loads('+JSON.stringify(JSON.stringify(bundle))+')\nCONFIG=json.loads('+JSON.stringify(JSON.stringify(config))+')\n'+

@@ -21,3 +21,20 @@ success or kernel speedup: those require the existing frozen A/B experiment.
 CPU numeric tests verify comparator behavior on bounded existing fixtures only.
 They do not establish NPU arithmetic, compilation, first-call launch or timing.
 The packs are A3 templates; they do not establish A5 compatibility.
+
+Case discovery and semantic selection use local catalogue descriptors before
+requesting a device. Only a selected curated A3 pack requests this pack's
+Triton-based runtime identity; CPU diagnostics and existing A5 catalogues retain
+their target-specific paths. Configured catalogues may scope applicability with
+`proposalIds`, `backlogIds` or `scopes`; final semantic selection still applies.
+
+`qualifyHypothesisTasks` retains its public signature and root directory. It
+reuses an already-qualified root without executing controls. Known transient
+harness/closed-transport failures may continue only after positive closure,
+under the first attempt's stored elapsed allocation. The original blocked report
+stays immutable; `qualification-continuation.json` indexes the current child
+attempt under `continuations/`. Root settlement follows that index before any
+child can be considered closed, and the returned `directory` identifies the
+actual report. Passed control receipts and cumulative elapsed time carry forward;
+bad controls, invalid receipts, elapsed failures and unresolved work do not become
+qualified. A larger allowance from a later caller cannot renew the first one.

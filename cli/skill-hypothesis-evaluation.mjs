@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='rsi-check-') as temporary:
   if code is None: break
 `;
  await mkdir(dirname(checker),{recursive:true});await writeFile(checker,script);const result=await execute();
- if(result.exitCode!==0)throw Error('Trusted batch command failed');
+ if(result.exitCode!==0)throw Object.assign(Error('Trusted batch command failed'),{code:'TRUSTED_BATCH_CLOSED',closure:{closed:true,handles:result.handle?[result.handle]:[]},verification:result});
  const rows=result.output.trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));const keys=new Set();
  for(const row of rows){const entry=plan.find(e=>e.key===row.key);if(!entry||keys.has(row.key)||!row.sourceFilesMatch||row.checkerSha256!==entry.checkerSha256)throw Error('Batch control source, checker or identity changed');keys.add(row.key);row.correct=row.exitCode===0;row.handle=result.handle;row.outputEvidence=result.outputEvidence;}
  return rows;
@@ -164,6 +164,8 @@ export async function evaluateHypothesis({directory,config,objective,target,task
 
 export async function hypothesisEvaluationSettled({directory,config={},binding,resource,signal},dependencies={}){
  try{
+  const continuation=await optional(join(directory,'qualification-continuation.json'));
+  if(continuation)return hypothesisEvaluationSettled({directory:continuation.directory,config,binding,resource,signal},dependencies);
   const file=join(directory,'micro','results.json'),bytes=await readFile(file,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;});
   if(!bytes)return true;const report=JSON.parse(bytes);
   if(report.owner&&!await ownerStopped(report.owner))return false;
@@ -216,20 +218,57 @@ export async function hypothesisEvaluationSettled({directory,config={},binding,r
  }catch{return false;}
 }
 
-/** Qualify a NEW learned test contract before spending model work on either arm. */
-export async function qualifyHypothesisTasks({directory,config,objective,target,tasks,binding,remainingSeconds,signal,resource},dependencies={}){
+const qualificationFailure=results=>{
+ const failed=results.filter(result=>!result.passed);
+ return failed.length&&failed.every(result=>result.verification.exitCode===125&&result.verification.receipt?.bucket==='harness')?'infrastructure':'controls';
+};
+/** A closed infrastructure failure may continue under its original elapsed allocation. */
+export async function qualifyHypothesisTasks(args,dependencies={}){
+ const {directory,remainingSeconds}=args;
+ if(!Number.isFinite(remainingSeconds)||remainingSeconds<=0||remainingSeconds>1800)throw Error('Remaining hypothesis elapsed allocation must be in (0,1800]');
+ const begun=performance.now(),redirect=await optional(join(directory,'qualification-continuation.json'));
+ if(redirect)return qualifyHypothesisTasks({...args,directory:redirect.directory,remainingSeconds:Math.max(.001,remainingSeconds-(performance.now()-begun)/1000)},dependencies);
+ const file=join(directory,'micro','results.json'),report=await optional(file);
+ if(report?.status==='blocked'&&report.failureKind==='infrastructure'&&Number.isFinite(report.allocationSeconds)){
+  const ledgerFile=join(directory,'qualification-recovery.json'),ledger=await optional(ledgerFile)??{elapsedSeconds:0},previous=ledger.elapsedSeconds;
+  const spent=()=>report.elapsedSeconds+previous+(performance.now()-begun)/1000;
+  if(Math.min(remainingSeconds,report.allocationSeconds-spent())<=30)return {status:'blocked',reason:'Qualification elapsed allocation exhausted',identity:report.identity,receipts:report.results,elapsedSeconds:spent(),directory};
+  const persist=()=>save(ledgerFile,{elapsedSeconds:previous+(performance.now()-begun)/1000});
+  let pending=Promise.resolve();const timer=setInterval(()=>{pending=pending.then(persist);},1000);let closed;
+  try{closed=await (dependencies.settled??hypothesisEvaluationSettled)({...args},dependencies);}
+  finally{clearInterval(timer);await pending;await persist();}
+  if(!closed)return {status:'blocked',reason:'Qualification infrastructure execution remains unresolved',identity:report.identity,receipts:report.results,elapsedSeconds:spent(),directory};
+  const elapsedSeconds=spent(),left=Math.min(remainingSeconds-(performance.now()-begun)/1000,report.allocationSeconds-elapsedSeconds);
+  if(left<=30)return {status:'blocked',reason:'Qualification elapsed allocation exhausted',identity:report.identity,receipts:report.results,elapsedSeconds,directory};
+  const next=join(directory,'continuations',randomUUID());await mkdir(join(next,'micro'),{recursive:true});
+  const continuation={from:directory,at:new Date().toISOString(),closed:true,elapsedSeconds,originalAllocationSeconds:report.allocationSeconds};
+  const carried={...report,status:'running',elapsedSeconds,results:report.results.filter(result=>result.passed),continuation};
+  delete carried.reason;delete carried.failureKind;delete carried.owner;delete carried.runningSample;
+  await save(join(next,'micro','results.json'),carried);
+  await save(join(directory,'qualification-continuation.json'),{directory:next,...continuation}); // Custody is indexed before any child command.
+  return qualifyHypothesisTasks({...args,directory:next,remainingSeconds:left},dependencies);
+ }
+ return {...await qualifyAttempt(args,dependencies),directory};
+}
+
+/** Qualify controls once; bad references and elapsed failures never renew. */
+async function qualifyAttempt({directory,config,objective,target,tasks,binding,remainingSeconds,signal,resource},dependencies={}){
  objective??=tasks?.[0]?.bucket;const prepared=prepareHypothesisEvaluation({objective,target,tasks,binding});if(prepared.status!=='ready')return {status:'needs-learning',reason:prepared.reason};
  if(tasks.some(t=>typeof t.controls?.reference?.files?.['kernel.py']!=='string'||!Array.isArray(t.controls.negatives)||!t.controls.negatives.length||t.controls.negatives.some(c=>typeof c.files?.['kernel.py']!=='string')))return {status:'needs-learning',reason:'Reference and independent negative controls required'};
  if(!Number.isFinite(remainingSeconds)||remainingSeconds<=0||remainingSeconds>1800)throw Error('Remaining hypothesis elapsed allocation must be in (0,1800]');
- const begun=performance.now(),available=()=>Math.max(0,remainingSeconds-(performance.now()-begun)/1000);
+ const begun=performance.now();let allocationSeconds=remainingSeconds,priorElapsed=0;
+ const available=()=>Math.max(0,Math.min(remainingSeconds,allocationSeconds-priorElapsed)-(performance.now()-begun)/1000);
  const frozen=await Promise.all(tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),...(task.pairedChecker?{pairedChecker:await readFile(task.pairedChecker,'utf8')}:{})})));
  const {knowledge,...runtimeBinding}=binding,identity=hash({target,tasks:frozen,binding:runtimeBinding});
  const micro=join(directory,'micro'),file=join(micro,'results.json');await mkdir(join(micro,'frozen'),{recursive:true});
  let report=await optional(file);if(report&&report.identity!==identity)throw Error('Frozen qualification contract changed');
  if(report?.runningSample)throw Object.assign(Error('Qualification execution remains unresolved'),{code:'RSI_EXECUTION_UNRESOLVED',handle:report.runningSample.unresolvedExecution?.handle});
+ if(report?.owner&&!await ownerStopped(report.owner))throw Object.assign(Error('Qualification owner remains live'),{code:'RSI_EXECUTION_UNRESOLVED'});
+ if(report?.status==='running'&&report.results.some(result=>!result.passed)){report.status='blocked';report.failureKind=qualificationFailure(report.results);report.reason='Interrupted failed control remains unqualified';await save(file,report);return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
  if(report?.settledInterruption||report?.status==='blocked')return {status:'blocked',reason:report.reason??'Qualification execution interrupted',identity,receipts:report.results};
  if(report?.status==='qualified')return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
- report??={kind:'qualification',identity,status:'running',results:[],elapsedSeconds:0};const previous=report.elapsedSeconds;
+ priorElapsed=report?.elapsedSeconds??0;allocationSeconds=report?.allocationSeconds??priorElapsed+remainingSeconds;
+ report??={kind:'qualification',identity,status:'running',results:[],elapsedSeconds:0,allocationSeconds};report.allocationSeconds??=allocationSeconds;const previous=report.elapsedSeconds;
  const persist=async()=>{report.elapsedSeconds=previous+(performance.now()-begun)/1000;await save(file,report);};
  await save(join(directory,'hypothesis.json'),{identity,target,binding:runtimeBinding});report.owner=await processIdentity();await persist();
  const cleanup=AbortSignal.timeout(Math.max(1,Math.ceil(available()*1000))),ops=target==='cpu'?{}:hypothesisTarget({root:resolve(directory),binding,resource,signal,stopSignal:cleanup,localExecution:config.local_execution},dependencies);
@@ -237,23 +276,23 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
   if(target!=='cpu'&&!dependencies.verify){
    const entries=[];for(const task of frozen)for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){const key=task.id+'/0/'+arm;if(!report.results.some(r=>r.key===key))entries.push({key,cwd:task.id+'-'+arm,files:{...task.files,...control.files},checker:task.checker,args:['.'],expectedExit,requireDevice:true});}
    if(entries.length){
-    const seconds=available()-30;if(seconds<=0)return {status:'blocked',reason:'Qualification elapsed allocation exhausted',identity,receipts:report.results};
+    const seconds=available()-30;if(seconds<=0){report.status='blocked';report.failureKind='elapsed';report.reason='Qualification elapsed allocation exhausted';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
     report.runningSample={key:'qualification/0/batch',owner:report.owner};await persist();const deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),work=signal?AbortSignal.any([signal,deadline]):deadline;let rows;
     try{rows=await ops.qualifyBatch({directory,entries,seconds,signal:work,sampleStopSignal:cleanup});}
-    catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;if(signal?.aborted)throw error;report.status='blocked';report.reason=error.message;return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;if(signal?.aborted)throw error;report.status='blocked';report.failureKind=error.closure?.closed===true?'infrastructure':'controls';report.reason=error.message;report.closure=error.closure;report.verification=error.verification;return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
     delete report.runningSample;signal?.throwIfAborted();
     for(const row of rows){const entry=entries.find(e=>e.key===row.key),cwd=join(micro,'qualification','0-batch','work',entry.cwd);let verification=row;
-     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false,requireDevice:entry.requireDevice});}catch(error){verification={...row,correct:null,error:error.message};}
+     if(row.exitCode===125||entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false,requireDevice:entry.requireDevice});}catch(error){verification={...row,correct:null,error:error.message};}
      const passed=!deadline.aborted&&row.exitCode===entry.expectedExit&&verification.correct===(entry.expectedExit===0);report.results.push({key:row.key,expectedExit:entry.expectedExit,passed,sourceSha256:hash(entry.files),elapsedSeconds:row.elapsedSeconds,verification});await persist();
     }
-    if(rows.length!==entries.length||report.results.some(r=>!r.passed)){report.status='blocked';report.reason='Reference or negative control did not qualify';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    if(rows.length!==entries.length||report.results.some(r=>!r.passed)){report.status='blocked';report.failureKind=deadline.aborted||rows.length!==entries.length?'elapsed':qualificationFailure(report.results);report.reason='Reference or negative control did not qualify';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
    }
    report.status='qualified';return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
   }
   for(const task of frozen){const checker=join(micro,'frozen',task.id+'.py');await writeFile(checker,task.checker);
    for(const [arm,control,expectedExit]of [['reference',task.controls.reference,0],...task.controls.negatives.map((c,n)=>['negative-'+n,c,1])]){
     const key=task.id+'/0/'+arm;if(report.results.some(r=>r.key===key))continue;signal?.throwIfAborted();
-    const seconds=Math.min(180,available()-30);if(seconds<=0){report.status='blocked';report.reason='Qualification elapsed allocation exhausted';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    const seconds=Math.min(180,available()-30);if(seconds<=0){report.status='blocked';report.failureKind='elapsed';report.reason='Qualification elapsed allocation exhausted';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
     const cwd=join(micro,task.id,'0-'+arm,'work'),files={...task.files,...control.files};await mkdir(cwd,{recursive:true});
     for(const [name,text]of Object.entries(files)){const path=resolve(cwd,name),rel=relative(cwd,path);if(!rel||rel==='..'||rel.startsWith('../'))throw Error('Control files must remain inside their source');await mkdir(dirname(path),{recursive:true});await writeFile(path,text);}
     report.runningSample={key,owner:report.owner};await persist();const start=performance.now(),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),work=signal?AbortSignal.any([signal,deadline]):deadline;let verification;
@@ -266,7 +305,7 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
     delete report.runningSample;if(signal?.aborted)signal.throwIfAborted();
     const passed=!deadline.aborted&&verification.exitCode===expectedExit&&verification.correct===(expectedExit===0);
     report.results.push({key,expectedExit,passed,elapsedSeconds:(performance.now()-start)/1000,sourceSha256:hash(files),verification});await persist();
-    if(!passed){report.status='blocked';report.reason=expectedExit===0?'Reference control failed':'Negative control was not independently rejected';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
+    if(!passed){report.status='blocked';report.failureKind=deadline.aborted||verification.exitCode===null?'elapsed':verification.exitCode===125&&verification.receipt?.bucket==='harness'?'infrastructure':'controls';report.reason=expectedExit===0?'Reference control failed':'Negative control was not independently rejected';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
    }
   }
   report.status='qualified';return {status:'qualified',identity,receipts:report.results,elapsedSeconds:report.elapsedSeconds};
