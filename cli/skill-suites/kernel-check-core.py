@@ -76,6 +76,7 @@ def runtime(expected):
     actual = {'torch': torch.__version__, 'torch_npu': torch_npu.__version__, 'triton': triton.__version__}
     try:
         torch.npu.set_device(0)
+        receipt['device'] = 'npu:' + str(torch.npu.current_device())
     except Exception as error:
         raise HarnessRefusal('NPU initialization failed before candidate import: ' + str(error)) from error
     receipt['runtime'] = actual
