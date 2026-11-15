@@ -9,6 +9,7 @@ import {reviewSession} from './skill-review-native.mjs';
 import {prepareHypothesisEvaluation,hypothesisTarget} from './skill-hypothesis-evaluation.mjs';
 import {curatedCatalogue,prepareCuratedSuites} from './skill-curated-suites.mjs';
 import {randomUUID} from 'node:crypto';
+import {caseSelectionEvidence} from './skill-case-evidence.mjs';
 
 const digest=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 export async function suiteFingerprint(suite,baseDirectory=process.cwd()){
@@ -110,11 +111,13 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
  }
  suites=suites.filter(s=>s.objective===item.objective&&(s.target===config.target||s.target==='cpu'&&item.objective==='correctness'));
  const selectionCatalogueIdentity=digest(await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:suite.descriptorFingerprint??await suiteFingerprint(suite,config.root)}))));
- const selectionIdentity=digest([proposalIdentity,selectionCatalogueIdentity]);
+ const evidence=await caseSelectionEvidence({config,item:{...item,proposal},suites,cachedSuites:local.suites,directory:join(directory,'catalogue-evidence')});
+ const evidenceGroups=[...(item.evidence?.groups??[]),...evidence.groups];
+ const selectionIdentity=digest(['inspectable-cases-v1',proposalIdentity,selectionCatalogueIdentity,evidence.identity,digest(item.evidence?.groups??[])]);
  const validate=value=>{if(!value||!value.reason?.trim()||value.catalogueId!==null&&!suites.some(s=>s.id===value.catalogueId))throw Error('Choose a supplied matching suite or null with a reason');return value;};
- const selection=suites.length?await (dependencies.select??reviewSession)({directory:join(directory,'selection',selectionIdentity),config,signal,seconds:Math.min(60,seconds),
-  prompt:{task:'Select one hypothesis-relevant evaluation suite or none. Return {catalogueId:null|string,reason}. The cases must directly exercise the proposed skill mechanism and boundaries. CPU contract/report tasks cannot validate device arithmetic, compiler behavior or kernel performance. Do not select merely because scopes overlap.',
-   hypothesis:{objective:item.objective,proposal},catalogues:suites.map(({id,description,target,objective})=>({id,description,target,objective}))},validate}):{value:{catalogueId:null,reason:'No target-compatible evaluation suite'}};
+ const selection=suites.length?await (dependencies.select??reviewSession)({directory:join(directory,'selection',selectionIdentity),config,signal,seconds:Math.min(60,seconds),allowedPaths:evidence.allowedPaths,evidenceGroups,
+  prompt:{groups:evidenceGroups,task:'Select one hypothesis-relevant evaluation suite or none. Return {catalogueId:null|string,reason}. The cases must directly exercise the proposed skill mechanism and boundaries. CPU contract/report tasks cannot validate device arithmetic, compiler behavior or kernel performance. Do not select merely because scopes overlap. Inspect the supplied case manifests, source files and qualification snapshots. Specifications establish what the cases test; stored reference/negative qualification is not evidence of a skill improvement, and target qualification is checked separately after selection.',
+   hypothesis:{objective:item.objective,proposal},catalogues:evidence.catalogues},validate}):{value:{catalogueId:null,reason:'No target-compatible evaluation suite'}};
  const chosen=validate(selection.value??selection);let suite=suites.find(s=>s.id===chosen.catalogueId);
  if(suite){
   let runtimeIdentity;
@@ -126,7 +129,7 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
    suite=(await (dependencies.curatedSuites??prepareCuratedSuites)({config,directory:join(config.root,'skills','priority','curated'),runtimeIdentity,item:{...item,proposal}})).find(candidate=>candidate.id===chosen.catalogueId);
    if(!suite)throw Error('Selected curated suite is no longer applicable');
   }
-  const catalogueIdentity=digest({selectionCatalogueIdentity,runtimeIdentity,fingerprint:await suiteFingerprint(suite,config.root)});
+  const catalogueIdentity=digest({selectionCatalogueIdentity,caseEvidenceIdentity:evidence.identity,runtimeIdentity,fingerprint:await suiteFingerprint(suite,config.root)});
   if(cached?.proposalIdentity===proposalIdentity&&cached.catalogueIdentity===catalogueIdentity)return cached;
   const frozen=join(directory,'frozen',digest([selectionIdentity,catalogueIdentity]));await mkdir(frozen,{recursive:true});
   suite={...suite,tasks:await Promise.all(suite.tasks.map(async(task,index)=>{
