@@ -156,6 +156,7 @@ test('A5 control qualification uses the bound environment and trusted source rec
  const file=join(f.directory,'micro/results.json'),saved=JSON.parse(await readFile(file,'utf8'));saved.status='running';saved.results=saved.results.slice(0,8);await writeFile(file,JSON.stringify(saved));
  const resumed=await qualifyHypothesisTasks({...f,resource,remainingSeconds:800},deps);assert.equal(resumed.status,'qualified');assert.deepEqual(counts,[10,2]);assert.deepEqual(resumed.receipts.slice(0,8),saved.results);
  const bad=await fixture(t,{target:'a5'});bad.tasks=controls(bad.tasks);await writeFile(bad.tasks[0].checker,await readFile(f.tasks[0].checker));bad.tasks[0].controls.negatives[0].files['kernel.py']='answer=42\n';const rejected=await qualifyHypothesisTasks({...bad,resource},deps);assert.equal(rejected.status,'blocked');assert.ok(rejected.receipts.some(r=>r.expectedExit===1&&!r.passed));
+ const terminalBytes=await readFile(join(bad.directory,'micro/results.json'),'utf8'),beforeCommands=commands;const terminal=await qualifyHypothesisTasks({...bad,resource,remainingSeconds:1800},{...deps,settled:()=>{throw Error('Bad control retried');}});assert.equal(terminal.status,'blocked');assert.equal(commands,beforeCommands);assert.equal(await readFile(join(bad.directory,'micro/results.json'),'utf8'),terminalBytes);
 
 });
 test('unknown qualification execution is retained and positive closure never turns it into a passing control',async t=>{
@@ -213,4 +214,34 @@ test('paired work deadline is inconclusive while external cancellation and unkno
   if(mode==='deadline'){const result=await invoke();assert.equal(finalizationStarted,true);assert.equal(result.status,'elapsed');assert.equal(result.decision.promote,false);assert.equal(JSON.parse(await readFile(join(f.directory,'micro/results.json'),'utf8')).status,'elapsed');}
   else if(mode==='external')await assert.rejects(invoke(),/operator cancellation/);else await assert.rejects(invoke(),{code:'RSI_EXECUTION_UNRESOLVED'});
  }
+});
+test('settled transient qualification resumes immutably under the original allocation and keeps root custody',async t=>{
+ const f=await fixture(t,{target:'a3'});f.tasks=controls(f.tasks);let commands=0,closed=false;
+ const source="import sys,pathlib,runpy,json,hashlib,os\np=pathlib.Path(sys.argv[1])/'kernel.py';ok=runpy.run_path(str(p)).get('answer')==42\nif os.environ.get('QUALIFICATION_TRANSIENT')=='1':\n print(json.dumps(dict(correct=None,bucket='harness',kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'reason':'fixture busy'})));raise SystemExit(125)\nprint(json.dumps(dict(correct=ok,kernelSha256=hashlib.sha256(p.read_bytes()).hexdigest(),evidence={'device':'npu:0','fixture':True})))\nraise SystemExit(0 if ok else 1)\n";
+ await writeFile(f.tasks[0].checker,source);
+ const deps={settled:async()=>closed,createEnvironment:async()=>{let checker;return {prepare:async p=>{checker=p.project.verifier.files[0];},execute:async(_cmd,cwd,opts)=>{
+  commands++;if(commands===2){const index=JSON.parse(await readFile(join(f.directory,'qualification-continuation.json'),'utf8'));const child=JSON.parse(await readFile(join(index.directory,'micro/results.json'),'utf8'));assert(child.runningSample);}
+  const r=spawnSync(f.config.python,[checker,cwd],{cwd,encoding:'utf8',timeout:Math.ceil(opts.timeout*1000),maxBuffer:1048576,env:{...process.env,QUALIFICATION_TRANSIENT:commands===1?'1':'0'}});
+  opts.onData(r.stdout);return {correct:r.status===0,exitCode:r.status,output:r.stdout,error:r.stderr,settled:true,handle:'local:control-'+commands};
+ }};}};
+ const first=await qualifyHypothesisTasks(f,deps);assert.equal(first.status,'blocked');assert.equal(commands,1);
+ const file=join(f.directory,'micro/results.json'),bytes=await readFile(file,'utf8'),before=JSON.parse(bytes);assert.equal(before.failureKind,'infrastructure');
+ const blocked=await qualifyHypothesisTasks({...f,remainingSeconds:1800},deps);assert.equal(blocked.status,'blocked');assert.equal(commands,1);assert.equal(await readFile(file,'utf8'),bytes);
+ closed=true;const resumed=await qualifyHypothesisTasks({...f,remainingSeconds:1800},deps);assert.equal(resumed.status,'qualified');assert.equal(commands,2);assert.notEqual(resumed.directory,f.directory);assert.equal(await readFile(file,'utf8'),bytes);
+ const after=JSON.parse(await readFile(join(resumed.directory,'micro/results.json'),'utf8'));assert.equal(after.allocationSeconds,before.allocationSeconds);assert(after.elapsedSeconds>=before.elapsedSeconds);assert(after.results.every(r=>r.passed));
+ const cached=await qualifyHypothesisTasks({...f,remainingSeconds:1800},{...deps,createEnvironment:()=>{throw Error('Qualified controls replayed');}});assert.equal(cached.status,'qualified');assert.equal(cached.directory,resumed.directory);
+ const active={...after,status:'running',runningSample:{key:'qualification/0/batch',unresolvedExecution:{handle:'remote:fixture:job:still-running'}}};delete active.owner;await writeFile(join(resumed.directory,'micro/results.json'),JSON.stringify(active));
+ assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:async()=>({observe:async()=>({state:'running'})})}),false);
+});
+test('new caller allowance cannot renew an exhausted infrastructure qualification',async t=>{
+ const f=await fixture(t);f.tasks=controls(f.tasks);
+ await qualifyHypothesisTasks({...f,remainingSeconds:60});
+ const file=join(f.directory,'micro/results.json'),report=JSON.parse(await readFile(file,'utf8'));report.status='blocked';report.failureKind='infrastructure';report.elapsedSeconds=40;report.allocationSeconds=60;await writeFile(file,JSON.stringify(report));const bytes=await readFile(file,'utf8');
+ const result=await qualifyHypothesisTasks({...f,remainingSeconds:1800},{settled:()=>{throw Error('Exhausted work attempted recovery');}});assert.equal(result.status,'blocked');assert.equal(await readFile(file,'utf8'),bytes);
+});
+
+test('a crash after recording a failed control cannot turn its partial checkpoint into qualified evidence',async t=>{
+ const f=await fixture(t);f.tasks=controls(f.tasks);await qualifyHypothesisTasks(f);
+ const file=join(f.directory,'micro/results.json'),report=JSON.parse(await readFile(file,'utf8'));report.status='running';report.results=report.results.slice(0,1);report.results[0].passed=false;report.results[0].verification={correct:false,exitCode:1,output:'fixture numerical failure'};await writeFile(file,JSON.stringify(report));
+ const result=await qualifyHypothesisTasks({...f,remainingSeconds:800},{verify:()=>{throw Error('Known failed control was retried');}});assert.equal(result.status,'blocked');assert.equal(result.receipts.length,1);assert.equal(result.receipts[0].passed,false);
 });

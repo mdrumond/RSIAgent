@@ -40,12 +40,21 @@ class RuntimeIdentityControls(unittest.TestCase):
             report = home / 'setup.json'
             report.write_text(json.dumps({'identity': identity}))
             board = SimpleNamespace(stdout='Chip Name : fixture-a3\n')
+            source_reads = []
+            original_open = Path.open
+            def record_open(path, *args, **kwargs):
+                if path.resolve() == source.resolve() and args and args[0] == 'rb':
+                    source_reads.append(path)
+                return original_open(path, *args, **kwargs)
             with patch.dict(os.environ, RSI_SETUP_REPORT=str(report), ASCEND_PHYSICAL_DEVICE='4'), \
-                    patch.object(module.subprocess, 'run', return_value=board):
+                    patch.object(module.subprocess, 'run', return_value=board), \
+                    patch.object(Path, 'open', new=record_open):
                 first = module.identity()
+                self.assertEqual(len(source_reads), 1)
                 # The probe crosses JSON before a fresh checker recomputes identity.
                 wire_identity = json.loads(json.dumps(first))
                 self.assertEqual(wire_identity, module.identity())
+                self.assertEqual(len(source_reads), 2)
                 identity['python'][1] = ['other-python-path', 30, 40]
                 for data in identity['packages'].values():
                     data[1] = 'relocated-installation'
@@ -64,6 +73,22 @@ class RuntimeIdentityControls(unittest.TestCase):
 
 
 class CuratedNumericControls(unittest.TestCase):
+    def test_output_container_and_arity_match_frozen_contracts(self):
+        core = load(ROOT / 'cli/skill-suites/kernel-check-core.py', 'container_core')
+        core.torch = torch
+        tensor = torch.ones(2)
+        for family in ('masked', 'gemm', 'gated'):
+            with self.subTest(family=family, result='tensor'):
+                self.assertIs(core.contract_outputs(tensor, family)[0], tensor)
+            for wrong in ((tensor,), [tensor], (tensor, tensor.clone()), [tensor, tensor.clone()]):
+                with self.subTest(family=family, result=type(wrong).__name__), self.assertRaises(AssertionError):
+                    core.contract_outputs(wrong, family)
+        for correct in ((tensor, tensor.clone()), [tensor, tensor.clone()]):
+            self.assertEqual(len(core.contract_outputs(correct, 'splitk')), 2)
+        for wrong in (tensor, (), (tensor,), (tensor, tensor.clone(), tensor.clone()), [tensor, 'not-a-tensor']):
+            with self.subTest(splitk=type(wrong).__name__), self.assertRaises(AssertionError):
+                core.contract_outputs(wrong, 'splitk')
+
     def test_references_and_independent_wrong_outputs(self):
         torch.set_num_threads(1)
         core = load(ROOT / 'cli/skill-suites/kernel-check-core.py', 'curated_core')

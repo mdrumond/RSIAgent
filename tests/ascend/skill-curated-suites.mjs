@@ -6,11 +6,12 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {curatedPacks,prepareCuratedSuites,applicablePack} from '../../cli/skill-curated-suites.mjs';
-import {resolveHypothesisCases,hypothesisCaseReadiness} from '../../cli/skill-priority-cases.mjs';
+import {resolveHypothesisCases,hypothesisCaseReadiness,registerQualifiedSuite} from '../../cli/skill-priority-cases.mjs';
 import {hypothesisTarget,hypothesisEvaluationSettled,qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
 import {validateKernelReceipt} from '../../cli/skill-microeval.mjs';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
+import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
 const runtime={setup:{packages:{torch:['fixture'],triton:['fixture'],'torch-npu':['fixture']},compilers:{hivmc:['revision-a']},cann:{}},cannVersions:{manifest:'a'},product:'fixture-a3'};
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'curated-suites-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -110,4 +111,39 @@ finally:assert calls==([['set',0]] if fail else [['set',0],['current']]),calls
   if(mode==='pass'){assert.equal(checked.receipt.evidence.device,'npu:0');assert.equal(checked.receipt.evidence.physicalDevice,4);assert.equal(checked.receipt.evidence.queries.health,'unit-fixture');}
   else{assert.equal(checked.correct,null);assert.equal(checked.receipt.evidence.device,undefined);}
  }
+});
+
+async function customSuite(f,{target='cpu',proposalIds=['custom-rule']}={}){
+ const checker=join(f.root,'custom-checker.py');await writeFile(checker,"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n");
+ return {id:'custom-'+target,target,objective:'correctness',proposalIds,binding:target==='cpu'?{target}:{target,environment:f.config.environment.options},
+  tasks:Array.from({length:5},(_,i)=>({id:'custom-'+i,kind:target==='cpu'?'hypothesis-case':'target-kernel',target,bucket:'correctness',prompt:'Repair the returned value',checker,files:{'kernel.py':'answer=0'},controls:{reference:{files:{'kernel.py':'answer=42'}},negatives:[{files:{'kernel.py':'answer=0'}}]}}))};
+}
+test('real readiness enumerates configured and noncurated shared suites ahead of unsupported hypotheses',async t=>{
+ const f=await fixture(t),suite=await customSuite(f);f.config.skills.priority.evaluations=[suite];
+ const item={id:'ready',objective:'correctness',priority:1,proposal:{changes:[{id:'custom-rule',scope:'implementation',text:'Compute the returned answer'}]}};
+ assert.equal((await hypothesisCaseReadiness({...f,item})).ready,true);
+ for(let i=0;i<7;i++)assert.equal((await hypothesisCaseReadiness({...f,item:{...item,id:'unsupported-'+i,priority:100+i,proposal:{changes:[{id:'different-'+i,text:'Different mechanism'}]}}})).supported,false);
+ const qualification=await qualifyHypothesisTasks({...suite,config:f.config,directory:join(f.root,'custom-qualification'),remainingSeconds:120});assert.equal(qualification.status,'qualified');
+ await registerQualifiedSuite({config:f.config,suite,qualification});f.config.skills.priority.evaluations=[];
+ assert.equal((await hypothesisCaseReadiness({...f,item})).ready,true);
+});
+test('verified learned cases are visible to cheap readiness without device probes or model calls',async t=>{
+ const f=await fixture(t),item={id:'learned-item',objective:'correctness',proposal:{changes:[{id:'learned-new',text:'Compute the returned answer'}]}},trusted=join(f.root,'trusted');await mkdir(trusted);
+ const files={'checker.py':"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n",'reference.py':'answer=42','starter.py':'answer=0'};
+ for(const [name,text]of Object.entries(files))await writeFile(join(trusted,name),text);
+ const tasks=Array.from({length:5},(_,i)=>({id:'learned-'+i,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Return the computed answer',checker:'checker.py',files:{'kernel.py':'starter.py'},controls:{reference:{files:{'kernel.py':'reference.py'}},negatives:[{files:{'kernel.py':'starter.py'}}]}}));
+ const manifest=join(trusted,'skill-evaluation.json');await writeFile(manifest,JSON.stringify({target:'cpu',objective:'correctness',tasks}));const editable=join(f.root,'editable');await mkdir(editable);
+ f.state.add({id:'learned-project',goal:'Check answer',actor_seconds:30,source:editable,verifier:{files:[manifest,...Object.keys(files).map(name=>join(trusted,name))]}});
+ const request=enqueueLearningRequest(f.state,{backlogId:item.id,target:'a3',question:'A bounded answer case',requiredEvidence:'Reference and negatives',findings:{projectId:'learned-project',outcome:'passed'}});f.state.db.prepare("UPDATE skill_learning_requests SET status='verified' WHERE id=?").run(request);
+ const readiness=await hypothesisCaseReadiness({...f,item});assert.equal(readiness.supported,true);assert.equal(readiness.ready,false);
+});
+test('CPU selection ignores unrelated shared device suites and A5 configured cases never invoke the A3 probe',async t=>{
+ const f=await fixture(t),device=await customSuite(f,{target:'a3'});delete device.proposalIds;
+ await registerQualifiedSuite({config:f.config,suite:{...device,mechanism:'unit-fixture device suite'},qualification:{status:'qualified'}}); // Dispatch fixture, no device validity claim.
+ const item={objective:'correctness',proposal:{changes:[{id:'new-origin',text:'Distinguish mutable candidate traceback from protected runtime failure'}]}};
+ const cpu=await resolveHypothesisCases({...f,item,directory:join(f.root,'cpu-selection'),seconds:30},{runtimeIdentity:()=>{throw Error('Unselected device probed');},select:async()=>({value:{catalogueId:'cpu-fault-ownership',reason:'Tests traceback ownership'}})});assert.equal(cpu.target,'cpu');
+ const a5=await fixture(t);a5.config.target='a5';a5.config.environment.options.health.product='a5';const suite=await customSuite(a5,{target:'a5'});a5.config.skills.priority.evaluations=[suite];
+ const args={...a5,item:{objective:'correctness',proposal:{changes:[{id:'custom-rule',text:'Fix the candidate result'}]}},directory:join(a5.root,'a5-selection'),seconds:30};
+ assert.equal((await hypothesisCaseReadiness(args)).ready,true);
+ const selected=await resolveHypothesisCases(args,{runtimeIdentity:()=>{throw Error('A5 requested Triton identity');},select:async()=>({value:{catalogueId:suite.id,reason:'Existing target-bound A5 cases'}})});assert.equal(selected.status,'ready');assert.equal(selected.target,'a5');
 });

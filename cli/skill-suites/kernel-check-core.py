@@ -91,6 +91,15 @@ def outputs(value):
     return value if isinstance(value, (tuple, list)) else (value,)
 
 
+def contract_outputs(result, family):
+    if family == 'splitk':
+        assert isinstance(result, (tuple, list)) and len(result) == 2, 'run() must return (out, partials)'
+        assert all(isinstance(value, torch.Tensor) for value in result), 'split-K outputs must be tensors'
+        return tuple(result)
+    assert isinstance(result, torch.Tensor), 'run() must return one tensor, not a container'
+    return (result,)
+
+
 def numeric_check(spec, family, case, original, host, expected):
     if family == 'splitk':
         excess = spec.check(*original, *host, expected)
@@ -102,7 +111,7 @@ def numeric_check(spec, family, case, original, host, expected):
 
 
 def validate(spec, family, case, original, device_args, result, expected, previous=None):
-    result = outputs(result)
+    result = contract_outputs(result, family)
     assert result and all(isinstance(x, torch.Tensor) and x.device.type == 'npu' for x in result), 'actual NPU outputs required'
     for x in result:
         assert x.is_contiguous(), 'output must be contiguous'
