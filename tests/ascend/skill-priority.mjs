@@ -248,7 +248,14 @@ test('a newly qualified shared suite wakes waiters once and semantic relevance c
  assert.equal(f.backlog.get(related.id).status,'rejected');assert.equal(constructed,0);assert(selected>0);
  const relatedRequest=JSON.parse(f.state.db.prepare("SELECT data FROM skill_learning_requests WHERE status='satisfied'").get().data);assert.equal(relatedRequest.backlogId,related.id);
  await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
- assert.equal(f.backlog.get(unrelated.id).status,'learning');assert.equal(constructed,0);
+ assert.equal(f.backlog.get(unrelated.id).status,'inconclusive');assert.equal(constructed,0);
+ const unrelatedRun=f.backlog.run(f.state.db.prepare('SELECT id FROM skill_backlog_runs WHERE item_id=? ORDER BY rowid DESC LIMIT 1').get(unrelated.id).id);
+ assert.equal(unrelatedRun.result.status,'unsupported');assert.equal(unrelatedRun.result.missingCapability,true);assert.equal(unrelatedRun.result.reason,'Different mechanism');
+ assert.equal(f.calls.filter(c=>c[0]==='evaluate').length,1,'Only the semantically related hypothesis reaches A/B');
+ assert.equal(f.state.db.prepare('SELECT count(*) n FROM skill_learning_requests').get().n,2,'No bespoke request is created for an unrelated shared suite');
+ const pending=f.state.db.prepare("SELECT data FROM skill_learning_requests WHERE status='pending'").get();assert.equal(JSON.parse(pending.data).backlogId,unrelated.id);
+ assert(unrelatedRun.elapsed>=90);assert.equal(unrelatedRun.seconds,1800);
+ const cohort=(await prioritySkillStatus(f.config)).cohort;assert.equal(cohort.counts.completed,1);assert.equal(cohort.counts.blocked,1);
 });
 test('standalone scheduler checkpoints the exact nested qualification path before dispatch',async t=>{
  const f=await fixture(t);f.add('custody',20);let checked=false;
