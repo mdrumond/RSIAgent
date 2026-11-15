@@ -132,11 +132,12 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
-export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
+export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,sampleProtocol,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
  if(!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Verification reserve must fit inside the sample elapsed allocation');
+ if(sampleProtocol&&(sampleProtocol.sampleSeconds!==seconds||sampleProtocol.verificationSeconds!==verificationSeconds||sampleProtocol.actorSeconds!==seconds-verificationSeconds))throw Error('Sample timing protocol differs from elapsed allocation');
  if(objective==='harness'||tasks.some(t=>t.bucket==='harness'))throw Error('Harness faults require user intervention, not skill A/B');
  if(tasks.some(t=>t.bucket)&&(!objective||objective==='legacy'))throw Error('Bucketed tasks require an explicit matching objective');
  if(tasks.some(t=>t.kind==='target-kernel')){
@@ -158,7 +159,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  let retained;try{if(resume)retained=JSON.parse(await readFile(join(directory,'results.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  if(retained?.owner&&!await ownerStopped(retained.owner)||retained?.runningSample)throw Error('Micro evaluation execution remains unresolved');
  if(!retained)await mkdir(directory);
- const manifest={format:1,shadow,...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
+ const manifest={format:1,shadow,...(sampleProtocol?{sampleProtocol}:{}),...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
   model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
@@ -186,7 +187,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
     // Allocated once here, before actor/setup/verification; all resumed spend
     // has already reduced allocation. This never authorizes additional work.
     const cleanupDeadline=AbortSignal.timeout(Math.max(1,Math.ceil((allocation+30)*1000)));let observed,verification;
-    const actorBudget=seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
+    const actorBudget=sampleProtocol?.actorSeconds??seconds-Math.min(verificationSeconds,seconds/2),savedActor=partial?.actorObservation;
     const actorExhausted=verificationSeconds&&savedActor&&!savedActor.actorCompleted&&spent>=actorBudget;
     const actorAllocation=Math.max(.001,Math.min(actorBudget-spent,allocation-Math.min(verificationSeconds,allocation/2))),actorDeadline=verificationSeconds?AbortSignal.timeout(Math.max(1,Math.ceil(actorAllocation*1000))):null;
     const actorSignal=actorDeadline?AbortSignal.any([sampleSignal,actorDeadline]):sampleSignal;

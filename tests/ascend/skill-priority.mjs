@@ -257,3 +257,14 @@ test('standalone scheduler checkpoints the exact nested qualification path befor
  }});
  assert.equal(checked,true);
 });
+
+test('fresh target split is frozen and approved before skill preparation or evaluation',async t=>{
+ const f=await fixture(t),item=f.add('timing-contract');let approved;
+ const cases={status:'ready',target:'a3',tasks:[],binding:{target:'a3'}};
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async()=>cases,prepare:async args=>{
+  approved=args.evaluationContract.protocol;assert.equal(approved.sampleSeconds,180);assert.equal(approved.actorSeconds,90);assert.equal(approved.verificationSeconds,90);
+  const home=join(args.directory,'..','evaluation'),saved=JSON.parse(await readFile(join(home,'evaluation-protocol.json'),'utf8'));assert.deepEqual(saved.protocol,approved);
+  return f.ops.prepare(args);
+ },evaluate:async args=>{const saved=JSON.parse(await readFile(join(args.directory,'evaluation-protocol.json'),'utf8'));assert.deepEqual(saved.protocol,approved);assert.equal(args.binding.verificationSeconds,undefined);return f.ops.evaluate(args);}});
+ assert(approved);assert.equal(f.backlog.get(item.id).status,'rejected');
+});

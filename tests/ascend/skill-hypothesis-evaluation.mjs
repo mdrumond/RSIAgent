@@ -5,8 +5,8 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {prepareHypothesisEvaluation,evaluateHypothesis,hypothesisEvaluationSettled,qualifyHypothesisTasks,hypothesisTarget} from '../../cli/skill-hypothesis-evaluation.mjs';
-import {runMicroeval,check,finalizeKernelPairs} from '../../cli/skill-microeval.mjs';
+import {prepareHypothesisEvaluation,freezeHypothesisProtocol,evaluateHypothesis,hypothesisEvaluationSettled,qualifyHypothesisTasks,hypothesisTarget} from '../../cli/skill-hypothesis-evaluation.mjs';
+import {runMicroeval,check,finalizeKernelPairs,skillInput} from '../../cli/skill-microeval.mjs';
 import {evaluationSettings} from '../../controller/skill-objectives.mjs';
 const fixtureCommand=(python,checker,cwd,seconds)=>{const r=spawnSync(python,[checker,cwd],{cwd,encoding:'utf8',maxBuffer:1048576,timeout:Math.ceil(seconds*1000)});return {correct:r.status===0,exitCode:r.status,output:r.stdout,error:r.stderr};};
 const digest=text=>createHash('sha256').update(text).digest('hex');
@@ -278,4 +278,27 @@ test('multi-target settlement links the interrupted marker to its exact target p
  await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify({binding:f.binding}));const file=join(f.directory,'micro/results.json');await writeFile(file,JSON.stringify({status:'interrupted',elapsedSeconds:17,results:[],runningSample:{key:'one/0/active'}}));
  assert.equal(await hypothesisEvaluationSettled({directory:f.directory},{createEnvironment:()=>{throw Error('Recorded closed handles should not be replayed');}}),true);
  const report=JSON.parse(await readFile(file,'utf8')),closure=JSON.parse(await readFile(report.settledInterruption.closure,'utf8'));assert.equal(closure.instancePath,markerTarget);assert.equal(report.settledInterruption.closures.length,2);assert.equal(report.elapsedSeconds,17);
+});
+
+for(const [target,override,expected]of [['a3',undefined,90],['a5',undefined,90],['cpu',undefined,30],['a3',60,60],['a3',120,120]])test(`fresh ${target} sample split honors reserve ${override??'default'}`,async t=>{
+ const f=await fixture(t,{target});if(override!==undefined)f.binding.verificationSeconds=override;
+ const frozen=await freezeHypothesisProtocol(f);assert.equal(frozen.protocol.sampleSeconds,180);assert.equal(frozen.protocol.actorSeconds,180-expected);assert.equal(frozen.verificationSeconds,expected);
+ let calls=0,verified=0;const result=await evaluateHypothesis(f,{sample:async args=>{calls++;assert.equal(args.sampleSeconds,180);assert(Math.abs(args.seconds-(180-expected))<.5);assert(Math.abs(args.verificationReserved-expected)<.5);assert(args.signal instanceof AbortSignal);assert.notEqual(args.signal,args.sampleSignal);assert.equal(args.signal.aborted,false);await writeFile(join(args.cwd,'kernel.py'),'answer=42\n');return {};},verify:async args=>{verified++;assert(args.seconds<=180&&args.seconds>170);assert.equal(args.signal,args.sampleSignal);return {correct:true,output:JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(args.cwd,'kernel.py'))),evidence:{device:'npu:0'}})};}});
+ assert.equal(calls,20);assert.equal(verified,20);assert.equal(result.report.seconds,180);assert.equal(result.report.verificationSeconds,expected);assert.deepEqual(result.report.sampleProtocol,frozen.protocol);assert.deepEqual(JSON.parse(await readFile(join(f.directory,'hypothesis.json'),'utf8')).protocol,frozen.protocol);
+ const before=await readFile(join(f.directory,'evaluation-protocol.json'),'utf8');await evaluateHypothesis({...f,remainingSeconds:800},{sample:()=>assert.fail('Frozen completed sample replayed')});assert.equal(await readFile(join(f.directory,'evaluation-protocol.json'),'utf8'),before);
+ await assert.rejects(evaluateHypothesis({...f,binding:{...f.binding,verificationSeconds:expected===60?45:60}},{sample:()=>assert.fail('Changed split dispatched')}),/Frozen hypothesis sample timing changed/);
+});
+test('legacy target root keeps thirty-second reserve and old identity without rewriting completed samples',async t=>{
+ const f=await fixture(t,{target:'a3'});await mkdir(f.directory,{recursive:true});
+ const frozen=await Promise.all(f.tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8')}))),skills=Object.fromEntries(await Promise.all(Object.entries(f.skills).map(async([arm,path])=>[arm,(await skillInput(path)).sha256])));
+ const identity=digest(JSON.stringify({objective:f.objective,target:f.target,binding:f.binding,tasks:frozen,skills})),state={identity,objective:f.objective,target:f.target,binding:f.binding,allocationSeconds:900,developmentSeconds:500,pairedSeconds:0};await writeFile(join(f.directory,'hypothesis.json'),JSON.stringify(state));
+ let calls=0;const deps={sample:async args=>{calls++;assert(Math.abs(args.seconds-150)<.5);assert(Math.abs(args.verificationReserved-30)<.5);await writeFile(join(args.cwd,'kernel.py'),'answer=42\n');return {};},verify:async args=>({correct:true,output:JSON.stringify({correct:true,kernelSha256:digest(await readFile(join(args.cwd,'kernel.py'))),evidence:{device:'npu:0'}})})};
+ const first=await evaluateHypothesis(f,deps);assert.equal(calls,20);assert.equal(first.identity,identity);assert.equal(first.report.verificationSeconds,30);
+ const rows=JSON.stringify(first.report.results),elapsed=first.report.elapsedSeconds,bytes=await readFile(join(f.directory,'hypothesis.json'),'utf8');const second=await evaluateHypothesis({...f,remainingSeconds:700},{sample:()=>assert.fail('Legacy completed samples replayed')});
+ assert.equal(JSON.stringify(second.report.results),rows);assert(second.report.elapsedSeconds>=elapsed);assert.equal(await readFile(join(f.directory,'hypothesis.json'),'utf8'),bytes);await assert.rejects(readFile(join(f.directory,'evaluation-protocol.json')),{code:'ENOENT'});
+ await assert.rejects(evaluateHypothesis({...f,binding:{...f.binding,verificationSeconds:90}}),/Frozen hypothesis sample timing changed/);
+});
+test('legacy micro manifest alone freezes reserve before proposal review',async t=>{
+ const f=await fixture(t,{target:'a3'});await mkdir(join(f.directory,'micro'),{recursive:true});await writeFile(join(f.directory,'micro','manifest.json'),JSON.stringify({verificationSeconds:30,seconds:180}));
+ const value=await freezeHypothesisProtocol(f);assert.equal(value.protocol,null);assert.equal(value.verificationSeconds,30);await assert.rejects(readFile(join(f.directory,'evaluation-protocol.json')),{code:'ENOENT'});
 });
