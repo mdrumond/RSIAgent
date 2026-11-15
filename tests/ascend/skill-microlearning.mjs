@@ -109,3 +109,16 @@ test('archival inspection accepts only actual nested KDB entries, never invented
  assert.throws(()=>validateArchivalInspection({...value,refs:['lessons:invented']},{request,refs,retrievals}),/Cited archival/);
  assert.throws(()=>validateArchivalInspection(value,{request:{workKind:'suite'},refs,retrievals}),/Cited archival/);
 });
+
+test('retained allowance includes closure proof waits and keeps its live owner until proof completes',async t=>{
+ const f=await fixture(t);let clock=0,failed=false;
+ await assert.rejects(runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{now:()=>clock,ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need controls',refs:[]}),
+  construct:async()=>[{id:'question',goal:'Small question',actor_seconds:20}],importProject:async(root,spec)=>spec,
+  operate:async(command,config)=>{const child=new State(join(config.root,'state.sqlite'));child.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','question','passed','now')").run();child.event('attempt','postprocess-completed',{});child.close();},
+  qualify:async()=>{clock=100000;failed=true;throw Error('qualification interrupted');},
+  stopped:async()=>{if(failed){assert(f.backlog.meta('microlearning-active').owner);clock+=20000;}return true;},
+  settled:async()=>{assert(f.backlog.meta('microlearning-active').owner);clock+=30000;return true;}}),/qualification interrupted/);
+ const work=f.backlog.meta('microlearning-active');assert.equal(work.elapsed,150);assert.equal(work.seconds,900);assert.equal(work.owner,undefined);assert.equal(work.runningAt,undefined);
+ const resumed=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{stopped:async()=>false,settled:async()=>true});
+ assert.equal(resumed.status,'blocked');assert.equal(f.backlog.meta('microlearning-active').elapsed,150);assert.equal(f.backlog.meta('microlearning-active').seconds,900);
+});

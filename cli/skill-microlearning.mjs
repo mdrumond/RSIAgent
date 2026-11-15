@@ -129,5 +129,12 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
    work.elapsed=spent();delete work.runningAt;delete work.owner;backlog.meta('microlearning-last',{...work,status:verified?'verified':'inconclusive',reason:qualification?.reason});backlog.meta('microlearning-active',null);
    return {status:verified?'verified':'inconclusive',findings:data.findings,qualification};
   }finally{state.close();}
- }catch(error){work.stage='settlement';save();throw error;}finally{clearInterval(timer);if(backlog.meta('microlearning-active')){save();delete work.owner;if(child&&await ops.stopped(child)&&(!work.qualificationDirectory||await ops.settled({directory:work.qualificationDirectory,config,resource})))delete work.runningAt;backlog.meta('microlearning-active',work);}}
+ }catch(error){work.stage='settlement';save();throw error;}finally{
+  clearInterval(timer);
+  if(backlog.meta('microlearning-active')){
+   save();let closed=false;
+   try{closed=child&&await ops.stopped(child)&&(!work.qualificationDirectory||await ops.settled({directory:work.qualificationDirectory,config,resource}));}
+   finally{save();if(closed)delete work.runningAt;delete work.owner;backlog.meta('microlearning-active',work);}
+  }
+ }
 }
