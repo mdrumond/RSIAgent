@@ -25,12 +25,16 @@ export async function runProposalQa(input,ops){
  let state;try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const identity=qaIdentity(input),now=ops.now??Date.now;
  if(state&&state.format!==2){const legacy=state;file=join(input.directory,'qa-v2.json');try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;state={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:legacy.elapsedSeconds??0,draft:input.proposal,rounds:[],resumeFrom:join(input.directory,'qa.json')};}}
- if(!state&&input.resumeFrom){const legacy=JSON.parse(await readFile(input.resumeFrom,'utf8'));state={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:Math.max(input.priorElapsedSeconds??0,legacy.elapsedSeconds??0),draft:input.proposal,rounds:[],resumeFrom:input.resumeFrom};}
+ if(!state&&input.resumeFrom){const legacy=JSON.parse(await readFile(input.resumeFrom,'utf8'));state={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:Math.max(input.priorElapsedSeconds??0,legacy.elapsedSeconds??0,legacy.inFlight?.reservedThrough??0),draft:input.proposal,rounds:[],resumeFrom:input.resumeFrom};}
  if(state&&state.inputIdentity!==identity)throw Error('QA input changed; use a new proposal QA directory');
  state??={format:2,protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:300,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
- const begun=now(),charged=state.elapsedSeconds??0;
+ // Reserve a bounded slice before provider work. A hard loss charges that slice,
+ // never paused wall time; graceful completion releases the unused reservation.
+ const begun=now(),charged=Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0);
+ delete state.inFlight;
  const elapsed=()=>charged+Math.max(0,(now()-begun)/1000);
- const persist=async()=>{state.elapsedSeconds=elapsed();const tmp=file+'.tmp';await writeFile(tmp,JSON.stringify(state,null,2)+'\n');await rename(tmp,file);};
+ let writes=Promise.resolve();
+ const persist=()=>{state.elapsedSeconds=elapsed();const snapshot=JSON.stringify(state,null,2)+'\n';writes=writes.then(async()=>{const tmp=file+'.tmp';await writeFile(tmp,snapshot);await rename(tmp,file);});return writes;};
  const remaining=()=>Math.max(0,state.seconds-elapsed());
  if(state.verdict&&!state.retryable)return state;
  if(state.retryable){delete state.verdict;delete state.reason;delete state.error;delete state.reasonKind;delete state.retryable;}
@@ -45,8 +49,12 @@ export async function runProposalQa(input,ops){
     if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
     input.signal?.throwIfAborted();const seconds=Math.min(remaining(),input.seconds??300);
     const signal=AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000)))]);
-    const directory=join(input.directory,`${index}-${name}`);await mkdir(directory,{recursive:true});
-    return ops[name]({...input,...payload,directory,seconds,signal});
+    const directory=join(input.directory,'sessions',state.protocol,identity,`${index}-${name}`);await mkdir(directory,{recursive:true});
+    const reserve=()=>{state.inFlight={stage:name,reservedThrough:Math.min(state.seconds,elapsed()+5)};return persist();};
+    await reserve();let checkpointError;
+    const heartbeat=setInterval(()=>{void reserve().catch(error=>{checkpointError=error;});},1000);
+    try{const result=await ops[name]({...input,...payload,directory,seconds,signal});if(checkpointError)throw checkpointError;return result;}
+    finally{clearInterval(heartbeat);await writes;delete state.inFlight;await persist();}
    };
    if(!round.answers){
     const refs=new Set([...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);

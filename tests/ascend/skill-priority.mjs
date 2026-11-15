@@ -251,3 +251,12 @@ test('a newly qualified shared suite wakes waiters once and semantic relevance c
  await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:resolver,learn:async()=>{constructed++;}});
  assert.equal(f.backlog.get(unrelated.id).status,'learning');assert.equal(constructed,0);
 });
+test('standalone scheduler checkpoints the exact nested qualification path before dispatch',async t=>{
+ const f=await fixture(t);f.add('custody',20);let checked=false;
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async({beforeQualification,directory})=>{
+  const actual=join(directory,'qualification','content-identity');await beforeQualification(actual);
+  const row=f.state.db.prepare("SELECT checkpoint FROM skill_backlog_runs WHERE status='running'").get();
+  assert.equal(JSON.parse(row.checkpoint).qualificationDirectory,actual);checked=true;return {status:'needs-learning',reason:'No cases'};
+ }});
+ assert.equal(checked,true);
+});

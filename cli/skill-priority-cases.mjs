@@ -9,20 +9,20 @@ import {enqueueLearningRequest} from '../controller/skill-review.mjs';
 import {prepareHypothesisEvaluation} from './skill-hypothesis-evaluation.mjs';
 
 const digest=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
-export async function suiteFingerprint(suite){
- return digest({objective:suite.objective,target:suite.target,binding:suite.binding,tasks:await Promise.all(suite.tasks.map(async task=>({...task,checker:await readFile(task.checker,'utf8'),pairedChecker:task.pairedChecker?await readFile(task.pairedChecker,'utf8'):null})))});
+export async function suiteFingerprint(suite,baseDirectory=process.cwd()){
+ return digest({objective:suite.objective,target:suite.target,binding:suite.binding,tasks:await Promise.all(suite.tasks.map(async task=>({...task,checker:await readFile(resolve(baseDirectory,task.checker),'utf8'),pairedChecker:task.pairedChecker?await readFile(resolve(baseDirectory,task.pairedChecker),'utf8'):null})))});
 }
 export async function registerQualifiedSuite({config,suite,qualification,provenance={}}){
  if(qualification?.status!=='qualified'||suite.tasks?.length!==5)throw Error('Five reference/negative-qualified cases required');
  const familyKey=suite.familyKey??digest([suite.target,suite.objective,suite.mechanism]);
- const stored={...suite,status:'ready',familyKey,qualification:{protocol:'reference-negative-v1',fingerprint:await suiteFingerprint(suite),provenance}};
+ const stored={...suite,status:'ready',familyKey,qualification:{protocol:'reference-negative-v1',fingerprint:await suiteFingerprint(suite,config.root),provenance}};
  const directory=join(config.root,'skills','priority','suites',familyKey);await mkdir(directory,{recursive:true});await writeFile(join(directory,'selected.json'),JSON.stringify(stored,null,2)+'\n');return stored;
 }
 export async function qualifiedSuites({config}){
  const root=join(config.root,'skills','priority','suites'),suites=[];
  for(const family of await readdir(root).catch(e=>{if(e.code!=='ENOENT')throw e;return [];})){
   try{const suite=JSON.parse(await readFile(join(root,family,'selected.json'),'utf8'));
-   if(suite.status==='ready'&&suite.qualification?.fingerprint===await suiteFingerprint(suite))suites.push({...suite,id:'shared-'+family,description:suite.mechanism,learned:false});
+   if(suite.status==='ready'&&suite.qualification?.fingerprint===await suiteFingerprint(suite,config.root))suites.push({...suite,id:'shared-'+family,description:suite.mechanism,learned:false});
   }catch(e){if(e.code!=='ENOENT')throw e;}
  }return suites;
 }
@@ -86,7 +86,7 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
    target:'cpu',objective:'correctness',tasks:catalogue.byHypothesis[h.id].map(t=>({...t,target:'cpu',bucket:'correctness'})),binding:{target:'cpu'}})));
  }
  suites=suites.filter(s=>s.objective===item.objective&&(s.target===config.target||s.target==='cpu'&&item.objective==='correctness'));
- const catalogueIdentity=digest(await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:await suiteFingerprint(suite)}))));
+ const catalogueIdentity=digest(await Promise.all(suites.map(async suite=>({id:suite.id,description:suite.description,fingerprint:await suiteFingerprint(suite,config.root)}))));
  if(cached?.proposalIdentity===proposalIdentity&&cached.catalogueIdentity===catalogueIdentity)return cached;
  const selectionIdentity=digest([proposalIdentity,catalogueIdentity]);
  const validate=value=>{if(!value||!value.reason?.trim()||value.catalogueId!==null&&!suites.some(s=>s.id===value.catalogueId))throw Error('Choose a supplied matching suite or null with a reason');return value;};

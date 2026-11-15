@@ -48,3 +48,11 @@ test('a final revised proposal must pass relevance selection again before cached
  assert.equal(third.status,'ready');assert.equal(seen.length,3);assert.notEqual(second.catalogueIdentity,third.catalogueIdentity);
  assert.equal(new Set(sessions).size,3);for(const file of sessions)assert.equal(JSON.parse(await readFile(file,'utf8')).catalogueId,'boundary');
 });
+test('configured relative checker paths use the campaign root independently of controller cwd',async t=>{
+ const {suiteFingerprint}=await import('../../cli/skill-priority-cases.mjs');
+ const root=await mkdtemp(join(tmpdir(),'review-relative-'));t.after(()=>rm(root,{recursive:true,force:true}));assert.notEqual(root,process.cwd());
+ await mkdir(join(root,'checks'));await writeFile(join(root,'checks','check.py'),'raise SystemExit(0)');
+ const relative={target:'cpu',tasks:[{id:'case',checker:'checks/check.py',pairedChecker:'checks/check.py'}]};
+ const absolute={...relative,tasks:[{id:'case',checker:join(root,'checks','check.py'),pairedChecker:join(root,'checks','check.py')}]};
+ assert.equal(await suiteFingerprint(relative,root),await suiteFingerprint(absolute,root));
+});

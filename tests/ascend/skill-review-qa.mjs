@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runProposalQa,qaIdentity,qaTopics} from '../../cli/skill-review-qa.mjs';
@@ -102,4 +102,31 @@ test('legacy timeout remains immutable and a v2 continuation charges its origina
  await writeFile(file,legacy);
  const result=await runProposalQa(input,{qaAnswer:async({seconds})=>{assert(seconds<=180&&seconds>179);return answers();},qaReview:async()=>({verdict:'approved',reason:'Supported'})});
  assert.equal(result.verdict,'approved');assert.equal(await readFile(file,'utf8'),legacy);assert.equal(JSON.parse(await readFile(join(input.directory,'qa-v2.json'))).protocol,'skill-qa-v2');
+});
+test('SIGKILL during provider work retains charged slices without charging paused downtime',async t=>{
+ const {spawn}=await import('node:child_process'),{once}=await import('node:events'),{setTimeout:pause}=await import('node:timers/promises');
+ const input=await fixture(t),module=new URL('../../cli/skill-review-qa.mjs',import.meta.url).href;
+ const child=spawn(process.execPath,['--input-type=module','-e',`import {runProposalQa} from ${JSON.stringify(module)};const input=${JSON.stringify(input)};input.validateProposal=x=>x;await runProposalQa(input,{qaAnswer:async()=>new Promise(()=>{})});`],{stdio:'ignore'});
+ t.after(()=>{if(child.exitCode===null)child.kill('SIGKILL');});
+ let checkpoint;
+ for(let i=0;i<300;i++){
+  try{checkpoint=JSON.parse(await readFile(join(input.directory,'qa.json'),'utf8'));if(checkpoint.inFlight&&checkpoint.elapsedSeconds>=1)break;}catch(error){if(error.code!=='ENOENT')throw error;}
+  await pause(10);
+ }
+ assert(checkpoint?.inFlight);assert(checkpoint.elapsedSeconds>=1);const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+ const reserved=checkpoint.inFlight.reservedThrough;assert(reserved>=6&&reserved<10);
+ const later=Date.now()+86400000;
+ const resumed=await runProposalQa(input,{now:()=>later,qaAnswer:async({seconds})=>{assert(seconds<=300-reserved);assert(seconds>289);return answers();},qaReview:async()=>({verdict:'approved',reason:'Supported'})});
+ assert.equal(resumed.verdict,'approved');assert(resumed.elapsedSeconds>=reserved&&resumed.elapsedSeconds<10);assert.equal(resumed.inFlight,undefined);assert.equal(resumed.seconds,300);
+});
+
+test('legacy cached native submissions cannot approve a changed contract in a v2 continuation',async t=>{
+ const input=await fixture(t),legacy={format:1,elapsedSeconds:120,verdict:'inconclusive',reason:'qa-elapsed'};
+ await writeFile(join(input.directory,'qa.json'),JSON.stringify(legacy));
+ const oldAnswer=join(input.directory,'0-qaAnswer'),oldReview=join(input.directory,'0-qaReview');await mkdir(oldAnswer);await mkdir(oldReview);
+ await writeFile(join(oldAnswer,'submission.json'),JSON.stringify(answers()));await writeFile(join(oldReview,'submission.json'),JSON.stringify({verdict:'approved',reason:'Old contract'}));
+ let calls=0;
+ const native=async({directory},fresh)=>{try{return JSON.parse(await readFile(join(directory,'submission.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}calls++;return fresh;};
+ const result=await runProposalQa({...input,evaluationContract:{id:'new-contract'}},{qaAnswer:args=>native(args,answers()),qaReview:args=>native(args,{verdict:'learn',reason:'New boundary requires facts',learningRequests:[{question:'New boundary?',hypothesis:'Untested'}]})});
+ assert.equal(calls,2);assert.equal(result.verdict,'learn');assert.equal(result.approval,undefined);assert.equal(JSON.parse(await readFile(join(oldReview,'submission.json'),'utf8')).reason,'Old contract');
 });
