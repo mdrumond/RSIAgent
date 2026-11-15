@@ -51,7 +51,7 @@ test('optimization, harness and mismatched target bindings do not run a correctn
 });
 test('unknown references, changed arms, missing cases, and win-every-pair scoring fail design admission',async t=>{
  const f=await fixture(t),ctx={project:f.options.project,evidence:f.options.evidence};
- for(const patch of [{evidenceRefs:['events:4']},{arms:['candidate','baseline']},{caseIds:['case-0']},{scoring:{candidateFullPasses:2,baselineFullPassesAtMost:0,noCorrectnessRegression:true}}])assert.throws(()=>validateSkillTestDesign({...f.design,...patch},ctx),/Design/);
+ for(const patch of [{evidenceRefs:['events:4']},{arms:['candidate','baseline']},{caseIds:['case-0']},{scoring:{candidateFullPasses:2,baselineFullPassesAtMost:0,noCorrectnessRegression:true}}])assert.throws(()=>validateSkillTestDesign({...f.design,...patch},ctx));
 });
 test('learn/no-test decisions and independent QA rejection do not execute controls or actors',async t=>{
  for(const which of ['learn','no-test','qa']){
@@ -94,7 +94,9 @@ test('native Pi uses stock file tools, preserves protected files and submits JSO
  const f=await fixture(t),requests=[],actions=[
   {name:'read',arguments:{path:'missing.txt'}},
   {name:'write',arguments:{path:'CONTRACT.md',content:'tampered'}},
-  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify({decision:'learn',reason:'Needs controls.'})}}
+  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['project.files.kernel.py']})}},
+  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['events:41']})}},
+  {name:'edit',arguments:{path:'proposal.json',oldText:'events:41',newText:'invented'}}
  ];
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;requests.push(JSON.parse(raw));const action=actions[requests.length-1],delta=action?{role:'assistant',tool_calls:[{index:0,id:'step-'+requests.length,type:'function',function:{name:action.name,arguments:JSON.stringify(action.arguments)}}]}:{role:'assistant',content:'Submitted.'};
@@ -104,10 +106,10 @@ test('native Pi uses stock file tools, preserves protected files and submits JSO
  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
  const key='RSI_PROJECT_TEST_KEY',old=process.env[key];process.env[key]='fixture';t.after(()=>{if(old===undefined)delete process.env[key];else process.env[key]=old;});
  const directory=join(f.root,'native'),profile={provider:'skill-project-test',model:'scripted',credential_env:key,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:2048,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
- const result=await nativeProjectRole({directory,files:{'input.json':'{}','CONTRACT.md':'protected'},prompt:'Use the provided file tools.',submission:'proposal.json',profile,seconds:20});
- assert.equal(result.error,null);assert.deepEqual(result.value,{decision:'learn',reason:'Needs controls.'});assert.equal(await readFile(join(result.cwd,'CONTRACT.md'),'utf8'),'protected');
+ const result=await nativeProjectRole({directory,files:{'input.json':'{}','CONTRACT.md':'protected'},prompt:'Use the provided file tools.',submission:'proposal.json',validate:value=>{if(value.evidenceRefs.some(ref=>ref!=='events:41'))throw Error('Unknown evidenceRefs: '+JSON.stringify(value.evidenceRefs));},profile,seconds:20});
+ assert.equal(result.error,null);assert.deepEqual(result.value,{decision:'learn',reason:'Needs controls.',evidenceRefs:['events:41']});assert.equal(await readFile(join(result.cwd,'CONTRACT.md'),'utf8'),'protected');
  const policy=(await readFile(join(directory,'policy.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(policy.map(p=>[p.tool,p.path]),[['write','CONTRACT.md']]);assert(requests.some(r=>r.messages.some(m=>m.role==='tool'&&JSON.stringify(m.content).includes('ENOENT'))));
- assert.equal(requests.length,4);assert(requests.every(r=>r.tools.every(t=>['read','write','edit'].includes(t.function.name))));
+ const rejections=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejections.length,2);assert.deepEqual(rejections.map(r=>r.tool),['write','edit']);assert.equal(rejections[0].input.content,JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['project.files.kernel.py']}));assert.equal(result.stats.userMessages,1);assert(requests.some(r=>r.messages.some(m=>m.role==='tool'&&JSON.stringify(m.content).includes('Unknown evidenceRefs'))));assert.equal(requests.length,6);assert(requests.every(r=>r.tools.every(t=>['read','write','edit'].includes(t.function.name))));
 });
 
 test('large elapsed allocations do not overflow native timer limits into immediate expiry',async t=>{

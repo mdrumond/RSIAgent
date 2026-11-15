@@ -43,7 +43,11 @@ uninformative result requiring learning, never a reason to manufacture a failure
 
 The test designer and independent reviewer run in separate native Pi sessions.
 They read `input.json` and write `proposal.json` / `qa.json` using stock file tools;
-final prose is not the submission contract. Plans preserve the trusted cases and
+final prose is not the submission contract. Submission writes are parsed and
+validated before saving; invalid JSON or references return the actual validation
+error through the stock tool, so the same session can correct them within its
+original elapsed allocation. Validated submissions use whole-file writes rather
+than unvalidated incremental edits, and the final file is validated again. Plans preserve the trusted cases and
 explicitly state success, disconfirmation and inconclusive outcomes. Exact evidence
 references and the fixed scoring policy are validated before admission. The review
 cannot change the trusted oracle, code, cases or treatment policy.
