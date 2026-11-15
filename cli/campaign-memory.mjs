@@ -64,6 +64,7 @@ export async function releaseKnowledgeService(config,{timeoutMs=((config.pause_g
   let service;
   try{service=JSON.parse(await readFile(join(config.root,'knowledge-service.json'),'utf8'));}
   catch(error){if(error.code==='ENOENT')return;throw error;}
+  if(service.ownership==='borrowed')return;
   if(!service.owner?.start||!service.owner?.boot)throw Error('Knowledge service ownership unknown');
   if(await ownerStopped(service.owner))return;
   try {
@@ -88,7 +89,7 @@ export async function sampleCampaignMemory(config,owner,{proc='/proc',known=new 
   });
   for(const [file,role]of [['knowledge-service.json','knowledge'],['device-cleanup-service.json','device-cleanup']])try{
     const service=JSON.parse(await readFile(join(config.root,file),'utf8'));
-    if(service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role});
+    if(service.ownership!=='borrowed'&&service.owner?.boot===owner.boot)roots.set(service.owner.pid,{...service.owner,role});
   }catch(error){if(error.code!=='ENOENT')throw error;}
   const rows=new Map();
   await Promise.all((await readdir(proc)).filter(name=>/^\d+$/.test(name)).map(async name=>{

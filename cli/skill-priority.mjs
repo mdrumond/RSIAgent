@@ -1,4 +1,5 @@
 /** Campaign-local failure backlog; one retained hypothesis owns the background slot. */
+import {createHash} from 'node:crypto';
 import {mkdir} from 'node:fs/promises';
 import {readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
@@ -9,9 +10,13 @@ import {readConfig} from './instance.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlog-analysis.mjs';
 import {evaluateHypothesis,hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
+import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
 import {resolveHypothesisCases} from './skill-priority-cases.mjs';
 
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
+const evaluationContract=cases=>({target:cases.target,objective:cases.objective,binding:cases.binding,tasks:cases.tasks.map(task=>{
+ const result={...task};for(const key of ['checker','pairedChecker'])if(task[key])result[key]=createHash('sha256').update(readFileSync(task[key])).digest('hex');return result;
+})});
 async function recordCandidate(config,prepared,options){
  if(config.storage)await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(config,prepared.candidate,
   {serialized:true,baseVersion:prepared.active,...options});
@@ -24,20 +29,22 @@ export async function prioritySkillStatus(config){
  try{
   const status=backlog.status(),items=['queued','learning','needs-review','user-required'].flatMap(s=>backlog.list({status:s,limit:20})).sort((a,b)=>b.priority-a.priority),
    active=backlog.list({status:'running',limit:1})[0],run=active&&backlog.run(active.id);
+  const learningWork=backlog.meta('microlearning-active'),learningQueue=pendingMicrolearning(backlog);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
   const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
-  return {...status,queued,evaluationStatus:active?'running':queued?'deferred':'idle',pending:Boolean(active),resource:run?.checkpoint?.resource,unresolved:Boolean(run?.checkpoint?.unresolved),
+  return {...status,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
    analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
-   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active)||items.some(i=>['queued','needs-review'].includes(i.status)))};
+   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||learningQueue.length>0||items.some(i=>['queued','needs-review'].includes(i.status)))};
  }finally{state.close();}
 }
 export async function prioritySkillsSettled(config,dependencies={}){
  const {state,backlog}=open(config);
  try{
   const item=backlog.list({status:'running',limit:1})[0],run=item&&backlog.run(item.id);
+  if(!await microlearningSettled(config,backlog.meta('microlearning-active'),dependencies))return false;
   if(!run)return true;
   if(executionDirectory(run.checkpoint))return await (dependencies.settled??hypothesisEvaluationSettled)({directory:executionDirectory(run.checkpoint),config,resource:run.checkpoint.resource,...run.checkpoint.evaluation});
   // instanceStopped independently checks the writer identity. Preparation has no device command.
@@ -46,7 +53,7 @@ export async function prioritySkillsSettled(config,dependencies={}){
 }
 export async function runPrioritySkills(config,values,dependencies={}){
  const ops={analyze:analyzeBacklog,prioritize:prioritizeBacklog,prepare:prepareHypothesis,evaluate:evaluateHypothesis,
-  resolveCases:resolveHypothesisCases,publish:publishSkillVersion,settled:hypothesisEvaluationSettled,now:()=>performance.now(),...dependencies};
+  learn:runMicrolearning,resolveCases:resolveHypothesisCases,publish:publishSkillVersion,settled:hypothesisEvaluationSettled,now:()=>performance.now(),...dependencies};
  const {state,backlog}=open(config),directory=join(config.root,'skills','priority');await mkdir(directory,{recursive:true});
  const campaignEnd=ops.now()+values.remainingSeconds*1000,remainingCampaign=()=>Math.max(0,(campaignEnd-ops.now())/1000);
  let selected,checkpoint,timer,started,prior;
@@ -55,6 +62,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
   const ingestionEnd=ops.now()+Math.min(1000,remainingCampaign()*1000);let ingestion;
   do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&ops.now()<ingestionEnd);
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.
+  if(backlog.meta('microlearning-active'))return await ops.learn({config,backlog,...values});
   const retained=backlog.list({status:'running',limit:1})[0];
   if(!retained){
    const admittedLearning=learningFingerprint(state);
@@ -92,7 +100,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    }
   }
   selected=backlog.claim({base:config.skills.activeVersion,owner});
-  if(!selected)return {status:'idle',backlog:backlog.status()};
+  if(!selected)return await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign()});
   const {run}=selected,item=run.snapshot,home=join(directory,'hypotheses',run.id);await mkdir(home,{recursive:true});
   checkpoint={...run.checkpoint,resource:values.resource};
   prior=run.elapsed+(checkpoint.runningAt?Math.max(0,Date.now()-checkpoint.runningAt)/1000:0);
@@ -115,15 +123,28 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(feedback){const bytes=JSON.stringify(feedback,null,2)+'\n';try{writeFileSync(path,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||readFileSync(path,'utf8')!==bytes)throw error;}}
    return backlog.atomic(()=>{const done=backlog.finish(run.id,{status,result});if(feedback)state.event(null,'skill-hypothesis-rejected',{...feedback,evidence:{path}});return done;});
   };
-  if(!checkpoint.prepared){
-   checkpoint.prepared=await ops.prepare({config,backlog,item,directory:join(home,'prepare'),signal,remainingSeconds:left()});save();
-  }
-  if(checkpoint.prepared.status!=='ready')return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
-  await recordCandidate(config,checkpoint.prepared,{reason:'awaiting-evaluation',signal});
   checkpoint.qualificationDirectory=join(home,'cases','qualification');save();
-  const cases=await ops.resolveCases({config,backlog,item,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
+  let cases=await ops.resolveCases({config,backlog,item,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
+  if(!checkpoint.prepared||checkpoint.prepared.retryable){
+   checkpoint.prepared=await ops.prepare({config,backlog,item,directory:join(home,'prepare'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases)});save();
+  }
+  if(checkpoint.prepared.status!=='ready'){
+   if(checkpoint.prepared.retryable){delete checkpoint.runningAt;save();return {status:'deferred',reason:checkpoint.prepared.reason};}
+   return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
+  }
+  const reviewedCases=JSON.stringify(evaluationContract(cases));
+  cases=await ops.resolveCases({config,backlog,item,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
+   resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
+  if(cases.status!=='ready')return finish('learning',cases);
+  if(JSON.stringify(evaluationContract(cases))!==reviewedCases&&checkpoint.prepared.proposal){
+   checkpoint.prepared=await ops.prepare({config,backlog,item:{...item,proposal:checkpoint.prepared.proposal},directory:join(home,'final-contract'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:checkpoint.prepared.elapsedSeconds??0});save();
+   if(checkpoint.prepared.status!=='ready')return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
+   const finalCases=await ops.resolveCases({config,backlog,item,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,resource:values.resource,signal,seconds:left()});
+   if(finalCases.status!=='ready'||JSON.stringify(evaluationContract(finalCases))!==JSON.stringify(evaluationContract(cases)))return finish('learning',{reason:'Final proposal requires a different qualified contract'});
+  }
+  await recordCandidate(config,checkpoint.prepared,{reason:'awaiting-evaluation',signal});
   checkpoint.evaluationDirectory=join(home,'evaluation');checkpoint.evaluation={binding:cases.binding,resource:values.resource};save();
   const result=await ops.evaluate({directory:checkpoint.evaluationDirectory,config,objective:item.objective,target:cases.target,
    tasks:cases.tasks,binding:cases.binding,skills:{active:join(config.root,'skills','versions',checkpoint.prepared.active),candidate:join(config.root,'skills','versions',checkpoint.prepared.candidate)},

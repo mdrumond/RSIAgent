@@ -180,3 +180,16 @@ test('learning outcomes arriving during analysis remain visible for the next sca
  await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{assert.equal(f.backlog.meta('learning-scan'),null);f.backlog.meta('learning-pending',false);}});
  assert.equal((await prioritySkillStatus(f.config)).hasWork,false);
 });
+test('missing cases defer to learning without spending QA allowance',async t=>{
+ const f=await fixture(t);f.add('missing-suite');let prepared=false,evaluated=false;
+ await runPrioritySkills(f.config,f.values,{...f.ops,resolveCases:async()=>({status:'needs-learning',reason:'missing-cases'}),
+  prepare:async()=>{prepared=true;},evaluate:async()=>{evaluated=true;}});
+ assert.equal(prepared,false);assert.equal(evaluated,false);assert.equal(f.backlog.get('missing-suite').status,'learning');
+});
+test('foreground queue uses the existing background worker only when comparisons are exhausted',async t=>{
+ const f=await fixture(t);f.add('ready');let learnt=0;
+ await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
+ assert.equal(learnt,0);
+ await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
+ assert.equal(learnt,1);
+});
