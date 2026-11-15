@@ -8,6 +8,7 @@ import {createHash} from 'node:crypto';
 import {curatedPacks,prepareCuratedSuites,applicablePack} from '../../cli/skill-curated-suites.mjs';
 import {resolveHypothesisCases,hypothesisCaseReadiness} from '../../cli/skill-priority-cases.mjs';
 import {hypothesisTarget,hypothesisEvaluationSettled,qualifyHypothesisTasks} from '../../cli/skill-hypothesis-evaluation.mjs';
+import {validateKernelReceipt} from '../../cli/skill-microeval.mjs';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 const runtime={setup:{packages:{torch:['fixture'],triton:['fixture'],'torch-npu':['fixture']},compilers:{hivmc:['revision-a']},cann:{}},cannVersions:{manifest:'a'},product:'fixture-a3'};
@@ -79,4 +80,34 @@ test('new CPU diagnostic proposals reuse premade report cases through semantic s
   runtimeIdentity:()=>{throw Error('CPU question dispatched a device command');}});
  assert.equal(result.status,'ready');assert.equal(result.target,'cpu');assert.equal(result.tasks.length,5);
  assert.equal((await hypothesisCaseReadiness({config:f.config,item})).ready,true);
+});
+
+test('curated runtime device selection reaches the public receipt validator only after initialization',async t=>{
+ const f=await fixture(t),kernel=join(f.root,'kernel.py');await writeFile(kernel,'fixture_source=True\n');
+ const script=`import importlib.util,json,sys,types
+s=importlib.util.spec_from_file_location('core',sys.argv[2]);core=importlib.util.module_from_spec(s);s.loader.exec_module(core)
+calls=[];fail=sys.argv[3]=='fail'
+class Npu:
+ def set_device(self,device):
+  calls.append(['set',device])
+  if fail: raise RuntimeError('initialization fixture failed')
+ def current_device(self):
+  calls.append(['current']);return 0
+sys.modules['torch']=types.SimpleNamespace(__version__='fixture',npu=Npu())
+sys.modules['torch_npu']=types.SimpleNamespace(__version__='fixture')
+sys.modules['triton']=types.SimpleNamespace(__version__='fixture')
+expected={'fixture':True};core.load=lambda *args:types.SimpleNamespace(identity=lambda:expected)
+core.health=lambda:{'physicalDevice':4,'logicalDevice':0,'queries':{'health':'unit-fixture'}}
+core.check_module=lambda *args:{'latencySeconds':.1,'rawSeconds':[.1],'checkedCases':['unit-fixture']}
+try:core.main(sys.argv[1],{'runtimeIdentity':expected,'family':'fixture','cases':[]})
+finally:assert calls==([['set',0]] if fail else [['set',0],['current']]),calls
+`;
+ const core=new URL('../../cli/skill-suites/kernel-check-core.py',import.meta.url).pathname;
+ for(const mode of ['pass','fail']){
+  const result=spawnSync(process.env.RSI_TEST_PYTHON??'python3',['-c',script,f.root,core,mode],{encoding:'utf8'});
+  assert.equal(result.status,mode==='pass'?0:125,result.stderr);
+  const checked=await validateKernelReceipt({exitCode:result.status,output:result.stdout},f.root,{requireDevice:true});
+  if(mode==='pass'){assert.equal(checked.receipt.evidence.device,'npu:0');assert.equal(checked.receipt.evidence.physicalDevice,4);assert.equal(checked.receipt.evidence.queries.health,'unit-fixture');}
+  else{assert.equal(checked.correct,null);assert.equal(checked.receipt.evidence.device,undefined);}
+ }
 });

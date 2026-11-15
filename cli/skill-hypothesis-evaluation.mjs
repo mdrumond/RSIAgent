@@ -243,7 +243,7 @@ export async function qualifyHypothesisTasks({directory,config,objective,target,
     catch(error){const unknown=unknownExecution(error);if(unknown){report.runningSample.unresolvedExecution=unknown;throw Object.assign(error,{code:'RSI_EXECUTION_UNRESOLVED'});}delete report.runningSample;if(signal?.aborted)throw error;report.status='blocked';report.reason=error.message;return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
     delete report.runningSample;signal?.throwIfAborted();
     for(const row of rows){const entry=entries.find(e=>e.key===row.key),cwd=join(micro,'qualification','0-batch','work',entry.cwd);let verification=row;
-     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false,requireDevice:entry.requireDevice});}catch(error){verification={correct:null,error:error.message};}
+     if(entry.expectedExit===0&&row.correct)try{verification=await validateKernelReceipt(row,cwd,{requireLatency:false,requireDevice:entry.requireDevice});}catch(error){verification={...row,correct:null,error:error.message};}
      const passed=!deadline.aborted&&row.exitCode===entry.expectedExit&&verification.correct===(entry.expectedExit===0);report.results.push({key:row.key,expectedExit:entry.expectedExit,passed,sourceSha256:hash(entry.files),elapsedSeconds:row.elapsedSeconds,verification});await persist();
     }
     if(rows.length!==entries.length||report.results.some(r=>!r.passed)){report.status='blocked';report.reason='Reference or negative control did not qualify';return {status:'blocked',reason:report.reason,identity,receipts:report.results};}
