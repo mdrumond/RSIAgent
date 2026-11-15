@@ -126,7 +126,7 @@ test('learned cases must pass real reference and negative controls before admiss
  const report=JSON.parse(await readFile(join(args.directory,'qualification','micro','results.json'),'utf8'));
  assert.equal(report.status,'qualified');assert.equal(report.results.length,10);assert(report.results.every(r=>r.passed));
  await writeFile(checker,'raise SystemExit(0)\n');
- assert.equal((await resolveHypothesisCases(args,deps)).tasks[0].checker,result.tasks[0].checker);
+ assert.equal((await resolveHypothesisCases(args,deps)).status,'needs-learning');
  assert.notEqual(await readFile(result.tasks[0].checker,'utf8'),await readFile(checker,'utf8'));
  const bad=await resolveHypothesisCases({...args,directory:join(f.root,'bad-cases')},deps);
  assert.equal(bad.status,'needs-learning');assert(bad.learningRequest);
