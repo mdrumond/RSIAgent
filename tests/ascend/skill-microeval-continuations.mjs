@@ -11,15 +11,15 @@ async function fixture(t,{correct=false,spent=.05,kind}={}){
  const root=await mkdtemp(join(tmpdir(),'microeval-continuation-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const skills={};for(const arm of ['active','candidate']){const p=join(root,arm);await mkdir(p);await writeFile(join(p,'skill-map.json'),JSON.stringify({implementation:'mapped.md'}));await writeFile(join(p,'mapped.md'),arm+' guidance');skills[arm]=p;}
  const checker=join(root,'checker.py');await writeFile(checker,"import runpy,sys,pathlib\nm=runpy.run_path(str(pathlib.Path(sys.argv[1])/'kernel.py'))\nassert m['answer']()==42\n");
- const originDirectory=join(root,'original'),profile={provider:'fixture',model:'scripted'};
- await runMicroeval({directory:originDirectory,skills,profile,python,runs:1,seconds:1,tasks:[{id:'repair',...(kind?{kind}:{}),scopes:['implementation'],prompt:'Repair answer',files:{'kernel.py':`def answer(): return ${correct?42:0}\n`,'case.json':'{"expected":42}'},checker,protectedFiles:{'case.json':'json'}}]},{sample:async args=>{
+ const originDirectory=join(root,'original'),profile={provider:'fixture',model:'scripted'};let closureChecks=0;
+ await runMicroeval({directory:originDirectory,skills,profile,python,runs:1,seconds:1,tasks:[{id:'repair',...(kind?{kind}:{}),scopes:['implementation'],prompt:'Repair answer',files:{'kernel.py':`def answer(): return ${correct?42:0}\n`,'case.json':'{"expected":42}'},checker,protectedFiles:{'case.json':'json'}}]},{sampleSettled:async({cwd,task})=>{assert.equal(task.kind,kind);assert(cwd.startsWith(originDirectory+'/'));closureChecks++;return true;},sample:async args=>{
   const session=join(args.sessionDirectory,'original-session.jsonl');
   await writeFile(session,JSON.stringify({type:'session',version:3,id:randomUUID(),timestamp:new Date().toISOString(),cwd:args.cwd})+'\n'+JSON.stringify({type:'message',id:'first',parentId:null,timestamp:new Date().toISOString(),message:{role:'user',content:'Keep original history',timestamp:Date.now()}})+'\n');return {timedOut:true,session};
  }});
  const report=JSON.parse(await readFile(join(originDirectory,'results.json')));for(const row of report.results)row.elapsedSeconds=spent;
  await writeFile(join(originDirectory,'results.json'),JSON.stringify(report));
  const original=await readFile(join(originDirectory,'results.json')),source=join(originDirectory,'repair/0-active/work/kernel.py'),session=report.results[0].session;
- return {root,original,source,session,skills,profile,originDirectory,directory:join(root,'extended'),sampleKeys:['repair/0/active'],python,seconds:2,verificationSeconds:.2};
+ return {root,original,source,session,skills,profile,originDirectory,closureChecks,directory:join(root,'extended'),sampleKeys:['repair/0/active'],python,seconds:2,verificationSeconds:.2};
 }
 async function unchanged(f){assert.equal(sha(await readFile(join(f.originDirectory,'results.json'))),sha(f.original));}
 const untilAbort=signal=>new Promise(resolve=>{const timer=setTimeout(resolve,3000),done=()=>{clearTimeout(timer);resolve();};if(signal.aborted)return done();signal.addEventListener('abort',done,{once:true});});
@@ -137,7 +137,7 @@ test('interruption during final verification resumes checking without another ac
 const a3Receipt=async(args,correct)=>({correct,exitCode:correct?0:1,output:JSON.stringify({correct,kernelSha256:sha(await readFile(join(args.cwd,'kernel.py'))),...(correct?{latencySeconds:.001}:{}),evidence:{type:'AssertionError',reason:'fixture comparison'}})});
 test('A3 actor continuation requires a trusted negative receipt bound to the current candidate',async t=>{
  for(const mode of ['missing','hash','type','reason','valid']){
-  const f=await fixture(t,{kind:'a3-kernel'});let calls=0,checks=0;
+  const f=await fixture(t,{kind:'a3-kernel'});assert.equal(f.closureChecks,2,'Both scripted target arms prove closure before their timeout markers are removed');let calls=0,checks=0;
   const report=await continueMicroevalSamples(f,{verify:async args=>{
    checks++;if(checks>1)return a3Receipt(args,true);if(mode==='missing')return {correct:false,exitCode:1,error:'reference import failed'};
    const value=await a3Receipt(args,false),wire=JSON.parse(value.output);if(mode==='hash')wire.kernelSha256='older-source';if(mode==='type')delete wire.evidence.type;if(mode==='reason')delete wire.evidence.reason;return {...value,output:JSON.stringify(wire)};
