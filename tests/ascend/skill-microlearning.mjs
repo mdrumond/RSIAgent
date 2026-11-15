@@ -6,7 +6,8 @@ import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {enqueueLearningRequest,claimLearningRequest} from '../../controller/skill-review.mjs';
-import {microlearningConfig,runMicrolearning,pendingMicrolearning} from '../../cli/skill-microlearning.mjs';
+import {microlearningConfig,runMicrolearning,pendingMicrolearning,validateArchivalInspection} from '../../cli/skill-microlearning.mjs';
+import {qualifiedSuites} from '../../cli/skill-priority-cases.mjs';
 import {releaseKnowledgeService} from '../../cli/campaign-memory.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 async function fixture(t){
@@ -28,7 +29,7 @@ test('minimal child uses exactly the admitted resource and cannot recursively tu
 });
 test('one bounded child borrows parent KDB and verifies postprocessed provenance',async t=>{
  const f=await fixture(t);let constructed=0,operated=0;
- const ops={inspect:async()=>({status:'experiment',answer:'A suite must be constructed',refs:[]}),ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),construct:async({config,concurrency})=>{
+ const ops={qualify:async()=>({status:'qualified'}),inspect:async()=>({status:'experiment',answer:'A suite must be constructed',refs:[]}),ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),construct:async({config,concurrency})=>{
   constructed++;assert.equal(concurrency,1);assert.deepEqual(config.resource_ids,[f.resource.id]);return [{id:'question',goal:'Tiny question',actor_seconds:20}];},
   importProject:async(root,spec)=>spec,operate:async(command,config)=>{operated++;const s=new State(join(config.root,'state.sqlite'));
    s.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','question','passed','now')").run();s.event('attempt','postprocess-completed',{});s.close();},stopped:async()=>true};
@@ -77,4 +78,33 @@ test('expired retained microlearning settles without creating another project or
  let service=false;
  const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{ensureKnowledgeService:async()=>{service=true;}});
  assert.equal(result.reason,'microlearning-elapsed');assert.equal(service,false);assert.equal(f.backlog.meta('microlearning-active'),null);
+});
+
+for(const oracle of ['correct','always-pass'])test('suite export must pass actual Python reference and negative controls: '+oracle,async t=>{
+ const f=await fixture(t),trusted=join(f.root,'trusted');await mkdir(trusted);
+ await writeFile(join(trusted,'checker.py'),oracle==='always-pass'?'raise SystemExit(0)\n':"import runpy,sys\nfrom pathlib import Path\nraise SystemExit(0 if runpy.run_path(str(Path(sys.argv[1])/'kernel.py')).get('answer')==42 else 1)\n");
+ await writeFile(join(trusted,'good.py'),'answer=42\n');await writeFile(join(trusted,'bad.py'),'answer=0\n');
+ const tasks=Array.from({length:5},(_,n)=>({id:'case-'+n,target:'cpu',kind:'hypothesis-case',bucket:'correctness',prompt:'Repair boundary answer',files:{'kernel.py':'bad.py'},checker:'checker.py',controls:{reference:{files:{'kernel.py':'good.py'}},negatives:[{files:{'kernel.py':'bad.py'}}]}}));
+ const manifest=join(trusted,'skill-evaluation.json');await writeFile(manifest,JSON.stringify({target:'cpu',objective:'correctness',tasks}));
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need controls',refs:[]}),
+  construct:async()=>[{id:'suite',goal:'Build suite',actor_seconds:20,verifier:{files:[manifest]}}],importProject:async(root,spec)=>spec,
+  operate:async(command,config)=>{const child=new State(join(config.root,'state.sqlite'));child.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','suite','passed','now')").run();child.event('attempt','postprocess-completed',{});child.close();},stopped:async()=>true});
+ assert.equal(result.status,oracle==='correct'?'verified':'inconclusive');
+ const suites=await qualifiedSuites({config:f.config});assert.equal(suites.length,oracle==='correct'?1:0);
+ if(suites.length){assert.equal(suites[0].tasks.length,5);assert.equal(suites[0].target,'cpu');}
+});
+test('passed child without protected suite export cannot satisfy suite learning',async t=>{
+ const f=await fixture(t);
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need suite',refs:[]}),
+ construct:async()=>[{id:'question',goal:'Only an answer',actor_seconds:20}],importProject:async(root,spec)=>spec,
+ operate:async(command,config)=>{const child=new State(join(config.root,'state.sqlite'));child.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','question','passed','now')").run();child.event('attempt','postprocess-completed',{});child.close();},stopped:async()=>true});
+ assert.equal(result.status,'inconclusive');assert.match(result.qualification.reason,/no trusted skill-evaluation.json/i);
+});
+
+test('archival inspection accepts only actual nested KDB entries, never invented retrieval IDs',()=>{
+ const request={workKind:'microlearning'},refs=new Set(),retrievals=[{arguments:{collection:'lessons'},entries:[{chunk_id:'observed-chunk',text:'Actual fact'}]}];
+ const value={status:'resolved',answer:'A retrieved archived fact',refs:['lessons:observed-chunk']};
+ assert.equal(validateArchivalInspection(value,{request,refs,retrievals}),value);
+ assert.throws(()=>validateArchivalInspection({...value,refs:['lessons:invented']},{request,refs,retrievals}),/Cited archival/);
+ assert.throws(()=>validateArchivalInspection(value,{request:{workKind:'suite'},refs,retrievals}),/Cited archival/);
 });

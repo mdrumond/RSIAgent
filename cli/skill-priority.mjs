@@ -32,12 +32,12 @@ export async function prioritySkillStatus(config){
   const learningWork=backlog.meta('microlearning-active'),learningQueue=pendingMicrolearning(backlog);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state);
   const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
-  return {...status,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
+  return {...status,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:(backlog.meta('procedural-continuations')??[]).length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
    analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
-   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||learningQueue.length>0||items.some(i=>['queued','needs-review'].includes(i.status)))};
+   hasWork:!config.skills?.tuningDisabled&&(status.ingestion.initialPending||status.ingestion.freshPending||!status.backfillComplete||status.dirtyFailures>0||changed||backlog.meta('learning-pending')||Boolean(active||learningWork)||(backlog.meta('procedural-continuations')??[]).length>0||learningQueue.length>0||items.some(i=>['queued','needs-review'].includes(i.status)))};
  }finally{state.close();}
 }
 export async function prioritySkillsSettled(config,dependencies={}){
@@ -99,6 +99,10 @@ export async function runPrioritySkills(config,values,dependencies={}){
     return {status:'needs-review'};
    }
   }
+  if(!retained){const queue=backlog.meta('procedural-continuations')??[];
+   queue.sort((a,b)=>(backlog.get(backlog.run(b.id)?.item_id)?.priority??0)-(backlog.get(backlog.run(a.id)?.item_id)?.priority??0));
+   while(queue.length){const next=queue.shift();backlog.meta('procedural-continuations',queue);if(next.base!==config.skills.activeVersion)continue;try{backlog.continue(next.id,{...next,owner});break;}catch(error){state.event(null,'skill-continuation-skipped',{id:next.id,reason:error.message});}}
+  }
   selected=backlog.claim({base:config.skills.activeVersion,owner});
   if(!selected)return await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign()});
   const {run}=selected,item=run.snapshot,home=join(directory,'hypotheses',run.id);await mkdir(home,{recursive:true});
@@ -124,11 +128,14 @@ export async function runPrioritySkills(config,values,dependencies={}){
    return backlog.atomic(()=>{const done=backlog.finish(run.id,{status,result});if(feedback)state.event(null,'skill-hypothesis-rejected',{...feedback,evidence:{path}});return done;});
   };
   checkpoint.qualificationDirectory=join(home,'cases','qualification');save();
-  let cases=await ops.resolveCases({config,backlog,item,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
+  let cases=await ops.resolveCases({config,backlog,item,proposal:checkpoint.prepared?.status==='ready'?checkpoint.prepared.proposal??item.proposal:item.proposal,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
-  if(!checkpoint.prepared||checkpoint.prepared.retryable){
-   checkpoint.prepared=await ops.prepare({config,backlog,item,directory:join(home,'prepare'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases)});save();
+  const contractKey=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');
+  if(!checkpoint.prepared||checkpoint.prepared.retryable||checkpoint.reviewedContract!==contractKey){
+   const previous=checkpoint.prepared,qaElapsed=previous?.qa?.elapsedSeconds??previous?.elapsedSeconds??checkpoint.priorQaElapsedSeconds??0;
+   checkpoint.prepared=await ops.prepare({config,backlog,item,directory:join(home,'prepare-v2-'+contractKey),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:qaElapsed});
+   checkpoint.reviewedContract=contractKey;save();
   }
   if(checkpoint.prepared.status!=='ready'){
    if(checkpoint.prepared.retryable){delete checkpoint.runningAt;save();return {status:'deferred',reason:checkpoint.prepared.reason};}
@@ -139,7 +146,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    resource:values.resource,signal,seconds:left(),event:(type,data)=>state.event(null,type,data)});
   if(cases.status!=='ready')return finish('learning',cases);
   if(JSON.stringify(evaluationContract(cases))!==reviewedCases&&checkpoint.prepared.proposal){
-   checkpoint.prepared=await ops.prepare({config,backlog,item:{...item,proposal:checkpoint.prepared.proposal},directory:join(home,'final-contract'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:checkpoint.prepared.elapsedSeconds??0});save();
+   checkpoint.prepared=await ops.prepare({config,backlog,item:{...item,proposal:checkpoint.prepared.proposal},directory:join(home,'final-contract'),signal,remainingSeconds:left(),evaluationContract:evaluationContract(cases),priorElapsedSeconds:checkpoint.prepared.qa?.elapsedSeconds??checkpoint.prepared.elapsedSeconds??0});checkpoint.reviewedContract=createHash('sha256').update(JSON.stringify(evaluationContract(cases))).digest('hex');save();
    if(checkpoint.prepared.status!=='ready')return finish(checkpoint.prepared.status==='learning'?'learning':'inconclusive',checkpoint.prepared);
    const finalCases=await ops.resolveCases({config,backlog,item,proposal:checkpoint.prepared.proposal??item.proposal,directory:join(home,'cases'),qualificationDirectory:checkpoint.qualificationDirectory,resource:values.resource,signal,seconds:left()});
    if(finalCases.status!=='ready'||JSON.stringify(evaluationContract(finalCases))!==JSON.stringify(evaluationContract(cases)))return finish('learning',{reason:'Final proposal requires a different qualified contract'});
@@ -170,4 +177,28 @@ export async function runPrioritySkills(config,values,dependencies={}){
   }
   throw error;
  }finally{clearInterval(timer);state.close();}
+}
+
+/** Explicit one-time procedural migration; claimed foreground projects and old run records stay intact. */
+export async function migratePriorityThroughput(config,{procedure,base=config.skills.activeVersion}={}){
+ if(!procedure?.trim())throw Error('Audited procedure description required');
+ const {state,backlog}=open(config);try{return backlog.atomic(()=>{
+  if(backlog.meta('throughput-migration'))return backlog.meta('throughput-migration');
+  const queue=[],tagged=[],seen=new Set();
+  for(const {id}of backlog.db.prepare("SELECT id FROM skill_backlog_runs ORDER BY rowid DESC").all()){
+   const run=backlog.run(id);if(seen.has(run.item_id))continue;seen.add(run.item_id);
+   if(!['learning','inconclusive'].includes(run.status))continue;
+   if(run.base!==base||run.elapsed>=run.seconds||run.checkpoint?.evaluationDirectory||run.result?.report?.results?.length)continue;
+   let qualification;try{qualification=JSON.parse(readFileSync(join(run.checkpoint?.qualificationDirectory??join(config.root,'skills','priority','hypotheses',run.id,'cases','qualification'),'micro','results.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+   if(qualification?.runningSample||qualification?.results?.length)continue;
+   const requestId=run.result?.learningRequest,row=requestId&&backlog.db.prepare("SELECT data,status FROM skill_learning_requests WHERE id=?").get(requestId),request=row&&JSON.parse(row.data);
+   const missingCases=Boolean(run.status==='learning'&&row?.status==='pending'&&request?.backlogId===run.item_id&&request.question?.startsWith('Qualify an experiment for '));
+   if(!missingCases&&!['qa-elapsed','qa-execution-failed'].includes(run.result?.reason))continue;
+   if(missingCases){request.workKind='suite';request.familyKey=createHash('sha256').update(JSON.stringify([config.target,run.snapshot.objective,run.snapshot.skill,run.snapshot.proposal?.changes])).digest('hex');
+    backlog.db.prepare("UPDATE skill_learning_requests SET data=? WHERE id=? AND status='pending'").run(JSON.stringify(request),requestId);tagged.push(requestId);}
+   queue.push({id,procedure,base,missingCases});
+  }
+  const audit={procedure,base,at:new Date().toISOString(),tagged,continuations:queue.map(q=>q.id)};
+  backlog.atomic(()=>{backlog.meta('procedural-continuations',queue);backlog.meta('throughput-migration',audit);state.event(null,'skill-throughput-migrated',audit);});return audit;});
+ }finally{state.close();}
 }

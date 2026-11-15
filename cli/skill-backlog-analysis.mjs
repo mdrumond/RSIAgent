@@ -27,7 +27,7 @@ function artifactPaths(value,key='',paths=[]){
  else if(value&&typeof value==='object')for(const [k,v]of Object.entries(value))artifactPaths(v,k,paths);
  return paths;
 }
-async function freezeGroups(root,groups,directory){
+export async function freezeGroups(root,groups,directory){
  const file=join(directory,'groups.json'),prior=await load(file);if(prior)return prior;
  await mkdir(join(directory,'evidence'),{recursive:true});const campaign=await realpath(root),frozen=structuredClone(groups);
  for(const group of frozen){delete group.classification;delete group.dirty;delete group.fresh;}

@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
-import {runPrioritySkills,prioritySkillStatus} from '../../cli/skill-priority.mjs';
+import {runPrioritySkills,prioritySkillStatus,migratePriorityThroughput} from '../../cli/skill-priority.mjs';
 import {backgroundSkillStatus} from '../../cli/skill-background.mjs';
 import {resolveHypothesisCases} from '../../cli/skill-priority-cases.mjs';
 import {claimLearningRequest,enqueueLearningRequest,recordLearningOutcome} from '../../controller/skill-review.mjs';
@@ -104,7 +104,7 @@ test('missing relevant cases create prioritized learning, never run generic task
  assert.equal(request.backlogId,item.id);assert.equal(request.priority,90);
  f.add('low',1);const low={...request,question:'Other question',backlogId:f.backlog.get('low').id,priority:1};
  f.state.db.prepare("INSERT INTO skill_learning_requests(id,data) VALUES('low',?)").run(JSON.stringify(low));
- assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft-1',topic:'matmul',target:'a3'}).id,result.learningRequest);
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft-1',topic:'matmul',target:'a3'}),null);
 });
 test('legacy pending comparison keeps the old execution path during opt-in migration',async t=>{
  const f=await fixture(t);await writeFile(join(f.root,'skills','evolution.json'),JSON.stringify({history:[],pending:{evaluationRoot:join(f.root,'old'),projectIds:[],runs:2,evaluationSeconds:100},evaluationStatus:'deferred'}));
@@ -192,4 +192,24 @@ test('foreground queue uses the existing background worker only when comparisons
  assert.equal(learnt,0);
  await runPrioritySkills(f.config,f.values,{...f.ops,learn:async({resource})=>{assert.equal(resource.id,'reserved');learnt++;return {status:'verified'};}});
  assert.equal(learnt,1);
+});
+
+test('audited migration preserves claimed projects and queues only pre-evaluation infrastructure continuations',async t=>{
+ const f=await fixture(t),item=f.add('legacy',90),old=f.backlog.claim({base:'baseline'});f.backlog.checkpoint(old.run.id,{elapsed:450,checkpoint:{prepared:{status:'ready',elapsedSeconds:100}}});
+ const request=enqueueLearningRequest(f.state,{target:'a3',backlogId:item.id,question:'Qualify an experiment for implementation: legacy',requiredEvidence:'Five controls'});
+ const claimed=enqueueLearningRequest(f.state,{target:'a3',question:'Already claimed original phase one',requiredEvidence:'Large experiment'});
+ f.state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft='existing-draft' WHERE id=?").run(claimed);
+ f.backlog.finish(old.run.id,{status:'learning',result:{reason:'No target-compatible evaluation suite',learningRequest:request}});
+ const audit=await migratePriorityThroughput(f.config,{procedure:'Enable qualified suite lane v2'});assert.deepEqual(audit.tagged,[request]);assert.deepEqual(audit.continuations,[old.run.id]);
+ assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(claimed).status,'claimed');assert.equal(f.backlog.run(old.run.id).elapsed,450);
+ await runPrioritySkills(f.config,f.values,f.ops);const runs=f.state.db.prepare('SELECT id,elapsed,status FROM skill_backlog_runs ORDER BY rowid').all();
+ assert.equal(runs.length,2);assert.equal(runs[0].status,'learning');assert(runs[1].elapsed>=450);assert.equal(runs[1].status,'rejected');assert.equal(f.backlog.meta('procedural-continuations').length,0);
+ assert.deepEqual(await migratePriorityThroughput(f.config,{procedure:'Repeated migration'}),audit);
+});
+test('legacy cached preparation cannot skip v2 contract review',async t=>{
+ const f=await fixture(t),item=f.add('legacy-ready'),old=f.backlog.claim({base:'baseline'});
+ f.backlog.checkpoint(old.run.id,{elapsed:120,checkpoint:{prepared:{status:'ready',active:'baseline',candidate:'old-candidate',qa:{elapsedSeconds:60}}}});
+ let budget;
+ await runPrioritySkills(f.config,f.values,{...f.ops,prepare:async args=>{budget=args.priorElapsedSeconds;assert(args.evaluationContract);return f.ops.prepare(args);}});
+ assert.equal(budget,60);assert.equal(f.calls.filter(c=>c[0]==='prepare').length,1);assert.equal(f.backlog.get(item.id).status,'rejected');
 });

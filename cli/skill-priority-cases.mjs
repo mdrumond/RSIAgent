@@ -27,9 +27,9 @@ export async function qualifiedSuites({config}){
  }return suites;
 }
 
-async function learnedCases(config,backlog,item){
+async function learnedCases(config,backlog,item,requests){
  if(!backlog.db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get())return {suites:[],errors:[]};
- const rows=backlog.db.prepare("SELECT data FROM skill_learning_requests WHERE status='verified'").all();
+ const rows=requests?requests.map(request=>({data:JSON.stringify(request)})):backlog.db.prepare("SELECT data FROM skill_learning_requests WHERE status='verified'").all();
  const suites=[],errors=[];
  for(const row of rows){
   const request=JSON.parse(row.data);if(request.backlogId!==item.id&&!request.backlogIds?.includes(item.id))continue;
@@ -121,4 +121,16 @@ export async function resolveHypothesisCases({config,backlog,item,directory,qual
  stored.backlogIds=[...new Set([stored.backlogId,...(stored.backlogIds??[]),item.id])];
  backlog.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify(stored),id);
  return {status:'needs-learning',reason:chosen.reason,learningRequest:id};
+}
+
+/** Suite learning is complete only after its protected export passes reference/negative controls. */
+export async function qualifyLearningSuite({config,backlog,request,directory,resource,signal,seconds},dependencies={}){
+ const item={id:request.backlogId},learned=await learnedCases(config,backlog,item,[request]);
+ if(learned.suites.length!==1)return {status:'inconclusive',reason:learned.errors.join('; ')||'No trusted five-case suite export'};
+ const suite=learned.suites[0],prepared=prepareHypothesisEvaluation(suite);
+ if(prepared.status!=='ready')return {status:'inconclusive',reason:prepared.reason};
+ const qualification=await (dependencies.qualify??(await import('./skill-hypothesis-evaluation.mjs')).qualifyHypothesisTasks)({...prepared,directory,config,resource,signal,remainingSeconds:seconds});
+ if(qualification.status!=='qualified')return {status:'inconclusive',reason:qualification.reason??'Suite controls did not qualify'};
+ const registered=await registerQualifiedSuite({config,suite:{...prepared,familyKey:request.familyKey,mechanism:request.hypothesis},qualification,provenance:{...request.findings,qualificationDirectory:directory,qualificationReport:join(directory,'micro','results.json')}});
+ return {status:'qualified',suite:registered};
 }
