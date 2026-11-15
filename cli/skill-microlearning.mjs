@@ -17,7 +17,7 @@ export const smallLearning=r=>r.intervention!=='user-required'&&(r.workKind==='s
 export function pendingMicrolearning(backlog){
  if(!has(backlog.db))return [];
  return backlog.db.prepare("SELECT id,data FROM skill_learning_requests WHERE status='pending'").all().map(row=>({...JSON.parse(row.data),id:row.id}))
-  .filter(smallLearning).sort((a,b)=>(backlog.get(b.backlogId)?.priority??b.priority??0)-(backlog.get(a.backlogId)?.priority??a.priority??0));
+  .filter(smallLearning).sort((a,b)=>((b.backlogId?backlog.get(b.backlogId)?.priority:null)??b.priority??0)-((a.backlogId?backlog.get(a.backlogId)?.priority:null)??a.priority??0));
 }
 export function validateArchivalInspection(value,{refs,request,retrievals=[]}){
  const known=new Set([...refs,...retrievals.flatMap(record=>(record.entries??[]).flatMap(entry=>{
@@ -45,12 +45,12 @@ export async function microlearningSettled(config,work,dependencies={}){
  if(work.qualificationDirectory&&!await (dependencies.settled??hypothesisEvaluationSettled)({directory:work.qualificationDirectory,config,resource:work.resource}))return false;
  return (dependencies.stopped??instanceStopped)(child);
 }
-export async function runMicrolearning({config,backlog,resource,remainingSeconds,signal},dependencies={}){
+export async function runMicrolearning({config,backlog,resource,remainingSeconds,signal,requestIds},dependencies={}){
  const ops={qualify:qualifyLearningSuite,settled:hypothesisEvaluationSettled,inspect:async input=>(await import('./skill-review-native.mjs')).reviewSession(input),construct:refillProjects,importProject,operate,stopped:instanceStopped,ensureKnowledgeService,createKdbBridge,now:()=>performance.now(),...dependencies};
  let work=backlog.meta('microlearning-active');
  if(work?.owner&&!await ownerStopped(work.owner))return {status:'blocked',reason:'Microlearning owner remains live'};
  if(!work){
-  const request=pendingMicrolearning(backlog)[0];if(!request)return {status:'idle'};
+  const request=pendingMicrolearning(backlog).find(r=>!requestIds||requestIds.includes(r.id));if(!request)return {status:'idle'};
   work={id:request.id,request,directory:join(config.root,'skills','priority','learning',request.id),elapsed:0,seconds:900,stage:'construction',resource};
   const changed=backlog.atomic(()=>{if(backlog.meta('microlearning-active'))return 0;const changed=backlog.db.prepare("UPDATE skill_learning_requests SET status='background',draft=? WHERE id=? AND status='pending'").run('background:'+request.id,request.id).changes;if(changed)backlog.meta('microlearning-active',work);return changed;});
   if(!changed)return {status:'deferred'};

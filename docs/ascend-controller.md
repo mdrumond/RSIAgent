@@ -504,3 +504,33 @@ New receipts also stamp host identity and reject a known foreign host. Closure
 preserves any real exit result; absent exit stays an infrastructure interruption,
 with no invented success or duration. Excluded setup retains its existing zero
 accounting policy; payloads without measured accounting remain unresolved.
+
+
+Failure-driven skill evaluation keeps a campaign-local cohort of at most five
+hypotheses. Qualified cases run first, followed by applicable premade packs that
+need qualification. New failures are ingested while a cohort runs, but global
+classification and ranking wait until its members have outcomes or explicit
+blockers. A missing compatible suite does not start bespoke suite construction.
+Status includes `cohort.members`, outcome counts, `nextAction`, and the count of
+new evidence deferred since selection. A pause preserves cohort membership,
+elapsed allocations and completed samples; a new active skill invalidates old
+baseline samples without renewing the unfinished hypothesis allowance. Existing
+claimed learning resumes normally; idle learning admits bounded factual requests
+rather than old unclaimed suite-construction requests.
+
+
+An operator may authorize a case-selection handoff repair with immutable code
+revision and evidence provenance. This continuation is limited to an unchanged,
+pre-Q&A hypothesis that ended inconclusive because its suite was unsupported;
+scored comparisons, rejected candidates and unresolved execution are excluded.
+The new checkpoint records the repair and carries the original elapsed spend and
+allocation. It does not overwrite the previous outcome or automatically retry
+scientific rejections.
+
+
+Recovery of a stopped background worker may ask the existing SDK to retire only
+canonical pre-payload upload custody for an interrupted device evaluation. A
+permanent comparison fence forces an inconclusive outcome without replay or
+rescoring; its elapsed spend and prior samples remain intact. Live workers,
+qualification and ordinary evaluation do not receive this retirement permission,
+and unknown native work remains blocked until positive closure is established.
