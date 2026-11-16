@@ -18,6 +18,7 @@ import {refillProjects} from './project-generation.mjs';
 import {runMicroeval,finalizeKernelPairs} from './skill-microeval.mjs';
 import {tasks} from './microtasks/tasks.mjs';
 import {stages as workflowStages} from '../controller/workflow.mjs';
+import {compactSummary,sourcePointers} from './skill-evidence-summary.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
 
@@ -30,6 +31,7 @@ const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:
 const issueFields={...Object.fromEntries(Object.entries(proofFields).map(([k,v])=>[k,Type.Optional(v)])),path:Type.Optional(nonempty())};
 const issueSchema=Type.Union([nonempty(),Type.Object({...issueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...issueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
 const requestSchema=Type.Object({groupIds:Type.Array(nonempty()),question:nonempty(),hypothesis:nonempty(),requiredEvidence:nonempty(),learningTarget:Type.Union([Type.Literal('cpu'),Type.Literal('device')]),workKind:Type.Optional(Type.Union([Type.Literal('microlearning'),Type.Literal('phase1')]))},{additionalProperties:false});
+const qaAnswerResultSchema=Type.Object({answers:Type.Object(Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,Type.Object({text:nonempty(),refs:Type.Array(nonempty())},{additionalProperties:false})])),{additionalProperties:false}),changes:Type.Optional(Type.Array(Type.Unknown())),memoryRefs:Type.Optional(Type.Array(nonempty())),reason:Type.Optional(nonempty()),claims:claimsSchema},{additionalProperties:false});
 const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
 
 async function reviewEvidence(directory,groups=[]){
@@ -47,18 +49,19 @@ async function reviewEvidence(directory,groups=[]){
  }
  return {required,previews};
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
  const {resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href);
- const declarations=[directory,...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths];
+ const declarations=[directory,...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths,...requiredReads];
  const allowed=await Promise.all([...new Set(declarations)].map(async path=>{try{const canonical=await realpath(path);return {path:canonical,directory:(await stat(canonical)).isDirectory()};}catch(error){if(error.code!=='ENOENT')throw error;return {path:resolve(path),directory:false};}}));
  const evidence=await reviewEvidence(directory,evidenceGroups);
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
- const packet=await frozenEvidencePacket(evidenceGroups);
+ const packet=compactEvidence?{observations:[],artifacts:[]}:await frozenEvidencePacket(evidenceGroups);
  prompt={...prompt,projectSummaries:prompt.projectSummaries??await projectSummaries(config,evidenceGroups),learningProofEvidence:prompt.learningProofEvidence??await learningProofEvidence(prompt.learning,prompt.learningEvidence),frozenEvidence:packet};
- if(proofRequired)prompt={...prompt,proofInstructions,proofEvidence:claimEvidence({prompt,packet})};
+ const proofSources=()=>proofRecords?[...proofRecords,...claimEvidence({prompt:{entries:prompt.entries,baseline:prompt.baseline,proposal:prompt.proposal,answers:prompt.answers,answerClaims:prompt.answerClaims}})]:claimEvidence({prompt,packet});
+ if(proofRequired)prompt={...prompt,proofInstructions,proofEvidence:compactEvidence?undefined:proofSources()};
  await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
  const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
  const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -67,8 +70,9 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async result=>{
   if((proofRequired||resultSchema)&&!Check(schema,result))throw Error('Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.');
+  if(requiredReads.some(path=>!seen.has('file:'+resolve(path))))throw Error('Read these primary source files before summary audit: '+JSON.stringify(requiredReads.filter(path=>!seen.has('file:'+resolve(path)))));
   if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
-  if(proofRequired)validateClaimedResult(result,claimEvidence({prompt,packet,retrievals}));
+  if(proofRequired)validateClaimedResult(result,proofRecords?proofSources():claimEvidence({prompt,packet,retrievals}));
   return validate(result,retrievals);
  };
  const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
@@ -86,7 +90,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    return {block:true,reason:'Filesystem inspection is limited to this review directory and explicitly copied evidence/verified learning paths. Read input.json and correct the submitted fields; use KDB MCP search/read_entry for indexed knowledge, not workspace searches.'};
   });
   pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
-   const path=resolve(directory,event.input.path??'');if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
+   const path=resolve(directory,event.input.path??'');if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
    const text=(event.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
    for(const ref of evidence.required){const quoted=JSON.stringify(ref);if(text.includes('\"reference\":'+quoted)||text.includes('\"reference\": '+quoted))seen.add(ref);}
    await writeFile(coverageFile,JSON.stringify([...seen]));
@@ -126,6 +130,18 @@ export async function nativeReview(input){
   return input.validate(result);
  }});
 }
+
+const summaryResultSchema=Type.Object({items:Type.Array(Type.Object({text:nonempty(),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')])},{additionalProperties:false}),{minItems:1}),claims:claimsSchema},{additionalProperties:false});
+const summaryAuditSchema=Type.Object({verdict:Type.Union(['supported','revise','unknown'].map(x=>Type.Literal(x))),reason:nonempty(),claims:claimsSchema},{additionalProperties:false});
+export async function nativeQaSummarize(input,dependencies={}){
+ const {sourceCatalogue:catalogue,page}=input;
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:summaryResultSchema,knowledge:false,evidenceGroups:[],compactEvidence:true,proofRecords:catalogue.records,allowedPaths:[catalogue.directory],prompt:{sources:page.sources,authoritativeFacts:catalogue.facts,previousReview:input.previousReview??[],task:'Read the primary source files in this page and summarize the consequential observed evidence into concise items, each with observation|hypothesis kind and a top-level claim path items.N.text with primary proof selectors. Code/docstrings and memory reports prove text, not measured execution or backend defects. Keep project status separate from passing verifier counts; preserve uncertainty, source/case/runtime boundaries and conflicting results. Do not draft skills or infer skill benefit. Select source lines, whole typed facts or input JSON fields; do not retype quotes. A summary is not a new primary source. Fix previousReview findings using only these primary sources.'},validate:value=>input.validate(value)});
+}
+export async function nativeQaAuditSummary(input,dependencies={}){
+ const {sourceCatalogue:catalogue,item}=input,refs=item.proofs.map(p=>p.reference),sources=sourcePointers(catalogue,refs),reads=sources.filter(s=>!s.factId).flatMap(s=>s.segments.map(p=>p.path));
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:summaryAuditSchema,knowledge:false,evidenceGroups:[],compactEvidence:true,proofRecords:catalogue.records,allowedPaths:[catalogue.directory],requiredReads:reads,prompt:{item:{text:item.text,kind:item.kind,proofs:item.proofs},sources,relatedSources:catalogue.pages.find(p=>p.id===item.pageId)?.sources??[],sourceCatalogue:catalogue.indexFile,authoritativeFacts:catalogue.facts,task:'Independently verify this summary item against the primary files and authoritative facts. Read its primary source files before deciding. Return verdict supported|revise|unknown, a concise reason and proof-bearing claims. Check entailment, not merely literal copying. A code comment or memory report does not establish device execution, numerical correctness, a backend defect or causal performance. Whole-kernel ratios do not prove component contribution. Check project/pass counts and omitted contradictions. supported means the correctly scoped statement follows, or is explicitly an unverified hypothesis; revise means a fixable mismatch, unknown means necessary primary evidence is absent. The summary itself cannot be its own proof.'},validate:value=>{if(!['supported','revise','unknown'].includes(value.verdict))throw Error('Invalid summary audit verdict');return input.validate(value);}});
+}
+
 // QA deliberately reuses retrieved evidence rather than reopening KDB or executing kernels.
 async function qaPrompt(input){
  let memory=input.memoryEvidence;
@@ -142,16 +158,18 @@ async function qaPrompt(input){
   rules:'Only supplied evidence is available. Do not run benchmarks or search live sources. Unsupported facts must remain explicit questions. Performance hypotheses need not already prove a speedup. The actor sees the skill text, not these answers.'};
 }
 export async function nativeQaAnswer(input,dependencies={}){
- const prompt=await qaPrompt(input);
+ let prompt=await qaPrompt(input);
+ const compact=input.evidenceSummary&&input.sourceCatalogue;if(compact)prompt={proposal:prompt.proposal,baseline:prompt.baseline,objective:prompt.objective,target:prompt.target,questions:prompt.questions,rules:prompt.rules,evidenceSummary:compactSummary(input.evidenceSummary,input.sourceCatalogue),evaluationContract:prompt.evaluationContract};
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return (dependencies.session??reviewSession)({...input,proofRequired:true,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,previousReview:input.previousReview,
-  task:'Answer all five questions concisely, at most two short sentences per answer. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[]}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:qaAnswerResultSchema,knowledge:false,evidenceGroups:compact?[]:prompt.groups,compactEvidence:!!compact,proofRecords:compact?input.sourceCatalogue.records:undefined,allowedPaths:compact?[...allowedPaths,input.sourceCatalogue.directory]:allowedPaths,prompt:{...prompt,previousReview:input.previousReview,
+  task:'Answer all five questions concisely, at most two short sentences per answer. Return {answers:{action:{text,refs:[]},mechanism:{text,refs:[]},example:{text,refs:[]},evidence:{text,refs:[]},objective:{text,refs:[]}},changes?:[],memoryRefs?:[],reason?:string}. refs must identify supplied failure references, baseline IDs or already cited memory. Revise changes and the optional proposal reason when necessary so essential actionable advice and boundaries appear in the actual skill text. Preserve the existing change schema. Do not merely explain a missing instruction in private answers.'}});
 }
 export async function nativeQaReview(input,dependencies={}){
- const prompt=await qaPrompt(input);
+ let prompt=await qaPrompt(input);
+ const compact=input.evidenceSummary&&input.sourceCatalogue;if(compact)prompt={proposal:prompt.proposal,baseline:prompt.baseline,objective:prompt.objective,target:prompt.target,questions:prompt.questions,rules:prompt.rules,evidenceSummary:compactSummary(input.evidenceSummary,input.sourceCatalogue),evaluationContract:prompt.evaluationContract};
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:qaReviewResultSchema,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,answerClaims:input.answerClaims??[],
-  task:'Independently review the draft, five answers and answerClaims against supplied evidence. Check each claim actually follows from its quoted source and typed project facts; an exact quote alone is not proof of entailment. Send fixable mismatches back with revise and concrete issues, not approval. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. For each learning request set workKind:microlearning only for one tiny controlled question fitting 900 elapsed seconds including construction, verification and cleanup; larger workKind:phase1. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:qaReviewResultSchema,knowledge:false,evidenceGroups:compact?[]:prompt.groups,compactEvidence:!!compact,proofRecords:compact?input.sourceCatalogue.records:undefined,allowedPaths:compact?[...allowedPaths,input.sourceCatalogue.directory]:allowedPaths,prompt:{...prompt,answers:input.answers,answerClaims:input.answerClaims??[],
+  task:'Independently review the draft, five answers and answerClaims against supplied evidence. Check the independently audited evidenceSummary against its primary source pointers as well as every final skill/answer claim; a summary is never its own primary proof. Check each claim actually follows from its primary source and typed project facts; an exact quote alone is not proof of entailment. Send fixable mismatches back with revise and concrete issues, not approval. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. For each learning request set workKind:microlearning only for one tiny controlled question fitting 900 elapsed seconds including construction, verification and cleanup; larger workKind:phase1. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
 }
 export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){
  const ops={construct:refillProjects,importProject,operate,ensureKnowledgeService,createKdbBridge,...dependencies};

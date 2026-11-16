@@ -1,0 +1,81 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createServer} from 'node:http';
+import {once} from 'node:events';
+import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
+import {prepareQaSources,validateSummary,summaryItems,compactSummary} from '../../cli/skill-evidence-summary.mjs';
+import {nativeQaAnswer,nativeQaAuditSummary,nativeQaSummarize,reviewSession} from '../../cli/skill-review-native.mjs';
+async function fixture(t){const directory=await mkdtemp(join(tmpdir(),'evidence-summary-'));t.after(()=>rm(directory,{recursive:true,force:true}));return {directory,proposal:{reason:'Observed failure',changes:[{text:'Check source',evidenceRefs:['raw']}],memoryRefs:[]},entries:[],objective:'correctness',target:'fixture',groups:[{id:'g',occurrences:[{reference:'raw',type:'tool-result',message:'PASS one case\nunknown target'}]}],memoryEvidence:[],projectSummaries:[{facts:[{reference:'count',factId:'count',value:1,text:'1'}],references:[]}],learningProofEvidence:[],validateProposal:x=>x};}
+const summary=text=>({items:[{text,kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]});
+const answers=()=>({answers:Object.fromEntries(qaTopics.map(k=>[k,{text:'Checked '+k,refs:['raw']}]))});
+const approve=()=>({verdict:'approved',reason:'Supported'});
+test('primary records stay outside compact prompt and summaries cannot prove themselves',async t=>{
+ const f=await fixture(t);f.groups[0].occurrences[0].message+='\n'+'large source context'.repeat(20000);
+ const c=await prepareQaSources(f),value=validateSummary(summary('A passing case is recorded'),c),items=summaryItems(value,c.pages[0].id),compact=compactSummary({items},c);
+ assert.ok(JSON.stringify(compact).length<4000);assert.ok((await readFile(c.sources.find(s=>s.reference==='raw').segments[0].path,'utf8')).length>200000);
+ await nativeQaAnswer({...f,evidenceSummary:{items},sourceCatalogue:c,validate:x=>x},{session:async options=>{assert.equal(options.compactEvidence,true);assert.equal(options.evidenceGroups.length,0);assert.ok(JSON.stringify(options.prompt).length<8000);assert.ok(options.proofRecords.some(r=>r.text.length>200000));assert.ok(options.allowedPaths.includes(c.directory));return {value:{}};}});
+ assert.throws(()=>validateSummary({items:[{text:'False fact',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:items[0].id,startLine:1,endLine:1}]}]},c),/Unknown proof/);
+});
+test('source-bound but false summary is returned before answers; each audit uses a fresh context',async t=>{
+ const f=await fixture(t),dirs=[],events=[];let clock=1000,writes=0;
+ const result=await runProposalQa(f,{now:()=>clock,qaSummarize:async x=>{events.push('summary');clock+=1000;return summary(writes++?'One case passed':'Zero cases passed');},qaAuditSummary:async x=>{dirs.push(x.directory);events.push('audit');clock+=1000;return {verdict:x.item.text==='Zero cases passed'?'revise':'supported',reason:'Compare the observed PASS'};},qaAnswer:async x=>{events.push('answers');assert.equal(x.evidenceSummary.items[0].text,'One case passed');return answers();},qaReview:async()=>{events.push('review');return approve();}});
+ assert.equal(result.verdict,'approved');assert.deepEqual(events,['summary','audit','summary','audit','answers','review']);assert.equal(new Set(dirs).size,2);assert.equal(result.summary.pages[Object.keys(result.summary.pages)[0]].revisions.length,1);
+});
+test('summary audit sees source provenance and requires direct primary file access',async t=>{
+ const f=await fixture(t);f.groups[0].occurrences[0].type='source-code';f.groups[0].occurrences[0].message='// This backend is broken';
+ const c=await prepareQaSources(f),item=summaryItems(validateSummary(summary('A code comment claims a backend defect'),c),c.pages[0].id)[0];
+ await nativeQaAuditSummary({...f,item,sourceCatalogue:c,validate:x=>x},{session:async options=>{assert.equal(options.prompt.sources[0].provenance,'code-text');assert.ok(options.requiredReads.includes(c.sources.find(s=>s.reference==='raw').segments[0].path));assert.equal(options.proofRecords.some(r=>r.reference===item.id),false);assert.equal(options.prompt.item.proofs[0].quote,'// This backend is broken');return {value:options.validate({verdict:'revise',reason:'Comment is not execution evidence'})};}});
+ await nativeQaSummarize({...f,page:c.pages[0],sourceCatalogue:c,validate:x=>x},{session:async options=>{assert.equal(options.compactEvidence,true);assert.ok(options.prompt.authoritativeFacts.some(s=>s.reference==='count'&&s.value===1));return {value:{}};}});
+});
+test('source-only changes invalidate summary and approval while preserving the elapsed ledger',async t=>{
+ const f=await fixture(t),artifact=join(f.directory,'log.txt');await writeFile(artifact,'same line\nold context');f.groups[0].occurrences[0].artifacts=[{path:artifact}];let clock=1000,produced=0,audited=0;
+ const ops={now:()=>clock,qaSummarize:async()=>{produced++;clock+=1000;return summary('One case passed');},qaAuditSummary:async()=>{audited++;clock+=1000;return {verdict:'supported',reason:'Primary supports it'};},qaAnswer:async()=>answers(),qaReview:async()=>approve()};
+ const first=await runProposalQa(f,ops);const firstCount=produced;await writeFile(artifact,'same line\nnew context');const second=await runProposalQa(f,ops);
+ assert.equal(second.verdict,'approved');assert.ok(produced>firstCount);assert.ok(audited>=2);assert.notEqual(first.sourceIdentity,second.sourceIdentity);assert.notEqual(first.approval,second.approval);assert.ok(second.elapsedSeconds>=first.elapsedSeconds);assert.equal(second.proofUpgrades.at(-1).verdict,'approved');
+});
+test('legacy 85-second approval gets only215seconds; expired300-second QA calls no providers',async t=>{
+ for(const spent of [85,300]){
+  const f=await fixture(t);let clock=1000;
+  await runProposalQa(f,{now:()=>clock,qaAnswer:async()=>{clock+=spent*1000;return answers();},qaReview:async()=>approve()});
+  const path=join(f.directory,'qa.json'),old=JSON.parse(await readFile(path));old.elapsedSeconds=spent;await writeFile(path,JSON.stringify(old));let calls=0,allowance;
+  const out=await runProposalQa(f,{now:()=>clock,qaSummarize:async x=>{calls++;allowance=x.seconds;return summary('One case passed');},qaAuditSummary:async()=>({verdict:'supported',reason:'Checked'}),qaAnswer:async()=>answers(),qaReview:async()=>approve()});
+  if(spent===85){assert.equal(allowance,215);assert.equal(out.verdict,'approved');}else{assert.equal(calls,0);assert.equal(out.verdict,'inconclusive');assert.equal(out.reason,'qa-elapsed');}
+  assert.ok(out.elapsedSeconds>=spent);assert.equal(out.seconds,300);
+ }
+});
+test('interrupted summary audits resume completed work and preserve all elapsed charges',async t=>{
+ const f=await fixture(t),stop=new AbortController();let clock=1000,produced=0;
+ await assert.rejects(runProposalQa({...f,signal:stop.signal},{now:()=>clock,qaSummarize:async()=>{produced++;clock+=10000;return summary('One case passed');},qaAuditSummary:async()=>{clock+=20000;stop.abort(Error('Pause'));throw stop.signal.reason;}}),/Pause/);
+ let left;const out=await runProposalQa(f,{now:()=>clock,qaSummarize:()=>{throw Error('Repeated completed summary');},qaAuditSummary:async x=>{left=x.seconds;return {verdict:'supported',reason:'Checked'};},qaAnswer:async()=>answers(),qaReview:async()=>approve()});
+ assert.equal(produced,1);assert.equal(left,270);assert.ok(out.elapsedSeconds>=30);assert.equal(out.verdict,'approved');
+});
+test('writer can revise the proposal reason with a source-bound claim',async t=>{
+ const f=await fixture(t);const out=await runProposalQa(f,{qaAnswer:async()=>({...answers(),reason:'One passing case is recorded',claims:[{path:'reason',text:'One passing case is recorded',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]}),qaReview:async x=>{assert.equal(x.proposal.reason,'One passing case is recorded');return approve();}});assert.equal(out.proposal.reason,'One passing case is recorded');
+});
+
+test('huge single-line sources have bounded literal pages with complete byte recovery',async t=>{
+ const f=await fixture(t),text='α'.repeat(60000);f.groups[0].occurrences[0].message=text;
+ const c=await prepareQaSources(f),aliases=c.sources.filter(s=>s.parent?.reference==='raw');assert.ok(aliases.length>4);
+ let reconstructed='';for(const s of aliases){const part=await readFile(s.segments[0].path,'utf8');assert.ok(Buffer.byteLength(part)<=16384);reconstructed+=part;}
+ assert.equal(reconstructed,c.records.find(r=>r.reference==='raw').text);for(const p of c.pages)assert.ok(p.sources.reduce((n,s)=>n+s.segments.reduce((n,x)=>n+x.bytes,0),0)<=16384);
+ const alias=aliases[0];assert.doesNotThrow(()=>validateSummary({items:[{text:'Literal source',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:alias.reference,startLine:1,endLine:1}]}]},c));
+ assert.throws(()=>validateSummary(summary('x'.repeat(9000)),c),/byte limit/);
+});
+test('summary pages select cited evidence and linked diagnostics while keeping full primary catalogue',async t=>{
+ const f=await fixture(t);f.groups[0].occurrences.push({reference:'irrelevant',message:'uncited metadata'});f.groups[0].linkedDiagnostics=[{reference:'negative',message:'contradictory diagnostic'}];
+ const c=await prepareQaSources(f),refs=c.pages.flatMap(p=>p.sources.map(s=>s.reference));assert.ok(refs.includes('raw'));assert.ok(refs.includes('negative'));assert.ok(!refs.includes('irrelevant'));assert.ok(c.records.some(r=>r.reference==='irrelevant'));
+});
+
+test('native audit rejects submission until a stock read opens its primary source',async t=>{
+ const f=await fixture(t),primary=join(f.directory,'primary.txt');await writeFile(primary,'literal primary');let requests=0;
+ const result={reason:'Recorded text',claims:[{path:'reason',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]};
+ const server=createServer(async(req,res)=>{for await(const chunk of req){}requests++;const call=requests<4,tool=requests===2?'read':'submit_review',args=tool==='read'?{path:primary}:{result};res.writeHead(200,{'content-type':'text/event-stream'});res.end('data: '+JSON.stringify({id:'audit',object:'chat.completion.chunk',created:1,model:'audit',choices:[{index:0,delta:call?{role:'assistant',tool_calls:[{index:0,id:'call'+requests,type:'function',function:{name:tool,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'Done'},finish_reason:call?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');});
+ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
+ const env='SUMMARY_AUDIT_FIXTURE',old=process.env[env];process.env[env]='fixture';t.after(()=>{if(old===undefined)delete process.env[env];else process.env[env]=old;});
+ const actor={provider:'audit-fixture',model:'audit',credential_env:env,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'audit',name:'audit',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}},directory=join(f.directory,'native');
+ const out=await reviewSession({directory,config:{actor},prompt:{task:'Check source'},proofRequired:true,compactEvidence:true,proofRecords:[{reference:'raw',text:'literal primary'}],requiredReads:[primary],seconds:10,validate:x=>x});
+ assert.equal(requests,4);assert.equal(out.value.claims[0].proofs[0].quote,'literal primary');assert.ok(!(await readFile(join(directory,'input.json'),'utf8')).includes('literal primary'));const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejected.length,1);assert.match(rejected[0].error,/Read these primary/);assert.deepEqual(JSON.parse(await readFile(join(directory,'read-evidence.json'),'utf8')),['file:'+primary]);
+});

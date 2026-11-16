@@ -127,7 +127,7 @@ export async function runReview(options,dependencies={}){
   state.fingerprintVersion=2;state.legacySignature=legacySignature;
   const remaining=()=>Math.max(0,seconds-(Date.now()-state.startedAt)/1000);
   const persist=async()=>{state.elapsedSeconds=(Date.now()-state.startedAt)/1000;await save(file,state);};
-  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
+  const native=await import('./skill-review-native.mjs'),ops={classify:native.nativeClassify,classifyBatch:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,qaSummarize:native.nativeQaSummarize,qaAuditSummary:native.nativeQaAuditSummary,learn:native.nativeLearn,evaluate:native.nativeEvaluate,evaluationSettled:native.evaluationSettled,...dependencies};
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(Error('Review elapsed allocation exhausted')),Math.min(2147483647,remaining()*1000));
   const signal=options.signal?AbortSignal.any([options.signal,controller.signal]):controller.signal;
   const invoke=async(name,input,cap=240)=>{signal.throwIfAborted();if(remaining()<=0)throw Error('Review elapsed allocation exhausted');
@@ -219,7 +219,7 @@ export async function runReview(options,dependencies={}){
      validateProposal:value=>validateReviewProposal(value,bucket.groups,state.classifications)};
     const directory=join(output,'qa',hash([key,qaIdentity(input)]));
     const result=await runProposalQa({...input,directory,seconds:remaining()},{
-     qaAnswer:args=>invoke('qaAnswer',args,args.seconds),qaReview:args=>invoke('qaReview',args,args.seconds)});
+     ...((!dependencies.qaAnswer&&!dependencies.qaReview||dependencies.qaSummarize&&dependencies.qaAuditSummary)?{qaSummarize:args=>invoke('qaSummarize',args,args.seconds),qaAuditSummary:args=>invoke('qaAuditSummary',args,args.seconds)}:{}),qaAnswer:args=>invoke('qaAnswer',args,args.seconds),qaReview:args=>invoke('qaReview',args,args.seconds)});
     (state.qa??={})[key]=result;
     if(result.verdict==='approved')state.reviews[key]={...review,...result.proposal};
     await rememberLearning();await persist();return result;
