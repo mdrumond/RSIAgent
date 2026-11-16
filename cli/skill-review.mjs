@@ -13,6 +13,7 @@ import {evaluationSettings,retrievalIdentity} from '../controller/skill-objectiv
 import {stages as workflowStages} from '../controller/workflow.mjs';
 import {runProposalQa,qaIdentity} from './skill-review-qa.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
+import {reviewPages,reviewPageLimits} from './skill-review-pages.mjs';
 const load=async path=>JSON.parse(await readFile(path,'utf8'));
 async function optional(path){try{return await load(path);}catch(e){if(e.code!=='ENOENT')throw e;return null;}}
 async function save(path,value){const tmp=path+'.'+randomUUID();await writeFile(tmp,JSON.stringify(value,null,2)+'\n');await rename(tmp,path);}
@@ -80,6 +81,7 @@ function reviewReport(state){
    dispositions:Object.values(state.reviews).reduce((out,r)=>(out[r.action]=(out[r.action]??0)+1,out),{}),
    qa:Object.entries(state.qa??{}).map(([key,q])=>({key,verdict:q.verdict,reason:q.reason,elapsedSeconds:q.elapsedSeconds,approval:q.approval})),
    reviewFailures:Object.entries(state.reviews).filter(([,r])=>r.action==='inconclusive').map(([key,r])=>({key,directory:r.directory,error:r.error,reason:r.reason})),
+   discoveryPages:Object.values(state.discoveryPages??{}).flatMap(plan=>plan.pages),
    userInterventions:Object.values(state.classifications).filter(c=>c.intervention==='user-required').map(c=>c.groupId),
    learning:Object.values(state.learning).map(({id,status,question,result,intervention})=>({id,status,question,...(intervention?{intervention}:{}),...(result?.reason?{reason:result.reason}:{}),...(result?.error?{error:result.error}:{})})),
    candidates:Object.entries(state.candidates).map(([key,c])=>({key,version:c.version,decision:c.decision,published:c.published??false})),
@@ -169,23 +171,38 @@ export async function runReview(options,dependencies={}){
      await persist();
     }
    }
-   const buckets=new Map();
+   const rawBuckets=new Map();
    for(const group of state.inventory.groups){const c=state.classifications[group.id];if(!c)continue;
     for(const id of c.guidanceIds.length?c.guidanceIds:[c.coverage]){const key=group.sourceId+':'+id+(c.bucket?':'+c.bucket:'');
-     const bucket=buckets.get(key)??{key,sourceId:group.sourceId,guidanceId:id,...(c.bucket?{objective:c.bucket}:{}),groups:[]};bucket.groups.push(group);buckets.set(key,bucket);}}
+     const bucket=rawBuckets.get(key)??{key,sourceId:group.sourceId,guidanceId:id,...(c.bucket?{objective:c.bucket}:{}),groups:[]};bucket.groups.push(group);rawBuckets.set(key,bucket);}}
+   const needsPages=selected.includes('propose')||Object.keys(state.discoveryPages??{}).length>0;
+   const limits=reviewPageLimits(options.discoveryPages??state.discoveryPageLimits),buckets=new Map();
+   if(needsPages&&state.discoveryPageLimits&&hash(state.discoveryPageLimits)!==hash(limits))throw Error('Frozen discovery page limits changed');
+   if(needsPages){state.discoveryPageLimits=limits;state.discoveryPages??={};}
+   for(const bucket of rawBuckets.values()){
+    const learning=Object.values(state.learning).filter(v=>v.key===bucket.key&&v.result?.status==='verified-cpu');
+    const legacy=state.reviews[bucket.key]||await optional(join(output,'proposals',hash([bucket.key,learning.length]),'native-session.json'));
+    if(legacy||!needsPages){buckets.set(bucket.key,bucket);continue;}
+    const pages=await reviewPages(bucket.groups,{directory:join(output,'discovery',hash(bucket.key)),limits});
+    const manifest={format:1,limits,pages:pages.map(page=>({key:bucket.key+':page:'+page.id,...page.metadata}))};
+    if(state.discoveryPages[bucket.key]&&hash(state.discoveryPages[bucket.key])!==hash(manifest))throw Error('Frozen discovery page plan changed');
+    state.discoveryPages[bucket.key]=manifest;
+    for(const page of pages){const key=bucket.key+':page:'+page.id;buckets.set(key,{...bucket,key,groups:page.groups,page:page.metadata});}
+   }
+   await persist();
    const propose=async()=>{for(const bucket of buckets.values()){
     const completed=state.reviews[bucket.key],learning=Object.entries(state.learning).filter(([,v])=>v.key===bucket.key&&v.result?.status==='verified-cpu');
     if(completed&&(!learning.length||completed.learningRevision===learning.length))continue;
     const config=await configFor(bucket.sourceId),entries=await guidanceEntries(config.root,config.skills.activeVersion),directory=join(output,'proposals',hash([bucket.key,learning.length]));await mkdir(directory,{recursive:true});
     const validate=result=>validateReviewProposal(result,bucket.groups,state.classifications);
-    let result;try{result=validate(await invoke('review',{directory,key:bucket.key,objective:bucket.objective,config,groups:bucket.groups,entries,learning,
+    let result;try{result=validate(await invoke('review',{directory,key:bucket.key,objective:bucket.objective,page:bucket.page,config,groups:bucket.groups,entries,learning,
      classifications:bucket.groups.map(g=>state.classifications[g.id]),validate}));}
     catch(error){
      if(signal.aborted)throw error;
      result={action:'inconclusive',reason:'review-execution-failed',error:{name:error.name,message:error.message},groupIds:bucket.groups.map(g=>g.id)};
      state.errors.push({at:new Date().toISOString(),stage:'propose',bucket:bucket.key,message:error.message});
     }
-    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,...(bucket.objective?{objective:bucket.objective}:{}),directory,learningRevision:learning.length};
+    state.reviews[bucket.key]={...result,sourceId:bucket.sourceId,guidanceId:bucket.guidanceId,...(bucket.objective?{objective:bucket.objective}:{}),...(bucket.page?{page:bucket.page}:{}),directory,learningRevision:learning.length};
     await rememberLearning();await persist();
    }};if(selected.includes('propose'))await propose();
    const qualify=async key=>{
