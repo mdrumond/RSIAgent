@@ -182,3 +182,7 @@ test('continuation work expiry retains cleanup custody without accepting late ve
  }});
  const row=report.samples['repair/0/active'];assert.equal(checks,1);assert.equal(actors,0);assert.equal(row.status,'elapsed');assert.equal(row.timedOut,true);assert.notEqual(row.correct,true);assert.ok(row.elapsedSeconds>=f.seconds);await unchanged(f);
 });
+
+test('a continuation cannot introduce a different context allowance into an existing experiment',async t=>{
+ const f=await fixture(t);await assert.rejects(continueMicroevalSamples({...f,profile:{...f.profile,max_context_tokens:200000}}),/model differs/);await unchanged(f);
+});
