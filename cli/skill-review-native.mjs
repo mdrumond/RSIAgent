@@ -3,6 +3,7 @@ import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
 import {Check} from 'typebox/value';
+import {discoveryProofSources} from './skill-discovery-proofs.mjs';
 import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence,claimEvidence,validateClaimedResult,proofInstructions} from './project-summary.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
@@ -47,7 +48,7 @@ async function reviewEvidence(directory,groups=[]){
  }
  return {required,previews};
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,discoveryProofRecords}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
@@ -68,7 +69,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const check=async result=>{
   if((proofRequired||resultSchema)&&!Check(schema,result))throw Error('Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.');
   if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
-  if(proofRequired)validateClaimedResult(result,claimEvidence({prompt,packet,retrievals}));
+  if(proofRequired)validateClaimedResult(result,[...claimEvidence({prompt,packet,retrievals}),...(discoveryProofRecords?await discoveryProofRecords():[])]);
   return validate(result,retrievals);
  };
  const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
@@ -117,10 +118,11 @@ export async function nativeClassify(input){
 export async function nativeClassifyBatch(input){
  return reviewSession({...input,proofRequired:true,evidenceGroups:input.groups,prompt:{task:`Classify EVERY failure group using the shared guidance. ${input.bucketPolicy?'Bucket is orthogonal to fault ownership: harness needs user intervention, correctness concerns functional behavior, optimization concerns kernel latency.':''} Return {classifications:[{groupId,cause:actor|harness|specification|provider|unknown,${input.bucketPolicy?'bucket:harness|correctness|optimization,':''}reason,coverage:covered|uncovered|unknown,guidanceIds:[],evidenceRefs:[],gap:missing|insufficient|not-followed|unknown}]}. Include each supplied groupId exactly once; keep each reason at most two short sentences. Cite actual occurrence/linked-diagnostic references. covered requires existing guidance IDs; unknown/uncovered requires guidanceIds=[]. Read actual copied diagnostics before attributing ownership; a pre-actor stage alone is not proof of a harness fault. Preserve unknown when evidence is insufficient.`,groups:input.groups,entries:input.entries}});
 }
-export async function nativeReview(input){
+export async function nativeReview(input,dependencies={}){
+ const sources=await discoveryProofSources(input.groups);
  const prompt={guidanceScopes:['global-kdb',...workflowStages],task:'Review this guidance bucket using KDB search and read_entry. Return {action:update|learn|no-change,reason,groupIds:[],memoryRefs:["collection:entry_id"],changes:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device,learningRequests:[{groupIds:[originating failure group IDs],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Include outstanding learning questions even when proposing a supported update. Each learning request must identify its own originating groupIds, a nonempty subset of this bucket; do not attach unrelated harness faults to an actor/specification question. An update requires retrieved supporting memory, not a failure alone. For KDB search results, chunk_id is the entry_id argument to read_entry; do not substitute a lesson hash, Git hash or filename. memoryRefs uses exact collection:chunk_id from actual retrieval. evidenceRefs uses exact failure occurrence/linked-diagnostic IDs, not KDB IDs. Use only the enumerated guidanceScopes for changes.scope; correctness/optimization/harness are evaluation buckets, not guidance scopes. changes are {action:upsert,id,scope,text,critical:boolean,negative:boolean,evidenceRefs:[occurrence references],response:actor-change|report-blocker|reserve-validation-runway|retrieve-scoped-evidence}. report-blocker and reserve-validation-runway require scope=global-kdb or scope=preflight; fix that scope field rather than reordering changes. actor-change is the valid response label for actor-owned guidance. Prefer one concise new entry supplementing protected baseline. No device performance claims from CPU results or unsupported duration/speed claims. Cumulative actor clocks are not operation timings. Keep references and guidance compact. Detailed kernel cases remain searchable; guidance should explain applicability and retrieval. Questions requiring GPU evidence must stay pending if CPU cannot answer. Harness faults may only produce report/preserve guidance. Classify each learning request with workKind:microlearning when a single tiny controlled experiment or archived-fact inspection can finish inside 900 elapsed seconds including construction, verification and cleanup; otherwise workKind:phase1. This only routes future work; do not run benchmarks in this review.',groups:input.groups,entries:input.entries,classification:input.classifications,learning:input.learning??[],learningEvidence:input.learningEvidence??[]};
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return reviewSession({...input,proofRequired:true,allowedPaths,evidenceGroups:input.groups,knowledge:true,prompt,validate:(result,retrievals)=>{
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,allowedPaths,evidenceGroups:input.groups,knowledge:true,discoveryProofRecords:async()=>(await discoveryProofSources(input.groups)).records,prompt:{...prompt,discoverySources:sources.indexes},validate:(result,retrievals)=>{
   const refs=new Set(retrievals.flatMap(r=>r.entries.map(e=>`${e.collection}:${e.entry_id??e.chunk_id??e.id}`)));
   if(result.action==='update'&&result.memoryRefs?.some(ref=>!refs.has(ref)))throw Error('Memory references must have been retrieved in this session');
   return input.validate(result);

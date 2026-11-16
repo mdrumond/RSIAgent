@@ -33,3 +33,12 @@ not rewritten.
 These limits bound discovery group payload. Project facts, baseline guidance,
 and dynamic KDB retrieval still require their own compact evidence views; page
 limits alone are not a claim that total model context is bounded to 24 KiB.
+
+Oversized readable fields also have a versioned `proof-index-v2.jsonl` in their
+retained text directory. Each entry gives an explicit proof reference, readable
+part path, field byte range, and parent identity. Discovery exposes only this
+index pointer in its prompt. Stock `read` can inspect any part; line selectors
+against its reference are checked as primary evidence. On submission and cache
+recovery the checker revalidates the complete parent JSON, original index, and
+all part hashes and byte ranges. Part text is never added to inline proof context.
+Existing page keys, manifests, and immutable readable indexes remain unchanged.

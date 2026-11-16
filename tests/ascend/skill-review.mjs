@@ -582,3 +582,35 @@ test('isolated review reads original project facts through a retained empty fork
  await runReview({...f.options,stage:'classify'},{classify:async input=>{const {nativeClassify}=await import('../../cli/skill-review-native.mjs');const out=await nativeClassify({...input,config:{...input.config,actor:provider.profile}});contexts.push(await load(join(input.directory,'input.json')));return out;}});
  const summary=contexts.flatMap(x=>x.projectSummaries).find(x=>x.projectId==='p1');assert.equal(summary.available,true);assert.equal(summary.projectStatus,'failed');assert.equal(summary.facts.find(x=>x.reference.endsWith(':passingVerificationCount')).value,1);assert.equal(createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex'),before);
 });
+
+test('native discovery reads and cites middle oversized evidence without inlining it; stale sources cannot recover cached acceptance',async t=>{
+ const {nativeReview,reviewSession}=await import('../../cli/skill-review-native.mjs');
+ const {reviewPages}=await import('../../cli/skill-review-pages.mjs');
+ const f=await fixture(t),directory=join(f.root,'middle-proof');
+ const message=Array.from({length:8000},(_,i)=>i===4000?'MIDDLE_PRIMARY_FAILURE':'diagnostic line '+i).join('\n');
+ const pages=await reviewPages([{id:'middle',occurrences:[{reference:'middle:failure',projectId:'project',message,artifacts:[]}],linkedDiagnostics:[]}],{directory:join(f.root,'pages')});
+ let descriptor,line,submitted;
+ const provider=await scriptedReview(t,f.root,async(_body,n)=>{
+  if(n===0)return {name:'read',args:{path:'input.json'}};
+  if(n===1){const input=await load(join(directory,'input.json'));
+   assert.equal(JSON.stringify(input).includes('MIDDLE_PRIMARY_FAILURE'),false);
+   return {name:'read',args:{path:input.discoverySources[0].path}};
+  }
+  if(n===2){const input=await load(join(directory,'input.json'));
+   const parts=(await readFile(input.discoverySources[0].path,'utf8')).trim().split('\n').map(JSON.parse);
+   for(const part of parts){const lines=(await readFile(part.path,'utf8')).split('\n');const i=lines.indexOf('MIDDLE_PRIMARY_FAILURE');if(i>=0){descriptor=part;line=i+1;break;}}
+   assert.ok(descriptor);return {name:'read',args:{path:descriptor.path}};
+  }
+  if(n===3){submitted={action:'no-change',reason:'Middle diagnostic is a primary failure',groupIds:['middle'],claims:[{path:'reason',kind:'observation',proofs:[{reference:descriptor.reference,startLine:line,endLine:line}]}]};return {name:'submit_review',args:{result:submitted}};}
+ });
+ const input={directory,config:{actor:provider.profile},groups:pages[0].groups,entries:[],seconds:30,validate:x=>x};
+ const result=await nativeReview(input,{session:args=>reviewSession({...args,knowledge:false})});
+ assert.equal(result.value.claims[0].proofs[0].quote,'MIDDLE_PRIMARY_FAILURE');
+ assert.deepEqual(result.value.claims[0].proofs[0].sourceRefs,['middle:failure']);
+ const calls=provider.requests();
+ assert.equal((await nativeReview(input,{session:args=>reviewSession({...args,knowledge:false})})).recovered,true);
+ assert.equal(provider.requests(),calls);
+ await writeFile(descriptor.path,'changed');
+ await assert.rejects(nativeReview(input,{session:args=>reviewSession({...args,knowledge:false})}),/Discovery proof source changed/);
+ assert.equal(provider.requests(),calls);
+});
