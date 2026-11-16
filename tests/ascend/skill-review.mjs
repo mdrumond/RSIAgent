@@ -143,6 +143,7 @@ test('native Pi classification submits validated results and resumes without ano
  const {createServer}=await import('node:http'),{once}=await import('node:events'),{nativeClassify}=await import('../../cli/skill-review-native.mjs');
  const f=await fixture(t),group=(await inventoryFailures(f.options.sources)).groups[0],directory=join(f.root,'native-classify');let requests=0;
  const value={cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[group.occurrences[0].reference],reason:'Observed failure does not establish cause'};
+ value.claims=[{path:'reason',text:value.reason,kind:'hypothesis',proofs:[{reference:group.occurrences[0].reference,quote:JSON.stringify(group.occurrences[0].data)}]}];
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests++;
   const used=body.messages.filter(m=>m.role==='tool').length;res.writeHead(200,{'Content-Type':'text/event-stream'});
@@ -240,6 +241,9 @@ async function scriptedReview(t,root,plan){
  const {createServer}=await import('node:http'),{once}=await import('node:events');let requests=0;
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),tool=await plan(body,requests++);
+  if(tool?.name==='submit_review'&&!tool.args.result.claims){let input;for(const m of body.messages.filter(x=>x.role==='tool'))try{const parsed=JSON.parse(m.content);if(parsed.proofEvidence)input=parsed;}catch{}
+   if(input){const result=tool.args.result,claims=[];const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){const field=path?path+'.'+key:key;if(typeof item==='string'&&['reason','text','findings'].includes(key)){const ref=x.evidenceRefs?.[0],record=input.proofEvidence.find(r=>r.reference===ref)??input.proofEvidence.find(r=>!r.factId);if(record)claims.push({path:field,text:item,kind:'hypothesis',proofs:[{reference:record.reference,quote:(record.segments??[record.text])[0]}]});}else visit(item,field);}};visit(result);result.claims=claims;}
+  }
   res.writeHead(200,{'Content-Type':'text/event-stream'});
   const delta={role:'assistant',...(tool?{tool_calls:[{index:0,id:'review-'+requests,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})};
   const frame=value=>res.write('data: '+JSON.stringify(value)+'\n\n');

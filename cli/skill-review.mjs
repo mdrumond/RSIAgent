@@ -200,7 +200,6 @@ export async function runReview(options,dependencies={}){
     const input={key,proposal:review,proposalDirectory:review.directory,retrievalEvidenceHash,learning,learningEvidence,entries,objective:review.objective,target:campaign.target,groups:bucket.groups,
      classifications:bucket.groups.map(g=>state.classifications[g.id]),config:await configFor(review.sourceId),signal,
      validateProposal:value=>validateReviewProposal(value,bucket.groups,state.classifications)};
-    const prior=state.qa?.[key];if(prior?.approval===qaIdentity(input))return prior;
     const directory=join(output,'qa',hash([key,qaIdentity(input)]));
     const result=await runProposalQa({...input,directory,seconds:remaining()},{
      qaAnswer:args=>invoke('qaAnswer',args,args.seconds),qaReview:args=>invoke('qaReview',args,args.seconds)});
