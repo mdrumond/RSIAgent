@@ -38,3 +38,12 @@ test('context cap cannot expand custom provider capacity and output capacity fit
 test('invalid context limits fail before loading credentials or constructing a provider',async()=>{
  for(const value of [null,0,1,-1,1.5,'200000',Infinity,Number.MAX_SAFE_INTEGER+1])await assert.rejects(modelFromProfile(profile({max_context_tokens:value,credentials_file:'/nonexistent/context-secret.env',credential_env:'ABSENT_CONTEXT_KEY'})),/max_context_tokens/);
 });
+
+// Pi keeps model headers in raw provider definitions, not its public model snapshots.
+test('clamping custom metadata retains required native gateway request headers',async t=>{
+ await credentials(t);const metadata={id:'custom',name:'Custom',api:'openai-completions',reasoning:false,input:['text'],contextWindow:1000000,maxTokens:8192,cost:{input:0,output:0,cacheRead:0,cacheWrite:0},headers:{'X-Gateway-Route':'fixture-route'}},base=profile({provider:'gateway-fixture',model:'custom',metadata});
+ const uncapped=await modelFromProfile(base),capped=await modelFromProfile({...base,max_context_tokens:200000});
+ for(const native of [uncapped,capped])assert.equal(native.modelRuntime.getCompatibilityRequestConfig(native.model).headers['X-Gateway-Route'],'fixture-route');
+ assert.equal(capped.model.contextWindow,200000);assert.deepEqual(metadata.headers,{'X-Gateway-Route':'fixture-route'});
+ const known=await modelFromProfile(profile({max_context_tokens:200000,metadata}));assert.equal(known.modelRuntime.getCompatibilityRequestConfig(known.model).headers?.['X-Gateway-Route'],undefined);
+});

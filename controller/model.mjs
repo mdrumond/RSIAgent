@@ -11,7 +11,8 @@ export async function modelFromProfile(profile) {
   if (!key) throw new Error(`Missing credential environment variable ${profile.credential_env}`);
   const runtime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),
     modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
-  if (!runtime.getModel(profile.provider,profile.model)) {
+  const customModel=!runtime.getModel(profile.provider,profile.model);
+  if (customModel) {
     if (!profile.metadata) throw new Error('Unknown model requires explicit native Pi model metadata');
     runtime.registerProvider(profile.provider,{baseUrl:profile.base_url,models:[profile.metadata]});
   }
@@ -22,7 +23,7 @@ export async function modelFromProfile(profile) {
   const maxTokens=Math.min(model.maxTokens,profile.max_tokens||model.maxTokens,contextWindow-1);
   if (profile.max_context_tokens!==undefined) {
     // Native session/model restoration must observe the same limits as the initial selection.
-    runtime.registerProvider(profile.provider,{models:[{...model,contextWindow,maxTokens}]});
+    runtime.registerProvider(profile.provider,{models:[{...model,...(customModel?{headers:profile.metadata.headers}:{}),contextWindow,maxTokens}]});
     return {modelRuntime:runtime,model:runtime.getModel(profile.provider,profile.model)};
   }
   return {modelRuntime:runtime,model:profile.max_tokens?{...model,maxTokens}:model};
