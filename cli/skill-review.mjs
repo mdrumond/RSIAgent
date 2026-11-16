@@ -40,7 +40,7 @@ async function dependentInputs(root){
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const stages=['inventory','classify','propose','qa','learn','evaluate','report','enqueue'];
 async function forkCampaign(source,directory,options){
- let config=await optional(join(directory,'instance.json'));if(config)return {...config,root:directory,...(options.evaluations?{skill_review_evaluations:options.evaluations}:{})};
+ let config=await optional(join(directory,'instance.json'));if(config)return {...config,root:directory,project_evidence_root:source.root,...(options.evaluations?{skill_review_evaluations:options.evaluations}:{})};
  const original=await load(join(source.root,'instance.json'));await mkdir(directory,{recursive:true});
  await cp(join(source.root,'skills','versions',source.activeVersion),join(directory,'skills','versions',source.activeVersion),{recursive:true});
  const knowledge=join(directory,'knowledge.sqlite');
@@ -49,7 +49,7 @@ async function forkCampaign(source,directory,options){
   const temporary=join(directory,'knowledge-copy-'+randomUUID()+'.sqlite'),db=new DatabaseSync(join(source.root,'knowledge.sqlite'),{readOnly:true});
   try{db.prepare('VACUUM INTO ?').run(temporary);await rename(temporary,knowledge);}finally{db.close();await rm(temporary,{force:true});}
  }
- config={format:1,revision:0,root:directory,mode:'phase1',target:source.target,actor_seconds:300,
+ config={format:1,revision:0,root:directory,project_evidence_root:source.root,mode:'phase1',target:source.target,actor_seconds:300,
   actor:options.profile??original.skill_writer_actor??original.actor,skill_writer_actor:options.profile??original.skill_writer_actor??original.actor,
   python:options.python??original.python,embeddings:options.embeddings??original.embeddings,embedding_factory:options.embedding_factory??original.embedding_factory,
   ...(options.evaluations?{skill_review_evaluations:options.evaluations}:{}),skills:{activeVersion:source.activeVersion,tuningDisabled:true},environment:{mode:'local'},projects:[],recovery:false,concurrency:1};

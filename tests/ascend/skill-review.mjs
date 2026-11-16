@@ -572,3 +572,13 @@ test('native case selection can read concrete curated inventories and protected 
  assert.equal(JSON.parse(await readFile(join(selectionDirectory,'submission.json'),'utf8')).catalogueId,'curated-splitk-empty-slots');
  await assert.rejects(readFile(join(selectionDirectory,'tool-policy.jsonl')),{code:'ENOENT'});
 });
+
+test('isolated review reads original project facts through a retained empty fork',async t=>{
+ const f=await fixture(t),db=new DatabaseSync(join(f.source,'state.sqlite'));
+ db.prepare("UPDATE projects SET status='failed' WHERE id='p1'").run();const attempt=db.prepare("SELECT id FROM attempts WHERE project='p1'").get().id;db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)').run(attempt,'verification',JSON.stringify({passed:true,correctness:{passed:true}}),new Date().toISOString());db.close();
+ const before=createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex');await runReview({...f.options,stage:'inventory'});
+ const fork=join(f.options.output,'campaigns','a3');await mkdir(fork,{recursive:true});await writeFile(join(fork,'instance.json'),JSON.stringify({format:1,target:'a3',skills:{activeVersion:'baseline'},actor:{provider:'fixture',model:'fixture'}}));new State(join(fork,'state.sqlite')).close();
+ const contexts=[],provider=await scriptedReview(t,f.root,body=>{const used=body.messages.filter(m=>m.role==='tool');if(!used.length)return{name:'read',args:{path:'input.json'}};if(used.length===1){const input=JSON.parse(used[0].content);return{name:'submit_review',args:{result:{cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[input.group.occurrences[0].reference],reason:'Observed evidence'}}};}return null;});
+ await runReview({...f.options,stage:'classify'},{classify:async input=>{const {nativeClassify}=await import('../../cli/skill-review-native.mjs');const out=await nativeClassify({...input,config:{...input.config,actor:provider.profile}});contexts.push(await load(join(input.directory,'input.json')));return out;}});
+ const summary=contexts.flatMap(x=>x.projectSummaries).find(x=>x.projectId==='p1');assert.equal(summary.available,true);assert.equal(summary.projectStatus,'failed');assert.equal(summary.facts.find(x=>x.reference.endsWith(':passingVerificationCount')).value,1);assert.equal(createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex'),before);
+});

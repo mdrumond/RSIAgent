@@ -49,3 +49,19 @@ Historical evaluation results are not rewritten.
 This change does not restart campaigns, publish skills or establish that an
 instruction improves actor performance. Local behavioral coverage is in
 `tests/ascend/project-summary-proof.mjs` and the existing native workflow tests.
+
+
+Isolated review forks retain a read-only `project_evidence_root` pointing to the
+source campaign, including when resuming an older empty fork. Project facts are
+read there; the large source database is neither copied nor mutated. Q&A's
+original elapsed ledger remains authoritative, while native answer/review session
+directories include the proof protocol and project-facts identity so superseded
+native cached submissions cannot bypass re-review.
+
+Verified learning contributes scoped record references and `file:` aliases for
+its source, verifier and log files. CPU/device/project status and target binding
+remain attached to those records; source code alone does not prove execution.
+Inspection is bounded to complete 64 KiB files and a 256 KiB proof-byte packet;
+missing, oversized or mismatched sources remain explicit unknowns. Additional
+learning evidence cannot expand the verified source scope. Q&A answer references
+may use only actual supplied project/learning IDs, never an arbitrary prefix.

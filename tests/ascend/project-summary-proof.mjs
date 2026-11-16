@@ -10,7 +10,7 @@ import {State} from '../../controller/state.mjs';
 import {projectSummary,projectSummaries,validateClaims,validateClaimedResult,claimEvidence} from '../../cli/project-summary.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
 import {frozenEvidencePacket} from '../../cli/skill-review-evidence.mjs';
-import {nativeClassify,reviewSession} from '../../cli/skill-review-native.mjs';
+import {nativeClassify,nativeQaAnswer,nativeQaReview,reviewSession} from '../../cli/skill-review-native.mjs';
 import {runProposalQa} from '../../cli/skill-review-qa.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'project-summary-proof-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -116,4 +116,26 @@ test('reviewer can prove what the submitted draft and answers actually say',()=>
  const claims=[{text:'The submitted draft says no passes',kind:'observation',proofs:[{reference:'input:proposal',quote:'No passes'}]}];
  assert.equal(validateClaims(claims,records),claims);
  assert.throws(()=>validateClaims([{...claims[0],proofs:[{reference:'input:answers',quote:'One pass'}]}],records),/Quote does not match/);
+});
+
+test('optional numeric case-count metadata does not discard a valid aggregate gain',async t=>{
+ const f=await fixture(t),path=join(f.root,'custom.log');await writeFile(path,JSON.stringify({geomean_speedup:2,cases:3}));
+ f.state.event(f.attempt.id,'verification',{passed:true,correctness:{passed:true},performance:{passed:true,evidence:path}});
+ const s=await projectSummary({state:f.state,projectId:'p'});assert.equal(s.measurements[0].geometricMeanSpeedup,2);assert.equal(s.measurements[0].caseIds,null);assert.equal(s.unknowns.length,1);
+});
+test('native proof gate accepts scoped verified-learning bytes without inventing device evidence',async t=>{
+ const f=await fixture(t),source=join(f.root,'learning.py'),outside=join(f.root,'outside.py');await writeFile(source,'print("checked CPU")');await writeFile(outside,'unscoped');
+ const reason='The source contains the checked CPU literal',value={verdict:'learn',reason,claims:[{path:'reason',text:reason,kind:'observation',proofs:[{reference:'file:'+source,quote:'checked CPU'},{reference:'learning-event',quote:'"passed":true'}]}]};
+ const p=await provider(t,n=>n===0?['read',{path:'input.json'}]:n===1?['submit_review',{result:value}]:undefined),directory=join(f.root,'learning-review');
+ const out=await nativeQaReview({directory,config:{actor:p.profile},seconds:15,proposal:{changes:[],memoryRefs:[]},entries:[],groups:[],answers:{},learning:[['new',{result:{status:'verified-cpu',binding:{target:'cpu'},project:{source},evidence:[{reference:'learning-log',log:source},{reference:'learning-event',type:'verification',data:{passed:true}}]}}]],learningEvidence:[{path:outside}],validate:x=>x});
+ assert.equal(out.value.reason,reason);const context=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));const record=context.proofEvidence.find(r=>r.reference==='file:'+source);assert.equal(record.status,'verified-cpu');assert.deepEqual(record.binding,{target:'cpu'});assert.ok(context.proofEvidence.some(r=>r.reference==='learning-log'));assert.ok(context.proofEvidence.some(r=>r.reference==='learning-event'&&r.status==='verified-cpu'));assert.ok(!context.proofEvidence.some(r=>r.reference==='file:'+outside));
+});
+test('changed project facts use fresh native QA sessions even when old proof still matches baseline',async t=>{
+ const f=await fixture(t),directory=join(f.root,'qa-native-facts'),text='Read supplied facts',baseline={id:'baseline',text};let requests=0;
+ const answers=Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,{text,refs:['project:p:passingVerificationCount']}]));
+ const answer={answers,claims:Object.keys(answers).map(k=>({path:'answers.'+k+'.text',text,kind:'hypothesis',proofs:[{reference:'baseline',quote:text}]}))},review={verdict:'approved',reason:text,claims:[{path:'reason',text,kind:'hypothesis',proofs:[{reference:'baseline',quote:text}]}]};
+ const p=await provider(t,n=>{requests++;const turn=n%6;return turn===0||turn===3?['read',{path:'input.json'}]:turn===1?['submit_review',{result:answer}]:turn===4?['submit_review',{result:review}]:undefined;});
+ const input={directory,config:{root:f.root,actor:p.profile},proposal:{changes:[],memoryRefs:[]},entries:[baseline],groups:[{id:'g',occurrences:[{reference:'failure:1',projectId:'p',message:'Observed failure'}]}],target:'a3',validateProposal:x=>x};
+ const a=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(a.verdict,'approved');assert.equal(requests,6);
+ f.state.event(f.attempt.id,'verification',{passed:true});const b=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(b.verdict,'approved');assert.equal(requests,12);assert.notEqual(a.projectFactsIdentity,b.projectFactsIdentity);assert.ok(b.elapsedSeconds>=a.elapsedSeconds);
 });
