@@ -149,3 +149,15 @@ test('typed native QA schema returns misplaced claims for correction in the same
  const out=await nativeQaReview({directory,config:{actor:p.profile},seconds:15,proposal:{changes:[],memoryRefs:[]},entries:[{id:'baseline',text}],groups:[],answers:{},validate:x=>x});
  assert.equal(out.value.verdict,'revise');assert.equal(p.requests(),4);const session=JSON.parse(await readFile(join(directory,'native-session.json'),'utf8'));const rows=(await readFile(session.path,'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.filter(x=>x.type==='session').length,1);
 });
+
+test('relocated snapshot performance logs supply facts without falling back to old live paths',async t=>{
+ const f=await fixture(t),original=join(f.root,'old-live.log'),copy=join(f.root,'copied','performance.log');await mkdir(join(f.root,'copied'));
+ const text=JSON.stringify({passed:true,geomean_speedup:2,cases:3,candidateHash:'copied-candidate'}),sha256=createHash('sha256').update(text).digest('hex');await writeFile(copy,text);
+ f.state.event(f.attempt.id,'verification',{passed:true,correctness:{passed:true},performance:{passed:true,evidence:original}});
+ await writeFile(join(f.root,'evidence-files.json'),JSON.stringify({[original]:{path:'copied/performance.log',sha256}}));
+ const s=await projectSummary({state:f.state,projectId:'p'});assert.equal(s.measurements[0].geometricMeanSpeedup,2);assert.equal(s.measurements[0].candidateHash,'copied-candidate');assert.equal(s.measurements[0].resolvedArtifact,copy);
+ const fork=join(f.root,'empty-fork');await mkdir(fork);new State(join(fork,'state.sqlite')).close();const nested=await projectSummaries({root:fork,project_evidence_root:f.root},[{occurrences:[{projectId:'p'}]}]);assert.equal(nested[0].measurements[0].sha256,sha256);
+ // Even a valid original cannot replace a changed or missing indexed copy.
+ await writeFile(original,text);await writeFile(copy,JSON.stringify({geomean_speedup:99}));const changed=await projectSummary({state:f.state,projectId:'p'});assert.equal(changed.measurements.length,0);assert.ok(changed.unknowns.some(x=>x.reason==='Performance artifact hash mismatch'));
+ await rm(copy);const missing=await projectSummary({state:f.state,projectId:'p'});assert.equal(missing.measurements.length,0);assert.ok(missing.unknowns.some(x=>x.reason==='ENOENT'));
+});
