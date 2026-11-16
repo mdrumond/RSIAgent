@@ -422,3 +422,12 @@ test('resuming new-protocol verification preserves its spent phase allowance wit
  const report=await runMicroeval(options,{sample:async()=>{actors++;return {};},verify:async args=>{checks++;if(checks===1)assert(args.seconds<=.4-spent&&args.seconds>0);return {correct:true};}});
  assert.equal(actors,2);assert.equal(checks,2);assert(report.results[0].verificationElapsedSeconds>=spent);assert(report.results.every(row=>row.correct));
 });
+
+test('resuming a microevaluation rejects a different frozen model context allowance',async t=>{
+ const f=await fixture(t),profile={...f.profile,max_context_tokens:200000};let calls=0;
+ await runMicroeval({...f,profile},{sample:async()=>{calls++;return {};}});
+ const before=calls;
+ await assert.rejects(runMicroeval({...f,profile:{...profile,max_context_tokens:100000},resume:true},{sample:()=>{calls++;throw Error('must not dispatch');}}),/Frozen micro/);
+ assert.equal(calls,before);
+ const resumed=await runMicroeval({...f,profile,resume:true},{sample:()=>{throw Error('must not replay');}});assert.equal(resumed.status,'complete');
+});

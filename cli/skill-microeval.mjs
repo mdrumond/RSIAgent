@@ -161,7 +161,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  if(!retained)await mkdir(directory);
  const manifest={format:1,shadow,...(sampleProtocol?{sampleProtocol}:{}),...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
-  model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null},
+  model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null,...(profile.max_context_tokens===undefined?{}:{maxContextTokens:profile.max_context_tokens})},
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
  if(retained){const {createdAt:_old,...old}=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));const {createdAt:_new,...next}=manifest;if(JSON.stringify(old)!==JSON.stringify(next))throw Error('Frozen micro evaluation changed');}
  else{await save(join(directory,'manifest.json'),manifest);await mkdir(join(directory,'frozen'));await save(join(directory,'frozen','tasks.json'),frozen);}

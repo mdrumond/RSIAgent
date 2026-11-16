@@ -34,7 +34,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
  if(directory===originDirectory||directory.startsWith(originDirectory+'/'))throw Error('Continuation directory must be separate from the original study');
  const originalManifest=await readFile(join(originDirectory,'manifest.json'),'utf8'),origin=await load(join(originDirectory,'results.json'));
  const tasks=await load(join(originDirectory,'frozen/tasks.json')),inputs={active:await skillInput(skills.active),candidate:await skillInput(skills.candidate)};
- const model={provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null};
+ const model={provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null,...(profile.max_context_tokens===undefined?{}:{maxContextTokens:profile.max_context_tokens})};
  const manifest=JSON.parse(originalManifest);
  if(JSON.stringify(model)!==JSON.stringify(manifest.model))throw Error('Continuation model differs from frozen model');
  if(JSON.stringify(knowledge?retrievalIdentity(knowledge):null)!==JSON.stringify(manifest.knowledge??null))throw Error('Continuation retrieval identity differs');
