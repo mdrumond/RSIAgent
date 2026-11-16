@@ -4,7 +4,7 @@ import {mkdir,open,readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {claimEvidence,validateClaimedResult} from './project-summary.mjs';
 import {frozenEvidencePacket} from './skill-review-evidence.mjs';
-export const summaryProtocol='primary-summary-v2';
+export const summaryProtocol='primary-summary-v3';
 export const sourceIdentity=records=>createHash('sha256').update(JSON.stringify(records)).digest('hex');
 const memoryRef=m=>m.ref??m.citationId??`${m.collection}:${m.entry_id??m.chunk_id??m.id}`;
 const hash=text=>createHash('sha256').update(text).digest('hex');
@@ -28,6 +28,7 @@ export async function prepareQaSources(input){
  if(!memory){const text=await readFile(join(input.proposalDirectory??input.directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});memory=text.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);}
  const cited=new Set(input.proposal.memoryRefs??[]);memory=memory.filter(m=>cited.has(memoryRef(m)));
  const restored=await restoreDiscoverySources(input.groups),packet=await frozenEvidencePacket(restored.groups),prompt={projectSummaries:input.projectSummaries,memory,learningProofEvidence:input.learningProofEvidence};
+ const learningRefs=new Set((input.learningProofEvidence??[]).filter(r=>r.available!==false&&typeof r.text==='string').map(r=>r.reference));
  const records=claimEvidence({prompt,packet}).map(r=>({...r})),observations=new Map(packet.observations.map(o=>[o.reference,o]));
  for(const r of records){const o=observations.get(r.reference),tool=o?.data?.sourceCall?.tool;
   if(restored.bindings.has(r.reference)){r.sha256=restored.bindings.get(r.reference);r.sourceRefs=[...(r.sourceRefs??[]),'discovery:'+r.sha256];}
@@ -50,14 +51,14 @@ export async function prepareQaSources(input){
  for(const record of records){
   const stem=createHash('sha256').update(record.reference).digest('hex').slice(0,24),segments=[];
   for(const [i,text]of (record.segments??[record.text]).entries()){
-   const path=join(directory,`${stem}-${i+1}.txt`);await writeFile(path,text);segments.push({segment:i+1,path,lines:text.split('\n').length,bytes:Buffer.byteLength(text)});
+   const path=join(directory,`${stem}-${i+1}.txt`);await writeFile(path,text);segments.push({segment:i+1,path,lines:text.split('\n').length-(text.endsWith('\n')?1:0),bytes:Buffer.byteLength(text)});
   }
   sources.push({reference:record.reference,provenance:record.provenance,sha256:record.sha256??createHash('sha256').update(record.text).digest('hex'),segments,observationType:record.observationType,...(record.parent?{parent:record.parent}:{}),...(record.factId?{factId:record.factId,value:record.value}:{})});
  }
  const indexFile=join(directory,'catalogue.json');await writeFile(indexFile,JSON.stringify(sources,null,2));
  const citedRefs=new Set((input.proposal.changes??[]).flatMap(c=>c.evidenceRefs??[])),scope=new Set();
  for(const g of input.groups)if([...g.occurrences,...(g.linkedDiagnostics??[])].some(o=>citedRefs.has(o.reference)))for(const o of [...g.occurrences.filter(o=>citedRefs.has(o.reference)),...(g.linkedDiagnostics??[])]){scope.add(o.reference);for(const a of observations.get(o.reference)?.artifacts??[])scope.add(a);}
- const pages=[],pending=sources.filter(s=>(scope.has(s.reference)||scope.has(s.parent?.reference)||memory.some(m=>memoryRef(m)===s.reference)||s.reference.startsWith('learning:'))&&!s.factId&&!s.reference.startsWith('project:')&&s.segments.reduce((n,p)=>n+p.bytes,0)<=spanBytes);
+ const pages=[],pending=sources.filter(s=>(scope.has(s.reference)||scope.has(s.parent?.reference)||memory.some(m=>[s.reference,s.parent?.reference].includes(memoryRef(m)))||learningRefs.has(s.reference)||learningRefs.has(s.parent?.reference))&&!s.factId&&!s.reference.startsWith('project:')&&s.segments.reduce((n,p)=>n+p.bytes,0)<=spanBytes);
  let rows=[],bytes=0;for(const source of pending){const size=source.segments.reduce((n,p)=>n+p.bytes,0);if(rows.length&&(rows.length===4||bytes+size>spanBytes)){pages.push({id:sourceIdentity(rows),sources:rows});rows=[];bytes=0;}rows.push(source);bytes+=size;}if(rows.length)pages.push({id:sourceIdentity(rows),sources:rows});
  return {identity,directory,indexFile,records,sources,pages,facts:sources.filter(s=>s.factId&&!s.reference.includes(':measurement:'))};
 }

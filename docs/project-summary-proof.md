@@ -115,5 +115,5 @@ paths, kinds and selectors; software derives claim text, quotes, hashes and type
 values. Summary claims target `items.0.text` through `items.2.text` (at most three
 material items per page); audit claims target the auditor's own `reason`.
 Normalized retained submissions still undergo full source validation on resume.
-The v2 summary protocol archives old semantic approvals and summaries while
+The current summary protocol archives old semantic approvals and summaries while
 retaining elapsed charges and outstanding request reservations.

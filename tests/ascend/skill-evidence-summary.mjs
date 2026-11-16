@@ -7,9 +7,10 @@ import {join} from 'node:path';
 import {reviewPages} from '../../cli/skill-review-pages.mjs';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
+import {materializeProof} from '../../cli/project-summary.mjs';
 import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
 import {prepareQaSources,validateSummary,summaryItems,compactSummary} from '../../cli/skill-evidence-summary.mjs';
-import {nativeQaAnswer,nativeQaAuditSummary,nativeQaSummarize,reviewSession} from '../../cli/skill-review-native.mjs';
+import {nativeQaAnswer,nativeQaReview,nativeQaAuditSummary,nativeQaSummarize,reviewSession} from '../../cli/skill-review-native.mjs';
 async function fixture(t){const directory=await mkdtemp(join(tmpdir(),'evidence-summary-'));t.after(()=>rm(directory,{recursive:true,force:true}));return {directory,proposal:{reason:'Observed failure',changes:[{text:'Check source',evidenceRefs:['raw']}],memoryRefs:[]},entries:[],objective:'correctness',target:'fixture',groups:[{id:'g',occurrences:[{reference:'raw',type:'tool-result',message:'PASS one case\nunknown target'}]}],memoryEvidence:[],projectSummaries:[{facts:[{reference:'count',factId:'count',value:1,text:'1'}],references:[]}],learningProofEvidence:[],validateProposal:x=>x};}
 const summary=text=>({items:[{text,kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]});
 const answers=()=>({answers:Object.fromEntries(qaTopics.map(k=>[k,{text:'Checked '+k,refs:['raw']}]))});
@@ -101,6 +102,30 @@ test('native compact summary accepts selector paths and restores normalized cach
 });
 test('selector-schema migration archives old semantic work and retains in-flight elapsed reservation',async t=>{
  const f=await fixture(t),ops={now:()=>1000,qaSummarize:async()=>summary('One case passed'),qaAuditSummary:async()=>({verdict:'supported',reason:'Checked'}),qaAnswer:async()=>answers(),qaReview:async()=>approve()};await runProposalQa(f,ops);
- const path=join(f.directory,'qa.json'),old=JSON.parse(await readFile(path,'utf8'));old.proofProtocol='primary-summary-v1';old.elapsedSeconds=225;old.inFlight={reservedThrough:230,stage:'qaAuditSummary'};await writeFile(path,JSON.stringify(old));let available;
+ const path=join(f.directory,'qa.json'),old=JSON.parse(await readFile(path,'utf8'));old.proofProtocol='primary-summary-v2';old.elapsedSeconds=225;old.inFlight={reservedThrough:230,stage:'qaAuditSummary'};await writeFile(path,JSON.stringify(old));let available;
  const out=await runProposalQa(f,{...ops,qaSummarize:async x=>{available=x.seconds;return summary('One case passed');}});assert.equal(available,70);assert.equal(out.elapsedSeconds,230);assert.ok(out.proofUpgrades.at(-1).summary);assert.ok(out.proofUpgrades.at(-1).rounds.length);assert.equal(out.verdict,'approved');
+});
+
+test('long cited memory spans reach summary pages and primary audit selectors',async t=>{
+ const f=await fixture(t),reference='good:long-memory',marker='MIDDLE_MEMORY_OBSERVATION';f.proposal.memoryRefs=[reference];f.memoryEvidence=[{ref:reference,text:'prefix '.repeat(5000)+'\n'+marker+'\n'+'suffix '.repeat(5000)}];
+ const c=await prepareQaSources(f),record=c.records.find(r=>r.parent?.reference===reference&&r.text.includes(marker)),page=c.pages.find(p=>p.sources.some(s=>s.reference===record?.reference));assert.ok(page);assert.equal(record.provenance,'actor-memory-report');
+ const line=record.text.split('\n').findIndex(s=>s.includes(marker))+1,value={items:[{text:'Memory reports an observation',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:record.reference,startLine:line,endLine:line}]}]};validateSummary(value,c);const item=summaryItems(value,page.id)[0];
+ await nativeQaAuditSummary({...f,item,sourceCatalogue:c,validate:x=>x},{session:async options=>{assert.equal(options.prompt.item.proofs[0].quote,marker);assert.equal(options.prompt.sources[0].provenance,'actor-memory-report');assert.ok(options.requiredReads.length);for(const path of options.requiredReads)assert.ok((await readFile(path,'utf8')).includes(marker));return {value:{verdict:'supported'}};}});
+});
+test('advertised primary line ranges match proof renderer with and without terminal newline',async t=>{
+ for(const text of ['first\nsecond','first\nsecond\n']){const f=await fixture(t),reference='good:lines';f.proposal.memoryRefs=[reference];f.memoryEvidence=[{ref:reference,text}];const c=await prepareQaSources(f),source=c.sources.find(s=>s.reference===reference),segment=source.segments[0];
+  const proof=materializeProof({reference,startLine:1,endLine:segment.lines},c.records);assert.equal(proof.quote,'first\nsecond');assert.throws(()=>materializeProof({reference,startLine:1,endLine:segment.lines+1},c.records),/exceeds/);
+ }
+});
+
+test('compact final review keeps normalized answer proof text out of inline context',async t=>{
+ const f=await fixture(t),raw='hidden primary '.repeat(10000);f.groups[0].occurrences[0].message=raw;const c=await prepareQaSources(f),value=validateSummary({items:[{text:'Recorded evidence',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:'raw',quote:'hidden primary'}]}]},c),items=summaryItems(value,c.pages[0].id),answerClaims=[{path:'answers.evidence.text',text:'Observed text',kind:'observation',proofs:[materializeProof({reference:'raw',startLine:1,endLine:1},c.records)]}];
+ await nativeQaReview({...f,sourceCatalogue:c,evidenceSummary:{items},answers:answers().answers,answerClaims,validate:x=>x},{session:async options=>{assert.ok(JSON.stringify(options.prompt).length<12000);assert.deepEqual(options.prompt.answerClaims[0].proofs,[{reference:'raw',startLine:1,endLine:1,segment:1}]);assert.equal(Object.hasOwn(options.prompt.answerClaims[0],'text'),false);assert.ok(options.proofRecords.some(r=>r.reference==='raw'&&r.text===raw));assert.equal(materializeProof({reference:'raw',quote:'hidden primary'},options.proofRecords).quote,'hidden primary');assert.throws(()=>materializeProof({reference:'raw',quote:'invented execution'},options.proofRecords),/Quote/);return {value:{}};}});
+});
+
+test('verified learning file aliases enter summary and audit without admitting unavailable or unrelated sources',async t=>{
+ const f=await fixture(t),reference='file:/verified/experiment.log',marker='VERIFIED_LEARNING_MIDDLE';f.learningProofEvidence=[{reference,text:'prefix '.repeat(5000)+'\n'+marker+'\n'+'suffix '.repeat(5000),learningId:'verified-one',status:'verified-device'},{reference:'file:/unavailable',text:'not available',available:false}];f.projectSummaries[0].references=[{reference:'learning:unrelated',text:'not a verified learning source'}];
+ const c=await prepareQaSources(f),record=c.records.find(r=>r.parent?.reference===reference&&r.text.includes(marker)),page=c.pages.find(p=>p.sources.some(s=>s.reference===record?.reference));assert.ok(page);assert.ok(!c.pages.some(p=>p.sources.some(s=>['file:/unavailable','learning:unrelated'].includes(s.reference))));assert.ok(!c.records.some(r=>r.reference==='file:/unavailable'));
+ const line=record.text.split('\n').findIndex(s=>s.includes(marker))+1,value={items:[{text:'Verified learning records an observation',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:record.reference,startLine:line,endLine:line}]}]};validateSummary(value,c);
+ await nativeQaAuditSummary({...f,item:summaryItems(value,page.id)[0],sourceCatalogue:c,validate:x=>x},{session:async options=>{assert.equal(options.prompt.item.proofs[0].quote,marker);assert.equal(options.prompt.sources[0].provenance,'learning-artifact');for(const path of options.requiredReads)assert.ok((await readFile(path,'utf8')).includes(marker));return {value:{}};}});
 });
