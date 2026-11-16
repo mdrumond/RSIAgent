@@ -1,7 +1,7 @@
 /** Deterministic project facts and scoped claim evidence; no model arithmetic. */
 import {DatabaseSync} from 'node:sqlite';
-import {open,stat,readdir,realpath} from 'node:fs/promises';
-import {join,relative,sep} from 'node:path';
+import {open,stat,readdir,realpath,readFile} from 'node:fs/promises';
+import {join,relative,sep,dirname,resolve,isAbsolute} from 'node:path';
 import {createHash} from 'node:crypto';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function jsonObject(text){
@@ -9,7 +9,10 @@ function jsonObject(text){
  for(let i=start;i<text.length;i++){const c=text[i];if(string){if(escape)escape=false;else if(c==='\\')escape=true;else if(c==='"')string=false;}else if(c==='"')string=true;else if(c==='{')depth++;else if(c==='}'&&!--depth){try{return JSON.parse(text.slice(start,i+1));}catch{return null;}}}
  return null;
 }
-export async function projectSummary({state,projectId,artifactResolver=path=>path}){
+export async function projectSummary({state,projectId,artifactResolver=path=>path,evidenceRoot}){
+ const database=state.db.prepare('PRAGMA database_list').all().find(row=>row.name==='main')?.file;
+ const root=evidenceRoot??(database?dirname(database):null);let artifactIndex=null;
+ if(root)try{artifactIndex=JSON.parse(await readFile(join(root,'evidence-files.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const row=state.db.prepare('SELECT id,status FROM projects WHERE id=?').get(projectId);
  if(!row)return {format:1,projectId,available:false,facts:[],references:[],unknowns:['Project not present in this evidence database']};
  const attempts=state.db.prepare('SELECT id,outcome,created FROM attempts WHERE project=? ORDER BY created,id').all(projectId).map(a=>({...a}));
@@ -22,13 +25,21 @@ export async function projectSummary({state,projectId,artifactResolver=path=>pat
   if(event.type!=='verification')continue;
   const record={reference,attemptId:event.attempt,created:event.created,passed:data.passed??null,correctnessPassed:data.correctness?.passed??null,performancePassed:data.performance?.passed??null,fingerprint:data.fingerprint??null};summary.verifications.push(record);
   const evidence=data.performance?.evidence;if(typeof evidence!=='string')continue;
+  const hasIndexed=artifactIndex!==null&&Object.hasOwn(artifactIndex,evidence),indexed=hasIndexed?artifactIndex[evidence]:null;
+  let resolvedArtifact;
+  if(artifactIndex!==null){
+   if(hasIndexed){const copied=typeof indexed?.path==='string'?resolve(root,indexed.path):null,within=copied&&relative(root,copied);
+    if(!copied||within==='..'||within?.startsWith('..'+sep)||isAbsolute(within??'')||indexed?.truncated){summary.unknowns.push({reference,artifact:evidence,reason:'Snapshot performance artifact is not complete scoped evidence'});continue;}resolvedArtifact=copied;
+   }else{const local=relative(root,resolve(root,evidence));if(local==='..'||local.startsWith('..'+sep)||isAbsolute(local)){summary.unknowns.push({reference,artifact:evidence,reason:'Performance artifact absent from evidence snapshot'});continue;}}
+  }
+  resolvedArtifact??=artifactResolver(evidence);if(artifactIndex!==null&&!isAbsolute(resolvedArtifact))resolvedArtifact=resolve(root,resolvedArtifact);
   let file;try{
-   file=await open(artifactResolver(evidence),'r');const info=await file.stat();if(!info.isFile()||info.size>1048576){summary.unknowns.push({reference,artifact:evidence,reason:'Performance artifact unavailable as bounded complete evidence'});continue;}
+   file=await open(resolvedArtifact,'r');const info=await file.stat();if(!info.isFile()||info.size>1048576){summary.unknowns.push({reference,artifact:evidence,reason:'Performance artifact unavailable as bounded complete evidence'});continue;}
    const bytes=await file.readFile(),sha256=createHash('sha256').update(bytes).digest('hex');
-   if(data.performance.evidence_sha256&&sha256!==data.performance.evidence_sha256){summary.unknowns.push({reference,artifact:evidence,reason:'Performance artifact hash mismatch'});continue;}
+   if([data.performance.evidence_sha256,indexed?.sha256].some(expected=>expected&&sha256!==expected)){summary.unknowns.push({reference,artifact:evidence,reason:'Performance artifact hash mismatch'});continue;}
    const result=jsonObject(bytes.toString('utf8')),gain=result?.geometricMeanSpeedup??result?.geomean_speedup;
    if(!Number.isFinite(gain)||gain<=0){summary.unknowns.push({reference,artifact:evidence,reason:'No aggregate performance gain in artifact'});continue;}
-   const measurement={reference,artifact:evidence,sha256,verified:record.correctnessPassed===true&&record.performancePassed===true&&result.passed!==false&&result.ok!==false,geometricMeanSpeedup:gain,
+   const measurement={reference,artifact:evidence,resolvedArtifact,sha256,verified:record.correctnessPassed===true&&record.performancePassed===true&&result.passed!==false&&result.ok!==false,geometricMeanSpeedup:gain,
     candidateHash:result.candidateHash??null,sourceHash:result.sourceHash??null,caseHash:result.caseHash??null,verifierHash:result.verifierHash??null,runtimeFingerprint:result.runtimeFingerprint??null,caseIds:Array.isArray(result.cases)&&result.cases.every(c=>c&&typeof c==='object'&&!Array.isArray(c))?result.cases.map(c=>c.id??null):null};summary.measurements.push(measurement);
    if(result.cases!==undefined&&measurement.caseIds===null)summary.unknowns.push({reference,reason:'Optional cases metadata is not an array of case records'});
    if((result.passed===false||result.ok===false)&&record.performancePassed===true)summary.unknowns.push({reference,reason:'Performance artifact contradicts controller pass'});
@@ -42,12 +53,13 @@ export async function projectSummary({state,projectId,artifactResolver=path=>pat
  summary.identity=digest(summary);return summary;
 }
 export async function projectSummaries(config,groups){
+ const evidenceRoot=config?.project_evidence_root??config?.evidenceRoot??config?.root;
  const projectIds=new Set(groups.flatMap(g=>[...(g.occurrences??[]),...(g.linkedDiagnostics??[])].map(o=>o.projectId).filter(Boolean)));
- if(!config?.root)return [...projectIds].map(projectId=>({projectId,available:false,facts:[],references:[],unknowns:['No evidence database configured']}));
- const path=join(config.project_evidence_root??config.root,'state.sqlite');try{await stat(path);}catch(error){if(error.code==='ENOENT')return [...projectIds].map(projectId=>({projectId,available:false,facts:[],references:[],unknowns:['Evidence database unavailable']}));throw error;}
+ if(!evidenceRoot)return [...projectIds].map(projectId=>({projectId,available:false,facts:[],references:[],unknowns:['No evidence database configured']}));
+ const path=join(evidenceRoot,'state.sqlite');try{await stat(path);}catch(error){if(error.code==='ENOENT')return [...projectIds].map(projectId=>({projectId,available:false,facts:[],references:[],unknowns:['Evidence database unavailable']}));throw error;}
  const db=new DatabaseSync(path,{readOnly:true});try{
   for(const group of groups)for(const o of [...(group.occurrences??[]),...(group.linkedDiagnostics??[])])if(o.attemptId){const a=db.prepare('SELECT project FROM attempts WHERE id=?').get(o.attemptId);if(a)projectIds.add(a.project);}
-  const summaries=[];for(const projectId of projectIds)summaries.push(await projectSummary({state:{db},projectId}));return summaries;
+  const summaries=[];for(const projectId of projectIds)summaries.push(await projectSummary({state:{db},projectId,evidenceRoot}));return summaries;
  }finally{db.close();}
 }
 /** Only copied/verified learning is a source; source code does not itself prove device execution. */
