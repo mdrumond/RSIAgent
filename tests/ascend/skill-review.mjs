@@ -143,6 +143,7 @@ test('native Pi classification submits validated results and resumes without ano
  const {createServer}=await import('node:http'),{once}=await import('node:events'),{nativeClassify}=await import('../../cli/skill-review-native.mjs');
  const f=await fixture(t),group=(await inventoryFailures(f.options.sources)).groups[0],directory=join(f.root,'native-classify');let requests=0;
  const value={cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[group.occurrences[0].reference],reason:'Observed failure does not establish cause'};
+ value.claims=[{path:'reason',text:value.reason,kind:'hypothesis',proofs:[{reference:group.occurrences[0].reference,quote:JSON.stringify(group.occurrences[0].data)}]}];
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests++;
   const used=body.messages.filter(m=>m.role==='tool').length;res.writeHead(200,{'Content-Type':'text/event-stream'});
@@ -240,6 +241,9 @@ async function scriptedReview(t,root,plan){
  const {createServer}=await import('node:http'),{once}=await import('node:events');let requests=0;
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),tool=await plan(body,requests++);
+  if(tool?.name==='submit_review'&&!tool.args.result.claims){let input;for(const m of body.messages.filter(x=>x.role==='tool'))try{const parsed=JSON.parse(m.content);if(parsed.proofEvidence)input=parsed;}catch{}
+   if(input){const result=tool.args.result,claims=[];const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){const field=path?path+'.'+key:key;if(typeof item==='string'&&['reason','text','findings'].includes(key)){const ref=x.evidenceRefs?.[0],record=input.proofEvidence.find(r=>r.reference===ref)??input.proofEvidence.find(r=>!r.factId);if(record)claims.push({path:field,text:item,kind:'hypothesis',proofs:[{reference:record.reference,quote:(record.segments??[record.text])[0]}]});}else visit(item,field);}};visit(result);result.claims=claims;}
+  }
   res.writeHead(200,{'Content-Type':'text/event-stream'});
   const delta={role:'assistant',...(tool?{tool_calls:[{index:0,id:'review-'+requests,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})};
   const frame=value=>res.write('data: '+JSON.stringify(value)+'\n\n');
@@ -567,4 +571,14 @@ test('native case selection can read concrete curated inventories and protected 
  assert.equal(observed.find(record=>record.n===3).text.trim(),(await readFile(sourcePath,'utf8')).trim());
  assert.equal(JSON.parse(await readFile(join(selectionDirectory,'submission.json'),'utf8')).catalogueId,'curated-splitk-empty-slots');
  await assert.rejects(readFile(join(selectionDirectory,'tool-policy.jsonl')),{code:'ENOENT'});
+});
+
+test('isolated review reads original project facts through a retained empty fork',async t=>{
+ const f=await fixture(t),db=new DatabaseSync(join(f.source,'state.sqlite'));
+ db.prepare("UPDATE projects SET status='failed' WHERE id='p1'").run();const attempt=db.prepare("SELECT id FROM attempts WHERE project='p1'").get().id;db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)').run(attempt,'verification',JSON.stringify({passed:true,correctness:{passed:true}}),new Date().toISOString());db.close();
+ const before=createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex');await runReview({...f.options,stage:'inventory'});
+ const fork=join(f.options.output,'campaigns','a3');await mkdir(fork,{recursive:true});await writeFile(join(fork,'instance.json'),JSON.stringify({format:1,target:'a3',skills:{activeVersion:'baseline'},actor:{provider:'fixture',model:'fixture'}}));new State(join(fork,'state.sqlite')).close();
+ const contexts=[],provider=await scriptedReview(t,f.root,body=>{const used=body.messages.filter(m=>m.role==='tool');if(!used.length)return{name:'read',args:{path:'input.json'}};if(used.length===1){const input=JSON.parse(used[0].content);return{name:'submit_review',args:{result:{cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[input.group.occurrences[0].reference],reason:'Observed evidence'}}};}return null;});
+ await runReview({...f.options,stage:'classify'},{classify:async input=>{const {nativeClassify}=await import('../../cli/skill-review-native.mjs');const out=await nativeClassify({...input,config:{...input.config,actor:provider.profile}});contexts.push(await load(join(input.directory,'input.json')));return out;}});
+ const summary=contexts.flatMap(x=>x.projectSummaries).find(x=>x.projectId==='p1');assert.equal(summary.available,true);assert.equal(summary.projectStatus,'failed');assert.equal(summary.facts.find(x=>x.reference.endsWith(':passingVerificationCount')).value,1);assert.equal(createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex'),before);
 });

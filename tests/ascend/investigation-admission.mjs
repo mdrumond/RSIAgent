@@ -91,7 +91,7 @@ for(const verifier of ['sessions','source','source/answer.py','../outside.py'])
   });
 
 test('native summary rejects directory evidence then accepts a real file without changing it',{timeout:15000},async t=>{
-  const record={findings:'The proposal failed before execution; no numeric conclusion.',useful:false,paths:['.']};
+  const record={claims:[{text:'The proposal failed before execution; no numeric conclusion.',kind:'hypothesis',proofs:[{reference:'file:evidence.log',quote:'missing independent verifier observed'}]}],useful:false,paths:['.']};
   const text='missing independent verifier observed\n';
   const f=await fixture(t,[['record_findings',record],['write',{path:'evidence.log',content:text}],['record_findings',{...record,paths:['evidence.log']}]]);
   const result=await summarize({...f.options,passed:false});
@@ -104,7 +104,7 @@ test('native summary rejects directory evidence then accepts a real file without
 
 
 test('pre-actor failure has readable diagnostics before native summary repairs directory evidence',{timeout:15000},async t=>{
-  const record={findings:'Missing verifier prevented actor startup; no experiment ran.',useful:false,paths:['.']};
+  const record={claims:[{text:'Missing verifier prevented actor startup; no experiment ran.',kind:'observation',proofs:[{reference:'file:diagnostics.json',quote:'ENOENT missing verifier'}]}],useful:false,paths:['.']};
   const f=await fixture(t,[['record_findings',record],['read',{path:'diagnostics.json'}],['record_findings',{...record,paths:['diagnostics.json']}]]);
   const failure={type:'attempt-error',data:{message:'ENOENT missing verifier',stage:'worker'}};
   f.options.state.event(f.options.job.attempt.id,failure.type,failure.data);

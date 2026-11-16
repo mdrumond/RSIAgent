@@ -15,7 +15,7 @@ export async function frozenEvidencePacket(groups,{limit=4096}={}){
     // Frozen snapshots already carry a full content hash; otherwise hash the available bytes.
     const sha256=artifact.sha256??createHash('sha256').update(bytes).digest('hex');
     let entry=byHash.get(sha256);
-    if(!entry){entry={id:'artifact:'+sha256,sha256,paths:[],available:true,text:bytes.toString('utf8'),truncated:!!artifact.truncated||info.size>limit,layout:info.size>limit?'head-and-tail':artifact.layout??'complete',originalBytes:artifact.originalBytes??info.size};byHash.set(sha256,entry);artifacts.push(entry);}
+    if(!entry){entry={id:'artifact:'+sha256,sha256,paths:[],available:true,text:bytes.toString('utf8'),truncated:!!artifact.truncated||info.size>limit,layout:info.size>limit?'head-and-tail':artifact.layout??'complete',segments:(info.size>limit||artifact.layout==='head-and-tail')?[bytes.subarray(0,Math.floor(bytes.length/2)).toString('utf8'),bytes.subarray(Math.floor(bytes.length/2)).toString('utf8')]:[bytes.toString('utf8')],originalBytes:artifact.originalBytes??info.size};byHash.set(sha256,entry);artifacts.push(entry);}
     if(!entry.paths.includes(artifact.path))entry.paths.push(artifact.path);refs.push(entry.id);
    }catch(error){if(!['ENOENT','EACCES','EISDIR'].includes(error.code)&&error.message!=='not a regular file')throw error;
     const id='unavailable:'+artifact.path;artifacts.push({id,paths:[artifact.path],available:false,reason:error.code??error.message});refs.push(id);

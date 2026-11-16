@@ -172,7 +172,7 @@ test('native summary and investigation retrieve authoritative diagnostics despit
         retrieved.push({session:context.session,evidence:logs});
         name=investigation?'submit_investigation':'record_findings';
         args=investigation?{goal:'inspect numeric',question:'why acceptance incomplete?',verifier:'verify.py',controls}:
-          {findings:'Numeric check observed 42; acceptance incomplete.',useful:true,paths:[logs]};
+          {claims:[{text:'Numeric check observed 42; acceptance incomplete.',kind:'observation',proofs:[{reference:'file:'+logs,quote:'numeric-check-observed-42'}]}],useful:true,paths:[logs]};
       }
     }
     res.writeHead(200,{'Content-Type':'text/event-stream'});

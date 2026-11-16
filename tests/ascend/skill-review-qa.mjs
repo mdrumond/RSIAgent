@@ -26,7 +26,7 @@ test('learning and inconclusive material issues never receive approval',async t=
 test('elapsed allowance is shared across revisions and retained on interruption',async t=>{
  const input=await fixture(t);let clock=1000,calls=0;
  const result=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>{clock+=50000;return answers();},qaReview:async()=>{calls++;clock+=20000;return {verdict:'revise',reason:'Missing boundary',issues:['Boundary']};}});
- assert.equal(result.verdict,'inconclusive');assert.equal(result.reason,'qa-revision-limit');assert.equal(calls,2);assert.equal(result.startedAt,1000);
+ assert.equal(result.verdict,'inconclusive');assert.equal(result.reason,'qa-elapsed');assert.equal(calls,4);assert.ok(result.elapsedSeconds>=300);assert.equal(result.startedAt,1000);
  const saved=JSON.parse(await readFile(join(input.directory,'qa.json')));assert.equal(saved.seconds,300);
 });
 test('invented answer evidence is rejected before independent assessment',async t=>{

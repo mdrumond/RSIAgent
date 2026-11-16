@@ -64,7 +64,7 @@ test('elapsed abort retains real session and summary reads it when actor session
   const rows=(await readFile(session.session,'utf8')).split('\n').filter(Boolean).map(JSON.parse);
   assert.ok(rows.some(e=>e.message?.stopReason==='aborted'));
   plan.splice(0,plan.length,['read',{path:session.session}],['read',{path:'diagnostics.json'}],
-    ['record_findings',{findings:'The curriculum elapsed allocation expired without a proposal; no actor ran.',useful:false,paths:['diagnostics.json']}]);
+    ['record_findings',{claims:[{text:'The curriculum elapsed allocation expired without a proposal; no actor ran.',kind:'observation',proofs:[{reference:'file:diagnostics.json',quote:'curriculum-interrupted'}]}],useful:false,paths:['diagnostics.json']}]);
   const result=await findingsFor({...f.options,passed:false});
   const wire=JSON.parse(f.prompts.at(-1).split('Attempt diagnostics: ')[1].split('\n')[0]);
   assert.equal(wire.session,session.session);
@@ -84,7 +84,7 @@ test('valid proposal survives elapsed abort after native submission',{timeout:15
 });
 
 test('valid findings survive elapsed abort and retain final evidence hash',{timeout:15000},async t=>{
-  const f=await fixture(t,[['record_findings',{findings:'Observed diagnostic fact.',useful:false,paths:['evidence.log']}],'wait']);
+  const f=await fixture(t,[['record_findings',{claims:[{text:'Observed diagnostic fact.',kind:'observation',proofs:[{reference:'file:evidence.log',quote:'fact'}]}],useful:false,paths:['evidence.log']}],'wait']);
   await writeFile(join(f.path,'evidence.log'),'fact\n');
   const result=await summarize({...f.options,passed:false});
   assert.equal(result.evidence[0].sha256,createHash('sha256').update('fact\n').digest('hex'));
@@ -127,7 +127,7 @@ for(const type of ['curriculum-session','curriculum-interrupted'])
   });
 
 test('summary diagnostics use bounded tails without reading complete history',{timeout:15000},async t=>{
-  const f=await fixture(t,[['record_findings',{findings:'Retained numeric observations.',useful:false,paths:['evidence.log']}],'wait']);
+  const f=await fixture(t,[['record_findings',{claims:[{text:'Retained numeric observations.',kind:'observation',proofs:[{reference:'file:evidence.log',quote:'numeric observation'}]}],useful:false,paths:['evidence.log']}],'wait']);
   const {state,job}=f.options;
   await writeFile(join(f.path,'evidence.log'),'numeric observation\n');
   for(let n=0;n<40;n++) {
