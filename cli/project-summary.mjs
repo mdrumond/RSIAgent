@@ -76,39 +76,11 @@ export function claimEvidence({prompt={},packet={},retrievals=[]}){
  const add=(reference,text,extra={})=>{if(reference&&typeof text==='string')records.push({reference,text,...extra});};
  for(const s of prompt.projectSummaries??[])for(const r of [...(s.facts??[]),...(s.references??[])])records.push(r);
  for(const o of packet.observations??[])add(o.reference,[o.message,JSON.stringify(o.data)].filter(Boolean).join('\n'));
- for(const a of packet.artifacts??[])if(a.available)add(a.id,a.text,{segments:a.segments??[a.text]});
+ for(const a of packet.artifacts??[])if(a.available)add(a.id,a.text,{segments:a.segments??[a.text],sha256:a.sha256,paths:a.paths??[]});
  for(const e of [...(prompt.entries??[]),...(prompt.baseline??[])])add(e.id,e.text);
  for(const e of [...(prompt.memory??[]),...retrievals.flatMap(r=>r.entries??[])])add(e.ref??e.citationId??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`,e.text??e.content??JSON.stringify(e));
  for(const record of prompt.learningProofEvidence??[])if(record.available!==false&&typeof record.text==='string')records.push(record);
  for(const key of ['proposal','answers','answerClaims'])if(prompt[key]!==undefined)add('input:'+key,JSON.stringify(prompt[key]));
  return [...new Map(records.map(r=>[r.reference,r])).values()];
 }
-export function validateClaims(claims,records){
- if(!Array.isArray(claims)||!claims.length)throw Error('Provide proof-bearing claims; factual prose without claims is not accepted');
- const sources=new Map(records.map(r=>[r.reference,r]));
- for(const claim of claims){
-  if(!claim.text?.trim()||!['observation','hypothesis'].includes(claim.kind)||!Array.isArray(claim.proofs)||!claim.proofs.length)throw Error('Each claim requires text, observation|hypothesis kind, and copied proofs');
-  for(const proof of claim.proofs){const source=sources.get(proof.reference);if(!source)throw Error('Unknown proof reference: '+proof.reference);
-   if(typeof proof.quote!=='string'||!proof.quote.trim()||!(source.segments??[source.text]).some(s=>s.includes(proof.quote)))throw Error('Quote does not match '+proof.reference+'; copy one contiguous source span from the cited record');
-   if(source.factId&&(proof.factId!==source.factId||!Object.hasOwn(proof,'value')||JSON.stringify(proof.value)!==JSON.stringify(source.value)))throw Error('Structured fact assertion does not match '+source.factId+'; use its exact factId and value');
-  }
- }
- return claims;
-}
-export function validateClaimedResult(value,records){
- const targets=new Map(),inline=[];
- const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){if(key==='claims')continue;const child=path?path+'.'+key:key;
-  if(typeof item==='string'&&['reason','text','findings','problem','description'].includes(key))targets.set(child,item);
-  else if(key==='issues'&&Array.isArray(item))item.forEach((issue,i)=>{if(typeof issue==='string')targets.set(child+'.'+i,issue);else{visit(issue,child+'.'+i);if(issue?.reference!==undefined||issue?.quote!==undefined)inline.push(issue);}});
-  else visit(item,child);
- }};visit(value);
- const paths=[...targets.keys()],hint=' Required prose claim paths: '+JSON.stringify(paths)+'. Categorical fields such as verdict are not prose claim paths.';
- try{
-  validateClaims(value?.claims,records);
-  for(const [path,text]of targets)if(!value.claims.some(c=>c.path===path&&c.text===text))throw Error('Missing exact proof-bearing claim for '+path);
-  for(const c of value.claims)if(!targets.has(c.path)||targets.get(c.path)!==c.text)throw Error('Claim path/text does not match submitted prose: '+c.path);
-  for(const issue of inline)validateClaims([{text:issue.problem??issue.description??'Issue citation',kind:'observation',proofs:[issue]}],records);
- }catch(error){throw Error(error.message+hint);}
- return value;
-}
-export const proofInstructions='Every factual reason/text/findings/problem/description and every issues string requires claims:[{path:exact dotted output field,text:exact field text,kind:observation|hypothesis,proofs:[{reference,quote}]}]. For QA review include reason and each issues.N.problem (or issues.N for string issues); do not create claims for categorical verdict. Copy one contiguous exact quote from the scoped proofEvidence record. For a typed fact also copy its exact factId and value into the proof. Structured issues may use problem/description, but any reference/quote fields they include must also match and carry factId/value for typed facts. Unknown is valid; mark unverified premises as hypothesis, never invent a fact. Quote matching checks copying; the independent QA must also check whether the claim follows from the evidence.';
+export {materializeProof,validateClaims,validateClaimedResult,proofInstructions} from './claim-proofs.mjs';

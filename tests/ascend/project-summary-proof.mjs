@@ -107,7 +107,7 @@ test('structured QA issue prose and inline citations cannot bypass proof admissi
  assert.throws(()=>validateClaimedResult(result,records),error=>error.message.includes('issues.0.problem')&&error.message.includes('issues.0.description'));
  result.claims.push(proof(fact,result.issues[0].problem,'issues.0.problem'),proof(fact,result.issues[0].description,'issues.0.description'));
  result.issues[0].quote='0';assert.throws(()=>validateClaimedResult(result,records),/Quote does not match/);
- result.issues[0].quote='1';assert.throws(()=>validateClaimedResult(result,records),/Structured fact assertion/);
+ result.issues[0].quote='1';result.issues[0].value=0;assert.throws(()=>validateClaimedResult(result,records),/Structured fact assertion/);
  Object.assign(result.issues[0],{factId:'count',value:1});assert.equal(validateClaimedResult(result,records),result);
  result.claims.push(proof(fact,'revise','verdict'));assert.throws(()=>validateClaimedResult(result,records),/Claim path\/text does not match/);
 });

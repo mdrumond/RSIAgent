@@ -18,17 +18,16 @@ not proof of an optimization mechanism or transferable performance.
 The existing summarizer receives these facts inline. Its output is a list of
 claims, not an independent uncited narrative. Accepted claims are composed into
 the compatible `findings` string (at most 4000 characters); hypotheses are labeled
-unverified. A claim cites an exact source reference and contiguous copied quote:
+unverified. A claim can select an exact source reference without retyping its quote:
 
 ```json
 {"text":"One passing verification was recorded","kind":"observation",
- "proofs":[{"reference":"project:p:passingVerificationCount","quote":"1",
- "factId":"project:p:passingVerificationCount","value":1}]}
+ "proofs":[{"reference":"project:p:passingVerificationCount"}]}
 ```
 
 For inspected files, the summarizer uses `file:<exact path listed in paths>`.
 Those files must satisfy the existing attempt-artifact boundary and bounded
-complete-file check. Typed project facts require the exact `factId` and `value`.
+complete-file check. Code supplies the exact typed `factId`/`value`; wrong supplied assertions are rejected.
 
 Native classification, skill review and Q&A receive project facts and scoped
 proof records inline. Every output `reason`, `text`, `findings`, structured issue `problem`/`description` or string issue needs a
@@ -71,3 +70,14 @@ result root. Q&A review additionally types verdict, reason, issues and learning
 requests; misplaced `reasonClaims` or nested claims are rejected before admission.
 Revision rounds share the original elapsed allocation; there is no round-count
 stopping budget.
+
+
+Proof selectors may be a whole typed fact reference; a 1-based inclusive
+`startLine`/`endLine` range (with an explicit 1-based `segment` for excerpts); or
+an RFC6901 `field` pointer on serialized `input:proposal`, `input:answers` and
+`input:answerClaims`. Materialization supplies the exact quote, source/record
+hashes and primary source metadata. It cannot cross omitted excerpt gaps. Legacy
+`reference` plus `quote` remains compatible. A normalized cached proof is rejected
+when its source record changes, including outside the selected span. Result
+claims may omit `text`: code derives it from the actual output `path`; standalone
+summary claim text remains required. Selector checks still do not prove entailment.

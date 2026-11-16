@@ -22,11 +22,12 @@ import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
 
 const nonempty=()=>Type.String({minLength:1});
-const proofSchema=Type.Object({reference:nonempty(),quote:nonempty(),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown())},{additionalProperties:false});
-const claimSchema=Type.Object({path:nonempty(),text:nonempty(),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(proofSchema,{minItems:1})},{additionalProperties:false});
+const proofFields={reference:nonempty(),quote:Type.Optional(nonempty()),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown()),startLine:Type.Optional(Type.Integer({minimum:1})),endLine:Type.Optional(Type.Integer({minimum:1})),segment:Type.Optional(Type.Integer({minimum:1})),field:Type.Optional(Type.String()),sourceSha256:Type.Optional(nonempty()),recordSha256:Type.Optional(nonempty()),sourceRefs:Type.Optional(Type.Array(nonempty())),sourcePaths:Type.Optional(Type.Array(nonempty()))};
+const proofSchema=Type.Object(proofFields,{additionalProperties:false});
+const claimSchema=Type.Object({path:nonempty(),text:Type.Optional(nonempty()),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(proofSchema,{minItems:1})},{additionalProperties:false});
 const claimsSchema=Type.Array(claimSchema,{minItems:1});
 const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
-const issueFields={path:Type.Optional(nonempty()),reference:Type.Optional(nonempty()),quote:Type.Optional(nonempty()),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown())};
+const issueFields={...Object.fromEntries(Object.entries(proofFields).map(([k,v])=>[k,Type.Optional(v)])),path:Type.Optional(nonempty())};
 const issueSchema=Type.Union([nonempty(),Type.Object({...issueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...issueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
 const requestSchema=Type.Object({groupIds:Type.Array(nonempty()),question:nonempty(),hypothesis:nonempty(),requiredEvidence:nonempty(),learningTarget:Type.Union([Type.Literal('cpu'),Type.Literal('device')]),workKind:Type.Optional(Type.Union([Type.Literal('microlearning'),Type.Literal('phase1')]))},{additionalProperties:false});
 const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
@@ -65,7 +66,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async result=>{
-  if((proofRequired||resultSchema)&&!Check(schema,result))throw Error('Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,text,kind,proofs}; nested claims and reasonClaims do not replace it.');
+  if((proofRequired||resultSchema)&&!Check(schema,result))throw Error('Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.');
   if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   if(proofRequired)validateClaimedResult(result,claimEvidence({prompt,packet,retrievals}));
   return validate(result,retrievals);
