@@ -101,3 +101,11 @@ seconds, including charges reserved before interrupted requests. Source catalogu
 changes invalidate semantic approvals without resetting that allocation. Existing
 callers injecting only `qaAnswer`/`qaReview` retain their original workflow;
 providing both summary operations enables the same admission gate explicitly.
+
+When discovery paging supplies an immutable record pointer, summary admission
+verifies its full-file hash and original reference before restoring the observation.
+The reconstructed primary text and bounded aliases are copied into the summary's
+own allowed scope; a head/tail preview is not used as the complete record. JSON
+record admission is limited to 32 MiB to bound host parsing memory. Alias proofs
+include whole-parent identity, so a changed sibling span invalidates an old proof
+even when its selected text still matches.

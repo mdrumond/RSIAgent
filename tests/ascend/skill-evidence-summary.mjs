@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {reviewPages} from '../../cli/skill-review-pages.mjs';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
@@ -78,4 +79,16 @@ test('native audit rejects submission until a stock read opens its primary sourc
  const actor={provider:'audit-fixture',model:'audit',credential_env:env,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'audit',name:'audit',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}},directory=join(f.directory,'native');
  const out=await reviewSession({directory,config:{actor},prompt:{task:'Check source'},proofRequired:true,compactEvidence:true,proofRecords:[{reference:'raw',text:'literal primary'}],requiredReads:[primary],seconds:10,validate:x=>x});
  assert.equal(requests,4);assert.equal(out.value.claims[0].proofs[0].quote,'literal primary');assert.ok(!(await readFile(join(directory,'input.json'),'utf8')).includes('literal primary'));const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejected.length,1);assert.match(rejected[0].error,/Read these primary/);assert.deepEqual(JSON.parse(await readFile(join(directory,'read-evidence.json'),'utf8')),['file:'+primary]);
+});
+
+test('discovery paging preserves middle primary evidence, scoped access and stale-source binding',async t=>{
+ const f=await fixture(t),marker='DEVICE_MIDDLE_VERIFIED_18923';f.groups[0].occurrences[0].message='prefix '.repeat(10000)+'\n'+marker+'\n'+'suffix '.repeat(10000);f.groups[0].occurrences[0].data={sourceCall:{tool:'rsi_target'}};
+ const pages=await reviewPages(f.groups,{directory:join(f.directory,'discovery')}),groups=pages.flatMap(p=>p.groups),c=await prepareQaSources({...f,groups});
+ const middle=c.records.find(r=>r.parent?.reference==='raw'&&r.text.includes(marker));assert.ok(middle);assert.equal(middle.provenance,'target-tool-record');assert.ok(c.pages.some(p=>p.sources.some(s=>s.reference===middle.reference)));
+ const line=middle.text.split('\n').findIndex(s=>s.includes(marker))+1,value={items:[{text:'A device result is recorded in the middle',kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:middle.reference,startLine:line,endLine:line}]}]};validateSummary(value,c);
+ const item=summaryItems(value,c.pages.find(p=>p.sources.some(s=>s.reference===middle.reference)).id)[0];
+ await nativeQaAuditSummary({...f,item,sourceCatalogue:c,validate:x=>x},{session:async options=>{for(const path of options.requiredReads){assert.ok(path.startsWith(c.directory+'/'));assert.ok((await readFile(path,'utf8')).includes(marker));}assert.ok(options.prompt.item.proofs[0].quote.includes(marker));return {value:{}};}});
+ f.groups[0].occurrences[0].message+=' changed later context';const nextPages=await reviewPages(f.groups,{directory:join(f.directory,'discovery-next')}),next=await prepareQaSources({...f,groups:nextPages.flatMap(p=>p.groups)});assert.notEqual(next.identity,c.identity);assert.throws(()=>validateSummary(value,next),/source changed/);
+ const pointer=groups[0].occurrences[0].data.evidencePointer;await writeFile(pointer.path,(await readFile(pointer.path,'utf8')).replace(marker,'DIFFERENT_RESULT'));
+ await assert.rejects(prepareQaSources({...f,groups}),/primary source changed/);
 });

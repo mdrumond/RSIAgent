@@ -1,19 +1,36 @@
 /** Immutable primary records live on disk; summaries never become proof sources. */
 import {createHash} from 'node:crypto';
-import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {mkdir,open,readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {claimEvidence,validateClaimedResult} from './project-summary.mjs';
 import {frozenEvidencePacket} from './skill-review-evidence.mjs';
 export const summaryProtocol='primary-summary-v1';
 export const sourceIdentity=records=>createHash('sha256').update(JSON.stringify(records)).digest('hex');
 const memoryRef=m=>m.ref??m.citationId??`${m.collection}:${m.entry_id??m.chunk_id??m.id}`;
+const hash=text=>createHash('sha256').update(text).digest('hex');
+async function restoreDiscoverySources(groups){
+ const bindings=new Map();
+ const restore=async row=>{
+  const pointer=row.data?.evidencePointer;if(!pointer)return row;
+  // Admission bounds JSON parsing/RAM; elapsed remains the sole work stopping budget.
+  const file=await open(pointer.path,'r');let bytes;
+  try{const info=await file.stat();if(!info.isFile()||info.size>32*1024*1024)throw Error('Discovery primary record exceeds 32 MiB file admission: '+row.reference);bytes=await file.readFile();}finally{await file.close();}
+  if(hash(bytes)!==pointer.sha256)throw Error('Discovery primary source changed: '+row.reference);
+  const original=JSON.parse(bytes.toString('utf8'));
+  if(pointer.reference!==row.reference||original.reference!==row.reference)throw Error('Discovery primary reference mismatch: '+row.reference);
+  bindings.set(row.reference,pointer.sha256);return original;
+ };
+ const restored=[];for(const group of groups){const occurrences=[],linkedDiagnostics=[];for(const row of group.occurrences)occurrences.push(await restore(row));for(const row of group.linkedDiagnostics??[])linkedDiagnostics.push(await restore(row));restored.push({...group,occurrences,linkedDiagnostics});}
+ return {groups:restored,bindings};
+}
 export async function prepareQaSources(input){
  let memory=input.memoryEvidence;
  if(!memory){const text=await readFile(join(input.proposalDirectory??input.directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});memory=text.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);}
  const cited=new Set(input.proposal.memoryRefs??[]);memory=memory.filter(m=>cited.has(memoryRef(m)));
- const packet=await frozenEvidencePacket(input.groups),prompt={projectSummaries:input.projectSummaries,memory,learningProofEvidence:input.learningProofEvidence};
+ const restored=await restoreDiscoverySources(input.groups),packet=await frozenEvidencePacket(restored.groups),prompt={projectSummaries:input.projectSummaries,memory,learningProofEvidence:input.learningProofEvidence};
  const records=claimEvidence({prompt,packet}).map(r=>({...r})),observations=new Map(packet.observations.map(o=>[o.reference,o]));
  for(const r of records){const o=observations.get(r.reference),tool=o?.data?.sourceCall?.tool;
+  if(restored.bindings.has(r.reference)){r.sha256=restored.bindings.get(r.reference);r.sourceRefs=[...(r.sourceRefs??[]),'discovery:'+r.sha256];}
   r.provenance=r.factId?'typed-controller-fact':memory.some(m=>memoryRef(m)===r.reference)?'actor-memory-report':/source|code/.test(o?.type??'')?'code-text':tool==='rsi_target'?'target-tool-record':tool==='bash'?'host-tool-record':r.learningId?'learning-artifact':'unknown';
   r.observationType=o?.type??null;
  }
@@ -24,7 +41,7 @@ export async function prepareQaSources(input){
   let offset=0,byteOffset=0,part=0;
   while(offset<text.length){let end=Math.min(offset+spanBytes,text.length);while(Buffer.byteLength(text.slice(offset,end))>spanBytes)end--;if(end<text.length&&/[\uD800-\uDBFF]/.test(text[end-1]))end--;
    const prefix=byteOffset,literal=text.slice(offset,end);byteOffset+=Buffer.byteLength(literal);
-   records.push({reference:`${record.reference}:span:${segment+1}:${++part}`,text:literal,sourceRefs:[record.reference],sourcePaths:record.sourcePaths??[],provenance:record.provenance,observationType:record.observationType,parent:{reference:record.reference,sha256:record.sha256??createHash('sha256').update(record.text).digest('hex'),segment:segment+1,startByte:prefix,endByte:prefix+Buffer.byteLength(literal)}});offset=end;
+   records.push({reference:`${record.reference}:span:${segment+1}:${++part}`,text:literal,sourceRefs:[record.reference,...(record.sourceRefs??[]),'parent-sha256:'+(record.sha256??hash(record.text))],sourcePaths:record.sourcePaths??[],provenance:record.provenance,observationType:record.observationType,parent:{reference:record.reference,sha256:record.sha256??createHash('sha256').update(record.text).digest('hex'),segment:segment+1,startByte:prefix,endByte:prefix+Buffer.byteLength(literal)}});offset=end;
   }
  }
 
