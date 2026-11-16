@@ -31,8 +31,10 @@ Those files must satisfy the existing attempt-artifact boundary and bounded
 complete-file check. Typed project facts require the exact `factId` and `value`.
 
 Native classification, skill review and Q&A receive project facts and scoped
-proof records inline. Every output `reason`, `text`, `findings` or issue needs a
+proof records inline. Every output `reason`, `text`, `findings`, structured issue `problem`/`description` or string issue needs a
 claim whose `path` and `text` match that field, such as `answers.evidence.text`.
+Structured issue inline citations are checked too. Rejections enumerate the
+required prose paths; categorical `verdict` values do not need prose claims.
 Unknown references, mismatched quotes, omitted-byte stitching and wrong typed
 values reject submission with tool feedback within the same Pi session and
 elapsed allowance. Cached native submissions undergo the same check.

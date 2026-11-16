@@ -55,6 +55,7 @@ export function claimEvidence({prompt={},packet={},retrievals=[]}){
  for(const a of packet.artifacts??[])if(a.available)add(a.id,a.text,{segments:a.segments??[a.text]});
  for(const e of [...(prompt.entries??[]),...(prompt.baseline??[])])add(e.id,e.text);
  for(const e of [...(prompt.memory??[]),...retrievals.flatMap(r=>r.entries??[])])add(e.ref??e.citationId??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`,e.text??e.content??JSON.stringify(e));
+ for(const key of ['proposal','answers','answerClaims'])if(prompt[key]!==undefined)add('input:'+key,JSON.stringify(prompt[key]));
  return [...new Map(records.map(r=>[r.reference,r])).values()];
 }
 export function validateClaims(claims,records){
@@ -70,12 +71,19 @@ export function validateClaims(claims,records){
  return claims;
 }
 export function validateClaimedResult(value,records){
- validateClaims(value?.claims,records);const targets=new Map();
+ const targets=new Map(),inline=[];
  const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){if(key==='claims')continue;const child=path?path+'.'+key:key;
-  if(typeof item==='string'&&['reason','text','findings'].includes(key))targets.set(child,item);else if(key==='issues'&&Array.isArray(item))item.forEach((text,i)=>{if(typeof text==='string')targets.set(child+'.'+i,text);});else visit(item,child);
+  if(typeof item==='string'&&['reason','text','findings','problem','description'].includes(key))targets.set(child,item);
+  else if(key==='issues'&&Array.isArray(item))item.forEach((issue,i)=>{if(typeof issue==='string')targets.set(child+'.'+i,issue);else{visit(issue,child+'.'+i);if(issue?.reference!==undefined||issue?.quote!==undefined)inline.push(issue);}});
+  else visit(item,child);
  }};visit(value);
- for(const [path,text]of targets)if(!value.claims.some(c=>c.path===path&&c.text===text))throw Error('Missing exact proof-bearing claim for '+path);
- for(const c of value.claims)if(!targets.has(c.path)||targets.get(c.path)!==c.text)throw Error('Claim path/text does not match submitted prose: '+c.path);
+ const paths=[...targets.keys()],hint=' Required prose claim paths: '+JSON.stringify(paths)+'. Categorical fields such as verdict are not prose claim paths.';
+ try{
+  validateClaims(value?.claims,records);
+  for(const [path,text]of targets)if(!value.claims.some(c=>c.path===path&&c.text===text))throw Error('Missing exact proof-bearing claim for '+path);
+  for(const c of value.claims)if(!targets.has(c.path)||targets.get(c.path)!==c.text)throw Error('Claim path/text does not match submitted prose: '+c.path);
+  for(const issue of inline)validateClaims([{text:issue.problem??issue.description??'Issue citation',kind:'observation',proofs:[issue]}],records);
+ }catch(error){throw Error(error.message+hint);}
  return value;
 }
-export const proofInstructions='Every factual reason/text requires claims:[{path:exact dotted output field,text:exact field text,kind:observation|hypothesis,proofs:[{reference,quote}]}]. Copy one contiguous exact quote from the scoped proofEvidence record. For a typed fact also copy its exact factId and value into the proof. Unknown is valid; mark unverified premises as hypothesis, never invent a fact. Quote matching checks copying; the independent QA must also check whether the claim follows from the evidence.';
+export const proofInstructions='Every factual reason/text/findings/problem/description and every issues string requires claims:[{path:exact dotted output field,text:exact field text,kind:observation|hypothesis,proofs:[{reference,quote}]}]. For QA review include reason and each issues.N.problem (or issues.N for string issues); do not create claims for categorical verdict. Copy one contiguous exact quote from the scoped proofEvidence record. For a typed fact also copy its exact factId and value into the proof. Structured issues may use problem/description, but any reference/quote fields they include must also match and carry factId/value for typed facts. Unknown is valid; mark unverified premises as hypothesis, never invent a fact. Quote matching checks copying; the independent QA must also check whether the claim follows from the evidence.';

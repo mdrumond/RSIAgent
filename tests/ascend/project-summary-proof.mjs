@@ -7,7 +7,7 @@ import {createHash} from 'node:crypto';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {State} from '../../controller/state.mjs';
-import {projectSummary,projectSummaries,validateClaims,validateClaimedResult} from '../../cli/project-summary.mjs';
+import {projectSummary,projectSummaries,validateClaims,validateClaimedResult,claimEvidence} from '../../cli/project-summary.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
 import {frozenEvidencePacket} from '../../cli/skill-review-evidence.mjs';
 import {nativeClassify,reviewSession} from '../../cli/skill-review-native.mjs';
@@ -98,4 +98,22 @@ test('new project facts invalidate approved QA without resetting its elapsed all
  const a=await runProposalQa({...base,projectSummaries:[{facts:[{factId:'count',value:0}]}]},ops);
  const b=await runProposalQa({...base,projectSummaries:[{facts:[{factId:'count',value:1}]}]},ops);
  assert.equal(calls,2);assert.notEqual(a.projectFactsIdentity,b.projectFactsIdentity);assert.ok(b.elapsedSeconds>=a.elapsedSeconds+2);assert.equal(b.proofUpgrade.verdict,'approved');
+});
+
+test('structured QA issue prose and inline citations cannot bypass proof admission',()=>{
+ const fact={reference:'count',factId:'count',text:'1',value:1},records=[fact];
+ const result={verdict:'revise',reason:'Count is one',issues:[{path:'proposal.changes.0.text',problem:'The draft says zero',description:'One was recorded',reference:'count',quote:'1'}],claims:[proof(fact,'Count is one')]};
+ assert.throws(()=>validateClaimedResult(result,records),error=>error.message.includes('issues.0.problem')&&error.message.includes('issues.0.description'));
+ result.claims.push(proof(fact,result.issues[0].problem,'issues.0.problem'),proof(fact,result.issues[0].description,'issues.0.description'));
+ result.issues[0].quote='0';assert.throws(()=>validateClaimedResult(result,records),/Quote does not match/);
+ result.issues[0].quote='1';assert.throws(()=>validateClaimedResult(result,records),/Structured fact assertion/);
+ Object.assign(result.issues[0],{factId:'count',value:1});assert.equal(validateClaimedResult(result,records),result);
+ result.claims.push(proof(fact,'revise','verdict'));assert.throws(()=>validateClaimedResult(result,records),/Claim path\/text does not match/);
+});
+
+test('reviewer can prove what the submitted draft and answers actually say',()=>{
+ const records=claimEvidence({prompt:{proposal:{text:'No passes'},answers:{evidence:{text:'No passes'}},answerClaims:[{text:'No passes'}]}});
+ const claims=[{text:'The submitted draft says no passes',kind:'observation',proofs:[{reference:'input:proposal',quote:'No passes'}]}];
+ assert.equal(validateClaims(claims,records),claims);
+ assert.throws(()=>validateClaims([{...claims[0],proofs:[{reference:'input:answers',quote:'One pass'}]}],records),/Quote does not match/);
 });
