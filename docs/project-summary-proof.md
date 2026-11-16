@@ -109,3 +109,11 @@ own allowed scope; a head/tail preview is not used as the complete record. JSON
 record admission is limited to 32 MiB to bound host parsing memory. Alias proofs
 include whole-parent identity, so a changed sibling span invalidates an old proof
 even when its selected text still matches.
+
+Native compact submissions use selector-only proof schemas. Models supply claim
+paths, kinds and selectors; software derives claim text, quotes, hashes and typed
+values. Summary claims target `items.0.text` through `items.2.text` (at most three
+material items per page); audit claims target the auditor's own `reason`.
+Normalized retained submissions still undergo full source validation on resume.
+The v2 summary protocol archives old semantic approvals and summaries while
+retaining elapsed charges and outstanding request reservations.

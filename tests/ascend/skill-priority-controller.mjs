@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile,writeFile,readdir,stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {setup,rows} from './driver_setup.mjs';
+import {setup,rows,until} from './driver_setup.mjs';
+import {firstPromptObject} from './driver_fixture.mjs';
 import {State} from '../../controller/state.mjs';
 import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
 
@@ -17,6 +18,8 @@ test('public controller analyzes a failed preplanned Phase 1 project before comp
   for(const group of groups)for(const path of [group.diagnosticsFile,group.linkedDiagnosticsFile].filter(Boolean))plan.push({name:'read',args:{path,limit:200}});
   const result=input.task.startsWith('Classify')?{classifications:groups.map(g=>({groupId:g.id,cause:'unknown',bucket:'correctness',reason:'The observed numeric failure requires evidence before proposing an instruction',coverage:'unknown',guidanceIds:[],evidenceRefs:[g.occurrences[0].reference]}))}:
    {action:'no-change',reason:'The fixture records the failure but supplies no grounded new instruction',groupIds:groups.map(g=>g.id)};
+  const proof=group=>({reference:group.occurrences[0].reference,startLine:1,endLine:1});
+  result.claims=result.classifications?result.classifications.map((row,i)=>({path:`classifications.${i}.reason`,kind:'hypothesis',proofs:[proof(groups[i])]})):[{path:'reason',kind:'hypothesis',proofs:[proof(groups[0])]}];
   reviews++;plan.push({name:'submit_review',args:{result}});return plan;
  }}});instance=f.root;
  const environment=join(f.root,'two-slots.mjs');
@@ -29,7 +32,8 @@ export const createEnvironment=(options,context)=>base(options,{...context,resou
  const request=enqueueLearningRequest(state,{target:'cpu',question:'Observe the preplanned correctness failure',requiredEvidence:'Actual attempt outcome'});
  state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft='preplanned' WHERE id=?").run(request);
  state.db.prepare('UPDATE projects SET spec=? WHERE id=?').run(JSON.stringify({...project.spec,generation:{draft:'preplanned',learningRequest:{id:request}}}),project.id);state.close();
- await f.run('campaign','--no-recovery');
+ const running=f.start('campaign','--no-recovery');
+ try{await until(()=>rows(f.root,"SELECT 1 FROM sqlite_master WHERE name='skill_backlog_failures'").length>0&&rows(f.root,"SELECT id FROM skill_backlog_failures").length>0&&rows(f.root,"SELECT id FROM skill_backlog_failures WHERE dirty=1").length===0&&rows(f.root,"SELECT sequence FROM events WHERE type='skill-priority-evidence-ready' AND json_extract(data,'$.phase')='phase1'").length>0,30000);}finally{await f.run('stop');await running.output;}
  const learning=rows(f.root,'SELECT status,data FROM skill_learning_requests')[0];assert.equal(learning.status,'inconclusive');
  assert(rows(f.root,'SELECT id FROM attempts').some(a=>a.id===JSON.parse(learning.data).findings.attemptId));
  assert(reviews>0);
@@ -38,4 +42,9 @@ export const createEnvironment=(options,context)=>base(options,{...context,resou
  assert(rows(f.root,"SELECT sequence FROM events WHERE type='skill-priority-evidence-ready' AND json_extract(data,'$.phase')='phase1'").length>0);
  assert.equal(rows(f.root,"SELECT sequence FROM events WHERE type='skill-update-error'").length,0);
  f.pass();
+});
+
+test('summary fixture decodes the first nested JSON context before trailing output examples',()=>{
+ const context={events:[{data:{text:'A quoted brace } and escaped quote " remain data'}}]},prompt='Inspect the native session. '+JSON.stringify(context)+'\nReturn '+JSON.stringify({findings:'different result'});
+ assert.deepEqual(firstPromptObject(prompt),context);assert.deepEqual(firstPromptObject('Project facts '+JSON.stringify({status:'failed'})+'\nExample {findings, paths}\n'+prompt,value=>Array.isArray(value.events)),context);assert.throws(()=>firstPromptObject('Inspect {"events":['),/no complete JSON/);
 });

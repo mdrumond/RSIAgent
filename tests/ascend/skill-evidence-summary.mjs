@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {Check} from 'typebox/value';
 import assert from 'node:assert/strict';
 import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -71,14 +72,14 @@ test('summary pages select cited evidence and linked diagnostics while keeping f
 });
 
 test('native audit rejects submission until a stock read opens its primary source',async t=>{
- const f=await fixture(t),primary=join(f.directory,'primary.txt');await writeFile(primary,'literal primary');let requests=0;
- const result={reason:'Recorded text',claims:[{path:'reason',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]};
- const server=createServer(async(req,res)=>{for await(const chunk of req){}requests++;const call=requests<4,tool=requests===2?'read':'submit_review',args=tool==='read'?{path:primary}:{result};res.writeHead(200,{'content-type':'text/event-stream'});res.end('data: '+JSON.stringify({id:'audit',object:'chat.completion.chunk',created:1,model:'audit',choices:[{index:0,delta:call?{role:'assistant',tool_calls:[{index:0,id:'call'+requests,type:'function',function:{name:tool,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'Done'},finish_reason:call?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');});
+ const f=await fixture(t),primary=join(f.directory,'primary.txt');await writeFile(primary,'literal primary\nunselected private source context');let requests=0;
+ const result={verdict:'supported',reason:'Recorded text',claims:[{path:'reason',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]};
+ const server=createServer(async(req,res)=>{for await(const chunk of req){}requests++;const call=requests<5,tool=requests===3?'read':'submit_review',args=tool==='read'?{path:primary}:{result:requests===2?{...result,claims:[{...result.claims[0],path:'item.text'}]}:result};res.writeHead(200,{'content-type':'text/event-stream'});res.end('data: '+JSON.stringify({id:'audit',object:'chat.completion.chunk',created:1,model:'audit',choices:[{index:0,delta:call?{role:'assistant',tool_calls:[{index:0,id:'call'+requests,type:'function',function:{name:tool,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'Done'},finish_reason:call?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');});
  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{server.closeAllConnections();await new Promise(ok=>server.close(ok));});
  const env='SUMMARY_AUDIT_FIXTURE',old=process.env[env];process.env[env]='fixture';t.after(()=>{if(old===undefined)delete process.env[env];else process.env[env]=old;});
  const actor={provider:'audit-fixture',model:'audit',credential_env:env,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'audit',name:'audit',api:'openai-completions',reasoning:false,input:['text'],contextWindow:128000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}},directory=join(f.directory,'native');
- const out=await reviewSession({directory,config:{actor},prompt:{task:'Check source'},proofRequired:true,compactEvidence:true,proofRecords:[{reference:'raw',text:'literal primary'}],requiredReads:[primary],seconds:10,validate:x=>x});
- assert.equal(requests,4);assert.equal(out.value.claims[0].proofs[0].quote,'literal primary');assert.ok(!(await readFile(join(directory,'input.json'),'utf8')).includes('literal primary'));const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejected.length,1);assert.match(rejected[0].error,/Read these primary/);assert.deepEqual(JSON.parse(await readFile(join(directory,'read-evidence.json'),'utf8')),['file:'+primary]);
+ const catalogue={directory:f.directory,records:[{reference:'raw',text:'literal primary\nunselected private source context'}],sources:[{reference:'raw',segments:[{path:primary}]}],facts:[],pages:[]};const auditInput={directory,config:{actor},sourceCatalogue:catalogue,item:{text:'Recorded primary',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1,quote:'literal primary'}]},seconds:10,validate:x=>x};const out=await nativeQaAuditSummary(auditInput,{session:async options=>{assert.equal(Check(options.resultSchema,result),true);assert.equal(Check(options.resultSchema,{...result,claims:[{...result.claims[0],path:'item.text'}]}),false);assert.equal(Check(options.resultSchema,{...result,claims:[{...result.claims[0],text:result.reason}]}),false);assert.equal(Check(options.resultSchema,{...result,claims:[{...result.claims[0],proofs:[{...result.claims[0].proofs[0],quote:'literal primary'}]}]}),false);return reviewSession(options);}});
+ assert.equal(requests,5);assert.equal(out.value.claims[0].proofs[0].quote,'literal primary');assert.ok(!(await readFile(join(directory,'input.json'),'utf8')).includes('unselected private source context'));const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejected.length,1);assert.match(rejected[0].error,/Read these primary/);assert.equal(out.value.claims[0].text,'Recorded text');const recovered=await nativeQaAuditSummary({...auditInput,config:{}});assert.equal(recovered.recovered,true);assert.deepEqual(JSON.parse(await readFile(join(directory,'read-evidence.json'),'utf8')),['file:'+primary]);
 });
 
 test('discovery paging preserves middle primary evidence, scoped access and stale-source binding',async t=>{
@@ -91,4 +92,15 @@ test('discovery paging preserves middle primary evidence, scoped access and stal
  f.groups[0].occurrences[0].message+=' changed later context';const nextPages=await reviewPages(f.groups,{directory:join(f.directory,'discovery-next')}),next=await prepareQaSources({...f,groups:nextPages.flatMap(p=>p.groups)});assert.notEqual(next.identity,c.identity);assert.throws(()=>validateSummary(value,next),/source changed/);
  const pointer=groups[0].occurrences[0].data.evidencePointer;await writeFile(pointer.path,(await readFile(pointer.path,'utf8')).replace(marker,'DIFFERENT_RESULT'));
  await assert.rejects(prepareQaSources({...f,groups}),/primary source changed/);
+});
+
+test('native compact summary accepts selector paths and restores normalized cached results',async t=>{
+ const f=await fixture(t),c=await prepareQaSources(f),value=summary('One passing case is recorded');await writeFile(join(f.directory,'submission.json'),JSON.stringify(value));
+ const input={...f,config:{},sourceCatalogue:c,page:c.pages[0],seconds:5,validate:x=>validateSummary(x,c)},first=await nativeQaSummarize(input);assert.equal(first.recovered,true);assert.equal(first.value.claims[0].text,value.items[0].text);assert.equal(first.value.claims[0].proofs[0].quote,'PASS one case');
+ const second=await nativeQaSummarize(input);assert.equal(second.recovered,true);assert.deepEqual(second.value,first.value);
+});
+test('selector-schema migration archives old semantic work and retains in-flight elapsed reservation',async t=>{
+ const f=await fixture(t),ops={now:()=>1000,qaSummarize:async()=>summary('One case passed'),qaAuditSummary:async()=>({verdict:'supported',reason:'Checked'}),qaAnswer:async()=>answers(),qaReview:async()=>approve()};await runProposalQa(f,ops);
+ const path=join(f.directory,'qa.json'),old=JSON.parse(await readFile(path,'utf8'));old.proofProtocol='primary-summary-v1';old.elapsedSeconds=225;old.inFlight={reservedThrough:230,stage:'qaAuditSummary'};await writeFile(path,JSON.stringify(old));let available;
+ const out=await runProposalQa(f,{...ops,qaSummarize:async x=>{available=x.seconds;return summary('One case passed');}});assert.equal(available,70);assert.equal(out.elapsedSeconds,230);assert.ok(out.proofUpgrades.at(-1).summary);assert.ok(out.proofUpgrades.at(-1).rounds.length);assert.equal(out.verdict,'approved');
 });

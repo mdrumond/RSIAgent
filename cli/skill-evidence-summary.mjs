@@ -4,7 +4,7 @@ import {mkdir,open,readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {claimEvidence,validateClaimedResult} from './project-summary.mjs';
 import {frozenEvidencePacket} from './skill-review-evidence.mjs';
-export const summaryProtocol='primary-summary-v1';
+export const summaryProtocol='primary-summary-v2';
 export const sourceIdentity=records=>createHash('sha256').update(JSON.stringify(records)).digest('hex');
 const memoryRef=m=>m.ref??m.citationId??`${m.collection}:${m.entry_id??m.chunk_id??m.id}`;
 const hash=text=>createHash('sha256').update(text).digest('hex');
