@@ -47,7 +47,6 @@ export async function runProposalQa(input,ops){
  let proposal=state.rounds.at(-1)?.proposal??state.draft;
  try{
   while(remaining()>0){
-   if(state.rounds.length>=2&&state.rounds.at(-1)?.review?.verdict==='revise'){state.verdict='inconclusive';state.reason='qa-revision-limit';state.reasonKind='scientific';break;}
    const round=state.rounds.at(-1)?.review?.verdict==='revise'||!state.rounds.length?{proposal}:state.rounds.at(-1);
    if(round!==state.rounds.at(-1)){state.rounds.push(round);await persist();}
    const index=state.rounds.length-1;

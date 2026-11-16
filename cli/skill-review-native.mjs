@@ -2,6 +2,7 @@
 import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
+import {Check} from 'typebox/value';
 import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence,claimEvidence,validateClaimedResult,proofInstructions} from './project-summary.mjs';
 import {modelFromProfile} from '../controller/model.mjs';
@@ -20,6 +21,16 @@ import {stages as workflowStages} from '../controller/workflow.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
 
+const nonempty=()=>Type.String({minLength:1});
+const proofSchema=Type.Object({reference:nonempty(),quote:nonempty(),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown())},{additionalProperties:false});
+const claimSchema=Type.Object({path:nonempty(),text:nonempty(),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(proofSchema,{minItems:1})},{additionalProperties:false});
+const claimsSchema=Type.Array(claimSchema,{minItems:1});
+const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
+const issueFields={path:Type.Optional(nonempty()),reference:Type.Optional(nonempty()),quote:Type.Optional(nonempty()),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown())};
+const issueSchema=Type.Union([nonempty(),Type.Object({...issueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...issueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
+const requestSchema=Type.Object({groupIds:Type.Array(nonempty()),question:nonempty(),hypothesis:nonempty(),requiredEvidence:nonempty(),learningTarget:Type.Union([Type.Literal('cpu'),Type.Literal('device')]),workKind:Type.Optional(Type.Union([Type.Literal('microlearning'),Type.Literal('phase1')]))},{additionalProperties:false});
+const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
+
 async function reviewEvidence(directory,groups=[]){
  const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
  for(const group of groups){
@@ -35,7 +46,7 @@ async function reviewEvidence(directory,groups=[]){
  }
  return {required,previews};
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
@@ -52,7 +63,9 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
  const coverageFile=join(directory,'read-evidence.json');
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
+ const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async result=>{
+  if((proofRequired||resultSchema)&&!Check(schema,result))throw Error('Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,text,kind,proofs}; nested claims and reasonClaims do not replace it.');
   if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   if(proofRequired)validateClaimedResult(result,claimEvidence({prompt,packet,retrievals}));
   return validate(result,retrievals);
@@ -77,7 +90,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    for(const ref of evidence.required){const quoted=JSON.stringify(ref);if(text.includes('\"reference\":'+quoted)||text.includes('\"reference\": '+quoted))seen.add(ref);}
    await writeFile(coverageFile,JSON.stringify([...seen]));
   });
-  pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:Type.Unknown()}),
+  pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
   execute:async(_id,{result})=>{try{submitted=await check(result);}catch(error){await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({error:error.message,result})+'\n');throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=JSON.parse(await readFile(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
@@ -136,7 +149,7 @@ export async function nativeQaAnswer(input,dependencies={}){
 export async function nativeQaReview(input,dependencies={}){
  const prompt=await qaPrompt(input);
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return (dependencies.session??reviewSession)({...input,proofRequired:true,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,answerClaims:input.answerClaims??[],
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,resultSchema:qaReviewResultSchema,allowedPaths,knowledge:false,evidenceGroups:prompt.groups,prompt:{...prompt,answers:input.answers,answerClaims:input.answerClaims??[],
   task:'Independently review the draft, five answers and answerClaims against supplied evidence. Check each claim actually follows from its quoted source and typed project facts; an exact quote alone is not proof of entailment. Send fixable mismatches back with revise and concrete issues, not approval. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. For each learning request set workKind:microlearning only for one tiny controlled question fitting 900 elapsed seconds including construction, verification and cleanup; larger workKind:phase1. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
 }
 export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){

@@ -65,3 +65,9 @@ Inspection is bounded to complete 64 KiB files and a 256 KiB proof-byte packet;
 missing, oversized or mismatched sources remain explicit unknowns. Additional
 learning evidence cannot expand the verified source scope. Q&A answer references
 may use only actual supplied project/learning IDs, never an arbitrary prefix.
+
+Proof-required native submissions expose a typed tool schema with `claims` at the
+result root. Q&A review additionally types verdict, reason, issues and learning
+requests; misplaced `reasonClaims` or nested claims are rejected before admission.
+Revision rounds share the original elapsed allocation; there is no round-count
+stopping budget.

@@ -24,6 +24,7 @@ test('all project attempts and verifications survive final failure and diagnosti
  for(let i=0;i<15;i++)f.state.event(f.attempt.id,'verification',{passed:false,correctness:{passed:false}});
  f.state.finish(f.attempt.id,'failed');const s=await projectSummary({state:f.state,projectId:'p'});
  assert.equal(s.projectStatus,'failed');assert.equal(s.attempts.length,2);assert.equal(s.verifications.length,16);assert.equal(s.facts.find(x=>x.reference.endsWith(':passingVerificationCount')).value,1);assert.ok(s.eventCutoff>0);
+ assert.deepEqual(s.overview,{projectStatus:'failed',attemptCount:2,verificationCount:16,passingVerificationCount:1,unknownVerificationCount:0,performancePassCount:0,eventCutoff:s.eventCutoff});
  const groups=[{occurrences:[{projectId:'p',attemptId:f.attempt.id}]}];assert.deepEqual((await projectSummaries({root:f.root},groups))[0],s);
 });
 test('aggregate gain, candidate identity and exact artifact binding remain distinct from case ratios',async t=>{
@@ -138,4 +139,13 @@ test('changed project facts use fresh native QA sessions even when old proof sti
  const input={directory,config:{root:f.root,actor:p.profile},proposal:{changes:[],memoryRefs:[]},entries:[baseline],groups:[{id:'g',occurrences:[{reference:'failure:1',projectId:'p',message:'Observed failure'}]}],target:'a3',validateProposal:x=>x};
  const a=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(a.verdict,'approved');assert.equal(requests,6);
  f.state.event(f.attempt.id,'verification',{passed:true});const b=await runProposalQa(input,{qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value});assert.equal(b.verdict,'approved');assert.equal(requests,12);assert.notEqual(a.projectFactsIdentity,b.projectFactsIdentity);assert.ok(b.elapsedSeconds>=a.elapsedSeconds);
+});
+
+test('typed native QA schema returns misplaced claims for correction in the same session',async t=>{
+ const f=await fixture(t),directory=join(f.root,'qa-schema'),text='Observed value',reason='A correction is needed',problem='Use the observed value';
+ const claim=(path,text)=>({path,text,kind:'hypothesis',proofs:[{reference:'baseline',quote:'Observed value'}]});
+ const valid={verdict:'revise',reason,issues:[{problem}],claims:[claim('reason',reason),claim('issues.0.problem',problem)]};
+ const p=await provider(t,(n,body)=>{if(n===0)return['submit_review',{result:{verdict:'revise',reason,issues:[{problem,claims:valid.claims}]}}];if(n===1){assert.ok(JSON.stringify(body.messages.filter(m=>m.role==='tool')).includes('claims'));return['submit_review',{result:{...valid,reasonClaims:valid.claims}}];}if(n===2)return['submit_review',{result:valid}];});
+ const out=await nativeQaReview({directory,config:{actor:p.profile},seconds:15,proposal:{changes:[],memoryRefs:[]},entries:[{id:'baseline',text}],groups:[],answers:{},validate:x=>x});
+ assert.equal(out.value.verdict,'revise');assert.equal(p.requests(),4);const session=JSON.parse(await readFile(join(directory,'native-session.json'),'utf8'));const rows=(await readFile(session.path,'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.filter(x=>x.type==='session').length,1);
 });

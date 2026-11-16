@@ -13,7 +13,7 @@ export async function projectSummary({state,projectId,artifactResolver=path=>pat
  const row=state.db.prepare('SELECT id,status FROM projects WHERE id=?').get(projectId);
  if(!row)return {format:1,projectId,available:false,facts:[],references:[],unknowns:['Project not present in this evidence database']};
  const attempts=state.db.prepare('SELECT id,outcome,created FROM attempts WHERE project=? ORDER BY created,id').all(projectId).map(a=>({...a}));
- const summary={format:1,projectId,available:true,projectStatus:row.status,eventCutoff:0,attempts,verifications:[],measurements:[],facts:[],references:[],unknowns:[]};
+ const summary={format:1,projectId,available:true,overview:null,projectStatus:row.status,eventCutoff:0,attempts,verifications:[],measurements:[],facts:[],references:[],unknowns:[]};
  const fact=(name,value,sourceRefs=[])=>{const reference=`project:${projectId}:${name}`;summary.facts.push({reference,factId:reference,value,text:JSON.stringify(value),sourceRefs});};
  for(const event of state.db.prepare("SELECT e.sequence,e.attempt,e.type,e.data,e.created FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project=? AND e.type IN ('verification','failure-recorded','attempt-error','project-invalid','preactor-infrastructure','rejected') ORDER BY e.sequence").iterate(projectId)){
   const data=JSON.parse(event.data),reference=`project:${projectId}:events:${event.sequence}`;
@@ -37,6 +37,8 @@ export async function projectSummary({state,projectId,artifactResolver=path=>pat
  }
  const refs=summary.verifications.map(v=>v.reference);
  fact('projectStatus',row.status);fact('eventCutoff',summary.eventCutoff);fact('unknownVerificationCount',summary.verifications.filter(v=>v.passed===null).length,refs);fact('attemptCount',attempts.length);fact('verificationCount',summary.verifications.length,refs);fact('passingVerificationCount',summary.verifications.filter(v=>v.passed).length,refs);fact('performancePassCount',summary.verifications.filter(v=>v.performancePassed===true).length,refs);
+ // Keep the facts needed for admission ahead of the potentially long evidence lists.
+ summary.overview={projectStatus:row.status,attemptCount:attempts.length,verificationCount:summary.verifications.length,passingVerificationCount:summary.verifications.filter(v=>v.passed===true).length,unknownVerificationCount:summary.verifications.filter(v=>v.passed===null).length,performancePassCount:summary.verifications.filter(v=>v.performancePassed===true).length,eventCutoff:summary.eventCutoff};
  summary.identity=digest(summary);return summary;
 }
 export async function projectSummaries(config,groups){
