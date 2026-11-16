@@ -81,3 +81,39 @@ hashes and primary source metadata. It cannot cross omitted excerpt gaps. Legacy
 when its source record changes, including outside the selected span. Result
 claims may omit `text`: code derives it from the actual output `path`; standalone
 summary claim text remains required. Selector checks still do not prove entailment.
+
+## Compact summary admission
+
+Production proposal QA uses `nativeQaSummarize` on cited primary evidence and
+linked diagnostics, then `nativeQaAuditSummary` independently checks each item in
+a fresh session. The source catalogue retains full primary records outside model
+input. Models see source pointers, provenance, authoritative project counts and a
+checked summary. Code and memory reports establish recorded text, not measured
+execution. Stock Pi filesystem tools can inspect immutable primary files; audit
+submission requires reading the cited files. Summary text is never a proof source.
+
+Large primary records also have literal span aliases of at most 16 KiB, carrying
+parent identity, segment and byte offsets. Original records remain valid for
+legacy proofs. Pages contain at most 16 KiB of primary bytes and four sources;
+summary output has an 8 KiB compact content limit. These are context validity
+constraints. Summary production, audit and skill QA share the original 300 elapsed
+seconds, including charges reserved before interrupted requests. Source catalogue
+changes invalidate semantic approvals without resetting that allocation. Existing
+callers injecting only `qaAnswer`/`qaReview` retain their original workflow;
+providing both summary operations enables the same admission gate explicitly.
+
+When discovery paging supplies an immutable record pointer, summary admission
+verifies its full-file hash and original reference before restoring the observation.
+The reconstructed primary text and bounded aliases are copied into the summary's
+own allowed scope; a head/tail preview is not used as the complete record. JSON
+record admission is limited to 32 MiB to bound host parsing memory. Alias proofs
+include whole-parent identity, so a changed sibling span invalidates an old proof
+even when its selected text still matches.
+
+Native compact submissions use selector-only proof schemas. Models supply claim
+paths, kinds and selectors; software derives claim text, quotes, hashes and typed
+values. Summary claims target `items.0.text` through `items.2.text` (at most three
+material items per page); audit claims target the auditor's own `reason`.
+Normalized retained submissions still undergo full source validation on resume.
+The current summary protocol archives old semantic approvals and summaries while
+retaining elapsed charges and outstanding request reservations.

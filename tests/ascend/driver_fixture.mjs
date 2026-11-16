@@ -1,6 +1,14 @@
 /** Frozen OpenAI chat-completions SSE fixture; production Pi owns all execution. */
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+export function firstPromptObject(prompt,accept=()=>true){
+ let start=prompt.indexOf('{'),depth=0,quoted=false,escaped=false;const limit=Math.min(prompt.length,1024*1024);
+ for(let i=start;i>=0&&i<limit;i++){
+  const c=prompt[i];if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;continue;}
+  if(c==='"')quoted=true;else if(c==='{')depth++;else if(c==='}'&&!--depth){try{const value=JSON.parse(prompt.slice(start,i+1));if(accept(value))return value;}catch{}start=prompt.indexOf('{',i+1);if(start<0)break;i=start-1;}
+ }
+ throw Error('Fixture summary context has no complete JSON object within 1 MiB');
+}
 const tool = (name, args = {}) => ({name, args});
 const steps = ['preflight','task-construction','design','implementation','test','debug',
   'optimisation','validation','acceptance'];
@@ -64,7 +72,7 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
             tool('submit_investigation',{goal:'SMALL arithmetic observation',
               question:'Does six times seven satisfy the independent oracle?',verifier:'verifier.py',controls:{positive:'positive',negative:['negative']}})];
         } else if (prompt.startsWith('Inspect the native')) {
-          const context = JSON.parse(prompt.slice(prompt.indexOf('{'),prompt.lastIndexOf('}')+1));
+          const context = firstPromptObject(prompt,value=>Array.isArray(value.events));
           const events = context.events;
           const verification = events.findLast(event => event.type === 'verification' && event.data.evidence);
           const path = verification?.data.evidence?.correctness ?? context.session ?? await nativeSession?.();
