@@ -2,7 +2,7 @@
 import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
-import {Check} from 'typebox/value';
+import {Check,Errors} from 'typebox/value';
 import {discoveryProofSources} from './skill-discovery-proofs.mjs';
 import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence,claimEvidence,validateClaimedResult,proofInstructions} from './project-summary.mjs';
@@ -19,6 +19,7 @@ import {refillProjects} from './project-generation.mjs';
 import {runMicroeval,finalizeKernelPairs} from './skill-microeval.mjs';
 import {tasks} from './microtasks/tasks.mjs';
 import {stages as workflowStages} from '../controller/workflow.mjs';
+import {validateSummaryTargets} from './skill-review-qa.mjs';
 import {compactSummary,sourcePointers} from './skill-evidence-summary.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
@@ -32,9 +33,12 @@ const selectorFields=Object.fromEntries(['reference','startLine','endLine','segm
 const selectorProofSchema=Type.Object(selectorFields,{additionalProperties:false});
 const selectorClaims=(path=nonempty())=>Type.Array(Type.Object({path,kind:claimSchema.properties.kind,proofs:Type.Array(selectorProofSchema,{minItems:1})},{additionalProperties:false}),{minItems:1});
 const selectorInstructions='Submit claims only as {path,kind,proofs:[{reference,startLine?,endLine?,segment?,field?}]}. The path identifies prose in your RESULT, not the input. Omit claim.text and all quotes, hashes, fact values, source lists and copied input metadata: software derives them. Lines are 1-based inclusive; excerpt records need segment. A whole typed fact uses only reference. JSON field selectors apply only to input:* records. Cite original primary references, never a summary as its own proof.';
-const selectorShape=result=>({...result,claims:result.claims?.map(({text,...claim})=>({...claim,proofs:claim.proofs?.map(p=>Object.fromEntries(Object.keys(selectorFields).filter(k=>Object.hasOwn(p,k)).map(k=>[k,p[k]])))}))});
+const selectorShape=result=>({...result,...(result.issues?{issues:result.issues.map(issue=>typeof issue==='string'?issue:Object.fromEntries(['problem','description','path','field','summaryItemId'].filter(k=>Object.hasOwn(issue,k)).map(k=>[k,issue[k]])))}:{}),claims:result.claims?.map(({text,...claim})=>({...claim,proofs:claim.proofs?.map(p=>Object.fromEntries(Object.keys(selectorFields).filter(k=>Object.hasOwn(p,k)).map(k=>[k,p[k]])))}))});
 const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
-const issueFields={...Object.fromEntries(Object.entries(proofFields).map(([k,v])=>[k,Type.Optional(v)])),path:Type.Optional(nonempty())};
+const summaryItemId=Type.Optional(Type.String({minLength:1,description:'For a defect in an evidence summary, copy the exact evidenceSummary.items[].id to route this issue back to its summarizer.'}));
+const selectorIssueFields={summaryItemId,path:Type.Optional(nonempty()),field:Type.Optional(nonempty())};
+const selectorIssueSchema=Type.Union([nonempty(),Type.Object({...selectorIssueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...selectorIssueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
+const issueFields={summaryItemId,...Object.fromEntries(Object.entries(proofFields).map(([k,v])=>[k,Type.Optional(v)])),path:Type.Optional(nonempty())};
 const issueSchema=Type.Union([nonempty(),Type.Object({...issueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...issueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
 const requestSchema=Type.Object({groupIds:Type.Array(nonempty()),question:nonempty(),hypothesis:nonempty(),requiredEvidence:nonempty(),learningTarget:Type.Union([Type.Literal('cpu'),Type.Literal('device')]),workKind:Type.Optional(Type.Union([Type.Literal('microlearning'),Type.Literal('phase1')]))},{additionalProperties:false});
 const qaAnswerResultSchema=Type.Object({answers:Type.Object(Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,Type.Object({text:nonempty(),refs:Type.Array(nonempty())},{additionalProperties:false})])),{additionalProperties:false}),changes:Type.Optional(Type.Array(Type.Unknown())),memoryRefs:Type.Optional(Type.Array(nonempty())),reason:Type.Optional(nonempty()),claims:claimsSchema},{additionalProperties:false});
@@ -75,7 +79,10 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async(result,cached=false)=>{
-  if((proofRequired||resultSchema)&&!Check(schema,cached&&selectorOnly?selectorShape(result):result))throw Error(selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.');
+  const candidate=cached&&selectorOnly?selectorShape(result):result;
+  if((proofRequired||resultSchema)&&!Check(schema,candidate)){const paths=Errors(schema,candidate).slice(0,4).map(e=>(e.instancePath||'/')+' '+e.message).join('; ');
+   throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
+  }
   if(requiredReads.some(path=>!seen.has('file:'+resolve(path))))throw Error('Read these primary source files before summary audit: '+JSON.stringify(requiredReads.filter(path=>!seen.has('file:'+resolve(path)))));
   if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   if(proofRequired)validateClaimedResult(result,[...(proofRecords?proofSources():claimEvidence({prompt,packet,retrievals})),...(discoveryProofRecords?await discoveryProofRecords():[])]);
@@ -86,7 +93,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));return {value,retrievals,recovered:true};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
- let submitted;
+ let submitted,rejectedSubmissions=0,lastRejection;
+ const sanitize=value=>String(value??'').replace(/(https?:\/\/)[^/\s@]+@/gi,'$1[redacted]@').replace(/Bearer\s+[^\s"<>]+/gi,'Bearer [redacted]').replace(/([?&](?:token|key|api_key|access_token)=)[^&\s"<>]+/gi,'$1[redacted]').slice(0,2000);
+ const rejectedCalls=new Set();let rejectionWrites=Promise.resolve();
+ const recordRejection=(toolCallId,error,result)=>{if(rejectedCalls.has(toolCallId))return rejectionWrites;rejectedCalls.add(toolCallId);rejectedSubmissions++;lastRejection=sanitize(error);
+  rejectionWrites=rejectionWrites.then(()=>appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({toolCallId,error:lastRejection,...(result===undefined?{}:{result})})+'\n'));return rejectionWrites;
+ };
  const extension=pi=>{
   pi.on('tool_call',async event=>{if(!['read','grep','find','ls'].includes(event.toolName))return;
    const requested=resolveToCwd(event.input.path??'.',directory);
@@ -102,7 +114,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    await writeFile(coverageFile,JSON.stringify([...seen]));
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
-  execute:async(_id,{result})=>{try{submitted=await check(result);}catch(error){await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({error:error.message,result})+'\n');throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
+  execute:async(id,{result})=>{try{submitted=await check(result);}catch(error){await recordRejection(id,error.message,result);throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=JSON.parse(await readFile(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
@@ -110,14 +122,32 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await modelFromProfile(config.skill_writer_actor??config.actor),thinkingLevel:'off',
   tools:['read','grep','find','ls','submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
+ const unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
+  const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
+ }});
+ const initialMessages=session.messages.length;
+ const termination=async(kind,error)=>{
+  await rejectionWrites;
+  const providerMessages=session.messages.slice(initialMessages).filter(m=>m.role==='assistant'&&m.stopReason==='error');
+  const detail={kind,rejectedSubmissions,providerErrors:providerMessages.length,...(lastRejection?{lastRejection}:{}),...(error||providerMessages.length?{cause:sanitize(providerMessages.at(-1)?.errorMessage??error?.message??error)}:{})};
+  await writeFile(join(directory,'termination.json'),JSON.stringify(detail,null,2));return detail;
+ };
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
   await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json, then read all distinct diagnostics listed by diagnosticsFile and linkedDiagnosticsFile using native read offset/limit when the bounded preview is incomplete. Full occurrences remain available in fullOccurrences; duplicate diagnostics need not be reread. Filesystem tools may only inspect this review directory and declared copied evidence/verified learning paths; indexed knowledge is available through KDB tools. Correct validation errors directly rather than searching implementation source. Perform exactly its task, using only provided observations and retrieved evidence. Submit the requested JSON result using submit_review. Unknown is valid; never invent cause, successful repairs or measurements. Harness faults require user intervention, not actor repairs.');
-  await session.waitForIdle();signal?.throwIfAborted();if(expired)throw Error('Review session elapsed allocation exhausted');if(submitted===undefined)throw Error('Review session did not submit');
+  await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
+  if(submitted===undefined){const provider=session.messages.slice(initialMessages).some(m=>m.role==='assistant'&&m.stopReason==='error'),kind=provider?'provider-error':rejectedSubmissions?'rejected-submissions':'no-submit',detail=await termination(kind);
+   throw Object.assign(Error('Review session '+kind+(detail.cause?': '+detail.cause:detail.lastRejection?': '+detail.lastRejection:'')),{reviewSession:detail});}
+  await termination('submitted');
   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
+ }catch(error){
+  if(!error.reviewSession){const elapsed=expired||signal?.reason?.name==='TimeoutError',detail=await termination(elapsed?'elapsed':signal?.aborted?'cancelled':'provider-error',error);
+   if(!signal?.aborted||elapsed){const wrapped=Error('Review session '+detail.kind+': '+detail.cause);wrapped.name=elapsed?'TimeoutError':error.name;wrapped.reviewSession=detail;throw wrapped;}
+  }
+  throw error;
  }finally{
-  clearTimeout(timer);signal?.removeEventListener('abort',abort);
+  clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();await rejectionWrites;
   try{await session.exportToJsonl(join(directory,'session.native.jsonl'));}finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
 }
@@ -175,7 +205,7 @@ export async function nativeQaReview(input,dependencies={}){
  let prompt=await qaPrompt(input);
  const compact=input.evidenceSummary&&input.sourceCatalogue;if(compact)prompt={proposal:prompt.proposal,baseline:prompt.baseline,objective:prompt.objective,target:prompt.target,questions:prompt.questions,rules:prompt.rules,evidenceSummary:compactSummary(input.evidenceSummary,input.sourceCatalogue),evaluationContract:prompt.evaluationContract};
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return (dependencies.session??reviewSession)({...input,proofRequired:true,selectorOnly:!!compact,resultSchema:compact?Type.Object({...qaReviewResultSchema.properties,claims:selectorClaims()},{additionalProperties:false}):qaReviewResultSchema,knowledge:false,evidenceGroups:compact?[]:prompt.groups,compactEvidence:!!compact,proofRecords:compact?input.sourceCatalogue.records:undefined,allowedPaths:compact?[...allowedPaths,input.sourceCatalogue.directory]:allowedPaths,prompt:{...prompt,answers:input.answers,answerClaims:compact?selectorShape({claims:input.answerClaims??[]}).claims:input.answerClaims??[],
+ return (dependencies.session??reviewSession)({...input,validate:value=>input.validate(validateSummaryTargets(value,input.evidenceSummary?.items??[])),proofRequired:true,selectorOnly:!!compact,resultSchema:compact?Type.Object({...qaReviewResultSchema.properties,issues:Type.Optional(Type.Array(selectorIssueSchema)),claims:selectorClaims()},{additionalProperties:false}):qaReviewResultSchema,knowledge:false,evidenceGroups:compact?[]:prompt.groups,compactEvidence:!!compact,proofRecords:compact?input.sourceCatalogue.records:undefined,allowedPaths:compact?[...allowedPaths,input.sourceCatalogue.directory]:allowedPaths,prompt:{...prompt,answers:input.answers,answerClaims:compact?selectorShape({claims:input.answerClaims??[]}).claims:input.answerClaims??[],
   task:'Independently review the draft, five answers and answerClaims against supplied evidence. Check the independently audited evidenceSummary against its primary source pointers as well as every final skill/answer claim; a summary is never its own primary proof. Check each claim actually follows from its primary source and typed project facts; an exact quote alone is not proof of entailment. Send fixable mismatches back with revise and concrete issues, not approval. Return {verdict:approved|revise|learn|inconclusive,reason,issues?:[],learningRequests?:[{groupIds:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Approve only if the skill text itself communicates the concrete edit, mechanism and material boundaries; private answers cannot repair absent guidance. Gate material contradictions, unsupported target claims and unnecessary optimization in correctness guidance. Do not demand prior performance proof of an explicitly untested optimization hypothesis. Use revise for fixable writing issues, learn for missing facts requiring CPU/device learning, inconclusive for insufficient review evidence. For each learning request set workKind:microlearning only for one tiny controlled question fitting 900 elapsed seconds including construction, verification and cleanup; larger workKind:phase1. Harness problems remain user handled. Cite concrete issues; approval admits A/B only.'}});
 }
 export async function nativeLearn({directory,config,request,signal,seconds},dependencies={}){

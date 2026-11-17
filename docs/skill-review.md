@@ -77,6 +77,28 @@ remain intact. Approval admits evaluation and never activates a skill. Missing
 facts follow the existing learning route; harness faults remain user handled.
 `report.json` includes QA dispositions, elapsed time and approval fingerprints.
 
+The proposal QA API accepts `qaConcurrency` (or `config.skill_qa_concurrency`),
+a positive integer defaulting to one. Independent evidence pages and summary-item
+audits share that session limit; page revisions wait for their own audits and the
+writer waits for all evidence checks. Parallel sessions consume elapsed wall time,
+not summed request durations. Checkpoints retain each in-flight reservation and
+completed audit; interruption drains running calls before returning. Scheduling
+concurrency does not change the evidence identity or approval contract. The
+standalone `runReview` API forwards its optional `qaConcurrency` setting and
+preserves cancellation from both the review and individual QA work.
+Identical summary item identities share one audit session. Compact review issues
+carry problem/description and optional target path/field; proof selectors belong
+in top-level claims. Complete historical inline issue proofs remain validated.
+Native sessions retain `termination.json` with submitted, provider-error,
+rejected-submissions, no-submit, elapsed, or cancelled disposition, rejection and
+provider-error counts, and bounded sanitized cause details. QA checkpoints retain
+these details under `error.reviewSession` when admission cannot finish.
+A reviewer can attach `summaryItemId` to a revision issue, using an exact current
+evidence-summary item ID. QA returns those issues to the affected page summarizer
+and independently re-audits that page in a new session namespace. Unaffected
+pages remain cached; prior summary text, audits, final-review feedback and elapsed
+spending remain in the checkpoint history. Unknown summary targets are rejected.
+
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only
 inside the candidate's isolated instance. Its next fresh actor reads the accepted

@@ -275,7 +275,7 @@ test('a resumed native review validates saved retrieval citations without queryi
  const provider=await scriptedReview(t,f.root,body=>phase&& !body.messages.some(m=>m.role==='tool')?{name:'submit_review',args:{result:{memoryRefs:['memory:old-entry']}}}:null);
  const validate=(result,records)=>{assert.ok(records.some(r=>r.entries.some(e=>e.collection==='memory'&&e.chunk_id==='old-entry')));return result;};
  const input={directory,config:{actor:provider.profile},prompt:{task:'Retain retrieved references'},validate,seconds:30};
- await assert.rejects(reviewSession(input),/did not submit/);const session=await load(join(directory,'native-session.json'));
+ await assert.rejects(reviewSession(input),error=>error.reviewSession?.kind==='no-submit');const session=await load(join(directory,'native-session.json'));
  await writeFile(join(directory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',chunk_id:'old-entry'}]})+'\n');phase=1;
  const resumed=await reviewSession(input);assert.deepEqual(resumed.value.memoryRefs,['memory:old-entry']);assert.equal(resumed.retrievals.length,1);
  assert.deepEqual(await load(join(directory,'native-session.json')),session);assert.equal(provider.requests(),3);
@@ -613,4 +613,21 @@ test('native discovery reads and cites middle oversized evidence without inlinin
  await writeFile(descriptor.path,'changed');
  await assert.rejects(nativeReview(input,{session:args=>reviewSession({...args,knowledge:false})}),/Discovery proof source changed/);
  assert.equal(provider.requests(),calls);
+});
+
+test('standalone review adapter propagates failed QA audit cancellation to sibling sessions',async t=>{
+ const f=await fixture(t);let started=0,finished=0,siblingAborted=false,release;
+ const siblingStarted=new Promise(resolve=>{release=resolve;});
+ const deps={classify,review:async args=>{const proposal=update(args);proposal.changes[0].evidenceRefs=args.groups.flatMap(g=>g.occurrences.map(o=>o.reference));return proposal;},qaSummarize:async({page})=>({items:[{text:'First observation',kind:'observation'},{text:'Second observation',kind:'observation'}],claims:[0,1].map(i=>({path:`items.${i}.text`,kind:'observation',proofs:[{reference:page.sources[0].reference,startLine:1,endLine:1}]}))}),qaAuditSummary:async({signal})=>{
+  const order=++started;
+  try{
+   if(order===1){await siblingStarted;throw Error('Provider audit failed');}
+   release();await new Promise(resolve=>{const timer=setTimeout(resolve,80);signal.addEventListener('abort',()=>{siblingAborted=true;clearTimeout(timer);resolve();},{once:true});});
+   return {verdict:'supported',reason:'Completed sibling cleanup'};
+  }finally{finished++;}
+ },qaAnswer:async()=>{throw Error('Failed audit must prevent writing');}};
+ for(const stage of ['inventory','classify','propose'])await runReview({...f.options,stage},deps);
+ await runReview({...f.options,stage:'qa',qaConcurrency:2},deps);
+ assert.equal(started,2);assert.equal(finished,2);assert.equal(siblingAborted,true);
+ const checkpoint=await load(join(f.options.output,'review.json'));assert.equal(Object.values(checkpoint.qa)[0].reason,'qa-execution-failed');
 });
