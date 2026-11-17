@@ -10,7 +10,7 @@ import {SkillBacklog} from '../controller/skill-backlog.mjs';
 import {ownerStopped,processIdentity} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {publishSkillVersion} from './skills.mjs';
-import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlog-analysis.mjs';
+import {currentAnalysisStages,analyzeBacklog,prioritizeBacklog,prepareHypothesis} from './skill-backlog-analysis.mjs';
 import {evaluateHypothesis,hypothesisEvaluationSettled,freezeHypothesisProtocol} from './skill-hypothesis-evaluation.mjs';
 import {runMicrolearning,microlearningSettled,pendingMicrolearning} from './skill-microlearning.mjs';
 import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs';
@@ -52,9 +52,10 @@ export async function prioritySkillStatus(config){
    active=backlog.list({status:'running',limit:1})[0],run=active&&backlog.run(active.id);
   const learningWork=backlog.meta('microlearning-active'),learningQueue=pendingMicrolearning(backlog);
   const changed=backlog.meta('learning-seen')!==learningFingerprint(state),cohort=cohortStatus(backlog),continuations=admissibleContinuations(backlog,config.skills.activeVersion);
+  const analysisStages=currentAnalysisStages({config,backlog});
   const queued=status.items.filter(i=>['queued','needs-review'].includes(i.status)).reduce((sum,i)=>sum+i.n,0);
   return {...status,cohort,activeWork:learningWork?{kind:learningWork.request.workKind,stage:learningWork.stage,id:learningWork.id,elapsedSeconds:learningWork.elapsed,allocatedSeconds:learningWork.seconds}:active?{kind:'hypothesis',stage:run?.checkpoint?.evaluationDirectory?'evaluation':run?.checkpoint?.prepared?'qa':'cases',id:active.id}:null,learningQueued:learningQueue.length,continuationQueued:continuations.length,lastLearning:backlog.meta('microlearning-last'),queued,evaluationStatus:active||learningWork?'running':queued?'deferred':'idle',pending:Boolean(active||learningWork),resource:run?.checkpoint?.resource??learningWork?.resource,unresolved:Boolean(run?.checkpoint?.unresolved||learningWork?.stage==='settlement'),
-   analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
+   analysisStages,analysisProgress:{classified:analysisStages.filter(s=>s.classification).length,pendingProposals:analysisStages.filter(s=>s.stage==='proposal'&&s.status!=='blocked'&&s.status!=='complete').length,blocked:analysisStages.filter(s=>s.status==='blocked').length,completed:analysisStages.filter(s=>s.status==='complete').length},analysisError:backlog.meta('analysis-error'),rankingError:backlog.meta('ranking-error'),
    current:active?{id:active.id,objective:active.objective,priority:active.priority,elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,
     candidate:run.checkpoint?.prepared?.candidate,evaluationDirectory:run.checkpoint?.evaluationDirectory}:null,
    backlog:items.map(({id,skill,objective,status,priority,reason})=>({id,skill,objective,status,priority,reason})),
@@ -96,7 +97,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(backlog.meta('learning-seen')!==admittedLearning){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
    // Preserve that progress and existing priorities instead of starving evaluation.
-   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:cacheDirectory('analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
+   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:cacheDirectory('analysis'),seconds:120,remainingSeconds:remainingCampaign(),limit:2}],
     ['ranking',ops.prioritize,{directory:cacheDirectory('ranking'),seconds:Math.min(60,remainingCampaign())}]]){
     if((backlog.meta(name+'-after')??0)>Date.now())continue;
     try{await operation({config,backlog,signal:values.signal,...args});backlog.meta(name+'-error',null);}
@@ -134,7 +135,8 @@ export async function runPrioritySkills(config,values,dependencies={}){
   selected=retained?backlog.claim({base:config.skills.activeVersion,owner}):await claimCohort(backlog,config,owner,ops.caseReadiness);
   if(!selected){
    const requests=pendingMicrolearning(backlog).filter(request=>request.workKind!=='suite');
-   return requests.length?await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign(),requestIds:requests.map(r=>r.id)}):{status:'idle',reason:'No applicable cohort comparison or bounded factual learning'};
+   const blocked=currentAnalysisStages({config,backlog}).filter(s=>s.status==='blocked');
+   return requests.length?await ops.learn({config,backlog,...values,remainingSeconds:remainingCampaign(),requestIds:requests.map(r=>r.id)}):blocked.length?{status:'blocked',reason:'Analysis stages require review or an explicit fresh epoch',blockedStages:blocked.length}:{status:'idle',reason:'No applicable cohort comparison or bounded factual learning'};
   }
   attachRetainedCohort(backlog,selected.run);
   const {run}=selected,item=run.snapshot,home=join(directory,'hypotheses',run.id);await mkdir(home,{recursive:true});

@@ -14,10 +14,19 @@ const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const load=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
 const save=async(path,value)=>{await mkdir(resolve(path,'..'),{recursive:true});const temporary=path+'.tmp';await writeFile(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);};
 const unwrap=result=>result?.value??result;
+// An unfinished marker means the owner died before closing its elapsed ledger.
+// Retain that uncertainty rather than renewing the unobserved portion of its grant.
+async function trackSpending(path,prior,now,allocation={}){
+ const begun=now();let writes=Promise.resolve(),failure;
+ const snapshot=()=>({...allocation,elapsedSeconds:prior+(now()-begun)/1000,running:true});
+ await save(path,snapshot());
+ const timer=setInterval(()=>{const value=snapshot();writes=writes.then(()=>save(path,value)).catch(error=>{failure??=error;});},1000);
+ return async()=>{clearInterval(timer);await writes;if(failure)throw failure;await save(path,{...allocation,elapsedSeconds:prior+(now()-begun)/1000,running:false});};
+}
 async function operations(dependencies){const native=await import('./skill-review-native.mjs');return {classify:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,session:native.reviewSession,...dependencies};}
-function allocation(seconds,signal){
+function allocation(seconds,signal,now=()=>performance.now()){
  if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive remaining elapsed allowance required');
- const started=performance.now(),remaining=()=>Math.max(0,seconds-(performance.now()-started)/1000);
+ const started=now(),remaining=()=>Math.max(0,seconds-(now()-started)/1000);
  return {remaining,elapsed:()=>seconds-remaining(),call:async(fn,input,cap=120)=>{
   signal?.throwIfAborted();const left=Math.min(remaining(),cap);if(left<=0)throw Error('Analysis elapsed allocation exhausted');
   return unwrap(await fn({...input,seconds:left,signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left*1000)))])}));
@@ -125,15 +134,51 @@ function consumeLearning(backlog,contributors){
 }
 function priority(group){return Math.min(90,20+Math.min(30,group.frequency?group.frequency.projects+group.frequency.attempts+group.frequency.drafts:group.occurrences.length)+(['execution-unresolved','project-invalid'].includes(group.type)?20:0));}
 
+/** Superseded coordinates remain historical evidence, never current blockers. */
+export function currentAnalysisStages({config,backlog}){
+ const epoch=backlog.meta('queue-epoch');
+ return Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch&&s.base===config.skills.activeVersion&&s.groupId&&backlog.failureCount(s.groupId)===s.count).map(([id,stage])=>({id,...stage}));
+}
+
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
-export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,limit=8},dependencies={}){
- const ops=await operations(dependencies),clock=allocation(seconds,signal),entries=await guidanceEntries(config.root,config.skills.activeVersion);
- const dirty=backlog.failures({limit,occurrenceLimit:6}),page=learningPage(backlog,config),learningItems=page.items;
- const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(Boolean).map(g=>[g.id,g])).values()].slice(0,limit);
+export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2},dependencies={}){
+ const ops=await operations(dependencies),now=dependencies.now??(()=>performance.now()),clock=allocation(remainingSeconds,signal,now),entries=await guidanceEntries(config.root,config.skills.activeVersion);
+ const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
+ const persist=()=>{for(const [id,stage]of Object.entries(stages))Object.assign(stage,coordinates.get(id));backlog.meta('analysis-stages',stages);};
+ const eligible=g=>stages[identity(g)]?.status!=='blocked';
+ const dirty=[];
+ for(let offset=0;dirty.length<limit;offset+=200){const rows=backlog.failures({limit:200,offset,occurrenceLimit:6});dirty.push(...rows.filter(eligible).slice(0,limit-dirty.length));if(rows.length<200)break;}
+ const page=learningPage(backlog,config),learningItems=page.items;
+ const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(g=>g&&eligible(g)).map(g=>[g.id,g])).values()].slice(0,limit);
  if(!groups.length){page.finish();return {analyzed:0,items:[],remainingSeconds:clock.remaining()};}
  const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results])])),frozen=await freezeGroups(config.root,groups,batch);
- const classifications=await clock.call(ops.classify,{directory:join(batch,'classify'),config,groups:frozen,entries,bucketPolicy:true,
-  validate:value=>validateClassificationBatch(value,frozen,entries,{requireBucket:true})});
+ const classificationFile=join(batch,'classifications.json');let classifications=await load(classificationFile);
+ if(!classifications&&frozen.every(g=>stages[identity(g)]?.classification))classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};
+ const stageError=(error,spent,cap)=>spent>=cap-.05||['rejected-submissions','no-submit','interrupted-unknown-spend'].includes(error.reviewSession?.kind);
+ if(!classifications){
+  // A retry retains its original grant membership. Fresh groups receive their own
+  // page rather than inheriting an unrelated group's spent time or unknown owner.
+  const pending=frozen.filter(g=>!stages[identity(g)]?.classification),partitions=new Map();
+  for(const group of pending){const key=stages[identity(group)]?.spendFile??'fresh';partitions.set(key,[...(partitions.get(key)??[]),group]);}
+  for(const [retainedFile,members]of partitions){
+   const spendFile=retainedFile==='fresh'?join(batch,'classification',hash(members.map(g=>identity(g))),'classification-spend.json'):retainedFile,
+    prior=await load(spendFile),grantSeconds=prior?.allocatedSeconds??members.map(g=>stages[identity(g)]?.allocatedSeconds).find(Number.isFinite)??(prior?120:seconds),
+    spent=Math.max(prior?.elapsedSeconds??0,...members.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
+   try{
+    if(prior?.running)throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
+    for(const group of members)stages[identity(group)]={stage:'classification',status:'running',spendFile,allocatedSeconds:grantSeconds,elapsedSeconds:spent};persist();
+    finishClassification=await trackSpending(spendFile,spent,now,{allocatedSeconds:grantSeconds});
+    if(spent>=grantSeconds)throw Error('Classification elapsed allowance exhausted');
+    const accepted=validateClassificationBatch(await clock.call(ops.classify,{directory:join(resolve(spendFile,'..'),'classify'),config,groups:members,entries,bucketPolicy:true,
+     validate:value=>validateClassificationBatch(value,members,entries,{requireBucket:true})},grantSeconds-spent),members,entries,{requireBucket:true});
+    for(const group of members)stages[identity(group)]={stage:'proposal',status:'pending',classification:accepted.classifications.find(c=>c.groupId===group.id)};
+    persist();
+   }catch(error){for(const group of members)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,grantSeconds)?'blocked':'retry',spendFile,allocatedSeconds:grantSeconds,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
+   finally{await finishClassification?.();}
+  }
+  classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};await save(classificationFile,classifications);
+ }
+
  const valid=validateClassificationBatch(classifications,frozen,entries,{requireBucket:true}).classifications,byGroup=Object.fromEntries(valid.map(c=>[c.groupId,c])),created=[];
  for(const group of frozen){
   signal?.throwIfAborted();if(clock.remaining()<=0)break;
@@ -142,15 +187,19 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    priority:priority(group),reason:classification.reason,base},evidence={groups:[group]},classificationContext={classifications:{[group.id]:classification}};
   if(classification.intervention==='user-required'){
    created.push(backlog.upsert({...common,key:'harness:'+group.id,proposal:{action:'no-change',reason:classification.reason},evidence,preparation:classificationContext,status:'user-required'}));
-   consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});continue;
+   consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});stages[identity(group)]={stage:'complete',status:'complete',classification};persist();continue;
   }
   const learning=await freezeLearning(config,learned.flatMap(({results})=>results),join(batch,'learning'));
-  const proposalDirectory=join(batch,'proposals',group.id);await mkdir(proposalDirectory,{recursive:true});
-  const spendFile=join(proposalDirectory,'writing-spend.json'),priorSpent=(await load(spendFile))?.elapsedSeconds??0,begun=performance.now();
-  if(priorSpent>=1800){created.push(backlog.upsert({...common,key:'analysis:'+group.id,proposal:{action:'no-change',reason:'Proposal elapsed allowance exhausted'},evidence,preparation:{...classificationContext,proposalElapsedSeconds:priorSpent},status:'inconclusive'}));consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});continue;}
+  const proposalDirectory=join(directory,'proposals',hash([identity(group),learned.map(({item,results})=>[item.id,learningIdentity(results)])]));await mkdir(proposalDirectory,{recursive:true});
+  const spendFile=join(proposalDirectory,'writing-spend.json'),priorLedger=await load(spendFile),priorSpent=priorLedger?.elapsedSeconds??0,begun=now();
+  if(priorLedger?.running){stages[identity(group)]={stage:'proposal',status:'blocked',classification,elapsedSeconds:priorSpent,reason:'Interrupted writing elapsed custody is unknown; explicit review required'};persist();continue;}
+  if(priorSpent>=1800){created.push(backlog.upsert({...common,key:'analysis:'+group.id,proposal:{action:'no-change',reason:'Proposal elapsed allowance exhausted'},evidence,preparation:{...classificationContext,proposalElapsedSeconds:priorSpent},status:'inconclusive'}));stages[identity(group)]={stage:'proposal',status:'blocked',classification,elapsedSeconds:priorSpent,reason:'Proposal elapsed allowance exhausted'};persist();continue;}
+  stages[identity(group)]={stage:'proposal',status:'running',classification,elapsedSeconds:priorSpent};persist();
+  const finishWriting=await trackSpending(spendFile,priorSpent,now);
   let review;try{review=validateReviewProposal(await clock.call(ops.review,{directory:proposalDirectory,config,groups:[group],entries,classifications:[classification],learning,
    validate:value=>validateReviewProposal(value,[group],byGroup)},Math.max(.001,1800-priorSpent)),[group],byGroup);}
-  finally{await save(spendFile,{elapsedSeconds:priorSpent+(performance.now()-begun)/1000});}
+  catch(error){stages[identity(group)]={stage:'proposal',status:stageError(error,priorSpent+(now()-begun)/1000,1800)?'blocked':'retry',classification,reason:error.message,elapsedSeconds:priorSpent+(now()-begun)/1000};persist();throw error;}
+  finally{await finishWriting();}
   const records=await readFile(join(proposalDirectory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code==='ENOENT')return '';throw e;});
   const memoryEvidence=records.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);
   const actualRefs=new Set(memoryEvidence.map(e=>e.ref??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`));
@@ -178,6 +227,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    queueLearning(backlog,config,item,[question]);created.push(item);
   }
   consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});
+  stages[identity(group)]={stage:'complete',status:'complete',classification};persist();
  }
  page.finish();return {analyzed:frozen.filter(g=>!backlog.failure(g.id)?.dirty).length,items:created,elapsedSeconds:clock.elapsed(),remainingSeconds:clock.remaining()};
 }
