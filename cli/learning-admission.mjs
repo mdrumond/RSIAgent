@@ -9,7 +9,8 @@ export const deviceLearning=(config,request)=>request.learningTarget!=='cpu'&&co
  (request.learningTarget==='device'||request.workKind==='suite');
 export function refreshLearningRoute(child,config){
  const routing=['deviceAffinity','backgroundDevice'],without=options=>Object.fromEntries(Object.entries(options??{}).filter(([key])=>!routing.includes(key)));
- if(child.target!==config.target||child.environment.module!==config.environment.module||!isDeepStrictEqual(without(child.environment.options),without(config.environment.options)))return null;
+ const modulePath=owner=>owner.environment.module?resolve(owner.root??config.root??'.',owner.environment.module):null;
+ if(child.target!==config.target||modulePath(child)!==modulePath(config)||!isDeepStrictEqual(without(child.environment.options),without(config.environment.options)))return null;
  const options={...child.environment.options};for(const key of routing){delete options[key];if(Object.hasOwn(config.environment.options,key))options[key]=config.environment.options[key];}
  return {...child,environment:{...child.environment,options}};
 }

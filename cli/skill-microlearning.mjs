@@ -96,7 +96,7 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
    backlog.db.prepare("UPDATE skill_learning_requests SET status='inconclusive' WHERE id=?").run(work.id);return {status:'inconclusive',reason:'microlearning-elapsed'};
   }
   child??=microlearningConfig(config,{directory:work.directory,request:work.request,resource,seconds:Math.max(.001,left())});
-  if(work.infrastructureBlock&&deviceLearning(config,work.request)){
+  if((work.infrastructureBlock||work.admission?.admitted===false)&&deviceLearning(config,work.request)){
    const rebound=refreshLearningRoute(child,config);
    if(!rebound)return {status:'blocked',reason:'Prepared learning target binding changed; audited migration required',infrastructure:true};
    child=rebound;
