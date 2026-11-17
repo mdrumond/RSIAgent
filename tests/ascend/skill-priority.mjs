@@ -491,3 +491,9 @@ test('superseded occurrence and baseline stages cannot keep the scheduler blocke
  assert.equal((await prioritySkillStatus(f.config)).analysisProgress.blocked,0);
  assert.equal((await runPrioritySkills(f.config,f.values,f.ops)).status,'idle');
 });
+
+test('scheduler keeps classification grant separate from the campaign invocation clock',async t=>{
+ const f=await fixture(t);let observed;
+ await runPrioritySkills(f.config,{...f.values,remainingSeconds:60},{...f.ops,analyze:async input=>{observed=input;}});
+ assert.equal(observed.seconds,120);assert.ok(observed.remainingSeconds>0&&observed.remainingSeconds<=60);
+});

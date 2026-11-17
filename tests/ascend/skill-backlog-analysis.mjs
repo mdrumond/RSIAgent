@@ -372,3 +372,19 @@ test('new occurrence coordinates supersede a blocked historical stage after succ
  assert.equal(currentAnalysisStages(f).filter(s=>s.status==='blocked').length,0);
  f.config.skills.activeVersion='another-version';assert.equal(currentAnalysisStages(f).length,0);
 });
+
+test('classification retains its original grant when the remaining campaign clock shrinks',async t=>{
+ const f=await fixture(t);let milliseconds=0,directory;
+ await assert.rejects(analyzeBacklog({...f,seconds:120,remainingSeconds:300},{now:()=>milliseconds,classify:async input=>{directory=input.directory;milliseconds+=100000;throw Error('Disconnected');}}),/Disconnected/);
+ const ledger=JSON.parse(await readFile(join(directory,'..','classification-spend.json'),'utf8'));assert.equal(ledger.allocatedSeconds,120);
+ let allowed;const result=await analyzeBacklog({...f,seconds:60,remainingSeconds:60},{now:()=>milliseconds,classify:async input=>{allowed=input.seconds;return classify(input);},review:review()});
+ assert.equal(allowed,20);assert.equal(result.items.length,1);assert.equal(currentAnalysisStages(f).filter(s=>s.status==='blocked').length,0);
+});
+
+test('campaign-clipped classification expiry preserves its unspent original grant',async t=>{
+ const f=await fixture(t);let milliseconds=0;
+ await assert.rejects(analyzeBacklog({...f,seconds:120,remainingSeconds:300},{now:()=>milliseconds,classify:async()=>{milliseconds+=100000;throw Error('Disconnected');}}),/Disconnected/);
+ await assert.rejects(analyzeBacklog({...f,seconds:10,remainingSeconds:10},{now:()=>milliseconds,classify:async input=>{assert.equal(input.seconds,10);milliseconds+=10000;throw Object.assign(Error('Campaign elapsed'),{reviewSession:{kind:'elapsed'}});}}),/Campaign elapsed/);
+ const stage=currentAnalysisStages(f)[0];assert.equal(stage.status,'retry');assert.equal(stage.allocatedSeconds,120);assert.equal(stage.elapsedSeconds,110);
+ let allowed;await analyzeBacklog({...f,seconds:60,remainingSeconds:60},{now:()=>milliseconds,classify:async input=>{allowed=input.seconds;return classify(input);},review:review()});assert.equal(allowed,10);
+});

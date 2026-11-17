@@ -97,7 +97,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(backlog.meta('learning-seen')!==admittedLearning){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
    // Preserve that progress and existing priorities instead of starving evaluation.
-   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:cacheDirectory('analysis'),seconds:Math.min(120,remainingCampaign()),remainingSeconds:remainingCampaign(),limit:2}],
+   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:cacheDirectory('analysis'),seconds:120,remainingSeconds:remainingCampaign(),limit:2}],
     ['ranking',ops.prioritize,{directory:cacheDirectory('ranking'),seconds:Math.min(60,remainingCampaign())}]]){
     if((backlog.meta(name+'-after')??0)>Date.now())continue;
     try{await operation({config,backlog,signal:values.signal,...args});backlog.meta(name+'-error',null);}

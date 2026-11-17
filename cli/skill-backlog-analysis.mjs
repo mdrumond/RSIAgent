@@ -16,12 +16,12 @@ const save=async(path,value)=>{await mkdir(resolve(path,'..'),{recursive:true});
 const unwrap=result=>result?.value??result;
 // An unfinished marker means the owner died before closing its elapsed ledger.
 // Retain that uncertainty rather than renewing the unobserved portion of its grant.
-async function trackSpending(path,prior,now){
+async function trackSpending(path,prior,now,allocation={}){
  const begun=now();let writes=Promise.resolve(),failure;
- const snapshot=()=>({elapsedSeconds:prior+(now()-begun)/1000,running:true});
+ const snapshot=()=>({...allocation,elapsedSeconds:prior+(now()-begun)/1000,running:true});
  await save(path,snapshot());
  const timer=setInterval(()=>{const value=snapshot();writes=writes.then(()=>save(path,value)).catch(error=>{failure??=error;});},1000);
- return async()=>{clearInterval(timer);await writes;if(failure)throw failure;await save(path,{elapsedSeconds:prior+(now()-begun)/1000,running:false});};
+ return async()=>{clearInterval(timer);await writes;if(failure)throw failure;await save(path,{...allocation,elapsedSeconds:prior+(now()-begun)/1000,running:false});};
 }
 async function operations(dependencies){const native=await import('./skill-review-native.mjs');return {classify:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,session:native.reviewSession,...dependencies};}
 function allocation(seconds,signal,now=()=>performance.now()){
@@ -162,17 +162,18 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   for(const group of pending){const key=stages[identity(group)]?.spendFile??'fresh';partitions.set(key,[...(partitions.get(key)??[]),group]);}
   for(const [retainedFile,members]of partitions){
    const spendFile=retainedFile==='fresh'?join(batch,'classification',hash(members.map(g=>identity(g))),'classification-spend.json'):retainedFile,
-    prior=await load(spendFile),spent=Math.max(prior?.elapsedSeconds??0,...members.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
+    prior=await load(spendFile),grantSeconds=prior?.allocatedSeconds??members.map(g=>stages[identity(g)]?.allocatedSeconds).find(Number.isFinite)??(prior?120:seconds),
+    spent=Math.max(prior?.elapsedSeconds??0,...members.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
    try{
     if(prior?.running)throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
-    for(const group of members)stages[identity(group)]={stage:'classification',status:'running',spendFile,elapsedSeconds:spent};persist();
-    finishClassification=await trackSpending(spendFile,spent,now);
-    if(spent>=seconds)throw Error('Classification elapsed allowance exhausted');
+    for(const group of members)stages[identity(group)]={stage:'classification',status:'running',spendFile,allocatedSeconds:grantSeconds,elapsedSeconds:spent};persist();
+    finishClassification=await trackSpending(spendFile,spent,now,{allocatedSeconds:grantSeconds});
+    if(spent>=grantSeconds)throw Error('Classification elapsed allowance exhausted');
     const accepted=validateClassificationBatch(await clock.call(ops.classify,{directory:join(resolve(spendFile,'..'),'classify'),config,groups:members,entries,bucketPolicy:true,
-     validate:value=>validateClassificationBatch(value,members,entries,{requireBucket:true})},seconds-spent),members,entries,{requireBucket:true});
+     validate:value=>validateClassificationBatch(value,members,entries,{requireBucket:true})},grantSeconds-spent),members,entries,{requireBucket:true});
     for(const group of members)stages[identity(group)]={stage:'proposal',status:'pending',classification:accepted.classifications.find(c=>c.groupId===group.id)};
     persist();
-   }catch(error){for(const group of members)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,seconds)?'blocked':'retry',spendFile,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
+   }catch(error){for(const group of members)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,grantSeconds)?'blocked':'retry',spendFile,allocatedSeconds:grantSeconds,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
    finally{await finishClassification?.();}
   }
   classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};await save(classificationFile,classifications);
