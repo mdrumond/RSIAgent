@@ -10,7 +10,7 @@ import {once} from 'node:events';
 import {materializeProof} from '../../cli/project-summary.mjs';
 import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
 import {prepareQaSources,validateSummary,summaryItems,compactSummary} from '../../cli/skill-evidence-summary.mjs';
-import {nativeQaAnswer,nativeQaReview,nativeQaAuditSummary,nativeQaSummarize,reviewSession} from '../../cli/skill-review-native.mjs';
+import {nativeQaAnswer,nativeQaReview,nativeQaAuditSummary,nativeQaSummarize,reviewSession,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
 async function fixture(t){const directory=await mkdtemp(join(tmpdir(),'evidence-summary-'));t.after(()=>rm(directory,{recursive:true,force:true}));return {directory,proposal:{reason:'Observed failure',changes:[{text:'Check source',evidenceRefs:['raw']}],memoryRefs:[]},entries:[],objective:'correctness',target:'fixture',groups:[{id:'g',occurrences:[{reference:'raw',type:'tool-result',message:'PASS one case\nunknown target'}]}],memoryEvidence:[],projectSummaries:[{facts:[{reference:'count',factId:'count',value:1,text:'1'}],references:[]}],learningProofEvidence:[],validateProposal:x=>x};}
 const summary=text=>({items:[{text,kind:'observation'}],claims:[{path:'items.0.text',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]});
 const answers=()=>({answers:Object.fromEntries(qaTopics.map(k=>[k,{text:'Checked '+k,refs:['raw']}]))});
@@ -97,7 +97,7 @@ test('discovery paging preserves middle primary evidence, scoped access and stal
 
 test('native compact summary accepts selector paths and restores normalized cached results',async t=>{
  const f=await fixture(t),c=await prepareQaSources(f),value=summary('One passing case is recorded');await writeFile(join(f.directory,'submission.json'),JSON.stringify(value));
- const input={...f,config:{},sourceCatalogue:c,page:c.pages[0],seconds:5,validate:x=>validateSummary(x,c)},first=await nativeQaSummarize(input);assert.equal(first.recovered,true);assert.equal(first.value.claims[0].text,value.items[0].text);assert.equal(first.value.claims[0].proofs[0].quote,'PASS one case');
+ const input={...f,config:{},sourceCatalogue:c,page:c.pages[0],seconds:5,validate:x=>validateSummary(x,c)},first=await nativeQaSummarize(input,{session:async options=>{await writeFile(join(f.directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:options.resultSchema}));return reviewSession(options);}});assert.equal(first.recovered,true);assert.equal(first.value.claims[0].text,value.items[0].text);assert.equal(first.value.claims[0].proofs[0].quote,'PASS one case');
  const second=await nativeQaSummarize(input);assert.equal(second.recovered,true);assert.deepEqual(second.value,first.value);
 });
 test('selector-schema migration archives old semantic work and retains in-flight elapsed reservation',async t=>{
