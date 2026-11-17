@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile,rm,access} from 'node:fs/promises';
+import {readFile,writeFile,rm,access} from 'node:fs/promises';
 import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {setup,rows} from './driver_setup.mjs';
 import {State} from '../../controller/state.mjs';
-import {readAttemptJob} from '../../cli/attempt-job.mjs';
+import {readAttemptJob,writeAttemptJob} from '../../cli/attempt-job.mjs';
+import {RecoveryQueue} from '../../controller/recovery.mjs';
 
 test('public CLI completes unrelated native work with a missing legacy finalizer and recovers its own published job',{timeout:90000},async t=>{
   const f=await setup(t,'phase2',['unrelated']);
@@ -34,5 +36,38 @@ test('public CLI completes unrelated native work with a missing legacy finalizer
   }finally{restored.close();}
   assert.equal(await readFile(file,'utf8'),original);
   await assert.rejects(access(join(f.root,'attempts',legacy.id,'job.json')));
+  f.pass();
+});
+
+test('a pinned retry resumes and verifies without requiring its missing legacy parent manifest',{timeout:90000},async t=>{
+  const f=await setup(t,'phase2',['unrelated']),state=new State(join(f.root,'state.sqlite'));
+  let original,retry,before;
+  try{
+    const queue=new RecoveryQueue(state),owner={pid:2147483647,start:'old',boot:'source'};
+    original=queue.claim('unrelated',0,owner).attempt;
+    state.checkpoint(original.id,12.75,null);state.finish(original.id,'failed');
+    state.event(original.id,'failure-settlement',{closed:true});
+    const evidence=join(f.root,'retained-original.log'),text='Retained original failure before retry admission.\n';
+    await writeFile(evidence,text);
+    queue.recordOriginal(original.id,{passed:false,findings:'Retained failed original',
+      evidence:[{path:evidence,sha256:createHash('sha256').update(text).digest('hex')}]},0);
+    for(const lesson of queue.lessons())queue.acknowledgeLesson(lesson.id);
+    state.event(original.id,'postprocess-completed',{});
+    // Seed the already-qualified retry queue; the test exercises its retained
+    // admission and native resume, not historical investigation construction.
+    state.db.prepare("UPDATE recovery_queue SET kind='retry' WHERE project='unrelated'").run();
+    retry=queue.claim('unrelated',1,owner,'local');
+    const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
+    await writeAttemptJob(state,f.root,retry.attempt.id,{...retry,wave:1,mode:'phase1',options:{},
+      skillVersion:config.skills.activeVersion,resource:{id:'local'}});
+    before=state.attempt(original.id);
+  }finally{state.close();}
+  await f.run('resume');
+  assert.equal(rows(f.root,`SELECT outcome FROM attempts WHERE id='${retry.attempt.id}'`)[0].outcome,'passed');
+  assert.ok(rows(f.root,`SELECT 1 FROM events WHERE attempt='${retry.attempt.id}' AND type='verification' AND json_extract(data,'$.passed')=1`).length);
+  assert.ok(rows(f.root,`SELECT 1 FROM events WHERE attempt='${retry.attempt.id}' AND type='postprocess-completed'`).length);
+  assert.deepEqual(rows(f.root,`SELECT * FROM attempts WHERE id='${original.id}'`)[0],before);
+  assert.equal(rows(f.root,`SELECT count(*) n FROM events WHERE attempt='${original.id}' AND type='attempt-metadata-unavailable'`)[0].n,0);
+  await assert.rejects(access(join(f.root,'attempts',original.id,'job.json')));
   f.pass();
 });
