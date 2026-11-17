@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 /** Isolated, resumable failure -> memory -> guidance/learning -> A/B review. */
 import {mkdir,readFile,writeFile,rename,cp,realpath,access,rm,stat,readdir} from 'node:fs/promises';
 import {join,resolve,relative,sep} from 'node:path';
@@ -41,7 +42,7 @@ async function dependentInputs(root){
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const stages=['inventory','classify','propose','qa','learn','evaluate','report','enqueue'];
 async function forkCampaign(source,directory,options){
- let config=await optional(join(directory,'instance.json'));if(config)return {...config,root:directory,project_evidence_root:source.root,...(options.evaluations?{skill_review_evaluations:options.evaluations}:{})};
+ let config=await optional(join(directory,'instance.json'));if(config)return skillConfig({...config,root:directory,project_evidence_root:source.root,...(options.evaluations?{skill_review_evaluations:options.evaluations}:{})});
  const original=await load(join(source.root,'instance.json'));await mkdir(directory,{recursive:true});
  await cp(join(source.root,'skills','versions',source.activeVersion),join(directory,'skills','versions',source.activeVersion),{recursive:true});
  const knowledge=join(directory,'knowledge.sqlite');
@@ -54,6 +55,7 @@ async function forkCampaign(source,directory,options){
   actor:options.profile??original.skill_writer_actor??original.actor,skill_writer_actor:options.profile??original.skill_writer_actor??original.actor,
   python:options.python??original.python,embeddings:options.embeddings??original.embeddings,embedding_factory:options.embedding_factory??original.embedding_factory,
   ...(options.evaluations?{skill_review_evaluations:options.evaluations}:{}),skills:{activeVersion:source.activeVersion,tuningDisabled:true},environment:{mode:'local'},projects:[],recovery:false,concurrency:1};
+ config=skillConfig(config);
  new State(join(directory,'state.sqlite')).close();await save(join(directory,'instance.json'),config);return config;
 }
 export function validateReviewProposal(result,groups,classifications){

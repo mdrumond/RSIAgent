@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import {attentionRevision} from '../controller/failure-attention.mjs';
 /** Campaign-local failure backlog; one retained hypothesis owns the background slot. */
 import {createHash} from 'node:crypto';
@@ -78,7 +79,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
  const campaignEnd=ops.now()+values.remainingSeconds*1000,remainingCampaign=()=>Math.max(0,(campaignEnd-ops.now())/1000);
  let selected,checkpoint,timer,started,prior;
  try{
-  config=await readConfig(config.root);
+  config=skillConfig(await readConfig(config.root));
   const ingestionEnd=ops.now()+Math.min(1000,remainingCampaign()*1000);let ingestion;
   do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&ops.now()<ingestionEnd);
   // Classification is shared work. Proposal writing is subsequently charged to its hypothesis.

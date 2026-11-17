@@ -68,10 +68,11 @@ test('native Pi tools edit files, retain sessions and record provider usage', {t
   frame({id:'microeval-fixture',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:used?'stop':'tool_calls'}],usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}});res.end('data: [DONE]\n\n');
  });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
  const credentials_file=join(f.root,'fixture.env');await writeFile(credentials_file,'MICROEVAL_FIXTURE=fixture\n');
- const profile={provider:'microeval-fixture',model:'scripted',credential_env:'MICROEVAL_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
+ const profile={provider:'microeval-fixture',model:'scripted',credential_env:'MICROEVAL_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:1000000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
  const report=await runMicroeval({...f,profile,runs:1});assert.equal(requests.length,4);
  assert.ok(report.results.every(x=>x.correct&&x.toolCalls===1&&x.tokens===36));
- for(const result of report.results){assert.ok((await readFile(result.session,'utf8')).length>0);}
+ assert.equal(report.model.effectiveContextTokens,200000);
+ for(const result of report.results){assert.ok((await readFile(result.session,'utf8')).length>0);const startup=JSON.parse(await readFile(join(f.directory,result.taskId,`${result.run}-${result.arm}`,'model-limits.json'),'utf8'));assert.equal(startup.contextWindow,200000);assert.equal(startup.maxTokens,4096);}
 });
 test('default scopes require matching guidance in both arms before dispatch',async t=>{
  const f=await fixture(t);await writeFile(join(f.skills.candidate,'skill-map.json'),JSON.stringify({debug:'mapped.md'}));
@@ -430,4 +431,14 @@ test('resuming a microevaluation rejects a different frozen model context allowa
  await assert.rejects(runMicroeval({...f,profile:{...profile,max_context_tokens:100000},resume:true},{sample:()=>{calls++;throw Error('must not dispatch');}}),/Frozen micro/);
  assert.equal(calls,before);
  const resumed=await runMicroeval({...f,profile,resume:true},{sample:()=>{throw Error('must not replay');}});assert.equal(resumed.status,'complete');
+});
+
+
+test('direct comparisons freeze omitted context caps and pass the same bounded profile to both arms',async t=>{
+ const f=await fixture(t),caps=[];
+ await runMicroeval(f,{sample:async({profile})=>{caps.push(profile.max_context_tokens);return {};}});
+ assert.deepEqual(caps,[200000,200000,200000,200000]);assert.equal(f.profile.max_context_tokens,undefined);
+ const manifest=JSON.parse(await readFile(join(f.directory,'manifest.json'),'utf8'));assert.equal(manifest.model.maxContextTokens,200000);
+ const resumed=await runMicroeval({...f,resume:true},{sample:()=>{throw Error('must not replay');}});assert.equal(resumed.status,'complete');
+ await assert.rejects(runMicroeval({...f,profile:{...f.profile,max_context_tokens:64000},resume:true},{sample:()=>{throw Error('must not dispatch');}}),/Frozen micro/);
 });

@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { managedBootstrap, bootstrapSettled } from './evaluation-bootstrap.mjs';
 import { fingerprint } from '../controller/evidence.mjs';
 import { join, resolve, dirname } from 'node:path';
@@ -11,6 +12,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 // Every A/B sample gets its own state, source, verifier, memory and native evidence.
 export async function bootstrap(request) {
+  request={...request,config:skillConfig(request.config)};
   request.signal?.throwIfAborted();
   const original=await readConfig(request.sourceInstanceRoot);
   const inputs=join(dirname(request.instanceRoot),'inputs');
@@ -80,6 +82,9 @@ export async function bootstrap(request) {
   });
 }
 export async function wave({instanceRoot,config,signal,resuming=false,remainingSeconds}) {
+  const retained=await readConfig(instanceRoot),bounded=skillConfig(retained);
+  if(['actor','curriculum_actor','skill_writer_actor'].some(key=>JSON.stringify(retained[key])!==JSON.stringify(bounded[key])))
+    throw Error('Frozen evaluation context policy differs; start a fresh comparison without reusing old arms');
   const log=await open(join(instanceRoot,'evaluation-wave.log'),'a',0o600);
   try {
     await new Promise((ok,no)=>{

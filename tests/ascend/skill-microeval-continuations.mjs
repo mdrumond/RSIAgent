@@ -184,5 +184,5 @@ test('continuation work expiry retains cleanup custody without accepting late ve
 });
 
 test('a continuation cannot introduce a different context allowance into an existing experiment',async t=>{
- const f=await fixture(t);await assert.rejects(continueMicroevalSamples({...f,profile:{...f.profile,max_context_tokens:200000}}),/model differs/);await unchanged(f);
+ const f=await fixture(t);await assert.rejects(continueMicroevalSamples({...f,profile:{...f.profile,max_context_tokens:100000}}),/model differs/);await unchanged(f);
 });
