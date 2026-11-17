@@ -6,12 +6,13 @@ import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {enqueueLearningRequest,claimLearningRequest} from '../../controller/skill-review.mjs';
-import {microlearningConfig,runMicrolearning,pendingMicrolearning,validateArchivalInspection} from '../../cli/skill-microlearning.mjs';
+import {microlearningConfig,runMicrolearning,pendingMicrolearning,validateArchivalInspection,microlearningSettled} from '../../cli/skill-microlearning.mjs';
 import {prioritySkillStatus} from '../../cli/skill-priority.mjs';
 import {qualifiedSuites} from '../../cli/skill-priority-cases.mjs';
 import {releaseKnowledgeService} from '../../cli/campaign-memory.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 import {SkillEvaluationContractError} from '../../cli/skill-evaluation-contract.mjs';
+import {RecoveryQueue} from '../../controller/recovery.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'microlearning-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());const backlog=new SkillBacklog(state,{target:'a3'});
@@ -19,12 +20,12 @@ async function fixture(t){
   environment:{module:'/existing/environment.mjs',options:{runtime:'pinned-runtime'}},skills:{activeVersion:'baseline',background:true,priority:{enabled:true}}};
  await mkdir(join(root,'skills','versions','baseline'),{recursive:true});await writeFile(join(root,'skills','versions','baseline','rules.md'),'pinned');
  await writeFile(join(root,'knowledge-service.json'),JSON.stringify({url:'http://borrowed',owner:await processIdentity()}));
- const request={target:'a3',question:'Construct a small controlled tail experiment',requiredEvidence:'Independent reference and negatives',workKind:'suite'};
+ const request={target:'a3',learningTarget:'cpu',question:'Construct a small controlled tail experiment',requiredEvidence:'Independent reference and negatives',workKind:'suite'};
  const id=enqueueLearningRequest(state,request),resource={id:'existing-background'};
  return {root,state,backlog,config,request,id,resource};
 }
 test('minimal child uses exactly the admitted resource and cannot recursively tune',async t=>{
- const f=await fixture(t),child=microlearningConfig(f.config,{directory:join(f.root,'child'),request:f.request,resource:f.resource,seconds:900});
+ const f=await fixture(t),child=microlearningConfig(f.config,{directory:join(f.root,'child'),request:{...f.request,learningTarget:'device'},resource:f.resource,seconds:900});
  assert.deepEqual(child.resource_ids,[f.resource.id]);assert.equal(child.concurrency,1);assert.equal(child.skills.background,false);assert.equal(child.skills.priority.enabled,false);
  assert.equal(child.phase_targets.phase1,1);assert.equal(child.actor_seconds_by_phase,undefined);assert.equal(child.campaign_seconds,900);assert.equal(child.environment.options.runtime,'pinned-runtime');
  assert.equal(claimLearningRequest(f.state,f.config,{draft:'foreground',target:'a3'}),null);assert.equal(pendingMicrolearning(f.backlog)[0].id,f.id);
@@ -150,4 +151,56 @@ test('a deterministic contract failure defers invalidation until positive closur
  const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
  assert.equal(result.status,'inconclusive');assert.equal(constructed,1);assert.equal(f.backlog.meta('microlearning-active'),null);
  assert.ok(f.backlog.meta('microlearning-last').elapsed>=12);
+});
+
+test('device admission blocks before knowledge/model work and keeps unresolved probe custody',async t=>{
+ const f=await fixture(t);f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify({...f.request,learningTarget:'device'}),f.id);
+ let probes=0,closed=false;
+ const ops={admit:async()=>{probes++;return {admitted:false,closed:false,reason:'probe-unresolved'};},admissionSettled:async()=>closed,
+  ensureKnowledgeService:async()=>{throw Error('Knowledge startup must not occur before device admission');},stopped:async()=>true};
+ const first=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
+ assert.equal(first.reason,'probe-unresolved');assert.equal(probes,1);
+ const retained=f.backlog.meta('microlearning-active');assert.ok(retained.runningAt);assert.equal(retained.stage,'admission');
+ const childPath=join(retained.directory,'instance.json'),bytes=await readFile(childPath);await rm(childPath);
+ assert.equal(await microlearningSettled(f.config,retained,{admissionSettled:async()=>false,stopped:async()=>true}),false);await writeFile(childPath,bytes);
+ assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(f.id).status,'background');
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).status,'blocked');assert.equal(probes,1);
+ closed=true;
+ await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{...ops,admit:async()=>{probes++;return {admitted:false,closed:true,reason:'no-healthy-idle-device'};}});
+ assert.equal(probes,2);assert.equal(f.backlog.meta('microlearning-active').runningAt,undefined);
+ await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);assert.equal(probes,2,'Known blocked admission must not poll the target every scheduler tick');
+});
+
+test('preactor infrastructure retry reuses prepared project, original clock and safe physical routing',async t=>{
+ const f=await fixture(t);let clock=0,constructed=0,imported=0,operated=0,firstAttempt;
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ f.config.environment.options={target:'registered',runtime:'pinned-runtime',deviceAffinity:[4,5],backgroundDevice:4};
+ f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify({...f.request,workKind:'microlearning',learningTarget:'device'}),f.id);
+ const ops={now:()=>clock,admit:async()=>({admitted:true,closed:true}),ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need target dtype control',refs:[]}),stopped:async()=>true,
+  construct:async()=>{constructed++;clock+=200000;return [{id:'question',goal:'Dtype experiment',actor_seconds:700}];},importProject:async(_root,spec)=>{imported++;return spec;},
+  operate:async(command,config)=>{
+   operated++;const s=new State(join(config.root,'state.sqlite')),q=new RecoveryQueue(s);
+   s.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+   if(operated===1){
+    firstAttempt=s.admit('question',await processIdentity()).id;s.finish(firstAttempt,'failed');s.event(firstAttempt,'preactor-infrastructure',{reason:'DEVICE_LEASE_BLOCKED'});s.event(firstAttempt,'failure-settlement',{closed:true});
+    q.recordOriginal(firstAttempt,{passed:false,findings:'Device reservation unavailable',evidence:[{collection:'fixture',entry_id:'refusal'}]},1);s.db.prepare('INSERT OR REPLACE INTO control VALUES (?,?)').run('wave','1');
+    clock+=1000;s.event(firstAttempt,'postprocess-completed',{});
+   }else{
+    assert.equal(command,'wave');assert.equal(config.environment.options.backgroundDevice,5);assert(config.actor_seconds<700);
+    const job=q.claim('question',2,await processIdentity());q.complete(job.attempt.id,{passed:true,findings:'Independent target control passed',evidence:[{collection:'fixture',entry_id:'control'}]},2);s.event(job.attempt.id,'postprocess-completed',{});clock+=1000;
+   }
+   for(const lesson of q.lessons())q.acknowledgeLesson(lesson.id);s.close();
+  }};
+ const first=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
+ assert.equal(first.reason,'preactor-infrastructure');assert.equal(f.backlog.meta('microlearning-active').elapsed,201);assert.equal(f.backlog.meta('microlearning-active').seconds,900);
+ const saved=JSON.parse(f.state.db.prepare('SELECT data FROM skill_learning_requests WHERE id=?').get(f.id).data);assert.equal(saved.infrastructureBlock.elapsed,201);
+ const child=new State(join(f.backlog.meta('microlearning-active').directory,'state.sqlite'));t.after(()=>child.close());
+ child.event(firstAttempt,'failure-settlement',{closed:false});
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).status,'blocked');assert.equal(operated,1);
+ child.event(firstAttempt,'failure-settlement',{closed:true});t.mock.timers.tick(31000);
+ f.config.environment.options.backgroundDevice=5;
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
+ assert.equal(result.status,'verified');assert.equal(constructed,1);assert.equal(imported,1);assert.equal(operated,2);
+ assert.equal(child.attempt(firstAttempt).outcome,'failed');assert.equal(child.db.prepare("SELECT count(*) n FROM attempts WHERE outcome='passed'").get().n,1);
+ assert.equal(f.backlog.meta('microlearning-last').elapsed,202);assert.equal(f.backlog.meta('microlearning-last').seconds,900);
 });
