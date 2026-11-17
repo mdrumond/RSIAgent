@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 /** One bounded child on the campaign's already reserved background resource. */
 import {mkdir,readFile,writeFile,cp,symlink} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
@@ -37,6 +38,7 @@ export function validateArchivalInspection(value,{refs,request,retrievals=[]}){
  return value;
 }
 export function microlearningConfig(config,{directory,request,resource,seconds}){
+ config=skillConfig(config);
  if(!resource?.id)throw Error('Microlearning requires the admitted background resource');
  const picked=Object.fromEntries(['actor','curriculum_actor','python','kernel_language','environment','local_execution','delivery','postprocessing','knowledge','pause_grace_seconds'].filter(k=>config[k]!==undefined).map(k=>[k,config[k]]));
  const cpu=request.learningTarget==='cpu';
@@ -95,7 +97,7 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
    work.elapsed=spent();delete work.runningAt;delete work.owner;backlog.meta('microlearning-last',{...work,status:'inconclusive',reason:'microlearning-elapsed'});backlog.meta('microlearning-active',null);
    backlog.db.prepare("UPDATE skill_learning_requests SET status='inconclusive' WHERE id=?").run(work.id);return {status:'inconclusive',reason:'microlearning-elapsed'};
   }
-  child??=microlearningConfig(config,{directory:work.directory,request:work.request,resource,seconds:Math.max(.001,left())});
+  child=skillConfig(child??microlearningConfig(config,{directory:work.directory,request:work.request,resource,seconds:Math.max(.001,left())}));
   if((work.infrastructureBlock||work.admission?.admitted===false)&&deviceLearning(config,work.request)){
    const rebound=refreshLearningRoute(child,config);
    if(!rebound)return {status:'blocked',reason:'Prepared learning target binding changed; audited migration required',infrastructure:true};

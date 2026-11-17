@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import {skillConfig,skillModelIdentity} from './skill-context.mjs';
 
 export const positiveSeconds = value => {
   if (!Number.isFinite(value) || value <= 0) throw new Error('Evaluation elapsed allocation must be positive seconds');
@@ -18,15 +19,24 @@ const save = async (path, value) => {
 // after a crash, conservatively charge until the next observer instead of refunding work.
 export async function evaluateRound({ pending, config, evaluate, signal,
   now = () => performance.now(), wallNow = Date.now }) {
+  const roles=['actor','curriculum_actor','skill_writer_actor'].filter(key=>config[key]);
+  const bounded=skillConfig(config);
+  if(roles.some(key=>JSON.stringify(config[key])!==JSON.stringify(bounded[key])))
+    throw Error('Frozen evaluation context policy differs; start a fresh comparison without reusing old arms');
+  const contextPolicy=Object.fromEntries(await Promise.all(roles.map(async key=>[key,await skillModelIdentity(config[key])])));
   const root = pending.evaluationRoot, file = join(root, 'round.json');
   await mkdir(root, { recursive: true });
   let round;
   try { round = await read(file); } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    round = { elapsedSeconds: 0, status: 'deferred', samples: pending.projectIds.flatMap(projectId =>
+    round = { contextPolicy, elapsedSeconds: 0, status: 'deferred', samples: pending.projectIds.flatMap(projectId =>
       Array.from({ length: pending.runs }, (_, run) => (run % 2 ? ['candidate', 'active'] : ['active', 'candidate'])
         .map(arm => ({ projectId, run, arm, instanceRoot: join(root, randomUUID()) }))).flat()) };
   }
+  // Do not bless cached results or unfinished arms from an unbound legacy round.
+  // A caller updating only pending.config cannot establish the completed arm's policy.
+  if(round.contextPolicy===undefined ? roles.length>0 : JSON.stringify(round.contextPolicy)!==JSON.stringify(contextPolicy))
+    throw Error('Frozen evaluation round context policy differs; start a fresh comparison without reusing old arms');
   if (round.runningAt !== undefined) {
     round.elapsedSeconds += Math.max(0, wallNow() - round.runningAt) / 1000;
     round.runningAt = wallNow(); // Work may still be live until settlement is proved.

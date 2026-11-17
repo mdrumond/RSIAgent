@@ -10,7 +10,7 @@ import {createEnvironmentTools} from '../integrations/environments/index.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
 import {evaluateSkillObjective,retrievalIdentity} from '../controller/skill-objectives.mjs';
-import {modelFromProfile} from '../controller/model.mjs';
+import {skillProfile,skillModelFromProfile,skillModelIdentity} from '../controller/skill-context.mjs';
 
 export const isKernelTask=kind=>['a3-kernel','target-kernel'].includes(kind);
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -106,7 +106,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  };
  const loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
- const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await modelFromProfile(profile),thinkingLevel:'off',
+ const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await skillModelFromProfile(profile,{directory:sessionDirectory??cwd}),thinkingLevel:'off',
   tools:['read','write','edit','grep','find','ls','bash',...(targetEnvironment?['rsi_target']:[]),...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
  const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
@@ -133,6 +133,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
 }
 
 export async function runMicroeval({directory,skills,tasks,profile,python='python3',runs=2,seconds=120,verificationSeconds=0,sampleProtocol,totalSeconds,signal,resume=false,shadow=true,objective,knowledge,binding,requireDevice=false},dependencies={}){
+ profile=skillProfile(profile);
  const begun=performance.now();signal?.throwIfAborted();
  if(totalSeconds!==undefined&&(!Number.isFinite(totalSeconds)||totalSeconds<=0))throw Error('Positive total elapsed allocation required');
  if(!Number.isSafeInteger(runs)||runs<1||!Number.isFinite(seconds)||seconds<=0||!Array.isArray(tasks)||!tasks.length)throw Error('Positive elapsed allocation, repetitions and tasks required');
@@ -161,7 +162,7 @@ export async function runMicroeval({directory,skills,tasks,profile,python='pytho
  if(!retained)await mkdir(directory);
  const manifest={format:1,shadow,...(sampleProtocol?{sampleProtocol}:{}),...(requireDevice?{requireDevice:true}:{}),...(verificationSeconds?{verificationSeconds}:{}),...(objective?{objective}:{}),...(binding?{binding}:{}),...(knowledge?{knowledge:retrievalIdentity(knowledge)}:{}),claim:frozen.some(t=>t.kind==='target-kernel')?'isolated-target-kernel-evaluation; trusted verification and paired timing':frozen.some(t=>t.kind==='a3-kernel')?'isolated-a3-kernel-evaluation; trusted verification and paired timing':'host-contract-microtasks; not device performance',runs,seconds,totalSeconds:totalSeconds??null,createdAt:new Date().toISOString(),
   skills:Object.fromEntries(Object.entries(inputs).map(([arm,x])=>[arm,{sha256:x.sha256}])),
-  model:{provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null,...(profile.max_context_tokens===undefined?{}:{maxContextTokens:profile.max_context_tokens})},
+  model:await skillModelIdentity(profile),
   tasks:frozen.map(t=>({id:t.id,kind:t.kind,scopes:t.scopes,sha256:hash(JSON.stringify(t))}))};
  if(retained){const {createdAt:_old,...old}=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));const {createdAt:_new,...next}=manifest;if(JSON.stringify(old)!==JSON.stringify(next))throw Error('Frozen micro evaluation changed');}
  else{await save(join(directory,'manifest.json'),manifest);await mkdir(join(directory,'frozen'));await save(join(directory,'frozen','tasks.json'),frozen);}

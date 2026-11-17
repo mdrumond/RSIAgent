@@ -8,7 +8,7 @@ import {Check,Errors} from 'typebox/value';
 import {discoveryProofSources} from './skill-discovery-proofs.mjs';
 import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence,claimEvidence,validateClaimedResult,proofInstructions} from './project-summary.mjs';
-import {modelFromProfile} from '../controller/model.mjs';
+import {skillConfig,skillModelFromProfile} from '../controller/skill-context.mjs';
 import {ensureKnowledgeService} from './knowledge.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
 import {State} from '../controller/state.mjs';
@@ -145,7 +145,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
  const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
- const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await modelFromProfile(config.skill_writer_actor??config.actor),thinkingLevel:'off',
+ const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls','submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  const unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
   const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
@@ -242,6 +242,7 @@ export async function nativeLearn({directory,config,request,signal,seconds},depe
   let cfg;try{cfg=JSON.parse(await readFile(join(directory,'instance.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
   cfg??={...config,root:directory,target:'cpu',mode:'phase1',actor_seconds:Math.min(300,seconds),curriculum_seconds:Math.min(600,seconds),
    environment:{module:fileURLToPath(new URL('../integrations/environments/index.mjs',import.meta.url)),options:{mode:'local'}},campaign_plan:[{id:'learning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},curriculum:{generation:{enabled:true,topics:[request.question],preprompt:'Investigate only this CPU-answerable learning question: '+JSON.stringify(request)+'. Keep fixtures tiny, deterministic and independently checked. Record actual observations, not hypothetical device behavior.'}},skills:{...config.skills,review:{enabled:false}}};
+  cfg=skillConfig(cfg);
   let spec=existing.length?state.project(existing[0].id).spec:null;
   if(!spec){
    await cp(join(config.root,'skills'),join(directory,'skills'),{recursive:true});
@@ -267,6 +268,7 @@ export async function nativeLearn({directory,config,request,signal,seconds},depe
  }finally{state.close();}
 }
 export async function nativeEvaluate({directory,active,candidate,config,signal,seconds,objective},dependencies={}){
+ config=skillConfig(config);
  const ops={runMicroeval,finalizeKernelPairs,...dependencies},settings=objective&&objective!=='legacy'?evaluationSettings(config.skill_review_evaluations,objective):null;
  const selected=settings?.tasks??config.skill_review_tasks??tasks;
  let frozen;try{frozen=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}

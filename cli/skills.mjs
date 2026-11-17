@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { readFile, access, appendFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -24,7 +25,7 @@ export async function run(config, values = {}) {
   return await lock(config, async () => {
     values.signal?.throwIfAborted();
     const readConfig = values.readConfig ?? (await import('./instance.mjs')).readConfig;
-    config = { ...await readConfig(instanceRoot), root: instanceRoot };
+    config = skillConfig({ ...await readConfig(instanceRoot), root: instanceRoot });
     if (values.task || values.background) config.mode = executedMode;
     const action = values.config ? JSON.parse(await readFile(resolve(values.config), 'utf8')) : {};
     const task = values.task ?? action.task;
