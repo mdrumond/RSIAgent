@@ -47,6 +47,50 @@ test('a promotion gate starts background evaluation even before the first ordina
   assert.equal(called,1);assert.equal(worker.reserved,true);await worker.stop();
 });
 
+test('early gate release returns the settled background claim but retains running or unresolved work',async()=>{
+  for(const unresolved of [false,true]) {
+    const ledger=new Map([['campaign-plan',{index:0}]]);let release,closed=false;
+    const config={campaign_plan:[{}],skills:{background:true,promotionGate:{baseVersion:'baseline',status:'waiting'}}};
+    const worker=skillWorker({control:{get:k=>ledger.get(k),set:(k,v)=>ledger.set(k,v),leased:()=>false},
+      config:()=>config,remaining:()=>20,event:()=>{},operations:{backgroundSkillStatus:async()=>({hasWork:true}),
+        backgroundSkillsSettled:async()=>closed,runBackgroundSkills:async()=>new Promise(r=>{release=r;})}});
+    // Qualification proves prior work closed; the next comparison remains in flight.
+    closed=true;const resources=[{id:'only',available:true}];await worker.poll(resources,0,1);
+    closed=false;config.skills.promotionGate.status='released';config.skills.promotionGate.acceptedVersion='candidate';
+    await worker.poll(resources,0,1);assert.equal(worker.resource.id,'only');assert.equal(worker.reserved,true);
+    release();await worker.running;closed=!unresolved;
+    await worker.poll(resources,0,1);
+    if(unresolved) {
+      assert.equal(worker.resource.id,'only');assert.equal(ledger.get('skill-background-resource').id,'only');
+      assert.equal(worker.reserved,true);closed=true;await worker.poll(resources,0,1);
+    }
+    assert.equal(worker.resource,null);assert.equal(ledger.get('skill-background-resource'),null);assert.equal(worker.reserved,false);
+    assert.equal(worker.capacity,1);await worker.stop();
+  }
+});
+
+test('first campaign entry admits its actor on the only resource after gate publication',{timeout:120000},async t=>{
+  const f=await setup(t,'phase2',['queued']),initial=await load(join(f.root,'instance.json'));
+  const environment=join(f.root,'one-slot.mjs'),settings=join(f.root,'gate-settings.json');
+  await writeFile(environment,`import {createEnvironment as local} from './machinery/integrations/environments/index.mjs';
+export const createEnvironment=(options,context)=>local(options,{...context,resources:async()=>[{id:'only',available:true,metadata:{}}]});\n`);
+  await save(settings,{mode:'phase1',recovery:false,concurrency:1,campaign_seconds:120,pause_grace_seconds:0,
+    environment:{module:environment,options:{mode:'local'}},campaign_plan:[{id:'first',phase:'phase1',new_projects:1}],
+    projects:initial.projects.map(p=>({...p,phase:'phase1',campaign_entry:'first'})),
+    skills:{...initial.skills,background:true,promotionGate:{baseVersion:'baseline',status:'waiting'}}});
+  await f.run('config','--config',settings);const running=f.start('campaign');
+  await until(()=>rows(f.root,"SELECT 1 FROM sqlite_master WHERE name='control'").length&&
+    rows(f.root,"SELECT value FROM control WHERE key='skill-background-resource'").some(r=>JSON.parse(r.value)?.id==='only'));
+  assert.equal(rows(f.root,'SELECT COUNT(*) n FROM attempts')[0].n,0);
+  assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='campaign-plan'")[0].value).index,0);
+  const candidate='approved-candidate';await cp(join(f.root,'skills/versions/baseline'),join(f.root,'skills/versions',candidate),{recursive:true});
+  await publishSkillVersion(f.root,{active:'baseline',candidate});await running.output;
+  assert.equal(rows(f.root,"SELECT status FROM projects WHERE id='queued'")[0].status,'passed');
+  const [attempt]=rows(f.root,"SELECT id FROM attempts WHERE project='queued'");
+  const job=await load(join(f.root,'attempts',attempt.id,'job.json'));assert.equal(job.resource.id,'only');assert.equal(job.skillVersion,candidate);
+  assert.equal(JSON.parse(rows(f.root,"SELECT value FROM control WHERE key='skill-background-resource'")[0].value),null);f.pass();
+});
+
 test('native campaign holds actors and curriculum across pause/resume until skill publication',{timeout:120000},async t=>{
   const f=await setup(t,'phase2',['held','queued']);
   const initial=await load(join(f.root,'instance.json')),settings=join(f.root,'gate-settings.json');
