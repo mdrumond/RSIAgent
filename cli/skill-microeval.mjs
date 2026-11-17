@@ -74,7 +74,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   const capability={kind:'local-filesystem-sandbox',available:probe.exitCode===0,exitCode:probe.exitCode,output};await writeFile(join(sessionDirectory,'sandbox-preflight.json'),JSON.stringify(capability,null,2)+'\n');
   if(!capability.available)return {timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
  }
- const bridge=knowledge?createKdbBridge({url:knowledge.url,attemptId:hash(sessionDirectory),agentDir}):null;
+ const bridge=knowledge?createKdbBridge({url:knowledge.url,attentionRevision:knowledge.attentionRevision??0,attemptId:hash(sessionDirectory),agentDir}):null;
  const extension=async pi=>{
   pi.on('tool_call',async event=>{
    if(event.toolName.startsWith('mcp__kdb__')&&!['mcp__kdb__search','mcp__kdb__read_entry'].includes(event.toolName))return {block:true,reason:'Evaluation knowledge is read-only: use search or read_entry.'};

@@ -1,3 +1,4 @@
+import {attemptAttention,occurrenceAttention} from '../controller/failure-attention.mjs';
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { cp, mkdir, readFile, stat,appendFile } from 'node:fs/promises';
@@ -127,8 +128,8 @@ async function artifactFile(root,name,source) {
   return file;
 }
 const reply=()=>({content:[{type:'text',text:'Recorded'}],details:{}});
-function diagnosticContext(state,id,limit) {
-  const tail=options=>state.queryEvents(id,{...options,order:'desc'}).reverse();
+export function diagnosticContext(state,id,limit) {
+  const tail=options=>state.queryEvents(id,{...options,order:'desc'}).reverse().filter(e=>e.type==='verification'||attemptAttention(state.db,id)==='active'&&occurrenceAttention(state.db,`events:${e.sequence}`)==='active');
   const events=tail({excludeTypes:['pi-event'],limit}).map(({type,data})=>({type,data}));
   const sessions=tail({types:['curriculum-session'],limit}).map(event=>event.data);
   return {session:state.attempt(id)?.session??sessions.at(-1)?.session??null,curriculum_sessions:sessions,

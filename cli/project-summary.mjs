@@ -1,3 +1,4 @@
+import {attentionRevision,projectAttention,attemptAttention,occurrenceAttention} from '../controller/failure-attention.mjs';
 /** Deterministic project facts and scoped claim evidence; no model arithmetic. */
 import {DatabaseSync} from 'node:sqlite';
 import {open,stat,readdir,realpath,readFile} from 'node:fs/promises';
@@ -9,19 +10,21 @@ function jsonObject(text){
  for(let i=start;i<text.length;i++){const c=text[i];if(string){if(escape)escape=false;else if(c==='\\')escape=true;else if(c==='"')string=false;}else if(c==='"')string=true;else if(c==='{')depth++;else if(c==='}'&&!--depth){try{return JSON.parse(text.slice(start,i+1));}catch{return null;}}}
  return null;
 }
-export async function projectSummary({state,projectId,artifactResolver=path=>path,evidenceRoot}){
+export async function projectSummary({state,projectId,artifactResolver=path=>path,evidenceRoot,includeRetired=false}){
  const database=state.db.prepare('PRAGMA database_list').all().find(row=>row.name==='main')?.file;
  const root=evidenceRoot??(database?dirname(database):null);let artifactIndex=null;
  if(root)try{artifactIndex=JSON.parse(await readFile(join(root,'evidence-files.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const row=state.db.prepare('SELECT id,status FROM projects WHERE id=?').get(projectId);
  if(!row)return {format:1,projectId,available:false,facts:[],references:[],unknowns:['Project not present in this evidence database']};
  const attempts=state.db.prepare('SELECT id,outcome,created FROM attempts WHERE project=? ORDER BY created,id').all(projectId).map(a=>({...a}));
- const summary={format:1,projectId,available:true,overview:null,projectStatus:row.status,eventCutoff:0,attempts,verifications:[],measurements:[],facts:[],references:[],unknowns:[]};
+ const summary={format:1,projectId,available:true,overview:null,attention:{revision:attentionRevision(state.db),state:projectAttention(state.db,projectId)},projectStatus:row.status,eventCutoff:0,attempts,verifications:[],measurements:[],facts:[],references:[],unknowns:[]};
  const fact=(name,value,sourceRefs=[])=>{const reference=`project:${projectId}:${name}`;summary.facts.push({reference,factId:reference,value,text:JSON.stringify(value),sourceRefs});};
  for(const event of state.db.prepare("SELECT e.sequence,e.attempt,e.type,e.data,e.created FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.project=? AND e.type IN ('verification','failure-recorded','attempt-error','project-invalid','preactor-infrastructure','rejected') ORDER BY e.sequence").iterate(projectId)){
   const data=JSON.parse(event.data),reference=`project:${projectId}:events:${event.sequence}`;
   summary.eventCutoff=event.sequence;
-  summary.references.push({reference,text:JSON.stringify({sequence:event.sequence,attemptId:event.attempt,created:event.created,type:event.type,data})});
+  const attention=occurrenceAttention(state.db,`events:${event.sequence}`),scope=attemptAttention(state.db,event.attempt);
+  if(event.type!=='verification'&&!includeRetired&&(attention!=='active'||scope!=='active'))continue;
+  summary.references.push({reference,attention,text:JSON.stringify({sequence:event.sequence,attemptId:event.attempt,created:event.created,type:event.type,data})});
   if(event.type!=='verification')continue;
   const record={reference,attemptId:event.attempt,created:event.created,passed:data.passed??null,correctnessPassed:data.correctness?.passed??null,performancePassed:data.performance?.passed??null,fingerprint:data.fingerprint??null};summary.verifications.push(record);
   const evidence=data.performance?.evidence;if(typeof evidence!=='string')continue;

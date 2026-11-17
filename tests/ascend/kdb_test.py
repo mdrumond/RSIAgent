@@ -20,6 +20,44 @@ from kdb_fixture import Embeddings
 
 
 class KnowledgeTests(unittest.TestCase):
+    def test_retired_negative_provenance_and_pinned_history(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'kernel.py'
+            source.write_text('gather index placement')
+            db = KDB(root / 'knowledge.sqlite', Embeddings())
+            negative = db.record_lesson('avoid CPU index placement', 'negative', 'a3',
+                                        [{'path': str(source)}], 'failed')
+            db.record_lesson('use verified device index', 'good', 'a3',
+                             [{'path': str(source)}], 'failed')
+            db.record_lesson('retain mixed correctness observation', 'negative', 'a3',
+                             [{'path': str(source)}], 'mixed')
+            with sqlite3.connect(root / 'state.sqlite') as ledger:
+                ledger.executescript("""CREATE TABLE attempts(id TEXT,project TEXT);
+                    CREATE TABLE events(attempt TEXT,type TEXT);
+                    CREATE TABLE failure_attention_actions(sequence INTEGER,incident TEXT);
+                    CREATE TABLE failure_attention_effects(sequence INTEGER,action_sequence INTEGER,kind TEXT,identity TEXT,attention TEXT);
+                    INSERT INTO attempts VALUES('failed','p'),('mixed','p2');
+                    INSERT INTO events VALUES('mixed','verification');
+                    INSERT INTO failure_attention_actions VALUES(1,'fixed');
+                    INSERT INTO failure_attention_effects VALUES(1,1,'attempt','failed','retired'),(2,1,'attempt','mixed','retired');""")
+            hits = db.search('placement', target='a3', limit=20)
+            self.assertEqual(len(hits), 2)
+            old = db.search('placement', target='a3', limit=20, attention_revision=0)
+            self.assertEqual(len(old), 3)
+            historical = db.search('placement', target='a3', limit=20, include_retired=True)
+            hidden = next(h for h in historical if h['retirement'])
+            self.assertEqual(hidden['retirement']['incident'], 'fixed')
+            read = db.read_entry(hidden['collection'], hidden['chunk_id'])
+            self.assertFalse(read['available'])
+            self.assertEqual(read['text'], '')
+            self.assertTrue(db.read_entry(hidden['collection'], hidden['chunk_id'],
+                                         include_retired=True)['text'])
+            self.assertTrue(db.read_entry(hidden['collection'], hidden['chunk_id'],
+                                         attention_revision=0)['text'])
+            db.close()
+
     def test_imported_language_baseline_is_universal_but_explicit_target_is_filtered(self):
         from ascend_tools.knowledge import KnowledgeDB
 

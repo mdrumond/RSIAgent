@@ -5,12 +5,20 @@ import {activeOccurrenceSql,activeItemSql,occurrenceAttention,observeAttentionRe
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const parse=value=>JSON.parse(value);
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
-const terminal=new Set(['accepted','rejected','inconclusive']);
+const terminal=new Set(['accepted','rejected','inconclusive','archived']);
+const analysisScopeSql=db=>{
+ const scope=has(db,'skill_backlog_meta')?parse(db.prepare("SELECT value FROM skill_backlog_meta WHERE key='queue-rebuild'").get()?.value??'null'):null;
+ if(!scope)return '1';
+ const ids=JSON.stringify(scope.groupIds??[]).replaceAll("'","''"),fresh=['events','generation_events'].map(j=>`(o.reference LIKE '${j}:%' AND CAST(substr(o.reference,${j.length+2}) AS INTEGER)>${Number.isSafeInteger(scope.cutoffs?.[j])?scope.cutoffs[j]:Number.MAX_SAFE_INTEGER})`).join(' OR ');
+ const newScopes=[['attempts','attemptId'],['generation_drafts','draftId']].filter(([t])=>has(db,t)).map(([t,field])=>`EXISTS(SELECT 1 FROM ${t} s WHERE s.id=json_extract(o.data,'$.${field}') AND s.rowid>${Number.isSafeInteger(scope.cutoffs?.[t])?scope.cutoffs[t]:Number.MAX_SAFE_INTEGER})`).join(' OR ');
+ return `(f.id IN (SELECT value FROM json_each('${ids}')) OR EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND (${fresh}${newScopes?' OR '+newScopes:''})))`;
+};
+
 const statuses=new Set(['queued','running','needs-review','learning','user-required',...terminal]);
 const semantic=(value,evidence=false)=>{
  if(Array.isArray(value)){const rows=value.map(v=>semantic(v,evidence));return evidence?[...new Map(rows.map(v=>[JSON.stringify(v),v])).entries()].sort(([a],[b])=>a.localeCompare(b)).map(([,v])=>v):rows;}
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([k])=>
-  !/^(reference|references|evidenceRefs|groupIds|attemptId|draftId|projectId|created|elapsed|count|occurrences|firstSeen|lastSeen)$/.test(k)&&
+  !/^(reference|references|evidenceRefs|groupIds|attemptId|draftId|projectId|created|elapsed|count|historicalCount|frequency|occurrences|firstSeen|lastSeen)$/.test(k)&&
   !(evidence&&/^(path|copiedPath|snapshotPath|archive|proposalDirectory|proposalElapsedSeconds|classification|classifications)$/.test(k))).map(([k,v])=>[k,semantic(v,evidence)]));
  return typeof value==='string'?value.replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>'):value;
 };
@@ -128,16 +136,18 @@ export class SkillBacklog {
     const data=parse(row.data),reference='events:'+row.sequence;if(failure(row.type,data)&&(includeRetired||occurrenceAttention(this.db,reference)==='active'))linkedDiagnostics.push({reference,type:row.type,data,artifacts:[]});
    }
   }
-  return {...parse(row.data),dirty:Boolean(row.dirty)&&count>0,count,historicalCount,occurrences,linkedDiagnostics};
+  const frequency=this.db.prepare(`SELECT COUNT(DISTINCT json_extract(o.data,'$.projectId')) projects,COUNT(DISTINCT o.attempt) attempts,COUNT(DISTINCT json_extract(o.data,'$.draftId')) drafts FROM skill_backlog_occurrences o WHERE group_id=? AND ${eligible}`).get(id);
+  return {...parse(row.data),dirty:Boolean(row.dirty)&&count>0,count,historicalCount,frequency:{...frequency},occurrences,linkedDiagnostics};
  }
- failures({dirty=true,limit=100,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ?`).all(limit).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
+ failures({dirty=true,limit=100,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} AND ${includeRetired?'1':analysisScopeSql(this.db)} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ?`).all(limit).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
- get(id){const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,id,id);return row?parse(row.data):null;}
+ get(id){const epoch=this.meta('queue-epoch'),key=epoch&&!id.startsWith('epoch:')?'epoch:'+epoch+':'+id:id;const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,key,key);return row?parse(row.data):null;}
  list({status,limit=100,includeRetired=false}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${status?'status=?':'1'} AND ${includeRetired?'1':activeItemSql(this.db,'i')} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
  store(item){this.db.prepare('INSERT INTO skill_backlog_items VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,status=excluded.status,priority=excluded.priority')
   .run(item.id,item.key,JSON.stringify(item),item.status,item.priority,item.created);return item;}
  completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}
  upsert(input){return this.atomic(()=>{
+  const epoch=this.meta('queue-epoch');if(epoch&&!input.key.startsWith('epoch:'))input={...input,key:'epoch:'+epoch+':'+input.key};
   if(!input.key||!['harness','correctness','optimization'].includes(input.objective)||!Array.isArray(input.groupIds)||!input.groupIds.length)throw Error('Hypothesis key, objective and failure groups required');
   for(const id of input.groupIds)if(!this.db.prepare('SELECT 1 FROM skill_backlog_failures WHERE id=?').get(id))throw Error('Unknown failure group');
   let prior=this.get(input.key);
@@ -220,7 +230,7 @@ export class SkillBacklog {
   const journals=Object.fromEntries(['events','generation_events'].filter(name=>has(this.db,name)).map(name=>{
    const tail=this.db.prepare(`SELECT COALESCE(MAX(sequence),0) n FROM ${name}`).get().n,c=cursors[name];return[name,{...(c??{end:tail,history:0,fresh:tail}),tail,initialized:Boolean(c)}];
   }));
-  return {dirtyFailures:this.db.prepare(`SELECT count(*) n FROM skill_backlog_failures f WHERE dirty=1 AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`).get().n,
+  return {dirtyFailures:this.db.prepare(`SELECT count(*) n FROM skill_backlog_failures f WHERE dirty=1 AND ${analysisScopeSql(this.db)} AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`).get().n,
    failures:this.db.prepare(`SELECT count(*) n FROM skill_backlog_occurrences o WHERE ${activeOccurrenceSql(this.db,'o')}`).get().n,
    historicalFailures:this.db.prepare('SELECT count(*) n FROM skill_backlog_occurrences').get().n,
    attention,

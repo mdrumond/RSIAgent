@@ -191,6 +191,19 @@ export async function publishStorageMemory(config, item, options = {}) {
     });
   });
 }
+/** Backfill exact retained provenance without changing active generation or history. */
+export async function refreshStorageMemoryProvenance(config,options={}){
+ return access(config,{...options,lockKey:'memory-writer'},async({state,history})=>{
+  const active=state.db.prepare("SELECT revision,generation FROM storage_revisions WHERE name='memory'").get();
+  if(!active)return {refreshed:false,reason:'No active storage memory'};
+  const snapshot=await history.readRevision(active.revision);
+  const url=options.url??(options.invoke?null:await (await import('../cli/knowledge.mjs')).ensureKnowledgeService(config,{signal:options.signal}));
+  const invoke=options.invoke??((tool,args)=>invokeStorageKdb(config,url,tool,args,{signal:options.signal}));
+  const result=await invoke('stage_memory_revision',{revision:active.generation,records:snapshot.memory});
+  if(result.generation!==active.generation)throw Error('Provenance refresh changed the memory generation');
+  return {refreshed:true,generation:active.generation,records:snapshot.memory.length,unknownProvenance:result.unknown_provenance??snapshot.memory.filter(r=>!r.attempt_id).map(r=>r.id)};
+ });
+}
 async function recordSkill({ state, ledger, history }, config, version, options) {
   state.db.exec(`CREATE TABLE IF NOT EXISTS storage_skill_versions (
     version TEXT PRIMARY KEY,revision TEXT NOT NULL,proposal_revision TEXT NOT NULL,

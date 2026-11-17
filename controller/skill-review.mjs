@@ -141,13 +141,14 @@ export function enqueueLearningRequest(state,request){
  if(request.intervention==='user-required')throw Error('Harness learning requires user intervention, not Phase 1 admission');
  if(!request.question||!request.target||!request.requiredEvidence)throw Error('Invalid learning request');
  state.db.exec(`CREATE TABLE IF NOT EXISTS skill_learning_requests(id TEXT PRIMARY KEY,data TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',draft TEXT)`);
- const id=digest([request.target,request.topic??null,request.question,request.requiredEvidence]);
+ const epoch=has(state.db,'skill_backlog_meta')?state.db.prepare("SELECT value FROM skill_backlog_meta WHERE key='queue-epoch'").get()?.value:null;
+ const identity=[request.target,request.topic??null,request.question,request.requiredEvidence];if(epoch)identity.push(JSON.parse(epoch));const id=digest(identity);
  state.db.prepare('INSERT OR IGNORE INTO skill_learning_requests(id,data) VALUES (?,?)').run(id,JSON.stringify(request));return id;
 }
 export function recordLearningOutcome(state,project,attempt){
  const request=project.generation?.learningRequest;if(!request||!has(state.db,'skill_learning_requests'))return;
  const row=state.db.prepare('SELECT data,status,draft FROM skill_learning_requests WHERE id=?').get(request.id);
- if(!row||row.draft!==project.generation.draft)return;
+ if(!row||row.status==='archived'||row.draft!==project.generation.draft)return;
  const data=JSON.parse(row.data);data.findings={attemptId:attempt.id,projectId:project.id,outcome:attempt.outcome};
  state.db.prepare('UPDATE skill_learning_requests SET status=?,data=? WHERE id=?').run(attempt.outcome==='passed'?'verified':'inconclusive',JSON.stringify(data),request.id);
 }
