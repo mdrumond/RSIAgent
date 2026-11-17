@@ -163,6 +163,7 @@ test('device admission blocks before knowledge/model work and keeps unresolved p
 test('preactor infrastructure retry reuses prepared project, original clock and safe physical routing',async t=>{
  const f=await fixture(t);let clock=0,constructed=0,imported=0,operated=0,firstAttempt;
  t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ f.config.environment.module='machinery/registered-environment.mjs';
  f.config.environment.options={target:'registered',runtime:'pinned-runtime',deviceAffinity:[4,5],backgroundDevice:4};
  f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify({...f.request,workKind:'microlearning',learningTarget:'device'}),f.id);
  const ops={now:()=>clock,admit:async()=>({admitted:true,closed:true}),ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need target dtype control',refs:[]}),stopped:async()=>true,
@@ -175,7 +176,7 @@ test('preactor infrastructure retry reuses prepared project, original clock and 
     q.recordOriginal(firstAttempt,{passed:false,findings:'Device reservation unavailable',evidence:[{collection:'fixture',entry_id:'refusal'}]},1);s.db.prepare('INSERT OR REPLACE INTO control VALUES (?,?)').run('wave','1');
     clock+=1000;s.event(firstAttempt,'postprocess-completed',{});
    }else{
-    assert.equal(command,'wave');assert.equal(config.environment.options.backgroundDevice,5);assert(config.actor_seconds<700);
+    assert.equal(command,'wave');assert.equal(config.environment.module,join(f.root,'machinery','registered-environment.mjs'));assert.equal(config.environment.options.backgroundDevice,5);assert(config.actor_seconds<700);
     const job=q.claim('question',2,await processIdentity());q.complete(job.attempt.id,{passed:true,findings:'Independent target control passed',evidence:[{collection:'fixture',entry_id:'control'}]},2);s.event(job.attempt.id,'postprocess-completed',{});clock+=1000;
    }
    for(const lesson of q.lessons())q.acknowledgeLesson(lesson.id);s.close();
@@ -192,4 +193,22 @@ test('preactor infrastructure retry reuses prepared project, original clock and 
  assert.equal(result.status,'verified');assert.equal(constructed,1);assert.equal(imported,1);assert.equal(operated,2);
  assert.equal(child.attempt(firstAttempt).outcome,'failed');assert.equal(child.db.prepare("SELECT count(*) n FROM attempts WHERE outcome='passed'").get().n,1);
  assert.equal(f.backlog.meta('microlearning-last').elapsed,202);assert.equal(f.backlog.meta('microlearning-last').seconds,900);
+});
+
+
+test('closed admission refusal reroutes the retained child before construction',async t=>{
+ const f=await fixture(t);t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ f.config.environment.module='machinery/registered.mjs';f.config.environment.options={target:'registered',runtime:'pinned-runtime',deviceAffinity:[4,5],backgroundDevice:4};
+ f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify({...f.request,workKind:'microlearning',learningTarget:'device'}),f.id);
+ let probes=0,constructed=0,operated=0;
+ const ops={admit:async({config})=>{probes++;return config.environment.options.backgroundDevice===4?{admitted:false,closed:true,reason:'device-reservation-unresolved'}:{admitted:true,closed:true};},
+  stopped:async()=>true,inspect:async()=>({status:'experiment',answer:'Need target control',refs:[]}),ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),
+  construct:async({config})=>{constructed++;assert.equal(config.environment.options.backgroundDevice,5);return [{id:'question',goal:'Tiny question',actor_seconds:20}];},importProject:async(_root,spec)=>spec,
+  operate:async(_command,config)=>{operated++;assert.equal(config.environment.options.backgroundDevice,5);assert.equal(config.environment.module,join(f.root,'machinery','registered.mjs'));const state=new State(join(config.root,'state.sqlite'));
+   state.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('attempt','question','passed','now')").run();state.event('attempt','postprocess-completed',{});state.close();}};
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).reason,'device-reservation-unresolved');
+ const first=f.backlog.meta('microlearning-active');assert.equal(constructed,0);assert.equal(first.seconds,900);
+ f.config.environment.options.backgroundDevice=5;t.mock.timers.tick(31000);
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
+ assert.equal(result.status,'verified');assert.equal(probes,2);assert.equal(constructed,1);assert.equal(operated,1);assert.equal(f.backlog.meta('microlearning-last').seconds,900);
 });
