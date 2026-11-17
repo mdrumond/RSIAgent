@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {materializeProof,validateClaims,validateClaimedResult,claimEvidence} from '../../cli/project-summary.mjs';
-import {reviewSession} from '../../cli/skill-review-native.mjs';
+import {reviewSession,REVIEW_CONTRACT_VERSION,proofResultSchema} from '../../cli/skill-review-native.mjs';
 
 test('line pointers materialize exact excerpts and reject invalid or gap-crossing ranges',()=>{
  const records=[{reference:'file',text:'first\nsecond\nthird\n',paths:['retained.txt'],sourceRefs:['original:1']}];
@@ -35,7 +35,7 @@ test('materialized proofs stay bound to current full record and do not silently 
 });
 test('native cached selector claims revalidate current source instead of recovering stale proof',async t=>{
  const root=await mkdtemp(join(tmpdir(),'proof-pointers-'));t.after(()=>rm(root,{recursive:true,force:true}));const directory=join(root,'review');await mkdir(directory);
- const record={reference:'count',factId:'count',text:'2',value:2},result={reason:'Two records exist',claims:[{path:'reason',kind:'observation',proofs:[{reference:'count'}]}]};validateClaimedResult(result,[record]);await writeFile(join(directory,'submission.json'),JSON.stringify(result));
+ const record={reference:'count',factId:'count',text:'2',value:2},result={reason:'Two records exist',claims:[{path:'reason',kind:'observation',proofs:[{reference:'count'}]}]};validateClaimedResult(result,[record]);await writeFile(join(directory,'submission.json'),JSON.stringify(result));await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:proofResultSchema}));
  const input={directory,config:{},proofRequired:true,prompt:{projectSummaries:[{facts:[record]}]},seconds:5,validate:x=>x};assert.equal((await reviewSession(input)).recovered,true);
  // A source-only change invalidates the cached proof before provider construction.
  await assert.rejects(reviewSession({...input,prompt:{projectSummaries:[{facts:[{...record,sourceRefs:['new-snapshot']}]}]}}));
