@@ -3,6 +3,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
+import {ReviewValidationError,validateReviewReferences} from './review-validation.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
 const negativeVerdict=data=>data&&typeof data==='object'&&(data.passed===false||data.correct===false||
@@ -103,14 +104,15 @@ export function validateClassification(value,group,entries,{requireBucket=false}
  if(value.coverage==='covered'&&!value.guidanceIds.length)throw Error('coverage=covered requires at least one existing guidance ID');
  if(value.coverage!=='covered'&&value.guidanceIds.length)throw Error('coverage='+value.coverage+' requires guidanceIds=[]; use covered only when identifying applicable existing guidance');
  const refs=new Set([...group.occurrences,...(group.linkedDiagnostics??[])].map(o=>o.reference));
- if(!Array.isArray(value.evidenceRefs)||!value.evidenceRefs.length||value.evidenceRefs.some(ref=>!refs.has(ref)))throw Error('evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group');
+ validateReviewReferences(value.evidenceRefs,refs,{field:'evidenceRefs',groupId:group.id,required:true,message:'evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group'});
  return {...value,groupId:group.id,intervention:value.cause==='harness'||value.bucket==='harness'?'user-required':null};
 }
 export function validateClassificationBatch(value,groups,entries,policy){
- const rows=value?.classifications;if(!Array.isArray(rows))throw Error('classifications must be an array with one result per supplied groupId');
- const ids=rows.map(row=>row?.groupId);
- if(rows.length!==groups.length||new Set(ids).size!==groups.length||ids.some(id=>!groups.some(g=>g.id===id)))
-  throw Error('classifications must contain exactly one result for EVERY supplied groupId, with no duplicates or unknown IDs');
+ const rows=value?.classifications,allowedGroupIds=groups.map(group=>group.id),ids=Array.isArray(rows)?rows.map(row=>row?.groupId??null):[];
+ const missingGroupIds=allowedGroupIds.filter(id=>!ids.includes(id)),unknownGroupIds=[...new Set(ids.filter(id=>!allowedGroupIds.includes(id)))],duplicateGroupIds=[...new Set(ids.filter((id,i)=>ids.indexOf(id)!==i))];
+ if(!Array.isArray(rows)||missingGroupIds.length||unknownGroupIds.length||duplicateGroupIds.length)
+  throw new ReviewValidationError('classifications must contain exactly one result for EVERY supplied groupId, with no duplicates or unknown IDs',
+   {field:'classifications',allowedGroupIds,missingGroupIds,unknownGroupIds,duplicateGroupIds,arrayRequired:true});
  return {classifications:rows.map(row=>validateClassification(row,groups.find(g=>g.id===row.groupId),entries,policy))};
 }
 export function validateReview(value,groups){

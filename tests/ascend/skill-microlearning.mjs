@@ -114,6 +114,17 @@ test('archival inspection accepts only actual nested KDB entries, never invented
  assert.throws(()=>validateArchivalInspection(value,{request:{workKind:'suite'},refs,retrievals}),/Cited archival/);
 });
 
+test('archival inspection exposes exact allowed references without relaxing suite or citation admission',()=>{
+ const input={request:{workKind:'microlearning'},refs:new Set(['events:one']),retrievals:[{arguments:{collection:'lessons'},entries:[{chunk_id:'known'}]}]};
+ const value={status:'resolved',answer:'Recorded observation',refs:['project:invented']};let diagnostic;
+ assert.throws(()=>validateArchivalInspection(value,input),error=>{diagnostic=error.details;return error.code==='INVALID_REVIEW_SUBMISSION';});
+ assert.deepEqual(diagnostic,{field:'refs',invalidRefs:['project:invented'],allowedRefs:['events:one','lessons:known'],required:true,arrayRequired:true});
+ const repaired={...value,refs:diagnostic.allowedRefs};assert.equal(validateArchivalInspection(repaired,input),repaired);
+ assert.throws(()=>validateArchivalInspection({...repaired,refs:[]},input),error=>error.details.required===true);
+ assert.throws(()=>validateArchivalInspection(repaired,{...input,request:{workKind:'suite'}}),error=>error.details.allowedValues?.[0]==='experiment');
+ assert.equal(validateArchivalInspection({...repaired,status:'experiment',refs:[]},{...input,request:{workKind:'suite'}}).status,'experiment');
+});
+
 test('retained allowance includes closure proof waits and keeps its live owner until proof completes',async t=>{
  const f=await fixture(t);let clock=0,failed=false;
  await assert.rejects(runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{now:()=>clock,ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),inspect:async()=>({status:'experiment',answer:'Need controls',refs:[]}),
