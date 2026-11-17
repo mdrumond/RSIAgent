@@ -1,7 +1,7 @@
 /** Proposal-only native Pi file sessions. Device execution remains outside the model. */
 import {mkdir,readFile,writeFile,realpath,appendFile} from 'node:fs/promises';
 import {join,resolve,relative,isAbsolute,dirname} from 'node:path';
-import {modelFromProfile} from '../controller/model.mjs';
+import {skillModelFromProfile} from '../controller/skill-context.mjs';
 const inside=(root,path)=>{const r=relative(root,path);return r===''||!isAbsolute(r)&&r!=='..'&&!r.startsWith('../');};
 export function projectDeadline(seconds,signal,began=performance.now()){
  if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive elapsed allocation required');
@@ -26,7 +26,7 @@ export async function nativeProjectRole({directory,files,prompt,profile,seconds,
   }
  });
  const settings=sdk.SettingsManager.inMemory({retry:{enabled:true},compaction:{enabled:true}}),loader=new sdk.DefaultResourceLoader({cwd,agentDir,settingsManager:settings,noExtensions:true,noSkills:true,noContextFiles:true,extensionFactories:[extension]});await loader.reload();
- const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager:settings,...await modelFromProfile(profile),thinkingLevel:'off',tools:['read','write','edit'],resourceLoader:loader,sessionManager:sdk.SessionManager.create(cwd,join(directory,'session'))});
+ const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager:settings,...await skillModelFromProfile(profile,{directory:directory}),thinkingLevel:'off',tools:['read','write','edit'],resourceLoader:loader,sessionManager:sdk.SessionManager.create(cwd,join(directory,'session'))});
  let last,expired=false,error=null;const unsubscribe=session.subscribe(e=>{if(e.type==='message_end'&&e.message.role==='assistant')last=e.message;}),abort=()=>{void session.abort();};
  const deadline=projectDeadline(seconds,signal,began);signal=deadline.signal;signal.addEventListener('abort',abort,{once:true});
  try{signal?.throwIfAborted();await session.bindExtensions({});session.agent.toolExecution='sequential';await session.prompt(prompt);await session.waitForIdle();signal?.throwIfAborted();if(['error','length','aborted'].includes(last?.stopReason))error=last.errorMessage??'provider-'+last.stopReason;}

@@ -1,3 +1,4 @@
+import {skillConfig} from '../controller/skill-context.mjs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -74,6 +75,7 @@ export async function backgroundSkillsSettled(config, { runtime } = {}) {
 // The campaign owns scheduling, device capacity and the decreasing remaining allocation.
 // One invocation handles one comparison, never recursively drains newer evidence.
 export async function runBackgroundSkills(config, values = {}) {
+  config=skillConfig(config);
   positiveSeconds(values.remainingSeconds);
   if (!values.resource?.id) throw new Error('Background evaluation requires a reserved resource');
   const deadline = new AbortController(), end = performance.now() + values.remainingSeconds * 1000;

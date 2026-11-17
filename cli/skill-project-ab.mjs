@@ -1,3 +1,4 @@
+import {skillConfig,skillModelIdentity} from '../controller/skill-context.mjs';
 /** Opt-in, immutable shadow experiment: one proposal covers five cases, four actors total. */
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {join,dirname,resolve,relative,isAbsolute} from 'node:path';
@@ -51,9 +52,10 @@ function receipt(row,files,checker,cases,successBasis){
 }
 /** directory must be fresh. A hard interruption is retained and never replayed by this API. */
 export async function runSkillProjectAB({directory,config,project,guidance,evidence,binding,resource,seconds,actorSeconds=180,signal},dependencies={}){
+ config=skillConfig(config);
  validateSkillProject(project);project={...project,successBasis:project.successBasis??'numerical-contract'};if(!text(guidance?.baseline)||!text(guidance?.candidate)||guidance.baseline===guidance.candidate||!evidence?.length||evidence.some(e=>!text(e.reference)||!text(e.text))||!binding?.environment||binding.environment.health?.product!==project.target||!Number.isFinite(seconds)||seconds<=60||!Number.isFinite(actorSeconds)||actorSeconds<=0)throw Error('Distinct guidance, evidence, target binding and positive elapsed allocation required');
  const began=performance.now(),elapsed=()=>(performance.now()-began)/1000,remaining=()=>Math.max(0,seconds-elapsed()),available=()=>Math.max(0,remaining()-30);
- await mkdir(dirname(directory),{recursive:true});await mkdir(directory);const checker=await readFile(project.checker,'utf8'),frozen={project:{...project,checker},guidance,evidence,binding};
+ await mkdir(dirname(directory),{recursive:true});await mkdir(directory);const checker=await readFile(project.checker,'utf8'),frozen={project:{...project,checker},guidance,evidence,binding,modelProfiles:Object.fromEntries(await Promise.all(['actor','skill_writer_actor'].map(async key=>[key,await skillModelIdentity(config[key]??config.actor)])))};
  const deadline=projectDeadline(seconds,signal,began),work=deadline.signal;await save(join(directory,'frozen.json'),frozen);const identity=sha(frozen),state={protocol:'skill-project-ab-v1',identity,seconds,startedAt:new Date().toISOString(),elapsedSeconds:elapsed(),status:'running',shadow:true,successBasis:project.successBasis,verdict:{promote:false,reason:'not-evaluated',successBasis:project.successBasis},results:[]};
  const persist=async()=>{state.elapsedSeconds=elapsed();await save(join(directory,'result.json'),state);};
  const role=dependencies.role??nativeProjectRole,call=async(name,args)=>{if(available()<=0)throw Error('Experiment elapsed allocation exhausted');if(args.editable&&available()<args.seconds)throw Error('Insufficient remaining elapsed time for a fair actor allocation');state.stage=name;await persist();const result=await role({...args,directory:join(directory,name),seconds:Math.min(args.seconds??120,available()),signal:work});if(result.error||result.expired)throw Object.assign(Error(result.error??'Model elapsed allocation exhausted'),{roleResult:result});return result;};

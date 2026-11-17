@@ -4,13 +4,16 @@ import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createAgentSession,DefaultResourceLoader,SessionManager,SettingsManager,shouldCompact} from '@earendil-works/pi-coding-agent';
+import {skillProfile,skillConfig,skillModelFromProfile,skillModelIdentity} from '../../controller/skill-context.mjs';
+import {microlearningConfig} from '../../cli/skill-microlearning.mjs';
+import {readFile} from 'node:fs/promises';
 import {modelFromProfile} from '../../controller/model.mjs';
 const key='CONTEXT_LIMIT_FIXTURE';
 function profile(overrides={}){return {provider:'deepseek',model:'deepseek-flash',credential_env:key,base_url:'http://127.0.0.1:1',...overrides};}
 async function credentials(t){const previous=process.env[key];process.env[key]='fixture-only';t.after(()=>{if(previous===undefined)delete process.env[key];else process.env[key]=previous;});}
 
 test('context limit governs known model catalogue and native session restoration/compaction',async t=>{
- await credentials(t);const original=await modelFromProfile(profile()),native=await modelFromProfile(profile({max_context_tokens:200000,max_tokens:8192,metadata:{contextWindow:9999999}}));
+ await credentials(t);const original=await modelFromProfile(profile()),native=await skillModelFromProfile(profile({max_tokens:8192,metadata:{contextWindow:9999999}}));
  assert.ok(original.model.contextWindow>200000);assert.equal(native.model.contextWindow,200000);assert.equal(native.model.maxTokens,8192);
  assert.equal(native.modelRuntime.getModel('deepseek','deepseek-flash').contextWindow,200000);
  assert.equal(original.modelRuntime.getModel('deepseek','deepseek-flash').contextWindow,original.model.contextWindow);
@@ -46,4 +49,24 @@ test('clamping custom metadata retains required native gateway request headers',
  for(const native of [uncapped,capped])assert.equal(native.modelRuntime.getCompatibilityRequestConfig(native.model).headers['X-Gateway-Route'],'fixture-route');
  assert.equal(capped.model.contextWindow,200000);assert.deepEqual(metadata.headers,{'X-Gateway-Route':'fixture-route'});
  const known=await modelFromProfile(profile({max_context_tokens:200000,metadata}));assert.equal(known.modelRuntime.getCompatibilityRequestConfig(known.model).headers?.['X-Gateway-Route'],undefined);
+});
+
+
+test('skill startup constrains all profiles without changing foreground configuration',async t=>{
+ await credentials(t);
+ const original={actor:profile(),curriculum_actor:profile({max_context_tokens:64000}),skill_writer_actor:profile({max_context_tokens:999999}),skills:{activeVersion:'fixture'},root:'/fixture'};
+ const bounded=skillConfig(original);
+ assert.equal(original.actor.max_context_tokens,undefined);assert.equal(original.skill_writer_actor.max_context_tokens,999999);
+ assert.equal(bounded.actor.max_context_tokens,200000);assert.equal(bounded.curriculum_actor.max_context_tokens,64000);assert.equal(bounded.skill_writer_actor.max_context_tokens,200000);
+ for(const key of ['actor','curriculum_actor','skill_writer_actor']){
+  const native=await skillModelFromProfile(bounded[key]);assert.equal(native.model.contextWindow,bounded[key].max_context_tokens);
+ }
+ const child=microlearningConfig(original,{directory:'/child',request:{learningTarget:'cpu',question:'fixture'},resource:{id:'host'},seconds:30});
+ assert.equal(child.actor.max_context_tokens,200000);assert.equal(child.curriculum_actor.max_context_tokens,64000);
+ const cwd=await mkdtemp(join(tmpdir(),'skill-startup-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+ const runtime=await skillModelFromProfile(profile(),{directory:cwd}),record=JSON.parse(await readFile(join(cwd,'model-limits.json'),'utf8'));
+ assert.equal(record.contextWindow,runtime.model.contextWindow);assert.equal(record.contextWindow,200000);assert.equal(record.maxTokens,runtime.model.maxTokens);
+ const identity=await skillModelIdentity(profile());assert.equal(identity.effectiveContextTokens,runtime.model.contextWindow);assert.equal(identity.effectiveMaxTokens,runtime.model.maxTokens);
+ assert.equal(skillProfile(profile({max_context_tokens:8000})).max_context_tokens,8000);
+ assert.throws(()=>skillProfile(profile({max_context_tokens:null})),/max_context_tokens/);
 });

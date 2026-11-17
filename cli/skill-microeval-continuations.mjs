@@ -3,6 +3,7 @@ import {mkdir,readFile,writeFile,rename,cp,readdir,lstat,readlink} from 'node:fs
 import {resolve,join,dirname,relative,isAbsolute} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
+import {skillProfile,skillModelIdentity} from '../controller/skill-context.mjs';
 import {retrievalIdentity} from '../controller/skill-objectives.mjs';
 import {nativeSample,skillInput,check,kernelCheck,unknownExecution,protectedFingerprint,validateKernelReceipt} from './skill-microeval.mjs';
 const hash=x=>createHash('sha256').update(x).digest('hex');
@@ -27,6 +28,7 @@ async function forkSession({source,cwd,sessionDirectory}){
 }
 /** Dependencies match runMicroeval's native sample/verification hooks. One key per lane is supported. */
 export async function continueMicroevalSamples({originDirectory,directory,sampleKeys,skills,profile,python='python3',seconds=600,verificationSeconds=180,precheckSeconds=120,knowledge,signal,resume=true},dependencies={}){
+ profile=skillProfile(profile);
  const begun=performance.now();
  if(!Number.isFinite(seconds)||seconds<=0||!Number.isFinite(verificationSeconds)||verificationSeconds<0||verificationSeconds>=seconds)throw Error('Positive continuation allowance and smaller verification reserve required');
  if(!Number.isFinite(precheckSeconds)||precheckSeconds<=0||precheckSeconds>120)throw Error('Positive precheck allowance of at most 120 seconds required');
@@ -34,7 +36,7 @@ export async function continueMicroevalSamples({originDirectory,directory,sample
  if(directory===originDirectory||directory.startsWith(originDirectory+'/'))throw Error('Continuation directory must be separate from the original study');
  const originalManifest=await readFile(join(originDirectory,'manifest.json'),'utf8'),origin=await load(join(originDirectory,'results.json'));
  const tasks=await load(join(originDirectory,'frozen/tasks.json')),inputs={active:await skillInput(skills.active),candidate:await skillInput(skills.candidate)};
- const model={provider:profile.provider,model:profile.model,maxTokens:profile.max_tokens??null,...(profile.max_context_tokens===undefined?{}:{maxContextTokens:profile.max_context_tokens})};
+ const model=await skillModelIdentity(profile);
  const manifest=JSON.parse(originalManifest);
  if(JSON.stringify(model)!==JSON.stringify(manifest.model))throw Error('Continuation model differs from frozen model');
  if(JSON.stringify(knowledge?retrievalIdentity(knowledge):null)!==JSON.stringify(manifest.knowledge??null))throw Error('Continuation retrieval identity differs');
