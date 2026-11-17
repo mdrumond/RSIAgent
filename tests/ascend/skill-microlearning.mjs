@@ -13,6 +13,7 @@ import {releaseKnowledgeService} from '../../cli/campaign-memory.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 import {SkillEvaluationContractError} from '../../cli/skill-evaluation-contract.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
+import {learningAdmissionSettled} from '../../cli/learning-admission.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'microlearning-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());const backlog=new SkillBacklog(state,{target:'a3'});
@@ -222,4 +223,25 @@ test('closed admission refusal reroutes the retained child before construction',
  f.config.environment.options.backgroundDevice=5;t.mock.timers.tick(31000);
  const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
  assert.equal(result.status,'verified');assert.equal(probes,2);assert.equal(constructed,1);assert.equal(operated,1);assert.equal(f.backlog.meta('microlearning-last').seconds,900);
+});
+
+
+for(const previous of [undefined,{admitted:true,closed:true}])test('interrupted admission retains exhausted custody despite prior admission '+Boolean(previous),async t=>{
+ const f=await fixture(t);f.state.db.prepare('UPDATE skill_learning_requests SET data=? WHERE id=?').run(JSON.stringify({...f.request,learningTarget:'device'}),f.id);
+ if(previous){f.state.db.prepare("UPDATE skill_learning_requests SET status='background' WHERE id=?").run(f.id);const directory=join(f.root,'retained');await mkdir(directory);f.backlog.meta('microlearning-active',{id:f.id,request:{...f.request,learningTarget:'device'},directory,resource:f.resource,elapsed:0,seconds:900,admission:previous});}
+ let closed=false,reconciled=0;
+ const ops={stopped:async()=>true,admissionSettled:async input=>learningAdmissionSettled(input,{createEnvironment:async()=>({reconcileOperation:async()=>{reconciled++;return {closed};}})}),
+  admit:async({directory})=>{
+   assert.equal(f.backlog.meta('microlearning-active').admission.closed,false);
+   await mkdir(directory,{recursive:true});await writeFile(join(directory,'environment-events.jsonl'),JSON.stringify({type:'execution-submitting',data:{submission:'unknown-probe'}})+'\n');
+   throw Error('controller interrupted after native dispatch');
+  }};
+ await assert.rejects(runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops),/controller interrupted/);
+ const retained=f.backlog.meta('microlearning-active');assert.equal(retained.admission.closed,false);assert.ok(retained.runningAt);
+ retained.elapsed=901;delete retained.runningAt;f.backlog.meta('microlearning-active',retained);
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).status,'blocked');
+ assert.equal(reconciled,1);assert.ok(f.backlog.meta('microlearning-active'));assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(f.id).status,'background');
+ closed=true;
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).reason,'microlearning-elapsed');
+ assert.equal(reconciled,2);assert.equal(f.backlog.meta('microlearning-active'),null);
 });
