@@ -14,6 +14,15 @@ const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const load=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
 const save=async(path,value)=>{await mkdir(resolve(path,'..'),{recursive:true});const temporary=path+'.tmp';await writeFile(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);};
 const unwrap=result=>result?.value??result;
+// An unfinished marker means the owner died before closing its elapsed ledger.
+// Retain that uncertainty rather than renewing the unobserved portion of its grant.
+async function trackSpending(path,prior,now){
+ const begun=now();let writes=Promise.resolve(),failure;
+ const snapshot=()=>({elapsedSeconds:prior+(now()-begun)/1000,running:true});
+ await save(path,snapshot());
+ const timer=setInterval(()=>{const value=snapshot();writes=writes.then(()=>save(path,value)).catch(error=>{failure??=error;});},1000);
+ return async()=>{clearInterval(timer);await writes;if(failure)throw failure;await save(path,{elapsedSeconds:prior+(now()-begun)/1000,running:false});};
+}
 async function operations(dependencies){const native=await import('./skill-review-native.mjs');return {classify:native.nativeClassifyBatch,review:native.nativeReview,qaAnswer:native.nativeQaAnswer,qaReview:native.nativeQaReview,session:native.reviewSession,...dependencies};}
 function allocation(seconds,signal,now=()=>performance.now()){
  if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive remaining elapsed allowance required');
@@ -139,11 +148,15 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
  const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results])])),frozen=await freezeGroups(config.root,groups,batch);
  const classificationFile=join(batch,'classifications.json');let classifications=await load(classificationFile);
  if(!classifications&&frozen.every(g=>stages[identity(g)]?.classification))classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};
- const stageError=(error,spent,cap)=>spent>=cap-.05||['rejected-submissions','no-submit'].includes(error.reviewSession?.kind);
+ const stageError=(error,spent,cap)=>spent>=cap-.05||['rejected-submissions','no-submit','interrupted-unknown-spend'].includes(error.reviewSession?.kind);
  if(!classifications){
   const pending=frozen.filter(g=>!stages[identity(g)]?.classification);
-  const prior=await load(join(batch,'classification-spend.json')),spent=Math.max(prior?.elapsedSeconds??0,...pending.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();
+  const spendFile=join(batch,'classification-spend.json'),prior=await load(spendFile),retained=await Promise.all(pending.map(g=>stages[identity(g)]?.spendFile?load(stages[identity(g)].spendFile):null)),
+   spent=Math.max(prior?.elapsedSeconds??0,...retained.map(r=>r?.elapsedSeconds??0),...pending.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
   try{
+   if(prior?.running||retained.some(r=>r?.running))throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
+   for(const group of pending)stages[identity(group)]={stage:'classification',status:'running',spendFile,elapsedSeconds:spent};persist();
+   finishClassification=await trackSpending(spendFile,spent,now);
    if(spent>=seconds)throw Error('Classification elapsed allowance exhausted');
    classifications=validateClassificationBatch(await clock.call(ops.classify,{directory:join(batch,'classify'),config,groups:pending,entries,bucketPolicy:true,
     validate:value=>validateClassificationBatch(value,pending,entries,{requireBucket:true})},seconds-spent),pending,entries,{requireBucket:true});
@@ -151,8 +164,8 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    await save(classificationFile,classifications);
    for(const group of frozen)stages[identity(group)]={stage:'proposal',status:'pending',classification:classifications.classifications.find(c=>c.groupId===group.id)};
    persist();
-  }catch(error){for(const group of pending)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,seconds)?'blocked':'retry',reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
-  finally{await save(join(batch,'classification-spend.json'),{elapsedSeconds:spent+(now()-begun)/1000});}
+  }catch(error){for(const group of pending)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,seconds)?'blocked':'retry',spendFile,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
+  finally{await finishClassification?.();}
  }
  const valid=validateClassificationBatch(classifications,frozen,entries,{requireBucket:true}).classifications,byGroup=Object.fromEntries(valid.map(c=>[c.groupId,c])),created=[];
  for(const group of frozen){
@@ -166,13 +179,15 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   }
   const learning=await freezeLearning(config,learned.flatMap(({results})=>results),join(batch,'learning'));
   const proposalDirectory=join(directory,'proposals',hash([identity(group),learned.map(({item,results})=>[item.id,learningIdentity(results)])]));await mkdir(proposalDirectory,{recursive:true});
-  const spendFile=join(proposalDirectory,'writing-spend.json'),priorSpent=(await load(spendFile))?.elapsedSeconds??0,begun=now();
+  const spendFile=join(proposalDirectory,'writing-spend.json'),priorLedger=await load(spendFile),priorSpent=priorLedger?.elapsedSeconds??0,begun=now();
+  if(priorLedger?.running){stages[identity(group)]={stage:'proposal',status:'blocked',classification,elapsedSeconds:priorSpent,reason:'Interrupted writing elapsed custody is unknown; explicit review required'};persist();continue;}
   if(priorSpent>=1800){created.push(backlog.upsert({...common,key:'analysis:'+group.id,proposal:{action:'no-change',reason:'Proposal elapsed allowance exhausted'},evidence,preparation:{...classificationContext,proposalElapsedSeconds:priorSpent},status:'inconclusive'}));stages[identity(group)]={stage:'proposal',status:'blocked',classification,elapsedSeconds:priorSpent,reason:'Proposal elapsed allowance exhausted'};persist();continue;}
   stages[identity(group)]={stage:'proposal',status:'running',classification,elapsedSeconds:priorSpent};persist();
+  const finishWriting=await trackSpending(spendFile,priorSpent,now);
   let review;try{review=validateReviewProposal(await clock.call(ops.review,{directory:proposalDirectory,config,groups:[group],entries,classifications:[classification],learning,
    validate:value=>validateReviewProposal(value,[group],byGroup)},Math.max(.001,1800-priorSpent)),[group],byGroup);}
   catch(error){stages[identity(group)]={stage:'proposal',status:stageError(error,priorSpent+(now()-begun)/1000,1800)?'blocked':'retry',classification,reason:error.message,elapsedSeconds:priorSpent+(now()-begun)/1000};persist();throw error;}
-  finally{await save(spendFile,{elapsedSeconds:priorSpent+(now()-begun)/1000});}
+  finally{await finishWriting();}
   const records=await readFile(join(proposalDirectory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code==='ENOENT')return '';throw e;});
   const memoryEvidence=records.split('\n').filter(Boolean).flatMap(line=>JSON.parse(line).entries??[]);
   const actualRefs=new Set(memoryEvidence.map(e=>e.ref??`${e.collection}:${e.entry_id??e.chunk_id??e.id}`));

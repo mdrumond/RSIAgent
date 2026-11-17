@@ -318,3 +318,31 @@ test('blocked first two hundred groups do not hide later unclassified evidence',
  let classified=0;const result=await analyzeBacklog(f,{classify:async input=>{classified=input.groups.length;return classify(input);},review:review()});
  assert.equal(classified,2);assert.equal(result.items.length,2);
 });
+
+test('an unclosed durable writing marker blocks rather than renewing unknown elapsed spending',async t=>{
+ const f=await fixture(t);let directory;
+ await assert.rejects(analyzeBacklog(f,{classify,review:async input=>{directory=input.directory;const ledger=JSON.parse(await readFile(join(directory,'writing-spend.json'),'utf8'));assert.equal(ledger.running,true);throw Error('Interrupted');}}),/Interrupted/);
+ const path=join(directory,'writing-spend.json'),ledger=JSON.parse(await readFile(path,'utf8'));assert.equal(ledger.running,false);
+ await writeFile(path,JSON.stringify({elapsedSeconds:17,running:true}));
+ const result=await analyzeBacklog(f,{classify:()=>{throw Error('Do not repeat');},review:()=>{throw Error('Unknown spend must not grant work');}});
+ assert.equal(result.items.length,0);assert.equal(f.backlog.failures().length,1);
+ const stage=Object.values(f.backlog.meta('analysis-stages'))[0];assert.equal(stage.status,'blocked');assert.equal(stage.elapsedSeconds,17);
+});
+
+test('classification spending with unknown elapsed custody is blocked without a fresh model grant',async t=>{
+ const f=await fixture(t);let directory;
+ await assert.rejects(analyzeBacklog(f,{classify:async input=>{directory=input.directory;throw Error('Disconnected');}}),/Disconnected/);
+ await writeFile(join(directory,'..','classification-spend.json'),JSON.stringify({elapsedSeconds:12,running:true}));
+ await assert.rejects(analyzeBacklog(f,{classify:()=>{throw Error('Must not call model');}}),/custody is unknown/);
+ const stage=Object.values(f.backlog.meta('analysis-stages'))[0];assert.equal(stage.status,'blocked');assert.ok(stage.elapsedSeconds>=12);
+});
+
+test('interrupted proposal has periodic durable elapsed checkpoints before completion',async t=>{
+ const f=await fixture(t);
+ await analyzeBacklog(f,{classify,review:async input=>{
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  const ledger=JSON.parse(await readFile(join(input.directory,'writing-spend.json'),'utf8'));
+  assert.equal(ledger.running,true);assert.ok(ledger.elapsedSeconds>=.5);
+  return review()(input);
+ }});
+});
