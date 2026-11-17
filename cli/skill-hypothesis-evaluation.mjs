@@ -25,6 +25,7 @@ export function prepareHypothesisEvaluation({objective,target,tasks,binding}){
 
 // One admitted process runs trusted controls sequentially; it never invokes a model or transport.
 async function trustedBatch({cwd,checker,entries,seconds},execute){
+ if(entries.some(entry=>entry.timeoutSeconds!==undefined&&(!Number.isFinite(entry.timeoutSeconds)||entry.timeoutSeconds<=0)))throw Error('Batch entry timeoutSeconds must be finite and positive');
  await mkdir(cwd,{recursive:true});const plan=[];
  for(const entry of entries){const source=join(cwd,entry.cwd),expected={};await mkdir(source,{recursive:true});
   for(const [name,text]of Object.entries(entry.files)){const path=resolve(source,name),rel=relative(source,path);if(!rel||rel==='..'||rel.startsWith('../'))throw Error('Batch source escapes its control directory');await mkdir(dirname(path),{recursive:true});await writeFile(path,text);expected[name]=hash(text);}
@@ -39,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='rsi-check-') as temporary:
   if left<=0: break
   command=[sys.executable,str(checker),*c['args']]; begun=time.monotonic()
   try:
-   p=subprocess.run(command,cwd=source,capture_output=True,text=True,errors='replace',timeout=min(180,left)); code=p.returncode; output=p.stdout; error=p.stderr
+   p=subprocess.run(command,cwd=source,capture_output=True,text=True,errors='replace',timeout=min(c.get('timeoutSeconds',180),left)); code=p.returncode; output=p.stdout; error=p.stderr
   except subprocess.TimeoutExpired:
    code=None; output=''; error='Control elapsed allocation exhausted'
   after={n:sha(source/n) for n in c['expected']}

@@ -138,3 +138,16 @@ test('success basis is a frozen admission choice, not a model-redefinable metric
 test('explicit compatibility cannot turn unknown command custody into a scored failure',async t=>{
  const f=await fixture(t);f.options.project.successBasis='compile-and-correct';f.design.successBasis='compile-and-correct';f.deps.target.qualifyBatch=async()=>{throw Object.assign(Error('Execution closure unknown'),{code:'RSI_EXECUTION_UNRESOLVED',handle:'remote:test:job:compatibility'});};f.deps.settled=async()=>false;const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.status,'unresolved');assert.equal(r.verdict.promote,false);assert.equal(r.verdict.successBasis,'compile-and-correct');assert.equal(r.error.handle,'remote:test:job:compatibility');
 });
+test('project verification allowance reaches controls and actor verification without changing defaults',async t=>{
+ for(const seconds of [undefined,540]){
+  const f=await fixture(t);if(seconds!==undefined)f.options.project.verificationSeconds=seconds;const original=f.deps.target.qualifyBatch,batches=[];
+  f.deps.target.qualifyBatch=async args=>{batches.push(args.entries.map(e=>e.timeoutSeconds));return original(args);};
+  const result=await runSkillProjectAB(f.options,f.deps);assert.equal(result.status,'complete');assert.deepEqual(batches,[[seconds??180,seconds??180],Array(4).fill(seconds??180)]);
+ }
+});
+test('invalid project verification allowances reject before provider or target work',async t=>{
+ for(const seconds of [0,-1,Infinity,NaN,'540',null]){
+  const f=await fixture(t);f.options.project.verificationSeconds=seconds;let dispatched=0;f.deps.target.qualifyBatch=()=>{dispatched++;throw Error('Unexpected target dispatch');};
+  await assert.rejects(runSkillProjectAB(f.options,f.deps),/verificationSeconds/);assert.equal(f.calls.length,0);assert.equal(dispatched,0);
+ }
+});
