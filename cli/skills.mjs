@@ -6,6 +6,7 @@ import { tune } from '../controller/skill-evolution.mjs';
 import {State} from '../controller/state.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import { tuningTask, skillEvents } from '../controller/skill-evidence.mjs';
+import {publishedPromotionGate} from './skill-promotion-gate.mjs';
 
 // Runtime module exports bootstrap({instanceRoot,config,sourceInstanceRoot,skillVersion})
 // and wave({instanceRoot,config,projectIds:[id],evaluation:true}). bootstrap must copy
@@ -153,7 +154,9 @@ export async function publishSkillVersion(root,{active,candidate,signal}) {
       signal?.throwIfAborted();
       if(current.skills.activeVersion!==active)
         throw Object.assign(new Error('Active skills changed during evaluation'),{code:'SKILL_BASE_CHANGED'});
-      return {...current,skills:{...current.skills,activeVersion:candidate}};
+      const promotionGate=publishedPromotionGate(current.skills,{active,candidate});
+      return {...current,skills:{...current.skills,activeVersion:candidate,
+        ...(promotionGate?{promotionGate}:{})}};
     });
   } catch(error) {
     if(error.code==='SKILL_BASE_CHANGED')return null;

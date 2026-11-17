@@ -63,3 +63,20 @@ and negatives before admitting A/B. References must pass; negatives must fail
 with the numeric rejection exit code, not an invocation or harness error.
 Receipts and elapsed spend survive resume. Curriculum construction still emits
 only PyTorch workload specifications/references; actors implement device kernels.
+
+## Wait for a skill update before admitting actors
+
+To run skill improvement before the next project, set
+`skills.promotionGate` to `{ "baseVersion": "<current active version>", "status": "waiting" }`
+and enable background skill tuning. Resume the existing campaign normally.
+The controller continues evaluation, settlement, postprocessing, and elapsed
+accounting, but holds new and resumed project actors and curriculum generation.
+Status reports `skill-update-required` while the gate is armed.
+
+Successful publication of a different candidate from that baseline atomically
+marks the gate `released` with its `acceptedVersion`; ordinary campaign work
+then resumes. Rejection, no-change, stale publication, and merely changing the
+active-version configuration do not release it. Pause/resume preserves the gate
+and original campaign allocation. Isolated A/B samples do not inherit the
+parent's admission gate. Existing actors already running when the gate is armed
+are allowed to finish; arm it on a paused campaign to begin with skills alone.

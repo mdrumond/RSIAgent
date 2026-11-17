@@ -1,11 +1,12 @@
 import * as background from './skill-background.mjs';
+import {skillPromotionPending} from './skill-promotion-gate.mjs';
 
 // The second iteration permanently earmarks one scheduler slot for tuning.
 // Physical commands still use the foreground environment's shared device leases.
 export function skillWorker({control, config, remaining, event, signal, operations=background, now=Date.now}) {
   let running, aborter, nextPoll=0, capacity=0, reservation=false;
   let resource=control.get('skill-background-resource');
-  const enabled=()=>config().skills?.background && (!config().campaign_plan ||
+  const enabled=()=>config().skills?.background && (skillPromotionPending(config()) || !config().campaign_plan ||
     (control.get('campaign-plan')?.index??0)>=2);
   const settled=()=>operations.backgroundSkillsSettled(config());
   return {

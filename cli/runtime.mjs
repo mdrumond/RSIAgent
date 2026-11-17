@@ -17,6 +17,7 @@ import {CampaignStorage} from '../controller/storage.mjs';
 import {assertPackAvailable} from './storage.mjs';
 import { tuningTask, environmentBinding } from '../controller/skill-evidence.mjs';
 import {skillWorker} from './skill-worker.mjs';
+import {skillPromotionPending} from './skill-promotion-gate.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectCatalogExtension} from './project-catalog.mjs';
 
@@ -373,17 +374,18 @@ export async function operate(command,config,options={}) {
           .run(JSON.stringify({...existing.spec,campaign_entry:project.campaign_entry,phase:project.phase}),project.id);
       }
       if(config.campaign_plan)startCampaignEntry(state,config);
+      const promotionPending=skillPromotionPending(config);
       const progress=campaignProgress(state,config),snapshot=JSON.stringify(progress);
       const priorityPending=options.continuous&&progress.done&&config.skills?.priority?.enabled&&
         (await (await import('./skill-background.mjs')).backgroundSkillStatus(config)).hasWork;
       if(snapshot!==progressSnapshot){ctl.set('progress',progress);progressSnapshot=snapshot;}
       if(config.campaign_plan && progress.currentEntry)config=campaignEntryConfig(config,progress.currentEntry.id);
-      if(options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)&&!priorityPending) {
+      if(!promotionPending&&options.continuous&&config.campaign_plan&&progress.phaseComplete&&(!progress.done||!running.size)&&!priorityPending) {
         advanceCampaignEntry(state,config);
         if(progress.done)break;
         continue;
       }
-      if(options.continuous&&!config.campaign_plan&&progress.nextMode) {
+      if(!promotionPending&&options.continuous&&!config.campaign_plan&&progress.nextMode) {
         await updateConfig(config.root,current=>({...current,mode:progress.nextMode}));
         state.event(null,'phase-advanced',{from:config.mode,to:progress.nextMode});
         config={...config,mode:progress.nextMode};continue;
@@ -392,7 +394,7 @@ export async function operate(command,config,options={}) {
       const generationEntry=currentCampaignEntry(state,config);
       const generationPhase=generationEntry?.phase??config.mode;
       const generationPolicy=generationSettings(config,generationPhase);
-      if(!memory?.blocked&&options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
+      if(!promotionPending&&!memory?.blocked&&options.continuous&&!progress.phaseComplete&&generationPolicy.enabled&&!generation&&Date.now()>=nextGeneration) {
         const generationConfig=config;
         generation=(async()=>{
           try {
@@ -443,6 +445,7 @@ export async function operate(command,config,options={}) {
         job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
+        if(promotionPending&&!job.finalize)return false;
         if(config.campaign_plan&&!job.finalize&&!job.resume) {
           if(progress.done&&(options.continuous||job.kind==='original'))return false;
           if(job.kind==='original' && (job.project.spec.campaign_entry!==progress.currentEntry?.id ||
@@ -472,6 +475,10 @@ export async function operate(command,config,options={}) {
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
         try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked&&memory?.limit!==1});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
+      }
+      if(promotionPending) {
+        ctl.set('wait',{reason:'skill-update-required',baseVersion:config.skills.promotionGate.baseVersion,at:new Date().toISOString()});
+        await Promise.race([...running,delay(250,undefined,{signal:schedulerAbort.signal})]);continue;
       }
       const foregroundLimit=Math.min(limit,tuning?.capacity??limit)-(tuning?.reserved?1:0);
       if(memory?.limit===1&&tuning?.reserved&&tuning.capacity>0&&foregroundLimit<1) {

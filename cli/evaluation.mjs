@@ -71,10 +71,11 @@ export async function bootstrap(request) {
   const {root:_root,skills:_skills,projects:_projects,baselineKDB:_baseline,
     campaign_plan:_plan,phase_sequence:_sequence,phase_targets:_targets,completion_target:_target,...settings}=request.config;
   const environment=structuredClone(frozen.environment);
+  const {promotionGate:_promotionGate,...skillSettings}=request.config.skills??{};
   request.signal?.throwIfAborted();
   await createInstance(request.instanceRoot,{initialization,...settings,curriculum:{...settings.curriculum,[settings.mode]:[project.id]},resource_ids:request.resource?[request.resource.id]:settings.resource_ids,baseline:join(inputs,'knowledge.sqlite'),
     skills:join(original.root,'skills','versions',request.skillVersion),
-    skillSettings:{...request.config.skills,tuningDisabled:true},projects:[project],environment,
+    skillSettings:{...skillSettings,tuningDisabled:true},projects:[project],environment,
     signal:request.signal,machinery:join(inputs,'machinery')});
   });
 }
