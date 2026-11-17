@@ -34,6 +34,7 @@ test('A/B samples freeze memory and source once, relocate both checks and block 
     const ledger = new State(join(parent, 'state.sqlite'));
     ledger.db.exec("CREATE TABLE control (key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO control VALUES ('owner','null')"); ledger.close();
     await cp(join(parent,'skills/versions/baseline'),join(parent,'skills/versions/candidate'),{recursive:true});
+    config.install=false; // This isolation test exercises files/SQLite, not dependency provisioning.
     config.skills.promotionGate={baseVersion:config.skills.activeVersion,status:'waiting'};
     const request=arm=>({sourceInstanceRoot:parent,instanceRoot:join(round,arm),config,
       projectId:'p',projectIds:['p'],skillVersion:arm==='a'?'baseline':'candidate'});
