@@ -4,6 +4,7 @@ import {readFile} from 'node:fs/promises';
 import {isAbsolute} from 'node:path';
 import {ownerStopped} from './lifecycle.mjs';
 import {terminalExecutionProofs} from './execution-proof.mjs';
+import {destinationExecutionEvents} from './portable-proof.mjs';
 
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
 const parse=JSON.parse,hash=value=>createHash('sha256').update(value).digest('hex');
@@ -90,7 +91,7 @@ function terminalScopes(db,input){
 }
 // Positive operation completions cover preceding starts only; no transport or writes.
 function journalClosed(db,id){
- const events=db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id).map(e=>({...e,data:parse(e.data)})),closed=new Map(),bash=new Map();
+ const events=destinationExecutionEvents(db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id).map(e=>({...e,data:parse(e.data)}))),closed=new Map(),bash=new Map();
  const terminal=terminalExecutionProofs(events),submitted=new Map();
  for(const e of events){
   if(e.type!=='execution-submitted'||!e.data.handle)continue;
