@@ -110,14 +110,14 @@ test('SIGKILL during provider work retains charged slices without charging pause
  t.after(()=>{if(child.exitCode===null)child.kill('SIGKILL');});
  let checkpoint;
  for(let i=0;i<300;i++){
-  try{checkpoint=JSON.parse(await readFile(join(input.directory,'qa.json'),'utf8'));if(checkpoint.inFlight&&checkpoint.elapsedSeconds>=1)break;}catch(error){if(error.code!=='ENOENT')throw error;}
+  try{checkpoint=JSON.parse(await readFile(join(input.directory,'qa.json'),'utf8'));if(checkpoint.inFlightOperations&&checkpoint.elapsedSeconds>=1)break;}catch(error){if(error.code!=='ENOENT')throw error;}
   await pause(10);
  }
- assert(checkpoint?.inFlight);assert(checkpoint.elapsedSeconds>=1);const exited=once(child,'exit');child.kill('SIGKILL');await exited;
- const reserved=checkpoint.inFlight.reservedThrough;assert(reserved>=6&&reserved<10);
+ assert(checkpoint?.inFlightOperations);assert(checkpoint.elapsedSeconds>=1);const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+ const reserved=Math.max(...Object.values(checkpoint.inFlightOperations).map(op=>op.reservedThrough));assert(reserved>=6&&reserved<10);
  const later=Date.now()+86400000;
  const resumed=await runProposalQa(input,{now:()=>later,qaAnswer:async({seconds})=>{assert(seconds<=300-reserved);assert(seconds>289);return answers();},qaReview:async()=>({verdict:'approved',reason:'Supported'})});
- assert.equal(resumed.verdict,'approved');assert(resumed.elapsedSeconds>=reserved&&resumed.elapsedSeconds<10);assert.equal(resumed.inFlight,undefined);assert.equal(resumed.seconds,300);
+ assert.equal(resumed.verdict,'approved');assert(resumed.elapsedSeconds>=reserved&&resumed.elapsedSeconds<10);assert.equal(resumed.inFlight,undefined);assert.equal(resumed.inFlightOperations,undefined);assert.equal(resumed.seconds,300);
 });
 
 test('legacy cached native submissions cannot approve a changed contract in a v2 continuation',async t=>{

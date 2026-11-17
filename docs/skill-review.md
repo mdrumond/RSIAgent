@@ -77,6 +77,14 @@ remain intact. Approval admits evaluation and never activates a skill. Missing
 facts follow the existing learning route; harness faults remain user handled.
 `report.json` includes QA dispositions, elapsed time and approval fingerprints.
 
+The proposal QA API accepts `qaConcurrency` (or `config.skill_qa_concurrency`),
+a positive integer defaulting to one. Independent evidence pages and summary-item
+audits share that session limit; page revisions wait for their own audits and the
+writer waits for all evidence checks. Parallel sessions consume elapsed wall time,
+not summed request durations. Checkpoints retain each in-flight reservation and
+completed audit; interruption drains running calls before returning. Scheduling
+concurrency does not change the evidence identity or approval contract.
+
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only
 inside the candidate's isolated instance. Its next fresh actor reads the accepted
