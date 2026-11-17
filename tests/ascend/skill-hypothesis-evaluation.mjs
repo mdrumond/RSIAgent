@@ -302,3 +302,19 @@ test('legacy micro manifest alone freezes reserve before proposal review',async 
  const f=await fixture(t,{target:'a3'});await mkdir(join(f.directory,'micro'),{recursive:true});await writeFile(join(f.directory,'micro','manifest.json'),JSON.stringify({verificationSeconds:30,seconds:180}));
  const value=await freezeHypothesisProtocol(f);assert.equal(value.protocol,null);assert.equal(value.verificationSeconds,30);await assert.rejects(readFile(join(f.directory,'evaluation-protocol.json')),{code:'ENOENT'});
 });
+test('trusted batch passes default and custom deadlines into the actual checker subprocess, clipped by remaining time',async t=>{
+ for(const [timeoutSeconds,total,expected]of [[undefined,900,180],[540,900,540],[540,60,60]]){
+  const f=await fixture(t,{target:'a3'});let checker;
+  const target=hypothesisTarget({root:f.directory,binding:f.binding},{createEnvironment:async()=>({prepare:async args=>{checker=args.project.verifier.files[0];},execute:async(_command,cwd,opts)=>{
+   const script="import sys,runpy,subprocess,os\noriginal=subprocess.run\ndef inspect(command,**kwargs):\n os.environ['OBSERVED_TIMEOUT']=str(kwargs['timeout'])\n return original(command,**kwargs)\nsubprocess.run=inspect\nsys.argv=[sys.argv[1],sys.argv[2]]\nrunpy.run_path(sys.argv[0],run_name='__main__')\n";
+   const result=spawnSync(f.config.python,['-c',script,checker,cwd],{encoding:'utf8',timeout:Math.ceil(opts.timeout*1000)});opts.onData(result.stdout);return {exitCode:result.status,settled:true,handle:'local:deadline'};
+  }})});
+  const rows=await target.qualifyBatch({directory:f.directory,seconds:total,entries:[{key:'control',cwd:'control',files:{'kernel.py':'answer=42\n'},checker:"import json,os\nprint(json.dumps({'timeout':float(os.environ['OBSERVED_TIMEOUT'])}))\n",args:[],...(timeoutSeconds===undefined?{}:{timeoutSeconds})}]});
+  const observed=JSON.parse(rows[0].output).timeout;assert(observed<=expected&&observed>expected-1);assert.equal(rows[0].correct,true);
+ }
+});
+test('invalid trusted batch entry deadlines reject before environment dispatch',async t=>{
+ const f=await fixture(t,{target:'a3'});let dispatched=0;const target=hypothesisTarget({root:f.directory,binding:f.binding},{createEnvironment:()=>{dispatched++;throw Error('Unexpected environment');}});
+ for(const timeoutSeconds of [0,-1,Infinity,NaN,'540',null])await assert.rejects(target.qualifyBatch({directory:f.directory,seconds:60,entries:[{key:'bad',cwd:'bad',files:{'kernel.py':'answer=0'},checker:'pass',args:[],timeoutSeconds}]}),/timeoutSeconds/);
+ assert.equal(dispatched,0);
+});
