@@ -90,11 +90,13 @@ export async function runPrioritySkills(config,values,dependencies={}){
   const cohort=refreshCohort(backlog);
   if(!retained&&(!cohort||cohort.status==='complete')&&(cohort?.status==='complete'||!hasCohortCandidates(backlog,config.skills.activeVersion))){
    const admittedLearning=learningFingerprint(state);
+   const epoch=backlog.meta('queue-epoch'),cacheKey=epoch?createHash('sha256').update(String(epoch)).digest('hex'):null;
+   const cacheDirectory=name=>cacheKey?join(directory,name,cacheKey):join(directory,name);
    if(backlog.meta('learning-seen')!==admittedLearning){backlog.meta('learning-scan',null);backlog.meta('learning-pending',true);}
    // A bounded analysis can produce useful items before its last group times out.
    // Preserve that progress and existing priorities instead of starving evaluation.
-   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:join(directory,'analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
-    ['ranking',ops.prioritize,{directory:join(directory,'ranking'),seconds:Math.min(60,remainingCampaign())}]]){
+   for(const [name,operation,args]of [['analysis',ops.analyze,{directory:cacheDirectory('analysis'),seconds:Math.min(120,remainingCampaign()),limit:10}],
+    ['ranking',ops.prioritize,{directory:cacheDirectory('ranking'),seconds:Math.min(60,remainingCampaign())}]]){
     if((backlog.meta(name+'-after')??0)>Date.now())continue;
     try{await operation({config,backlog,signal:values.signal,...args});backlog.meta(name+'-error',null);}
     catch(error){values.signal?.throwIfAborted();backlog.meta(name+'-error',{at:new Date().toISOString(),message:error.message});backlog.meta(name+'-after',Date.now()+60000);}
