@@ -3,6 +3,7 @@ import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {isAbsolute} from 'node:path';
 import {ownerStopped} from './lifecycle.mjs';
+import {terminalExecutionProofs} from './execution-proof.mjs';
 
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
 const parse=JSON.parse,hash=value=>createHash('sha256').update(value).digest('hex');
@@ -50,7 +51,8 @@ function scopeRows(db,input){
  const rows=input.references.map(reference=>{
   const row=db.prepare('SELECT * FROM skill_backlog_occurrences WHERE reference=?').get(reference);
   if(!row)throw Error('Unknown failure occurrence: '+reference);
-  const data=parse(row.data);return {reference,groupId:row.group_id,attemptId:data.attemptId??null,projectId:data.projectId??null};
+  const data=parse(row.data),attemptId=row.attempt??data.attemptId??null,projectId=attemptId?db.prepare('SELECT project FROM attempts WHERE id=?').get(attemptId)?.project:null;
+  return {reference,groupId:row.group_id,attemptId,projectId:projectId??data.projectId??null};
  });
  for(const [field,key]of [['attemptIds','attemptId'],['projectIds','projectId']]){
   if(input[field]!==undefined&&(!Array.isArray(input[field])||new Set(input[field]).size!==input[field].length||input[field].some(id=>!rows.some(r=>r[key]===id))))throw Error(field+' must identify scopes in the exact references');
@@ -59,20 +61,24 @@ function scopeRows(db,input){
  return rows;
 }
 function terminalScopes(db,input){
- const refs=new Set(input.references),ids=new Set(input.attemptIds??[]);
+ const refs=new Set(input.references),coverage=new Set(input.attemptIds??[]);
  for(const project of input.projectIds??[]){
   const row=db.prepare('SELECT status FROM projects WHERE id=?').get(project);
   if(row?.status!=='failed')throw Error('Only failed terminal projects may leave active attention: '+project);
-  for(const a of db.prepare('SELECT id FROM attempts WHERE project=?').all(project))ids.add(a.id);
+  for(const a of db.prepare('SELECT id FROM attempts WHERE project=?').all(project))coverage.add(a.id);
  }
+ // Even reference-only overlays must not hide a live/unsettled attempt.
+ const ids=new Set([...coverage,...scopeRows(db,input).map(row=>row.attemptId).filter(Boolean)]);
  const owners=[];
  for(const id of ids){
   const a=db.prepare('SELECT * FROM attempts WHERE id=?').get(id);
   const closure=db.prepare("SELECT data FROM events WHERE attempt=? AND type='failure-settlement' ORDER BY sequence DESC LIMIT 1").get(id);
-  const investigation=a?.outcome==='passed'&&has(db,'recovery_attempts')&&db.prepare("SELECT 1 FROM recovery_attempts WHERE attempt=? AND kind='investigation' AND completed=1").get(id)&&db.prepare("SELECT 1 FROM events WHERE attempt=? AND type='postprocess-completed'").get(id);
-  if(!(investigation||a?.outcome==='failed'&&closure)||closure&&parse(closure.data).closed!==true)throw Error('Explicit positive failure settlement or completed investigation required: '+id);
+  const passed=a?.outcome==='passed'&&db.prepare("SELECT 1 FROM events WHERE attempt=? AND type='postprocess-completed'").get(id);
+  const investigation=passed&&has(db,'recovery_attempts')&&db.prepare("SELECT 1 FROM recovery_attempts WHERE attempt=? AND kind='investigation' AND completed=1").get(id);
+  if(!(investigation||passed&&!coverage.has(id)||a?.outcome==='failed'&&closure)||closure&&parse(closure.data).closed!==true)throw Error('Explicit positive failure settlement or completed investigation required: '+id);
   if(!journalClosed(db,id))throw Error('Unmatched execution remains unresolved: '+id);
   if(a.owner)owners.push(parse(a.owner));
+  if(!coverage.has(id))continue;
   const occurrences=db.prepare('SELECT reference FROM skill_backlog_occurrences WHERE attempt=?').all(id);
   if(!investigation&&!occurrences.length||occurrences.some(r=>!refs.has(r.reference)&&occurrenceAttention(db,r.reference)==='active'))throw Error('Mixed or uncovered failures remain active: '+id);
   // An incomplete ingest must not hide a known verifier failure in the same attempt.
@@ -85,6 +91,7 @@ function terminalScopes(db,input){
 // Positive operation completions cover preceding starts only; no transport or writes.
 function journalClosed(db,id){
  const events=db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id).map(e=>({...e,data:parse(e.data)})),closed=new Map(),bash=new Map();
+ const terminal=terminalExecutionProofs(events);
  for(const [index,e]of events.entries()){
   if(e.type==='execution-settled'||e.type==='execution-reconciled'&&e.data.closed===true)closed.set(e.data.operation,index);
   if(e.type==='native-bash-completed')bash.set(e.data.operation,index);
@@ -92,7 +99,11 @@ function journalClosed(db,id){
  return events.every((e,index)=>{
   const op=e.data.operation??e.data.submission;
   if(e.type==='native-bash-started')return (bash.get(op)??-1)>index;
-  if(['execution-starting','execution-submitting','execution-unresolved','execution-handle'].includes(e.type))return op!==undefined&&(closed.get(op)??-1)>index;
+  // Reconciliation records recovered handle identities after its closure event.
+  // Only immutable native terminal evidence may cover that late identity;
+  // every subsequent launch/unresolved marker still needs its own closure.
+  if(e.type==='execution-handle')return Boolean(e.data.handle)&&op!==undefined&&((closed.get(op)??-1)>index||closed.has(op)&&terminal.has(e.data.handle));
+  if(['execution-starting','execution-submitting','execution-unresolved'].includes(e.type))return op!==undefined&&(closed.get(op)??-1)>index;
   return true;
  });
 }
