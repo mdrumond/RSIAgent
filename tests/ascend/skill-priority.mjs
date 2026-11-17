@@ -470,3 +470,12 @@ test('fresh target split is frozen and approved before skill preparation or eval
  },evaluate:async args=>{const saved=JSON.parse(await readFile(join(args.directory,'evaluation-protocol.json'),'utf8'));assert.deepEqual(saved.protocol,approved);assert.equal(args.binding.verificationSeconds,undefined);return f.ops.evaluate(args);}});
  assert(approved);assert.equal(f.backlog.get(item.id).status,'rejected');
 });
+
+test('analysis stage status distinguishes blocked contracts from useful progress',async t=>{
+ const f=await fixture(t);f.backlog.meta('queue-epoch','current');
+ f.backlog.meta('analysis-stages',{one:{epoch:'current',stage:'proposal',status:'blocked',classification:{bucket:'correctness'},reason:'Bad contract'},two:{epoch:'current',stage:'proposal',status:'retry',classification:{bucket:'optimization'}},old:{epoch:'old',stage:'classification',status:'blocked'}});
+ const status=await prioritySkillStatus(f.config);
+ assert.deepEqual(status.analysisProgress,{classified:2,pendingProposals:1,blocked:1,completed:0});
+ assert.equal(status.analysisStages.length,2);
+ const result=await runPrioritySkills(f.config,f.values,f.ops);assert.equal(result.status,'blocked');assert.equal(result.blockedStages,1);
+});

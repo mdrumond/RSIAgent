@@ -161,7 +161,7 @@ test('actual verifier receipt and captured-stream paths expose bounded diagnosti
  const a=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;
  f.state.event(a,'verification',{passed:false,correctness:{passed:false,evidence:correctness},performance:{passed:false,evidence:performance},evidence:{correctness,performance}});
  f.state.event(a,'attempt-error',{message:'Captured streams',stdout:correctness,stderr:performance});f.state.event(a,'attempt-error',{message:'Raw output is not a filename',stdout:'/compiler/source.cpp\n'+'z'.repeat(6000)});f.backlog.ingest();
- const {items}=await analyzeBacklog(f,{classify,review:review()});assert.ok(items.some(i=>i.evidence.groups[0].message==='Raw output is not a filename'&&i.evidence.groups[0].occurrences[0].artifacts.length===0));
+ const items=[];while(f.backlog.failures().length)items.push(...(await analyzeBacklog(f,{classify,review:review()})).items);assert.ok(items.some(i=>i.evidence.groups[0].message==='Raw output is not a filename'&&i.evidence.groups[0].occurrences[0].artifacts.length===0));
  for(const type of ['verification','attempt-error']){
   const item=items.find(i=>i.evidence.groups[0].type===type&&i.evidence.groups[0].occurrences[0].artifacts.length===2);assert.ok(item);
   const texts=await Promise.all(item.evidence.groups[0].occurrences[0].artifacts.map(a=>readFile(a.path,'utf8')));
@@ -264,4 +264,57 @@ test('ranking cache replay normalizes legacy arrays and persists an idempotent o
  await prioritizeBacklog(f,{session});await prioritizeBacklog(f,{session});
  assert.equal(providerCalls,1);assert.equal(Array.isArray(JSON.parse(cached).priorities),true);assert.equal(f.backlog.list()[0].priority,95);
  await assert.rejects(prioritizeBacklog(f,{session:async({validate})=>validate({priorities:[]})}));assert.equal(f.backlog.list()[0].priority,95);
+});
+
+test('classification spending does not clip independent proposal allowance',async t=>{
+ const f=await fixture(t);let milliseconds=0,proposalSeconds;
+ const result=await analyzeBacklog({...f,seconds:120,remainingSeconds:2000},{now:()=>milliseconds,
+  classify:async input=>{milliseconds+=105000;return classify(input);},
+  review:async input=>{proposalSeconds=input.seconds;milliseconds+=30000;return review()(input);}});
+ assert.equal(proposalSeconds,1800);assert.equal(result.items[0].preparation.proposalElapsedSeconds,30);
+ assert.equal(result.elapsedSeconds,135);
+});
+
+test('resuming proposal reuses accepted classifications and charges only remaining writing time',async t=>{
+ const f=await fixture(t);let milliseconds=0,calls=0;
+ const dependencies={now:()=>milliseconds,classify:async input=>{calls++;return classify(input);}};
+ await assert.rejects(analyzeBacklog({...f,remainingSeconds:2000},{...dependencies,review:async()=>{milliseconds+=25000;throw Error('Provider disconnected');}}),/disconnected/);
+ const stages=Object.values(f.backlog.meta('analysis-stages'));assert.equal(stages[0].stage,'proposal');assert.equal(stages[0].status,'retry');
+ let allowed;const result=await analyzeBacklog({...f,remainingSeconds:2000},{...dependencies,review:async input=>{allowed=input.seconds;milliseconds+=10000;return review()(input);}});
+ assert.equal(calls,1);assert.equal(allowed,1775);assert.equal(result.items[0].preparation.proposalElapsedSeconds,35);
+ assert.equal(Object.values(f.backlog.meta('analysis-stages'))[0].status,'complete');
+});
+
+test('exhausted contract stages remain visible and do not reopen native sessions automatically',async t=>{
+ const f=await fixture(t);let calls=0;
+ await assert.rejects(analyzeBacklog(f,{classify:async()=>{calls++;throw Object.assign(Error('Schema contract rejected'),{reviewSession:{kind:'rejected-submissions'}});}}),/contract rejected/);
+ const resumed=await analyzeBacklog(f,{classify:()=>{throw Error('Do not replay blocked session');}});
+ assert.equal(resumed.analyzed,0);assert.equal(calls,1);assert.equal(f.backlog.failures().length,1);
+ assert.equal(Object.values(f.backlog.meta('analysis-stages'))[0].status,'blocked');
+ // A fresh explicit queue epoch is the operator-controlled retry boundary.
+ f.backlog.meta('queue-epoch','fresh');const fresh=await analyzeBacklog(f,{classify,review:review()});assert.equal(fresh.items.length,1);
+});
+
+test('classification elapsed exhaustion is retained without granting a fresh allowance',async t=>{
+ const f=await fixture(t);let milliseconds=0;
+ await assert.rejects(analyzeBacklog(f,{now:()=>milliseconds,classify:async()=>{milliseconds+=120000;throw Object.assign(Error('Elapsed'),{reviewSession:{kind:'elapsed'}});}}),/Elapsed/);
+ assert.equal(Object.values(f.backlog.meta('analysis-stages'))[0].status,'blocked');
+ assert.equal((await analyzeBacklog(f,{classify:()=>{throw Error('Must not retry');}})).analyzed,0);
+});
+
+test('new urgent evidence does not reset interrupted writing or repeat accepted classification',async t=>{
+ const f=await fixture(t);let milliseconds=0,originalId,originalDirectory;
+ await assert.rejects(analyzeBacklog({...f,remainingSeconds:3000},{now:()=>milliseconds,classify,review:async input=>{originalId=input.groups[0].id;originalDirectory=input.directory;milliseconds+=50000;throw Error('Disconnected');}}),/Disconnected/);
+ const a=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;f.state.event(a,'attempt-error',{message:'New independent compile failure'});f.backlog.ingest();
+ const classified=[],allowances=[];
+ await analyzeBacklog({...f,remainingSeconds:3000},{now:()=>milliseconds,classify:async input=>{classified.push(...input.groups.map(g=>g.id));return classify(input);},review:async input=>{if(input.groups[0].id===originalId){assert.equal(input.directory,originalDirectory);allowances.push(input.seconds);}return review()(input);}});
+ assert.ok(!classified.includes(originalId));assert.deepEqual(allowances,[1750]);assert.equal(f.backlog.failures().length,0);
+});
+
+test('blocked first two hundred groups do not hide later unclassified evidence',async t=>{
+ const f=await fixture(t);for(let i=0;i<201;i++)f.state.event(null,'generation-rejected',{message:'Independent diagnostic '+i});
+ while(f.backlog.ingest({limit:100}).progress){}
+ await assert.rejects(analyzeBacklog({...f,limit:200},{classify:async()=>{throw Object.assign(Error('Contract failed'),{reviewSession:{kind:'rejected-submissions'}});}}),/Contract failed/);
+ let classified=0;const result=await analyzeBacklog(f,{classify:async input=>{classified=input.groups.length;return classify(input);},review:review()});
+ assert.equal(classified,2);assert.equal(result.items.length,2);
 });
