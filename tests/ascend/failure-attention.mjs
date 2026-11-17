@@ -121,6 +121,28 @@ test('native reconciliation may recover terminal handles after closure without p
  await assert.rejects(auditResolution(f.db,f.manifest),/Unmatched execution/);
 });
 
+test('legacy transfer handles require exact submitted operation mapping and native terminal proof',async t=>{
+ const f=await fixture(t),handle='remote:fixture:transfer:legacy',operation='transfer-operation';
+ f.event('execution-submitting',{submission:operation,operation});
+ f.event('execution-submitted',{submission:operation,operation,handle});
+ f.event('execution-handle',{handle,purpose:'transfer'});
+ f.event('execution-state',{handle,state:'stopped',nativeState:'completed'});
+ f.event('execution-reconciled',{operation,closed:true});
+ f.event('execution-handle',{operation,handle});
+ await auditResolution(f.db,f.manifest);
+ f.event('execution-handle',{handle:'remote:fixture:transfer:unknown',purpose:'transfer'});
+ await assert.rejects(auditResolution(f.db,f.manifest),/Unmatched execution/);
+ const g=await fixture(t);
+ g.event('execution-submitted',{submission:operation,operation,handle});
+ g.event('execution-handle',{handle,purpose:'transfer'});
+ g.event('execution-reconciled',{operation,closed:true});
+ await assert.rejects(auditResolution(g.db,g.manifest),/Unmatched execution/);
+ g.event('execution-state',{handle,state:'stopped',nativeState:'completed'});
+ await auditResolution(g.db,g.manifest);
+ g.event('execution-submitting',{submission:operation,operation});
+ await assert.rejects(auditResolution(g.db,g.manifest),/Unmatched execution/);
+});
+
 test('occurrence-only attention cannot hide live or unresolved attempts and does not require whole-attempt coverage',async t=>{
  for(const defect of ['running','live-owner','open-settlement','unmatched-shell']){
   const f=await fixture(t),manifest={...f.manifest,projectIds:[],attemptIds:[]};
