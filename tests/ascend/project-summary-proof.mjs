@@ -82,7 +82,7 @@ test('cached legacy submission is rejected and repaired rather than bypassing pr
  const f=await fixture(t),directory=join(f.root,'legacy');await mkdir(directory);await writeFile(join(directory,'submission.json'),JSON.stringify({reason:'old uncited'}));
  const record={reference:'r',text:'observed'},value={reason:'observed',claims:[{path:'reason',text:'observed',kind:'observation',proofs:[{reference:'r',quote:'observed'}]}]};
  const p=await provider(t,n=>n===0?['submit_review',{result:value}]:undefined);
- const out=await reviewSession({directory,config:{actor:p.profile},prompt:{entries:[{id:'r',text:'observed'}]},seconds:10,proofRequired:true,validate:x=>x});assert.equal(out.value.reason,'observed');assert.equal(p.requests(),2);assert.equal(JSON.parse((await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n')[0]).cached,true);
+ const out=await reviewSession({directory,config:{actor:p.profile},prompt:{entries:[{id:'r',text:'observed'}]},seconds:10,proofRequired:true,validate:x=>x});assert.equal(out.value.reason,'observed');assert.equal(p.requests(),2);const [archived]=await readdir(join(directory,'contract-history'));assert.equal(JSON.parse(await readFile(join(directory,'contract-history',archived,'submission.json'),'utf8')).reason,'old uncited');
 });
 test('legacy approved QA cannot bypass proof-required answer and semantic re-review',async t=>{
  const f=await fixture(t),directory=join(f.root,'qa');await mkdir(directory);const proposal={changes:[],memoryRefs:[]},input={directory,proposal,entries:[],groups:[],target:'a3',validateProposal:x=>x};
