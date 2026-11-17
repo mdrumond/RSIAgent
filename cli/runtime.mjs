@@ -447,7 +447,7 @@ export async function operate(command,config,options={}) {
         [...maintenanceJobs,...jobs.filter(job=>job.resume),...nextWave(state,{wave:options.continuous?wave+1:wave,...policy({...config,mode:'phase1'})})];
       const ready=[];
       for(const job of candidates) {
-        if(['investigation','retry'].includes(job.kind)&&job.origin_attempt) {
+        if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt) {
           const parent=await availableAttemptJob(state,config.root,job.origin_attempt);
           if(!parent)continue;
           job.mode??=parent.mode;
