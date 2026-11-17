@@ -1,6 +1,7 @@
 import {createHash,randomUUID} from 'node:crypto';
 import {isAbsolute} from 'node:path';
 import {diagnosticIdentity} from './skill-review.mjs';
+import {activeOccurrenceSql,activeItemSql,occurrenceAttention,observeAttentionRecurrence,attentionStatus} from './failure-attention.mjs';
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const parse=value=>JSON.parse(value);
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
@@ -78,6 +79,8 @@ export class SkillBacklog {
     const reference=`${journal}:${row.sequence}`,occurrence={reference,attemptId:row.attempt??null,draftId:row.draft??null,projectId:attempt?.project??null,
      phase:row.phase??data.phase??job.mode??spec?.phase??null,kind:job.kind??null,skillVersion:(selection&&parse(selection.data).version)??job.skillVersion??job.config?.skills?.activeVersion??null,skillReads:[],artifacts:[],created:row.created??null,data,diagnostic};
     if(!this.db.prepare('INSERT OR IGNORE INTO skill_backlog_occurrences VALUES(?,?,?,?)').run(reference,id,row.attempt??null,JSON.stringify(occurrence)).changes)return;
+    observeAttentionRecurrence(this.db,{reference,groupId:id,projectId:occurrence.projectId,attemptId:occurrence.attemptId});
+    if(occurrenceAttention(this.db,reference)!=='active')return;
     const group={id,target:this.target,type:row.type,message:String(data.message??data.error??data.reason??row.type).slice(0,1500)};
     this.db.prepare('INSERT INTO skill_backlog_failures VALUES(?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET dirty=1,fresh=MAX(fresh,excluded.fresh),updated=excluded.updated').run(id,JSON.stringify(group),Number(fresh),this.now());observed++;
    };
@@ -111,23 +114,26 @@ export class SkillBacklog {
    return {observed,progress,...this.status()};
   });
  }
- failure(id,{limit=20,offset=0}={}){
+ failure(id,{limit=20,offset=0,includeRetired=false}={}){
   const row=this.db.prepare('SELECT data,dirty FROM skill_backlog_failures WHERE id=?').get(id);if(!row)return null;
-  const count=this.db.prepare('SELECT count(*) n FROM skill_backlog_occurrences WHERE group_id=?').get(id).n;
-  const occurrences=this.db.prepare('SELECT data FROM skill_backlog_occurrences WHERE group_id=? ORDER BY rowid DESC LIMIT ? OFFSET ?').all(id,limit,offset).map(r=>parse(r.data));
+  const eligible=includeRetired?'1':activeOccurrenceSql(this.db,'o');
+  const historicalCount=this.db.prepare('SELECT count(*) n FROM skill_backlog_occurrences WHERE group_id=?').get(id).n;
+  const count=this.db.prepare(`SELECT count(*) n FROM skill_backlog_occurrences o WHERE group_id=? AND ${eligible}`).get(id).n;
+  if(!includeRetired&&!count)return null;
+  const occurrences=this.db.prepare(`SELECT data FROM skill_backlog_occurrences o WHERE group_id=? AND ${eligible} ORDER BY rowid DESC LIMIT ? OFFSET ?`).all(id,limit,offset).map(r=>parse(r.data));
   for(const occurrence of occurrences)if(occurrence.attemptId)occurrence.skillReads=this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='skill-read' ORDER BY sequence DESC LIMIT 12").all(occurrence.attemptId).map(r=>parse(r.data));
   const linkedDiagnostics=[];
   for(const attempt of [...new Set(occurrences.map(o=>o.attemptId).filter(Boolean))].slice(0,2)){
    for(const row of this.db.prepare(`SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','baseline-preflight-completed','project-invalid','attempt-error') ORDER BY sequence DESC LIMIT 12`).all(attempt)){
-    const data=parse(row.data);if(failure(row.type,data))linkedDiagnostics.push({reference:'events:'+row.sequence,type:row.type,data,artifacts:[]});
+    const data=parse(row.data),reference='events:'+row.sequence;if(failure(row.type,data)&&(includeRetired||occurrenceAttention(this.db,reference)==='active'))linkedDiagnostics.push({reference,type:row.type,data,artifacts:[]});
    }
   }
-  return {...parse(row.data),dirty:Boolean(row.dirty),count,occurrences,linkedDiagnostics};
+  return {...parse(row.data),dirty:Boolean(row.dirty)&&count>0,count,historicalCount,occurrences,linkedDiagnostics};
  }
- failures({dirty=true,limit=100,occurrenceLimit=20}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures ${dirty?'WHERE dirty=1':''} ORDER BY fresh DESC,updated DESC,rowid LIMIT ?`).all(limit).map(r=>this.failure(r.id,{limit:occurrenceLimit}));}
+ failures({dirty=true,limit=100,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ?`).all(limit).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
  get(id){const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,id,id);return row?parse(row.data):null;}
- list({status,limit=100}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items ${status?'WHERE status=?':''} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
+ list({status,limit=100,includeRetired=false}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${status?'status=?':'1'} AND ${includeRetired?'1':activeItemSql(this.db,'i')} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
  store(item){this.db.prepare('INSERT INTO skill_backlog_items VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,status=excluded.status,priority=excluded.priority')
   .run(item.id,item.key,JSON.stringify(item),item.status,item.priority,item.created);return item;}
  completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}
@@ -155,6 +161,7 @@ export class SkillBacklog {
   let row=this.db.prepare("SELECT id FROM skill_backlog_runs WHERE status='running'").get();
   if(row){const run=this.run(row.id);if(run.base!==base)throw Error('Settle retained comparison before baseline change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
   for(const item of itemId?[this.get(itemId)].filter(item=>item?.status==='queued'):this.list({status:'queued',limit:100})){
+   if(!this.db.prepare(`SELECT 1 FROM skill_backlog_items i WHERE id=? AND ${activeItemSql(this.db,'i')}`).get(item.id))continue;
    if(item.base!==base){this.rebase(item.id,base);continue;}
    const completed=this.completed(item);if(completed){this.store({...item,status:completed.status,previousRun:completed.id});continue;}
    const id=randomUUID();this.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,status,snapshot,owner) VALUES(?,?,?,?,?,'running',?,?)")
@@ -208,13 +215,16 @@ export class SkillBacklog {
   const item=this.get(run.item_id),completed=item.revision!==run.revision&&this.completed(item);this.store({...item,status:item.revision===run.revision?status:completed?completed.status:item.objective==='harness'?'user-required':'queued',...(completed?{previousRun:completed.id}:{})});return this.run(run.id);
  });}
  status(){
+  const attention=attentionStatus(this.db);
   const cursors=Object.fromEntries(this.db.prepare("SELECT key,value FROM skill_backlog_meta WHERE key LIKE 'cursor:%'").all().map(r=>[r.key.slice(7),parse(r.value)]));
   const journals=Object.fromEntries(['events','generation_events'].filter(name=>has(this.db,name)).map(name=>{
    const tail=this.db.prepare(`SELECT COALESCE(MAX(sequence),0) n FROM ${name}`).get().n,c=cursors[name];return[name,{...(c??{end:tail,history:0,fresh:tail}),tail,initialized:Boolean(c)}];
   }));
-  return {dirtyFailures:this.db.prepare('SELECT count(*) n FROM skill_backlog_failures WHERE dirty=1').get().n,
-   failures:this.db.prepare('SELECT count(*) n FROM skill_backlog_occurrences').get().n,
-   items:this.db.prepare('SELECT status,count(*) n FROM skill_backlog_items GROUP BY status').all(),cursors,
+  return {dirtyFailures:this.db.prepare(`SELECT count(*) n FROM skill_backlog_failures f WHERE dirty=1 AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`).get().n,
+   failures:this.db.prepare(`SELECT count(*) n FROM skill_backlog_occurrences o WHERE ${activeOccurrenceSql(this.db,'o')}`).get().n,
+   historicalFailures:this.db.prepare('SELECT count(*) n FROM skill_backlog_occurrences').get().n,
+   attention,
+   items:this.db.prepare(`SELECT status,count(*) n FROM skill_backlog_items i WHERE ${activeItemSql(this.db,'i')} GROUP BY status`).all(),cursors,
    backfillComplete:Object.values(journals).every(c=>c.history>=c.end),ingestion:{journals,initialPending:Object.values(journals).some(c=>!c.initialized),freshPending:Object.values(journals).some(c=>c.fresh<c.tail)}};
  }
 }

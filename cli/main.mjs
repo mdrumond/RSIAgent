@@ -49,7 +49,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const [command,arg]=positionals;
   const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','bind','upgrade','reconcile-local','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage','skills-review']};
+  if (values.help || !command) return {commands:['bootstrap','bind','upgrade','reconcile-local','failures','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage','skills-review']};
   const storageAction=command==='storage'?(values.config?JSON.parse(await readFile(values.config,'utf8')):{...values,action:values.action??arg??'inspect'}):null;
   if(storageAction?.action==='unpack')return (await import('./storage.mjs')).runStandalone({...storageAction,signal});
   if (command==='bootstrap') {
@@ -59,6 +59,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   }
   if(command==='skills-review')return (await import('./skill-review.mjs')).runReview({...JSON.parse(await readFile(values.config,'utf8')),signal});
   const config=await readConfig(root);
+  if(command==='failures')return (await import('./failures.mjs')).runFailures(config,values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'inspect'});
   if(command==='reconcile-local')return (await import('./local-reboot.mjs')).reconcileLocalReboot(config,
     values.config?{...JSON.parse(await readFile(values.config,'utf8')),...(values.apply?{apply:true}:{})}:null);
   if(command==='bind')return (await import('./portable-binding.mjs')).bindPortable(root,JSON.parse(await readFile(values.config,'utf8')));

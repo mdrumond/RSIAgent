@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { currentCampaignEntry, startCampaignEntry } from './progress.mjs';
 import { stages } from './workflow.mjs';
 import { failureSettled } from './lifecycle.mjs';
+import {projectAttention} from './failure-attention.mjs';
 
 export function modePolicy(mode, { inferenceRecovery = true } = {}) {
   if (!['phase1', 'phase2', 'inference'].includes(mode)) throw new Error('Unknown mode');
@@ -63,6 +64,7 @@ export class RecoveryQueue {
       if (this.db.prepare('SELECT 1 FROM recovery_attempts WHERE attempt=?').get(attemptId))
         throw new Error('Recovery attempts complete through the recovery queue');
       const project = this.state.project(attempt.project);
+      if(projectAttention(this.db,project.id)!=='active')return null;
       if (project.frozen || project.status !== 'failed') throw new Error('Project is not recoverable');
       const existing = this.entry(project.id);
       if (existing) return existing;
@@ -85,14 +87,14 @@ export class RecoveryQueue {
         WHERE a.project=q.project AND e.sequence=(SELECT MAX(last.sequence) FROM events last
           WHERE last.attempt=a.id AND last.type='failure-settlement')
         AND json_extract(e.data,'$.closed')!=1)
-      ORDER BY q.eligible_wave,q.project`).all(wave,Date.now());
+      ORDER BY q.eligible_wave,q.project`).all(wave,Date.now()).filter(row=>projectAttention(this.db,row.project)==='active');
   }
   claim(projectId, wave, owner = {}, resourceId) {
     this.wave(wave);
     return this.transaction(() => {
       const queue = this.entry(projectId), project = this.state.project(projectId);
       const original = project?.status === 'queued' && !queue;
-      if (!project || project.frozen || (!original && !this.ready(wave).some(row => row.project === projectId)))
+      if (!project || project.frozen || projectAttention(this.db,projectId)!=='active' || (!original && !this.ready(wave).some(row => row.project === projectId)))
         throw new Error('Job is not eligible');
       if (original) {
         const saved = this.db.prepare("SELECT name FROM sqlite_master WHERE name='control'").get() &&
