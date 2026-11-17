@@ -69,3 +69,16 @@ test('rebuild rejects changed evidence and active comparisons, preserves infrast
  const item=backlog.upsert({key:'active',groupIds:[group.id],objective:'correctness',proposal:{action:'update',changes:[]},base:'v1'});backlog.claim({base:'v1',itemId:item.id});
  await assert.rejects(auditQueueRebuild(config,state.db,input,deps),/Settle active/);assert.equal(backlog.get(item.id).status,'running');
 });
+
+test('an acknowledged failure cannot become an unready update with no executable learning request',async t=>{
+ const {state,backlog,group,config}=await fixture(t);backlog.acknowledge(group.id);assert.equal(backlog.status().dirtyFailures,0);
+ const input={id:'missing-cases',operator:{reason:'Rebuild actionable work'},seeds:[{id:'gather',objective:'correctness',groupIds:[group.id],evidenceRefs:[group.occurrences[0].reference],proposal:{action:'update',changes:[{action:'add',scope:'implementation',text:'Place indices on the tensor device'}]}}]};
+ const unready={readiness:async()=>({ready:false,supported:true})};
+ await assert.rejects(auditQueueRebuild(config,state.db,input,unready),/requires ready evaluation cases/);
+ await assert.rejects(rebuildQueue(config,state.db,{...input,auditSignature:'unused'},unready),/requires ready evaluation cases/);
+ assert.equal(backlog.list().length,0);assert.equal(backlog.meta('queue-epoch'),null);assert.equal(backlog.status().dirtyFailures,0);
+ const ready={readiness:async()=>({ready:true,supported:true})},audit=await auditQueueRebuild(config,state.db,input,ready);
+ assert.equal(audit.seeds[0].readiness.ready,true);
+ const rebuilt=await rebuildQueue(config,state.db,{...input,auditSignature:audit.signature},ready),item=backlog.get(rebuilt.seedIds[0]);
+ assert.equal(item.status,'queued');assert.equal(item.priority,100);assert.equal(backlog.claim({base:'v1',itemId:item.id}).item.id,item.id);
+});

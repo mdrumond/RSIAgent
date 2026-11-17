@@ -137,7 +137,9 @@ Supply an operator JSON file with `action: "rebuild-audit"`, a unique `id`,
 `objective` (`correctness` or `optimization`), active `groupIds`, exact
 `evidenceRefs`, and either an approved `proposal` or a bounded `question`,
 `requiredEvidence`, and `learningTarget` (`cpu` or `device`). The audit reports
-actual case readiness and independent project/attempt counts. Unclassified
+actual case readiness and independent project/attempt counts. Update proposals
+require ready evaluation cases; otherwise submit a bounded learning question
+for the missing cases. The audit rejects unready updates before changing state. Unclassified
 claims of skill benefit are not proof. Harness incidents remain human work.
 Known infrastructure-blocked learning requests can be annotated explicitly as
 `openInfrastructureBlocked: [{requestId, diagnosis, evidenceRefs}]`; they remain

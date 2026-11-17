@@ -35,7 +35,9 @@ export async function auditQueueRebuild(config,db,input,{readiness=hypothesisCas
   const projects=new Set(),attempts=new Set();
   for(const id of seed.groupIds)for(const row of db.prepare(`SELECT o.data FROM skill_backlog_occurrences o WHERE group_id=? AND ${activeOccurrenceSql(db,'o')}`).all(id)){const o=JSON.parse(row.data);if(o.projectId)projects.add(o.projectId);if(o.attemptId)attempts.add(o.attemptId);}
   const item={...seed,target:config.target,base:config.skills.activeVersion,proposal,evidence:{groups,frequency:{projects:projects.size,attempts:attempts.size}}};
-  seeds.push({...item,readiness:await readiness({config,backlog,item})});
+  const caseReadiness=await readiness({config,backlog,item});
+  if(proposal.action==='update'&&!caseReadiness.ready)throw Error('Update seed requires ready evaluation cases; supply a bounded learning question for missing cases');
+  seeds.push({...item,readiness:caseReadiness});
  }
  seeds.sort((a,b)=>Number(!!b.readiness.ready)-Number(!!a.readiness.ready)||Number(!!b.readiness.supported)-Number(!!a.readiness.supported)||b.evidence.frequency.projects-a.evidence.frequency.projects||b.evidence.frequency.attempts-a.evidence.frequency.attempts||a.id.localeCompare(b.id));
  const humanReview=input.openInfrastructureBlocked??[];
@@ -57,7 +59,7 @@ export async function rebuildQueue(config,db,input,dependencies){
   backlog.meta('queue-rebuild',{id:input.id,groupIds:[...new Set(audit.seeds.flatMap(s=>s.groupIds))],cutoffs});
   for(const k of ['hypothesis-cohort','procedural-continuations','learning-scan'])backlog.meta(k,null);
   const items=audit.seeds.map((seed,index)=>{
-   const {readiness,...value}=seed,item=backlog.upsert({...value,key:'seed:'+seed.id,priority:100-index,status:seed.proposal.action==='update'&&readiness.ready?'queued':'learning',reason:JSON.stringify({ready:!!readiness.ready,supported:!!readiness.supported,...seed.evidence.frequency})});
+   const {readiness,...value}=seed,item=backlog.upsert({...value,key:'seed:'+seed.id,priority:100-index,status:seed.proposal.action==='update'?'queued':'learning',reason:JSON.stringify({ready:!!readiness.ready,supported:!!readiness.supported,...seed.evidence.frequency})});
    if(item.status==='archived')throw Error('Seed repeats archived proposal; provide a distinct grounded question');
    if(seed.proposal.action==='learn')enqueueLearningRequest({db},{...seed.proposal,target:config.target,groupIds:seed.groupIds,backlogId:item.id,priority:item.priority});return item.id;
   });
