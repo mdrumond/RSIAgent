@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
+import {runtimeStatus} from '../../controller/runtime-status.mjs';
 import {writeAttemptJob,readAttemptJob} from '../../cli/attempt-job.mjs';
 import {migrateForegroundCheckpoint} from '../../cli/foreground-resource.mjs';
 import {setup,rows,until} from './driver_setup.mjs';
@@ -55,6 +56,30 @@ test('unresolved native work, an unknown physical lease, or a live owner never y
     assert.equal(f.state.db.prepare('SELECT resource FROM resource_leases').get().resource,f.resources[0].id);
     assert.equal(await readFile(f.file,'utf8'),before);
     assert.equal(f.state.queryEvents(f.attempt.id,{types:['foreground-resource-migrated']}).length,0);
+  });
+});
+
+test('reconciliation errors stay visible and deduplicated without changing checkpoint custody',async t=>{
+  for(const stage of ['environment','execution-closure','device-lease-closure'])await t.test(stage,async t=>{
+    const f=await fixture(t),before=f.state.attempt(f.attempt.id),bytes=await readFile(f.file,'utf8');
+    const failure=()=>{throw Object.assign(new Error('Retained lease or native observation unavailable'),{code:'EIO'});};
+    if(stage==='environment')f.input.createEnvironment=failure;
+    else if(stage==='execution-closure'){
+      f.state.event(f.attempt.id,'execution-starting',{operation:'retained',startElapsed:123.75});
+      f.environment.reconcileOperation=failure;
+    }else f.environment.reconcileLease=failure;
+    for(let i=0;i<3;i++)assert.equal(await migrateForegroundCheckpoint(f.input),null);
+    assert.deepEqual(f.state.attempt(f.attempt.id),before);assert.equal(await readFile(f.file,'utf8'),bytes);
+    assert.equal(f.state.db.prepare('SELECT resource FROM resource_leases').get().resource,f.resources[0].id);
+    assert.equal(f.state.queryEvents(f.attempt.id,{types:['foreground-resource-blocked']}).length,1);
+    assert.equal(f.state.failures(f.attempt.id).length,1);
+    const blocked=runtimeStatus(f.state).resourceBlocked;assert.equal(blocked.length,1);
+    assert.equal(blocked[0].attempt,f.attempt.id);assert.equal(blocked[0].stage,stage);assert.equal(blocked[0].code,'EIO');
+    f.input.createEnvironment=async()=>f.environment;
+    f.environment.reconcileOperation=async()=>({closed:true,executionSeconds:0,handles:[]});
+    f.environment.reconcileLease=async()=>true;
+    assert.equal((await migrateForegroundCheckpoint(f.input)).id,f.resources[1].id);
+    assert.deepEqual(runtimeStatus(f.state).resourceBlocked,[]);
   });
 });
 
@@ -167,7 +192,9 @@ test('a cached resume whose metadata becomes unwritable cannot abort an unrelate
   f.pass();
 });
 
-test('the promotion gate frees the A/B slot without starting the retained foreground actor',async t=>{
+for(const failing of [false,true])test(failing
+  ?'the gated controller keeps a reconciliation error local and visible without admitting actors'
+  :'the promotion gate frees the A/B slot without starting the retained foreground actor',async t=>{
   const f=await setup(t,'phase2',['retained']);
   const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
   const resources=[0,1].map(hostSlot=>({id:'fixture-slot-'+hostSlot,available:true,
@@ -176,7 +203,8 @@ test('the promotion gate frees the A/B slot without starting the retained foregr
   const generic=pathToFileURL(join(f.root,'machinery','integrations/environments/index.mjs')).href;
   await writeFile(environment,`import {createEnvironment as generic} from ${JSON.stringify(generic)};
     export async function createEnvironment(options,context){return {...await generic(options,context),
-      resources:async()=>${JSON.stringify(resources)},reconcileLease:async()=>true};}`);
+      resources:async()=>${JSON.stringify(resources)},reconcileLease:async()=>{${failing
+        ?"throw Object.assign(new Error('Retained lease unreadable'),{code:'EIO'});":'return true;'}}};}`);
   const input=join(f.root,'gate-settings.json');
   await writeFile(input,JSON.stringify({environment:{module:environment,options:{mode:'local'}},campaign_seconds:30,concurrency:2,
     skills:{...config.skills,background:true,tuningDisabled:true,promotionGate:{baseVersion:config.skills.activeVersion,status:'waiting'}}}));
@@ -193,12 +221,18 @@ test('the promotion gate frees the A/B slot without starting the retained foregr
   }finally{state.close();}
   const running=f.start('resume');
   try {
-    await until(()=>rows(f.root,"SELECT 1 FROM events WHERE type='foreground-resource-migrated'").length>0,10000);
+    await until(()=>rows(f.root,`SELECT 1 FROM events WHERE type='${failing?'foreground-resource-blocked':'foreground-resource-migrated'}'`).length>0,10000);
     const checkpoint=rows(f.root,'SELECT outcome,session,elapsed FROM attempts')[0];
     assert.equal(checkpoint.outcome,null);assert.equal(checkpoint.session,null);assert.equal(checkpoint.elapsed,7.25);
     assert.equal(rows(f.root,"SELECT 1 FROM events WHERE type='task-constructed'").length,0);
-    assert.equal(rows(f.root,'SELECT resource FROM resource_leases')[0].resource,resources[1].id);
+    assert.equal(rows(f.root,'SELECT resource FROM resource_leases')[0].resource,resources[failing?0:1].id);
     assert.equal(f.server.requests.length,0);
+    if(failing){
+      const status=await f.run('status');assert.equal(status.controller.state,'running');
+      assert.equal(status.resourceBlocked[0].attempt,id);assert.equal(status.resourceBlocked[0].code,'EIO');
+      assert.equal(rows(f.root,"SELECT 1 FROM events WHERE type='foreground-resource-blocked'").length,1);
+      assert.equal(rows(f.root,"SELECT 1 FROM events WHERE type='scheduler-error'").length,0);
+    }
   }finally{await f.run('pause');await running.output;}
   f.pass();
 });

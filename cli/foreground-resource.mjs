@@ -25,8 +25,22 @@ export async function migrateForegroundCheckpoint({state,config,job,resources,re
   if(!next)return null;
   // The old binding owns reconciliation. Never route an unknown command or
   // physical-device lease onto the replacement slot to make it appear stopped.
-  const environment=await createEnvironment(prior);
-  if(!await attemptStopped(state,attempt,environment)||!environment.reconcileLease||!await environment.reconcileLease())return null;
+  let stage='environment';
+  try {
+    const environment=await createEnvironment(prior);stage='execution-closure';
+    if(!await attemptStopped(state,attempt,environment))return null;
+    stage='device-lease-closure';
+    if(!environment.reconcileLease||!await environment.reconcileLease())return null;
+  }catch(error){
+    const code=String(error.code??'RECONCILIATION_ERROR');
+    const last=state.queryEvents(id,{types:['foreground-resource-blocked','foreground-resource-migrated'],order:'desc',limit:1})[0];
+    if(last?.type!=='foreground-resource-blocked'||last.data.stage!==stage||last.data.code!==code||last.data.resource!==prior.id){
+      const message=String(error.message??error).slice(0,1000);
+      state.event(id,'foreground-resource-blocked',{resource:prior.id,stage,code,message});
+      state.recordFailure(id,{phase:'controller',kind:'foreground-resource-reconciliation',message,operation:stage});
+    }
+    return null;
+  }
   if(!isDeepStrictEqual((await readConfig(config.root)).environment,config.environment))return null;
   const moved={...manifest,resource:next};
   state.db.exec('BEGIN IMMEDIATE');
