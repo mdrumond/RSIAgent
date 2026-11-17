@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {importProject} from '../../cli/instance.mjs';
 import {compileGenerationProposal} from '../../cli/project-generation.mjs';
-import {loadSkillEvaluation} from '../../cli/skill-evaluation-contract.mjs';
+import {loadSkillEvaluation,SkillEvaluationContractError} from '../../cli/skill-evaluation-contract.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'suite-contract-'));t.after(()=>rm(root,{recursive:true,force:true}));
  for(const dir of ['source','reference','negative','verifier','instance'])await mkdir(join(root,dir));
@@ -52,4 +52,11 @@ test('legacy A3 kernel task metadata retains inferred A3 target compatibility',a
  const f=await fixture(t);f.contract.target='a3';for(const task of f.contract.tasks){delete task.target;task.kind='a3-kernel';}await f.save();
  await compileGenerationProposal(f.root,f.proposal,{skillEvaluation:true});const imported=await importProject(join(f.root,'instance'),f.spec());
  assert.equal((await loadSkillEvaluation(imported)).tasks[0].kind,'a3-kernel');
+});
+
+for(const bytes of ['{','null',JSON.stringify({target:'cpu',objective:'correctness',tasks:[null,null,null,null,null]})])test('malformed contract data has a typed terminal error at real admission boundaries: '+bytes,async t=>{
+ const f=await fixture(t);await writeFile(join(f.root,'verifier','skill-evaluation.json'),bytes);
+ const typed=error=>error instanceof Error&&error instanceof SkillEvaluationContractError&&error.code==='INVALID_SKILL_EVALUATION';
+ await assert.rejects(compileGenerationProposal(f.root,f.proposal,{skillEvaluation:true}),typed);
+ await assert.rejects(importProject(join(f.root,'instance'),f.spec()),typed);
 });

@@ -220,6 +220,7 @@ export async function refillProjects({config,state,bridge,concurrency,path,signa
               const constructionCommand=entrypointCommand(construction.entrypoints.command);
               const packaged=await projectBundle(artifacts,constructionCommand,d.seconds,await realpath(root));
               artifacts.files=packaged.files;
+              await loadSkillEvaluation({source:artifacts.source,verifier:{files:artifacts.files}},{required:generation.requireSkillEvaluation===true});
               const env=await createEnvironment({mode:'local',localExecution:config.local_execution},{instancePath:root,signal:active,
                 exclude:async(_label,fn)=>fn(),event:(type,data)=>store.adapter.event(d.id,type,data)});
               const hashFiles=()=>bundleHashes(artifacts.files);

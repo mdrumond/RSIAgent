@@ -33,7 +33,7 @@ function workflow({pass, interrupt}) {
   }
   return calls;
 }
-export async function provider(scenario, {nativeSession, workflowForGoal, resolveCall, writerChanges, reviewPlan} = {}) {
+export async function provider(scenario, {nativeSession, workflowForGoal, resolveCall, writerChanges, reviewPlan, generationPlan, samplePlan} = {}) {
   const requests = [], failures = [], plans = new Map();
   let originals = 0, writers = 0;
   const server = createServer(async (req,res) => {
@@ -48,9 +48,10 @@ export async function provider(scenario, {nativeSession, workflowForGoal, resolv
       const key = prompt.startsWith('Goal:') ? prompt.split('\n')[0] : prompt;
       if (!count) {
         let plan;
-        if(reviewPlan&&prompt.startsWith('Read input.json'))plan=await reviewPlan(body);
+        if(samplePlan&&prompt.startsWith('Host-only kernel-engineering microtask.'))plan=await samplePlan(body);
+        else if(reviewPlan&&prompt.startsWith('Read input.json'))plan=await reviewPlan(body);
         else if (prompt.startsWith('Construct ONE fresh original')) {
-          plan=[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
+          plan=generationPlan?await generationPlan(body):[tool('mcp__kdb__search',{query:'independent arithmetic oracle',kind:'good',limit:1}),
             tool('write',{path:'source/answer.py',content:'def answer(): return 42\n'}),
             tool('write',{path:'reference/answer.py',content:'def answer(): return 6 * 7\n'}),
             tool('write',{path:'negative/answer.py',content:'def answer(): return -1\n'}),

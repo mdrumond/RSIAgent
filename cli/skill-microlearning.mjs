@@ -4,7 +4,8 @@ import {fileURLToPath} from 'node:url';
 import {join,resolve,sep} from 'node:path';
 import {State} from '../controller/state.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
-import {refillProjects} from './project-generation.mjs';
+import {refillProjects,rejectGeneratedProject} from './project-generation.mjs';
+import {SkillEvaluationContractError,skillEvaluationExample} from './skill-evaluation-contract.mjs';
 import {importProject} from './instance.mjs';
 import {operate,instanceStopped} from './runtime.mjs';
 import {ensureKnowledgeService} from './knowledge.mjs';
@@ -35,7 +36,7 @@ export function microlearningConfig(config,{directory,request,resource,seconds})
  if(picked.environment?.module)picked.environment={...picked.environment,module:resolve(config.root,picked.environment.module)};
  return {...picked,format:1,root:directory,target:cpu?'cpu':config.target,mode:'phase1',concurrency:1,resource_ids:[resource.id],actor_seconds:seconds,curriculum_seconds:seconds,
   campaign_plan:[{id:'microlearning',phase:'phase1',new_projects:1}],phase_targets:{phase1:1},
-  curriculum:{generation:{enabled:true,requireSkillEvaluation:request.workKind==='suite',topics:[request.question],preprompt:'Investigate only this bounded learning question. Preserve independent reference and negative controls; report actual observations. For suite work, export protected verifier/skill-evaluation.json before submission: exactly five cases with reference and negative controls; every path is relative to that manifest directory and every dependency must be declared in verifier.files. Use UTF-8 text/JSON or seed-generated fixtures, never binary tensor files. Request: '+JSON.stringify(request)}},
+  curriculum:{generation:{enabled:true,requireSkillEvaluation:request.workKind==='suite',topics:[request.question],preprompt:'Investigate only this bounded learning question. Preserve independent reference and negative controls; report actual observations. For suite work, export protected verifier/skill-evaluation.json before submission: exactly five cases with reference and negative controls; every path is relative to that manifest directory and every dependency must be declared in verifier.files. Use UTF-8 text/JSON or seed-generated fixtures, never binary tensor files. CPU correctness contract template (adapt semantics and target; declare the manifest, checker and every mapped file in verifier.files): '+JSON.stringify(skillEvaluationExample)+'. Device cases use target-kernel and the matching a3/a5 target; optimization also requires pairedChecker. Request: '+JSON.stringify(request)}},
   campaign_seconds:seconds,skills:{activeVersion:config.skills.activeVersion,background:false,tuningDisabled:true,review:{enabled:false},priority:{enabled:false}},recovery:false};
 }
 export async function microlearningSettled(config,work,dependencies={}){
@@ -63,9 +64,21 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
  const left=()=>Math.max(0,Math.min(work.seconds-spent(),remainingSeconds-(ops.now()-begun)/1000));
  await mkdir(work.directory,{recursive:true});save();const timer=setInterval(save,1000);
  const budget=AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000))),active=signal?AbortSignal.any([signal,budget]):budget;
+ const rejectInvalid=()=>{
+  const failure=work.invalidContract;
+  const state=new State(join(work.directory,'state.sqlite'));
+  try{if(work.invalidSpec)rejectGeneratedProject(state,work.invalidSpec,new SkillEvaluationContractError(failure.message));}finally{state.close();}
+  work.elapsed=spent();delete work.runningAt;delete work.owner;
+  backlog.atomic(()=>{
+   backlog.db.prepare("UPDATE skill_learning_requests SET status='inconclusive',data=? WHERE id=?").run(JSON.stringify({...work.request,findings:{instanceRoot:work.directory,outcome:'inconclusive',validationFailure:failure}}),work.id);
+   backlog.meta('microlearning-last',{...work,status:'inconclusive',reason:failure.code});backlog.meta('microlearning-active',null);
+  });
+  return {status:'inconclusive',reason:failure.code,error:failure.message};
+ };
  let child;
  try{
   try{child=JSON.parse(await readFile(join(work.directory,'instance.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+  if(work.invalidContract)return rejectInvalid();
   if(left()<=0){
    if(child&&!await ops.stopped(child))return {status:'blocked',reason:'Expired learning child remains unresolved'};
    work.elapsed=spent();delete work.runningAt;delete work.owner;backlog.meta('microlearning-last',{...work,status:'inconclusive',reason:'microlearning-elapsed'});backlog.meta('microlearning-active',null);
@@ -108,7 +121,7 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
     const bridge=ops.createKdbBridge({url,attemptId:work.id,agentDir:join(work.directory,'agent')});
     work.stage='construction';save();
     const drafts=await ops.construct({config:child,state,bridge,concurrency:1,path:join(work.directory,'drafts'),signal:active});
-    if(drafts[0]){spec=await ops.importProject(work.directory,{...drafts[0],phase:'phase1',campaign_entry:'microlearning',generation:{...drafts[0].generation,learningRequest:work.request},actor_seconds:Math.max(.001,left())},{signal:active});state.add(spec);}
+    if(drafts[0]){work.invalidSpec=drafts[0];save();spec=await ops.importProject(work.directory,{...drafts[0],phase:'phase1',campaign_entry:'microlearning',generation:{...drafts[0].generation,learningRequest:work.request},actor_seconds:Math.max(.001,left())},{signal:active});state.add(spec);delete work.invalidSpec;}
    }
    if(spec&&left()>0){
     child.projects=[spec];child.curriculum={phase1:[spec.id],generation:{enabled:false}};child.actor_seconds=Math.min(spec.actor_seconds,left());
@@ -131,7 +144,13 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
    work.elapsed=spent();delete work.runningAt;delete work.owner;backlog.meta('microlearning-last',{...work,status:verified?'verified':'inconclusive',reason:qualification?.reason});backlog.meta('microlearning-active',null);
    return {status:verified?'verified':'inconclusive',findings:data.findings,qualification};
   }finally{state.close();}
- }catch(error){work.stage='settlement';save();throw error;}finally{
+ }catch(error){
+  work.stage='settlement';
+  if(error instanceof SkillEvaluationContractError)work.invalidContract={code:error.code,message:error.message};
+  save();
+  if(work.invalidContract&&child&&await ops.stopped(child)&&(!work.qualificationDirectory||await ops.settled({directory:work.qualificationDirectory,config,resource})))return rejectInvalid();
+  throw error;
+ }finally{
   clearInterval(timer);
   if(backlog.meta('microlearning-active')){
    save();let closed=false;
