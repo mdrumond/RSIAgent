@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,access,chmod} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
@@ -42,6 +42,20 @@ test('failed atomic file publication retains the trusted checkpoint and database
   assert.deepEqual(await readAttemptJob(f.state,f.root,f.attempt.id),f.job);
   f.state.db.exec('BEGIN IMMEDIATE');publishAttemptJob(f.state,f.attempt.id,{...f.job,mode:'phase2'});f.state.db.exec('ROLLBACK');
   assert.equal((await readAttemptJob(f.state,f.root,f.attempt.id)).mode,'phase1');
+});
+
+test('checkpoint materialization failures block only the affected attempt and retry the same trusted bytes',async t=>{
+  if(process.getuid?.()===0){t.skip('root bypasses directory write permissions');return;}
+  const f=await fixture(t);await writeAttemptJob(f.state,f.root,f.attempt.id,f.job);await rm(f.file);
+  const directory=join(f.root,'attempts',f.attempt.id),before=f.state.attempt(f.attempt.id);
+  await chmod(directory,0o555);
+  try{
+    assert.equal(await availableAttemptJob(f.state,f.root,f.attempt.id),null);
+    assert.equal(runtimeStatus(f.state).metadataBlocked[0].reason,'checkpoint-materialization-failed');
+    assert.deepEqual(f.state.attempt(f.attempt.id),before);
+  }finally{await chmod(directory,0o700);}
+  assert.deepEqual(await availableAttemptJob(f.state,f.root,f.attempt.id),f.job);
+  assert.deepEqual(runtimeStatus(f.state).metadataBlocked,[]);
 });
 
 test('a portable destination never recovers pre-binding metadata but accepts its retained destination file',async t=>{

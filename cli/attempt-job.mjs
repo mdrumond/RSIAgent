@@ -39,7 +39,10 @@ export async function readAttemptJob(state,root,id) {
   const saved=exists(state)?state.db.prepare('SELECT * FROM attempt_job_manifests WHERE attempt=?').get(id):null;
   const boundary=saved&&state.queryEvents(id,{types:['portable-bound'],order:'desc',limit:1})[0];
   const stale=boundary&&boundary.sequence>saved.event_sequence;
-  if(saved&&!stale&&content!==saved.data){content=saved.data;source='controller-checkpoint';await publish(file,content);}
+  if(saved&&!stale&&content!==saved.data){
+    content=saved.data;source='controller-checkpoint';
+    try{await publish(file,content);}catch(error){throw new AttemptJobUnavailable(id,'checkpoint-materialization-failed',error);}
+  }
   if(content===undefined)throw new AttemptJobUnavailable(id,stale?'checkpoint-precedes-binding':'no-trusted-checkpoint',missing);
   let value;try{value=JSON.parse(content);}catch(error){throw new AttemptJobUnavailable(id,'invalid-metadata',error);}
   if(!value||typeof value!=='object'||Array.isArray(value))throw new AttemptJobUnavailable(id,'invalid-metadata');

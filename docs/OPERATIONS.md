@@ -187,4 +187,3 @@ For legacy attempts with no trusted checkpoint, `status.metadataBlocked` identif
 the affected attempt. Scheduling other work continues, but the affected outcome
 and execution custody are preserved. Restore the original metadata from retained
 evidence; do not invent a replacement job or renew its elapsed allowance.
-
