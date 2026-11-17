@@ -91,13 +91,22 @@ function terminalScopes(db,input){
 // Positive operation completions cover preceding starts only; no transport or writes.
 function journalClosed(db,id){
  const events=db.prepare('SELECT type,data FROM events WHERE attempt=? ORDER BY sequence').all(id).map(e=>({...e,data:parse(e.data)})),closed=new Map(),bash=new Map();
- const terminal=terminalExecutionProofs(events);
+ const terminal=terminalExecutionProofs(events),submitted=new Map();
+ for(const e of events){
+  if(e.type!=='execution-submitted'||!e.data.handle)continue;
+  const op=e.data.operation??e.data.submission;
+  if(op===undefined)continue;
+  const operations=submitted.get(e.data.handle)??new Set();operations.add(op);submitted.set(e.data.handle,operations);
+ }
  for(const [index,e]of events.entries()){
   if(e.type==='execution-settled'||e.type==='execution-reconciled'&&e.data.closed===true)closed.set(e.data.operation,index);
   if(e.type==='native-bash-completed')bash.set(e.data.operation,index);
  }
  return events.every((e,index)=>{
-  const op=e.data.operation??e.data.submission;
+  let op=e.data.operation??e.data.submission;
+  // Legacy transfer identities omitted operation; recover only an unambiguous
+  // exact submitted handle with immutable terminal evidence, never by proximity.
+  if(e.type==='execution-handle'&&op===undefined&&terminal.has(e.data.handle)&&submitted.get(e.data.handle)?.size===1)op=[...submitted.get(e.data.handle)][0];
   if(e.type==='native-bash-started')return (bash.get(op)??-1)>index;
   // Reconciliation records recovered handle identities after its closure event.
   // Only immutable native terminal evidence may cover that late identity;
