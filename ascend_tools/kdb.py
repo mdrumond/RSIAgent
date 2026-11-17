@@ -9,6 +9,7 @@ import os
 import tempfile
 
 from .knowledge import KnowledgeDB, RRF_K
+from .failure_attention import attention_snapshot, lesson_attention
 
 
 class KDB:
@@ -58,7 +59,8 @@ class KDB:
             )
 
     def search(self, query: str, kind: str = 'all', target: str | None = None,
-               limit: int = 10, generation: str | None = None):
+               limit: int = 10, generation: str | None = None,
+               include_retired: bool = False, attention_revision: int | None = None):
         if kind not in ('good', 'negative', 'all') or not 1 <= limit <= 50:
             raise ValueError('kind must be good/negative/all; limit must be 1..50')
         if generation is None:
@@ -67,6 +69,7 @@ class KDB:
         elif not self.db.connection.execute(
                 'SELECT 1 FROM memory_revisions WHERE revision=?', (generation,)).fetchone():
             raise KeyError(generation)
+        attention = attention_snapshot(self.db.path, attention_revision)
         selected = []
         rows = self.db.connection.execute('''
             SELECT c.name, s.kind, s.target FROM collections c
@@ -78,6 +81,8 @@ class KDB:
                   WHERE g.collection=c.name AND g.generation=?))
         ''', (generation,)).fetchall()
         for row in rows:
+            if not include_retired and lesson_attention(self.db.path, row['name'], attention):
+                continue
             scoped_kind = row['kind'] or 'good'
             if kind != 'all' and kind != scoped_kind:
                 continue
@@ -122,6 +127,7 @@ class KDB:
             manifest = self.db.manifest(name)
             hits.append(dict(hit, collection=name, kind=scoped_kind, generation=generation,
                              target=scoped_target, language=manifest.language,
+                             **(dict(attention_revision=attention['revision'], retirement=lesson_attention(self.db.path, name, attention)) if attention['revision'] or attention_revision is not None else {}),
                              kernel_languages=list(manifest.kernel_languages),
                              score=-negative_score, vector_rank=rank,
                              lexical_rank=keyword_rank, lexical_score=None,
@@ -131,7 +137,8 @@ class KDB:
                                            ((hit['collection'], hit['chunk_id']) for hit in hits))
         return hits
 
-    def read_entry(self, collection: str, entry_id: str, generation: str | None = None):
+    def read_entry(self, collection: str, entry_id: str, generation: str | None = None,
+                   include_retired: bool = False, attention_revision: int | None = None):
         """Read indexed evidence without needing its original source checkout."""
         explicit_generation = generation is not None
         is_memory = self.db.connection.execute(
@@ -150,9 +157,15 @@ class KDB:
         row = self.db.connection.execute(
             'SELECT text FROM chunks WHERE collection=? AND chunk_id=?',
             (collection, entry_id)).fetchone()
+        attention = attention_snapshot(self.db.path, attention_revision)
+        retirement = lesson_attention(self.db.path, collection, attention)
+        if retirement and not include_retired:
+            return dict(citation, generation=generation, text='', available=False, retirement=retirement,
+                        attention_revision=attention['revision'], evidence=[citation])
         encoded = row['text'].encode('utf-8')
         text = encoded[:16384].decode('utf-8', errors='ignore')
         return dict(citation, generation=generation, text=text, total_bytes=len(encoded),
+                    retirement=retirement, attention_revision=attention['revision'],
                     truncated=len(encoded) > 16384, evidence=[citation])
 
     def add_repo(self, path: str, collection: str, language: str,

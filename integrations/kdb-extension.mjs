@@ -15,7 +15,7 @@ function decode(result) {
   return hits;
 }
 
-export function createKdbBridge({url, attemptId, agentDir, target, generation, recordRetrieval, event = async () => {}}) {
+export function createKdbBridge({url, attemptId, agentDir, target, generation, attentionRevision, recordRetrieval, event = async () => {}}) {
   const endpoint = new URL(url);
   if (endpoint.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(endpoint.hostname)) {
     throw new Error('Instance KDB must use loopback HTTP');
@@ -23,7 +23,7 @@ export function createKdbBridge({url, attemptId, agentDir, target, generation, r
   if (!attemptId || !agentDir) throw new Error('KDB requires attemptId and attempt agentDir');
   const config = {
     servers: [{name: 'kdb', source: join(agentDir, 'mcp.json'), scope: 'extension', config: {
-      url: endpoint.href, headers: {'X-Attempt-Id': attemptId}, exposure: 'direct',
+      url: endpoint.href, headers: {'X-Attempt-Id': attemptId,...(attentionRevision===undefined?{}:{'X-Attention-Revision':String(attentionRevision)})}, exposure: 'direct',
     }}], errors: [], autoEnableCodemode: false,
   };
   const nativeExtension = createMcpExtension({loadConfig: () => config, logPath: join(agentDir, 'mcp.log')});

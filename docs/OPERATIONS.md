@@ -125,3 +125,36 @@ If an evaluator defect is found, preserve the original result and identify the
 corrected evaluator revision in a separate measurement. Do not supply diagnostic
 grading details to a learning agent. The included T102 correction is explicitly
 opt-in, source-hash-bound, and disabled by the standard example.
+
+### Rebuild failure planning without deleting evidence
+
+Checkpoint campaign, skill and memory writers first. `failures` maintenance
+refuses live writers or unsettled comparisons. Retain a storage snapshot before
+applying operator maintenance. No queue action retires an underlying failure.
+
+Supply an operator JSON file with `action: "rebuild-audit"`, a unique `id`,
+`operator.reason`, and at most five distinct `seeds`. Each seed names its `id`,
+`objective` (`correctness` or `optimization`), active `groupIds`, exact
+`evidenceRefs`, and either an approved `proposal` or a bounded `question`,
+`requiredEvidence`, and `learningTarget` (`cpu` or `device`). The audit reports
+actual case readiness and independent project/attempt counts. Unclassified
+claims of skill benefit are not proof. Harness incidents remain human work.
+Known infrastructure-blocked learning requests can be annotated explicitly as
+`openInfrastructureBlocked: [{requestId, diagnosis, evidenceRefs}]`; they remain
+open in the audit and stored archive, including inconclusive child findings.
+
+Run `node cli/main.mjs failures --instance INSTANCE --config operator.json`.
+Inspect the returned snapshot, seed order, retained active/inconclusive requests,
+and signature. Copy the signature to `auditSignature`, change only `action` to
+`rebuild`, and run the same command. A changed snapshot requires another audit.
+The archive retains original queued/learning/review drafts, pending requests,
+cohort and continuation metadata. Active projects and completed/accepted runs
+remain intact. A new queue epoch prevents archived proposals from reviving;
+analysis focuses on the selected groups and failures arriving after the rebuild.
+Targets, campaign budgets, outcomes and workload quotas are unchanged.
+
+Ordinary curriculum and KDB retrieval omit retired/quarantined harness-only
+attention; history remains available with `include_retired` for native KDB or
+`includeRetired` for project summaries, tagged with its attention status. A/B
+pairs pin their attention revision; existing in-flight evaluations preserve
+revision zero and their original identity.

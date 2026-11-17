@@ -70,8 +70,8 @@ async function provider(t,plan){
 test('native classification gets complete facts inline and repairs rejected proof in same Pi session',async t=>{
  const f=await fixture(t);f.state.event(f.attempt.id,'verification',{passed:true});f.state.finish(f.attempt.id,'failed');
  const summary=await projectSummary({state:f.state,projectId:'p'}),fact=summary.facts.find(x=>x.reference.endsWith(':passingVerificationCount'));
- const value={cause:'unknown',reason:'One passing verification exists',coverage:'unknown',guidanceIds:[],evidenceRefs:['failure:1'],gap:'unknown',claims:[proof(fact,'One passing verification exists')]};
- const p=await provider(t,(n,body)=>{if(n===0)return ['read',{path:'input.json'}];if(n===1)return ['submit_review',{result:{...value,claims:[{...value.claims[0],proofs:[{...value.claims[0].proofs[0],value:0}]}]}}];if(n===2){assert.match(JSON.stringify(body.messages),/Structured fact assertion/);return ['submit_review',{result:value}];}});
+ const value={cause:'unknown',reason:'One passing verification exists',coverage:'unknown',guidanceIds:[],evidenceRefs:['failure:1'],gap:'unknown',claims:[{path:'reason',kind:'observation',proofs:[{reference:fact.reference}]}]};
+ const p=await provider(t,(n,body)=>{if(n===0)return ['read',{path:'input.json'}];if(n===1)return ['submit_review',{result:{...value,claims:[{...value.claims[0],proofs:[{...value.claims[0].proofs[0],value:0}]}]}}];if(n===2){return ['submit_review',{result:value}];}});
  const directory=join(f.root,'review'),input={directory,config:{root:f.root,actor:p.profile},group:{id:'failure',occurrences:[{reference:'failure:1',projectId:'p',attemptId:f.attempt.id,message:'failed attempt'}]},entries:[],seconds:15,validate:r=>r};
  const out=await nativeClassify(input);assert.equal(out.value.reason,value.reason);assert.equal(p.requests(),4);
  const context=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));assert.equal(context.projectSummaries[0].projectStatus,'failed');assert.equal(context.proofEvidence.find(x=>x.factId===fact.factId).value,1);

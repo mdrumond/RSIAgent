@@ -1,3 +1,4 @@
+import {attentionRevision} from '../controller/failure-attention.mjs';
 /** Campaign-local failure backlog; one retained hypothesis owns the background slot. */
 import {createHash} from 'node:crypto';
 import {mkdir,readFile} from 'node:fs/promises';
@@ -15,6 +16,13 @@ import {resolveHypothesisCases,qualifiedSuites} from './skill-priority-cases.mjs
 import {refreshCohort,cohortStatus,hasCohortCandidates,claimCohort,attachRetainedCohort,admissibleContinuations,retireStaleContinuations} from './skill-cohort.mjs';
 const caseReadiness=async args=>(await import('./skill-priority-cases.mjs')).hypothesisCaseReadiness?.(args)??{ready:false};
 
+// Historical in-flight pairs retain their pre-overlay identity and revision zero.
+export function freezeAttentionBinding(backlog,checkpoint,cases){
+ if(checkpoint.evaluationDirectory&&checkpoint.evaluation?.binding?.attentionRevision===undefined)return cases;
+ checkpoint.attentionRevision??=attentionRevision(backlog.db);
+ return {...cases,binding:{...cases.binding,attentionRevision:checkpoint.attentionRevision,
+  ...(cases.binding?.knowledge?{knowledge:{...cases.binding.knowledge,attentionRevision:checkpoint.attentionRevision}}:{})}};
+}
 const executionDirectory=checkpoint=>checkpoint?.evaluationDirectory??checkpoint?.qualificationDirectory;
 async function evaluationReport(checkpoint){
  if(!checkpoint?.evaluationDirectory)return null;
@@ -148,7 +156,7 @@ export async function runPrioritySkills(config,values,dependencies={}){
    if(feedback){const bytes=JSON.stringify(feedback,null,2)+'\n';try{writeFileSync(path,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||readFileSync(path,'utf8')!==bytes)throw error;}}
    return backlog.atomic(()=>{const done=backlog.finish(run.id,{status,result});if(feedback)state.event(null,'skill-hypothesis-rejected',{...feedback,evidence:{path}});return done;});
   };
-  const freezeCases=async cases=>{const {protocol}=await freezeHypothesisProtocol({directory:join(home,'evaluation'),target:cases.target,binding:cases.binding});return {...cases,...(protocol?{protocol}:{})};};
+  const freezeCases=async cases=>{cases=freezeAttentionBinding(backlog,checkpoint,cases);save();const {protocol}=await freezeHypothesisProtocol({directory:join(home,'evaluation'),target:cases.target,binding:cases.binding});return {...cases,...(protocol?{protocol}:{})};};
   const qualificationDirectory=join(home,'cases','qualification');
   checkpoint.qualificationDirectory??=qualificationDirectory;save();
   const beforeQualification=async directory=>{checkpoint.qualificationDirectory=directory;save();};

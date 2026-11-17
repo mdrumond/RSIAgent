@@ -13,6 +13,33 @@ from ascend_tools.kdb_service import create_server
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_search_and_read_enforce_the_pinned_attention_revision(self):
+        calls = []
+        class Backend:
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                return []
+            def read_entry(self, **kwargs):
+                calls.append(kwargs)
+                return {'text': 'historical', 'retirement': {'state': 'retired'}}
+            def event(self, *args, **kwargs):
+                pass
+            def close(self):
+                pass
+        app = create_server(Backend).streamable_http_app()
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                    headers={'x-attempt-id': 'paired', 'x-attention-revision': '7'}) as client:
+                async with streamable_http_client('http://127.0.0.1:8765/mcp', http_client=client) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        self.assertFalse((await session.call_tool('search', {'query': 'index'})).isError)
+                        self.assertFalse((await session.call_tool('read_entry', {'collection': 'lesson-a', 'entry_id': 'b', 'include_retired': True})).isError)
+                        self.assertTrue((await session.call_tool('search', {'query': 'index', 'attention_revision': 8})).isError)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c['attention_revision'] for c in calls], [7, 7])
+        self.assertTrue(calls[1]['include_retired'])
+
     async def test_slow_search_keeps_protocol_responsive_and_serializes_backend(self):
         started, release, closed = (threading.Event() for _ in range(3))
         calls = []

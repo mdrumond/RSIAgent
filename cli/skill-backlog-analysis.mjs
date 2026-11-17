@@ -1,3 +1,4 @@
+import {hypothesisCaseReadiness} from './skill-priority-cases.mjs';
 /** Campaign-local failure analysis. Model work never holds the foreground ledger. */
 import {createHash} from 'node:crypto';
 import {mkdir,readFile,writeFile,rename,open,realpath,readdir} from 'node:fs/promises';
@@ -122,7 +123,7 @@ function learningPage(backlog,config){
 function consumeLearning(backlog,contributors){
  for(const {item,results}of contributors){const current=backlog.get(item.id);if(current)backlog.upsert({...current,evidence:{...current.evidence,learningIdentity:learningIdentity(results)}});}
 }
-function priority(group){return Math.min(90,20+Math.min(30,group.count??group.occurrences.length)+(['execution-unresolved','project-invalid'].includes(group.type)?20:0));}
+function priority(group){return Math.min(90,20+Math.min(30,group.frequency?group.frequency.projects+group.frequency.attempts+group.frequency.drafts:group.occurrences.length)+(['execution-unresolved','project-invalid'].includes(group.type)?20:0));}
 
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,limit=8},dependencies={}){
@@ -189,13 +190,13 @@ export async function prioritizeBacklog({config,backlog,directory,signal,seconds
  const cursor=backlog.meta('priority-cursor')??0,ordered=open.slice().sort((a,b)=>b.priority-a.priority||a.created-b.created);
  const refresh=changed.length?changed.slice(0,20):ordered.slice(cursor,cursor+20);
  const items=[...new Map([...refresh,...ordered.slice(0,4)].map(i=>[i.id,i])).values()];
- const ops=await operations(dependencies),clock=allocation(seconds,signal),input=items.map(i=>({id:i.id,objective:i.objective,skill:i.skill,priority:i.priority,reason:i.reason,
-  proposal:i.proposal,evidence:i.evidence?.groups?.map(g=>({id:g.id,type:g.type,message:g.message,count:g.count}))}));
+ const ops=await operations(dependencies),clock=allocation(seconds,signal),input=await Promise.all(items.map(async i=>({caseReadiness:await (dependencies.caseReadiness??hypothesisCaseReadiness)({config,backlog,item:i}),id:i.id,objective:i.objective,skill:i.skill,priority:i.priority,reason:i.reason,
+  proposal:i.proposal,evidence:i.evidence?.groups?.map(g=>({id:g.id,type:g.type,message:g.message,frequency:g.frequency,observations:g.count}))})));
  const validate=value=>{
   const rows=Array.isArray(value)?value:value?.priorities;if(!Array.isArray(rows)||rows.length!==items.length||new Set(rows.map(r=>r.id)).size!==items.length||rows.some(r=>!items.some(i=>i.id===r.id)||!Number.isFinite(r.priority)||r.priority<0||r.priority>100||!r.reason?.trim()))throw Error('Rank every open hypothesis once with priority 0–100 and evidence-supported reason');return {priorities:rows};
  };
  const rows=await clock.call(ops.session,{directory:join(directory,hash(input)),config,knowledge:false,
-  prompt:{task:'Rank every open hypothesis by expected impact: severity, recurrence, recoverable wasted elapsed time, evidence strength, and readiness. New urgent evidence may rank above all existing work. Do not use cumulative actor clocks as measured operation duration. Return {priorities:[{id,priority:0..100,reason}]}. Keep each reason to at most two short sentences and cite supplied evidence references when available; do not write an essay. Harness problems remain user handled; do not invent evidence.',items:input},validate});
+  prompt:{task:'Rank every open hypothesis by expected impact: severity, independent affected projects/attempts, evidence strength, and actual case readiness; observation counts are polling telemetry, not independent failures. New urgent evidence may rank above all existing work. Do not use cumulative actor clocks as measured operation duration. Return {priorities:[{id,priority:0..100,reason}]}. Keep each reason to at most two short sentences and cite supplied evidence references when available; do not write an essay. Harness problems remain user handled; do not invent evidence.',items:input},validate});
  const ranked=validate(Array.isArray(rows)?{priorities:rows}:rows),result=backlog.rank(ranked.priorities);
  for(const item of items)seen[item.id]=signature(item);backlog.meta('priority-inputs',seen);backlog.meta('priority-cursor',cursor+20>=ordered.length?0:cursor+20);return result;
 }

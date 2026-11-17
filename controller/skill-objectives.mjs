@@ -66,7 +66,7 @@ export function evaluationSettings(evaluations,objective){
 
 // A caller-bound immutable retrieval snapshot may reconnect on a new local port.
 export function retrievalIdentity(knowledge){
- if(knowledge.identity===undefined)return {url:knowledge.url,readOnly:true};
+ if(knowledge.identity===undefined)return {url:knowledge.url,readOnly:true,...(knowledge.attentionRevision===undefined?{}:{attentionRevision:knowledge.attentionRevision})};
  if(typeof knowledge.identity!=='string'||!knowledge.identity.trim())throw Error('Nonempty retrieval snapshot identity required');
- return {readOnly:true,identity:knowledge.identity};
+ return {readOnly:true,identity:knowledge.identity,...(knowledge.attentionRevision===undefined?{}:{attentionRevision:knowledge.attentionRevision})};
 }
