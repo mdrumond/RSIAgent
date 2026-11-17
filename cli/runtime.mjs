@@ -1,6 +1,6 @@
 import {phaseActorSeconds} from '../controller/budget.mjs';
 import { spawn } from 'node:child_process';
-import { open, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { open, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -20,16 +20,12 @@ import {skillWorker} from './skill-worker.mjs';
 import {skillPromotionPending} from './skill-promotion-gate.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectCatalogExtension} from './project-catalog.mjs';
+import {writeAttemptJob,readAttemptJob,availableAttemptJob} from './attempt-job.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
   maxFailedRounds:config.failed_recovery_rounds??5,investigationSeconds:config.investigation_seconds??9600});
 const stateFor=root=>new State(join(root,'state.sqlite'));
-async function writeJob(path,value) {
-  const temporary=path+'.'+randomUUID()+'.tmp';
-  await writeFile(temporary,JSON.stringify(value),{mode:0o600,flag:'wx'});
-  await rename(temporary,path);
-}
 function control(state) {
   state.db.exec('CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY,value TEXT NOT NULL)');
   return {
@@ -163,7 +159,8 @@ export async function operate(command,config,options={}) {
         const signal=schedulerAbort.signal;
         try {
           const path=join(config.root,'attempts',attempt.id);
-          const job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+          const job=await availableAttemptJob(state,config.root,attempt.id);
+          if(!job)continue;
           const previous=await environment(config,path,(type,data)=>state.event(attempt.id,type,data),
             async(_label,fn)=>fn(),job.resource,signal);
           if(!failureSettled(state,attempt.id))await reconcileFailure(state,attempt.id,previous);
@@ -192,7 +189,7 @@ export async function operate(command,config,options={}) {
     const finalize=state.db.prepare(`SELECT a.* FROM attempts a WHERE outcome IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`)
       .all().filter(attempt=>failureSettled(state,attempt.id));
-    const jobs=[];
+    let jobs=[];
     for(const attempt of finalize)if(await ownerStopped(attempt.owner))
       jobs.push({attempt,projectId:attempt.project,resume:true,finalize:true});
     jobs.push(...(command==='resume'
@@ -203,9 +200,10 @@ export async function operate(command,config,options={}) {
           return Array.isArray(selected)?selected.includes(job.projectId):(!job.project.spec.phase || job.project.spec.phase===config.mode);
         })));
     for(const job of jobs)if(job.resume) {
-      const manifest=JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8'));
-      Object.assign(job,{...manifest,...job});
+      const manifest=await availableAttemptJob(state,config.root,job.attempt.id);
+      if(manifest)Object.assign(job,{...manifest,...job});else job.metadataBlocked=true;
     }
+    jobs=jobs.filter(job=>!job.metadataBlocked);
     let access=await environment(config,join(config.root,'scheduler'),(type,data)=>state.event(null,type,data),async(_label,fn)=>fn(),undefined,schedulerAbort.signal);
     let environmentRevision=JSON.stringify(config.environment);
     const running=new Set();
@@ -240,15 +238,15 @@ export async function operate(command,config,options={}) {
       try {
       const prepare=async()=>{
       let pinnedMode=job.mode??config.mode;
-      if(job.origin_attempt&&!job.resume)pinnedMode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
-      const admitted=job.resume?{...JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
+      if(job.origin_attempt&&!job.resume)pinnedMode=(await readAttemptJob(state,config.root,job.origin_attempt)).mode;
+      const admitted=job.resume?{...await readAttemptJob(state,config.root,job.attempt.id),...job}:admitJob(state,{projectId:job.projectId,wave,owner,resourceId:resource?.id,...policy({...config,mode:pinnedMode})});
       admitted.mode=pinnedMode;
       admitted.actor_seconds=phaseActorSeconds(config,pinnedMode,admitted.actor_seconds);
       attempt=admitted.attempt;
       launchedAttempts.add(attempt.id);
       assignedResource=resource??admitted.resource;
       if(job.origin_attempt&&!job.resume) {
-        const parent=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8'));
+        const parent=await readAttemptJob(state,config.root,job.origin_attempt);
         admitted.mode=parent.mode;
       }
       if(job.failure_pattern) {
@@ -257,7 +255,7 @@ export async function operate(command,config,options={}) {
       }
       path=join(config.root,'attempts',attempt.id);await mkdir(path,{recursive:true});
       // Retain a finalization manifest even if subsequent launch preparation fails.
-      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,
+      await writeAttemptJob(state,config.root,attempt.id,{...admitted,wave:admitted.wave??wave,
         options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,
         skillVersion:admitted.skillVersion??config.skills.activeVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
@@ -280,7 +278,7 @@ export async function operate(command,config,options={}) {
             (await (await import('../controller/storage-knowledge.mjs')).recordStorageSkill(latest,skillVersion,{state})).revision});
         await storage.register(join(path,'worker.log'),{attempt:attempt.id,project:attempt.project,kind:'worker-log',role:'controller'});
       }
-      await writeJob(join(path,'job.json'),{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
+      await writeAttemptJob(state,config.root,attempt.id,{...admitted,wave:admitted.wave??wave,options:{...admitted.options,...options,signal:undefined},mode:admitted.mode??config.mode,skillVersion,resource:assignedResource,
         deferFinalization:options.continuous&&!job.finalize});
       return {argv:[process.execPath,self,'worker',config.root,attempt.id],cwd:config.root,
         env:{...process.env,...assignedResource?.env},
@@ -436,13 +434,22 @@ export async function operate(command,config,options={}) {
         WHERE outcome IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events e
           WHERE e.attempt=a.id AND e.type='postprocess-completed')`).all()) {
         if(!failureSettled(state,attempt.id)||!await ownerStopped(attempt.owner))continue;
-        const manifest=JSON.parse(await readFile(join(config.root,'attempts',attempt.id,'job.json'),'utf8'));
+        const manifest=await availableAttemptJob(state,config.root,attempt.id);
+        if(!manifest)continue;
         maintenanceJobs.push({...manifest,attempt,projectId:attempt.project,resume:true,finalize:true});
       }
-      const candidates=command==='resume' && !options.continuous?jobs:
+      let candidates=command==='resume' && !options.continuous?jobs:
         [...maintenanceJobs,...jobs.filter(job=>job.resume),...nextWave(state,{wave:options.continuous?wave+1:wave,...policy({...config,mode:'phase1'})})];
-      for(const job of candidates)if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt)
-        job.mode=JSON.parse(await readFile(join(config.root,'attempts',job.origin_attempt,'job.json'),'utf8')).mode;
+      const ready=[];
+      for(const job of candidates) {
+        if(['investigation','retry'].includes(job.kind)&&!job.mode&&job.origin_attempt) {
+          const parent=await availableAttemptJob(state,config.root,job.origin_attempt);
+          if(!parent)continue;
+          job.mode??=parent.mode;
+        }
+        ready.push(job);
+      }
+      candidates=ready;
       const eligible=candidates.filter(job=>{
         const key=keyFor(job);
         if(promotionPending&&!job.finalize)return false;
@@ -518,7 +525,7 @@ export async function operate(command,config,options={}) {
       }
       ctl.set('actor-capacity',Math.min(resources.filter(r=>r.available).length,limit));
       if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
-      const prior=job.resume?JSON.parse(await readFile(join(config.root,'attempts',job.attempt.id,'job.json'),'utf8')).resource:null;
+      const prior=job.resume?(await readAttemptJob(state,config.root,job.attempt.id)).resource:null;
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:
         !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)) && r.id!==tuning?.resource?.id);
       const resource=choose();
@@ -599,7 +606,7 @@ export async function stopWorkerExecutions(state,id,environment) {
 
 async function worker(root,id) {
   let config=await readConfig(root);const state=stateFor(root),attempt=state.attempt(id);
-  const path=join(root,'attempts',id),job=JSON.parse(await readFile(join(path,'job.json'),'utf8'));
+  const path=join(root,'attempts',id),job=await readAttemptJob(state,root,id);
   config={...config,mode:job.mode??config.mode,recovery:job.options['no-recovery']?false:config.recovery};
   let env,bridge,url,stopping,interrupted=false,claimed=false,actorRunning=false;
   const abort=new AbortController(),ctl=control(state);

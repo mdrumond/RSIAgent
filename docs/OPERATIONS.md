@@ -172,3 +172,18 @@ Git history, or the active generation. It reports `unknownProvenance` record IDs
 records lacking exact retained provenance stay searchable. Positive lessons and
 attempts containing useful verification observations remain visible. No attempt
 identity is inferred from lesson text.
+# Attempt control files
+
+Attempt summaries inspect evidence with Pi's read, grep, find and ls tools;
+controller files and native session logs are not a summary's editable workspace.
+Investigation construction retains its coding tools in the investigation directory.
+
+The controller checkpoints job metadata in SQLite before publishing its file
+mirror. Missing or stale mirrors recover from that exact trusted checkpoint,
+preserving resource assignments, options and elapsed state. A checkpoint older
+than a portable binding cannot restore source-side metadata at the destination.
+
+For legacy attempts with no trusted checkpoint, `status.metadataBlocked` identifies
+the affected attempt. Scheduling other work continues, but the affected outcome
+and execution custody are preserved. Restore the original metadata from retained
+evidence; do not invent a replacement job or renew its elapsed allowance.
