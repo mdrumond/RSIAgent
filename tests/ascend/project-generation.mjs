@@ -24,7 +24,7 @@ import {createEnvironment} from '../../integrations/environments/index.mjs';
 import {target} from './resilience/fixtures.mjs';
 import {refillPhase1,refillProjects,generationEventState,rejectGeneratedProject,checkpointGeneratedBundle,publishGeneratedProject} from '../../cli/project-generation.mjs';
 
-async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,pauseDraft,importGate=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false,repairFixturePaths=false}={}) {
+async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,pauseDraft,importGate=false,repair=false,afterAccepted=false,separateCommand=false,pauseAfterRejection=false,verbose=false,mutateVerifier=false,goal='Compute answer',performanceGoal,performanceCommand,baselineCommand,pytorch=false,nestedBundle=false,duplicateControl=false,unequalDepth=false,omitConstruction=false,rawConstruction=false,starterLayout,baselineDevice='cpu',brokenBaseline=false,omitBaselineConstruction=false,repairFixturePaths=false,hiddenManifest=false}={}) {
   const root=await mkdtemp(join(process.env.DRIVER_ARTIFACTS??tmpdir(),'generation-'));
   t.after(()=>process.env.RSI_GENERATED_SMOKE_PROFILE?undefined:rm(root,{recursive:true,force:true}));
   const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
@@ -89,6 +89,19 @@ async function fixture(t,{badVerifier=false,negative=0,positive=42,pause=false,p
           .replace('from answer import answer','answer=loaded.answer');
       }
       if(starterLayout==='mismatch')plan.at(-1)[1].source='source/src';
+    }
+    if(hiddenManifest){
+      for(const call of plan)if(call[0]==='write')call[1].path='project/'+call[1].path;
+      const proposal=plan.at(-1)[1];
+      for(const key of ['source','reference'])proposal[key]='project/'+proposal[key];
+      proposal.negative_controls=proposal.negative_controls.map(path=>'project/'+path);
+      proposal.verifier.files=['project/verify.py'];proposal.verifier.command.entrypoint='project/verify.py';proposal.construction_command.entrypoint='project/verify.py';
+      plan.splice(plan.length-1,0,['write',{path:'project/skill-evaluation.json',content:JSON.stringify({schema:1,cases:[]})}]);
+      // Repair the optional artifact in the same native session after the real
+      // post-bundle validator rejects it. No second generation budget is issued.
+      const files={'kernel.py':'reference/answer.py'},negative={files:{'kernel.py':'negative/answer.py'}};
+      const manifest={target:'cpu',objective:'correctness',tasks:Array.from({length:5},(_,i)=>({id:'case-'+i,kind:'hypothesis-case',bucket:'correctness',prompt:'Return 42',checker:'verify.py',files,controls:{reference:{files},negatives:[negative]}}))};
+      plan.push(['write',{path:'project/skill-evaluation.json',content:JSON.stringify(manifest)}],['submit_project',proposal]);
     }
     if(omitConstruction)delete plan.at(-1)[1].construction_command;
     if(duplicateControl)plan.at(-1)[1].negative_controls=['negative','negative'];
@@ -797,4 +810,23 @@ test('native curriculum corrects file-valued fixtures and fixture-owned verifier
  const imported=await importProject(f.config.root,specs[0]);f.state.add(imported);
  assert.equal(f.state.project(imported.id).status,'queued');
  assert.equal(f.state.db.prepare('SELECT COUNT(*) n FROM attempts').get().n,0);
+});
+
+
+test('expanded hidden manifest is rejected before readiness and repaired in the same native session',async t=>{
+ const f=await fixture(t,{hiddenManifest:true});
+ const [spec]=await refillProjects(f.options);
+ assert.ok(spec);
+ const draft=JSON.parse(f.state.db.prepare('SELECT data FROM generation_drafts WHERE id=?').get(spec.id).data);
+ const rejected=f.state.db.prepare("SELECT data FROM generation_events WHERE type='generation-rejected' AND draft=?").all(spec.id);
+ assert.equal(rejected.length,1);
+ assert.match(JSON.parse(rejected[0].data).error,/exactly five cases/);
+ assert.equal(draft.status,'ready');assert.ok(draft.elapsed>0);
+ const sessions=f.state.db.prepare("SELECT data FROM generation_events WHERE type='curriculum-session' AND draft=?").all(spec.id);
+ assert.equal(new Set(sessions.map(row=>JSON.parse(row.data).session)).size,1);
+ const transcript=await readFile(JSON.parse(sessions[0].data).session,'utf8');
+ const toolResults=transcript.split('\n').filter(Boolean).map(JSON.parse).filter(row=>row.message?.role==='toolResult');
+ assert.ok(toolResults.some(row=>row.message.isError&&JSON.stringify(row.message.content).includes('exactly five cases')));
+ const imported=await importProject(join(f.config.root,'imported'),spec);
+ assert.equal(imported.id,spec.id);
 });

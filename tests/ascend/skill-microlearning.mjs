@@ -11,6 +11,7 @@ import {prioritySkillStatus} from '../../cli/skill-priority.mjs';
 import {qualifiedSuites} from '../../cli/skill-priority-cases.mjs';
 import {releaseKnowledgeService} from '../../cli/campaign-memory.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
+import {SkillEvaluationContractError} from '../../cli/skill-evaluation-contract.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'microlearning-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());const backlog=new SkillBacklog(state,{target:'a3'});
@@ -124,4 +125,18 @@ test('retained allowance includes closure proof waits and keeps its live owner u
  const work=f.backlog.meta('microlearning-active');assert.equal(work.elapsed,150);assert.equal(work.seconds,900);assert.equal(work.owner,undefined);assert.equal(work.runningAt,undefined);
  const resumed=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},{stopped:async()=>false,settled:async()=>true});
  assert.equal(resumed.status,'blocked');assert.equal(f.backlog.meta('microlearning-active').elapsed,150);assert.equal(f.backlog.meta('microlearning-active').seconds,900);
+});
+
+test('a deterministic contract failure defers invalidation until positive closure without reconstructing',async t=>{
+ const f=await fixture(t);let closed=false,constructed=0,clock=0;
+ const ops={now:()=>clock,ensureKnowledgeService:async()=> 'http://borrowed',createKdbBridge:()=>({}),stopped:async()=>closed,
+  construct:async()=>{constructed++;clock=12000;throw new SkillEvaluationContractError('malformed protected artifact');}};
+ await assert.rejects(runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops),SkillEvaluationContractError);
+ const retained=f.backlog.meta('microlearning-active');assert.equal(retained.invalidContract.code,'INVALID_SKILL_EVALUATION');assert.equal(retained.elapsed,12);
+ assert.equal(f.state.db.prepare('SELECT status FROM skill_learning_requests WHERE id=?').get(f.id).status,'background');
+ assert.equal((await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops)).status,'blocked');
+ closed=true;
+ const result=await runMicrolearning({config:f.config,backlog:f.backlog,resource:f.resource,remainingSeconds:1000},ops);
+ assert.equal(result.status,'inconclusive');assert.equal(constructed,1);assert.equal(f.backlog.meta('microlearning-active'),null);
+ assert.ok(f.backlog.meta('microlearning-last').elapsed>=12);
 });
