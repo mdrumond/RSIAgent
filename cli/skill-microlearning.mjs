@@ -98,7 +98,7 @@ export async function runMicrolearning({config,backlog,resource,remainingSeconds
   }
   await writeFile(join(work.directory,'instance.json'),JSON.stringify(child));
   if(deviceLearning(config,work.request)){
-   work.stage='admission';save();
+   work.stage='admission';work.admission={admitted:false,closed:false,reason:'device-admission-in-flight'};save();
    work.admission=await ops.admit({config,request:work.request,resource,directory:join(work.directory,'admission'),signal:active});save();
    if(!work.admission.admitted){if(work.admission.closed)work.admissionRetryAt=Date.now()+30000;return {status:'blocked',reason:work.admission.reason,infrastructure:true};}
    delete work.admissionRetryAt;
