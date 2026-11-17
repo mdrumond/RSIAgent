@@ -138,7 +138,7 @@ export async function runProposalQa(input,ops){
     round.proposal=proposal;round.answers=result.answers;if(result.claims)round.claims=result.claims;await persist();
    }
    if(!round.review){const validate=value=>{validateQaVerdict(value);validateSummaryTargets(value,input.evidenceSummary?.items??[]);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
-    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,answerClaims:round.claims,validate},`${index}-qaReview`));repairSummary(round);await persist();}
+    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate},`${index}-qaReview`));repairSummary(round);await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){proposal=round.proposal;continue;}
    state.verdict=round.review.verdict;state.reason=round.review.reason;

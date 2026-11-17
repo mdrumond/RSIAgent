@@ -130,3 +130,11 @@ test('legacy cached native submissions cannot approve a changed contract in a v2
  const result=await runProposalQa({...input,evaluationContract:{id:'new-contract'}},{qaAnswer:args=>native(args,answers()),qaReview:args=>native(args,{verdict:'learn',reason:'New boundary requires facts',learningRequests:[{question:'New boundary?',hypothesis:'Untested'}]})});
  assert.equal(calls,2);assert.equal(result.verdict,'learn');assert.equal(result.approval,undefined);assert.equal(JSON.parse(await readFile(join(oldReview,'submission.json'),'utf8')).reason,'Old contract');
 });
+test('every review receives the complete previous issue list after a writer revision',async t=>{
+ const input=await fixture(t),previous={verdict:'revise',reason:'Two material defects',issues:[{problem:'Wrong direction'},{problem:'Unsupported device claim'}]};let reviews=0;
+ const result=await runProposalQa(input,{qaAnswer:async x=>{if(reviews)assert.deepEqual(x.previousReview,previous);return answers();},qaReview:async x=>{
+  if(!reviews++){assert.equal(x.previousReview,undefined);return previous;}
+  assert.deepEqual(x.previousReview,previous);return {verdict:'approved',reason:'Both defects corrected'};
+ }});
+ assert.equal(result.verdict,'approved');assert.equal(reviews,2);
+});

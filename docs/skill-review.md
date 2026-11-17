@@ -186,3 +186,13 @@ target contexts must use the latter for lifetime and the former for each request
 A3 actor admission requires a negative receipt bound to the current kernel hash
 with candidate-failure evidence. Missing receipts and infrastructure timeouts do
 not justify another model call.
+
+QA answers can state that no actor edit is justified and identify the missing
+fact; writers must not invent a repair to fill the answer schema. Reviews assess
+all material defects together and receive the complete previous review when a
+revised draft returns. Retained code, executed checkpoints, memory reports and
+mathematical deductions remain distinct kinds of evidence. A rule already
+satisfied by retained code is not a newly established repair; documentation-only
+corrections do not count as useful optimization approvals. Session input exposes
+the canonical filesystem admission paths, including declared primary-source
+catalogues, so an external catalogue path is not mistaken for inaccessible data.
