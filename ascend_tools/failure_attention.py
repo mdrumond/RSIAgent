@@ -37,8 +37,14 @@ def attention_snapshot(database, revision=None):
         return {'revision': chosen, 'attempts': attempts}
 
 
-def lesson_attention(database, collection, snapshot):
-    if not collection.startswith('lesson-') or not snapshot['attempts']:
+def lesson_attention(database, collection, snapshot, connection=None):
+    if not snapshot['attempts']:
+        return None
+    if collection.startswith('memory-'):
+        row = connection.execute('SELECT attempt_id,kind FROM memory_provenance WHERE collection=?',
+                                 (collection,)).fetchone() if connection is not None else None
+        return snapshot['attempts'].get(row['attempt_id']) if row and row['kind'] == 'negative' else None
+    if not collection.startswith('lesson-'):
         return None
     source = Path(str(database) + '.lessons') / (collection[7:] + '.json')
     try:

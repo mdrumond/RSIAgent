@@ -160,3 +160,15 @@ attention; history remains available with `include_retired` for native KDB or
 `includeRetired` for project summaries, tagged with its attention status. A/B
 pairs pin their attention revision; existing in-flight evaluations preserve
 revision zero and their original identity.
+
+
+Storage memory keeps exact attempt provenance separately from immutable indexed
+content. Before applying retirement to an older deployed knowledge database,
+run `failures` with `{"action":"refresh-memory-provenance"}` after checkpointing
+writers and settling active comparisons/learning. This public operation starts
+or reconnects the native KDB service, re-stages the active retained Git manifest,
+and backfills exact `attempt_id`/kind metadata without changing collection hashes,
+Git history, or the active generation. It reports `unknownProvenance` record IDs;
+records lacking exact retained provenance stay searchable. Positive lessons and
+attempts containing useful verification observations remain visible. No attempt
+identity is inferred from lesson text.

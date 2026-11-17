@@ -3,6 +3,11 @@ import asyncio
 from contextlib import asynccontextmanager
 import sqlite3
 import threading
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
 import unittest
 
 import httpx
@@ -13,6 +18,69 @@ from ascend_tools.kdb_service import create_server
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_storage_publication_staging_and_native_attention_with_legacy_backfill(self):
+        from ascend_tools.kdb import KDB
+        from kdb_fixture import Embeddings
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = Path(__file__).resolve().parents[2]
+            script = """
+                import {State} from './controller/state.mjs';
+                import {CampaignStorage} from './controller/storage.mjs';
+                import {publishStorageMemory} from './controller/storage-knowledge.mjs';
+                const root=process.argv[1],state=new State(root+'/state.sqlite');
+                const ledger=new CampaignStorage(state,root);await ledger.initialize();
+                const config={root,target:'a3',storage:{format:1}},calls=[];
+                for(const [id,attempt_id,outcome] of [[1,'failed','failed'],[2,'failed','passed'],[3,'mixed','failed'],[4,null,'failed']]){
+                    await publishStorageMemory(config,{id,attempt_id,outcome,findings:'placement '+id,evidence_refs:['events:1']},
+                        {invoke:async(tool,args)=>{if(tool==='stage_memory_revision')calls.push(args);return {generation:args.revision};}});
+                }
+                state.close();console.log(JSON.stringify(calls.at(-1)));
+            """
+            published = await asyncio.to_thread(subprocess.run,
+                [os.environ.get('NODE','node'), '--input-type=module', '-e', script, str(root)],
+                cwd=repo, capture_output=True, text=True)
+            self.assertEqual(published.returncode,0,published.stderr)
+            payload = json.loads(published.stdout)
+            with sqlite3.connect(root / 'state.sqlite') as ledger:
+                ledger.executescript("""CREATE TABLE failure_attention_actions(sequence INTEGER,incident TEXT);
+                    CREATE TABLE failure_attention_effects(sequence INTEGER,action_sequence INTEGER,kind TEXT,identity TEXT,attention TEXT);
+                    INSERT INTO attempts(id,project,created) VALUES('failed','p','now'),('mixed','p2','now');
+                    INSERT INTO events(attempt,type,data,created) VALUES('mixed','verification','{}','now');
+                    INSERT INTO failure_attention_actions VALUES(1,'fixed');
+                    INSERT INTO failure_attention_effects VALUES(1,1,'attempt','failed','retired'),(2,1,'attempt','mixed','retired');""")
+            app = create_server(lambda: KDB(root / 'knowledge.sqlite', Embeddings())).streamable_http_app()
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers={'x-attempt-id':'reader'}) as client:
+                    async with streamable_http_client('http://127.0.0.1:8765/mcp',http_client=client) as (read,write,_):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(tool,args):
+                                result=await session.call_tool(tool,args)
+                                self.assertFalse(result.isError, result)
+                                return result.structuredContent
+                            legacy={**payload,'records':[{k:v for k,v in r.items() if k!='attempt_id'} for r in payload['records']]}
+                            staged=await call('stage_memory_revision',legacy)
+                            await call('activate_memory_revision',{'revision':payload['revision']})
+                            self.assertEqual(len(staged['unknown_provenance']),4)
+                            before=(await call('search',{'query':'placement','limit':20}))['result']
+                            self.assertEqual(len(before),4)  # Unknown provenance is preserved.
+                            refreshed=await call('stage_memory_revision',payload)
+                            self.assertEqual(refreshed['collections'],staged['collections'])
+                            self.assertEqual(len(refreshed['unknown_provenance']),1)
+                            conflict={**payload,'records':[{**r,'attempt_id':'different'} for r in payload['records']]}
+                            self.assertTrue((await session.call_tool('stage_memory_revision',conflict)).isError)
+                            hits=(await call('search',{'query':'placement','limit':20}))['result']
+                            self.assertEqual(len(hits),3)
+                            self.assertEqual({json.loads(h['text'])['lesson'] for h in hits},{'placement 2','placement 3','placement 4'})
+                            history=(await call('search',{'query':'placement','limit':20,'include_retired':True}))['result']
+                            self.assertEqual(len(history),4)
+                            hidden=next(h for h in history if h['retirement'])
+                            self.assertFalse((await call('read_entry',{'collection':hidden['collection'],'entry_id':hidden['chunk_id']}))['available'])
+                            self.assertTrue((await call('read_entry',{'collection':hidden['collection'],'entry_id':hidden['chunk_id'],'include_retired':True}))['text'])
+                            old=(await call('search',{'query':'placement','limit':20,'attention_revision':0}))['result']
+                            self.assertEqual(len(old),4)
+
     async def test_native_search_and_read_enforce_the_pinned_attention_revision(self):
         calls = []
         class Backend:
