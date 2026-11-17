@@ -8,7 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {RecoveryQueue} from '../../controller/recovery.mjs';
-import {processIdentity} from '../../controller/lifecycle.mjs';
+import {processIdentity,operationsStopped} from '../../controller/lifecycle.mjs';
 import {auditResolution,applyResolution,reopenResolution,attentionRevision,attentionSnapshot,occurrenceAttention,projectAttention,attemptAttention} from '../../controller/failure-attention.mjs';
 import {main} from '../../cli/main.mjs';
 
@@ -102,6 +102,38 @@ test('passed settled investigations do not prevent retiring a failed original, b
  const h=await fixture(t);h.db.prepare("INSERT INTO attempts(id,project,outcome,created) VALUES('accepted','project','passed','now')").run();
  h.db.prepare("INSERT INTO recovery_attempts(attempt,project,kind,wave,completed) VALUES('accepted','project','retry',1,1)").run();h.state.event('accepted','postprocess-completed',{});
  await assert.rejects(applyResolution(h.db,h.manifest),/positive failure settlement/);
+});
+
+test('native reconciliation may recover terminal handles after closure without permitting a later launch',async t=>{
+ const f=await fixture(t),handle='remote:fixture:job:recovered';
+ f.event('execution-starting',{operation:'recovered-operation',actor_elapsed:0});
+ assert.equal(await operationsStopped(f.state,f.state.attempt('attempt'),{
+  reconcileOperation:async()=>({closed:true,executionSeconds:1,handles:[handle]}),
+  observe:async()=>({state:'stopped',nativeState:'completed',executionSeconds:1})}),true);
+ f.event('failure-settlement',{closed:true});
+ const recovered=f.state.events('attempt'),closure=recovered.findIndex(e=>e.type==='execution-reconciled'),identity=recovered.findIndex(e=>e.type==='execution-handle');
+ assert.ok(identity>closure);await auditResolution(f.db,f.manifest);
+ f.event('execution-handle',{operation:'recovered-operation',handle:'remote:fixture:job:unproved'});
+ await assert.rejects(auditResolution(f.db,f.manifest),/Unmatched execution/);
+ f.event('execution-state',{handle:'remote:fixture:job:unproved',state:'stopped',nativeState:'completed'});
+ await auditResolution(f.db,f.manifest);
+ f.event('execution-starting',{operation:'recovered-operation',actor_elapsed:1});
+ await assert.rejects(auditResolution(f.db,f.manifest),/Unmatched execution/);
+});
+
+test('occurrence-only attention cannot hide live or unresolved attempts and does not require whole-attempt coverage',async t=>{
+ for(const defect of ['running','live-owner','open-settlement','unmatched-shell']){
+  const f=await fixture(t),manifest={...f.manifest,projectIds:[],attemptIds:[]};
+  if(defect==='running')f.db.prepare('UPDATE attempts SET outcome=NULL').run();
+  if(defect==='live-owner')f.db.prepare('UPDATE attempts SET owner=?').run(JSON.stringify(await processIdentity()));
+  if(defect==='open-settlement')f.event('failure-settlement',{closed:false});
+  if(defect==='unmatched-shell')f.event('native-bash-started',{operation:'still-running'});
+  await assert.rejects(applyResolution(f.db,manifest),/positive failure settlement|remains live|Unmatched execution/);
+  assert.equal(attentionRevision(f.db),0);assert.equal(occurrenceAttention(f.db,f.ref),'active');
+ }
+ const f=await fixture(t);f.event('verification',{passed:false,correctness:{passed:false}});f.backlog.ingest();
+ await applyResolution(f.db,{...f.manifest,projectIds:[],attemptIds:[]});
+ assert.equal(occurrenceAttention(f.db,f.ref),'retired');assert.equal(f.backlog.failures().length,1);assert.equal(projectAttention(f.db,'project'),'active');
 });
 
 test('public failures maintenance defaults to inspection/audit and requires stopped writers to apply',async t=>{
