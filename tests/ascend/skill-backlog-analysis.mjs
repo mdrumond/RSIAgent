@@ -8,7 +8,7 @@ import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
-import {analyzeBacklog,prioritizeBacklog,prepareHypothesis} from '../../cli/skill-backlog-analysis.mjs';
+import {currentAnalysisStages,analyzeBacklog,prioritizeBacklog,prepareHypothesis} from '../../cli/skill-backlog-analysis.mjs';
 async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'backlog-analysis-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const version=join(root,'skills','versions','baseline');await mkdir(version,{recursive:true});
@@ -345,4 +345,30 @@ test('interrupted proposal has periodic durable elapsed checkpoints before compl
   assert.equal(ledger.running,true);assert.ok(ledger.elapsedSeconds>=.5);
   return review()(input);
  }});
+});
+
+test('fresh classification groups do not inherit an older page grant or unknown custody',async t=>{
+ for(const unknown of [false,true])await t.test(unknown?'unknown owner':'119 seconds spent',async t=>{
+  const f=await fixture(t);let milliseconds=0,oldId,directory;
+  await assert.rejects(analyzeBacklog(f,{now:()=>milliseconds,classify:async input=>{oldId=input.groups[0].id;directory=input.directory;milliseconds+=119000;throw Error('Disconnected');}}),/Disconnected/);
+  if(unknown)await writeFile(join(directory,'..','classification-spend.json'),JSON.stringify({elapsedSeconds:119,running:true}));
+  const a=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;f.state.event(a,'attempt-error',{message:'Fresh unrelated failure'});f.backlog.ingest();
+  const calls=[],deps={now:()=>milliseconds,classify:async input=>{calls.push({ids:input.groups.map(g=>g.id),seconds:input.seconds});return classify(input);},review:review()};
+  if(unknown){await assert.rejects(analyzeBacklog(f,deps),/custody is unknown/);await analyzeBacklog(f,deps);}else await analyzeBacklog(f,deps);
+  const fresh=calls.find(c=>!c.ids.includes(oldId));assert.equal(fresh.seconds,120);assert.equal(fresh.ids.length,1);
+  if(!unknown)assert.equal(calls.find(c=>c.ids.includes(oldId)).seconds,1);
+  assert.ok(f.backlog.list().some(i=>i.groupIds.includes(fresh.ids[0])&&i.status==='queued'));
+  assert.equal(currentAnalysisStages(f).filter(s=>s.status==='blocked').length,Number(unknown));
+ });
+});
+
+test('new occurrence coordinates supersede a blocked historical stage after successful analysis',async t=>{
+ const f=await fixture(t);
+ await assert.rejects(analyzeBacklog(f,{classify:async()=>{throw Object.assign(Error('Contract failed'),{reviewSession:{kind:'no-submit'}});}}),/Contract failed/);
+ assert.equal(currentAnalysisStages(f).filter(s=>s.status==='blocked').length,1);
+ const a=f.state.db.prepare('SELECT id FROM attempts LIMIT 1').get().id;f.state.event(a,'verification',{correct:false,evidence:{path:f.log}});f.backlog.ingest();
+ const result=await analyzeBacklog(f,{classify,review:review()});assert.equal(result.items.length,1);
+ assert.equal(Object.values(f.backlog.meta('analysis-stages')).filter(s=>s.status==='blocked').length,1);
+ assert.equal(currentAnalysisStages(f).filter(s=>s.status==='blocked').length,0);
+ f.config.skills.activeVersion='another-version';assert.equal(currentAnalysisStages(f).length,0);
 });

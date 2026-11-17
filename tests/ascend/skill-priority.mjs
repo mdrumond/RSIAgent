@@ -473,9 +473,21 @@ test('fresh target split is frozen and approved before skill preparation or eval
 
 test('analysis stage status distinguishes blocked contracts from useful progress',async t=>{
  const f=await fixture(t);f.backlog.meta('queue-epoch','current');
- f.backlog.meta('analysis-stages',{one:{epoch:'current',stage:'proposal',status:'blocked',classification:{bucket:'correctness'},reason:'Bad contract'},two:{epoch:'current',stage:'proposal',status:'retry',classification:{bucket:'optimization'}},old:{epoch:'old',stage:'classification',status:'blocked'}});
+ f.backlog.meta('analysis-stages',{one:{epoch:'current',base:'baseline',groupId:f.group.id,count:f.group.count,stage:'proposal',status:'blocked',classification:{bucket:'correctness'},reason:'Bad contract'},two:{epoch:'current',base:'baseline',groupId:f.group.id,count:f.group.count,stage:'proposal',status:'retry',classification:{bucket:'optimization'}},old:{epoch:'old',stage:'classification',status:'blocked'}});
  const status=await prioritySkillStatus(f.config);
  assert.deepEqual(status.analysisProgress,{classified:2,pendingProposals:1,blocked:1,completed:0});
  assert.equal(status.analysisStages.length,2);
  const result=await runPrioritySkills(f.config,f.values,f.ops);assert.equal(result.status,'blocked');assert.equal(result.blockedStages,1);
+});
+
+test('superseded occurrence and baseline stages cannot keep the scheduler blocked',async t=>{
+ const f=await fixture(t);f.backlog.meta('queue-epoch','current');
+ f.backlog.meta('analysis-stages',{oldCount:{epoch:'current',base:'baseline',groupId:f.group.id,count:f.group.count,stage:'classification',status:'blocked'}});
+ assert.equal((await prioritySkillStatus(f.config)).analysisProgress.blocked,1);
+ f.state.event(null,'generation-rejected',{message:'bad frozen shape'});f.backlog.ingest();
+ assert.equal((await prioritySkillStatus(f.config)).analysisProgress.blocked,0);
+ assert.equal((await runPrioritySkills(f.config,f.values,f.ops)).status,'idle');
+ f.backlog.meta('analysis-stages',{oldBase:{epoch:'current',base:'obsolete',groupId:f.group.id,count:f.backlog.failure(f.group.id).count,stage:'classification',status:'blocked'}});
+ assert.equal((await prioritySkillStatus(f.config)).analysisProgress.blocked,0);
+ assert.equal((await runPrioritySkills(f.config,f.values,f.ops)).status,'idle');
 });

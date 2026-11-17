@@ -134,11 +134,17 @@ function consumeLearning(backlog,contributors){
 }
 function priority(group){return Math.min(90,20+Math.min(30,group.frequency?group.frequency.projects+group.frequency.attempts+group.frequency.drafts:group.occurrences.length)+(['execution-unresolved','project-invalid'].includes(group.type)?20:0));}
 
+/** Superseded coordinates remain historical evidence, never current blockers. */
+export function currentAnalysisStages({config,backlog}){
+ const epoch=backlog.meta('queue-epoch');
+ return Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch&&s.base===config.skills.activeVersion&&s.groupId&&backlog.failureCount(s.groupId)===s.count).map(([id,stage])=>({id,...stage}));
+}
+
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2},dependencies={}){
  const ops=await operations(dependencies),now=dependencies.now??(()=>performance.now()),clock=allocation(remainingSeconds,signal,now),entries=await guidanceEntries(config.root,config.skills.activeVersion);
- const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),identity=g=>hash([epoch,config.skills.activeVersion,g.id,g.count]);
- const persist=()=>{for(const stage of Object.values(stages))stage.epoch=epoch;backlog.meta('analysis-stages',stages);};
+ const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
+ const persist=()=>{for(const [id,stage]of Object.entries(stages))Object.assign(stage,coordinates.get(id));backlog.meta('analysis-stages',stages);};
  const eligible=g=>stages[identity(g)]?.status!=='blocked';
  const dirty=[];
  for(let offset=0;dirty.length<limit;offset+=200){const rows=backlog.failures({limit:200,offset,occurrenceLimit:6});dirty.push(...rows.filter(eligible).slice(0,limit-dirty.length));if(rows.length<200)break;}
@@ -150,23 +156,28 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
  if(!classifications&&frozen.every(g=>stages[identity(g)]?.classification))classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};
  const stageError=(error,spent,cap)=>spent>=cap-.05||['rejected-submissions','no-submit','interrupted-unknown-spend'].includes(error.reviewSession?.kind);
  if(!classifications){
-  const pending=frozen.filter(g=>!stages[identity(g)]?.classification);
-  const spendFile=join(batch,'classification-spend.json'),prior=await load(spendFile),retained=await Promise.all(pending.map(g=>stages[identity(g)]?.spendFile?load(stages[identity(g)].spendFile):null)),
-   spent=Math.max(prior?.elapsedSeconds??0,...retained.map(r=>r?.elapsedSeconds??0),...pending.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
-  try{
-   if(prior?.running||retained.some(r=>r?.running))throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
-   for(const group of pending)stages[identity(group)]={stage:'classification',status:'running',spendFile,elapsedSeconds:spent};persist();
-   finishClassification=await trackSpending(spendFile,spent,now);
-   if(spent>=seconds)throw Error('Classification elapsed allowance exhausted');
-   classifications=validateClassificationBatch(await clock.call(ops.classify,{directory:join(batch,'classify'),config,groups:pending,entries,bucketPolicy:true,
-    validate:value=>validateClassificationBatch(value,pending,entries,{requireBucket:true})},seconds-spent),pending,entries,{requireBucket:true});
-   classifications={classifications:frozen.map(g=>stages[identity(g)]?.classification??classifications.classifications.find(c=>c.groupId===g.id))};
-   await save(classificationFile,classifications);
-   for(const group of frozen)stages[identity(group)]={stage:'proposal',status:'pending',classification:classifications.classifications.find(c=>c.groupId===group.id)};
-   persist();
-  }catch(error){for(const group of pending)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,seconds)?'blocked':'retry',spendFile,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
-  finally{await finishClassification?.();}
+  // A retry retains its original grant membership. Fresh groups receive their own
+  // page rather than inheriting an unrelated group's spent time or unknown owner.
+  const pending=frozen.filter(g=>!stages[identity(g)]?.classification),partitions=new Map();
+  for(const group of pending){const key=stages[identity(group)]?.spendFile??'fresh';partitions.set(key,[...(partitions.get(key)??[]),group]);}
+  for(const [retainedFile,members]of partitions){
+   const spendFile=retainedFile==='fresh'?join(batch,'classification',hash(members.map(g=>identity(g))),'classification-spend.json'):retainedFile,
+    prior=await load(spendFile),spent=Math.max(prior?.elapsedSeconds??0,...members.map(g=>stages[identity(g)]?.elapsedSeconds??0)),begun=now();let finishClassification;
+   try{
+    if(prior?.running)throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
+    for(const group of members)stages[identity(group)]={stage:'classification',status:'running',spendFile,elapsedSeconds:spent};persist();
+    finishClassification=await trackSpending(spendFile,spent,now);
+    if(spent>=seconds)throw Error('Classification elapsed allowance exhausted');
+    const accepted=validateClassificationBatch(await clock.call(ops.classify,{directory:join(resolve(spendFile,'..'),'classify'),config,groups:members,entries,bucketPolicy:true,
+     validate:value=>validateClassificationBatch(value,members,entries,{requireBucket:true})},seconds-spent),members,entries,{requireBucket:true});
+    for(const group of members)stages[identity(group)]={stage:'proposal',status:'pending',classification:accepted.classifications.find(c=>c.groupId===group.id)};
+    persist();
+   }catch(error){for(const group of members)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,seconds)?'blocked':'retry',spendFile,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
+   finally{await finishClassification?.();}
+  }
+  classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};await save(classificationFile,classifications);
  }
+
  const valid=validateClassificationBatch(classifications,frozen,entries,{requireBucket:true}).classifications,byGroup=Object.fromEntries(valid.map(c=>[c.groupId,c])),created=[];
  for(const group of frozen){
   signal?.throwIfAborted();if(clock.remaining()<=0)break;

@@ -122,6 +122,7 @@ export class SkillBacklog {
    return {observed,progress,...this.status()};
   });
  }
+ failureCount(id){return this.db.prepare(`SELECT COUNT(*) n FROM skill_backlog_occurrences o WHERE group_id=? AND ${activeOccurrenceSql(this.db,'o')}`).get(id).n;}
  failure(id,{limit=20,offset=0,includeRetired=false}={}){
   const row=this.db.prepare('SELECT data,dirty FROM skill_backlog_failures WHERE id=?').get(id);if(!row)return null;
   const eligible=includeRetired?'1':activeOccurrenceSql(this.db,'o');
