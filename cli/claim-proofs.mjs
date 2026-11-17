@@ -2,6 +2,8 @@
 import {createHash} from 'node:crypto';
 const hash=x=>createHash('sha256').update(x).digest('hex');
 const allowed=['reference','quote','factId','value','startLine','endLine','segment','field','sourceSha256','recordSha256','sourceRefs','sourcePaths'];
+const jsonInputs=new Set(['input:proposal','input:answers','input:answerClaims']);
+export function proofSelectorCatalogue(records){return records.filter(r=>r.available!==false&&typeof r.text==='string').map(r=>({reference:r.reference,selectors:r.factId?['reference']:['lines',...(jsonInputs.has(r.reference)&&(r.segments??[r.text]).length===1?['field']:[])],...(r.factId?{}:{segments:(r.segments??[r.text]).map((text,i)=>({segment:i+1,lines:text.replace(/\n$/,'').split('\n').length}))})}));}
 const own=(x,k)=>Object.hasOwn(x,k),same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
 function fieldValue(text,pointer){
  if(typeof pointer!=='string'||pointer!==''&&!pointer.startsWith('/'))throw Error('field must be an RFC6901 JSON pointer');
@@ -37,7 +39,7 @@ export function materializeProof(proof,records){
   if(proof.endLine>parts.length)throw Error('Proof line range exceeds selected source segment');
   quote=parts.slice(proof.startLine-1,proof.endLine).join('\n');
  }else if(field){
-  if(!['input:proposal','input:answers','input:answerClaims'].includes(proof.reference)||segments.length!==1||segment!==undefined)throw Error('JSON field selectors require a complete input:proposal/answers/answerClaims record');
+  if(!jsonInputs.has(proof.reference)||segments.length!==1||segment!==undefined)throw Error('Unsupported field selector for '+proof.reference+'. Validation details: '+JSON.stringify({field:'field',reference:proof.reference,allowedSelectors:proofSelectorCatalogue([source])[0],repair:source.factId?{reference:proof.reference}:{reference:proof.reference,startLine:1,endLine:1,...(segments.length>1?{segment:1}:{})}}));
   selectedValue=fieldValue(source.text,proof.field);quote=JSON.stringify(selectedValue);
   if(own(proof,'factId')||own(proof,'value')&&!same(proof.value,selectedValue))throw Error('Structured field assertion does not match '+proof.reference+proof.field);
  }else quote=proof.quote;

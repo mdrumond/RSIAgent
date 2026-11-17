@@ -1,3 +1,4 @@
+import {scriptedReview} from './helpers/scripted-review.mjs';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -241,27 +242,14 @@ test('a revised proposal receives a new candidate while prior decisions and vers
  assert.equal(await readFile(join(first.directory,'skills','versions',first.version,'guidance.json'),'utf8'),before);assert.equal(candidates[0].decision.promote,true);
 });
 
-async function scriptedReview(t,root,plan){
- const {createServer}=await import('node:http'),{once}=await import('node:events');let requests=0;
- const server=createServer(async(req,res)=>{
-  let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),tool=await plan(body,requests++);
-  if(tool?.name==='submit_review'&&!tool.args.result.claims){let input;for(const m of body.messages.filter(x=>x.role==='tool'))try{const parsed=JSON.parse(m.content);if(parsed.proofEvidence)input=parsed;}catch{}
-   if(input){const shape=body.tools?.find(t=>t.function?.name==='submit_review')?.function?.parameters?.properties?.result?.properties?.claims?.items?.properties,selector=shape&&!Object.hasOwn(shape,'text');const result=tool.args.result,claims=[];const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){const field=path?path+'.'+key:key;if(typeof item==='string'&&['reason','text','findings'].includes(key)){const ref=x.evidenceRefs?.[0],record=input.proofEvidence.find(r=>r.reference===ref)??input.proofEvidence.find(r=>!r.factId);if(record)claims.push({path:field,...(selector?{}:{text:item}),kind:'hypothesis',proofs:[selector?{reference:record.reference,...(record.factId?{}:{startLine:1,endLine:1,...(record.segments?.length>1?{segment:1}:{})})}:{reference:record.reference,quote:(record.segments??[record.text])[0]}]});}else visit(item,field);}};visit(result);result.claims=claims;}
-  }
-  res.writeHead(200,{'Content-Type':'text/event-stream'});
-  const delta={role:'assistant',...(tool?{tool_calls:[{index:0,id:'review-'+requests,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})};
-  const frame=value=>res.write('data: '+JSON.stringify(value)+'\n\n');
-  frame({id:'review-pages',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta,finish_reason:null}]});
-  frame({id:'review-pages',object:'chat.completion.chunk',created:1,model:'scripted',choices:[{index:0,delta:{},finish_reason:tool?'tool_calls':'stop'}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}});res.end('data: [DONE]\n\n');
- });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
- const credentials_file=join(root,'extra.env');await writeFile(credentials_file,'REVIEW_EXTRA=fixture-only\n');
- return {requests:()=>requests,profile:{provider:'review-extra',model:'scripted',credential_env:'REVIEW_EXTRA',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}}};
-}
+const sourceClaim=(path,reference)=>({path,kind:'hypothesis',proofs:[{reference,startLine:1,endLine:1}]});
+const classificationClaims=value=>({...value,claims:[sourceClaim('reason',value.evidenceRefs[0])]});
+const batchClaims=rows=>({classifications:rows,claims:rows.map((r,i)=>sourceClaim(`classifications.${i}.reason`,['not-an-event','invented:event'].includes(r.evidenceRefs[0])?'first:event':r.evidenceRefs[0]))});
 
 test('native reads page beyond the preview before classifying a late distinct failure',async t=>{
  const {nativeClassify}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'late-diagnostic');
  const group={id:'late-group',message:'Verification failed',occurrences:Array.from({length:7},(_,i)=>({reference:'failure:'+i,data:{message:i===6?'Incorrect strided layout':'Distinct boundary '+i},artifacts:[]}))};
- const decision=cause=>({cause,reason:'Observed diagnostic evidence',coverage:'uncovered',guidanceIds:[],evidenceRefs:[cause==='actor'?'failure:6':'failure:0']});
+ const decision=cause=>classificationClaims({cause,reason:'Observed diagnostic evidence',coverage:'uncovered',guidanceIds:[],evidenceRefs:[cause==='actor'?'failure:6':'failure:0']});
  const provider=await scriptedReview(t,f.root,(_body,n)=>[
   {name:'read',args:{path:'input.json'}},
   {name:'submit_review',args:{result:decision('unknown')}},
@@ -335,7 +323,7 @@ test('native Pi blocks an outside workspace grep before execution and accepts co
  let outsideActions=0;const originalStat=fs.promises.stat;
  fs.promises.stat=async function(path,...args){if(String(path)===outside)outsideActions++;return originalStat.call(this,path,...args);};syncBuiltinESMExports();
  t.after(()=>{fs.promises.stat=originalStat;syncBuiltinESMExports();});
- const invalid={cause:'unknown',coverage:'unknown',guidanceIds:['implementation-baseline'],reason:'Need observed diagnostics',evidenceRefs:[group.occurrences[0].reference]};
+ const invalid={cause:'unknown',coverage:'unknown',guidanceIds:['implementation-baseline'],reason:'Need observed diagnostics',evidenceRefs:[group.occurrences[0].reference],claims:[sourceClaim('reason',group.occurrences[0].reference)]};
  const entries=[{id:'implementation-baseline',scope:'implementation'}];
  const provider=await scriptedReview(t,f.root,(_body,n)=>[
   {name:'read',args:{path:'input.json'}},
@@ -356,9 +344,9 @@ test('native classification batches validate all group IDs and correct missing o
  const rows=groups.map(group=>({groupId:group.id,cause:'unknown',coverage:'uncovered',guidanceIds:[],reason:'The evidence is inconclusive.',evidenceRefs:[group.occurrences[0].reference]}));
  const provider=await scriptedReview(t,f.root,(_body,n)=>[
   {name:'read',args:{path:'input.json'}},
-  {name:'submit_review',args:{result:{classifications:rows.slice(0,1)}}},
-  {name:'submit_review',args:{result:{classifications:[rows[0],rows[0]]}}},
-  {name:'submit_review',args:{result:{classifications:rows}}}
+  {name:'submit_review',args:{result:batchClaims(rows.slice(0,1))}},
+  {name:'submit_review',args:{result:batchClaims([rows[0],rows[0]])}},
+  {name:'submit_review',args:{result:batchClaims(rows)}}
  ][n]);
  const result=await nativeClassifyBatch({directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])});
  assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),5);
@@ -371,14 +359,14 @@ test('native classification repairs coverage and references from actual copyable
  const received=[];
  const provider=await scriptedReview(t,f.root,(body,n)=>{
   if(n===0)return {name:'read',args:{path:'input.json'}};
-  if(n===1)return {name:'submit_review',args:{result:{classifications:[row('first'),row('first'),row('invented')]}}};
+  if(n===1)return {name:'submit_review',args:{result:batchClaims([row('first'),row('first'),row('invented')])}};
   if(n===2||n===3){
    const content=body.messages.filter(m=>m.role==='tool').at(-1).content;
    const match=String(content).match(/Validation details: (\{[^\n]+\})/);assert.ok(match,String(content));
    const detail=JSON.parse(match[1]);received.push(detail);
    const rows=(n===2?detail.allowedGroupIds:groups.map(g=>g.id)).map(row);
    if(n===2)rows[1].evidenceRefs=['not-an-event'];else rows[1].evidenceRefs=detail.allowedRefs;
-   return {name:'submit_review',args:{result:{classifications:rows}}};
+   return {name:'submit_review',args:{result:batchClaims(rows)}};
   }
   return null;
  });
@@ -589,7 +577,7 @@ test('traceback ownership survives inventory grouping and native diagnostic dedu
  for(const path of ['/tmp/work-a/candidate/kernel.py','/tmp/work-b/candidate/kernel.py','/tmp/work-c/trusted/reference.py'])state.event(attempt,'verification',{correct:false,error:`Traceback: File "${path}", line 7: ValueError: incorrect argument`});state.close();
  const inventory=await inventoryFailures(f.options.sources);assert.equal(inventory.groups.length,2);assert.deepEqual(inventory.groups.map(g=>g.occurrences.length).sort(),[1,2]);
  const group={id:'ownership',occurrences:inventory.groups.flatMap(g=>g.occurrences)},directory=join(f.root,'ownership-review');
- const decision={cause:'unknown',reason:'Observed failures have different source ownership',coverage:'uncovered',guidanceIds:[],evidenceRefs:group.occurrences.map(o=>o.reference)};
+ const decision={cause:'unknown',reason:'Observed failures have different source ownership',coverage:'uncovered',guidanceIds:[],evidenceRefs:group.occurrences.map(o=>o.reference),claims:[sourceClaim('reason',group.occurrences[0].reference)]};
  const provider=await scriptedReview(t,f.root,(_body,n)=>[{name:'read',args:{path:'input.json'}},{name:'submit_review',args:{result:decision}}][n]);
  const {nativeClassify}=await import('../../cli/skill-review-native.mjs');await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
  const input=await load(join(directory,'input.json'));assert.equal(input.group.distinctDiagnostics,2);
@@ -630,7 +618,7 @@ test('isolated review reads original project facts through a retained empty fork
  db.prepare("UPDATE projects SET status='failed' WHERE id='p1'").run();const attempt=db.prepare("SELECT id FROM attempts WHERE project='p1'").get().id;db.prepare('INSERT INTO events(attempt,type,data,created) VALUES (?,?,?,?)').run(attempt,'verification',JSON.stringify({passed:true,correctness:{passed:true}}),new Date().toISOString());db.close();
  const before=createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex');await runReview({...f.options,stage:'inventory'});
  const fork=join(f.options.output,'campaigns','a3');await mkdir(fork,{recursive:true});await writeFile(join(fork,'instance.json'),JSON.stringify({format:1,target:'a3',skills:{activeVersion:'baseline'},actor:{provider:'fixture',model:'fixture'}}));new State(join(fork,'state.sqlite')).close();
- const contexts=[],provider=await scriptedReview(t,f.root,body=>{const used=body.messages.filter(m=>m.role==='tool');if(!used.length)return{name:'read',args:{path:'input.json'}};if(used.length===1){const input=JSON.parse(used[0].content);return{name:'submit_review',args:{result:{cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[input.group.occurrences[0].reference],reason:'Observed evidence'}}};}return null;});
+ const contexts=[],provider=await scriptedReview(t,f.root,body=>{const used=body.messages.filter(m=>m.role==='tool');if(!used.length)return{name:'read',args:{path:'input.json'}};if(used.length===1){const input=JSON.parse(used[0].content);return{name:'submit_review',args:{result:{cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[input.group.occurrences[0].reference],reason:'Observed evidence',claims:[sourceClaim('reason',input.group.occurrences[0].reference)]}}};}return null;});
  await runReview({...f.options,stage:'classify'},{classify:async input=>{const {nativeClassify}=await import('../../cli/skill-review-native.mjs');const out=await nativeClassify({...input,config:{...input.config,actor:provider.profile}});contexts.push(await load(join(input.directory,'input.json')));return out;}});
  const summary=contexts.flatMap(x=>x.projectSummaries).find(x=>x.projectId==='p1');assert.equal(summary.available,true);assert.equal(summary.projectStatus,'failed');assert.equal(summary.facts.find(x=>x.reference.endsWith(':passingVerificationCount')).value,1);assert.equal(createHash('sha256').update(await readFile(join(f.source,'state.sqlite'))).digest('hex'),before);
 });

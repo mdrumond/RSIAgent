@@ -1,7 +1,9 @@
 /** Native Pi/KDB and existing curriculum/evaluation adapters for isolated reviews. */
-import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat,rename} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {Type} from 'typebox';
+import {randomUUID} from 'node:crypto';
+import {proofSelectorCatalogue} from './claim-proofs.mjs';
 import {Check,Errors} from 'typebox/value';
 import {discoveryProofSources} from './skill-discovery-proofs.mjs';
 import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
@@ -24,6 +26,7 @@ import {compactSummary,sourcePointers} from './skill-evidence-summary.mjs';
 import {diagnosticIdentity} from '../controller/skill-review.mjs';
 import {evaluateSkillObjective,evaluationSettings} from '../controller/skill-objectives.mjs';
 
+export const REVIEW_CONTRACT_VERSION=2;
 const nonempty=()=>Type.String({minLength:1});
 const proofFields={reference:nonempty(),quote:Type.Optional(nonempty()),factId:Type.Optional(nonempty()),value:Type.Optional(Type.Unknown()),startLine:Type.Optional(Type.Integer({minimum:1})),endLine:Type.Optional(Type.Integer({minimum:1})),segment:Type.Optional(Type.Integer({minimum:1})),field:Type.Optional(Type.String()),sourceSha256:Type.Optional(nonempty()),recordSha256:Type.Optional(nonempty()),sourceRefs:Type.Optional(Type.Array(nonempty())),sourcePaths:Type.Optional(Type.Array(nonempty()))};
 const proofSchema=Type.Object(proofFields,{additionalProperties:false});
@@ -32,19 +35,25 @@ const claimsSchema=Type.Array(claimSchema,{minItems:1});
 const selectorFields=Object.fromEntries(['reference','startLine','endLine','segment','field'].map(k=>[k,proofFields[k]]));
 const selectorProofSchema=Type.Object(selectorFields,{additionalProperties:false});
 const selectorClaims=(path=nonempty())=>Type.Array(Type.Object({path,kind:claimSchema.properties.kind,proofs:Type.Array(selectorProofSchema,{minItems:1})},{additionalProperties:false}),{minItems:1});
-const selectorInstructions='Submit claims only as {path,kind,proofs:[{reference,startLine?,endLine?,segment?,field?}]}. The path identifies prose in your RESULT, not the input. Omit claim.text and all quotes, hashes, fact values, source lists and copied input metadata: software derives them. Lines are 1-based inclusive; excerpt records need segment. A whole typed fact uses only reference. JSON field selectors apply only to input:* records. Cite original primary references, never a summary as its own proof.';
+const selectorInstructions='Submit claims only as {path,kind,proofs:[{reference,startLine?,endLine?,segment?,field?}]}. The path identifies prose in your RESULT, not the input. Omit claim.text and all quotes, hashes, fact values, source lists and copied input metadata: software derives them. Lines are 1-based inclusive; excerpt records need segment. A whole typed fact uses only reference. JSON field selectors require a listed eligible input record and an RFC6901 pointer such as /changes/0/text; use proofSelectors for each reference and its supported selectors. Cite original primary references, never a summary as its own proof.';
 const selectorShape=result=>({...result,...(result.issues?{issues:result.issues.map(issue=>typeof issue==='string'?issue:Object.fromEntries(['problem','description','path','field','summaryItemId'].filter(k=>Object.hasOwn(issue,k)).map(k=>[k,issue[k]])))}:{}),claims:result.claims?.map(({text,...claim})=>({...claim,proofs:claim.proofs?.map(p=>Object.fromEntries(Object.keys(selectorFields).filter(k=>Object.hasOwn(p,k)).map(k=>[k,p[k]])))}))});
-const classificationSchema=Type.Object({claims:selectorClaims(Type.Literal('reason'))},{additionalProperties:true});
-const classificationBatchSchema=Type.Object({claims:selectorClaims(Type.String({pattern:'^classifications[.][0-9]+[.]reason$'}))},{additionalProperties:true});
+const choices=values=>Type.Union(values.map(value=>Type.Literal(value)));
+const strings=()=>Type.Array(nonempty());
+const classificationFields={cause:choices(['actor','harness','specification','provider','unknown']),bucket:Type.Optional(choices(['harness','correctness','optimization'])),reason:nonempty(),coverage:choices(['covered','uncovered','unknown']),guidanceIds:strings(),evidenceRefs:Type.Array(nonempty(),{minItems:1}),gap:Type.Optional(choices(['missing','insufficient','not-followed','unknown']))};
+export const classificationSchema=Type.Object({...classificationFields,claims:selectorClaims(Type.Literal('reason'))},{additionalProperties:false});
+export const classificationBatchSchema=Type.Object({classifications:Type.Array(Type.Object({groupId:nonempty(),...classificationFields},{additionalProperties:false}),{minItems:1}),claims:selectorClaims(Type.String({pattern:'^classifications[.][0-9]+[.]reason$'}))},{additionalProperties:false});
 const classificationOptions=(input,batch=false)=>({...input,proofRequired:true,selectorOnly:true,resultSchema:batch?classificationBatchSchema:classificationSchema,
  validate:async(value,retrievals)=>({...await input.validate(value,retrievals),claims:value.claims})});
-const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
+export const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
 const summaryItemId=Type.Optional(Type.String({minLength:1,description:'For a defect in an evidence summary, copy the exact evidenceSummary.items[].id to route this issue back to its summarizer.'}));
 const selectorIssueFields={summaryItemId,path:Type.Optional(nonempty()),field:Type.Optional(nonempty())};
 const selectorIssueSchema=Type.Union([nonempty(),Type.Object({...selectorIssueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...selectorIssueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
 const issueFields={summaryItemId,...Object.fromEntries(Object.entries(proofFields).map(([k,v])=>[k,Type.Optional(v)])),path:Type.Optional(nonempty())};
 const issueSchema=Type.Union([nonempty(),Type.Object({...issueFields,problem:nonempty(),description:Type.Optional(nonempty())},{additionalProperties:false}),Type.Object({...issueFields,description:nonempty(),problem:Type.Optional(nonempty())},{additionalProperties:false})]);
 const requestSchema=Type.Object({groupIds:Type.Array(nonempty()),question:nonempty(),hypothesis:nonempty(),requiredEvidence:nonempty(),learningTarget:Type.Union([Type.Literal('cpu'),Type.Literal('device')]),workKind:Type.Optional(Type.Union([Type.Literal('microlearning'),Type.Literal('phase1')]))},{additionalProperties:false});
+const contradiction={contradictoryEvidence:Type.Optional(strings())};
+const changeSchema=Type.Union([Type.Object({action:Type.Literal('remove'),id:nonempty(),...contradiction},{additionalProperties:false}),Type.Object({action:Type.Literal('upsert'),id:nonempty(),scope:nonempty(),text:nonempty(),critical:Type.Boolean(),negative:Type.Boolean(),...contradiction,evidenceRefs:Type.Optional(strings()),response:Type.Optional(choices(['actor-change','report-blocker','reserve-validation-runway','retrieve-scoped-evidence'])),measurements:Type.Optional(Type.Array(Type.Object({reference:nonempty(),durationSeconds:Type.Number({minimum:0})},{additionalProperties:false})))},{additionalProperties:false})]);
+export const proposalSchema=Type.Object({action:choices(['update','learn','no-change']),reason:nonempty(),groupIds:Type.Array(nonempty(),{minItems:1}),memoryRefs:Type.Optional(strings()),changes:Type.Optional(Type.Array(changeSchema)),question:Type.Optional(nonempty()),hypothesis:Type.Optional(nonempty()),requiredEvidence:Type.Optional(nonempty()),learningTarget:Type.Optional(choices(['cpu','device'])),workKind:Type.Optional(choices(['microlearning','phase1'])),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:selectorClaims()},{additionalProperties:false});
 const qaAnswerResultSchema=Type.Object({answers:Type.Object(Object.fromEntries(['action','mechanism','example','evidence','objective'].map(k=>[k,Type.Object({text:nonempty(),refs:Type.Array(nonempty())},{additionalProperties:false})])),{additionalProperties:false}),changes:Type.Optional(Type.Array(Type.Unknown())),memoryRefs:Type.Optional(Type.Array(nonempty())),reason:Type.Optional(nonempty()),claims:claimsSchema},{additionalProperties:false});
 const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
 
@@ -74,16 +83,20 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
  const packet=compactEvidence?{observations:[],artifacts:[]}:await frozenEvidencePacket(evidenceGroups);
  prompt={...prompt,filesystemAccess:{allowed,requiredReads},projectSummaries:prompt.projectSummaries??await projectSummaries(config,evidenceGroups),learningProofEvidence:prompt.learningProofEvidence??await learningProofEvidence(prompt.learning,prompt.learningEvidence),frozenEvidence:packet};
- const proofSources=()=>proofRecords?[...proofRecords,...claimEvidence({prompt:{entries:prompt.entries,baseline:prompt.baseline,proposal:prompt.proposal,answers:prompt.answers,answerClaims:prompt.answerClaims}})]:claimEvidence({prompt,packet});
- if(proofRequired)prompt={...prompt,proofInstructions:selectorOnly?selectorInstructions:proofInstructions,proofEvidence:compactEvidence?undefined:proofSources()};
- await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
  const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
  const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
+ const proofSources=()=>proofRecords?[...proofRecords,...claimEvidence({prompt:{entries:prompt.entries,baseline:prompt.baseline,proposal:prompt.proposal,answers:prompt.answers,answerClaims:prompt.answerClaims},retrievals})]:claimEvidence({prompt,packet,retrievals});
+ const catalogueFile=join(directory,'proof-selectors.json');let catalogueWrites=Promise.resolve();
+ const refreshCatalogue=()=>catalogueWrites=catalogueWrites.then(async()=>{const catalogue=proofSelectorCatalogue([...proofSources(),...(discoveryProofRecords?await discoveryProofRecords():[])]),temporary=catalogueFile+'.'+randomUUID()+'.tmp';await writeFile(temporary,JSON.stringify(catalogue,null,2));await rename(temporary,catalogueFile);return catalogue;});
+ if(proofRequired)prompt={...prompt,proofInstructions:(selectorOnly?selectorInstructions:proofInstructions)+' After KDB search/read_entry, read proofSelectorsFile for newly retrieved references and actual line/segment bounds. Submit selectors only; never copy source prose into proof metadata.',proofSelectorsFile:catalogueFile,proofSelectors:await refreshCatalogue(),proofEvidence:compactEvidence?undefined:proofSources()};
+ await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
  const coverageFile=join(directory,'read-evidence.json');
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async(result,cached=false)=>{
-  const candidate=cached&&selectorOnly?selectorShape(result):result;
+  let candidate=cached&&selectorOnly?selectorShape(result):result;
+  if(cached&&schema===classificationSchema){const {groupId,intervention,...submitted}=candidate;candidate=submitted;}
+  if(cached&&schema===classificationBatchSchema)candidate={...candidate,classifications:candidate.classifications?.map(({intervention,...submitted})=>submitted)};
   if((proofRequired||resultSchema)&&!Check(schema,candidate)){const paths=Errors(schema,candidate).slice(0,4).map(e=>(e.instancePath||'/')+' '+e.message).join('; ');
    throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
   }
@@ -92,11 +105,19 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   if(proofRequired)validateClaimedResult(result,[...(proofRecords?proofSources():claimEvidence({prompt,packet,retrievals})),...(discoveryProofRecords?await discoveryProofRecords():[])]);
   return validate(result,retrievals);
  };
- const prior=await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
+ const contractFile=join(directory,'review-contract.json');
+ const contract={version:REVIEW_CONTRACT_VERSION,schema};
+ let oldContract;try{oldContract=JSON.parse(await readFile(contractFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+ const compatible=JSON.stringify(oldContract)===JSON.stringify(contract);
+ if(!compatible){const archive=join(directory,'contract-history',randomUUID());await mkdir(archive,{recursive:true});
+  for(const file of ['submission.json','native-session.json','review-contract.json'])try{await rename(join(directory,file),join(archive,file));}catch(error){if(error.code!=='ENOENT')throw error;}
+ }
+ await writeFile(contractFile,JSON.stringify(contract));
+ const prior=compatible?await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;}):null;
  let priorRejection;
  if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));return {value,retrievals,recovered:true};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
-  recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
+  recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');if(proofRequired)await refreshCatalogue();}}):null;
  let submitted,rejectedSubmissions=0,lastRejection;
  const sanitize=value=>String(value??'').replace(/(https?:\/\/)[^/\s@]+@/gi,'$1[redacted]@').replace(/Bearer\s+[^\s"<>]+/gi,'Bearer [redacted]').replace(/([?&](?:token|key|api_key|access_token)=)[^&\s"<>]+/gi,'$1[redacted]').slice(0,2000);
  const rejectedCalls=new Set();let rejectionWrites=Promise.resolve();
@@ -119,7 +140,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
   execute:async(id,{result})=>{try{submitted=await check(result);}catch(error){await recordRejection(id,error.message,result);throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
- const sessionFile=join(directory,'native-session.json');let retained;try{retained=JSON.parse(await readFile(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+ const sessionFile=join(directory,'native-session.json');let retained;try{retained=compatible?JSON.parse(await readFile(sessionFile,'utf8')):undefined;}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
  const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
@@ -165,7 +186,7 @@ export async function nativeReview(input,dependencies={}){
  const sources=await discoveryProofSources(input.groups);
  const prompt={guidanceScopes:['global-kdb',...workflowStages],task:'Review this guidance bucket using KDB search and read_entry. Return {action:update|learn|no-change,reason,groupIds:[],memoryRefs:["collection:entry_id"],changes:[],question,hypothesis,requiredEvidence,learningTarget:cpu|device,learningRequests:[{groupIds:[originating failure group IDs],question,hypothesis,requiredEvidence,learningTarget:cpu|device}]}. Include outstanding learning questions even when proposing a supported update. Each learning request must identify its own originating groupIds, a nonempty subset of this bucket; do not attach unrelated harness faults to an actor/specification question. An update requires retrieved supporting memory, not a failure alone. For KDB search results, chunk_id is the entry_id argument to read_entry; do not substitute a lesson hash, Git hash or filename. memoryRefs uses exact collection:chunk_id from actual retrieval. evidenceRefs uses exact failure occurrence/linked-diagnostic IDs, not KDB IDs. Use only the enumerated guidanceScopes for changes.scope; correctness/optimization/harness are evaluation buckets, not guidance scopes. changes are {action:upsert,id,scope,text,critical:boolean,negative:boolean,evidenceRefs:[occurrence references],response:actor-change|report-blocker|reserve-validation-runway|retrieve-scoped-evidence}. report-blocker and reserve-validation-runway require scope=global-kdb or scope=preflight; fix that scope field rather than reordering changes. actor-change is the valid response label for actor-owned guidance. Prefer one concise new entry supplementing protected baseline. No device performance claims from CPU results or unsupported duration/speed claims. Cumulative actor clocks are not operation timings. Keep references and guidance compact. Detailed kernel cases remain searchable; guidance should explain applicability and retrieval. Questions requiring GPU evidence must stay pending if CPU cannot answer. Harness faults may only produce report/preserve guidance. Classify each learning request with workKind:microlearning when a single tiny controlled experiment or archived-fact inspection can finish inside 900 elapsed seconds including construction, verification and cleanup; otherwise workKind:phase1. This only routes future work; do not run benchmarks in this review.',groups:input.groups,entries:input.entries,classification:input.classifications,learning:input.learning??[],learningEvidence:input.learningEvidence??[]};
  const allowedPaths=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
- return (dependencies.session??reviewSession)({...input,proofRequired:true,allowedPaths,evidenceGroups:input.groups,knowledge:true,discoveryProofRecords:async()=>(await discoveryProofSources(input.groups)).records,prompt:{...prompt,discoverySources:sources.indexes},validate:(result,retrievals)=>{
+ return (dependencies.session??reviewSession)({...input,proofRequired:true,selectorOnly:true,resultSchema:proposalSchema,allowedPaths,evidenceGroups:input.groups,knowledge:true,discoveryProofRecords:async()=>(await discoveryProofSources(input.groups)).records,prompt:{...prompt,discoverySources:sources.indexes},validate:(result,retrievals)=>{
   const refs=new Set(retrievals.flatMap(r=>r.entries.map(e=>`${e.collection}:${e.entry_id??e.chunk_id??e.id}`)));
   if(result.action==='update'&&result.memoryRefs?.some(ref=>!refs.has(ref)))throw Error('Memory references must have been retrieved in this session');
   return input.validate(result);
