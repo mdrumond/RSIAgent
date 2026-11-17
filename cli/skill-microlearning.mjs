@@ -13,6 +13,7 @@ import {freezeGroups} from './skill-backlog-analysis.mjs';
 import {qualifyLearningSuite} from './skill-priority-cases.mjs';
 import {hypothesisEvaluationSettled} from './skill-hypothesis-evaluation.mjs';
 import {createKdbBridge} from '../integrations/kdb-extension.mjs';
+import {ReviewValidationError,validateReviewReferences} from '../controller/review-validation.mjs';
 const has=db=>db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get();
 export const smallLearning=r=>r.intervention!=='user-required'&&(r.workKind==='suite'||r.workKind==='microlearning');
 export function pendingMicrolearning(backlog){
@@ -25,7 +26,11 @@ export function validateArchivalInspection(value,{refs,request,retrievals=[]}){
   const collection=entry.collection??record.arguments?.collection,id=entry.entry_id??entry.chunk_id??entry.id;
   return collection&&id?[`${collection}:${id}`]:[];
  }))]);
- if(!['resolved','experiment'].includes(value?.status)||!value.answer?.trim()||!Array.isArray(value.refs)||value.refs.some(ref=>!known.has(ref))||value.status==='resolved'&&(!value.refs.length||request.workKind==='suite'))throw Error('Cited archival facts or a required experiment decision expected');
+ const message='Cited archival facts or a required experiment decision expected';
+ if(!['resolved','experiment'].includes(value?.status))throw new ReviewValidationError(message,{field:'status',allowedValues:['resolved','experiment']});
+ if(typeof value.answer!=='string'||!value.answer.trim())throw new ReviewValidationError(message,{field:'answer',required:'nonempty string'});
+ if(value.status==='resolved'&&request.workKind==='suite')throw new ReviewValidationError(message,{field:'status',allowedValues:['experiment'],reason:'A suite requires an experiment, not archival resolution'});
+ validateReviewReferences(value.refs,known,{field:'refs',required:value.status==='resolved',message});
  return value;
 }
 export function microlearningConfig(config,{directory,request,resource,seconds}){
