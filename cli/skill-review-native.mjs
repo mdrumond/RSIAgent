@@ -93,6 +93,10 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');}}):null;
  let submitted,rejectedSubmissions=0,lastRejection;
  const sanitize=value=>String(value??'').replace(/(https?:\/\/)[^/\s@]+@/gi,'$1[redacted]@').replace(/Bearer\s+[^\s"<>]+/gi,'Bearer [redacted]').replace(/([?&](?:token|key|api_key|access_token)=)[^&\s"<>]+/gi,'$1[redacted]').slice(0,2000);
+ const rejectedCalls=new Set();let rejectionWrites=Promise.resolve();
+ const recordRejection=(toolCallId,error,result)=>{if(rejectedCalls.has(toolCallId))return rejectionWrites;rejectedCalls.add(toolCallId);rejectedSubmissions++;lastRejection=sanitize(error);
+  rejectionWrites=rejectionWrites.then(()=>appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({toolCallId,error:lastRejection,...(result===undefined?{}:{result})})+'\n'));return rejectionWrites;
+ };
  const extension=pi=>{
   pi.on('tool_call',async event=>{if(!['read','grep','find','ls'].includes(event.toolName))return;
    const requested=resolveToCwd(event.input.path??'.',directory);
@@ -108,7 +112,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    await writeFile(coverageFile,JSON.stringify([...seen]));
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
-  execute:async(_id,{result})=>{try{submitted=await check(result);}catch(error){rejectedSubmissions++;lastRejection=sanitize(error.message);await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({error:error.message,result})+'\n');throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
+  execute:async(id,{result})=>{try{submitted=await check(result);}catch(error){await recordRejection(id,error.message,result);throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=JSON.parse(await readFile(sessionFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
@@ -116,8 +120,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await modelFromProfile(config.skill_writer_actor??config.actor),thinkingLevel:'off',
   tools:['read','grep','find','ls','submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
+ const unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
+  const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
+ }});
  const initialMessages=session.messages.length;
  const termination=async(kind,error)=>{
+  await rejectionWrites;
   const providerMessages=session.messages.slice(initialMessages).filter(m=>m.role==='assistant'&&m.stopReason==='error');
   const detail={kind,rejectedSubmissions,providerErrors:providerMessages.length,...(lastRejection?{lastRejection}:{}),...(error||providerMessages.length?{cause:sanitize(providerMessages.at(-1)?.errorMessage??error?.message??error)}:{})};
   await writeFile(join(directory,'termination.json'),JSON.stringify(detail,null,2));return detail;
@@ -132,12 +140,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   await termination('submitted');
   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
  }catch(error){
-  if(!error.reviewSession){const detail=await termination(signal?.aborted?'cancelled':expired?'elapsed':'provider-error',error);
-   if(!signal?.aborted){const wrapped=Error('Review session '+detail.kind+': '+detail.cause);wrapped.name=expired?'TimeoutError':error.name;wrapped.reviewSession=detail;throw wrapped;}
+  if(!error.reviewSession){const elapsed=expired||signal?.reason?.name==='TimeoutError',detail=await termination(elapsed?'elapsed':signal?.aborted?'cancelled':'provider-error',error);
+   if(!signal?.aborted||elapsed){const wrapped=Error('Review session '+detail.kind+': '+detail.cause);wrapped.name=elapsed?'TimeoutError':error.name;wrapped.reviewSession=detail;throw wrapped;}
   }
   throw error;
  }finally{
-  clearTimeout(timer);signal?.removeEventListener('abort',abort);
+  clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();await rejectionWrites;
   try{await session.exportToJsonl(join(directory,'session.native.jsonl'));}finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
 }

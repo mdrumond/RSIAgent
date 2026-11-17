@@ -62,3 +62,13 @@ test('actual Pi SDK elapsed termination is distinct from cancellation and no-sub
  const f=await fixture(t,()=>undefined);await assert.rejects(reviewSession({...f,seconds:0.05}),error=>{assert.equal(error.name,'TimeoutError');assert.equal(error.reviewSession.kind,'elapsed');return true;});
  const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.kind,'elapsed');assert.equal(termination.rejectedSubmissions,0);
 });
+test('actual Pi SDK schema rejection before execute counts exactly one rejected submission',async t=>{
+ const f=await fixture(t,n=>n===1?{result:{reason:'Observed failure'}}:{});
+ await assert.rejects(reviewSession(f),error=>{assert.equal(error.reviewSession.kind,'rejected-submissions');assert.equal(error.reviewSession.rejectedSubmissions,1);assert(error.reviewSession.lastRejection);return true;});
+ const rows=(await readFile(join(f.directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.length,1);
+});
+test('actual Pi SDK inherited timeout signal records elapsed rather than deliberate cancellation',async t=>{
+ const f=await fixture(t,()=>undefined);
+ await assert.rejects(reviewSession({...f,signal:AbortSignal.timeout(50)}),error=>{assert.equal(error.name,'TimeoutError');assert.equal(error.reviewSession.kind,'elapsed');return true;});
+ const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.kind,'elapsed');
+});
