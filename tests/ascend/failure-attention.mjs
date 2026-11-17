@@ -11,6 +11,7 @@ import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {processIdentity,operationsStopped} from '../../controller/lifecycle.mjs';
 import {auditResolution,applyResolution,reopenResolution,attentionRevision,attentionSnapshot,occurrenceAttention,projectAttention,attemptAttention} from '../../controller/failure-attention.mjs';
 import {main} from '../../cli/main.mjs';
+import {executionDigest,administrativeHealthHistory} from '../../controller/portable-proof.mjs';
 
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'failure-attention-')),state=new State(join(root,'state.sqlite')),db=state.db;
@@ -141,6 +142,26 @@ test('legacy transfer handles require exact submitted operation mapping and nati
  await auditResolution(g.db,g.manifest);
  g.event('execution-submitting',{submission:operation,operation});
  await assert.rejects(auditResolution(g.db,g.manifest),/Unmatched execution/);
+});
+
+test('retirement honors only validated portable administrative boundaries and fences destination work',async t=>{
+ for(const kind of ['valid','fake-digest','payload','destination-start']){
+  const f=await fixture(t),handle='local:exec-health';
+  f.event('execution-starting',{operation:'source-health'});
+  f.event('execution-submitting',{operation:'source-health',submission:'health',kind:'run',accountingExcluded:true});
+  f.event('execution-submitted',{operation:'source-health',submission:'health',handle});
+  f.event('execution-handle',{operation:'source-health',handle,purpose:'resource-health'});
+  const prefix=f.state.events('attempt'),proof={eventCount:prefix.length,executionSha256:executionDigest(prefix),healthHandles:administrativeHealthHistory(prefix),sourceShutdown:{sha256:'a'.repeat(64)}};
+  if(kind==='fake-digest')proof.executionSha256='0'.repeat(64);
+  if(kind==='payload'){
+   f.event('native-bash-started',{operation:'source-payload'});
+   const altered=f.state.events('attempt');proof.eventCount=altered.length;proof.executionSha256=executionDigest(altered);
+  }
+  f.event('portable-bound',proof);
+  if(kind==='destination-start')f.event('execution-starting',{operation:'destination-payload'});
+  if(kind==='valid')await auditResolution(f.db,f.manifest);
+  else await assert.rejects(auditResolution(f.db,f.manifest),/Unmatched execution/);
+ }
 });
 
 test('occurrence-only attention cannot hide live or unresolved attempts and does not require whole-attempt coverage',async t=>{
