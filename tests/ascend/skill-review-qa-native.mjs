@@ -1,9 +1,10 @@
 import test from 'node:test';
+import {Type} from 'typebox';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {nativeQaAnswer,nativeQaReview} from '../../cli/skill-review-native.mjs';
+import {nativeQaAnswer,nativeQaReview,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'qa-native-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const proposalDirectory=join(root,'writer');await mkdir(proposalDirectory);
@@ -63,7 +64,7 @@ test('QA can inspect copied device learning evidence without presenting it as CP
 test('native cached submissions replay validation without opening a provider session',async t=>{
  const {reviewSession}=await import('../../cli/skill-review-native.mjs');
  const {root}=await fixture(t),directory=join(root,'ranking');await mkdir(directory);
- await writeFile(join(directory,'submission.json'),JSON.stringify([{id:'one',priority:80,reason:'Observed recurrence'}]));
+ await writeFile(join(directory,'submission.json'),JSON.stringify([{id:'one',priority:80,reason:'Observed recurrence'}]));await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:Type.Unknown()}));
  let validations=0;
  const result=await reviewSession({directory,config:{},prompt:{},seconds:1,validate:value=>{validations++;return {priorities:Array.isArray(value)?value:value.priorities};}});
  assert.equal(result.recovered,true);assert.equal(validations,1);assert.equal(result.value.priorities[0].priority,80);assert.equal(JSON.parse(await readFile(join(directory,'submission.json'))).priorities[0].id,'one');
@@ -85,7 +86,7 @@ test('native reviewer receives all previous issues without dropping them from co
 });
 test('session input exposes the same canonical paths used for filesystem admission',async t=>{
  const {root}=await fixture(t),directory=join(root,'cached'),primary=join(root,'primary');await mkdir(directory);await mkdir(primary);const source=join(primary,'source.txt');await writeFile(source,'Observed fact');
- await writeFile(join(directory,'submission.json'),JSON.stringify({ok:true}));const {reviewSession}=await import('../../cli/skill-review-native.mjs');
+ await writeFile(join(directory,'submission.json'),JSON.stringify({ok:true}));await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:Type.Unknown()}));const {reviewSession}=await import('../../cli/skill-review-native.mjs');
  const out=await reviewSession({directory,config:{},prompt:{},allowedPaths:[primary,source],validate:x=>x});assert.equal(out.recovered,true);
  const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
  assert.deepEqual(input.filesystemAccess.allowed,[{path:directory,directory:true},{path:primary,directory:true},{path:source,directory:false}]);assert.deepEqual(input.filesystemAccess.requiredReads,[]);
