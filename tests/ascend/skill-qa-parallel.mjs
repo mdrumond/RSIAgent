@@ -85,3 +85,10 @@ test('audit completion order does not change approval for the same evidence and 
  const path=join(input.directory,'qa.json'),saved=JSON.parse(await readFile(path));delete saved.verdict;delete saved.approval;delete saved.rounds[0].answers;delete saved.rounds[0].review;saved.summary.audits={};await writeFile(path,JSON.stringify(saved));reverse=true;
  const second=await runProposalQa(input,{...ops,qaAuditSummary:audit});assert.equal(first.approval,second.approval);
 });
+test('identical summary item IDs receive exactly one independent audit session',async t=>{
+ const input=await fixture(t,1);let calls=0;const directories=new Set();
+ const out=await runProposalQa(input,{qaSummarize:async({page})=>{const value=summary(page);value.items[1]={...value.items[0]};return value;},qaAuditSummary:async({directory})=>{
+  calls++;assert(!directories.has(directory),'Duplicate audit session directory');directories.add(directory);await pause(10);return {verdict:'supported',reason:'Checked once'};
+ },qaAnswer:async()=>answers(),qaReview:async()=>approved()});
+ assert.equal(out.verdict,'approved');assert.equal(calls,1);
+});

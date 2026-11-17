@@ -86,6 +86,13 @@ completed audit; interruption drains running calls before returning. Scheduling
 concurrency does not change the evidence identity or approval contract. The
 standalone `runReview` API forwards its optional `qaConcurrency` setting and
 preserves cancellation from both the review and individual QA work.
+Identical summary item identities share one audit session. Compact review issues
+carry problem/description and optional target path/field; proof selectors belong
+in top-level claims. Complete historical inline issue proofs remain validated.
+Native sessions retain `termination.json` with submitted, provider-error,
+rejected-submissions, no-submit, elapsed, or cancelled disposition, rejection and
+provider-error counts, and bounded sanitized cause details. QA checkpoints retain
+these details under `error.reviewSession` when admission cannot finish.
 
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only

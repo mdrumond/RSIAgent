@@ -93,7 +93,7 @@ export async function runProposalQa(input,ops){
        const result=await call('qaSummarize',{sourceCatalogue:catalogue,page,previousReview:row.revisions.at(-1)?.audits??[],validate:value=>validateSummary(value,catalogue)},`summary-${page.id}-${row.revisions.length}`);
        row.value=validateSummary(result,catalogue);await persist();
       }
-      const items=summaryItems(row.value,page.id);
+      const items=[...new Map(summaryItems(row.value,page.id).map(item=>[item.id,item])).values()];
       await parallel(items,async item=>{
        if(!summary.audits[item.id])summary.audits[item.id]=await call('qaAuditSummary',{sourceCatalogue:catalogue,item,validate:value=>{if(!['supported','revise','unknown'].includes(value.verdict)||!value.reason?.trim())throw Error('Summary audit needs a verdict and reason');return value;}},`summary-audit-${item.id}`);
        await persist();
@@ -134,7 +134,7 @@ export async function runProposalQa(input,ops){
   if(!state.verdict){state.verdict='inconclusive';state.reason='qa-elapsed';}
  }catch(error){
   if(input.signal?.aborted){await persist();throw error;}
-  state.verdict='inconclusive';state.reason=remaining()<=0||error.name==='TimeoutError'?'qa-elapsed':'qa-execution-failed';state.reasonKind='infrastructure';state.retryable=remaining()>0;state.error={name:error.name,message:error.message};
+  state.verdict='inconclusive';state.reason=remaining()<=0||error.name==='TimeoutError'?'qa-elapsed':'qa-execution-failed';state.reasonKind='infrastructure';state.retryable=remaining()>0;state.error={name:error.name,message:error.message,...(error.reviewSession?{reviewSession:error.reviewSession}:{})};
  }
  state.reasonKind??=state.reason==='qa-elapsed'?'infrastructure':'scientific';state.retryable??=false;await persist();return state;
 }

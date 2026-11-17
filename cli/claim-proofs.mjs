@@ -57,16 +57,23 @@ export function validateClaimedResult(value,records){
  const targets=new Map(),inline=[];
  const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){if(key==='claims')continue;const child=path?path+'.'+key:key;
   if(typeof item==='string'&&['reason','text','findings','problem','description'].includes(key))targets.set(child,item);
-  else if(key==='issues'&&Array.isArray(item))item.forEach((issue,i)=>{if(typeof issue==='string')targets.set(child+'.'+i,issue);else{visit(issue,child+'.'+i);if(issue&&allowed.some(k=>own(issue,k)))inline.push(issue);}});
+  else if(key==='issues'&&Array.isArray(item))item.forEach((issue,i)=>{if(typeof issue==='string')targets.set(child+'.'+i,issue);else{visit(issue,child+'.'+i);if(issue&&allowed.some(k=>k!=='field'&&own(issue,k)))inline.push({issue,path:child+'.'+i});}});
   else visit(item,child);
  }};visit(value);
  const hint=' Required prose claim paths: '+JSON.stringify([...targets.keys()])+'. Categorical fields such as verdict are not prose claim paths.';
  try{
-  for(const c of value?.claims??[])if(c&&c.text===undefined&&targets.has(c.path))c.text=targets.get(c.path);
-  validateClaims(value?.claims,records);
+  for(const [i,c]of (value?.claims??[]).entries()){
+   if(c&&c.text===undefined&&targets.has(c.path))c.text=targets.get(c.path);
+   if(!targets.has(c?.path))throw Error('claims.'+i+'.path does not identify submitted prose: '+c?.path);
+   try{validateClaims([c],records);}catch(error){throw Error('claims.'+i+' ('+c.path+'): '+error.message);}
+  }
+  if(!value?.claims?.length)validateClaims(value?.claims,records);
   for(const [path,text]of targets)if(!value.claims.some(c=>c.path===path&&c.text===text))throw Error('Missing exact proof-bearing claim for '+path);
   for(const c of value.claims)if(!targets.has(c.path)||targets.get(c.path)!==c.text)throw Error('Claim path/text does not match submitted prose: '+c.path);
-  for(const issue of inline)Object.assign(issue,materializeProof(Object.fromEntries(allowed.filter(k=>own(issue,k)).map(k=>[k,issue[k]])),records));
+  for(const {issue,path}of inline){
+   if(typeof issue.reference!=='string'||!issue.reference.trim())throw Error(path+'.reference is required for an inline issue proof; put selectors in top-level claims instead');
+   try{Object.assign(issue,materializeProof(Object.fromEntries(allowed.filter(k=>own(issue,k)).map(k=>[k,issue[k]])),records));}catch(error){throw Error(path+': '+error.message);}
+  }
  }catch(error){throw Error(error.message+hint);}
  return value;
 }

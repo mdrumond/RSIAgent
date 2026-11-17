@@ -275,7 +275,7 @@ test('a resumed native review validates saved retrieval citations without queryi
  const provider=await scriptedReview(t,f.root,body=>phase&& !body.messages.some(m=>m.role==='tool')?{name:'submit_review',args:{result:{memoryRefs:['memory:old-entry']}}}:null);
  const validate=(result,records)=>{assert.ok(records.some(r=>r.entries.some(e=>e.collection==='memory'&&e.chunk_id==='old-entry')));return result;};
  const input={directory,config:{actor:provider.profile},prompt:{task:'Retain retrieved references'},validate,seconds:30};
- await assert.rejects(reviewSession(input),/did not submit/);const session=await load(join(directory,'native-session.json'));
+ await assert.rejects(reviewSession(input),error=>error.reviewSession?.kind==='no-submit');const session=await load(join(directory,'native-session.json'));
  await writeFile(join(directory,'retrievals.jsonl'),JSON.stringify({entries:[{collection:'memory',chunk_id:'old-entry'}]})+'\n');phase=1;
  const resumed=await reviewSession(input);assert.deepEqual(resumed.value.memoryRefs,['memory:old-entry']);assert.equal(resumed.retrievals.length,1);
  assert.deepEqual(await load(join(directory,'native-session.json')),session);assert.equal(provider.requests(),3);

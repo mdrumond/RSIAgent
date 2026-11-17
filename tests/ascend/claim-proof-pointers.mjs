@@ -51,3 +51,12 @@ test('native typed submission accepts compact selectors and derives exact output
  const out=await reviewSession({directory:join(root,'review'),config:{actor},proofRequired:true,seconds:10,prompt:{proposal:{changes:[{text}]},entries:[{id:'source',text:'First Line\nExact SECOND line'}],projectSummaries:[{facts:[{reference:'count',factId:'count',text:'1',value:1}]}]},validate:x=>x});
  assert.equal(requests,2);assert.equal(out.value.claims[0].text,text);assert.equal(out.value.claims[0].proofs[0].quote,JSON.stringify(text));assert.equal(out.value.claims[0].proofs[1].quote,'Exact SECOND line');assert.equal(out.value.claims[0].proofs[2].value,1);
 });
+test('issue target fields use top-level claims while complete legacy inline proofs remain validated',()=>{
+ const records=[{reference:'raw',text:'Observed failure\n'}],claim=path=>({path,kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]});
+ const plain={reason:'Observed failure',issues:[{problem:'Observed failure',field:'changes.0.text'}],claims:[claim('reason'),claim('issues.0.problem')]};
+ assert.equal(validateClaimedResult(plain,records),plain);assert.equal(plain.issues[0].reference,undefined);
+ const legacy={reason:'Observed failure',issues:[{problem:'Observed failure',reference:'raw',quote:'Observed failure'}],claims:[claim('reason'),claim('issues.0.problem')]};
+ validateClaimedResult(legacy,records);assert.equal(legacy.issues[0].sourceSha256.length,64);
+ legacy.issues[0].quote='Invented';assert.throws(()=>validateClaimedResult(legacy,records),/Quote|quote/);
+ assert.throws(()=>validateClaimedResult({reason:'Observed failure',issues:[{problem:'Observed failure',startLine:1,endLine:1}],claims:[claim('reason'),claim('issues.0.problem')]},records),/issues\.0.*reference/);
+});
