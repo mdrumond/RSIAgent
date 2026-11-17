@@ -1,16 +1,22 @@
 // State is synchronous: waiting here blocks its owner, just as SQLite's native
 // busy handler does. Keep that wait elapsed-bounded and never replay a workflow
-// or transaction body. Competing writers must be separate processes/connections.
+// or transaction body. An async transaction on the same thread cannot release
+// its lock while this synchronous wait blocks that thread; callers must not
+// hold SQLite writer transactions across event-loop awaits.
 const sleeper=new Int32Array(new SharedArrayBuffer(4));
 
 export function sqliteBackoff(db,{seconds=30}={}) {
   if(!Number.isFinite(seconds)||seconds<=0)throw new Error('SQLite contention seconds must be positive and finite');
   const exec=db.exec.bind(db),prepare=db.prepare.bind(db);
-  // Short native waits allow the remaining elapsed allowance to be checked.
-  exec(`PRAGMA busy_timeout=${Math.min(100,Math.ceil(seconds*1000))}`);
+  // Preserve native waiting for exec scripts/iterators that must not replay.
+  exec('PRAGMA busy_timeout=5000');
   function retry(operation,{commit=false}={}) {
     const deadline=performance.now()+seconds*1000;let delay=25;
-    for(;;) {
+    const previousWait=prepare('PRAGMA busy_timeout').get().timeout;
+    // Scope short waits to operations that can safely retry. Explicit caller
+    // overrides and unreplayed bootstrap/DDL scripts keep their native policy.
+    exec(`PRAGMA busy_timeout=${Math.min(100,previousWait,Math.ceil(seconds*1000))}`);
+    try {for(;;) {
       try{return operation();}
       catch(error) {
         // A stale WAL snapshot cannot become writable by waiting. Retrying a
@@ -23,7 +29,7 @@ export function sqliteBackoff(db,{seconds=30}={}) {
         if(performance.now()>=deadline)throw error;
         delay=Math.min(delay*2,500);
       }
-    }
+    }} finally {exec(`PRAGMA busy_timeout=${previousWait}`);}
   }
   db.exec=function(sql) {
     // exec accepts multiple statements, whose earlier effects could have

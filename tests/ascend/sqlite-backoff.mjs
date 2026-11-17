@@ -7,12 +7,14 @@ import {Worker} from 'node:worker_threads';
 import {once} from 'node:events';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../../controller/state.mjs';
+import {RecoveryQueue} from '../../controller/recovery.mjs';
 
-async function fixture(t,seconds=2) {
+async function fixture(t,seconds=2,nativeWait=20) {
   const root=await mkdtemp(join(tmpdir(),'sqlite-backoff-'));
   t.after(()=>rm(root,{recursive:true,force:true}));
   const file=join(root,'state.sqlite'),state=new State(file,{contentionSeconds:seconds});
-  t.after(()=>state.close());state.db.exec('PRAGMA busy_timeout=20');
+  t.after(()=>state.close());
+  if(nativeWait!==null)state.db.exec(`PRAGMA busy_timeout=${nativeWait}`);
   state.add({id:'one',goal:'persist actual state',actor_seconds:30});
   const attempt=state.admit('one',{});return {state,file,attempt};
 }
@@ -97,4 +99,16 @@ test('COMMIT can wait for a reader without replaying the transaction body',async
   f.state.db.exec('BEGIN IMMEDIATE');f.state.event(f.attempt.id,'commit-once',{});
   f.state.db.exec('COMMIT');assert.equal(f.state.db.isTransaction,false);
   assert.equal(f.state.queryEvents(f.attempt.id,{types:['commit-once']}).length,1);
+});
+
+// Constructors outside State still use unreplayed, multi-statement exec.
+test('RecoveryQueue bootstrap retains native waiting while prepared retries restore caller policy',async t=>{
+  const f=await fixture(t,2,null);
+  await lock(t,f.file);const queue=new RecoveryQueue(f.state);
+  f.state.finish(f.attempt.id,'failed');queue.enqueue(f.attempt.id,0);
+  assert.equal(queue.entry('one').origin,f.attempt.id);
+  f.state.db.exec('PRAGMA busy_timeout=20');await lock(t,f.file);
+  f.state.event(f.attempt.id,'policy-restored',{});
+  assert.equal(f.state.db.prepare('PRAGMA busy_timeout').get().timeout,20);
+  assert.equal(f.state.queryEvents(f.attempt.id,{types:['policy-restored']}).length,1);
 });
