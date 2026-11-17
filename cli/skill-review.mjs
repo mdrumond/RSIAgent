@@ -131,7 +131,7 @@ export async function runReview(options,dependencies={}){
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(Error('Review elapsed allocation exhausted')),Math.min(2147483647,remaining()*1000));
   const signal=options.signal?AbortSignal.any([options.signal,controller.signal]):controller.signal;
   const invoke=async(name,input,cap=240)=>{signal.throwIfAborted();if(remaining()<=0)throw Error('Review elapsed allocation exhausted');
-   const allocation=Math.min(cap,remaining()),bounded=AbortSignal.any([signal,AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
+   const allocation=Math.min(cap,remaining()),bounded=AbortSignal.any([signal,...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000)))]);
    const started=performance.now(),telemetry={stage:name,key:input.key,...(input.groups?{groupCount:input.groups.length,groupIds:input.groups.map(g=>g.id)}:input.group?{groupCount:1,groupIds:[input.group.id]}:{}),...(input.sourceId?{sourceId:input.sourceId,guidanceVersion:input.guidanceVersion}:{})};
    try{const result=await ops[name]({...input,signal:bounded,seconds:allocation});if(result.stats)state.stats.push({...telemetry,...result.stats});return result.value??result;}
    finally{(state.timings??=[]).push({...telemetry,elapsedSeconds:(performance.now()-started)/1000});}};
@@ -218,7 +218,7 @@ export async function runReview(options,dependencies={}){
      classifications:bucket.groups.map(g=>state.classifications[g.id]),config:await configFor(review.sourceId),signal,
      validateProposal:value=>validateReviewProposal(value,bucket.groups,state.classifications)};
     const directory=join(output,'qa',hash([key,qaIdentity(input)]));
-    const result=await runProposalQa({...input,directory,seconds:remaining()},{
+    const result=await runProposalQa({...input,directory,seconds:remaining(),qaConcurrency:options.qaConcurrency},{
      ...((!dependencies.qaAnswer&&!dependencies.qaReview||dependencies.qaSummarize&&dependencies.qaAuditSummary)?{qaSummarize:args=>invoke('qaSummarize',args,args.seconds),qaAuditSummary:args=>invoke('qaAuditSummary',args,args.seconds)}:{}),qaAnswer:args=>invoke('qaAnswer',args,args.seconds),qaReview:args=>invoke('qaReview',args,args.seconds)});
     (state.qa??={})[key]=result;
     if(result.verdict==='approved')state.reviews[key]={...review,...result.proposal};

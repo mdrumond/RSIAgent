@@ -83,7 +83,9 @@ audits share that session limit; page revisions wait for their own audits and th
 writer waits for all evidence checks. Parallel sessions consume elapsed wall time,
 not summed request durations. Checkpoints retain each in-flight reservation and
 completed audit; interruption drains running calls before returning. Scheduling
-concurrency does not change the evidence identity or approval contract.
+concurrency does not change the evidence identity or approval contract. The
+standalone `runReview` API forwards its optional `qaConcurrency` setting and
+preserves cancellation from both the review and individual QA work.
 
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only

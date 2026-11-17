@@ -614,3 +614,20 @@ test('native discovery reads and cites middle oversized evidence without inlinin
  await assert.rejects(nativeReview(input,{session:args=>reviewSession({...args,knowledge:false})}),/Discovery proof source changed/);
  assert.equal(provider.requests(),calls);
 });
+
+test('standalone review adapter propagates failed QA audit cancellation to sibling sessions',async t=>{
+ const f=await fixture(t);let started=0,finished=0,siblingAborted=false,release;
+ const siblingStarted=new Promise(resolve=>{release=resolve;});
+ const deps={classify,review:async args=>{const proposal=update(args);proposal.changes[0].evidenceRefs=args.groups.flatMap(g=>g.occurrences.map(o=>o.reference));return proposal;},qaSummarize:async({page})=>({items:[{text:'First observation',kind:'observation'},{text:'Second observation',kind:'observation'}],claims:[0,1].map(i=>({path:`items.${i}.text`,kind:'observation',proofs:[{reference:page.sources[0].reference,startLine:1,endLine:1}]}))}),qaAuditSummary:async({signal})=>{
+  const order=++started;
+  try{
+   if(order===1){await siblingStarted;throw Error('Provider audit failed');}
+   release();await new Promise(resolve=>{const timer=setTimeout(resolve,80);signal.addEventListener('abort',()=>{siblingAborted=true;clearTimeout(timer);resolve();},{once:true});});
+   return {verdict:'supported',reason:'Completed sibling cleanup'};
+  }finally{finished++;}
+ },qaAnswer:async()=>{throw Error('Failed audit must prevent writing');}};
+ for(const stage of ['inventory','classify','propose'])await runReview({...f.options,stage},deps);
+ await runReview({...f.options,stage:'qa',qaConcurrency:2},deps);
+ assert.equal(started,2);assert.equal(finished,2);assert.equal(siblingAborted,true);
+ const checkpoint=await load(join(f.options.output,'review.json'));assert.equal(Object.values(checkpoint.qa)[0].reason,'qa-execution-failed');
+});
