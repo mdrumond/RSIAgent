@@ -20,7 +20,11 @@ export function runtimeStatus(state,{limit=100}={}) {
     WHERE a.outcome IS NULL AND json_extract(e.data,'$.waiting')=1 ORDER BY e.sequence DESC LIMIT ?`).all(limit);
   const postprocessing=state.db.prepare(`SELECT COUNT(*) n FROM attempts a WHERE outcome IS NOT NULL
     AND NOT EXISTS(SELECT 1 FROM events e WHERE e.attempt=a.id AND e.type='postprocess-completed')`).get().n;
-  return {leases,actorWaits,queues:{fresh:count('projects',"status='queued' AND frozen=0"),
+  const metadataBlocked=state.db.prepare(`SELECT a.id AS attempt,a.project,json_extract(e.data,'$.reason') AS reason
+    FROM attempts a JOIN events e ON e.sequence=(SELECT MAX(sequence) FROM events WHERE attempt=a.id
+      AND type IN ('attempt-metadata-unavailable','attempt-metadata-restored'))
+    WHERE e.type='attempt-metadata-unavailable' ORDER BY e.sequence DESC LIMIT ?`).all(limit);
+  return {leases,actorWaits,metadataBlocked,queues:{fresh:count('projects',"status='queued' AND frozen=0"),
     recovery:count('recovery_queue','attempt IS NULL'),memory:count('recovery_lessons','recorded=0'),postprocessing},
     hostSlots:exists('resource_leases')?state.db.prepare('SELECT resource,attempt FROM resource_leases LIMIT ?').all(limit):[]};
 }

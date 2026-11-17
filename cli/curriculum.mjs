@@ -34,13 +34,14 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
   const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
   const providerPath=join(path,'provider-'+role+'.jsonl');
   let remaining=()=>config.curriculum_seconds??240;
+  const readOnly=role==='summary';
   const local=createLocalExecutionOperations(sdk,config.local_execution);
   const loader=new sdk.DefaultResourceLoader({cwd:path,agentDir,settingsManager,noExtensions:true,noSkills:true,
     extensionFactories:[bridge.extension,pi=>{
       if(config.storage)for(const type of ['before_provider_request','provider_stream_event'])
         pi.on(type,payload=>appendFile(providerPath,JSON.stringify(payload)+'\n'));
       pi.on('tool_call',()=>accepted()?{block:true,reason:'Submission already accepted; further tools are closed.'}:undefined);
-      pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
+      if(!readOnly)pi.registerTool(sdk.createBashToolDefinition(path,{operations:{exec:(command,cwd,options)=>local.exec(command,cwd,
         {...options,timeout:Math.min(options.timeout??Infinity,remaining())})}}));
       for(const entry of (Array.isArray(tool)?tool:[tool]))pi.registerTool({...entry,
         execute:(id,args,signal,update,ctx)=>entry.execute(id,args,signal,update,ctx,{remainingSeconds:remaining})});
@@ -60,7 +61,7 @@ export async function curriculumSession({config,path,bridge,prompt,tool,signal,s
     }finally{ledger.close();}
   }
   const {session}=await sdk.createAgentSession({cwd:path,agentDir,settingsManager,...await modelFromProfile(config.curriculum_actor??config.actor),
-    thinkingLevel:'off',tools:['read','write','edit','bash','mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
+    thinkingLevel:'off',tools:[...(readOnly?['read','grep','find','ls']:['read','write','edit','bash']),'mcp__kdb__*',...(Array.isArray(tool)?tool:[tool]).map(entry=>entry.name)],resourceLoader:loader,sessionManager:manager});
   const started=performance.now();
   const spent=()=>elapsed+(performance.now()-started)/1000;
   remaining=()=>Math.max(.001,seconds-spent());
