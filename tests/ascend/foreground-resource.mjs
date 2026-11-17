@@ -86,8 +86,9 @@ test('a foreground slot claimed during closure is not stolen and a failed snapsh
 test('a file-publication failure cannot revive the old reserved resource after the atomic transfer',async t=>{
   const f=await fixture(t);
   f.environment.reconcileLease=async()=>{await rm(f.file);await mkdir(f.file);return true;};
-  await assert.rejects(migrateForegroundCheckpoint(f.input));
+  assert.equal(await migrateForegroundCheckpoint(f.input),null);
   assert.equal(f.state.db.prepare('SELECT resource FROM resource_leases WHERE attempt=?').get(f.attempt.id).resource,f.resources[1].id);
+  assert.equal(f.state.queryEvents(f.attempt.id,{types:['attempt-metadata-unavailable']}).length,1);
   await rm(f.file,{recursive:true});
   assert.deepEqual(await readAttemptJob(f.state,f.root,f.attempt.id),{...f.job,resource:f.resources[1]});
 });

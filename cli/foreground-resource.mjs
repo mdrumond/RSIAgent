@@ -3,7 +3,7 @@ import {isDeepStrictEqual} from 'node:util';
 import {attemptStopped,ownerStopped,processIdentity} from '../controller/lifecycle.mjs';
 import {environmentBinding} from '../controller/skill-evidence.mjs';
 import {readConfig} from './instance.mjs';
-import {readAttemptJob,publishAttemptJob,materializeAttemptJob} from './attempt-job.mjs';
+import {readAttemptJob,publishAttemptJob,availableAttemptJob} from './attempt-job.mjs';
 
 export async function migrateForegroundCheckpoint({state,config,job,resources,reserved,createEnvironment}) {
   if(!job.resume||job.finalize||!reserved)return null;
@@ -42,8 +42,7 @@ export async function migrateForegroundCheckpoint({state,config,job,resources,re
     state.event(id,'foreground-resource-migrated',{from:prior,to:next,closure:'previous-execution-and-device-lease'});
     state.db.exec('COMMIT');
   }catch(error){state.db.exec('ROLLBACK');throw error;}
-  // If this replace fails, the committed lease and trusted job still agree;
-  // readAttemptJob repairs the old file rather than reviving its reserved slot.
-  await materializeAttemptJob(config.root,id,moved);
-  return next;
+  // File publication can block this attempt, but not unrelated scheduling. The
+  // committed lease and trusted job still agree and later reads repair the file.
+  return await availableAttemptJob(state,config.root,id)?next:null;
 }
