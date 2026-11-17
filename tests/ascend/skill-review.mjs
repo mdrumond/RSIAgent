@@ -143,7 +143,7 @@ test('native Pi classification submits validated results and resumes without ano
  const {createServer}=await import('node:http'),{once}=await import('node:events'),{nativeClassify}=await import('../../cli/skill-review-native.mjs');
  const f=await fixture(t),group=(await inventoryFailures(f.options.sources)).groups[0],directory=join(f.root,'native-classify');let requests=0;
  const value={cause:'unknown',coverage:'uncovered',guidanceIds:[],evidenceRefs:[group.occurrences[0].reference],reason:'Observed failure does not establish cause'};
- value.claims=[{path:'reason',text:value.reason,kind:'hypothesis',proofs:[{reference:group.occurrences[0].reference,quote:JSON.stringify(group.occurrences[0].data)}]}];
+ value.claims=[{path:'reason',kind:'hypothesis',proofs:[{reference:group.occurrences[0].reference,startLine:1,endLine:1}]}];
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);requests++;
   const used=body.messages.filter(m=>m.role==='tool').length;res.writeHead(200,{'Content-Type':'text/event-stream'});
@@ -155,7 +155,11 @@ test('native Pi classification submits validated results and resumes without ano
  const profile={provider:'review-fixture',model:'scripted',credential_env:'REVIEW_FIXTURE',credentials_file,base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
  const input={directory,config:{actor:profile},group,entries:[],seconds:20,validate:r=>validateClassification(r,group,[])};
  const result=await nativeClassify(input);assert.equal(result.value.cause,'unknown');assert.ok(result.stats.tokens.total>0);assert.equal(requests,3);
- await nativeClassify(input);assert.equal(requests,3);
+ const saved=await load(join(directory,'submission.json'));
+ // Legacy accepted submissions may contain copied excerpts rather than selectors.
+ for(const proof of saved.claims[0].proofs){delete proof.startLine;delete proof.endLine;}
+ await writeFile(join(directory,'submission.json'),JSON.stringify(saved));
+ const replay=await nativeClassify(input);assert.equal(replay.recovered,true);assert.equal(requests,3);
 });
 
 test('learning backlog retains every question while only two CPU projects execute',async t=>{
@@ -242,7 +246,7 @@ async function scriptedReview(t,root,plan){
  const server=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw),tool=await plan(body,requests++);
   if(tool?.name==='submit_review'&&!tool.args.result.claims){let input;for(const m of body.messages.filter(x=>x.role==='tool'))try{const parsed=JSON.parse(m.content);if(parsed.proofEvidence)input=parsed;}catch{}
-   if(input){const result=tool.args.result,claims=[];const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){const field=path?path+'.'+key:key;if(typeof item==='string'&&['reason','text','findings'].includes(key)){const ref=x.evidenceRefs?.[0],record=input.proofEvidence.find(r=>r.reference===ref)??input.proofEvidence.find(r=>!r.factId);if(record)claims.push({path:field,text:item,kind:'hypothesis',proofs:[{reference:record.reference,quote:(record.segments??[record.text])[0]}]});}else visit(item,field);}};visit(result);result.claims=claims;}
+   if(input){const shape=body.tools?.find(t=>t.function?.name==='submit_review')?.function?.parameters?.properties?.result?.properties?.claims?.items?.properties,selector=shape&&!Object.hasOwn(shape,'text');const result=tool.args.result,claims=[];const visit=(x,path='')=>{if(!x||typeof x!=='object')return;for(const [key,item]of Object.entries(x)){const field=path?path+'.'+key:key;if(typeof item==='string'&&['reason','text','findings'].includes(key)){const ref=x.evidenceRefs?.[0],record=input.proofEvidence.find(r=>r.reference===ref)??input.proofEvidence.find(r=>!r.factId);if(record)claims.push({path:field,...(selector?{}:{text:item}),kind:'hypothesis',proofs:[selector?{reference:record.reference,...(record.factId?{}:{startLine:1,endLine:1,...(record.segments?.length>1?{segment:1}:{})})}:{reference:record.reference,quote:(record.segments??[record.text])[0]}]});}else visit(item,field);}};visit(result);result.claims=claims;}
   }
   res.writeHead(200,{'Content-Type':'text/event-stream'});
   const delta={role:'assistant',...(tool?{tool_calls:[{index:0,id:'review-'+requests,type:'function',function:{name:tool.name,arguments:JSON.stringify(tool.args)}}]}:{content:'Done'})};
@@ -358,6 +362,54 @@ test('native classification batches validate all group IDs and correct missing o
  ][n]);
  const result=await nativeClassifyBatch({directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])});
  assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),5);
+});
+
+test('native classification repairs coverage and references from actual copyable tool feedback',async t=>{
+ const {nativeClassifyBatch}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'native-feedback');
+ const groups=['first','second'].map(id=>({id,occurrences:[{reference:id+':event',data:{message:id+' failure'},artifacts:[]}]}));
+ const row=id=>({groupId:id,cause:'unknown',coverage:'uncovered',guidanceIds:[],reason:'The cause remains unknown.',evidenceRefs:[id+':event']});
+ const received=[];
+ const provider=await scriptedReview(t,f.root,(body,n)=>{
+  if(n===0)return {name:'read',args:{path:'input.json'}};
+  if(n===1)return {name:'submit_review',args:{result:{classifications:[row('first'),row('first'),row('invented')]}}};
+  if(n===2||n===3){
+   const content=body.messages.filter(m=>m.role==='tool').at(-1).content;
+   const match=String(content).match(/Validation details: (\{[^\n]+\})/);assert.ok(match,String(content));
+   const detail=JSON.parse(match[1]);received.push(detail);
+   const rows=(n===2?detail.allowedGroupIds:groups.map(g=>g.id)).map(row);
+   if(n===2)rows[1].evidenceRefs=['not-an-event'];else rows[1].evidenceRefs=detail.allowedRefs;
+   return {name:'submit_review',args:{result:{classifications:rows}}};
+  }
+  return null;
+ });
+ const options={directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])};
+ const result=await nativeClassifyBatch(options);
+ assert.deepEqual(received[0],{field:'classifications',allowedGroupIds:['first','second'],missingGroupIds:['second'],unknownGroupIds:['invented'],duplicateGroupIds:['first'],arrayRequired:true});
+ assert.deepEqual(received[1].invalidRefs,['not-an-event']);assert.deepEqual(received[1].allowedRefs,['second:event']);
+ assert.deepEqual(result.value.classifications.map(r=>r.evidenceRefs),[['first:event'],['second:event']]);
+ // The provider submitted selectors only; the real verifier materialized their
+ // source excerpts. A cached accepted classification needs no new model work.
+ assert.ok(result.value.claims.every(c=>c.proofs[0].quote&&c.proofs[0].startLine===1));
+ const before=provider.requests(),replay=await nativeClassifyBatch(options);
+ assert.equal(replay.recovered,true);assert.equal(provider.requests(),before);
+});
+
+test('native classification accepts primary selectors and refuses copied proof metadata or invalid source ranges',async t=>{
+ const {nativeClassify}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'selector-classification');
+ const group={id:'one',occurrences:[{reference:'event:one',data:{message:'An observed failure'},artifacts:[]}]};
+ const value={cause:'unknown',coverage:'unknown',guidanceIds:[],reason:'The cause is unknown.',evidenceRefs:['event:one']};
+ const claim=proof=>({path:'reason',kind:'hypothesis',proofs:[proof]});
+ const provider=await scriptedReview(t,f.root,(_body,n)=>[
+  {name:'read',args:{path:'input.json'}},
+  {name:'submit_review',args:{result:{...value,claims:[claim({reference:'event:one',quote:'Invented excerpt'})]}}},
+  {name:'submit_review',args:{result:{...value,claims:[claim({reference:'event:one',startLine:999,endLine:999})]}}},
+  {name:'submit_review',args:{result:{...value,claims:[claim({reference:'event:one',startLine:1,endLine:1})]}}}
+ ][n]);
+ const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
+ assert.equal(result.value.cause,'unknown');assert.equal(provider.requests(),5);
+ const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+ assert.equal(rejected.length,2);
+ assert.equal(result.value.claims[0].proofs[0].quote,JSON.stringify(group.occurrences[0].data));
 });
 
 test('classification batches resume unfinished groups without repeating completed outputs or resetting the deadline',async t=>{
