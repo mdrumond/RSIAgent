@@ -8,7 +8,7 @@ import {RecoveryQueue} from '../../controller/recovery.mjs';
 import {processIdentity} from '../../controller/lifecycle.mjs';
 import {writeAttemptJob,readAttemptJob} from '../../cli/attempt-job.mjs';
 import {migrateForegroundCheckpoint} from '../../cli/foreground-resource.mjs';
-import {setup} from './driver_setup.mjs';
+import {setup,rows,until} from './driver_setup.mjs';
 import {pathToFileURL} from 'node:url';
 
 async function fixture(t) {
@@ -126,5 +126,79 @@ test('the native campaign resume migrates its retained foreground checkpoint bef
     assert.equal(after.queryEvents(id,{types:['foreground-resource-migrated']}).length,1);
     assert.equal((await readAttemptJob(after,f.root,id)).resource.id,resources[1].id);
   }finally{after.close();}
+  f.pass();
+});
+
+test('a cached resume whose metadata becomes unwritable cannot abort an unrelated native actor',async t=>{
+  const f=await setup(t,'phase2',['blocked','healthy']);
+  const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
+  const state=new State(join(f.root,'state.sqlite')),ids=[];
+  const resources=[0,1].map(hostSlot=>({id:'fixture-slot-'+hostSlot,available:true,
+    metadata:{kind:'host-slot',pool:'fixture-pool',hostSlot,backgroundSlot:false,target:'fixture-target'}}));
+  try {
+    new RecoveryQueue(state);
+    for(const [index,project]of ['blocked','healthy'].entries()){
+      const a=state.admit(project,{pid:2147483647,start:'old',boot:'old'});ids.push(a.id);
+      state.checkpoint(a.id,7.25);
+      state.db.prepare('INSERT INTO resource_leases VALUES (?,?)').run(resources[index].id,a.id);
+      await writeAttemptJob(state,f.root,a.id,{attempt:{...state.attempt(a.id)},project:state.project(project),
+        kind:'original',wave:1,actor_seconds:120,mode:'phase1',skillVersion:config.skills.activeVersion,
+        options:{},resource:resources[index]});
+    }
+  }finally{state.close();}
+  const environment=join(f.root,'fault-environment.mjs'),broken=join(f.root,'attempts',ids[0],'job.json');
+  const generic=pathToFileURL(join(f.root,'machinery','integrations/environments/index.mjs')).href;
+  await writeFile(environment,`import {createEnvironment as generic} from ${JSON.stringify(generic)};
+    import {rm,mkdir} from 'node:fs/promises';let corrupted=false;
+    export async function createEnvironment(options,context){return {...await generic(options,context),
+      resources:async()=>{if(!corrupted){corrupted=true;await rm(${JSON.stringify(broken)});await mkdir(${JSON.stringify(broken)});}
+        return ${JSON.stringify(resources)};}};}`);
+  const input=join(f.root,'fault-settings.json');
+  await writeFile(input,JSON.stringify({environment:{module:environment,options:{mode:'local'}},concurrency:2,recovery:false}));
+  await f.run('config','--config',input);await f.run('resume');
+  const after=new State(join(f.root,'state.sqlite'));
+  try {
+    assert.equal(after.project('healthy').status,'passed');
+    assert.equal(after.attempt(ids[0]).outcome,null);assert.equal(after.attempt(ids[0]).elapsed,7.25);
+    assert.equal(after.db.prepare('SELECT resource FROM resource_leases WHERE attempt=?').get(ids[0]).resource,resources[0].id);
+    assert.equal(after.queryEvents(ids[0],{types:['attempt-metadata-unavailable']}).length,1);
+    assert.equal(after.queryEvents(null,{types:['scheduler-error']}).length,0);
+  }finally{after.close();}
+  f.pass();
+});
+
+test('the promotion gate frees the A/B slot without starting the retained foreground actor',async t=>{
+  const f=await setup(t,'phase2',['retained']);
+  const config=JSON.parse(await readFile(join(f.root,'instance.json'),'utf8'));
+  const resources=[0,1].map(hostSlot=>({id:'fixture-slot-'+hostSlot,available:true,
+    metadata:{kind:'host-slot',pool:'fixture-pool',hostSlot,backgroundSlot:hostSlot===0,target:'fixture-target'}}));
+  const environment=join(f.root,'gated-environment.mjs');
+  const generic=pathToFileURL(join(f.root,'machinery','integrations/environments/index.mjs')).href;
+  await writeFile(environment,`import {createEnvironment as generic} from ${JSON.stringify(generic)};
+    export async function createEnvironment(options,context){return {...await generic(options,context),
+      resources:async()=>${JSON.stringify(resources)},reconcileLease:async()=>true};}`);
+  const input=join(f.root,'gate-settings.json');
+  await writeFile(input,JSON.stringify({environment:{module:environment,options:{mode:'local'}},campaign_seconds:30,concurrency:2,
+    skills:{...config.skills,background:true,tuningDisabled:true,promotionGate:{baseVersion:config.skills.activeVersion,status:'waiting'}}}));
+  await f.run('config','--config',input);
+  const state=new State(join(f.root,'state.sqlite'));let id;
+  try {
+    const a=state.admit('retained',{pid:2147483647,start:'old',boot:'old'});id=a.id;state.checkpoint(id,7.25);new RecoveryQueue(state);
+    state.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+    state.db.prepare("INSERT OR REPLACE INTO control VALUES ('operation','\"campaign\"')").run();
+    state.db.prepare('INSERT INTO resource_leases VALUES (?,?)').run(resources[0].id,id);
+    await writeAttemptJob(state,f.root,id,{attempt:{...state.attempt(id)},project:state.project('retained'),
+      kind:'original',wave:1,actor_seconds:120,mode:'phase1',skillVersion:config.skills.activeVersion,
+      options:{continuous:true},resource:resources[0],deferFinalization:true});
+  }finally{state.close();}
+  const running=f.start('resume');
+  try {
+    await until(()=>rows(f.root,"SELECT 1 FROM events WHERE type='foreground-resource-migrated'").length>0,10000);
+    const checkpoint=rows(f.root,'SELECT outcome,session,elapsed FROM attempts')[0];
+    assert.equal(checkpoint.outcome,null);assert.equal(checkpoint.session,null);assert.equal(checkpoint.elapsed,7.25);
+    assert.equal(rows(f.root,"SELECT 1 FROM events WHERE type='task-constructed'").length,0);
+    assert.equal(rows(f.root,'SELECT resource FROM resource_leases')[0].resource,resources[1].id);
+    assert.equal(f.server.requests.length,0);
+  }finally{await f.run('pause');await running.output;}
   f.pass();
 });

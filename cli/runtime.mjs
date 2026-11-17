@@ -328,6 +328,10 @@ export async function operate(command,config,options={}) {
       config:()=>config,remaining:()=>campaignClock.remaining,
       event:(type,data)=>state.event(null,type,data),signal:backgroundAbort.signal,
     }):null;
+    const migrate=(job,resources)=>migrateForegroundCheckpoint({state,config,job,resources,reserved:tuning?.resource,
+      createEnvironment:resource=>environment({...config,environment:{...config.environment,
+        options:{...config.environment.options,asyncCleanup:false}}},join(config.root,'attempts',job.attempt.id),
+      (type,data)=>state.event(job.attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal)});
     const unavailable=new Set();let resourceWait;
     const keyFor=job=>job.attempt?`${job.finalize?'finalize':'attempt'}:${job.attempt.id}`:
       `${job.kind}:${job.projectId}:${job.kind==='original'?'':job.eligible_wave}`;
@@ -483,6 +487,9 @@ export async function operate(command,config,options={}) {
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
         try{await tuning.poll(slots,activeActors.length,limit,{admit:!memory?.blocked&&memory?.limit!==1});}
         catch(error){state.event(null,'skill-background-error',{message:error.message});}
+        if(promotionPending&&tuning.resource)for(const job of candidates.filter(job=>job.resume&&!job.finalize)){
+          const moved=await migrate(job,slots);if(moved)job.resource=moved;
+        }
       }
       if(promotionPending) {
         ctl.set('wait',{reason:'skill-update-required',baseVersion:config.skills.promotionGate.baseVersion,at:new Date().toISOString()});
@@ -526,12 +533,11 @@ export async function operate(command,config,options={}) {
       }
       ctl.set('actor-capacity',Math.min(resources.filter(r=>r.available).length,limit));
       if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
-      let prior=job.resume?(await readAttemptJob(state,config.root,job.attempt.id)).resource:null;
+      const retained=job.resume?await availableAttemptJob(state,config.root,job.attempt.id):null;
+      if(job.resume&&!retained){unavailable.add(keyFor(job));continue;}
+      let prior=retained?.resource??null;
       if(job.resume&&tuning?.reserved&&prior?.id===tuning.resource?.id) {
-        const migrated=await migrateForegroundCheckpoint({state,config,job,resources,reserved:tuning.resource,
-          createEnvironment:resource=>environment({...config,environment:{...config.environment,
-            options:{...config.environment.options,asyncCleanup:false}}},join(config.root,'attempts',job.attempt.id),
-          (type,data)=>state.event(job.attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal)});
+        const migrated=await migrate(job,resources);
         if(migrated)prior=migrated;
       }
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:

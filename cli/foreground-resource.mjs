@@ -3,11 +3,13 @@ import {isDeepStrictEqual} from 'node:util';
 import {attemptStopped,ownerStopped,processIdentity} from '../controller/lifecycle.mjs';
 import {environmentBinding} from '../controller/skill-evidence.mjs';
 import {readConfig} from './instance.mjs';
-import {readAttemptJob,publishAttemptJob,availableAttemptJob} from './attempt-job.mjs';
+import {publishAttemptJob,availableAttemptJob} from './attempt-job.mjs';
 
 export async function migrateForegroundCheckpoint({state,config,job,resources,reserved,createEnvironment}) {
   if(!job.resume||job.finalize||!reserved)return null;
-  const id=job.attempt.id,manifest=await readAttemptJob(state,config.root,id),prior=manifest.resource;
+  const id=job.attempt.id,manifest=await availableAttemptJob(state,config.root,id);
+  if(!manifest)return null;
+  const prior=manifest.resource;
   if(prior?.id!==reserved.id||prior.metadata?.kind!=='host-slot'||prior.metadata.backgroundSlot!==true)return null;
   const controller=state.db.prepare("SELECT value FROM control WHERE key='owner'").get()?.value;
   if(!controller||!isDeepStrictEqual(JSON.parse(controller),await processIdentity()))return null;

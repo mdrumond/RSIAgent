@@ -52,6 +52,21 @@ test('partial analysis and ranking timeouts preserve ready work and expose diagn
  assert.equal(f.backlog.get('new-ready').status,'rejected');assert.equal(f.backlog.get('ready').status,'queued');
  const status=await prioritySkillStatus(f.config);assert.equal(status.analysisError.message,'Analysis elapsed');assert.equal(status.rankingError.message,'Ranking elapsed');
 });
+test('a new queue epoch performs fresh analysis and ranking while preserving previous cache evidence',async t=>{
+ const f=await fixture(t);let reviews=0;const paths=[];
+ const cached=async({directory})=>{
+  paths.push(directory);await mkdir(directory,{recursive:true});const file=join(directory,'review.json');
+  try{return JSON.parse(await readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  const result={review:++reviews};await writeFile(file,JSON.stringify(result));return result;
+ };
+ const ops={...f.ops,analyze:cached,prioritize:cached};
+ f.backlog.meta('queue-epoch','first');await runPrioritySkills(f.config,f.values,ops);
+ await runPrioritySkills(f.config,f.values,ops);assert.equal(reviews,2);
+ f.backlog.meta('queue-epoch','second');await runPrioritySkills(f.config,f.values,ops);assert.equal(reviews,4);
+ assert.equal(paths[0],paths[2]);assert.notEqual(paths[0],paths[4]);
+ assert.equal(JSON.parse(await readFile(join(paths[0],'review.json'),'utf8')).review,1);
+ assert.equal(JSON.parse(await readFile(join(paths[1],'review.json'),'utf8')).review,2);
+});
 test('a real rejected comparison feeds new diagnostic evidence back into analysis',async t=>{
  const f=await fixture(t),item=f.add('first-proposal',20);
  await runPrioritySkills(f.config,f.values,{...f.ops,evaluate:async()=>({status:'complete',decision:{promote:false,reason:'insufficient-correctness-improvement'},
