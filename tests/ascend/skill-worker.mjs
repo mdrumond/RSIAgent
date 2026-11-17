@@ -75,6 +75,25 @@ test('marked A/B slot is mandatory and never replaced by an idle foreground slot
   available.finish();await available.worker.running;await available.worker.stop();
 });
 
+test('the marked earmark survives a foreground lease until that owner releases it',async()=>{
+  const f=marked(fixture({capacity:3}));
+  let leased=true;
+  const worker=skillWorker({
+    control:{get:key=>f.ledger.get(key),set:(key,value)=>f.ledger.set(key,value),leased:()=>leased},
+    config:()=>({campaign_plan:[{},{}],skills:{background:true}}),remaining:()=>100,
+    event:()=>{},operations:{backgroundSkillStatus:async()=>({hasWork:false}),
+      backgroundSkillsSettled:async()=>true,runBackgroundSkills:async()=>assert.fail('Idle writer must not launch')},
+  });
+  await worker.poll(f.resources,1,3);
+  assert.equal(worker.resource.id,'slot0');
+  assert.equal(f.ledger.get('skill-background-resource').id,'slot0');
+  assert.equal(worker.reserved,true);
+  leased=false;
+  // A foreground owner may exit after poll and before the next scheduler query.
+  assert.deepEqual(f.resources.filter(row=>row.id!==worker.resource.id).map(row=>row.id),['slot1','slot2']);
+  await worker.stop();
+});
+
 const marked=fixture=>{
   fixture.resources[0].metadata={hostSlot:0,backgroundSlot:true};
   fixture.resources[1].metadata={hostSlot:1,backgroundSlot:false};

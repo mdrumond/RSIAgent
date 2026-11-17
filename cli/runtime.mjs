@@ -21,6 +21,7 @@ import {skillPromotionPending} from './skill-promotion-gate.mjs';
 import {campaignEntryConfig} from './campaign-manifest.mjs';
 import {projectCatalogExtension} from './project-catalog.mjs';
 import {writeAttemptJob,readAttemptJob,availableAttemptJob} from './attempt-job.mjs';
+import {migrateForegroundCheckpoint} from './foreground-resource.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const policy=config=>({mode:config.mode,inferenceRecovery:config.recovery!==false,
@@ -525,7 +526,14 @@ export async function operate(command,config,options={}) {
       }
       ctl.set('actor-capacity',Math.min(resources.filter(r=>r.available).length,limit));
       if(resources[0]?.metadata?.pool)ctl.set('target-pool',resources[0].metadata.pool);
-      const prior=job.resume?(await readAttemptJob(state,config.root,job.attempt.id)).resource:null;
+      let prior=job.resume?(await readAttemptJob(state,config.root,job.attempt.id)).resource:null;
+      if(job.resume&&tuning?.reserved&&prior?.id===tuning.resource?.id) {
+        const migrated=await migrateForegroundCheckpoint({state,config,job,resources,reserved:tuning.resource,
+          createEnvironment:resource=>environment({...config,environment:{...config.environment,
+            options:{...config.environment.options,asyncCleanup:false}}},join(config.root,'attempts',job.attempt.id),
+          (type,data)=>state.event(job.attempt.id,type,data),async(_label,fn)=>fn(),resource,schedulerAbort.signal)});
+        if(migrated)prior=migrated;
+      }
       const choose=()=>resources.find(r=>r.available && (!config.resource_ids || config.resource_ids.includes(r.id)) && (job.resume?r.id===prior?.id:
         !state.db.prepare('SELECT 1 FROM resource_leases WHERE resource=?').get(r.id)) && r.id!==tuning?.resource?.id);
       const resource=choose();

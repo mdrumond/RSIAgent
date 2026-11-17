@@ -40,8 +40,14 @@ export function skillWorker({control, config, remaining, event, signal, operatio
       if(!resource&&retained) {
         resource=retained;control.set('skill-background-resource',resource);await account();
       }
+      // Keep the earmark while a legacy foreground owner drains. Otherwise its
+      // exit between this poll and foreground selection makes the slot reusable.
+      if(!resource&&marked) {
+        const earmark=available.find(row=>row.metadata?.backgroundSlot===true);
+        if(earmark){resource=earmark;control.set('skill-background-resource',resource);}
+      }
       const selected=available.find(row=>(!marked || row.metadata?.backgroundSlot===true) &&
-        (!retained || row.id===retained.id) && !control.leased(row.id));
+        (!resource || row.id===resource.id) && !control.leased(row.id));
       if(!selected || capacity<1 || active>capacity-1)return;
       resource=selected;control.set('skill-background-resource',resource);
       if(!status.hasWork || remaining()<=0 || !await settled())return;
