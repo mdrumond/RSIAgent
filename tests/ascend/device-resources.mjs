@@ -15,6 +15,7 @@ import { attemptStopped, processIdentity } from '../../controller/lifecycle.mjs'
 import { createEnvironment } from '../../integrations/environments/ascend.mjs';
 import {queueDeviceCleanup,drainDeviceCleanup,cleanupStatus,cleanupDirectory} from '../../integrations/environments/device-cleanup.mjs';
 import {reserveDevice,closedDeviceLease,closeDeviceLease} from '../../integrations/environments/device-leases.mjs';
+import {admitLearning,learningAdmissionSettled} from '../../cli/learning-admission.mjs';
 
 // Real foundation parser runs against a CPU npu-smi wire-format fixture. No NPU evidence.
 async function fixture(t, health = {}) {
@@ -97,6 +98,23 @@ print(outputs[query])
     queued:value=>{queued=value;}, wait:fn=>{waitSignal=fn;},runWorkload: () => {runWorkload=true;}, onSync: fn => {onSync=fn;}, running: value => {running=value;},
     update: () => writeFile(telemetry, JSON.stringify(rows)) };
 }
+
+test('learning admission uses real health/parser and leases before any payload dispatch',async t=>{
+ const f=await fixture(t,{product:'a3',chip:0});f.setEnabled([0]);
+ const pool=f.context.instancePath,held=await reserveDevice(pool,0,f.context.leaseDirectory,{instancePath:join(pool,'old-pilot')});
+ const input={directory:join(pool,'learning-admission'),config:{root:pool,target:'a3',environment:{options:f.options}},request:{learningTarget:'device'},resource:{id:'background',metadata:{pool}}};
+ const deps={leaseDirectory:f.context.leaseDirectory,createEnvironment:(options,context)=>createEnvironment(options,{...context,client:f.context.client,leaseDirectory:f.context.leaseDirectory})};
+ const bytes=await readFile(held.receipt,'utf8');
+ const blocked=await admitLearning(input,deps);assert.equal(blocked.admitted,false);assert.equal(blocked.reason,'device-reservation-unresolved');assert.equal(await readFile(held.receipt,'utf8'),bytes);
+ assert.equal(await learningAdmissionSettled(input,deps),true);
+ assert(f.calls.some(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('probe.sh')));
+ assert(!f.calls.some(args=>args[0]==='run'&&args[args.indexOf('--file')+1].endsWith('command.sh')));
+ await held.release();const admitted=await admitLearning(input,deps);assert.equal(admitted.admitted,true);assert.equal(admitted.physicalDevice,0);
+ f.hideSubmission(true);const unknown=await admitLearning(input,deps);assert.equal(unknown.closed,false);assert.equal(unknown.admitted,false);
+ const runs=f.calls.filter(args=>args[0]==='run').length,probe=f.lastProbe();
+ f.hideSubmission(false);await writeFile(probe.receipt,JSON.stringify({handle:probe.handle}));
+ assert.equal(await learningAdmissionSettled(input,deps),true);assert.equal(f.calls.filter(args=>args[0]==='run').length,runs,'Closure must observe the original probe, not submit another');
+});
 
 for(const failure of ['closed','closed-at-stop','not-admitted','unknown'])test(`health setup proof: ${failure}`,async t=>{
   const f=await fixture(t),reason={stage:'ssh_preflight',message:'open failed'};
