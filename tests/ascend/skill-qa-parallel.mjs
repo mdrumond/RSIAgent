@@ -92,3 +92,22 @@ test('identical summary item IDs receive exactly one independent audit session',
  },qaAnswer:async()=>answers(),qaReview:async()=>approved()});
  assert.equal(out.verdict,'approved');assert.equal(calls,1);
 });
+test('final review routes a typed summary defect back to its page without repeating unaffected audits',async t=>{
+ const input=await fixture(t,2),summaryCalls=new Map(),auditCalls=new Map(),auditDirs=[],feedback=[];let reviews=0,target;
+ const out=await runProposalQa(input,{qaSummarize:async({page,previousReview})=>{
+  const n=(summaryCalls.get(page.id)??0)+1;summaryCalls.set(page.id,n);if(n>1)feedback.push(previousReview);
+  return summary(page,1);
+ },qaAuditSummary:async({item,directory})=>{auditCalls.set(item.pageId,(auditCalls.get(item.pageId)??0)+1);auditDirs.push(directory);return {verdict:'supported',reason:'Primary checked'};},qaAnswer:async()=>answers(),qaReview:async({evidenceSummary})=>{
+  if(++reviews===1){target=evidenceSummary.items[0];return {verdict:'revise',reason:'Check the cited line again',issues:[{summaryItemId:target.id,problem:'Selected line needs another independent check'}]};}
+  return approved();
+ }});
+ assert.equal(out.verdict,'approved');assert.equal(reviews,2);assert.equal(summaryCalls.get(target.pageId),2);assert.equal(auditCalls.get(target.pageId),2);
+ assert.equal([...summaryCalls.values()].filter(n=>n===1).length,1);assert.equal([...auditCalls.values()].filter(n=>n===1).length,1);assert.equal(new Set(auditDirs).size,3);
+ assert.equal(feedback[0][0].issues[0].summaryItemId,target.id);assert.equal(feedback[0][0].reason,'Check the cited line again');
+ const history=out.summary.pages[target.pageId].revisions[0];assert.equal(history.source,'final-review');assert.equal(history.priorAudits.length,1);assert.equal(out.rounds.length,2);
+});
+test('unknown final-review summary targets cannot enter the repair queue or approve a proposal',async t=>{
+ const input=await fixture(t,1);let reviews=0;
+ const out=await runProposalQa(input,{qaSummarize:async({page})=>summary(page,1),qaAuditSummary:async()=>({verdict:'supported',reason:'Checked'}),qaAnswer:async()=>answers(),qaReview:async()=>++reviews===1?{verdict:'revise',reason:'Wrong summary',issues:[{summaryItemId:'invented-summary',problem:'Wrong pointer'}]}:approved()});
+ assert.equal(out.verdict,'inconclusive');assert.match(out.error.message,/Unknown summaryItemId/);assert.equal(out.approval,undefined);
+});

@@ -93,6 +93,11 @@ Native sessions retain `termination.json` with submitted, provider-error,
 rejected-submissions, no-submit, elapsed, or cancelled disposition, rejection and
 provider-error counts, and bounded sanitized cause details. QA checkpoints retain
 these details under `error.reviewSession` when admission cannot finish.
+A reviewer can attach `summaryItemId` to a revision issue, using an exact current
+evidence-summary item ID. QA returns those issues to the affected page summarizer
+and independently re-audits that page in a new session namespace. Unaffected
+pages remain cached; prior summary text, audits, final-review feedback and elapsed
+spending remain in the checkpoint history. Unknown summary targets are rejected.
 
 A memory-backed update becomes an immutable candidate. Existing protected-guidance
 rules and the four-task, two-run CPU A/B comparison apply. Publication occurs only

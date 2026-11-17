@@ -68,3 +68,12 @@ test('native cached submissions replay validation without opening a provider ses
  const result=await reviewSession({directory,config:{},prompt:{},seconds:1,validate:value=>{validations++;return {priorities:Array.isArray(value)?value:value.priorities};}});
  assert.equal(result.recovered,true);assert.equal(validations,1);assert.equal(result.value.priorities[0].priority,80);assert.equal(JSON.parse(await readFile(join(directory,'submission.json'))).priorities[0].id,'one');
 });
+
+test('native reviewer validates typed summary repair targets against the current evidence summary',async t=>{
+ const {input}=await fixture(t);const result={verdict:'revise',reason:'Recheck pointer',issues:[{problem:'Wrong line',summaryItemId:'known-summary'}]};
+ await nativeQaReview({...input,evidenceSummary:{items:[{id:'known-summary',text:'Observed failure',kind:'observation',proofs:[]}]},sourceCatalogue:{directory:input.directory,indexFile:'unused',facts:[],records:[],pages:[],sources:[]},validate:x=>x},{session:async options=>{
+  assert.equal(options.validate(result),result);
+  assert.throws(()=>options.validate({...result,issues:[{problem:'Wrong line',summaryItemId:'invented'}]}),/Unknown summaryItemId/);
+  return {value:result};
+ }});
+});

@@ -20,6 +20,11 @@ export function validateQaVerdict(value){
  if(value.verdict==='learn'&&(!Array.isArray(value.learningRequests)||!value.learningRequests.length))throw Error('Learning verdict requires learning requests');
  return value;
 }
+export function validateSummaryTargets(value,items=[]){
+ const ids=new Set(items.map(item=>item.id));
+ for(const issue of value.issues??[])if(issue.summaryItemId!==undefined&&!ids.has(issue.summaryItemId))throw Error('Unknown summaryItemId: '+issue.summaryItemId);
+ return value;
+}
 export function qaIdentity(input,proposal=input.proposal){
  return digest({changes:proposal.changes,memoryRefs:proposal.memoryRefs,baseline:input.entries,objective:input.objective??null,target:input.target,evidence:input.groups,memoryEvidence:input.memoryEvidence??null,learning:input.learning??[],learningEvidence:input.learningEvidence??[],retrievalEvidenceHash:input.retrievalEvidenceHash??null,evaluationContract:input.evaluationContract??null});
 }
@@ -78,9 +83,22 @@ export async function runProposalQa(input,ops){
   }
  };
 
+ const repairSummary=round=>{
+  if(!summarized||round.summaryRequeued||round.review?.verdict!=='revise')return;
+  const items=catalogue.pages.flatMap(page=>{const value=state.summary?.pages?.[page.id]?.value;return value?summaryItems(value,page.id):[];});
+  validateSummaryTargets(round.review,items);
+  const issues=(round.review.issues??[]).filter(issue=>issue.summaryItemId!==undefined),pages=new Set(issues.map(issue=>items.find(item=>item.id===issue.summaryItemId).pageId));
+  for(const pageId of pages){const row=state.summary.pages[pageId],previous=summaryItems(row.value,pageId),priorAudits=previous.map(item=>({itemId:item.id,...state.summary.audits[item.id]}));
+   const feedback=issues.filter(issue=>previous.some(item=>item.id===issue.summaryItemId)).map(issue=>({itemId:issue.summaryItemId,verdict:'revise',reason:round.review.reason,issues:[issue]}));
+   row.revisions.push({source:'final-review',value:row.value,audits:feedback,priorAudits,review:round.review});row.value=null;
+   for(const item of previous)delete state.summary.audits[item.id];
+  }
+  round.summaryRequeued=true;
+ };
  let proposal=state.rounds.at(-1)?.proposal??state.draft;
  try{
   while(remaining()>0){
+   const prior=state.rounds.at(-1);if(prior?.review?.verdict==='revise'&&!prior.summaryRequeued){repairSummary(prior);await persist();}
    const round=state.rounds.at(-1)?.review?.verdict==='revise'||!state.rounds.length?{proposal}:state.rounds.at(-1);
    if(round!==state.rounds.at(-1)){state.rounds.push(round);await persist();}
    const index=state.rounds.length-1;
@@ -95,7 +113,7 @@ export async function runProposalQa(input,ops){
       }
       const items=[...new Map(summaryItems(row.value,page.id).map(item=>[item.id,item])).values()];
       await parallel(items,async item=>{
-       if(!summary.audits[item.id])summary.audits[item.id]=await call('qaAuditSummary',{sourceCatalogue:catalogue,item,validate:value=>{if(!['supported','revise','unknown'].includes(value.verdict)||!value.reason?.trim())throw Error('Summary audit needs a verdict and reason');return value;}},`summary-audit-${item.id}`);
+       if(!summary.audits[item.id])summary.audits[item.id]=await call('qaAuditSummary',{sourceCatalogue:catalogue,item,validate:value=>{if(!['supported','revise','unknown'].includes(value.verdict)||!value.reason?.trim())throw Error('Summary audit needs a verdict and reason');return value;}},`summary-audit-${item.id}${row.revisions.length?'-revision-'+row.revisions.length:''}`);
        await persist();
       });
       const audits=items.map(item=>({itemId:item.id,...summary.audits[item.id]}));
@@ -119,8 +137,8 @@ export async function runProposalQa(input,ops){
     if(result.changes||result.reason!==undefined)proposal=input.validateProposal({...proposal,...(result.reason!==undefined?{reason:result.reason}:{}),changes:result.changes??proposal.changes,...(result.memoryRefs?{memoryRefs:result.memoryRefs}:{})});
     round.proposal=proposal;round.answers=result.answers;if(result.claims)round.claims=result.claims;await persist();
    }
-   if(!round.review){const validate=value=>{validateQaVerdict(value);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
-    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,answerClaims:round.claims,validate},`${index}-qaReview`));await persist();}
+   if(!round.review){const validate=value=>{validateQaVerdict(value);validateSummaryTargets(value,input.evidenceSummary?.items??[]);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
+    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,answerClaims:round.claims,validate},`${index}-qaReview`));repairSummary(round);await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){proposal=round.proposal;continue;}
    state.verdict=round.review.verdict;state.reason=round.review.reason;

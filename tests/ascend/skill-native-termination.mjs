@@ -24,12 +24,12 @@ async function fixture(t,script){
 }
 test('actual Pi SDK returns validation feedback, accepts selector issue fields, and normalizes cached proofs',async t=>{
  const f=await fixture(t,(n,body)=>{
-  if(n===1)return {result:{verdict:'revise',reason:'Observed failure',issues:[{problem:'Observed failure',field:'changes.0.text'}],claims:[claim('reason')]}};
-  if(n===2){assert(body.messages.some(m=>m.role==='tool'&&JSON.stringify(m).includes('issues.0.problem')));return {result:{verdict:'revise',reason:'Observed failure',issues:[{problem:'Observed failure',field:'changes.0.text'}],claims:[claim('reason'),claim('issues.0.problem')]}};}
+  if(n===1)return {result:{verdict:'revise',reason:'Observed failure',issues:[{problem:'Observed failure',field:'changes.0.text',summaryItemId:'summary-item'}],claims:[claim('reason')]}};
+  if(n===2){assert(body.messages.some(m=>m.role==='tool'&&JSON.stringify(m).includes('issues.0.problem')));return {result:{verdict:'revise',reason:'Observed failure',issues:[{problem:'Observed failure',field:'changes.0.text',summaryItemId:'summary-item'}],claims:[claim('reason'),claim('issues.0.problem')]}};}
   return {};
  });
- const input={...f,groups:[],entries:[],proposal:{changes:[],memoryRefs:[]},answers:{},sourceCatalogue:{directory:f.directory,indexFile:join(f.directory,'unused.json'),records:f.proofRecords,facts:[],pages:[],sources:[]},evidenceSummary:{items:[]}};
- const result=await nativeQaReview(input);assert.equal(result.value.verdict,'revise');assert.equal(f.bodies.length,3);assert.equal(result.value.claims[1].proofs[0].quote,'Observed failure');
+ const input={...f,groups:[],entries:[],proposal:{changes:[],memoryRefs:[]},answers:{},sourceCatalogue:{directory:f.directory,indexFile:join(f.directory,'unused.json'),records:f.proofRecords,facts:[],pages:[],sources:[]},evidenceSummary:{items:[{id:'summary-item',text:'Observed failure',kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]}]}};
+ const result=await nativeQaReview(input);assert.equal(result.value.verdict,'revise');assert.equal(result.value.issues[0].summaryItemId,'summary-item');assert.equal(f.bodies.length,3);assert.equal(result.value.claims[1].proofs[0].quote,'Observed failure');
  const cached=await nativeQaReview({...input,config:{}});assert.equal(cached.recovered,true);assert.equal(f.bodies.length,3);assert.deepEqual(cached.value,result.value);
  const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.kind,'submitted');assert.equal(termination.rejectedSubmissions,1);
  const legacy={...result.value,issues:[{problem:'Observed failure',reference:'raw',quote:'Observed failure'}]};await writeFile(join(f.directory,'submission.json'),JSON.stringify(legacy));
