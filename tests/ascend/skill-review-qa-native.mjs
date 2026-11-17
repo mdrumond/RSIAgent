@@ -77,3 +77,16 @@ test('native reviewer validates typed summary repair targets against the current
   return {value:result};
  }});
 });
+test('native reviewer receives all previous issues without dropping them from compact evidence mode',async t=>{
+ const {input}=await fixture(t),previousReview={verdict:'revise',reason:'Multiple defects',issues:[{problem:'Direction'},{problem:'Unsupported timing'}]};
+ await nativeQaReview({...input,previousReview,sourceCatalogue:{directory:'/copied-primary',indexFile:'/copied-primary/catalogue.json',facts:[],records:[]},evidenceSummary:{items:[]},validate:x=>x},{session:async options=>{
+  assert.deepEqual(options.prompt.previousReview,previousReview);assert.deepEqual(options.allowedPaths,['/copied-primary']);return {value:{verdict:'inconclusive',reason:'Fixture'}};
+ }});
+});
+test('session input exposes the same canonical paths used for filesystem admission',async t=>{
+ const {root}=await fixture(t),directory=join(root,'cached'),primary=join(root,'primary');await mkdir(directory);await mkdir(primary);const source=join(primary,'source.txt');await writeFile(source,'Observed fact');
+ await writeFile(join(directory,'submission.json'),JSON.stringify({ok:true}));const {reviewSession}=await import('../../cli/skill-review-native.mjs');
+ const out=await reviewSession({directory,config:{},prompt:{},allowedPaths:[primary,source],validate:x=>x});assert.equal(out.recovered,true);
+ const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
+ assert.deepEqual(input.filesystemAccess.allowed,[{path:directory,directory:true},{path:primary,directory:true},{path:source,directory:false}]);assert.deepEqual(input.filesystemAccess.requiredReads,[]);
+});
