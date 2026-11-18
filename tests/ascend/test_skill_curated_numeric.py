@@ -79,7 +79,7 @@ class RuntimeIdentityControls(unittest.TestCase):
             compiler = home / 'hivmc'; compiler.write_text('compiler-v1')
             (home / 'version.info').write_text('cann-9.3')
             packages = {name: ['v1', str(home), 'record', [[str(artifact), 1, 2]]]
-                        for name in ('torch', 'torch-npu', 'catlass-dsl')}
+                        for name in ('torch', 'torch-npu', 'ascend-catlass-dsl')}
             report = home / 'setup.json'
             identity = {'binding': {'target': 'registered-a5', 'runtime': 'catlass-dsl', 'product': 'a5'},
                         'python': ['version', ['python', 1, 2]], 'machine': 'fixture', 'packages': packages,
@@ -87,14 +87,15 @@ class RuntimeIdentityControls(unittest.TestCase):
             def save(): report.write_text(json.dumps({'identity': identity}))
             save()
             with patch.dict(os.environ, RSI_SETUP_REPORT=str(report), ASCEND_PHYSICAL_DEVICE='0'), \
-                    patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout='Chip Name : Ascend950\n')):
+                    patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout='Chip Name : Ascend950\n')) as query:
                 first = module.identity('a5')
                 self.assertEqual(first['target'], 'a5')
+                self.assertNotIn('-c', query.call_args.args[0])
                 self.assertEqual(first, module.identity())
                 with self.assertRaisesRegex(RuntimeError, 'triton'): module.identity('a3')
                 artifact.write_text('catlass-v2')
                 self.assertNotEqual(first, module.identity('a5'))
-                del packages['catlass-dsl']; save()
+                del packages['ascend-catlass-dsl']; save()
                 with self.assertRaisesRegex(RuntimeError, 'Catlass'): module.identity('a5')
                 with self.assertRaisesRegex(RuntimeError, 'Explicit A3 or A5'): module.identity('unknown')
 
