@@ -81,7 +81,7 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
    const micro=join(args.directory,'micro'),cwd=join(micro,'runtime','0-probe','work'),checker=join(micro,'frozen','runtime.py'),file=join(micro,'results.json');
    await mkdir(cwd,{recursive:true});await mkdir(dirname(checker),{recursive:true});
    const source=await readFile(new URL('./skill-suites/runtime-identity.py',import.meta.url),'utf8');
-   await writeFile(checker,source+'\nprint(json.dumps(identity(),sort_keys=True))\n');
+   await writeFile(checker,source+'\nprint(json.dumps(identity('+JSON.stringify(binding.target)+'),sort_keys=True))\n');
    await save(join(args.directory,'hypothesis.json'),{binding});
    const report={owner:await processIdentity(),runningSample:{key:'runtime/0/probe'},results:[]};await save(file,report);
    try{
