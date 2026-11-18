@@ -99,7 +99,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
 
 function trials(rows,task){assert(rows?.length===5,'Every arm requires five trials');return rows.map(row=>{assert(!row.infrastructure,'Infrastructure cannot establish skill benefit');return validatePilotTrial(structuredClone(row),task);});}
 /** Recheck the persisted evidence and exact reviewed version before the existing atomic publisher. */
-export async function publishFailureWinner({config,item,result,directory,signal},dependencies={}){
+export async function publishFailureWinner({config,item,result,directory,signal,recoverOnly=false},dependencies={}){
  const ops={readConfig,publish:publishSkillVersion,record:async request=>{
   const {recordStorageSkill}=await import('../controller/storage-knowledge.mjs');return recordStorageSkill(request.config,request.candidate,{serialized:true,baseVersion:request.base,promote:true,reason:'failure-first-transfer-improvement',signal:request.signal});
  },...dependencies};
@@ -120,6 +120,7 @@ export async function publishFailureWinner({config,item,result,directory,signal}
  const publicationFile=join(directory,'publication.json'),identity=hash({study:result.identity,result:hash(result),base,version:winner.version,text:winner.textSha256,storage:Boolean(config.storage)}),prior=await load(publicationFile);if(prior)assert.equal(prior.identity,identity,'Publication evidence changed');
  const record=async()=>{if(config.storage)await ops.record({config,candidate:winner.version,base,signal});};
  const current=await ops.readConfig(config.root);if(current.skills.activeVersion!==base){if(current.skills.activeVersion===winner.version&&prior){if(!prior.recordComplete)await record();const recovered={...prior,published:true,memoryRecorded:Boolean(config.storage),recordComplete:true,recovered:true};await save(publicationFile,recovered);return recovered;}return {published:false,reason:'stale-base'};}
+ if(recoverOnly)return {published:false,reason:'no-prior-publication'};
  signal?.throwIfAborted();await save(publicationFile,{identity,base,candidate:winner.version,published:false});const published=await ops.publish(config.root,{active:base,candidate:winner.version,signal});
  if(published)await record();const receipt={identity,base,candidate:winner.version,published:Boolean(published),memoryRecorded:Boolean(published&&config.storage),recordComplete:Boolean(published),reason:published?'transfer-improvement':'stale-base'};await save(publicationFile,receipt);return receipt;
 }
