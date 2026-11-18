@@ -176,8 +176,9 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
  if(prior?.status==='needs-evidence')return prior;
  if(prior?.running)throw Error('Interrupted isolation elapsed custody is unknown');
  const elapsed=prior?.elapsedSeconds??0;if(elapsed>=1800)throw Error('Isolation elapsed allowance exhausted');
- const begun=performance.now(),bounded=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(Math.min(seconds,1800-elapsed)*1000)))]);let ledger={identity,elapsedSeconds:elapsed,running:true};await save(stateFile,ledger);
- const checkpoint=async()=>{ledger.elapsedSeconds=elapsed+(performance.now()-begun)/1000;await save(stateFile,ledger);};let pending=Promise.resolve();const timer=setInterval(()=>{pending=pending.then(checkpoint);},1000);
+ const saveIsolation=dependencies.saveIsolation??save;
+ const begun=performance.now(),bounded=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(Math.min(seconds,1800-elapsed)*1000)))]);let ledger={identity,elapsedSeconds:elapsed,running:true};await saveIsolation(stateFile,ledger);
+ const checkpoint=async()=>{ledger.elapsedSeconds=elapsed+(performance.now()-begun)/1000;await saveIsolation(stateFile,ledger);};let pending=Promise.resolve();const timer=setInterval(()=>{pending=pending.then(checkpoint);},1000);
  try{
   const sources=await failureSourceInventory({config,item,directory:join(directory,'sources'),signal:bounded});
   bounded.throwIfAborted();if(!sources.length){ledger.status='needs-evidence';ledger.reason='No recoverable source bound to an actual actor correctness failure';return ledger;}
@@ -193,7 +194,12 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
     if(checkReferences){const remaining=Math.min(seconds,1800-elapsed)-(performance.now()-begun)/1000;bounded.throwIfAborted();if(remaining<=0)throw Error('Isolation elapsed allowance exhausted before reference checks');try{await checkReferences({family,directory,seconds:remaining,signal:bounded});}catch(error){throw Error('Family reference checks failed: '+error.message,{cause:error});}}
     bounded.throwIfAborted();return value;
    }});
-  bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;ledger={identity,status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};await save(stateFile,ledger);
+  bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;ledger={identity,status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};
   return family?{status:'ready',family,elapsedSeconds:ledger.elapsedSeconds}:ledger;
- }finally{clearInterval(timer);await pending;await checkpoint();ledger.running=false;await save(stateFile,ledger);}
+ }finally{
+  clearInterval(timer);
+  await pending;
+  ledger.running=false;
+  await checkpoint();
+ }
 }

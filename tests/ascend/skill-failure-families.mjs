@@ -111,6 +111,36 @@ test('isolation checkpoints elapsed work while native research is still running'
 });
 
 
+test('isolation completion waits for an in-flight heartbeat write',async t=>{
+ const f=await fixture(t),directory=join(f.root,'overlapping-checkpoint');
+ let heartbeatStarted,releaseHeartbeat,writing=false;
+ const heartbeat=new Promise(resolve=>{heartbeatStarted=resolve;}),release=new Promise(resolve=>{releaseHeartbeat=resolve;});
+ const result=await prepareFailureFamily({...f,directory,seconds:5},{
+  saveIsolation:async(file,value)=>{
+   assert.equal(writing,false,'Overlapping isolation writes');
+   writing=true;
+   try{
+    if(value.running&&value.elapsedSeconds>0){
+     heartbeatStarted();
+     await release;
+    }
+    await writeFile(file,JSON.stringify(value));
+   }finally{writing=false;}
+  },
+  session:async()=>{
+   await heartbeat;
+   setTimeout(releaseHeartbeat,50);
+   return {value:{status:'needs-evidence',reason:'Reference unavailable'}};
+  }
+ });
+ const retained=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
+ assert.equal(result.status,'needs-evidence');
+ assert.equal(retained.status,result.status);
+ assert.equal(retained.running,false);
+ assert(retained.elapsedSeconds>=1);
+});
+
+
 test('debug edits after a stage snapshot bind only to the source actually verified',async t=>{
  const f=await fixture(t),repo=join(f.root,'history');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);await mkdir(join(repo,'a'));await writeFile(join(repo,'a/x.txt'),'nested');await writeFile(join(repo,'a.b'),'sibling');await writeFile(join(repo,'payload.dat'),Buffer.from([255,0,1]));execFileSync('git',['-C',repo,'add','.']);const treeA=execFileSync('git',['-C',repo,'write-tree'],{encoding:'utf8'}).trim(),stage=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:treeA});
  const codeB='def run(x): return x - 2\n';await writeFile(join(repo,'kernel.py'),codeB);execFileSync('git',['-C',repo,'add','kernel.py']);const treeB=execFileSync('git',['-C',repo,'write-tree'],{encoding:'utf8'}).trim();
