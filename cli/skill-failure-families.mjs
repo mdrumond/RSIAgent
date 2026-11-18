@@ -141,10 +141,19 @@ export async function loadFailureFamily({file,config,item,signal}){
  return {...family,identity:sha({manifest,hashes,provenance})};
 }
 
+async function checkPythonSyntax({config,family,manifest,directory,signal}){
+ const paths=new Set();for(const [index,task]of [family.development,...family.transfer].entries()){
+  paths.add(task.checker);paths.add(task.publicChecker);const original=[manifest.development,...manifest.transfer][index];
+  for(const [name,path]of Object.entries(original.checkerFiles??{}))if(name.endsWith('.py'))paths.add(await scoped(await realpath(directory),path));
+ }
+ try{await git(config.python??'python3',['-c','import pathlib,sys\nfor name in sys.argv[1:]: compile(pathlib.Path(name).read_bytes(), name, "exec")',...paths],{timeout:10000,maxBuffer:65536,signal});}
+ catch(error){throw Error('Family checker Python syntax validation failed: '+String(error.stderr||error.message).slice(-4000),{cause:error});}
+}
+
 const selector=Type.Object({reference:Type.String(),startLine:Type.Optional(Type.Integer({minimum:1})),endLine:Type.Optional(Type.Integer({minimum:1})),segment:Type.Optional(Type.Integer({minimum:1})),field:Type.Optional(Type.String())},{additionalProperties:false});
 const resultSchema=Type.Object({status:Type.Union([Type.Literal('ready'),Type.Literal('needs-evidence')]),reason:Type.String({minLength:1}),family:Type.Optional(Type.Unknown()),files:Type.Optional(Type.Record(Type.String(),Type.String())),claims:Type.Array(Type.Object({path:Type.Literal('reason'),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(selector,{minItems:1})},{additionalProperties:false}),{minItems:1})},{additionalProperties:false});
 /** A bounded native research session may produce fixtures, never skill instructions or curriculum jobs. */
-export async function prepareFailureFamily({config,backlog,item,directory,seconds=1800,signal},dependencies={}){
+export async function prepareFailureFamily({config,backlog,item,directory,seconds=1800,signal,checkReferences},dependencies={}){
  if(!Number.isFinite(seconds)||seconds<=0||seconds>1800)throw Error('Isolation must fit 1800 elapsed seconds');await mkdir(directory,{recursive:true});
  const file=join(directory,'family.json'),stateFile=join(directory,'isolation.json'),prior=await optional(stateFile),identity=sha([item.id,item.base,item.evidence,config.target]);
  if(prior&&prior.identity!==identity)throw Error('Isolation inputs changed');
@@ -164,7 +173,10 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
     if(value.status==='needs-evidence')return value;
     if(!value.family||!value.files||Object.keys(value.files).length>64||Object.values(value.files).reduce((n,s)=>n+Buffer.byteLength(s),0)>4194304)throw Error('Bounded family file bundle required');
     for(const [name,s]of Object.entries(value.files)){if(!text(name)||isAbsolute(name)||!inside(directory,resolve(directory,name))||['family.json','isolation.json'].includes(name)||s.includes('\0'))throw Error('Family output files must be relative UTF-8 payloads');await mkdir(dirname(join(directory,name)),{recursive:true});await writeFile(join(directory,name),s,{mode:0o600});}
-    await save(file,value.family);await loadFailureFamily({file,config,item,signal:bounded});return value;
+    await save(file,value.family);const family=await loadFailureFamily({file,config,item,signal:bounded});
+    await checkPythonSyntax({config,family,manifest:value.family,directory,signal:bounded});
+    if(checkReferences){const remaining=Math.min(seconds,1800-elapsed)-(performance.now()-begun)/1000;bounded.throwIfAborted();if(remaining<=0)throw Error('Isolation elapsed allowance exhausted before reference checks');try{await checkReferences({family,directory,seconds:remaining,signal:bounded});}catch(error){throw Error('Family reference checks failed: '+error.message,{cause:error});}}
+    bounded.throwIfAborted();return value;
    }});
   bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;ledger={identity,status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};await save(stateFile,ledger);
   return family?{status:'ready',family,elapsedSeconds:ledger.elapsedSeconds}:ledger;

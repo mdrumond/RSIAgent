@@ -112,3 +112,16 @@ test('A3 investigation actor failures retain exact source admission without admi
  f.state.db.prepare("UPDATE attempts SET session=NULL WHERE id=?").run(f.attempt.id);await assert.rejects(failureWitness({...f,provenance:f.family.provenance}),/actual failed actor/);f.state.db.prepare("UPDATE attempts SET session='native.jsonl' WHERE id=?").run(f.attempt.id);
  f.state.db.prepare("UPDATE events SET data=? WHERE attempt=? AND type='job-admitted'").run(JSON.stringify({...admission,kind:'curriculum'}),f.attempt.id);await assert.rejects(failureWitness({...f,provenance:f.family.provenance}),/admitted actor/);
 });
+
+
+test('native isolation retries syntax and reference failures within one session before accepting corrected files',async t=>{
+ const f=await fixture(t),directory=join(f.root,'retry-isolation');let checks=0,sessions=0;
+ const checkReferences=async({family,directory:received,seconds,signal})=>{checks++;assert.equal(received,directory);assert(seconds>0&&seconds<=30);assert.equal(signal.aborted,false);assert.equal(family.development.files['kernel.py'],f.code);if(checks===1)throw Error('Reference failed ordinary case');};
+ const result=await prepareFailureFamily({...f,directory,seconds:30,checkReferences},{session:async({validate})=>{
+  sessions++;const submission={status:'ready',reason:'Recovered failure',family:f.family,files:{...f.files},claims:[]};submission.files['dev/private.py']='def broken(:\n';
+  await assert.rejects(validate(submission),/syntax validation failed/);assert.equal(checks,0);
+  submission.files['dev/private.py']=f.files['dev/private.py'];for(const path of ['dev/public.py','dev/helper.py']){submission.files[path]='def broken(:\n';await assert.rejects(validate(submission),/syntax validation failed/);assert.equal(checks,0);submission.files[path]=f.files[path];}
+  submission.files['dev/private.py']='raise RuntimeError("syntax must not execute checker")\n';await assert.rejects(validate(submission),/Reference failed ordinary case/);assert.equal(checks,1);
+  return {value:await validate(submission)};
+ }});assert.equal(result.status,'ready');assert.equal(sessions,1);assert.equal(checks,2);
+});
