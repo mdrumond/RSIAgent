@@ -58,19 +58,18 @@ const qaAnswerResultSchema=Type.Object({answers:Type.Object(Object.fromEntries([
 const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
 
 async function reviewEvidence(directory,groups=[]){
- const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
+ const previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
  for(const group of groups){
   const representatives=[...new Map(group.occurrences.map(o=>[diagnosticIdentity(o),o])).values()];
   const linked=group.linkedDiagnostics??[],linkedFile=join(directory,'evidence',group.id+'-linked-diagnostics.jsonl');
-  await writeFile(linkedFile,linked.map(d=>JSON.stringify(d)).join('\n')+'\n');linked.forEach(d=>required.add(d.reference));
+  await writeFile(linkedFile,linked.map(d=>JSON.stringify(d)).join('\n')+'\n');
   const all=join(directory,'evidence',group.id+'-occurrences.jsonl'),diagnostics=join(directory,'evidence',group.id+'-diagnostics.jsonl');
   await writeFile(all,group.occurrences.map(o=>JSON.stringify(o)).join('\n')+'\n');
   await writeFile(diagnostics,representatives.map(o=>JSON.stringify(o)).join('\n')+'\n');
-  representatives.forEach(o=>required.add(o.reference));
   previews.push({...group,linkedDiagnostics:linked.slice(0,6),linkedDiagnosticCount:linked.length,linkedDiagnosticsFile:linkedFile,occurrences:representatives.slice(0,6),occurrenceCount:group.occurrences.length,
    distinctDiagnostics:representatives.length,fullOccurrences:all,diagnosticsFile:diagnostics});
  }
- return {required,previews};
+ return {previews};
 }
 /** Resolve existing ancestors too: native write may create a new file below a symlink. */
 export async function reviewWritePathAllowed(path,directory){
@@ -107,7 +106,6 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
   }
   if(requiredReads.some(path=>!seen.has('file:'+resolve(path))))throw Error('Read these primary source files before summary audit: '+JSON.stringify(requiredReads.filter(path=>!seen.has('file:'+resolve(path)))));
-  if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   if(proofRequired)validateClaimedResult(result,[...(proofRecords?proofSources():claimEvidence({prompt,packet,retrievals})),...(discoveryProofRecords?await discoveryProofRecords():[])]);
   return validate(result,retrievals);
  };
@@ -141,10 +139,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    return {block:true,reason:'Filesystem inspection is limited to this review directory and explicitly copied evidence/verified learning paths. Read input.json and correct the submitted fields; use KDB MCP search/read_entry for indexed knowledge, not workspace searches.'};
   });
   pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
-   const path=resolve(directory,event.input.path??'');if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
-   const text=(event.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
-   for(const ref of evidence.required){const quoted=JSON.stringify(ref);if(text.includes('\"reference\":'+quoted)||text.includes('\"reference\": '+quoted))seen.add(ref);}
-   await writeFile(coverageFile,JSON.stringify([...seen]));
+   const path=resolveToCwd(event.input.path??'',directory);if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
   execute:async(id,{result})=>{
@@ -178,7 +173,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
-  await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read required primary files and distinct supplied diagnostics using native read offset/limit when previews are incomplete; duplicate diagnostics need no repeated reads. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
+  await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read explicitly required primary files before audit submission. Inspect relevant diagnostics using native read offset/limit when needed; diagnostic coverage is not a submission gate. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
   if(submitted===undefined){const provider=session.messages.slice(initialMessages).some(m=>m.role==='assistant'&&m.stopReason==='error'),kind=provider?'provider-error':rejectedSubmissions?'rejected-submissions':'no-submit',detail=await termination(kind);
    throw Object.assign(Error('Review session '+kind+(detail.cause?': '+detail.cause:detail.lastRejection?': '+detail.lastRejection:'')),{reviewSession:detail});}
