@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,rm,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createServer} from 'node:http';
@@ -15,7 +15,7 @@ async function fixture(t,script){
  const server=createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;bodies.push(JSON.parse(text));const next=await script(bodies.length,bodies.at(-1),req,res);
   if(res.writableEnded||next===undefined)return;
   if(next.status){res.writeHead(next.status,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:next.error,type:'permission_error'}}));return;}
-  res.writeHead(200,{'content-type':'text/event-stream'});const tool=next.result!==undefined,delta=tool?{role:'assistant',tool_calls:[{index:0,id:'call'+bodies.length,type:'function',function:{name:'submit_review',arguments:JSON.stringify({result:next.result})}}]}:{role:'assistant',content:'Finished without submitting'};
+  res.writeHead(200,{'content-type':'text/event-stream'});const tool=next.result!==undefined||next.tool,delta=tool?{role:'assistant',tool_calls:[{index:0,id:'call'+bodies.length,type:'function',function:{name:next.tool??'submit_review',arguments:JSON.stringify(next.tool?next.args:{result:next.result})}}]}:{role:'assistant',content:'Finished without submitting'};
   res.end('data: '+JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:'termination',choices:[{index:0,delta,finish_reason:tool?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');
  });server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});
  const env='QA_TERMINATION_FIXTURE';const previous=process.env[env];process.env[env]='fixture';t.after(()=>{if(previous===undefined)delete process.env[env];else process.env[env]=previous;});
@@ -71,4 +71,17 @@ test('actual Pi SDK inherited timeout signal records elapsed rather than deliber
  const f=await fixture(t,()=>undefined);
  await assert.rejects(reviewSession({...f,signal:AbortSignal.timeout(50)}),error=>{assert.equal(error.name,'TimeoutError');assert.equal(error.reviewSession.kind,'elapsed');return true;});
  const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.kind,'elapsed');
+});
+
+
+test('actual Pi native draft write and edit leave evidence and session files read-only',async t=>{
+ let draft;const f=await fixture(t,n=>{
+  if(n===1)return {tool:'write',args:{path:join(draft,'kernel.py'),content:'VALUE=1\n'}};
+  if(n===2)return {tool:'edit',args:{path:join(draft,'kernel.py'),oldText:'VALUE=1',newText:'VALUE=2'}};
+  if(n===3)return {tool:'write',args:{path:join(f.directory,'input.json'),content:'overwritten'}};
+  if(n===4)return {tool:'read',args:{path:join(f.directory,'../not-permitted')}};
+  return n===5?{result:valid()}:{};
+ });draft=join(f.directory,'draft');await mkdir(draft);
+ const result=await reviewSession({...f,writableDirectory:draft});assert.equal(result.value.reason,'Observed failure');assert.equal(await readFile(join(draft,'kernel.py'),'utf8'),'VALUE=2\n');assert.equal(JSON.parse(await readFile(join(f.directory,'input.json'),'utf8')).filesystemAccess.writableDirectory,draft);
+ const blocked=(await readFile(join(f.directory,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(blocked.map(r=>r.tool),['write','read']);
 });
