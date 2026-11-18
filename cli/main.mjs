@@ -41,7 +41,7 @@ export function statusRecoveries(state) {
     FROM recovery_queue ORDER BY project LIMIT 500`).all();
 }
 
-export async function main(argv=process.argv.slice(2),{signal}={}) {
+export async function main(argv=process.argv.slice(2),{signal,failureDependencies}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     ...storageOptions,instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
@@ -59,7 +59,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   }
   if(command==='skills-review')return (await import('./skill-review.mjs')).runReview({...JSON.parse(await readFile(values.config,'utf8')),signal});
   const config=await readConfig(root);
-  if(command==='skills-ab')return (await import('./skill-failure-worker.mjs')).runFailureCampaign(config,{signal,once:values.once===true});
+  if(command==='skills-ab')return (await import('./skill-failure-worker.mjs')).runFailureCampaign(config,{signal,once:values.once===true},failureDependencies);
   if(command==='failures')return (await import('./failures.mjs')).runFailures(config,values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'inspect'});
   if(command==='reconcile-local')return (await import('./local-reboot.mjs')).reconcileLocalReboot(config,
     values.config?{...JSON.parse(await readFile(values.config,'utf8')),...(values.apply?{apply:true}:{})}:null);

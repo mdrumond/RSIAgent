@@ -37,7 +37,7 @@ export async function selectFailureSlots(config,{directory,signal,retained},depe
  const devices=[];
  for(const row of inventory.filter(d=>d.available&&d.metadata?.measurements?.idle===true)){
   const physical=row.metadata.physicalDevice,pool=hosts[0]?.metadata.pool;if(!Number.isInteger(physical)||!pool)continue;
-  try{await stat(deviceLeaseReceipt(pool,physical));}catch(e){if(e.code!=='ENOENT')throw e;devices.push(physical);}
+  try{await stat((dependencies.leaseReceipt??deviceLeaseReceipt)(pool,physical));}catch(e){if(e.code!=='ENOENT')throw e;devices.push(physical);}
  }
  devices.sort((a,b)=>Number(b===config.environment.options.backgroundDevice)-Number(a===config.environment.options.backgroundDevice)||b-a);
  if(retained){if(retained.length!==4||retained.some(s=>!devices.includes(s.physical)||!hosts.some(r=>r.id===s.resource.id)))throw Error('Retained A/B resources are unavailable; keep their exact bindings');return retained;}

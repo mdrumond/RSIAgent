@@ -100,7 +100,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
     while(!failure&&cursor<cells.length){const {arm,repetition}=cells[cursor++],id=[phase,family.id,task.id,arm.id,repetition].join('--');
      try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);outputs[arm.id][repetition]=answer;
       if(answer.infrastructure)throw Object.assign(Error(answer.reason),{code:'PILOT_INFRASTRUCTURE'});}
-     catch(error){failure=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(error);}
+     catch(error){failure??=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(failure);}
     }
    });await Promise.all(workers);if(failure)throw failure;
    return outputs;
