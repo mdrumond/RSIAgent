@@ -85,3 +85,13 @@ test('actual Pi native draft write and edit leave evidence and session files rea
  const result=await reviewSession({...f,writableDirectory:draft});assert.equal(result.value.reason,'Observed failure');assert.equal(await readFile(join(draft,'kernel.py'),'utf8'),'VALUE=2\n');assert.equal(JSON.parse(await readFile(join(f.directory,'input.json'),'utf8')).filesystemAccess.writableDirectory,draft);
  const blocked=(await readFile(join(f.directory,'tool-policy.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(blocked.map(r=>r.tool),['write','read']);
 });
+
+
+test('actual Pi accepts supported submission without reading every supplied diagnostic',async t=>{
+ const f=await fixture(t,n=>n===1?{result:valid()}:{}),group={id:'diagnostics',occurrences:Array.from({length:8},(_,i)=>({reference:'events:'+i,data:{message:'Distinct failure '+i},artifacts:[]})),linkedDiagnostics:[{reference:'events:linked',data:{message:'Linked failure'},artifacts:[]}]};
+ const result=await reviewSession({...f,evidenceGroups:[group]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,2);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,0);
+});
+test('actual Pi still requires explicit audit reads before accepting supported submission',async t=>{
+ let required;const f=await fixture(t,n=>n===1||n===3?{result:valid()}:n===2?{tool:'read',args:{path:required}}:{});required=join(f.directory,'primary.txt');await writeFile(required,'Observed failure\n');
+ const result=await reviewSession({...f,requiredReads:[required]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,4);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,1);
+});
