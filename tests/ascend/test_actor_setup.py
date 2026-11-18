@@ -65,3 +65,22 @@ def test_existing_report_refreshes_after_runtime_change(tmp_path):
     report = json.loads(Path(second["RSI_SETUP_REPORT"]).read_text())
     assert report["identity"] == {"compiler": "replacement"}
     assert report["environment"]["TRITON_CACHE_DIR"] == second["TRITON_CACHE_DIR"]
+
+
+def test_catlass_distribution_retains_native_binding_identity(tmp_path):
+    native = tmp_path / 'catlass' / '_tla_type_bridge_native.fixture.so'
+    native.parent.mkdir(); native.write_bytes(b'native-binding')
+    (native.parent / '__init__.py').write_text('catlass source')
+    class Distribution:
+        version = 'fixture-catlass'
+        def locate_file(self, name): return tmp_path / name
+        def read_text(self, name): return 'fixture metadata'
+    def distribution(name):
+        if name != 'ascend-catlass-dsl':
+            raise setup.importlib.metadata.PackageNotFoundError(name)
+        return Distribution()
+    with patch.object(setup.importlib.metadata, 'distribution', side_effect=distribution):
+        identity = setup.runtime_identity({'target': 'a5'})
+    package = identity['packages']['ascend-catlass-dsl']
+    assert package[0] == 'fixture-catlass'
+    assert str(native) in [stamp[0] for stamp in package[3]]

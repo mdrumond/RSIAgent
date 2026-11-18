@@ -7,10 +7,16 @@ import re
 import subprocess
 
 
-def identity():
+def identity(target=None):
     report = json.loads(Path(os.environ['RSI_SETUP_REPORT']).read_text())['identity']
-    if not all(name in report['packages'] for name in ('torch', 'torch-npu', 'triton')):
-        raise RuntimeError('A3 Torch-NPU and Triton packages required')
+    target = target or report['binding'].get('product', 'a3')
+    if target not in ('a3', 'a5'):
+        raise RuntimeError('Explicit A3 or A5 runtime identity target required')
+    required = ('torch', 'torch-npu') + (() if target == 'a5' else ('triton',))
+    if not all(name in report['packages'] for name in required):
+        raise RuntimeError(target.upper() + ' runtime packages missing: ' + ', '.join(required))
+    if target == 'a5' and not any(name in report['packages'] for name in ('catlass', 'catlass-dsl', 'ascend-catlass-dsl')):
+        raise RuntimeError('A5 Catlass package required')
     digests = {}
     def digest(path):
         path = Path(path).resolve()
@@ -30,11 +36,13 @@ def identity():
             path = Path(root) / relative
             if path.is_file():
                 versions.add((relative, digest(path)))
-    board = subprocess.run(['npu-smi', 'info', '-t', 'board', '-i', os.environ['ASCEND_PHYSICAL_DEVICE'], '-c', '0'],
+    board = subprocess.run(['npu-smi', 'info', '-t', 'board', '-i', os.environ['ASCEND_PHYSICAL_DEVICE']] + ([] if target == 'a5' else ['-c', '0']),
                            capture_output=True, text=True, timeout=5, check=True).stdout
     product = re.search(r'Chip Name\s*:\s*(\S+)', board)
     if not product or not versions or not report['compilers']:
         raise RuntimeError('Device, CANN version and compiler identity required')
-    return {'setup': {'binding': report['binding'], 'python': report['python'][0],
+    result = {'setup': {'binding': report['binding'], 'python': report['python'][0],
                       'machine': report['machine'], 'packages': packages, 'compilers': compilers},
             'cannVersions': [list(version) for version in sorted(versions)], 'product': product.group(1)}
+    if target == 'a5': result['target'] = target
+    return result
