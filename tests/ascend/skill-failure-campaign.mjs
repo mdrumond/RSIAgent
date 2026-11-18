@@ -130,3 +130,17 @@ for(const boundary of ['review profile','memory attention'])test('resume rejects
  await assert.rejects(runCampaignFailureStep(f.config,f.values,ops),/Frozen experiment baseline, model, machinery or memory changed/);
  assert.equal(evaluations,1);
 });
+
+test('eligible family remains visible behind more than one page of legacy work',async t=>{
+ const f=await fixture(t);
+ for(let i=0;i<105;i++)f.backlog.upsert({key:'old-'+i,priority:100+i,reason:'Legacy proposal',objective:'correctness',skill:'old-'+i,base:'base',groupIds:f.item.groupIds,proposal:{action:'update'},evidence:f.item.evidence});
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
+ const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,analyze:async()=>assert.fail('Eligible family is already queued')});
+ assert.equal(result.status,'accepted');
+});
+
+test('expired retained experiment never starts a new publication',async t=>{
+ const f=await fixture(t),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ f.backlog.checkpoint(run.id,{elapsed:7200,checkpoint:{workflow:'failure-first-v1',startedAt:Date.now()-7201000,directory:f.root,slots,phase:'publish'}});
+ await assert.rejects(runCampaignFailureStep(f.config,f.values,{...f.ops,publish:async()=>assert.fail('Expired work cannot promote')}),/allowance exhausted before publication/);
+});
