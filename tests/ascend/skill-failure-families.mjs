@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {Type} from 'typebox';
 import {Check} from 'typebox/value';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm,symlink} from 'node:fs/promises';
@@ -6,7 +7,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-import {reviewWritePathAllowed} from '../../cli/skill-review-native.mjs';
+import {REVIEW_CONTRACT_VERSION,reviewSession,reviewWritePathAllowed} from '../../cli/skill-review-native.mjs';
 import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {fingerprint} from '../../controller/evidence.mjs';
@@ -80,6 +81,23 @@ test('source-history Git metadata is materialized for read-only native research'
  const history=join(f.root,'source-history/retained');await mkdir(join(f.root,'source-history'));execFileSync('git',['clone','--bare','-q',repo,history]);execFileSync('git',['--git-dir',history,'config','core.bare','false']);
  const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
+ const isolated=await mkdtemp(join(tmpdir(),'isolated-family-'));t.after(()=>rm(isolated,{recursive:true,force:true}));
+ const result=await prepareFailureFamily({...f,directory:isolated,seconds:30},{session:async options=>{
+  const {directory,writableDirectory,prompt}=options;
+  const source=prompt.sourceInventory.find(row=>row.reference===reference);
+  const resultSchema=Type.Unknown();
+  await mkdir(directory,{recursive:true});
+  await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:resultSchema,writableDirectory}));
+  await writeFile(join(directory,'submission.json'),JSON.stringify({status:'needs-evidence',reason:'Reference unavailable'}));
+  const reviewed=await reviewSession({...options,resultSchema,knowledge:false,proofRequired:false});
+  const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
+  assert.deepEqual(input.filesystemAccess.allowed.find(entry=>entry.path===source.path),{path:source.path,directory:false});
+  assert.ok(!input.filesystemAccess.allowed.some(entry=>entry.path===join(isolated,'sources')));
+  assert.equal(await reviewWritePathAllowed(source.path,writableDirectory),false);
+  assert.equal(await readFile(source.path,'utf8'),f.code);
+  return reviewed;
+ }});
+ assert.equal(result.status,'needs-evidence');
 });
 
 test('no actual failed actor evidence avoids inference entirely',async t=>{
