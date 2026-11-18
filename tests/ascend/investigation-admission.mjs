@@ -12,6 +12,8 @@ import {promisify} from 'node:util';
 import {investigate,summarize} from '../../cli/curriculum.mjs';
 import {State} from '../../controller/state.mjs';
 import {findingsFor} from '../../cli/findings.mjs';
+import {importProject} from '../../cli/instance.mjs';
+import {freezeFiles} from '../../controller/evidence.mjs';
 
 async function fixture(t,plan) {
   const root=await mkdtemp(join(tmpdir(),'investigation-admission-'));
@@ -75,7 +77,7 @@ test('construction from a bundled parent owns only the new investigation source 
   assert.equal(result.performance_goal,undefined);
   assert.equal(result.id,'parent');assert.equal(result.phase,'phase1');assert.equal(result.campaign_entry,'batch1');
   assert.deepEqual(f.options.base,before);
-  assert.deepEqual(result.verifier.files,[join(f.path,'investigation','verify.py')]);
+  assert.deepEqual(new Set(result.verifier.files),new Set(['verify.py','positive/answer.py','negative/answer.py'].map(name=>join(f.path,'investigation',name))));
   const run=await promisify(execFile)(process.env.PYTHON??'python3',
     ['-c',"import runpy; runpy.run_path('../verify.py')"],{cwd:result.source});
   assert.equal(Number(run.stdout.trim()),42);
@@ -93,7 +95,8 @@ for(const verifier of ['sessions','source','source/answer.py','../outside.py'])
 test('native summary rejects directory evidence then accepts a real file without changing it',{timeout:15000},async t=>{
   const record={claims:[{text:'The proposal failed before execution; no numeric conclusion.',kind:'hypothesis',proofs:[{reference:'file:evidence.log',quote:'missing independent verifier observed'}]}],useful:false,paths:['.']};
   const text='missing independent verifier observed\n';
-  const f=await fixture(t,[['record_findings',record],['write',{path:'evidence.log',content:text}],['record_findings',{...record,paths:['evidence.log']}]]);
+  const f=await fixture(t,[['record_findings',record],['read',{path:'evidence.log'}],['record_findings',{...record,paths:['evidence.log']}]]);
+  await writeFile(join(f.path,'evidence.log'),text);
   const result=await summarize({...f.options,passed:false});
   assert.match(f.results()[0].content,/regular file/);
   assert.equal(f.results()[2].content,'Recorded');
@@ -133,7 +136,12 @@ test('canonical argparse verifier rejects missing argv and accepts corrected sub
   assert.match(responses[3].content,/reference failed/);
   assert.equal(responses[4].content,'Recorded');
   const events=f.options.state.queryEvents(f.options.job.attempt.id,{types:['curriculum-proposal']});
-  assert.equal(events.length,1);assert.deepEqual(events[0].data.proposal,{...corrected,verifier_command:result.verifier.command});
+  assert.equal(events.length,1);
+  const saved=events[0].data.proposal;
+  assert.deepEqual(saved.verifier_args,corrected.verifier_args);assert.deepEqual(saved.controls,corrected.controls);
+  assert.equal(saved.verifier_command,result.verifier.command);
+  assert.deepEqual(saved.verifier_files.map(name=>join(f.path,'investigation',name)),result.verifier.files);
+  assert.deepEqual(Object.fromEntries(Object.entries(saved.verifier_hashes).map(([name,hash])=>[join(f.path,'investigation',name),hash])),result.verifier.hashes);
   const run=cwd=>promisify(execFile)('bash',['-c',result.verifier.command],{cwd});
   await run(join(f.path,'investigation','positive'));
   await assert.rejects(run(join(f.path,'investigation','negative')),error=>error.code===1);
@@ -193,4 +201,21 @@ test('control execution consumes the existing curriculum elapsed allocation befo
   const attempt=f.options.state.attempt(id);
   assert.equal(attempt.elapsed,0);assert.equal(attempt.session,null);
   assert.equal(f.options.state.queryEvents(id,{types:['curriculum-interrupted']})[0].data.accepted,false);
+});
+
+test('investigation helper closure survives fresh import and stays frozen after construction',async t=>{
+  const verifier="import runpy\nfrom helper import expected\nraise SystemExit(0 if runpy.run_path('answer.py')['answer']==expected() else 1)\n";
+  const helper="import json\nfrom pathlib import Path\ndef expected(): return json.loads((Path(__file__).parent/'data'/'expected.json').read_text())['answer']\n";
+  const f=await fixture(t,[['write',{path:'verify.py',content:verifier}],['write',{path:'helper.py',content:helper}],
+    ['write',{path:'data/expected.json',content:'{"answer":42}\n'}],...knowledge,
+    ['submit_investigation',{...proposal,verifier_files:['helper.py','data/expected.json']}] ]);
+  const result=await investigate(f.options),root=join(f.path,'investigation');
+  for(const name of ['verify.py','helper.py','data/expected.json','positive/answer.py','negative/answer.py'])
+    assert.equal(result.verifier.hashes[join(root,name)],createHash('sha256').update(await readFile(join(root,name))).digest('hex'));
+  const imported=await importProject(join(f.root,'fresh'),{...result,id:'isolated-investigation'});
+  await rm(root,{recursive:true});
+  await promisify(execFile)('bash',['-c',imported.verifier.command],{cwd:imported.source});
+  const data=imported.verifier.files.find(file=>file.endsWith('/data/expected.json'));
+  await writeFile(data,'{"answer":7}\n');
+  await assert.rejects(freezeFiles(imported.verifier.files,imported.source,imported.verifier.hashes));
 });

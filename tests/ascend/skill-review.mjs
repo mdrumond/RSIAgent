@@ -136,8 +136,9 @@ test('learning requests are idempotent, opt-in, and preserve topic/target admiss
  const cfg={skills:{review:{enabled:true}}};assert.equal(claimLearningRequest(state,cfg,{...args,target:'a5'}),null);
  assert.equal(claimLearningRequest(state,cfg,{...args,topic:'layout'}),null);
  assert.equal(claimLearningRequest(state,cfg,args).id,id);assert.equal(claimLearningRequest(state,cfg,{...args,draft:'other'}),null);
- recordLearningOutcome(state,{id:'project',generation:{draft:args.draft,learningRequest:{id}}},{id:'attempt',outcome:'passed'});
- const row=state.db.prepare('SELECT status,data FROM skill_learning_requests WHERE id=?').get(id);assert.equal(row.status,'verified');assert.equal(JSON.parse(row.data).findings.attemptId,'attempt');
+ const project={id:'project',goal:'Answer the learning question',actor_seconds:60,generation:{draft:args.draft,learningRequest:{id}}};state.add(project);
+ const attempt=state.admit(project.id,{});state.finish(attempt.id,'passed');recordLearningOutcome(state,project,state.attempt(attempt.id));
+ const row=state.db.prepare('SELECT status,data FROM skill_learning_requests WHERE id=?').get(id);assert.equal(row.status,'verified');assert.equal(JSON.parse(row.data).findings.attemptId,attempt.id);
 });
 
 test('native Pi classification submits validated results and resumes without another provider call',async t=>{

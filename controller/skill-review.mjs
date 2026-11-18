@@ -149,6 +149,12 @@ export function recordLearningOutcome(state,project,attempt){
  const request=project.generation?.learningRequest;if(!request||!has(state.db,'skill_learning_requests'))return;
  const row=state.db.prepare('SELECT data,status,draft FROM skill_learning_requests WHERE id=?').get(request.id);
  if(!row||row.status==='archived'||row.draft!==project.generation.draft)return;
+ const recovery=has(state.db,'recovery_attempts')&&state.db.prepare('SELECT kind FROM recovery_attempts WHERE attempt=?').get(attempt.id);
+ const admitted=state.queryEvents(attempt.id,{types:['job-admitted'],limit:1})[0]?.data;
+ // An investigation has its own smaller verifier. Its findings are already
+ // retained by recovery; they cannot settle the parent's learning contract.
+ if((recovery?.kind??admitted?.kind)==='investigation')return;
+ if(attempt.outcome==='passed'&&state.project(project.id)?.status!=='passed')return;
  const data=JSON.parse(row.data);data.findings={attemptId:attempt.id,projectId:project.id,outcome:attempt.outcome};
  state.db.prepare('UPDATE skill_learning_requests SET status=?,data=? WHERE id=?').run(attempt.outcome==='passed'?'verified':'inconclusive',JSON.stringify(data),request.id);
 }
