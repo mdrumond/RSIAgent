@@ -190,7 +190,9 @@ test('learning outcomes arriving during analysis remain visible for the next sca
  await runPrioritySkills(f.config,f.values,{...f.ops,analyze:async()=>{
   const id=enqueueLearningRequest(f.state,{target:'a3',question:'A new boundary',requiredEvidence:'Actual learning result'});
   claimLearningRequest(f.state,f.config,{draft:'new-draft',target:'a3'});
-  recordLearningOutcome(f.state,{id:'new-project',generation:{draft:'new-draft',learningRequest:{id}}},{id:'new-attempt',outcome:'passed'});
+  const project={id:'new-project',goal:'Answer the new boundary question',actor_seconds:60,generation:{draft:'new-draft',learningRequest:{id}}};
+  f.state.add(project);const attempt=f.state.admit(project.id,{});f.state.finish(attempt.id,'passed');
+  recordLearningOutcome(f.state,project,f.state.attempt(attempt.id));
   f.backlog.meta('learning-pending',false);
  }});
  assert.equal((await prioritySkillStatus(f.config)).hasWork,true);
