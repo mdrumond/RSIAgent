@@ -124,7 +124,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));const retained=await readFile(join(directory,'native-session.json'),'utf8').then(JSON.parse).catch(error=>{if(error.code==='ENOENT')return null;throw error;});return {value,retrievals,recovered:true,...(retained?.path?{session:retained.path}:{})};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');if(proofRequired)await refreshCatalogue();}}):null;
- let submitted,rejectedSubmissions=0,lastRejection;
+ let submitted,rejectedSubmissions=0,lastRejection,submitting=false;
  const sanitize=value=>String(value??'').replace(/(https?:\/\/)[^/\s@]+@/gi,'$1[redacted]@').replace(/Bearer\s+[^\s"<>]+/gi,'Bearer [redacted]').replace(/([?&](?:token|key|api_key|access_token)=)[^&\s"<>]+/gi,'$1[redacted]').slice(0,2000);
  const rejectedCalls=new Set();let rejectionWrites=Promise.resolve();
  const recordRejection=(toolCallId,error,result)=>{if(rejectedCalls.has(toolCallId))return rejectionWrites;rejectedCalls.add(toolCallId);rejectedSubmissions++;lastRejection=sanitize(error);
@@ -147,7 +147,17 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    await writeFile(coverageFile,JSON.stringify([...seen]));
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
-  execute:async(id,{result})=>{try{submitted=await check(result);}catch(error){await recordRejection(id,error.message,result);throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
+  execute:async(id,{result})=>{
+   if(writableDirectory&&(submitting||submitted!==undefined))throw Error('A draft submission is already being checked or has been accepted');
+   submitting=true;
+   try{
+    const accepted=await check(result);
+    await writeFile(join(directory,'submission.json'),JSON.stringify(accepted,null,2));
+    submitted=accepted;
+    return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};
+   }catch(error){await recordRejection(id,error.message,result);throw error;}
+   finally{submitting=false;}
+  }});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=compatible?JSON.parse(await readFile(sessionFile,'utf8')):undefined;}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
