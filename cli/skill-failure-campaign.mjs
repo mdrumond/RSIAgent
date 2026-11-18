@@ -58,7 +58,7 @@ export async function failureCampaignSettled(config,dependencies={}){
 
 /** One ranked family owns the complete two-hour ledger and all child operation handles. */
 export async function runCampaignFailureStep(config,{slots,memory,remainingSeconds,signal},dependencies={}){
- config=skillConfig(config);if(!failureFirstEnabled(config)||config.target!=='a3')throw Error('Failure-first A3 workflow must be explicitly enabled');
+ config=skillConfig(config);if(!failureFirstEnabled(config)||!['a3','a5'].includes(config.target))throw Error('Failure-first workflow on A3 or A5 must be explicitly enabled');
  if(slots?.length!==4)throw Error('Failure-first startup requires four reserved healthy devices');
  const {state,backlog}=open(config),now=dependencies.now??Date.now;
  const knowledgeConfig={...memory?.config,project_evidence_root:config.root};
