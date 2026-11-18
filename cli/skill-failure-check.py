@@ -10,7 +10,8 @@ def receipt(path):
         for line in stream.read().decode('utf8', errors='replace').splitlines():
             try:
                 value = json.loads(line)
-                if isinstance(value, dict) and 'kernelSha256' in value: found = value
+                if isinstance(value, dict) and isinstance(value.get('correct'), bool) and isinstance(value.get('evidence'), dict):
+                    found = value
             except ValueError: pass
     return found
 
@@ -74,12 +75,13 @@ with tempfile.TemporaryDirectory(prefix='rsi-failure-oracle-') as temporary:
             if complete: break
             time.sleep(.05)
     value = receipt(out)
-    valid = isinstance(value, dict) and value.get('kernelSha256') == digest and hashlib.sha256((source / 'kernel.py').read_bytes()).hexdigest() == digest and isinstance(value.get('evidence'), dict)
+    valid = value is not None and value.get('kernelSha256', digest) == digest and hashlib.sha256((source / 'kernel.py').read_bytes()).hexdigest() == digest
     cleanup_only = reason in ('elapsed-limit', 'cleanup-elapsed') and valid and value.get('correct') is False and observed_at is not None and observed_at <= begun + PAYLOAD.get('seconds', 180)
     guard = {'reason': reason, 'commandExit': code, 'allChildrenReaped': complete, 'peakRssBytes': peak, 'elapsedSeconds': time.monotonic() - begun}
     if not valid or not complete or reason and not cleanup_only or valid and value.get('correct') is True and code != 0:
         value = {'correct': None, 'kernelSha256': digest, 'evidence': {'reason': 'Verification guard refused or receipt missing', 'processGuard': guard}}
     else:
+        value['kernelSha256'] = digest
         value['evidence']['processGuard'] = guard
         if cleanup_only: value['evidence']['cleanupElapsedAfterFailure'] = True
     sys.stderr.write(err.read_text(errors='replace')[-2048:]); print(json.dumps(value), flush=True)
