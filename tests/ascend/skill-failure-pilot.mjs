@@ -84,9 +84,9 @@ test('closed work without a trustworthy result is never silently replayed',async
 });
 test('elapsed expiry propagates remaining time and prevents renewed work on resume',async t=>{
  const f=await fixture(t);let clock=0,calls=0;
- const report=await runFailurePilot({...f.options,seconds:2,concurrency:1},{...f.ops,now:()=>clock,qualify:async input=>{assert.equal(input.remainingSeconds,2);clock=1500;return {qualified:true,referencePassed:true,negativeFailed:true};},trial:async input=>{assert(input.remainingSeconds<=.5);calls++;clock=2500;return result(false);}});
- assert.equal(report.status,'inconclusive');assert.match(report.reason,/elapsed/);assert.equal(calls,1);
- const resumed=await runFailurePilot({...f.options,seconds:2,concurrency:1},{...f.ops,now:()=>clock,trial:async()=>{calls++;return result(false);}});assert.equal(calls,1);assert.equal(resumed.status,'inconclusive');
+ const report=await runFailurePilot({...f.options,seconds:2,concurrency:1},{...f.ops,now:()=>clock,qualify:async input=>{assert.equal(input.remainingSeconds,2);clock=1500;return {qualified:true,referencePassed:true,negativeFailed:true};},trial:async()=>{calls++;return result(false);}});
+ assert.equal(report.status,'inconclusive');assert.match(report.reason,/elapsed/);assert.equal(calls,0);
+ const resumed=await runFailurePilot({...f.options,seconds:2,concurrency:1},{...f.ops,now:()=>clock,trial:async()=>{calls++;return result(false);}});assert.equal(calls,0);assert.equal(resumed.status,'inconclusive');
 });
 test('wire validation rejects missing cases, unknown cases and counterfeit successful outcomes',()=>{
  const t=task('public');assert.throws(()=>validatePilotTrial(result(true,{caseResults:[]}),t),/Successful trial/);
@@ -130,4 +130,31 @@ test('qualification work already performed consumes the original pilot allocatio
  const f=await fixture(t);let calls=0;
  const report=await runFailurePilot({...f.options,seconds:120,initialElapsedSeconds:120},{qualify:async()=>{calls++;},trial:f.ops.trial,design:f.ops.design});
  assert.equal(report.status,'inconclusive');assert.equal(calls,0);assert(report.elapsedSeconds>=120);
+});
+
+test('actor headroom and trusted verification have separate immutable grants',async t=>{
+ const f=await fixture(t);let clock=0,calls=0;
+ const options={...f.options,seconds:7200,trialSeconds:180,verificationSeconds:120,concurrency:1};
+ const report=await runFailurePilot(options,{...f.ops,now:()=>clock,trial:async input=>{
+  calls++;assert.equal(input.actorSeconds,180);assert.equal(input.verificationSeconds,120);assert.equal(input.remainingSeconds,300);clock+=299000;return result(true);
+ }});
+ assert.equal(report.status,'complete');assert.equal(calls,5);
+ for(const op of Object.values(report.operations).filter(op=>op.kind==='trial')){assert.equal(op.actorSeconds,180);assert.equal(op.verificationSeconds,120);assert.equal(op.allocatedSeconds,300);assert.equal(op.elapsedSeconds,299);}
+ await assert.rejects(runFailurePilot({...options,verificationSeconds:121},f.ops),/Frozen pilot/);
+});
+test('remaining campaign time cannot silently shorten actor or verification grants',async t=>{
+ const f=await fixture(t);let calls=0;
+ const report=await runFailurePilot({...f.options,seconds:299,trialSeconds:180,verificationSeconds:120},{...f.ops,trial:async()=>{calls++;return result(false);}});
+ assert.equal(report.status,'inconclusive');assert.equal(calls,0);assert.match(report.reason,/full actor and verification allocation/);assert.equal(Object.values(report.operations).filter(op=>op.kind==='trial').length,0);
+});
+
+test('denying a new full grant does not cancel other already admitted trials',async t=>{
+ const f=await fixture(t);let clock=0,calls=0;
+ const report=await runFailurePilot({...f.options,seconds:15,trialSeconds:10,concurrency:2},{...f.ops,now:()=>clock,trial:async input=>{
+  calls++;
+  if(input.repetition===0){clock=6000;await delay(1);}else{await delay(10);clock=8000;assert.equal(input.signal.aborted,false);}
+  return result(false);
+ }});
+ assert.equal(report.status,'inconclusive');assert.equal(calls,2);
+ const trials=Object.values(report.operations).filter(op=>op.kind==='trial');assert.equal(trials.length,2);assert(trials.every(op=>op.status==='complete'&&op.result.correct===false));
 });

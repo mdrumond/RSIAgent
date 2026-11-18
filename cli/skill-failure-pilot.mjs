@@ -43,10 +43,11 @@ export function pilotWinner(results,rows){
  const baseline=results.baseline;
  return rows.filter(c=>passes(results[c.id])>=passes(baseline)+2&&!controlRegression(baseline,results[c.id])).sort((a,b)=>passes(results[b.id])-passes(results[a.id])||a.text.length-b.text.length||a.id.localeCompare(b.id))[0]??null;
 }
-/** Five repetitions are a frozen workload, never a renewed elapsed allowance. */
-export async function runFailurePilot({directory,manifest,seconds=7200,trialSeconds=180,concurrency=4,initialElapsedSeconds=0,signal},dependencies){
+/** Five repetitions are a frozen workload, never a renewed elapsed allowance.
+ * Trial adapters enforce actorSeconds separately; remainingSeconds covers actor plus private verification. */
+export async function runFailurePilot({directory,manifest,seconds=7200,trialSeconds=180,verificationSeconds=0,concurrency=4,initialElapsedSeconds=0,signal},dependencies){
  manifest=clone(validatePilotManifest(manifest));
- if(!positive(seconds)||!positive(trialSeconds)||!Number.isFinite(initialElapsedSeconds)||initialElapsedSeconds<0||initialElapsedSeconds>seconds||!Number.isInteger(concurrency)||concurrency<1||concurrency>4||!['qualify','trial','design'].every(k=>typeof dependencies?.[k]==='function'))throw Error('Positive elapsed allocations, concurrency1..4 and trusted adapters required');
+ if(!positive(seconds)||!positive(trialSeconds)||!Number.isFinite(verificationSeconds)||verificationSeconds<0||!Number.isFinite(initialElapsedSeconds)||initialElapsedSeconds<0||initialElapsedSeconds>seconds||!Number.isInteger(concurrency)||concurrency<1||concurrency>4||!['qualify','trial','design'].every(k=>typeof dependencies?.[k]==='function'))throw Error('Positive elapsed allocations, concurrency1..4 and trusted adapters required');
  await mkdir(directory,{recursive:true});
  const owner=await processIdentity(),lock=join(directory,'pilot.lock');let handle;
  try{handle=await open(lock,'wx');}catch(error){
@@ -57,7 +58,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
  }
  await handle.writeFile(JSON.stringify(owner));await handle.close();
  const now=dependencies.now??(()=>performance.now()),wall=dependencies.wallNow??Date.now,file=join(directory,'pilot.json');let state,timer,readOnly=false,finalised=false,writes=Promise.resolve(),last=now();
- const identity=digest({manifest,seconds,trialSeconds,concurrency,initialElapsedSeconds}),end=new AbortController(),active=signal?AbortSignal.any([signal,end.signal]):end.signal;
+ const identity=digest({manifest,seconds,trialSeconds,verificationSeconds,concurrency,initialElapsedSeconds}),end=new AbortController(),active=signal?AbortSignal.any([signal,end.signal]):end.signal;
  const working=new Map();
  const charge=()=>{const current=now();state.elapsedSeconds+=Math.max(0,current-last)/1000;last=current;state.runningAt=wall();for(const [id,start]of working){const op=state.operations[id];op.elapsedSeconds=start.prior+Math.max(0,current-start.at)/1000;op.runningAt=wall();}};
  const persist=()=>{charge();const snapshot=clone(state);writes=writes.then(()=>save(file,snapshot));return writes;};
@@ -83,7 +84,8 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   timer=setInterval(()=>{void persist().catch(error=>end.abort(error));if(remaining()<=0)end.abort(Error('Pilot elapsed allocation exhausted'));},1000);
   const invoke=async(id,kind,input,fn,cap=remaining())=>{
    const prior=state.operations[id];if(prior?.status==='complete')return clone(prior.result);
-   expired();const available=Math.min(cap,remaining()),op={id,kind,status:'running',directory:join(directory,'operations',id),allocatedSeconds:available,elapsedSeconds:0,runningAt:wall()};
+   expired();if(kind==='trial'&&remaining()<cap)throw Object.assign(Error('Insufficient pilot elapsed time for a full actor and verification allocation'),{code:'PILOT_ADMISSION_BUDGET'});
+   const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',directory:join(directory,'operations',id),allocatedSeconds:available,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
    state.operations[id]=op;working.set(id,{at:now(),prior:0});await mkdir(op.directory,{recursive:true});await persist();
    const timeout=AbortSignal.timeout(Math.max(1,Math.ceil(available*1000))),bounded=AbortSignal.any([active,timeout]);
    try{const answer=await fn({...clone(input),directory:op.directory,remainingSeconds:available,signal:bounded});
@@ -96,8 +98,8 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    const outputs=Object.fromEntries(arms.map(a=>[a.id,[]]));let cursor=0,failure;
    const workers=Array.from({length:Math.min(concurrency,cells.length)},async()=>{
     while(!failure&&cursor<cells.length){const {arm,repetition}=cells[cursor++],id=[phase,family.id,task.id,arm.id,repetition].join('--');
-     try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities},dependencies.trial,trialSeconds),task);outputs[arm.id][repetition]=answer;}
-     catch(error){failure=error;end.abort(error);}
+     try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);outputs[arm.id][repetition]=answer;}
+     catch(error){failure=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(error);}
     }
    });await Promise.all(workers);if(failure)throw failure;
    return outputs;
