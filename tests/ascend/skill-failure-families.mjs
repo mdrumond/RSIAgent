@@ -137,3 +137,11 @@ test('draft native writes are scoped through existing ancestors and accepted byt
   const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));assert.equal(Check(resultSchema,{status:wire.status,reason:wire.reason,claims:wire.claims}),false);await assert.rejects(validate(wire),/Missing draft file: dev\//);assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
  }});assert.equal(result.family.development.files['kernel.py'],f.code);assert.equal(await readFile(join(directory,'dev/starter.py'),'utf8'),f.code);
 });
+
+
+for(const [name,edit]of [
+ ['transfer checker in development editable',f=>{f.family.development.files['oracle.py']='layout/./private.py';}],
+ ['transfer helper in development editable',f=>{f.family.development.files['oracle.py']='layout/./helper.py';}],
+ ['transfer checker in development public',f=>{f.family.development.publicChecker='layout/./private.py';}],
+ ['development helper in transfer public',f=>{f.family.transfer[0].publicChecker='dev/./helper.py';}]
+])test(name+' is rejected across family task boundaries',async t=>{const f=await fixture(t);edit(f);await assert.rejects(loadFailureFamily({file:await f.write(),config:f.config,item:f.item}),/any family task/);});
