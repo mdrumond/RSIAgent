@@ -24,7 +24,9 @@ export function failureReceipt(row,task){
  return value;
 }
 export async function failureChecker(task,runtime=null,guard={}){
- const payload={checker:await readFile(task.checker,'utf8'),helpers:task.checkerFiles??{},runtime,seconds:failureProtocol.checkerSeconds,...guard};
+ // On A5 the NPU runtime can take more than five seconds to exit after a
+ // valid receipt. Keep the same elapsed verifier limit and require a clean exit.
+ const payload={checker:await readFile(task.checker,'utf8'),helpers:task.checkerFiles??{},runtime,seconds:failureProtocol.checkerSeconds,...(runtime?.target==='a5'?{cleanupSeconds:15}:{}),...guard};
  assert(!Object.hasOwn(payload.helpers,'oracle.py')&&!Object.hasOwn(payload.helpers,'runtime_identity.py'),'Reserved oracle helper filename');
  if(runtime)payload.runtimeHelper=await readFile(new URL('./skill-suites/runtime-identity.py',import.meta.url),'utf8');
  return (await readFile(new URL('./skill-failure-check.py',import.meta.url),'utf8')).replace('__PAYLOAD__','json.loads('+JSON.stringify(JSON.stringify(payload))+')');
