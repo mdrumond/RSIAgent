@@ -121,7 +121,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  await writeFile(contractFile,JSON.stringify(contract));
  const prior=compatible?await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;}):null;
  let priorRejection;
- if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));return {value,retrievals,recovered:true};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
+ if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));const retained=await readFile(join(directory,'native-session.json'),'utf8').then(JSON.parse).catch(error=>{if(error.code==='ENOENT')return null;throw error;});return {value,retrievals,recovered:true,...(retained?.path?{session:retained.path}:{})};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');if(proofRequired)await refreshCatalogue();}}):null;
  let submitted,rejectedSubmissions=0,lastRejection;
