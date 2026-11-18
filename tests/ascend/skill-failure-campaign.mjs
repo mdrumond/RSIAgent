@@ -90,3 +90,11 @@ test('a resumed experiment refuses substitute devices before research or inferen
  const checkpoint={workflow:'failure-first-v1',startedAt:Date.now(),directory:join(f.root,'retained-study'),slots};f.backlog.checkpoint(run.id,{elapsed:0,checkpoint});
  await assert.rejects(runCampaignFailureStep(f.config,{...f.values,slots:slots.map((s,i)=>({...s,physical:i+1}))},f.ops),/exact original resource bindings/);assert.equal(f.calls.length,0);assert.deepEqual(f.backlog.run(run.id).checkpoint.slots,slots);
 });
+test('higher-ranked legacy proposals stay frozen while failure-first work proceeds',async t=>{
+ const f=await fixture(t),legacy=f.backlog.upsert({key:'legacy',priority:999,reason:'Retained older proposal',objective:'correctness',skill:'implementation',base:'base',groupIds:f.item.groupIds,proposal:{action:'update'},evidence:f.item.evidence});
+ const before=f.backlog.get(legacy.id);assert.equal((await runCampaignFailureStep(f.config,f.values,f.ops)).status,'accepted');assert.deepEqual(f.backlog.get(legacy.id),before);
+});
+test('legacy correctness history neither suppresses classification nor claims new-mode work',async t=>{
+ const f=await fixture(t);f.backlog.revise(f.item.id,{status:'rejected'});const legacy=f.backlog.upsert({key:'legacy',priority:999,reason:'Retained older proposal',objective:'correctness',skill:'implementation',base:'base',groupIds:f.item.groupIds,proposal:{action:'update'},evidence:f.item.evidence});let classified=0;
+ const out=await runCampaignFailureStep(f.config,f.values,{...f.ops,analyze:async()=>{classified++;}});assert.equal(out.status,'idle');assert.equal(classified,1);assert.equal(f.backlog.get(legacy.id).status,'queued');assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
+});

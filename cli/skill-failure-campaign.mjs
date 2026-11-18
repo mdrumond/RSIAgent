@@ -19,6 +19,7 @@ export const failureFirstEnabled=config=>config.skills?.failureFirst?.enabled===
 const open=config=>{const state=new State(join(config.root,'state.sqlite'));return {state,backlog:new SkillBacklog(state,{target:config.target})};};
 const value=(db,key)=>table(db,'control')?JSON.parse(db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
 const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name);
+const eligible=item=>item.workflow==='failure-first-v1'&&item.objective==='correctness';
 
 export function failureMemoryGeneration(config,state){
  const cutoff=table(state.db,'events')?state.db.prepare('SELECT max(sequence) n FROM events WHERE attempt IS NOT NULL').get().n:null;
@@ -41,7 +42,7 @@ export async function failureCampaignStatus(config){
    operations:running.map(o=>({id:o.id,elapsedSeconds:o.elapsedSeconds,allocatedSeconds:o.allocatedSeconds})),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||backlog.list({status:'queued'}).some(i=>i.objective==='correctness'))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||backlog.list({status:'queued'}).some(eligible))};
  }finally{state.close();}
 }
 
@@ -72,11 +73,11 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  try{
   let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
   const existing=backlog.list({status:'running',limit:1})[0];
-  if(!existing&&!backlog.list({status:'queued'}).some(i=>i.objective==='correctness')){
+  if(!existing&&!backlog.list({status:'queued'}).some(eligible)){
    await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
     classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,remainingSeconds),limit:2,signal});
   }
-  const item=existing??backlog.list({status:'queued'}).find(i=>i.objective==='correctness');
+  const item=existing??backlog.list({status:'queued'}).find(eligible);
   if(!item)return {status:'idle',reason:'No eligible correctness family'};
   if(item.objective!=='correctness'||item.proposal?.action==='update')throw Error('Legacy proposal cannot enter failure-first screening');
   const retained=existing&&backlog.run(existing.id);

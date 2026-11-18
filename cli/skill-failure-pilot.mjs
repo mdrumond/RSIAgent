@@ -115,7 +115,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   }
   if(!selected)return await result('complete','No qualified family demonstrated baseline struggle');
   state.selectedFamily=selected.id;
-  const designed=await invoke('design--'+selected.id,'design',{family:publicFamily(selected),baselineResults:state.screens[selected.id],identities:manifest.identities},dependencies.design);
+  const designed=await invoke('design--'+selected.id,'design',{family:publicFamily(selected),baselineResults:state.screens[selected.id],baseline:manifest.baseline,identities:manifest.identities},dependencies.design);
   if(designed?.status==='rejected'&&nonempty(designed.reason))return await result('complete',designed.reason,{designRejected:true});
   state.candidates=candidates(designed);await persist();
   const arms=[baseline,...state.candidates];state.development=await trials('development',selected,selected.development,arms);await persist();
