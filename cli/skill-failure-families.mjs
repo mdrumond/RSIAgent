@@ -34,27 +34,50 @@ function failedRecord(db,item,provenance){
  if(!['original','retry'].includes(kind))throw Error('Investigations and pre-actor work cannot establish a kernel failure');
  return {row,attempt,data};
 }
-async function gitRead(repository,args,signal){
+async function gitRead(repository,args,signal,binary=false){
  const metadata=await stat(join(repository,'HEAD')).then(s=>s.isFile(),()=>false);
- return (await git('git',[...(metadata?['--git-dir',repository]:['-C',repository]),...args],{maxBuffer:1048576,timeout:10000,...(signal?{signal}:{})})).stdout;
+ return (await git('git',[...(metadata?['--git-dir',repository]:['-C',repository]),...args],{maxBuffer:1048576,timeout:10000,encoding:binary?'buffer':'utf8',...(signal?{signal}:{})})).stdout;
+}
+
+async function verificationKernelHashes(root,data){
+ const expected=kernelHashes(data),artifact=data.correctness.evidence,artifactHash=data.correctness.evidence_sha256;
+ if(text(artifact)&&hex(artifactHash))try{const actual=await realpath(artifact);if(inside(root,actual)){const bytes=Buffer.from(await utf8(actual));if(sha(bytes)===artifactHash)for(const line of bytes.toString('utf8').split('\n'))try{kernelHashes(JSON.parse(line),expected);}catch{}}}catch(error){if(!['ENOENT','EISDIR'].includes(error.code))throw error;}
+ return expected;
+}
+// The controller fingerprints all source files, not merely the most recent stage snapshot.
+const treeFingerprints=new Map();
+async function treeFingerprint(repository,tree,signal){
+ signal?.throwIfAborted();
+ const key=repository+'\0'+tree;if(treeFingerprints.has(key))return treeFingerprints.get(key);
+ const records=(await gitRead(repository,['ls-tree','-rz',tree],signal)).split('\0').filter(Boolean).map(line=>{const tab=line.indexOf('\t');return {mode:line.slice(0,6),path:line.slice(tab+1)};}).filter(r=>!r.path.split('/').some(p=>['.git','node_modules','__pycache__','.pytest_cache'].includes(p)));
+ if(records.length>128||records.some(r=>!['100644','100755'].includes(r.mode)))return null;
+ records.sort((a,b)=>{const left=a.path.split('/'),right=b.path.split('/');for(let i=0;i<Math.min(left.length,right.length);i++)if(left[i]!==right[i])return left[i]<right[i]?-1:1;return left.length-right.length;});
+ const hash=createHash('sha256');let size=0;for(const r of records){signal?.throwIfAborted();const code=await gitRead(repository,['show',tree+':'+r.path],signal,true);size+=Buffer.byteLength(code);if(size>8388608)return null;hash.update(JSON.stringify([r.path,sha(code)])+'\n');}
+ const result=hash.digest('hex');if(treeFingerprints.size>=16)treeFingerprints.delete(treeFingerprints.keys().next().value);treeFingerprints.set(key,result);return result;
+}
+function sourceTrees(db,attempt,sequence){
+ const snapshots=db.prepare("SELECT sequence,data FROM events WHERE attempt=? AND type='source-snapshot' AND sequence<? ORDER BY sequence DESC").all(attempt,sequence).map(s=>({tree:JSON.parse(s.data).tree_oid,snapshotReference:'events:'+s.sequence}));
+ if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='storage_iterations'").get())for(const row of db.prepare("SELECT id,source_hash FROM storage_iterations WHERE attempt=? AND stage='validation' ORDER BY ordinal DESC").all(attempt))snapshots.unshift({tree:row.source_hash,iterationId:row.id});
+ const seen=new Set();return snapshots.filter(s=>{if(!/^[a-f0-9]{40}$/.test(s.tree??'')||seen.has(s.tree))return false;seen.add(s.tree);return true;});
 }
 
 /** Validate the replay witness against controller records, not a model summary. */
-export async function failureWitness({config,item,provenance}){
+export async function failureWitness({config,item,provenance,signal}){
  const root=await realpath(config.project_evidence_root??config.root),db=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});
  try{
   const {row,attempt,data}=failedRecord(db,item,provenance);
   const source=provenance.source;if(!source)throw Error('Recoverable failed source is required');let code,sourceIdentity;
-  if(source.snapshotReference){
-   const snapshot=/^events:(\d+)$/.exec(source.snapshotReference),entry=snapshot&&db.prepare("SELECT attempt,data FROM events WHERE sequence=? AND type='source-snapshot' AND sequence<?").get(Number(snapshot[1]),row.sequence);
-   if(entry?.attempt!==attempt.id)throw Error('Source snapshot does not belong to this verification');
-   const record=JSON.parse(entry.data);if(!/^[a-f0-9]{40}$/.test(record.tree_oid??''))throw Error('Exact retained source tree is required');
+  if(source.snapshotReference||source.iterationId){
+   let tree;
+   if(source.iterationId){const entry=db.prepare("SELECT source_hash FROM storage_iterations WHERE id=? AND attempt=? AND stage='validation'").get(source.iterationId,attempt.id);tree=entry?.source_hash;}
+   else{const snapshot=/^events:(\d+)$/.exec(source.snapshotReference),entry=snapshot&&db.prepare("SELECT data FROM events WHERE sequence=? AND attempt=? AND type='source-snapshot' AND sequence<?").get(Number(snapshot[1]),attempt.id,row.sequence);tree=entry&&JSON.parse(entry.data).tree_oid;}
+   if(!/^[a-f0-9]{40}$/.test(tree??''))throw Error('Source snapshot does not belong to this verification');
+   const record={tree_oid:tree};
    const repository=await scoped(root,source.repository);if(!text(source.file)||isAbsolute(source.file)||!inside('/tree',resolve('/tree',source.file)))throw Error('Snapshot file must remain inside the source tree');
-   code=await gitRead(repository,['show',record.tree_oid+':'+source.file]);sourceIdentity={repository:source.repository,tree:record.tree_oid,file:source.file,snapshotReference:source.snapshotReference};
+   code=await gitRead(repository,['show',record.tree_oid+':'+source.file],signal);sourceIdentity={repository:source.repository,tree:record.tree_oid,file:source.file,...(source.iterationId?{iterationId:source.iterationId}:{snapshotReference:source.snapshotReference})};
+   const hashes=await verificationKernelHashes(root,data);if(!hashes.has(sha(code))&&(!hex(data.fingerprint)||await treeFingerprint(repository,record.tree_oid,signal)!==data.fingerprint))throw Error('Source snapshot is not bound to this failed verification');
   }else{
-   const path=await scoped(root,source.path);code=await utf8(path);const expected=kernelHashes(data);
-   const artifact=data.correctness.evidence,artifactHash=data.correctness.evidence_sha256;
-   if(text(artifact)&&hex(artifactHash)){const actual=await realpath(artifact);if(inside(root,actual)){const bytes=Buffer.from(await utf8(actual));if(sha(bytes)===artifactHash)for(const line of bytes.toString('utf8').split('\n'))try{kernelHashes(JSON.parse(line),expected);}catch{}}}
+   const path=await scoped(root,source.path);code=await utf8(path);const expected=await verificationKernelHashes(root,data);
    if(!expected.has(sha(code)))throw Error('Recovered source is not bound to the failed verification');sourceIdentity={path:relative(root,path)};
   }
   if(!text(code)||Buffer.byteLength(code)>1048576)throw Error('Retained kernel is empty or oversized');
@@ -73,16 +96,18 @@ export async function failureSourceInventory({config,item,directory,signal}){
   const sources=[];await mkdir(directory,{recursive:true});
   for(const {row,attempt,reference}of candidates.slice(0,6)){signal?.throwIfAborted();
    const spec=JSON.parse(db.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project)?.spec??'{}');
-   for(const path of [spec.source&&join(spec.source,'kernel.py'),join(root,'attempts',attempt.id,'source/kernel.py')].filter(Boolean))try{const relativePath=relative(root,path),witness=await failureWitness({config,item,provenance:{reference,source:{path:relativePath}}});sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
-   const snapshots=db.prepare("SELECT sequence,data FROM events WHERE attempt=? AND type='source-snapshot' AND sequence<? ORDER BY sequence DESC LIMIT 1").all(attempt.id,row.sequence);
-   for(const snapshot of snapshots){const tree=JSON.parse(snapshot.data).tree_oid;if(!/^[a-f0-9]{40}$/.test(tree??''))continue;
+   for(const path of [spec.source&&join(spec.source,'kernel.py'),join(root,'attempts',attempt.id,'source/kernel.py')].filter(Boolean))try{const relativePath=relative(root,path),witness=await failureWitness({config,item,provenance:{reference,source:{path:relativePath}},signal});sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
+   if(sources.some(s=>s.reference===reference))continue;
+   const snapshots=sourceTrees(db,attempt.id,row.sequence);
+   for(const snapshot of snapshots){const tree=snapshot.tree;
     for(const repository of [...(spec.source?[spec.source]:[]),...repositories]){signal?.throwIfAborted();
      let names;try{names=(await gitRead(repository,['ls-tree','-r','--name-only',tree],signal)).trim().split('\n');}catch{continue;}
      for(const file of names.filter(n=>/(^|\/)(kernel|solution|main)\.(py|cpp|c|cce)$/.test(n)).slice(0,8)){
-      const provenance={reference,source:{snapshotReference:'events:'+snapshot.sequence,repository:relative(root,repository),file}};
-      try{const witness=await failureWitness({config,item,provenance}),path=join(directory,sha([reference,tree,file])+'.txt');await writeFile(path,witness.code);sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
+      const provenance={reference,source:{...(snapshot.iterationId?{iterationId:snapshot.iterationId}:{snapshotReference:snapshot.snapshotReference}),repository:relative(root,repository),file}};
+      try{const witness=await failureWitness({config,item,provenance,signal}),path=join(directory,sha([reference,tree,file])+'.txt');await writeFile(path,witness.code);sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
      }break;
     }
+    if(sources.some(s=>s.reference===reference))break;
    }
   }
   await save(join(directory,'sources.json'),sources);return sources;
@@ -90,10 +115,10 @@ export async function failureSourceInventory({config,item,directory,signal}){
 }
 
 /** v2 is distinct from legacy five-case suites: transfer roles must be authored explicitly. */
-export async function loadFailureFamily({file,config,item}){
+export async function loadFailureFamily({file,config,item,signal}){
  const root=await realpath(dirname(file)),manifest=JSON.parse(await utf8(file));
  if(manifest.format!==2||!slug(manifest.id)||manifest.target!==config.target||manifest.target!=='a3'||manifest.objective!=='correctness'||!text(manifest.mechanism?.phase)||!text(manifest.mechanism?.type)||!manifest.development||manifest.transfer?.length!==2)throw Error('Failure family v2 requires A3 correctness development and two transfers with a replay mechanism');
- const witness=await failureWitness({config,item,provenance:manifest.provenance}),ids=new Set(),hashes={};
+ const witness=await failureWitness({config,item,provenance:manifest.provenance,signal}),ids=new Set(),hashes={};
  const read=async name=>{const path=await scoped(root,name),s=await utf8(path);hashes[relative(root,path)]=sha(s);return {path,text:s};};
  async function task(input,transfer=false){
   if(!slug(input.id)||ids.has(input.id)||!text(input.prompt)||!Array.isArray(input.caseIds)||!input.caseIds.length||input.caseIds.some(id=>!text(id))||new Set(input.caseIds).size!==input.caseIds.length||input.controlCaseIds?.some(id=>!input.caseIds.includes(id)))throw Error('Family tasks require unique IDs and explicit case coverage');ids.add(input.id);
@@ -102,7 +127,7 @@ export async function loadFailureFamily({file,config,item}){
   const editablePaths=new Set();const materialize=async(mapping,editable=false)=>{if(!mapping||!Object.hasOwn(mapping,'kernel.py'))throw Error('Kernel file mapping required');const result={};for(const [name,path]of Object.entries(mapping)){if(!text(name)||isAbsolute(name)||!inside('/work',resolve('/work',name))||name==='.')throw Error('Editable files must remain within the task');const value=await read(path);if(value.path===checker.path)throw Error('Private checker cannot be editable');if(editable)editablePaths.add(value.path);result[name]=value.text;}return result;};
   const files=await materialize(input.files,true),reference={files:await materialize(input.controls?.reference?.files)},negative=input.controls?.negatives;
   if(!Array.isArray(negative)||!negative.length)throw Error('Every task requires reference and negative controls');const negatives=await Promise.all(negative.map(async n=>({files:await materialize(n.files)})));
-  const checkerFiles={};for(const [name,path]of Object.entries(input.checkerFiles??{})){if(!text(name)||isAbsolute(name)||!inside('/check',resolve('/check',name))||name==='.')throw Error('Checker helpers must be relative');const value=await read(path);if(editablePaths.has(value.path))throw Error('Private checker helper cannot be editable');checkerFiles[name]=value.text;}
+  const checkerFiles={};for(const [name,path]of Object.entries(input.checkerFiles??{})){if(!text(name)||isAbsolute(name)||!inside('/check',resolve('/check',name))||name==='.')throw Error('Checker helpers must be relative');const value=await read(path);if(editablePaths.has(value.path)||value.path===publicChecker.path)throw Error('Private checker helper cannot alias editable or public checker files');checkerFiles[name]=value.text;}
   return {...input,kind:'target-kernel',target:'a3',bucket:'correctness',files,checker:checker.path,publicChecker:publicChecker.path,checkerFiles,controls:{reference,negatives}};
  }
  const development=await task(manifest.development),transfer=await Promise.all(manifest.transfer.map(t=>task(t,true)));
@@ -133,14 +158,14 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
   bounded.throwIfAborted();if(!sources.length){ledger.status='needs-evidence';ledger.reason='No recoverable source bound to an actual actor correctness failure';return ledger;}
   const groups=await freezeGroups(config.root,item.evidence?.groups??[],join(directory,'evidence'));bounded.throwIfAborted();
   const session=dependencies.session??reviewSession,result=await session({directory:join(directory,'research'),config,seconds:Math.max(.001,Math.min(seconds,1800-elapsed)-(performance.now()-begun)/1000),signal:bounded,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root],proofRequired:true,selectorOnly:true,resultSchema,
-   prompt:{task:'Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. Return needs-evidence if no retained failing source is recoverable. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family and its UTF-8 files map: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; final JSON contains correct, kernelSha256 and evidence with checkedCases, phase and type. Public and private checkers are separate. The trusted runtime will qualify all controls on A3; no claim of execution from code alone.',contract:{format:2,target:'a3',objective:'correctness',id:'family-id',mechanism:{phase:'candidate-call-or-synchronize',type:'observed failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference/repository/file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}]}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
+   prompt:{task:'Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. Return needs-evidence if no retained failing source is recoverable. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family and its UTF-8 files map: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; enforce a 90-second elapsed deadline per case. Final JSON contains correct, kernelSha256 and evidence.caseResults with exactly one {id,correct:boolean} for every frozen case; overall correct is true only when all cases pass. checkedCases lists actual execution coverage only, including failed cases; unverified cases must not be marked successful. Include evidence.phase and type for failures. Public and private checkers are separate. The trusted runtime will qualify all controls on A3; no claim of execution from code alone.',contract:{format:2,target:'a3',objective:'correctness',id:'family-id',mechanism:{phase:'candidate-call-or-synchronize',type:'observed failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}]}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
     if(value.status==='needs-evidence')return value;
     if(!value.family||!value.files||Object.keys(value.files).length>64||Object.values(value.files).reduce((n,s)=>n+Buffer.byteLength(s),0)>4194304)throw Error('Bounded family file bundle required');
     for(const [name,s]of Object.entries(value.files)){if(!text(name)||isAbsolute(name)||!inside(directory,resolve(directory,name))||['family.json','isolation.json'].includes(name)||s.includes('\0'))throw Error('Family output files must be relative UTF-8 payloads');await mkdir(dirname(join(directory,name)),{recursive:true});await writeFile(join(directory,name),s,{mode:0o600});}
-    await save(file,value.family);await loadFailureFamily({file,config,item});return value;
+    await save(file,value.family);await loadFailureFamily({file,config,item,signal:bounded});return value;
    }});
-  bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item}):null;ledger={identity,status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};await save(stateFile,ledger);
+  bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;ledger={identity,status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};await save(stateFile,ledger);
   return family?{status:'ready',family,elapsedSeconds:ledger.elapsedSeconds}:ledger;
  }finally{clearInterval(timer);await pending;await checkpoint();ledger.running=false;await save(stateFile,ledger);}
 }
