@@ -1,6 +1,6 @@
 /** Native Pi/KDB and existing curriculum/evaluation adapters for isolated reviews. */
 import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat,rename} from 'node:fs/promises';
-import {join,resolve} from 'node:path';
+import {join,resolve,dirname} from 'node:path';
 import {Type} from 'typebox';
 import {randomUUID} from 'node:crypto';
 import {proofSelectorCatalogue} from './claim-proofs.mjs';
@@ -58,31 +58,36 @@ const qaAnswerResultSchema=Type.Object({answers:Type.Object(Object.fromEntries([
 const qaReviewResultSchema=Type.Object({verdict:Type.Union(['approved','revise','learn','inconclusive'].map(x=>Type.Literal(x))),reason:nonempty(),issues:Type.Optional(Type.Array(issueSchema)),learningRequests:Type.Optional(Type.Array(requestSchema)),claims:claimsSchema},{additionalProperties:false});
 
 async function reviewEvidence(directory,groups=[]){
- const required=new Set(),previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
+ const previews=[];await mkdir(join(directory,'evidence'),{recursive:true});
  for(const group of groups){
   const representatives=[...new Map(group.occurrences.map(o=>[diagnosticIdentity(o),o])).values()];
   const linked=group.linkedDiagnostics??[],linkedFile=join(directory,'evidence',group.id+'-linked-diagnostics.jsonl');
-  await writeFile(linkedFile,linked.map(d=>JSON.stringify(d)).join('\n')+'\n');linked.forEach(d=>required.add(d.reference));
+  await writeFile(linkedFile,linked.map(d=>JSON.stringify(d)).join('\n')+'\n');
   const all=join(directory,'evidence',group.id+'-occurrences.jsonl'),diagnostics=join(directory,'evidence',group.id+'-diagnostics.jsonl');
   await writeFile(all,group.occurrences.map(o=>JSON.stringify(o)).join('\n')+'\n');
   await writeFile(diagnostics,representatives.map(o=>JSON.stringify(o)).join('\n')+'\n');
-  representatives.forEach(o=>required.add(o.reference));
   previews.push({...group,linkedDiagnostics:linked.slice(0,6),linkedDiagnosticCount:linked.length,linkedDiagnosticsFile:linkedFile,occurrences:representatives.slice(0,6),occurrenceCount:group.occurrences.length,
    distinctDiagnostics:representatives.length,fullOccurrences:all,diagnosticsFile:diagnostics});
  }
- return {required,previews};
+ return {previews};
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords}){
+/** Resolve existing ancestors too: native write may create a new file below a symlink. */
+export async function reviewWritePathAllowed(path,directory){
+ if(!directory)return false;const root=await realpath(directory);let cursor=resolve(path);
+ while(true){try{const actual=await realpath(cursor);return actual!==root&&actual.startsWith(root+'/')||actual===root&&cursor!==resolve(path);}catch(error){if(error.code!=='ENOENT')throw error;const parent=dirname(cursor);if(parent===cursor)return false;cursor=parent;}}
+}
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
  const {resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href);
- const declarations=[directory,...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths,...requiredReads];
+ if(writableDirectory){await mkdir(writableDirectory,{recursive:true});writableDirectory=await realpath(writableDirectory);}
+ const declarations=[directory,...(writableDirectory?[writableDirectory]:[]),...evidenceGroups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].flatMap(o=>(o.artifacts??[]).map(a=>a.path))),...allowedPaths,...requiredReads];
  const allowed=await Promise.all([...new Set(declarations)].map(async path=>{try{const canonical=await realpath(path);return {path:canonical,directory:(await stat(canonical)).isDirectory()};}catch(error){if(error.code!=='ENOENT')throw error;return {path:resolve(path),directory:false};}}));
  const evidence=await reviewEvidence(directory,evidenceGroups);
  if(prompt.group)prompt={...prompt,group:evidence.previews[0]};if(prompt.groups)prompt={...prompt,groups:evidence.previews};
  const packet=compactEvidence?{observations:[],artifacts:[]}:await frozenEvidencePacket(evidenceGroups);
- prompt={...prompt,filesystemAccess:{allowed,requiredReads},projectSummaries:prompt.projectSummaries??await projectSummaries(config,evidenceGroups),learningProofEvidence:prompt.learningProofEvidence??await learningProofEvidence(prompt.learning,prompt.learningEvidence),frozenEvidence:packet};
+ prompt={...prompt,filesystemAccess:{allowed,requiredReads,...(writableDirectory?{writableDirectory}:{})},projectSummaries:prompt.projectSummaries??await projectSummaries(config,evidenceGroups),learningProofEvidence:prompt.learningProofEvidence??await learningProofEvidence(prompt.learning,prompt.learningEvidence),frozenEvidence:packet};
  const records=await readFile(join(directory,'retrievals.jsonl'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '';});
  const retrievals=records.split('\n').filter(Boolean).map(line=>JSON.parse(line));
  const proofSources=()=>proofRecords?[...proofRecords,...claimEvidence({prompt:{entries:prompt.entries,baseline:prompt.baseline,proposal:prompt.proposal,answers:prompt.answers,answerClaims:prompt.answerClaims},retrievals})]:claimEvidence({prompt,packet,retrievals});
@@ -101,12 +106,11 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
   }
   if(requiredReads.some(path=>!seen.has('file:'+resolve(path))))throw Error('Read these primary source files before summary audit: '+JSON.stringify(requiredReads.filter(path=>!seen.has('file:'+resolve(path)))));
-  if([...evidence.required].some(ref=>!seen.has(ref)))throw Error('Read every distinct diagnostic and linked diagnostic using native read with offset/limit on diagnosticsFile/linkedDiagnosticsFile before submitting; duplicate occurrences need no repeated reads');
   if(proofRequired)validateClaimedResult(result,[...(proofRecords?proofSources():claimEvidence({prompt,packet,retrievals})),...(discoveryProofRecords?await discoveryProofRecords():[])]);
   return validate(result,retrievals);
  };
  const contractFile=join(directory,'review-contract.json');
- const contract={version:REVIEW_CONTRACT_VERSION,schema};
+ const contract={version:REVIEW_CONTRACT_VERSION,schema,...(writableDirectory?{writableDirectory}:{})};
  let oldContract;try{oldContract=JSON.parse(await readFile(contractFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
  const compatible=JSON.stringify(oldContract)===JSON.stringify(contract);
  if(!compatible){const archive=join(directory,'contract-history',randomUUID());await mkdir(archive,{recursive:true});
@@ -115,17 +119,19 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  await writeFile(contractFile,JSON.stringify(contract));
  const prior=compatible?await readFile(join(directory,'submission.json'),'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return null;}):null;
  let priorRejection;
- if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));return {value,retrievals,recovered:true};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
+ if(prior)try{const value=await check(JSON.parse(prior),true);if(JSON.stringify(value)!==JSON.stringify(JSON.parse(prior)))await writeFile(join(directory,'submission.json'),JSON.stringify(value,null,2));const retained=await readFile(join(directory,'native-session.json'),'utf8').then(JSON.parse).catch(error=>{if(error.code==='ENOENT')return null;throw error;});return {value,retrievals,recovered:true,...(retained?.path?{session:retained.path}:{})};}catch(error){priorRejection=error.message;await appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({cached:true,error:error.message})+'\n');}
  const bridge=knowledge?createKdbBridge({url:await ensureKnowledgeService(config,{signal}),attemptId:'review-'+directory.split('/').at(-1),agentDir,
   recordRetrieval:async record=>{retrievals.push(record);await appendFile(join(directory,'retrievals.jsonl'),JSON.stringify(record)+'\n');if(proofRequired)await refreshCatalogue();}}):null;
- let submitted,rejectedSubmissions=0,lastRejection;
+ let submitted,rejectedSubmissions=0,lastRejection,submitting=false;
  const sanitize=value=>String(value??'').replace(/(https?:\/\/)[^/\s@]+@/gi,'$1[redacted]@').replace(/Bearer\s+[^\s"<>]+/gi,'Bearer [redacted]').replace(/([?&](?:token|key|api_key|access_token)=)[^&\s"<>]+/gi,'$1[redacted]').slice(0,2000);
  const rejectedCalls=new Set();let rejectionWrites=Promise.resolve();
  const recordRejection=(toolCallId,error,result)=>{if(rejectedCalls.has(toolCallId))return rejectionWrites;rejectedCalls.add(toolCallId);rejectedSubmissions++;lastRejection=sanitize(error);
   rejectionWrites=rejectionWrites.then(()=>appendFile(join(directory,'submission-rejections.jsonl'),JSON.stringify({toolCallId,error:lastRejection,...(result===undefined?{}:{result})})+'\n'));return rejectionWrites;
  };
  const extension=pi=>{
-  pi.on('tool_call',async event=>{if(!['read','grep','find','ls'].includes(event.toolName))return;
+  pi.on('tool_call',async event=>{
+   if(['write','edit'].includes(event.toolName)){const path=resolveToCwd(event.input.path??'',directory);if(await reviewWritePathAllowed(path,writableDirectory))return;await appendFile(join(directory,'tool-policy.jsonl'),JSON.stringify({tool:event.toolName,path,blocked:true,toolCallId:event.toolCallId})+'\n');return {block:true,reason:'Write and edit are limited to filesystemAccess.writableDirectory. Evidence, session state and accepted files are read-only.'};}
+   if(!['read','grep','find','ls'].includes(event.toolName))return;
    const requested=resolveToCwd(event.input.path??'.',directory);
    const path=await realpath(requested).catch(error=>{if(error.code!=='ENOENT')throw error;return requested;});
    if(allowed.some(a=>path===a.path||a.directory&&path.startsWith(a.path+'/')))return;
@@ -133,20 +139,27 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    return {block:true,reason:'Filesystem inspection is limited to this review directory and explicitly copied evidence/verified learning paths. Read input.json and correct the submitted fields; use KDB MCP search/read_entry for indexed knowledge, not workspace searches.'};
   });
   pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
-   const path=resolve(directory,event.input.path??'');if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}if(path!==join(directory,'input.json')&&!path.startsWith(join(directory,'evidence')+'/'))return;
-   const text=(event.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
-   for(const ref of evidence.required){const quoted=JSON.stringify(ref);if(text.includes('\"reference\":'+quoted)||text.includes('\"reference\": '+quoted))seen.add(ref);}
-   await writeFile(coverageFile,JSON.stringify([...seen]));
+   const path=resolveToCwd(event.input.path??'',directory);if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}
   });
   pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
-  execute:async(id,{result})=>{try{submitted=await check(result);}catch(error){await recordRejection(id,error.message,result);throw error;}await writeFile(join(directory,'submission.json'),JSON.stringify(submitted,null,2));return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};}});};
+  execute:async(id,{result})=>{
+   if(writableDirectory&&(submitting||submitted!==undefined))throw Error('A draft submission is already being checked or has been accepted');
+   submitting=true;
+   try{
+    const accepted=await check(result);
+    await writeFile(join(directory,'submission.json'),JSON.stringify(accepted,null,2));
+    submitted=accepted;
+    return {content:[{type:'text',text:'Accepted. Finish this session.'}],details:{}};
+   }catch(error){await recordRejection(id,error.message,result);throw error;}
+   finally{submitting=false;}
+  }});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=compatible?JSON.parse(await readFile(sessionFile,'utf8')):undefined;}catch(e){if(e.code!=='ENOENT')throw e;}
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
  const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
-  tools:['read','grep','find','ls','submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
+  tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  const unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
   const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
  }});
@@ -160,7 +173,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
  try{
   signal?.throwIfAborted();if(bridge)await bridge.knowledge.prepareSession(session,{signal});else await session.bindExtensions({});
-  await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read required primary files and distinct supplied diagnostics using native read offset/limit when previews are incomplete; duplicate diagnostics need no repeated reads. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
+  await session.prompt((priorRejection?'Previous cached submission was rejected: '+priorRejection+'. Correct it within this session. ':'')+'Read input.json and follow its task. filesystemAccess.allowed lists the actual permitted files and directory trees, including any primary-source catalogue and its files outside this session directory; those declared paths may be read. Read diagnosticsFile, linkedDiagnosticsFile and fullOccurrences only when supplied; absent diagnostic files are not an instruction to search for them. Read explicitly required primary files before audit submission. Inspect relevant diagnostics using native read offset/limit when needed; diagnostic coverage is not a submission gate. Use only supplied evidence or enabled KDB tools, without searching implementation source or live workspaces. Submit the requested JSON result using submit_review, correcting its field-specific validation feedback rather than finishing with ordinary prose. Unknown is valid: never invent a cause, repair, source identity, device execution or measurement. Harness faults require user intervention, not actor repairs.');
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
   if(submitted===undefined){const provider=session.messages.slice(initialMessages).some(m=>m.role==='assistant'&&m.stopReason==='error'),kind=provider?'provider-error':rejectedSubmissions?'rejected-submissions':'no-submit',detail=await termination(kind);
    throw Object.assign(Error('Review session '+kind+(detail.cause?': '+detail.cause:detail.lastRejection?': '+detail.lastRejection:'')),{reviewSession:detail});}
