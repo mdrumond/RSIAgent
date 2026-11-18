@@ -89,13 +89,17 @@ test('settlement observation errors preserve unresolved state and exact custody 
  const r=await runSkillProjectAB(f.options,f.deps);assert.equal(r.status,'unresolved');assert.equal(r.custodyErrors[0].handle,'remote:test:job:retained');assert.equal(r.verdict.promote,false);const stored=JSON.parse(await readFile(join(f.options.directory,'result.json'),'utf8'));assert.equal(stored.status,'unresolved');assert.equal(stored.error.handle,'remote:test:job:retained');await assert.rejects(runSkillProjectAB(f.options,f.deps),/EEXIST/);
 });
 
-test('native Pi uses stock file tools, preserves protected files and submits JSON from disk',async t=>{
+test('native Pi drafts incrementally and freezes only explicitly accepted JSON',async t=>{
  const {createServer}=await import('node:http'),{once}=await import('node:events'),{nativeProjectRole}=await import('../../cli/skill-project-native.mjs');
  const f=await fixture(t),requests=[],actions=[
   {name:'read',arguments:{path:'missing.txt'}},
   {name:'write',arguments:{path:'CONTRACT.md',content:'tampered'}},
-  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['project.files.kernel.py']})}},
-  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['events:41']})}},
+  {name:'write',arguments:{path:'proposal.json',content:'{'}},
+  {name:'submit_review',arguments:{}},
+  {name:'edit',arguments:{path:'proposal.json',oldText:'{',newText:JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['project.files.kernel.py']})}},
+  {name:'submit_review',arguments:{}},
+  {name:'edit',arguments:{path:'proposal.json',oldText:'project.files.kernel.py',newText:'events:41'}},
+  {name:'submit_review',arguments:{}},
   {name:'edit',arguments:{path:'proposal.json',oldText:'events:41',newText:'invented'}}
  ];
  const server=createServer(async(req,res)=>{
@@ -109,7 +113,14 @@ test('native Pi uses stock file tools, preserves protected files and submits JSO
  const result=await nativeProjectRole({directory,files:{'input.json':'{}','CONTRACT.md':'protected'},prompt:'Use the provided file tools.',submission:'proposal.json',validate:value=>{if(value.evidenceRefs.some(ref=>ref!=='events:41'))throw Error('Unknown evidenceRefs: '+JSON.stringify(value.evidenceRefs));},profile,seconds:20});
  assert.equal(result.error,null);assert.deepEqual(result.value,{decision:'learn',reason:'Needs controls.',evidenceRefs:['events:41']});assert.equal(await readFile(join(result.cwd,'CONTRACT.md'),'utf8'),'protected');
  const policy=(await readFile(join(directory,'policy.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(policy.map(p=>[p.tool,p.path]),[['write','CONTRACT.md']]);assert(requests.some(r=>r.messages.some(m=>m.role==='tool'&&JSON.stringify(m.content).includes('ENOENT'))));
- const rejections=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejections.length,2);assert.deepEqual(rejections.map(r=>r.tool),['write','edit']);assert.equal(rejections[0].input.content,JSON.stringify({decision:'learn',reason:'Needs controls.',evidenceRefs:['project.files.kernel.py']}));assert.equal(result.stats.userMessages,1);assert(requests.some(r=>r.messages.some(m=>m.role==='tool'&&JSON.stringify(m.content).includes('Unknown evidenceRefs'))));assert.equal(requests.length,6);assert(requests.every(r=>r.tools.every(t=>['read','write','edit'].includes(t.function.name))));
+ const rejections=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rejections.length,2);assert.deepEqual(rejections.map(r=>r.tool),['submit_review','submit_review']);assert.equal(result.stats.userMessages,1);assert(requests.some(r=>r.messages.some(m=>m.role==='tool'&&JSON.stringify(m.content).includes('Unknown evidenceRefs'))));assert.equal(requests.length,10);assert(requests.every(r=>r.tools.every(t=>['read','write','edit','submit_review'].includes(t.function.name))));
+ assert.equal(JSON.parse(await readFile(join(directory,'submission.accepted.json'),'utf8')).evidenceRefs[0],'events:41');assert.equal(JSON.parse(await readFile(join(result.cwd,'proposal.json'),'utf8')).evidenceRefs[0],'invented');
+ const missing=await nativeProjectRole({directory:join(f.root,'not-submitted'),files:{'proposal.json':'{"valid":true}'},prompt:'Finish.',submission:'proposal.json',validate:()=>assert.fail('No implicit validation'),profile,seconds:20});assert.match(missing.error,/No accepted explicit submission/);assert.equal(missing.value,undefined);
+ actions.length=requests.length;actions.push(
+  {name:'write',arguments:{path:'proposal.json',content:JSON.stringify(f.design)}},{name:'submit_review',arguments:{}},undefined,
+  {name:'write',arguments:{path:'qa.json',content:JSON.stringify({verdict:'approved',reason:'Fair.',disconfirmation:'Both arms may pass.',leakage:'Controls hidden.'})}},{name:'submit_review',arguments:{}},undefined
+ );
+ const experiment=await runSkillProjectAB({...f.options,config:{actor:profile,skill_writer_actor:profile}},{...f.deps,role:nativeProjectRole});assert.equal(experiment.status,'complete');assert.equal(experiment.verdict.promote,true);assert.equal(experiment.results.length,4);assert.equal(JSON.parse(await readFile(join(f.options.directory,'design','submission.accepted.json'),'utf8')).decision,'propose');
 });
 
 test('large elapsed allocations do not overflow native timer limits into immediate expiry',async t=>{
