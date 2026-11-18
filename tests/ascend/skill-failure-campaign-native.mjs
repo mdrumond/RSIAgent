@@ -10,7 +10,7 @@ const execute=promisify(execFile),hash=x=>createHash('sha256').update(x).digest(
 test('actual skills-ab CLI completes all stages, native trials, independent transfers and publication', {timeout:120000},async t=>{
  const abort=new AbortController();t.after(()=>abort.abort());
  const parent=join(homedir(),'.cache/rsi-campaign-native');await mkdir(parent,{recursive:true});const root=await mkdtemp(join(parent,'run-'));t.after(()=>rm(root,{recursive:true,force:true}));const providerDir=join(root,'provider');await mkdir(providerDir);
- let sessions=0,qaSessions=0;const reviewSessions={};
+ let sessions=0,qaSessions=0,isolationSubmissions=0;const reviewSessions={};
  const provider=await scriptedReview(t,providerDir,body=>{
   const calls=body.messages.flatMap(m=>m.tool_calls??[]),raw=body.messages.find(m=>m.role==='user').content,text=typeof raw==='string'?raw:raw.map(p=>p.text??'').join('\n');
   const review=body.tools.find(tool=>tool.function.name==='submit_review');
@@ -27,7 +27,16 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
    const selector=reference=>{const row=input.proofSelectors.find(s=>s.reference===reference);assert(row,'Missing proof source '+reference);return row.selectors.includes('reference')?{reference}:{reference,startLine:1,endLine:1,...(row.segments.length>1?{segment:1}:{})};};
    const claim=(path,proof)=>({path,kind:'hypothesis',proofs:[proof]});let value;
    if(kind==='classify')value={classifications:input.groups.map(g=>({groupId:g.id,cause:'actor',bucket:'correctness',reason:'The fixture records an actor correctness failure.',coverage:'uncovered',guidanceIds:[],evidenceRefs:g.occurrences.map(o=>o.reference)})),claims:input.groups.map((g,i)=>claim('classifications.'+i+'.reason',selector(g.occurrences[0].reference)))};
-   else if(kind==='isolate')value={status:'ready',reason:'A retained failure admits controlled replay fixtures.',family,files:bundle,claims:[claim('reason',selector(reference))]};
+   else if(kind==='isolate'){
+    const attempt=++isolationSubmissions,feedback=String(tools.at(-1).content);
+    if(attempt===2)assert.match(feedback,/SyntaxError/);
+    if(attempt===3)assert.match(feedback,/missing fixture dependency/);
+    assert(attempt<=3);
+    const files={...bundle};
+    if(attempt===1)files['dev/private.py']='Private checker executes the candidate.\n';
+    if(attempt===2)files['dev/private.py']='raise ImportError("missing fixture dependency")\n';
+    value={status:'ready',reason:'A retained failure admits controlled replay fixtures.',family,files,claims:[claim('reason',selector(reference))]};
+   }
    else if(kind==='write'){
     if(!calls.some(c=>c.function.name==='mcp__kdb__search'))return {name:'mcp__kdb__search',args:{query:'kernel answer',limit:3}};
     const retrieved=[];const visit=x=>{if(!x||typeof x!=='object')return;if(x.collection&&x.chunk_id)retrieved.push(x);for(const v of Object.values(x))visit(v);};for(const tool of tools)try{visit(JSON.parse(String(tool.content)));}catch{}
@@ -60,7 +69,7 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
  const callbacks={runtime:args=>createFailureRuntime({...args,config:{...args.config,target:'cpu',environment:{options:{mode:'local',python}}}},{target:localTarget,settled:async()=>true})};
  const slots=Array.from({length:4},(_,physical)=>({resource:{id:'slot-'+physical,available:true,metadata:{kind:'host-slot',pool:'fixture',hostSlot:physical}},physical}));
  const out=await main(['skills-ab','--instance',root,'--once'],{signal:abort.signal,failureDependencies:{settled:async()=>true,slots:async()=>slots,memory:prepareFailureMemory,step:(config,values)=>runCampaignFailureStep(config,values,callbacks)}});
- assert.equal(out.status,'accepted',JSON.stringify(out));assert.equal(models,45);assert.equal(sessions,45);assert.equal(writes,3);assert.equal(qaSessions,6);assert(peak>1&&peak<=4);assert.equal(privateChecks,48);
+ assert.equal(out.status,'accepted',JSON.stringify(out));assert.equal(models,45);assert.equal(sessions,45);assert.equal(writes,3);assert.equal(qaSessions,6);assert(peak>1&&peak<=4);assert.equal(privateChecks,52);assert.equal(isolationSubmissions,3);
  assert.deepEqual(reviewSessions,{classify:1,isolate:1,write:3,answer:3,review:3});
  const updated=JSON.parse(await readFile(join(root,'instance.json'),'utf8'));assert.notEqual(updated.skills.activeVersion,'base');const effective=await skillInput(join(root,'skills/versions',updated.skills.activeVersion));assert(effective.text.includes('A bounded representation'));
  const backlog=new SkillBacklog(state,{target:'a3'}),item=backlog.list({status:'accepted'})[0];assert(item);assert.equal(backlog.meta('failure-first-current'),null);assert.equal(JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='pause'").get().value),true);

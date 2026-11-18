@@ -98,3 +98,18 @@ test('legacy correctness history neither suppresses classification nor claims ne
  const f=await fixture(t);f.backlog.revise(f.item.id,{status:'rejected'});const legacy=f.backlog.upsert({key:'legacy',priority:999,reason:'Retained older proposal',objective:'correctness',skill:'implementation',base:'base',groupIds:f.item.groupIds,proposal:{action:'update'},evidence:f.item.evidence});let classified=0;
  const out=await runCampaignFailureStep(f.config,f.values,{...f.ops,analyze:async()=>{classified++;}});assert.equal(out.status,'idle');assert.equal(classified,1);assert.equal(f.backlog.get(legacy.id).status,'queued');assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
 });
+
+test('unresolved submission reference execution aborts isolation and retains custody',async t=>{
+ const f=await fixture(t),lost=Error('Reference command custody remains unresolved');
+ const ops={...f.ops,
+  family:async({checkReferences,signal})=>{
+   await assert.rejects(checkReferences({family,seconds:90,signal}),error=>error===lost);
+   assert.equal(signal.reason,lost);
+   return {status:'needs-evidence',reason:'Model ended'};
+  },
+  runtime:async()=>({...await f.ops.runtime(),checkReferences:async()=>{throw lost;},close:async()=>false})
+ };
+ await assert.rejects(runCampaignFailureStep(f.config,f.values,ops),error=>error===lost);
+ assert.equal(f.backlog.run(f.item.id).checkpoint.unresolved,true);
+ assert.equal(f.calls.length,0);
+});

@@ -1,7 +1,7 @@
 /** Campaign admission for the failure-first experiment; legacy comparisons stay frozen. */
 import {readFile,mkdir,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../controller/state.mjs';
@@ -107,15 +107,47 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const active=AbortSignal.any([failure.signal,...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining()*1000)))]),cleanup=AbortSignal.timeout(Math.max(1,Math.ceil((remaining()+90)*1000)));
   phase('isolate');
   const priorFamily=await optional(join(cp.directory,'family-ready.json'));
-  const prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(1800,remaining()),signal:active});
-  if(prepared.status!=='ready')return finish('inconclusive',{reason:'needs-evidence',detail:prepared.reason});
+  const openRuntime=async()=>{
+   if(runtime)return runtime;
+   cp.runtimeDirectory=join(cp.directory,'runtime');save();
+   runtime=await ops.runtime({config,directory:cp.runtimeDirectory,publicDirectory:join(cp.directory,'public'),slots:cp.slots,knowledge:memory.knowledge,hiddenDirectories:[memory.config.root],signal:active,stopSignal:cleanup});
+   return runtime;
+  };
+  const isolation=new AbortController();
+  let referenceError,identity;
+  const checkReferences=async({family,seconds,signal})=>{
+   if(referenceError)throw referenceError;
+   const started=performance.now();
+   try{
+    const adapter=await openRuntime();
+    identity??=await adapter.identify({seconds:Math.min(120,seconds),signal});
+    await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+   }catch(error){
+    if(error.code!=='FAILURE_REFERENCE_REJECTED'){
+     referenceError=error;
+     isolation.abort(error);
+    }
+    throw error;
+   }
+  };
+  let prepared;
+  try{
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(1800,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+  }catch(error){throw referenceError??error;}
+  if(referenceError)throw referenceError;
+  if(prepared.status!=='ready'){
+   if(runtime){
+    closed=await runtime.close();runtime=null;
+    if(!closed)throw Error('Submission reference execution remains unresolved');
+   }
+   return finish('inconclusive',{reason:'needs-evidence',detail:prepared.reason});
+  }
   if(priorFamily&&hash(priorFamily.family)!==hash(prepared.family))throw Error('Frozen failure family changed');
   if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));
-  cp.runtimeDirectory=join(cp.directory,'runtime');save();
-  runtime=await ops.runtime({config,directory:cp.runtimeDirectory,publicDirectory:join(cp.directory,'public'),slots:cp.slots,knowledge:memory.knowledge,hiddenDirectories:[memory.config.root],signal:active,stopSignal:cleanup});
+  await openRuntime();
   phase('qualify');
   let manifest=await optional(join(cp.directory,'experiment.json'));
-  if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));const identity=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
+  if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
    manifest={baseline:baseline.text,identities:{model:await ops.model(config.actor),runtime:identity,memory:memory.knowledge.identity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
    cp.initialElapsedSeconds=(now()-cp.startedAt)/1000;await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
   if((await readConfig(config.root)).skills.activeVersion!==run.base||manifest.identities.memory!==memory.knowledge.identity||hash(manifest.identities.model)!==hash(await ops.model(config.actor))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
