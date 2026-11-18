@@ -1,0 +1,179 @@
+/** Campaign admission for the failure-first experiment; legacy comparisons stay frozen. */
+import {readFile,mkdir,writeFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {createHash,randomUUID} from 'node:crypto';
+import {existsSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
+import {State} from '../controller/state.mjs';
+import {SkillBacklog} from '../controller/skill-backlog.mjs';
+import {attentionRevision} from '../controller/failure-attention.mjs';
+import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
+import {readConfig} from './instance.mjs';
+import {skillInput} from './skill-microeval.mjs';
+import {skillModelIdentity,skillConfig} from '../controller/skill-context.mjs';
+import {runFailurePilot} from './skill-failure-pilot.mjs';
+
+const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
+const optional=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
+export const failureFirstEnabled=config=>config.skills?.failureFirst?.enabled===true;
+const open=config=>{const state=new State(join(config.root,'state.sqlite'));return {state,backlog:new SkillBacklog(state,{target:config.target})};};
+const value=(db,key)=>table(db,'control')?JSON.parse(db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
+const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name);
+const queuedFamily=backlog=>backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:1})[0];
+
+export function failureMemoryGeneration(config,state){
+ const cutoff=table(state.db,'events')?state.db.prepare('SELECT max(sequence) n FROM events WHERE attempt IS NOT NULL').get().n:null;
+ const generated=table(state.db,'generation_events')?state.db.prepare('SELECT max(sequence) n FROM generation_events').get().n:null;
+ let generation=null;const path=join(config.root,'knowledge.sqlite');
+ if(existsSync(path)){const db=new DatabaseSync(path,{readOnly:true});try{if(table(db,'active_generation'))generation=db.prepare('SELECT revision FROM active_generation').get()?.revision;}finally{db.close();}}
+ return hash({base:config.skills.activeVersion,generation,cutoff,generated,attention:attentionRevision(state.db)});
+}
+
+export async function failureCampaignStatus(config){
+ const {state,backlog}=open(config);
+ try{
+  const active=backlog.meta('failure-first-current'),run=active&&backlog.run(active),cp=run?.checkpoint;
+  const pilot=cp&&await optional(join(cp.directory,'pilot','pilot.json'));
+  const operations=Object.values(pilot?.operations??{}),running=operations.filter(o=>o.status==='running');
+  const screen=Object.values(pilot?.screens??{}).flat(),last=backlog.meta('failure-first-status');
+  return {...backlog.status(),...last,workflow:'failure-first-v1',current:run?{id:run.id,itemId:run.item_id,phase:cp.phase,
+   elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,directory:cp.directory}:null,
+   activeWork:run?{kind:'failure-first',stage:running[0]?.kind??cp.phase,id:run.id}:null,
+   operations:running.map(o=>({id:o.id,elapsedSeconds:o.elapsedSeconds,allocatedSeconds:o.allocatedSeconds})),
+   screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
+   resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
+   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
+ }finally{state.close();}
+}
+
+export async function failureCampaignSettled(config,dependencies={}){
+ const {state,backlog}=open(config);
+ try{const id=backlog.meta('failure-first-current'),run=id&&backlog.run(id);
+  if(run?.owner&&!await ownerStopped(run.owner))return false;
+  if(!run?.checkpoint?.runtimeDirectory)return true;
+  const result=await (dependencies.settled??(await import('./skill-failure-runtime.mjs')).failureRuntimeSettled)({config,directory:run.checkpoint.runtimeDirectory,signal:AbortSignal.timeout(90000)});
+  return result.closed===true;
+ }finally{state.close();}
+}
+
+/** One ranked family owns the complete two-hour ledger and all child operation handles. */
+export async function runCampaignFailureStep(config,{slots,memory,remainingSeconds,signal},dependencies={}){
+ config=skillConfig(config);if(!failureFirstEnabled(config)||config.target!=='a3')throw Error('Failure-first A3 workflow must be explicitly enabled');
+ if(slots?.length!==4)throw Error('Failure-first startup requires four reserved healthy devices');
+ const {state,backlog}=open(config),now=dependencies.now??Date.now;
+ const knowledgeConfig={...memory?.config,project_evidence_root:config.root};
+ const ops={
+  analyze:async args=>(await import('./skill-backlog-analysis.mjs')).analyzeBacklog(args,{classify:async input=>(await import('./skill-review-native.mjs')).nativeClassifyBatch({...input,config:knowledgeConfig})}),
+  family:async args=>(await import('./skill-failure-families.mjs')).prepareFailureFamily(args,{session:async input=>(await import('./skill-review-native.mjs')).reviewSession({...input,config:knowledgeConfig})}),
+  runtime:async args=>(await import('./skill-failure-runtime.mjs')).createFailureRuntime(args),
+  design:async args=>(await import('./skill-failure-candidates.mjs')).createFailureDesign(args),
+  publish:async args=>(await import('./skill-failure-candidates.mjs')).publishFailureWinner(args),
+  pilot:runFailurePilot,model:skillModelIdentity,input:skillInput,...dependencies};
+ let run,cp,timer,runtime,closed=true;
+ try{
+  let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
+  const existing=backlog.list({status:'running',limit:1})[0];
+  if(!existing&&!queuedFamily(backlog)){
+   await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
+    classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,remainingSeconds),limit:2,signal});
+  }
+  const item=existing??queuedFamily(backlog);
+  if(!item)return {status:'idle',reason:'No eligible correctness family'};
+  if(item.objective!=='correctness'||item.proposal?.action==='update')throw Error('Legacy proposal cannot enter failure-first screening');
+  const retained=existing&&backlog.run(existing.id);
+  if(retained?.checkpoint?.phase==='publish'){
+   const saved=await optional(join(retained.checkpoint.directory,'pilot','pilot.json'));
+   const elapsedAtResume=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
+   const remaining=Math.min(retained.seconds-elapsedAtResume,remainingSeconds);
+   const alreadyChanged=(await readConfig(config.root)).skills.activeVersion!==retained.base;
+   if(!alreadyChanged&&remaining<=0)throw Error('Experiment elapsed allowance exhausted before publication recovery');
+   const deadline=alreadyChanged?signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.floor(remaining*1000)))]);
+   const publication=await ops.publish({config,item:retained.snapshot,result:saved,directory:join(retained.checkpoint.directory,'pilot'),signal:deadline,recoverOnly:alreadyChanged});
+   if(!publication?.published)throw Error(publication?.reason??'Publication recovery refused');
+   const elapsed=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000),status=elapsed<retained.seconds?'accepted':'inconclusive';
+   backlog.checkpoint(retained.id,{elapsed,checkpoint:retained.checkpoint});backlog.finish(retained.id,{status,result:{reason:'publication-recovered',published:true,publication}});backlog.meta('failure-first-current',null);
+   return {status,published:true,reason:'publication-recovered'};
+  }
+  if(item.base!==config.skills.activeVersion){
+   if(existing)throw Error('Frozen experiment baseline changed; preserve its original run');
+   backlog.revise(item.id,{base:config.skills.activeVersion,status:'queued'});return {status:'reclassified',reason:'Active skill changed before screening'};
+  }
+  const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(7200,remainingSeconds),workflow:'failure-first-v1',owner:await processIdentity()});
+  if(!claimed)return {status:'idle',reason:'Family already completed'};
+  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots};
+  if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
+  backlog.meta('failure-first-current',run.id);await mkdir(cp.directory,{recursive:true});
+  const remaining=()=>Math.max(0,Math.min(run.seconds-(now()-cp.startedAt)/1000,remainingSeconds));
+  const save=()=>{backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});};
+  const phase=name=>{cp.phase=name;save();backlog.meta('failure-first-status',{status:'running',phase:name,at:now()});};
+  const finish=(status,result)=>{save();backlog.finish(run.id,{status,result});backlog.meta('failure-first-current',null);backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory});return {status,...result};};
+  const failure=new AbortController();save();timer=setInterval(()=>{try{save();}catch(error){failure.abort(error);}},1000);
+  if(remaining()<=0)throw Error('Experiment elapsed allowance exhausted');
+  const active=AbortSignal.any([failure.signal,...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining()*1000)))]),cleanup=AbortSignal.timeout(Math.max(1,Math.ceil((remaining()+90)*1000)));
+  phase('isolate');
+  const priorFamily=await optional(join(cp.directory,'family-ready.json'));
+  const openRuntime=async()=>{
+   if(runtime)return runtime;
+   cp.runtimeDirectory=join(cp.directory,'runtime');save();
+   runtime=await ops.runtime({config,directory:cp.runtimeDirectory,publicDirectory:join(cp.directory,'public'),slots:cp.slots,knowledge:memory.knowledge,hiddenDirectories:[memory.config.root],signal:active,stopSignal:cleanup});
+   return runtime;
+  };
+  const isolation=new AbortController();
+  let referenceError,identity;
+  const checkReferences=async({family,seconds,signal})=>{
+   if(referenceError)throw referenceError;
+   const started=performance.now();
+   try{
+    const adapter=await openRuntime();
+    identity??=await adapter.identify({seconds:Math.min(120,seconds),signal});
+    await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+   }catch(error){
+    if(error.code!=='FAILURE_REFERENCE_REJECTED'){
+     referenceError=error;
+     isolation.abort(error);
+    }
+    throw error;
+   }
+  };
+  let prepared;
+  try{
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(1800,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+  }catch(error){throw referenceError??error;}
+  if(referenceError)throw referenceError;
+  if(prepared.status!=='ready'){
+   if(runtime){
+    closed=await runtime.close();runtime=null;
+    if(!closed)throw Error('Submission reference execution remains unresolved');
+   }
+   return finish('inconclusive',{reason:'needs-evidence',detail:prepared.reason});
+  }
+  if(priorFamily&&hash(priorFamily.family)!==hash(prepared.family))throw Error('Frozen failure family changed');
+  if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));
+  await openRuntime();
+  phase('qualify');
+  const modelIdentities=async current=>({actor:await ops.model(current.actor),review:await ops.model(current.skill_writer_actor??current.actor)});
+  const memoryIdentity={snapshot:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null};
+  let manifest=await optional(join(cp.directory,'experiment.json'));
+  if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
+   manifest={baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
+   cp.initialElapsedSeconds=(now()-cp.startedAt)/1000;await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
+  const currentConfig=skillConfig(await readConfig(config.root));
+  if(currentConfig.skills.activeVersion!==run.base||hash(manifest.identities.memory)!==hash(memoryIdentity)||hash(manifest.identities.model)!==hash(await modelIdentities(currentConfig))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
+  const design=await ops.design({config,item:run.snapshot,knowledgeConfig});phase('evaluate');
+  const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:180,verificationSeconds:300,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
+   {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
+  closed=await runtime.close();runtime=null;if(!closed)throw Error('Experiment execution remains unresolved');
+  if(result.status!=='complete')throw Error(result.reason??'Incomplete experiment');
+  if(!result.promising)return finish('rejected',{reason:result.reason,result});
+  phase('publish');const publication=await ops.publish({config,item:run.snapshot,result,directory:join(cp.directory,'pilot'),signal:active});
+  if(!publication?.published)throw Error(publication?.reason??'Validated skill publication refused');
+  return finish('accepted',{reason:'protected-transfer-improvement',result,publication});
+ }catch(error){
+  cp&&(cp.unresolved=!closed);if(run&&cp){saveFailure();}
+  function saveFailure(){backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});}
+  throw error;
+ }finally{
+  clearInterval(timer);if(runtime){closed=await runtime.close().catch(()=>false);if(cp){cp.unresolved=!closed;backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});}}
+  state.close();
+ }
+}

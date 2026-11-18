@@ -98,8 +98,9 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    const outputs=Object.fromEntries(arms.map(a=>[a.id,[]]));let cursor=0,failure;
    const workers=Array.from({length:Math.min(concurrency,cells.length)},async()=>{
     while(!failure&&cursor<cells.length){const {arm,repetition}=cells[cursor++],id=[phase,family.id,task.id,arm.id,repetition].join('--');
-     try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);outputs[arm.id][repetition]=answer;}
-     catch(error){failure=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(error);}
+     try{const answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);outputs[arm.id][repetition]=answer;
+      if(answer.infrastructure)throw Object.assign(Error(answer.reason),{code:'PILOT_INFRASTRUCTURE'});}
+     catch(error){failure??=error;if(error.code!=='PILOT_ADMISSION_BUDGET')end.abort(failure);}
     }
    });await Promise.all(workers);if(failure)throw failure;
    return outputs;
@@ -114,7 +115,9 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   }
   if(!selected)return await result('complete','No qualified family demonstrated baseline struggle');
   state.selectedFamily=selected.id;
-  state.candidates=candidates(await invoke('design--'+selected.id,'design',{family:publicFamily(selected),baselineResults:state.screens[selected.id]},dependencies.design));await persist();
+  const designed=await invoke('design--'+selected.id,'design',{family:publicFamily(selected),baselineResults:state.screens[selected.id],baseline:manifest.baseline,identities:manifest.identities},dependencies.design);
+  if(designed?.status==='rejected'&&nonempty(designed.reason))return await result('complete',designed.reason,{designRejected:true});
+  state.candidates=candidates(designed);await persist();
   const arms=[baseline,...state.candidates];state.development=await trials('development',selected,selected.development,arms);await persist();
   if(Object.values(state.development).flat().some(r=>r.infrastructure))return await result('inconclusive','Development contains infrastructure outcomes');
   const winner=pilotWinner(state.development,state.candidates);if(!winner)return await result('complete','No development candidate improved success without control regression');

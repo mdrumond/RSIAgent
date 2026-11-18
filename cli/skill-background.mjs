@@ -31,6 +31,7 @@ export function enqueueSkillEvidence(config, task) {
 }
 
 export async function backgroundSkillStatus(config) {
+  if(config.skills?.failureFirst?.enabled)return (await import('./skill-failure-campaign.mjs')).failureCampaignStatus(config);
   const evolution = await read(join(config.root, 'skills', 'evolution.json'));
   const archives = await evaluationArchiveStatus(config,evolution);
   if(config.skills?.priority?.enabled&&!evolution?.pending){
@@ -54,6 +55,7 @@ export async function backgroundSkillStatus(config) {
 // Used by scheduler settlement before returning a reserved slot to foreground work.
 export async function backgroundSkillsSettled(config, { runtime } = {}) {
   try {
+    if(config.skills?.failureFirst?.enabled)return (await import('./skill-failure-campaign.mjs')).failureCampaignSettled(config);
     if(!await evaluationArchivesSettled(config))return false;
     const evolution = await read(join(config.root, 'skills', 'evolution.json'));
     const pending = evolution?.pending;
@@ -75,6 +77,7 @@ export async function backgroundSkillsSettled(config, { runtime } = {}) {
 // The campaign owns scheduling, device capacity and the decreasing remaining allocation.
 // One invocation handles one comparison, never recursively drains newer evidence.
 export async function runBackgroundSkills(config, values = {}) {
+  if(config.skills?.failureFirst?.enabled)throw Error('Use skills-ab for the four-device failure-first campaign while foreground is paused');
   config=skillConfig(config);
   positiveSeconds(values.remainingSeconds);
   if (!values.resource?.id) throw new Error('Background evaluation requires a reserved resource');

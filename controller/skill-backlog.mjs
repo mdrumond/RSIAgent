@@ -143,7 +143,14 @@ export class SkillBacklog {
  failures({dirty=true,limit=100,offset=0,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} AND ${includeRetired?'1':analysisScopeSql(this.db)} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ? OFFSET ?`).all(limit,offset).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
  get(id){const epoch=this.meta('queue-epoch'),key=epoch&&!id.startsWith('epoch:')?'epoch:'+epoch+':'+id:id;const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,key,key);return row?parse(row.data):null;}
- list({status,limit=100,includeRetired=false}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${status?'status=?':'1'} AND ${includeRetired?'1':activeItemSql(this.db,'i')} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
+ list({status,limit=100,includeRetired=false,workflow,objective}={}){
+  const predicates=[],args=[];
+  if(status){predicates.push('status=?');args.push(status);}
+  if(workflow){predicates.push("json_extract(i.data,'$.workflow')=?");args.push(workflow);}
+  if(objective){predicates.push("json_extract(i.data,'$.objective')=?");args.push(objective);}
+  if(!includeRetired)predicates.push(activeItemSql(this.db,'i'));
+  return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${predicates.join(' AND ')||'1'} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...args,limit).map(r=>parse(r.data));
+ }
  store(item){this.db.prepare('INSERT INTO skill_backlog_items VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,status=excluded.status,priority=excluded.priority')
   .run(item.id,item.key,JSON.stringify(item),item.status,item.priority,item.created);return item;}
  completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}
@@ -167,11 +174,13 @@ export class SkillBacklog {
  rank(rows){return this.atomic(()=>rows.map(({id,priority,reason})=>{const item=this.get(id);if(!item||!Number.isFinite(priority)||!reason)throw Error('Known hypothesis, priority and reason required');return this.store({...item,priority,reason});}));}
  rebase(id,base){return this.atomic(()=>{const item=this.get(id);if(!item)throw Error('Unknown hypothesis');if(item.base===base)return item;if(item.status==='running')throw Error('Settle running comparison before rebasing');return this.revise(id,{base,status:'needs-review',reason:'Active skill changed; requalification required'});});}
  run(id){const row=this.db.prepare("SELECT * FROM skill_backlog_runs WHERE id=? OR (item_id=? AND status='running') ORDER BY rowid DESC LIMIT 1").get(id,id);return row?{...row,snapshot:parse(row.snapshot),checkpoint:row.checkpoint&&parse(row.checkpoint),result:row.result&&parse(row.result),owner:row.owner&&parse(row.owner)}:null;}
- claim({base,seconds=1800,owner,itemId}={}){return this.atomic(()=>{
-  if(!Number.isFinite(seconds)||seconds<=0||seconds>1800)throw Error('Hypothesis allowance must fit 1800 elapsed seconds');
+ claim({base,seconds=1800,owner,itemId,workflow}={}){return this.atomic(()=>{
+  const maximum=workflow==='failure-first-v1'?7200:1800;
+  if(!Number.isFinite(seconds)||seconds<=0||seconds>maximum)throw Error(`Hypothesis allowance must fit ${maximum} elapsed seconds`);
   let row=this.db.prepare("SELECT id FROM skill_backlog_runs WHERE status='running'").get();
-  if(row){const run=this.run(row.id);if(run.base!==base)throw Error('Settle retained comparison before baseline change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
+  if(row){const run=this.run(row.id);if(run.base!==base||(run.snapshot.workflow==='failure-first-v1')!==(workflow==='failure-first-v1'))throw Error('Settle retained comparison before baseline or workflow change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
   for(const item of itemId?[this.get(itemId)].filter(item=>item?.status==='queued'):this.list({status:'queued',limit:100})){
+   if((item.workflow==='failure-first-v1')!==(workflow==='failure-first-v1'))continue;
    if(!this.db.prepare(`SELECT 1 FROM skill_backlog_items i WHERE id=? AND ${activeItemSql(this.db,'i')}`).get(item.id))continue;
    if(item.base!==base){this.rebase(item.id,base);continue;}
    const completed=this.completed(item);if(completed){this.store({...item,status:completed.status,previousRun:completed.id});continue;}
