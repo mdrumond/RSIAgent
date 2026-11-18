@@ -30,8 +30,9 @@ function failedRecord(db,item,provenance){
  if(provenance.attemptId&&provenance.attemptId!==attempt.id||provenance.projectId&&provenance.projectId!==attempt.project)throw Error('Witness attempt/project identity changed');
  const refs=(item.evidence?.groups??[]).flatMap(g=>[...(g.occurrences??[]),...(g.linkedDiagnostics??[])].map(o=>o.reference));
  if(!refs.includes(provenance.reference))throw Error('Witness is outside the supplied failure evidence');
+ if(data.correctness.exitCode===125)throw Error('Verifier infrastructure failure cannot seed a kernel experiment');
  const admitted=db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted' ORDER BY sequence LIMIT 1").get(attempt.id),kind=admitted&&JSON.parse(admitted.data).kind;
- if(!['original','retry'].includes(kind))throw Error('Investigations and pre-actor work cannot establish a kernel failure');
+ if(!['original','retry','investigation'].includes(kind))throw Error('Only admitted actor work can establish a kernel failure');
  return {row,attempt,data};
 }
 async function gitRead(repository,args,signal,binary=false){
