@@ -15,11 +15,12 @@ export function kdbContamination(jsonl){
   if(m?.role==='toolResult'&&m.toolName?.startsWith('mcp__kdb__')&&m.isError===true&&/timed?\s*out|timeout|transport|connection|ECONN|socket|disconnected/i.test(JSON.stringify(m.content)))return {infrastructure:true,correct:null,reason:'KDB retrieval infrastructure failure',tool:m.toolName,toolCallId:m.toolCallId};
  }return null;
 }
-export function failureReceipt(row){
+export function failureReceipt(row,task){
  if(!row?.sourceFilesMatch)return {correct:null,reason:'Source identity unavailable'};
  let value;try{value=JSON.parse(row.output.trim().split('\n').at(-1));}catch{return {correct:null,reason:'Trusted receipt missing'};}
  if(value.kernelSha256!==row.sourceFilesSha256?.['kernel.py']||typeof value.evidence!=='object'||!value.evidence)return {correct:null,reason:'Trusted source identity or evidence mismatch'};
  if(typeof value.correct==='boolean'&&value.evidence.processGuard?.allChildrenReaped!==true)return {correct:null,reason:'Trusted process closure missing'};
+ if(task&&typeof value.correct==='boolean'){const cases=value.evidence.caseResults,ids=task.caseIds;if(!Array.isArray(cases)||cases.length!==ids.length||new Set(cases.map(c=>c?.id)).size!==ids.length||cases.some(c=>!ids.includes(c?.id)||typeof c.correct!=='boolean')||value.correct!==cases.every(c=>c.correct))return {correct:null,reason:'Explicit case outcomes missing or inconsistent'};}
  return value;
 }
 export async function failureChecker(task,runtime=null,guard={}){
@@ -74,7 +75,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    const left=input.remainingSeconds-(performance.now()-start)/1000;assert(left>0,'Qualification elapsed allocation exhausted');
    const rows=await verify(root,slot,task,entries,Math.min(left,entries.length*300),input.signal,input.family.id);assert.equal(rows.length,entries.length,'Trusted control rows missing');
    for(const row of rows){
-    const value=failureReceipt(row);if(typeof value.correct!=='boolean')throw Error(value.evidence?.reason??value.reason??'Control infrastructure failure');
+    const value=failureReceipt(row,task);if(typeof value.correct!=='boolean')throw Error(value.evidence?.reason??value.reason??'Control infrastructure failure');
     if(value.correct)assert(task.caseIds.every(id=>value.evidence.checkedCases?.includes(id)),'Reference receipt omits frozen cases');
     if(row.key==='reference')referencePassed&&=value.correct;else negativeFailed&&=!value.correct&&(task.id!==input.family.development.id||sameMechanism(value,input.family));
    }await save(join(root,'qualification.json'),{referencePassed,negativeFailed,rows});controls.push({task:task.id,path:join(root,'qualification.json')});
@@ -90,15 +91,15 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    await mkdir(join(publicRoot,'micro','frozen'),{recursive:true});await writeFile(join(publicRoot,'micro','frozen',input.task.id+'.py'),frozen.publicChecker);
    await save(join(input.directory,'adapter.json'),{publicRoot,privateRoot,cwd});host=await target(publicRoot,slot,'public',frozen.sha256,input.signal);
    const profile=skillProfile(config.actor),hiddenPaths=[privateDirectory,publicDirectory,...hiddenDirectories,...(profile.credentials_file?[dirname(profile.credentials_file)]:[])];
-   const actor=await host.sample({cwd,sessionDirectory,profile,guidance:input.guidance,prompt:input.task.prompt+'\nUse native local file/Bash tools for edits and rsi_target for device commands. Public check: python3 public_verify.py .',seconds:input.actorSeconds??180,signal:input.signal,sampleSignal:input.signal,sampleStopSignal:stopSignal,knowledge,localFilesystemSandbox:{hiddenPaths}});
+   const actor=await host.sample({cwd,sessionDirectory,profile,guidance:input.guidance,prompt:input.task.prompt+'\nUse native local file/Bash tools for edits and rsi_target for device commands. Public check: python3 public_verify.py .',actorBash:'local',seconds:input.actorSeconds??180,signal:input.signal,sampleSignal:input.signal,sampleStopSignal:stopSignal,knowledge,localFilesystemSandbox:{hiddenPaths}});
    assert(await host.sampleSettled({cwd})&&await closed(publicRoot),'Actor custody remains unresolved');
    if(actor.session){const contamination=kdbContamination(await readFile(actor.session,'utf8'));if(contamination)return contamination;}
    if(actor.error&&!actor.timedOut)return {infrastructure:true,correct:null,reason:'Native session failed: '+actor.error};
    const files={};async function gather(path,prefix=''){for(const entry of await readdir(path,{withFileTypes:true})){if(entry.name.startsWith('.')||['__pycache__','node_modules'].includes(entry.name))continue;const name=prefix+entry.name;if(entry.isDirectory())await gather(join(path,entry.name),name+'/');else if(entry.isFile()&&entry.name!=='public_verify.py'&&(Object.hasOwn(input.task.files,name)||/\.(py|c|cc|cpp|cxx|cce|h|hpp|inc|cmake|sh|json|md)$/.test(name)||['Makefile','CMakeLists.txt'].includes(name))){assert((await stat(join(path,entry.name))).size<=16*1048576,'Source artifact too large');files[name]=await readFile(join(path,entry.name),'utf8');}}}await gather(cwd);assert(files['kernel.py'],'Candidate kernel missing');
    const protectedNames=[...new Set([...Object.keys(input.task.protectedFiles??{}),...['CONTRACT.md','WORKLOAD.md','case.json','cases.json'].filter(n=>Object.hasOwn(input.task.files,n))])];const unchanged=protectedNames.every(name=>files[name]===input.task.files[name])&&(await readFile(join(cwd,'public_verify.py'),'utf8'))===frozen.publicChecker;
-   const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],input.verificationSeconds??300,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row);
+   const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],input.verificationSeconds??300,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row,input.task);
    await save(join(input.directory,'verification.json'),row);if(typeof value.correct!=='boolean')return {infrastructure:true,correct:null,reason:value.evidence?.reason??value.reason??'Verification unavailable'};
-   const correct=value.correct&&unchanged,result={correct,mechanismMatch:!correct&&unchanged&&sameMechanism(value,{mechanism:mechanisms[input.familyId]}),caseResults:input.task.caseIds.map(id=>({id,correct:correct||unchanged&&value.evidence.checkedCases?.includes(id)===true})),sourceSha256:hash(row.sourceFilesSha256),artifacts:[{path:join(input.directory,'verification.json')},...(actor.session?[{path:actor.session}]:[])],handles:[row.handle],actorTimedOut:actor.timedOut,failure:correct?null:unchanged?value.evidence:{phase:'protected-input',reason:'Protected actor input changed'}};
+   const correct=value.correct&&unchanged,result={correct,mechanismMatch:!correct&&unchanged&&sameMechanism(value,{mechanism:mechanisms[input.familyId]}),caseResults:value.evidence.caseResults.map(c=>({...c,correct:unchanged&&c.correct})),sourceSha256:hash(row.sourceFilesSha256),artifacts:[{path:join(input.directory,'verification.json')},...(actor.session?[{path:actor.session}]:[])],handles:[row.handle],actorTimedOut:actor.timedOut,failure:correct?null:unchanged?value.evidence:{phase:'protected-input',reason:'Protected actor input changed'}};
    if(value.correct)assert(input.task.caseIds.every(id=>value.evidence.checkedCases?.includes(id)),'Successful receipt omits frozen cases');
    await save(join(input.directory,'source-manifest.json'),{files:row.sourceFilesSha256,cwd});await save(join(input.directory,'operation-result.json'),result);return result;
   }catch(error){return {infrastructure:true,correct:null,reason:error.message,handle:error.handle??null};}
