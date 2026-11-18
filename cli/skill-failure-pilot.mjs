@@ -7,7 +7,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const load=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;return null;}};
 const save=async(path,value)=>{const temporary=path+'.'+randomUUID()+'.tmp';await writeFile(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);};
-const slug=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]+$/.test(value);
+const slug=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]+$/.test(value)&&!value.includes('--');
 const nonempty=value=>typeof value==='string'&&value.trim();
 const positive=value=>Number.isFinite(value)&&value>0;
 const clone=value=>structuredClone(value);
@@ -91,7 +91,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    try{const answer=await fn({...clone(input),directory:op.directory,remainingSeconds:available,signal:bounded});
     if(bounded.aborted||(now()-working.get(id).at)/1000>available||remaining()<=0){op.result={infrastructure:true,correct:null,reason:'Operation elapsed allocation exhausted before result admission'};op.status='complete';throw Error('Operation elapsed allocation exhausted');}
     op.result=clone(answer);op.status='complete';return clone(answer);}
-   finally{const start=working.get(id);op.elapsedSeconds=start.prior+Math.max(0,now()-start.at)/1000;working.delete(id);if(op.status==='complete')delete op.runningAt;await persist();}
+   finally{const start=working.get(id);op.elapsedSeconds=start.prior+Math.max(0,now()-start.at)/1000;working.delete(id);if(op.status==='complete')delete op.runningAt;else op.runningAt=wall();await persist();}
   };
   const trials=async(phase,family,task,arms)=>{
    const cells=Array.from({length:5},(_,repetition)=>arms.map((_,offset)=>arms[(offset+repetition)%arms.length]).map(arm=>({arm,repetition}))).flat();

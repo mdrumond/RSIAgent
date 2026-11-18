@@ -158,3 +158,24 @@ test('denying a new full grant does not cancel other already admitted trials',as
  assert.equal(report.status,'inconclusive');assert.equal(calls,2);
  const trials=Object.values(report.operations).filter(op=>op.kind==='trial');assert.equal(trials.length,2);assert(trials.every(op=>op.status==='complete'&&op.result.correct===false));
 });
+
+
+test('immediate settlement does not charge an interrupted interval twice',async t=>{
+ const f=await fixture(t);let clock=0,wall=10000;
+ const options={...f.options,concurrency:1};
+ const first=await runFailurePilot(options,{...f.ops,now:()=>clock,wallNow:()=>wall,trial:async()=>{clock+=6000;wall+=6000;throw Error('Disconnected');}});
+ const pending=Object.values(first.operations).find(op=>op.status==='running');assert.equal(pending.elapsedSeconds,6);
+ const resumed=await runFailurePilot(options,{...f.ops,now:()=>clock,wallNow:()=>wall,settle:async()=>({closed:true,result:result(false)})});
+ assert.equal(resumed.status,'complete');assert.equal(resumed.operations[pending.id].elapsedSeconds,6);assert.equal(resumed.elapsedSeconds,6);
+});
+test('operation delimiter in family or task IDs is rejected before any dispatch',async t=>{
+ for(const field of ['family','development','transfer']){
+  const f=await fixture(t);if(field==='family')f.manifest.families[0].id='first--second';else if(field==='development')f.manifest.families[0].development.id='development--baseline';else f.manifest.families[0].transfer[0].id='transfer--baseline';
+  let dispatched=0;await assert.rejects(runFailurePilot(f.options,{qualify:async()=>{dispatched++;},trial:async()=>{dispatched++;},design:async()=>{dispatched++;}}),/Unique/);assert.equal(dispatched,0);
+ }
+});
+test('candidate IDs containing the operation delimiter never reach development trials',async t=>{
+ const f=await fixture(t);let laterTrials=0;
+ const report=await runFailurePilot(f.options,{...f.ops,design:async()=>[candidate('principle--a'),...rows.slice(1)],trial:async input=>{if(input.phase!=='screen')laterTrials++;return result(false);}});
+ assert.equal(report.status,'inconclusive');assert.match(report.reason,/candidate IDs/);assert.equal(laterTrials,0);assert.equal(report.candidates,null);
+});
