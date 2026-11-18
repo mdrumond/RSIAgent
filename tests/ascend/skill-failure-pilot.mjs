@@ -125,3 +125,9 @@ test('an incomplete owner record is retained for settlement rather than overwrit
  const f=await fixture(t);await writeFile(join(f.directory,'pilot.lock'),'{');
  const report=await runFailurePilot(f.options,f.ops);assert.equal(report.status,'needs-settlement');assert.equal(await readFile(join(f.directory,'pilot.lock'),'utf8'),'{');assert.equal(f.calls.length,0);
 });
+
+test('qualification work already performed consumes the original pilot allocation',async t=>{
+ const f=await fixture(t);let calls=0;
+ const report=await runFailurePilot({...f.options,seconds:120,initialElapsedSeconds:120},{qualify:async()=>{calls++;},trial:f.ops.trial,design:f.ops.design});
+ assert.equal(report.status,'inconclusive');assert.equal(calls,0);assert(report.elapsedSeconds>=120);
+});

@@ -44,9 +44,9 @@ export function pilotWinner(results,rows){
  return rows.filter(c=>passes(results[c.id])>=passes(baseline)+2&&!controlRegression(baseline,results[c.id])).sort((a,b)=>passes(results[b.id])-passes(results[a.id])||a.text.length-b.text.length||a.id.localeCompare(b.id))[0]??null;
 }
 /** Five repetitions are a frozen workload, never a renewed elapsed allowance. */
-export async function runFailurePilot({directory,manifest,seconds=7200,trialSeconds=180,concurrency=4,signal},dependencies){
+export async function runFailurePilot({directory,manifest,seconds=7200,trialSeconds=180,concurrency=4,initialElapsedSeconds=0,signal},dependencies){
  manifest=clone(validatePilotManifest(manifest));
- if(!positive(seconds)||!positive(trialSeconds)||!Number.isInteger(concurrency)||concurrency<1||concurrency>4||!['qualify','trial','design'].every(k=>typeof dependencies?.[k]==='function'))throw Error('Positive elapsed allocations, concurrency1..4 and trusted adapters required');
+ if(!positive(seconds)||!positive(trialSeconds)||!Number.isFinite(initialElapsedSeconds)||initialElapsedSeconds<0||initialElapsedSeconds>seconds||!Number.isInteger(concurrency)||concurrency<1||concurrency>4||!['qualify','trial','design'].every(k=>typeof dependencies?.[k]==='function'))throw Error('Positive elapsed allocations, concurrency1..4 and trusted adapters required');
  await mkdir(directory,{recursive:true});
  const owner=await processIdentity(),lock=join(directory,'pilot.lock');let handle;
  try{handle=await open(lock,'wx');}catch(error){
@@ -57,7 +57,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
  }
  await handle.writeFile(JSON.stringify(owner));await handle.close();
  const now=dependencies.now??(()=>performance.now()),wall=dependencies.wallNow??Date.now,file=join(directory,'pilot.json');let state,timer,readOnly=false,finalised=false,writes=Promise.resolve(),last=now();
- const identity=digest({manifest,seconds,trialSeconds,concurrency}),end=new AbortController(),active=signal?AbortSignal.any([signal,end.signal]):end.signal;
+ const identity=digest({manifest,seconds,trialSeconds,concurrency,initialElapsedSeconds}),end=new AbortController(),active=signal?AbortSignal.any([signal,end.signal]):end.signal;
  const working=new Map();
  const charge=()=>{const current=now();state.elapsedSeconds+=Math.max(0,current-last)/1000;last=current;state.runningAt=wall();for(const [id,start]of working){const op=state.operations[id];op.elapsedSeconds=start.prior+Math.max(0,current-start.at)/1000;op.runningAt=wall();}};
  const persist=()=>{charge();const snapshot=clone(state);writes=writes.then(()=>save(file,snapshot));return writes;};
@@ -68,7 +68,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   state=await load(file);
   if(state&&state.identity!==identity){readOnly=true;throw Error('Frozen pilot manifest or allocations changed');}
   if(state?.status==='complete'){readOnly=true;return clone(state);}
-  if(!state){state={format:1,identity,status:'running',elapsedSeconds:0,operations:{},qualifications:{},screens:{},candidates:null,winner:null,development:{},confirmation:{}};await save(join(directory,'manifest.json'),manifest);}
+  if(!state){state={format:1,identity,status:'running',promising:false,elapsedSeconds:initialElapsedSeconds,operations:{},qualifications:{},screens:{},candidates:null,winner:null,development:{},confirmation:{}};await save(join(directory,'manifest.json'),manifest);}
   else if(state.runningAt!==undefined)state.elapsedSeconds+=Math.max(0,wall()-state.runningAt)/1000;
   last=now();
   for(const op of Object.values(state.operations).filter(op=>op.status==='running')){
