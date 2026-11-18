@@ -7,7 +7,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const load=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;return null;}};
 const save=async(path,value)=>{const temporary=path+'.'+randomUUID()+'.tmp';await writeFile(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);};
-const slug=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]+$/.test(value)&&!value.includes('--');
+const slug=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]+$/.test(value)&&!value.includes('--')&&!value.startsWith('-')&&!value.endsWith('-');
 const nonempty=value=>typeof value==='string'&&value.trim();
 const positive=value=>Number.isFinite(value)&&value>0;
 const clone=value=>structuredClone(value);

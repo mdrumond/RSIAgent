@@ -169,8 +169,8 @@ test('immediate settlement does not charge an interrupted interval twice',async 
  assert.equal(resumed.status,'complete');assert.equal(resumed.operations[pending.id].elapsedSeconds,6);assert.equal(resumed.elapsedSeconds,6);
 });
 test('operation delimiter in family or task IDs is rejected before any dispatch',async t=>{
- for(const field of ['family','development','transfer']){
-  const f=await fixture(t);if(field==='family')f.manifest.families[0].id='first--second';else if(field==='development')f.manifest.families[0].development.id='development--baseline';else f.manifest.families[0].transfer[0].id='transfer--baseline';
+ for(const invalidId of ['first--second','first-','-first'])for(const field of ['family','development','transfer']){
+  const f=await fixture(t);if(field==='family')f.manifest.families[0].id=invalidId;else if(field==='development')f.manifest.families[0].development.id=invalidId;else f.manifest.families[0].transfer[0].id=invalidId;
   let dispatched=0;await assert.rejects(runFailurePilot(f.options,{qualify:async()=>{dispatched++;},trial:async()=>{dispatched++;},design:async()=>{dispatched++;}}),/Unique/);assert.equal(dispatched,0);
  }
 });
@@ -178,4 +178,8 @@ test('candidate IDs containing the operation delimiter never reach development t
  const f=await fixture(t);let laterTrials=0;
  const report=await runFailurePilot(f.options,{...f.ops,design:async()=>[candidate('principle--a'),...rows.slice(1)],trial:async input=>{if(input.phase!=='screen')laterTrials++;return result(false);}});
  assert.equal(report.status,'inconclusive');assert.match(report.reason,/candidate IDs/);assert.equal(laterTrials,0);assert.equal(report.candidates,null);
+});
+
+test('candidate boundary hyphens cannot alias composite operation IDs',async t=>{
+ for(const id of ['principle-','-principle']){const f=await fixture(t);let later=0;const report=await runFailurePilot(f.options,{...f.ops,design:async()=>[candidate(id),...rows.slice(1)],trial:async input=>{if(input.phase!=='screen')later++;return result(false);}});assert.equal(report.status,'inconclusive');assert.equal(later,0);}
 });
