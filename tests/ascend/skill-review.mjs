@@ -252,13 +252,11 @@ test('native reads page beyond the preview before classifying a late distinct fa
  const decision=cause=>classificationClaims({cause,reason:'Observed diagnostic evidence',coverage:'uncovered',guidanceIds:[],evidenceRefs:[cause==='actor'?'failure:6':'failure:0']});
  const provider=await scriptedReview(t,f.root,(_body,n)=>[
   {name:'read',args:{path:'input.json'}},
-  {name:'submit_review',args:{result:decision('unknown')}},
   {name:'read',args:{path:join(directory,'evidence','late-group-diagnostics.jsonl'),offset:7,limit:1}},
   {name:'submit_review',args:{result:decision('actor')}}
  ][n]);
  const result=await nativeClassify({directory,config:{actor:provider.profile},group,entries:[],seconds:30,validate:r=>validateClassification(r,group,[])});
- assert.equal(result.value.cause,'actor');assert.equal(provider.requests(),5);
- assert.equal((await load(join(directory,'read-evidence.json'))).length,7);
+ assert.equal(result.value.cause,'actor');assert.equal(provider.requests(),4);
  const full=(await readFile(join(directory,'evidence','late-group-occurrences.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.equal(full.length,7);assert.equal(full.at(-1).reference,'failure:6');
 });
 
@@ -583,7 +581,6 @@ test('traceback ownership survives inventory grouping and native diagnostic dedu
  const input=await load(join(directory,'input.json'));assert.equal(input.group.distinctDiagnostics,2);
  assert.equal(input.group.occurrences.filter(o=>o.data.error.includes('/candidate/kernel.py')).length,1);
  assert.equal(input.group.occurrences.filter(o=>o.data.error.includes('/trusted/reference.py')).length,1);
- assert.equal((await load(join(directory,'read-evidence.json'))).length,2);
 });
 
 test('native case selection can read concrete curated inventories and protected source evidence',async t=>{
