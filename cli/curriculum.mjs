@@ -7,7 +7,7 @@ import { modelFromProfile } from '../controller/model.mjs';
 import {CampaignStorage} from '../controller/storage.mjs';
 import {State} from '../controller/state.mjs';
 import {projectSummary as buildProjectSummary,validateClaims,proofInstructions} from './project-summary.mjs';
-import {projectBundle,validateBundle} from './project-bundle.mjs';
+import {projectBundle,validateBundle,bundleHashes} from './project-bundle.mjs';
 import {createLocalExecutionOperations} from '../integrations/environments/local-bash.mjs';
 
 // Page telemetry without retaining complete event or native Pi history. The first
@@ -180,30 +180,36 @@ export async function investigate({config,job,base,path,state,bridge,signal}) {
     `Repeated failure evidence: ${JSON.stringify(job.failure_pattern??null)}\n`+
     `Attempt diagnostics: ${JSON.stringify(diagnosticContext(state,job.origin_attempt,20))}\n`+
     `Read the recorded native session and diagnostic evidence files before proposing an investigation.\n`+
-    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation and both positive (good) and negative KDB evidence with investigation_knowledge before submitting. Choose a discriminating control and observable outcome that separates competing explanations, rather than retrying the full goal. Preserve the original project and verifier. Submit the investigation goal, question, verifier filename and optional verifier_args array. Create CPU-only positive and negative fixture directories as direct siblings of ./source; submit their names as controls. The exact source-relative verifier command must exit 0 on the positive fixture and 1 on every negative fixture. Read candidate inputs from the working directory so this same command checks each fixture and the actor source. Negative results are useful; do not promise the original target will pass.`,
+    `Create ONE smaller Python investigation about a specific missing fact, with source in ./source and an independent verifier outside ./source. Read relevant documentation and both positive (good) and negative KDB evidence with investigation_knowledge before submitting. Choose a discriminating control and observable outcome that separates competing explanations, rather than retrying the full goal. Preserve the original project and verifier. Submit the investigation goal, question, verifier filename and optional verifier_args array. Declare every additional trusted verifier helper or data file in verifier_files, outside ./source; resolve these dependencies relative to the verifier file. Create CPU-only positive and negative fixture directories as direct siblings of ./source; submit their names as controls. The exact source-relative verifier command must exit 0 on the positive fixture and 1 on every negative fixture. Read candidate inputs from the working directory so this same command checks each fixture and the actor source. Negative results are useful; do not promise the original target will pass.`,
     tool:[knowledgeTool,{name:'submit_investigation',label:'Submit investigation',description:'Declare the smaller investigation after creating its source and independent verifier.',
       parameters:Type.Object({goal:Type.String({minLength:1}),question:Type.String({minLength:1}),verifier:Type.String({minLength:1}),
         verifier_args:Type.Optional(Type.Array(Type.String())),
+        verifier_files:Type.Optional(Type.Array(Type.String({minLength:1}),{description:'Additional trusted verifier helper/data files outside source, relative to this investigation directory.'})),
         controls:Type.Object({positive:Type.String({minLength:1}),negative:Type.Array(Type.String({minLength:1}),{minItems:1,maxItems:8})})}),
       execute:async(_id,args,active,_update,_ctx,{remainingSeconds})=>{
         const verifier=await artifactFile(root,args.verifier,source);
+        const helpers=await Promise.all((args.verifier_files??[]).map(name=>artifactFile(root,name,source)));
         if(!retrieved.has('good')||!retrieved.has('negative'))throw new Error('Retrieve both good and negative KDB evidence before submitting');
         const fixtures=[args.controls.positive,...args.controls.negative].map(name=>resolve(root,name));
         if(fixtures.some(directory=>dirname(directory)!==root||directory===source))
           throw new Error('Investigation controls must be direct sibling directories of source');
         const command=investigationCommand(source,verifier,args.verifier_args);
-        const trusted=await projectBundle({source,reference:fixtures[0],negatives:fixtures.slice(1),files:[verifier]},
+        const trusted=await projectBundle({source,reference:fixtures[0],negatives:fixtures.slice(1),files:[...new Set([verifier,...helpers])]},
           command,remainingSeconds(),root);
-        await validateBundle({source,...trusted,verifier:{files:trusted.files}},path,
+        const hashes=await bundleHashes(trusted.files);
+        await validateBundle({source,...trusted,verifier:{files:trusted.files,hashes}},path,
           {localExecution:config.local_execution,budget:{signal:active??signal??new AbortController().signal,remaining:remainingSeconds}});
-        const validated={...args,verifier_command:command};
+        const validated={...args,verifier_command:command,verifier_files:trusted.files.map(file=>relative(root,file)),
+          verifier_hashes:Object.fromEntries(Object.entries(hashes).map(([file,hash])=>[relative(root,file),hash]))};
         await state.event(job.attempt.id,'curriculum-proposal',{proposal:validated});
         proposal=validated;return reply();
       }}]});
   if(!proposal)throw new Error('Curriculum did not submit an investigation');
   const verifier=await artifactFile(root,proposal.verifier,source);
+  const files=[...new Set([verifier,...await Promise.all((proposal.verifier_files??[]).map(name=>artifactFile(root,name,source)))])];
+  const hashes=proposal.verifier_hashes&&Object.fromEntries(Object.entries(proposal.verifier_hashes).map(([file,hash])=>[resolve(root,file),hash]));
   return normalizeInvestigationProject({...base,goal:`${proposal.goal}\nInvestigate: ${proposal.question}`,source,
-    actor_seconds:job.actor_seconds,verifier:{files:[verifier],command:proposal.verifier_command??investigationCommand(source,verifier)}},path);
+    actor_seconds:job.actor_seconds,verifier:{files,...(hashes?{hashes}:{}),command:proposal.verifier_command??investigationCommand(source,verifier)}},path);
 }
 
 export async function summarize({config,job,path,state,bridge,passed,signal,projectSummary}) {
