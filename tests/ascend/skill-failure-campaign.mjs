@@ -113,3 +113,20 @@ test('unresolved submission reference execution aborts isolation and retains cus
  assert.equal(f.backlog.run(f.item.id).checkpoint.unresolved,true);
  assert.equal(f.calls.length,0);
 });
+
+for(const boundary of ['review profile','memory attention'])test('resume rejects changed '+boundary,async t=>{
+ const f=await fixture(t);
+ f.config.actor={model:'actor'};
+ f.config.skill_writer_actor={model:'review-a'};
+ f.memory.knowledge.attentionRevision=1;
+ await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+ let evaluations=0;
+ const ops={...f.ops,model:async profile=>profile.model,pilot:async()=>{evaluations++;throw Error('Retained interruption');}};
+ await assert.rejects(runCampaignFailureStep(f.config,f.values,ops),/Retained interruption/);
+ if(boundary==='review profile'){
+  f.config.skill_writer_actor={model:'review-b'};
+  await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+ }else f.memory.knowledge.attentionRevision=2;
+ await assert.rejects(runCampaignFailureStep(f.config,f.values,ops),/Frozen experiment baseline, model, machinery or memory changed/);
+ assert.equal(evaluations,1);
+});
