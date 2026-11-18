@@ -20,7 +20,7 @@ export function failureReceipt(row,task){
  let value;try{value=JSON.parse(row.output.trim().split('\n').at(-1));}catch{return {correct:null,reason:'Trusted receipt missing'};}
  if(value.kernelSha256!==row.sourceFilesSha256?.['kernel.py']||typeof value.evidence!=='object'||!value.evidence)return {correct:null,reason:'Trusted source identity or evidence mismatch'};
  if(typeof value.correct==='boolean'&&value.evidence.processGuard?.allChildrenReaped!==true)return {correct:null,reason:'Trusted process closure missing'};
- if(task&&typeof value.correct==='boolean'){const cases=value.evidence.caseResults,ids=task.caseIds;if(!Array.isArray(cases)||cases.length!==ids.length||new Set(cases.map(c=>c?.id)).size!==ids.length||cases.some(c=>!ids.includes(c?.id)||typeof c.correct!=='boolean')||value.correct!==cases.every(c=>c.correct))return {correct:null,reason:'Explicit case outcomes missing or inconsistent'};}
+ if(task&&typeof value.correct==='boolean'){const cases=value.evidence.caseResults,ids=task.caseIds;if(!Array.isArray(cases)||cases.length!==ids.length||new Set(cases.map(c=>c?.id)).size!==ids.length||cases.some(c=>!ids.includes(c?.id)||typeof c.correct!=='boolean')||value.correct!==cases.every(c=>c.correct))return {correct:null,reason:'Explicit case outcomes missing or inconsistent',evidence:value.evidence};}
  return value;
 }
 export async function failureChecker(task,runtime=null,guard={}){
@@ -66,6 +66,23 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   const root=join(directory,'identity'),host=await target(root,slots[0],'identity',hash(config.environment.options),work),actual=await host.runtimeIdentity({directory:root,seconds,signal:work,sampleStopSignal:stopSignal});
   assert(await closed(root),'Runtime probe custody remains unresolved');work?.throwIfAborted();if(runtime)assert.deepEqual(actual,runtime,'Qualified runtime changed');else{runtime=actual;await save(join(directory,'runtime-identity.json'),runtime);}return runtime;
  };
+ const checkReferences=async input=>{
+  input.signal?.throwIfAborted();signal?.throwIfAborted();assert(Number.isFinite(input.seconds)&&input.seconds>0,'Positive reference allowance required');assert(config.target==='cpu'||runtime,'Identify target before references');
+  const slot=free.pop();assert(slot,'No reference slot');const roots=[],started=performance.now(),diagnostics=[];
+  try{for(const task of [input.family.development,...input.family.transfer]){
+   input.signal?.throwIfAborted();signal?.throwIfAborted();const fingerprint=hash({family:input.family.id,task,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8')}),root=join(input.directory,'references',fingerprint);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
+   const left=input.seconds-(performance.now()-started)/1000;assert(left>0,'Reference elapsed allocation exhausted');let rows;
+   try{rows=await verify(root,slot,task,[{key:'reference',files:task.controls.reference.files}],Math.min(300,left),input.signal,'reference-'+fingerprint);}
+   catch(error){await save(join(root,'reference.json'),{task:task.id,error:{message:error.message,code:error.code??null}});throw error;}
+   await save(join(root,'reference.json'),{task:task.id,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
+   const diagnostic={task:task.id,correct:value.correct,reason:value.reason??value.evidence?.reason??null,error:String(row.error??'').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
+   if(value.correct!==true||!task.caseIds.every(id=>value.evidence.checkedCases?.includes(id))){
+    const error=Error('Reference '+task.id+' rejected: '+JSON.stringify(diagnostic));
+    if(row.sourceFilesMatch===true&&guard?.allChildrenReaped===true&&guard.reason==null&&!input.signal?.aborted&&!signal?.aborted)error.code='FAILURE_REFERENCE_REJECTED';throw error;
+   }
+  }return {checked:true,references:diagnostics};
+  }finally{if((await Promise.all(roots.map(closed))).every(Boolean))free.push(slot);}
+ };
  const qualify=async input=>{
   input.signal?.throwIfAborted();signal?.throwIfAborted();
   assert(config.target==='cpu'||runtime,'Identify target before qualification');const slot=free.pop();assert(slot,'No qualification slot');const roots=[];let referencePassed=true,negativeFailed=true;
@@ -106,6 +123,6 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   finally{if(await closed(publicRoot)&&await closed(privateRoot))free.push(slot);}
  };
  const settle=async op=>{const adapter=await read(join(op.directory,'adapter.json'));if(!adapter)return {closed:false};if(!(await Promise.all((adapter.qualificationRoots??[adapter.publicRoot,adapter.privateRoot]).map(closed))).every(Boolean))return {closed:false};const result=await read(join(op.directory,'operation-result.json')),manifest=await read(join(op.directory,'source-manifest.json'));if(result&&manifest)for(const [name,sha]of Object.entries(manifest.files))assert.equal(hash(await readFile(inside(manifest.cwd,name),'utf8')),sha,'Recovered source changed');return {closed:true,...(result?{result}:{})};};
- return {identify,qualify,trial,settle,close:async()=>{await writes;return (await settleFailureRuntime({directory,config,signal:stopSignal},dependencies)).closed;}};
+ return {identify,checkReferences,qualify,trial,settle,close:async()=>{await writes;return (await settleFailureRuntime({directory,config,signal:stopSignal},dependencies)).closed;}};
 }
 function sameMechanism(value,family){return value.evidence?.phase===family.mechanism?.phase&&value.evidence?.type===family.mechanism?.type&&!!family.mechanism;}
