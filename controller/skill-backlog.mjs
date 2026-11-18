@@ -14,7 +14,7 @@ const analysisScopeSql=db=>{
  return `(f.id IN (SELECT value FROM json_each('${ids}')) OR EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND (${fresh}${newScopes?' OR '+newScopes:''})))`;
 };
 
-const statuses=new Set(['queued','running','needs-review','learning','user-required',...terminal]);
+const statuses=new Set(['queued','running','needs-review','learning','user-required','deferred',...terminal]);
 const semantic=(value,evidence=false)=>{
  if(Array.isArray(value)){const rows=value.map(v=>semantic(v,evidence));return evidence?[...new Map(rows.map(v=>[JSON.stringify(v),v])).entries()].sort(([a],[b])=>a.localeCompare(b)).map(([,v])=>v):rows;}
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).filter(([k])=>
