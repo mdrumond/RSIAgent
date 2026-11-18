@@ -45,11 +45,11 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   const {positionals,values}=parseArgs({args:argv,allowPositionals:true,options:{
     ...storageOptions,instance:{type:'string'},config:{type:'string'},baseline:{type:'string'},skills:{type:'string'},
     repository:{type:'string'},project:{type:'string'},mode:{type:'string'},port:{type:'string'},request:{type:'string'},
-    concurrency:{type:'string'},'memory-pause-token':{type:'string'},detach:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
+    concurrency:{type:'string'},'memory-pause-token':{type:'string'},detach:{type:'boolean'},once:{type:'boolean'},'no-recovery':{type:'boolean'},help:{type:'boolean'}}});
   const [command,arg]=positionals;
   const root=resolve(values.instance??(command==='storage'?'.':arg)??'.');
   const operation=async()=>{
-  if (values.help || !command) return {commands:['bootstrap','bind','upgrade','reconcile-local','failures','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage','skills-review']};
+  if (values.help || !command) return {commands:['bootstrap','bind','upgrade','reconcile-local','failures','status','config','skill','project','wave','campaign','resume','pause','stop','dashboard','kdb','tune','storage','skills-review','skills-ab']};
   const storageAction=command==='storage'?(values.config?JSON.parse(await readFile(values.config,'utf8')):{...values,action:values.action??arg??'inspect'}):null;
   if(storageAction?.action==='unpack')return (await import('./storage.mjs')).runStandalone({...storageAction,signal});
   if (command==='bootstrap') {
@@ -59,6 +59,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
   }
   if(command==='skills-review')return (await import('./skill-review.mjs')).runReview({...JSON.parse(await readFile(values.config,'utf8')),signal});
   const config=await readConfig(root);
+  if(command==='skills-ab')return (await import('./skill-failure-worker.mjs')).runFailureCampaign(config,{signal,once:values.once===true});
   if(command==='failures')return (await import('./failures.mjs')).runFailures(config,values.config?JSON.parse(await readFile(values.config,'utf8')):{action:'inspect'});
   if(command==='reconcile-local')return (await import('./local-reboot.mjs')).reconcileLocalReboot(config,
     values.config?{...JSON.parse(await readFile(values.config,'utf8')),...(values.apply?{apply:true}:{})}:null);
@@ -182,7 +183,7 @@ export async function main(argv=process.argv.slice(2),{signal}={}) {
         ?JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
       return {controller,metadataBlocked:(await import('../controller/runtime-status.mjs')).attemptMetadataBlocked(state),
         resourceBlocked:(await import('../controller/runtime-status.mjs')).foregroundResourceBlocked(state),mode:config.mode,tuning:await (await import('../controller/evaluation-round.mjs')).tuningStatus(root),
-        backgroundTuning:config.skills?.background?await (await import('./skill-background.mjs')).backgroundSkillStatus(config):null,
+        backgroundTuning:config.skills?.background||config.skills?.failureFirst?.enabled?await (await import('./skill-background.mjs')).backgroundSkillStatus(config):null,
         progress,skills:await statusSkills(root,config,state),recoveries:statusRecoveries(state),wait:controlValue('wait'),memory:controlValue('memory'),requests:requests(state),projects:state.db.prepare("SELECT id,status,frozen,json_extract(spec,'$.actor_seconds') AS actor_seconds,json_extract(spec,'$.goal') AS goal FROM projects").all().map(project=>config.actor_seconds_by_phase ? {...project,
           effective_actor_seconds:phaseActorSeconds(config,state.project(project.id).spec.phase??
             config.campaign_plan?.find(entry=>entry.id===state.project(project.id).spec.campaign_entry)?.phase??config.mode,

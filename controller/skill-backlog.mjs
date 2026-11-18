@@ -167,11 +167,13 @@ export class SkillBacklog {
  rank(rows){return this.atomic(()=>rows.map(({id,priority,reason})=>{const item=this.get(id);if(!item||!Number.isFinite(priority)||!reason)throw Error('Known hypothesis, priority and reason required');return this.store({...item,priority,reason});}));}
  rebase(id,base){return this.atomic(()=>{const item=this.get(id);if(!item)throw Error('Unknown hypothesis');if(item.base===base)return item;if(item.status==='running')throw Error('Settle running comparison before rebasing');return this.revise(id,{base,status:'needs-review',reason:'Active skill changed; requalification required'});});}
  run(id){const row=this.db.prepare("SELECT * FROM skill_backlog_runs WHERE id=? OR (item_id=? AND status='running') ORDER BY rowid DESC LIMIT 1").get(id,id);return row?{...row,snapshot:parse(row.snapshot),checkpoint:row.checkpoint&&parse(row.checkpoint),result:row.result&&parse(row.result),owner:row.owner&&parse(row.owner)}:null;}
- claim({base,seconds=1800,owner,itemId}={}){return this.atomic(()=>{
-  if(!Number.isFinite(seconds)||seconds<=0||seconds>1800)throw Error('Hypothesis allowance must fit 1800 elapsed seconds');
+ claim({base,seconds=1800,owner,itemId,workflow}={}){return this.atomic(()=>{
+  const maximum=workflow==='failure-first-v1'?7200:1800;
+  if(!Number.isFinite(seconds)||seconds<=0||seconds>maximum)throw Error(`Hypothesis allowance must fit ${maximum} elapsed seconds`);
   let row=this.db.prepare("SELECT id FROM skill_backlog_runs WHERE status='running'").get();
-  if(row){const run=this.run(row.id);if(run.base!==base)throw Error('Settle retained comparison before baseline change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
+  if(row){const run=this.run(row.id);if(run.base!==base||(run.snapshot.workflow==='failure-first-v1')!==(workflow==='failure-first-v1'))throw Error('Settle retained comparison before baseline or workflow change');if(owner!==undefined)this.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(owner),run.id);return {item:this.get(run.item_id),run:this.run(run.id),remaining:Math.max(0,run.seconds-run.elapsed),reused:true};}
   for(const item of itemId?[this.get(itemId)].filter(item=>item?.status==='queued'):this.list({status:'queued',limit:100})){
+   if((item.workflow==='failure-first-v1')!==(workflow==='failure-first-v1'))continue;
    if(!this.db.prepare(`SELECT 1 FROM skill_backlog_items i WHERE id=? AND ${activeItemSql(this.db,'i')}`).get(item.id))continue;
    if(item.base!==base){this.rebase(item.id,base);continue;}
    const completed=this.completed(item);if(completed){this.store({...item,status:completed.status,previousRun:completed.id});continue;}

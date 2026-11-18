@@ -59,6 +59,8 @@ export async function instanceStopped(config) {
 }
 
 export async function operate(command,config,options={}) {
+  if(['wave','resume'].includes(command)&&config.skills?.failureFirst?.enabled&&config.skills.background&&!config.skills.tuningDisabled)
+    throw new Error('Stop the four-device skills-ab worker before resuming foreground work');
   if(config.binding_required&&['wave','resume'].includes(command))throw new Error('Bind the portable campaign before execution');
   if(options.signal?.aborted)throw new Error('Wave interrupted');
   config={...config,mode:options.mode==='revisit'?config.mode:(options.mode??config.mode),
