@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='rsi-failure-oracle-') as temporary:
         path = root / 'runtime_identity.py'; path.write_text(PAYLOAD['runtimeHelper'])
         spec = importlib.util.spec_from_file_location('trusted_identity', path)
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        if module.identity() != PAYLOAD['runtime']:
+        if module.identity(PAYLOAD['runtime'].get('target')) != PAYLOAD['runtime']:
             print(json.dumps({'correct': None, 'kernelSha256': digest, 'evidence': {'reason': 'Qualified runtime identity changed'}})); sys.exit(125)
     if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0: raise RuntimeError('Subreaper unavailable')
     out = pathlib.Path(temporary) / 'stdout'; err = pathlib.Path(temporary) / 'stderr'; out.touch(); err.touch()
