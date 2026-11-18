@@ -22,6 +22,8 @@ test('trusted process guard preserves recorded failure only with source identity
  await writeFile(checker,receiptCode('False','time.sleep(60)').replace("hashlib.sha256(p.read_bytes()).hexdigest()","'wrong'"));assert.equal((await oracleRun(root,checker)).correct,null);
  await writeFile(checker,receiptCode('True').replace("'kernelSha256':hashlib.sha256(p.read_bytes()).hexdigest(),",''));
  const guardBound=await oracleRun(root,checker,{seconds:2});assert.equal(guardBound.correct,true);assert.equal(guardBound.kernelSha256,hash('answer=0\n'));
+ await writeFile(checker,receiptCode('True').replace('hashlib.sha256(p.read_bytes()).hexdigest()','None'));
+ assert.equal((await oracleRun(root,checker,{seconds:2})).kernelSha256,guardBound.kernelSha256);
  await writeFile(checker,receiptCode('True',"p.write_text('changed')").replace("'kernelSha256':hashlib.sha256(p.read_bytes()).hexdigest(),",''));
  assert.equal((await oracleRun(root,checker,{seconds:2})).correct,null);
  await writeFile(checker,"import signal,time,sys,pathlib,json,hashlib\np=pathlib.Path(sys.argv[1])/'kernel.py'\ndef stop(*_):\n print(json.dumps({'correct':False,'kernelSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'evidence':{}}),flush=True);sys.exit(1)\nsignal.signal(signal.SIGTERM,stop);time.sleep(60)\n");assert.equal((await oracleRun(root,checker)).correct,null);

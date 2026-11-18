@@ -81,7 +81,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    try{rows=await verify(root,slot,task,[{key:variant,files}],Math.min(300,left),input.signal,'reference-'+fingerprint);}
    catch(error){await save(join(root,'reference.json'),{task:task.id,error:{message:error.message,code:error.code??null}});throw error;}
    await save(join(root,'reference.json'),{task:task.id,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
-   const diagnostic={task:task.id,variant,correct:value.correct,phase:value.evidence?.phase,type:value.evidence?.type,checkedCases:value.evidence?.checkedCases,reason:value.reason??value.evidence?.reason??null,error:String(row.error??'').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
+   const diagnostic={task:task.id,variant,correct:value.correct,phase:value.evidence?.phase,type:value.evidence?.type,checkedCases:value.evidence?.checkedCases,reason:value.reason??value.evidence?.reason??value.evidence?.message??null,error:[value.error,row.error].filter(Boolean).join('\n').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
    const passed=variant==='starter'
      ? value.correct===false&&sameMechanism(value,input.family)&&value.evidence.caseResults.some(row=>!row.correct&&value.evidence.checkedCases?.includes(row.id))
      : value.correct===true&&task.caseIds.every(id=>value.evidence.checkedCases?.includes(id));
