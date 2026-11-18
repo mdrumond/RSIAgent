@@ -143,7 +143,14 @@ export class SkillBacklog {
  failures({dirty=true,limit=100,offset=0,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} AND ${includeRetired?'1':analysisScopeSql(this.db)} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ? OFFSET ?`).all(limit,offset).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
  get(id){const epoch=this.meta('queue-epoch'),key=epoch&&!id.startsWith('epoch:')?'epoch:'+epoch+':'+id:id;const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,key,key);return row?parse(row.data):null;}
- list({status,limit=100,includeRetired=false}={}){return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${status?'status=?':'1'} AND ${includeRetired?'1':activeItemSql(this.db,'i')} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...(status?[status,limit]:[limit])).map(r=>parse(r.data));}
+ list({status,limit=100,includeRetired=false,workflow,objective}={}){
+  const predicates=[],args=[];
+  if(status){predicates.push('status=?');args.push(status);}
+  if(workflow){predicates.push("json_extract(i.data,'$.workflow')=?");args.push(workflow);}
+  if(objective){predicates.push("json_extract(i.data,'$.objective')=?");args.push(objective);}
+  if(!includeRetired)predicates.push(activeItemSql(this.db,'i'));
+  return this.db.prepare(`SELECT data FROM skill_backlog_items i WHERE ${predicates.join(' AND ')||'1'} ORDER BY priority DESC,created,rowid LIMIT ?`).all(...args,limit).map(r=>parse(r.data));
+ }
  store(item){this.db.prepare('INSERT INTO skill_backlog_items VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,status=excluded.status,priority=excluded.priority')
   .run(item.id,item.key,JSON.stringify(item),item.status,item.priority,item.created);return item;}
  completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}

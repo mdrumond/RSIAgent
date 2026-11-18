@@ -19,7 +19,7 @@ export const failureFirstEnabled=config=>config.skills?.failureFirst?.enabled===
 const open=config=>{const state=new State(join(config.root,'state.sqlite'));return {state,backlog:new SkillBacklog(state,{target:config.target})};};
 const value=(db,key)=>table(db,'control')?JSON.parse(db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
 const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name);
-const eligible=item=>item.workflow==='failure-first-v1'&&item.objective==='correctness';
+const queuedFamily=backlog=>backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:1})[0];
 
 export function failureMemoryGeneration(config,state){
  const cutoff=table(state.db,'events')?state.db.prepare('SELECT max(sequence) n FROM events WHERE attempt IS NOT NULL').get().n:null;
@@ -42,7 +42,7 @@ export async function failureCampaignStatus(config){
    operations:running.map(o=>({id:o.id,elapsedSeconds:o.elapsedSeconds,allocatedSeconds:o.allocatedSeconds})),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||backlog.list({status:'queued'}).some(eligible))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
  }finally{state.close();}
 }
 
@@ -73,17 +73,22 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  try{
   let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
   const existing=backlog.list({status:'running',limit:1})[0];
-  if(!existing&&!backlog.list({status:'queued'}).some(eligible)){
+  if(!existing&&!queuedFamily(backlog)){
    await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
     classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,remainingSeconds),limit:2,signal});
   }
-  const item=existing??backlog.list({status:'queued'}).find(eligible);
+  const item=existing??queuedFamily(backlog);
   if(!item)return {status:'idle',reason:'No eligible correctness family'};
   if(item.objective!=='correctness'||item.proposal?.action==='update')throw Error('Legacy proposal cannot enter failure-first screening');
   const retained=existing&&backlog.run(existing.id);
   if(retained?.checkpoint?.phase==='publish'){
    const saved=await optional(join(retained.checkpoint.directory,'pilot','pilot.json'));
-   const publication=await ops.publish({config,item:retained.snapshot,result:saved,directory:join(retained.checkpoint.directory,'pilot'),signal});
+   const elapsedAtResume=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
+   const remaining=Math.min(retained.seconds-elapsedAtResume,remainingSeconds);
+   const alreadyChanged=(await readConfig(config.root)).skills.activeVersion!==retained.base;
+   if(!alreadyChanged&&remaining<=0)throw Error('Experiment elapsed allowance exhausted before publication recovery');
+   const deadline=alreadyChanged?signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.floor(remaining*1000)))]);
+   const publication=await ops.publish({config,item:retained.snapshot,result:saved,directory:join(retained.checkpoint.directory,'pilot'),signal:deadline,recoverOnly:alreadyChanged});
    if(!publication?.published)throw Error(publication?.reason??'Publication recovery refused');
    const elapsed=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000),status=elapsed<retained.seconds?'accepted':'inconclusive';
    backlog.checkpoint(retained.id,{elapsed,checkpoint:retained.checkpoint});backlog.finish(retained.id,{status,result:{reason:'publication-recovered',published:true,publication}});backlog.meta('failure-first-current',null);
