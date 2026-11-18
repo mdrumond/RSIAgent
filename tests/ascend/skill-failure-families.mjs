@@ -6,6 +6,8 @@ import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {State} from '../../controller/state.mjs';
+import {CampaignStorage} from '../../controller/storage.mjs';
+import {fingerprint} from '../../controller/evidence.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {analyzeBacklog} from '../../cli/skill-backlog-analysis.mjs';
@@ -52,11 +54,11 @@ for(const [name,change]of [['pre-actor failure',f=>f.state.db.prepare('UPDATE at
 test('retained source can be recovered from the exact controller source tree',async t=>{
  const f=await fixture(t),repo=join(f.root,'history');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);execFileSync('git',['-C',repo,'add','kernel.py']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','retained']);const tree=execFileSync('git',['-C',repo,'rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim();
  // A source snapshot must precede the specific failed verifier, not merely name any tree.
- const snap=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),verification=emit(f.state,f.attempt.id,'verification',{actor_elapsed:50,correctness:{passed:false}});const reference='events:'+verification.sequence;f.item.evidence.groups[0].occurrences.push({reference});const provenance={reference,source:{snapshotReference:'events:'+snap.sequence,repository:'history',file:'kernel.py'}};const value=await failureWitness({...f,provenance});assert.equal(value.code,f.code);assert.equal(value.source.tree,tree);
+ const snap=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),verification=emit(f.state,f.attempt.id,'verification',{actor_elapsed:50,correctness:{passed:false,receipt:{kernelSha256:sha(f.code)}}});const reference='events:'+verification.sequence;f.item.evidence.groups[0].occurrences.push({reference});const provenance={reference,source:{snapshotReference:'events:'+snap.sequence,repository:'history',file:'kernel.py'}};const value=await failureWitness({...f,provenance});assert.equal(value.code,f.code);assert.equal(value.source.tree,tree);
  provenance.source.snapshotReference=f.reference;await assert.rejects(failureWitness({...f,provenance}),/snapshot/);
 });
 
-for(const [name,edit]of [['legacy suite',f=>{f.family.format=1;}],['seed-only transfer',f=>{f.family.transfer[0].changeType='seed';}],['private checker leaked into editable files',f=>{f.family.development.files['oracle.py']='dev/private.py';}],['private helper path alias',f=>{f.family.development.files['helper.py']='dev/./helper.py';}],['duplicate transfer adaptation',f=>{f.family.transfer[1].changeType='layout';}],['unexplained replacement starter',f=>{f.files['dev/starter.py']='def run(x): return x\n';}]])test(name+' is rejected before any model evaluation',async t=>{const f=await fixture(t);edit(f);await assert.rejects(loadFailureFamily({file:await f.write(),config:f.config,item:f.item}));});
+for(const [name,edit]of [['legacy suite',f=>{f.family.format=1;}],['seed-only transfer',f=>{f.family.transfer[0].changeType='seed';}],['private checker leaked into editable files',f=>{f.family.development.files['oracle.py']='dev/private.py';}],['public checker helper alias',f=>{f.family.development.checkerFiles={'hidden.py':'dev/./public.py'};}],['private helper path alias',f=>{f.family.development.files['helper.py']='dev/./helper.py';}],['duplicate transfer adaptation',f=>{f.family.transfer[1].changeType='layout';}],['unexplained replacement starter',f=>{f.files['dev/starter.py']='def run(x): return x\n';}]])test(name+' is rejected before any model evaluation',async t=>{const f=await fixture(t);edit(f);await assert.rejects(loadFailureFamily({file:await f.write(),config:f.config,item:f.item}));});
 
 test('native isolation validates its submission, never calls a curriculum, and reuses frozen output',async t=>{
  const f=await fixture(t);let calls=0;const input={...f,directory:join(f.root,'isolated'),seconds:90};
@@ -73,7 +75,7 @@ test('missing evidence is terminal without a speculative proposal; unknown inter
 test('source-history Git metadata is materialized for read-only native research',async t=>{
  const f=await fixture(t),repo=join(f.root,'work');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);execFileSync('git',['-C',repo,'add','kernel.py']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','retained']);const tree=execFileSync('git',['-C',repo,'rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim();
  const history=join(f.root,'source-history/retained');await mkdir(join(f.root,'source-history'));execFileSync('git',['clone','--bare','-q',repo,history]);execFileSync('git',['--git-dir',history,'config','core.bare','false']);
- const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
+ const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
 });
 
@@ -85,4 +87,18 @@ test('isolation checkpoints elapsed work while native research is still running'
  const f=await fixture(t),directory=join(f.root,'checkpoint');let observed;
  const result=await prepareFailureFamily({...f,directory,seconds:5},{session:async()=>{await new Promise(r=>setTimeout(r,1100));observed=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));return {value:{status:'needs-evidence',reason:'Reference source unavailable'}};}});
  assert.equal(observed.running,true);assert(observed.elapsedSeconds>=.9);assert.equal(result.running,false);assert(result.elapsedSeconds>=observed.elapsedSeconds);
+});
+
+
+test('debug edits after a stage snapshot bind only to the source actually verified',async t=>{
+ const f=await fixture(t),repo=join(f.root,'history');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);await mkdir(join(repo,'a'));await writeFile(join(repo,'a/x.txt'),'nested');await writeFile(join(repo,'a.b'),'sibling');await writeFile(join(repo,'payload.dat'),Buffer.from([255,0,1]));execFileSync('git',['-C',repo,'add','.']);const treeA=execFileSync('git',['-C',repo,'write-tree'],{encoding:'utf8'}).trim(),stage=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:treeA});
+ const codeB='def run(x): return x - 2\n';await writeFile(join(repo,'kernel.py'),codeB);execFileSync('git',['-C',repo,'add','kernel.py']);const treeB=execFileSync('git',['-C',repo,'write-tree'],{encoding:'utf8'}).trim();
+ const storage=new CampaignStorage(f.state,f.root);await storage.initialize();storage.iteration(f.attempt.id,{stage:'validation',sourceHash:treeB,reflection:JSON.stringify({tree_oid:treeB})});const iterationId=f.state.db.prepare("SELECT id FROM storage_iterations WHERE attempt=? AND stage='validation'").get(f.attempt.id).id;
+ const data={actor_elapsed:50,fingerprint:await fingerprint(repo),correctness:{passed:false}},event=emit(f.state,f.attempt.id,'verification',data),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];f.item.evidence.groups[0].linkedDiagnostics=[];const spec=JSON.parse(f.state.db.prepare('SELECT spec FROM projects WHERE id=?').get('project').spec);f.state.db.prepare('UPDATE projects SET spec=? WHERE id=?').run(JSON.stringify({...spec,source:repo}),'project');
+ const stale={reference,source:{snapshotReference:'events:'+stage.sequence,repository:'history',file:'kernel.py'}},current={reference,source:{iterationId,repository:'history',file:'kernel.py'}};
+ await assert.rejects(failureWitness({...f,provenance:stale}),/not bound/);const witness=await failureWitness({...f,provenance:current});assert.equal(witness.code,codeB);assert.equal(witness.source.tree,treeB);
+ const rows=await failureSourceInventory({...f,directory:join(f.root,'matching-index')});assert(rows.some(r=>r.source.iterationId===iterationId&&r.sourceSha256===sha(codeB)));assert(!rows.some(r=>r.sourceSha256===sha(f.code)));
+ // A kernel receipt is an alternative exact binding when a full tree fingerprint is absent.
+ delete data.fingerprint;data.correctness.receipt={kernelSha256:sha(codeB)};f.state.db.prepare('UPDATE events SET data=? WHERE sequence=?').run(JSON.stringify(data),event.sequence);await assert.rejects(failureWitness({...f,provenance:stale}),/not bound/);assert.equal((await failureWitness({...f,provenance:current})).code,codeB);
+ delete data.correctness.receipt;f.state.db.prepare('UPDATE events SET data=? WHERE sequence=?').run(JSON.stringify(data),event.sequence);await assert.rejects(failureWitness({...f,provenance:current}),/not bound/);assert.deepEqual(await failureSourceInventory({...f,directory:join(f.root,'unbound-index')}),[]);
 });
