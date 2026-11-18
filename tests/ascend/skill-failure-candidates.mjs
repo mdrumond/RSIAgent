@@ -35,7 +35,7 @@ async function fixture(t){
  };
  const qaAnswer=async input=>{qaCalls.push(input);return {answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text:'Evidence-supported applicability boundary',refs:['events:1']}]))};};
  const qaReview=async()=>({verdict:'approved',reason:'General instruction with a stated boundary'});
- const input={identities:{model:'fixed-model',runtime:'fixed-runtime',memory:'fixed-memory'},family:{id:'retained',development:family().development,evidence:[]},baselineResults:baseline(),directory:join(root,'design'),remainingSeconds:1200};
+ const input={baseline:(await skillInput(directory)).text,identities:{model:'fixed-model',runtime:'fixed-runtime',memory:'fixed-memory'},family:{id:'retained',development:family().development,evidence:[]},baselineResults:baseline(),directory:join(root,'design'),remainingSeconds:1200};
  return {root,config,item,input,calls,qaCalls,deps:{session,qaAnswer,qaReview},peak:()=>peak};
 }
 async function study(t,overrides={}){
@@ -51,6 +51,9 @@ test('baseline gate prevents any instruction inference or candidate creation',as
  const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps);
  await assert.rejects(design({...f.input,baselineResults:Array.from({length:5},()=>result(true))}),/matching failures/);assert.equal(f.calls.length,0);
  await assert.rejects(design({...f.input,baselineResults:[...baseline().slice(1),{infrastructure:true,correct:null,reason:'Unavailable'}]}),/clean baselines/);assert.equal(f.calls.length,0);
+});
+test('different tested baseline refuses inference before any writer starts',async t=>{
+ const f=await fixture(t);await assert.rejects(createFailureDesign({config:f.config,item:f.item},f.deps)({...f.input,baseline:f.input.baseline+'Additional guidance'}),/Tested baseline guidance differs/);assert.equal(f.calls.length,0);assert.equal(f.qaCalls.length,0);assert.deepEqual(await readdir(join(f.root,'skills/versions')),['base']);
 });
 test('three writers run independently, cannot see controls, and freeze exact publishable guidance',async t=>{
  const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps),rows=await design(f.input);
@@ -84,6 +87,23 @@ test('native Pi submission accepts selector-only prose and preserves reviewed gu
  const retrievals=[{entries:[{collection:'memory',chunk_id:'chunk',text:'Successful bounded formulation'}]}];
  f.deps.session=async args=>{const reviewed=await reviewSession({...args,knowledge:false,config:{...args.config,actor:provider.profile,skill_writer_actor:provider.profile},validate:value=>args.validate(value,retrievals)});return {...reviewed,retrievals};};
  const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(rows.length,3);assert.equal(submitted,3);assert.equal(provider.requests(),9);for(const row of rows)assert.equal(row.text,(await skillInput(join(f.root,'skills/versions',row.version))).text);
+});
+test('default native QA envelopes pass five proof-backed answers and review through proposal QA',async t=>{
+ const f=await fixture(t);let answers=0,reviews=0;
+ const provider=await scriptedReview(t,f.root,body=>{
+  const tools=body.messages.filter(message=>message.role==='tool');if(!tools.length)return {name:'read',args:{path:'input.json'}};
+  if(String(tools.at(-1).content).includes('Accepted. Finish'))return null;
+  const first=JSON.parse(tools[0].content),paths=first.groups.flatMap(group=>[group.diagnosticsFile,group.linkedDiagnosticsFile]);
+  const readPaths=body.messages.filter(message=>message.role==='assistant').flatMap(message=>message.tool_calls??[]).filter(call=>call.function.name==='read').map(call=>JSON.parse(call.function.arguments).path);
+  const missing=paths.find(path=>!readPaths.includes(path));if(missing)return {name:'read',args:{path:missing}};
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  const proof={reference:'input:proposal',field:'/reason'},text='Instruction grounded in reproduced baseline failures';let value;
+  if(schema.properties.answers){answers++;value={answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text,refs:['events:1']}])),claims:qaTopics.map(topic=>({path:'answers.'+topic+'.text',kind:'observation',proofs:[proof]}))};}
+  else{reviews++;value={verdict:'approved',reason:text,claims:[{path:'reason',kind:'observation',proofs:[proof]}]};}
+  return {name:'submit_review',args:{result:value}};
+ });
+ const rows=await createFailureDesign({config:f.config,item:f.item,knowledgeConfig:{...f.config,actor:provider.profile,skill_writer_actor:provider.profile}},{session:f.deps.session})(f.input);
+ assert.equal(rows.length,3);assert.equal(answers,3);assert.equal(reviews,3);for(const row of rows){assert.equal(row.qa.verdict,'approved');assert(row.qa.approval);}
 });
 test('memory transport failures exclude even an otherwise supported instruction',async t=>{
  const f=await fixture(t),session=f.deps.session;f.deps.session=async args=>{const value=await session(args),file=join(args.directory,'tainted.jsonl');await mkdir(args.directory,{recursive:true});await writeFile(file,JSON.stringify({message:{role:'toolResult',toolName:'mcp__kdb__search',isError:true,content:[{type:'text',text:'MCP request timed out after 60000ms'}]}})+'\n');return {...value,session:file};};
@@ -144,4 +164,10 @@ test('accepted storage recording happens only after CAS and recovers without rep
  await assert.rejects(publishFailureWinner(input,dependencies),/Storage temporarily/);assert.equal(publicationCalls,1);assert.equal(recordCalls,1);
  const recovered=await publishFailureWinner(input,dependencies);assert.equal(recovered.published,true);assert.equal(recovered.memoryRecorded,true);assert.equal(recordCalls,2);assert.equal(publicationCalls,1);
  await publishFailureWinner(input,dependencies);assert.equal(recordCalls,2);assert.equal(publicationCalls,1);
+});
+
+test('coherently persisted pilot with a different baseline cannot publish',async t=>{
+ const f=await study(t),manifest=JSON.parse(await readFile(join(f.directory,'manifest.json'),'utf8'));manifest.baseline+='Additional untested baseline';await writeFile(join(f.directory,'manifest.json'),JSON.stringify(manifest));
+ const report={...f.report,identity:'coherently-replaced-study'};await writeFile(join(f.directory,'pilot.json'),JSON.stringify(report));let published=0;
+ await assert.rejects(publishFailureWinner({config:f.config,item:f.item,result:report,directory:f.directory},{publish:async()=>{published++;return true;}}),/Tested baseline guidance differs/);assert.equal(published,0);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
