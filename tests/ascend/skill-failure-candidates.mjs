@@ -93,6 +93,22 @@ test('scientific QA rejection is a completed disposition with no repeated infere
  const f=await fixture(t);f.deps.qaReview=async()=>({verdict:'learn',reason:'Evidence does not support a general instruction',learningRequests:[{question:'Need a different observed failure',hypothesis:'Current principle is already known',requiredEvidence:'Independent failure',learningTarget:'device'}]});
  const design=createFailureDesign({config:f.config,item:f.item},f.deps),out=await design(f.input);assert.equal(out.status,'rejected');const requests=f.calls.length;assert.deepEqual(await design(f.input),out);assert.equal(f.calls.length,requests);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
+test('one scientific rejection lets pending approved siblings finish without infrastructure cancellation',async t=>{
+ const f=await fixture(t);let entered=0,completed=0,cancelled=0,ready;const allEntered=new Promise(resolve=>{ready=resolve;});
+ f.deps.qa=async input=>{if(++entered===3)ready();await allEntered;
+  if(input.directory.endsWith('principle-a/qa'))return {verdict:'learn',reason:'Unsupported principle',reasonKind:'scientific'};
+  await new Promise((resolve,reject)=>{const aborted=()=>{cancelled++;reject(new DOMException('Sibling cancelled','AbortError'));};if(input.signal.aborted)return aborted();input.signal.addEventListener('abort',aborted,{once:true});setTimeout(()=>{input.signal.removeEventListener('abort',aborted);resolve();},25);});
+  completed++;return {verdict:'approved',approval:'reviewed',proposal:input.proposal};
+ };
+ const out=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(out.status,'rejected');assert.equal(completed,2);assert.equal(cancelled,0);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
+});
+test('infrastructure cancellation retains the original cause rather than a sibling AbortError',async t=>{
+ const f=await fixture(t);let entered=0,cancelled=0,ready;const allEntered=new Promise(resolve=>{ready=resolve;}),cause=Object.assign(Error('Memory transport disconnected'),{code:'FAILURE_DESIGN_INFRASTRUCTURE'});
+ f.deps.qa=async input=>{if(++entered===3)ready();await allEntered;if(input.directory.endsWith('principle-c/qa'))throw cause;
+  await new Promise((_resolve,reject)=>{const aborted=()=>{cancelled++;reject(new DOMException('Sibling cancelled','AbortError'));};if(input.signal.aborted)aborted();else input.signal.addEventListener('abort',aborted,{once:true});});
+ };
+ await assert.rejects(createFailureDesign({config:f.config,item:f.item},f.deps)(f.input),error=>error===cause);assert.equal(cancelled,2);
+});
 test('tampered reviewed guidance cannot be recovered or published',async t=>{
  const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps),rows=await design(f.input),file=join(f.root,'skills/versions',rows[0].version,'skill-map.json'),map=JSON.parse(await readFile(file));await writeFile(join(f.root,'skills/versions',rows[0].version,map.implementation),'Changed after review');
  await assert.rejects(design(f.input),/changed after review/);

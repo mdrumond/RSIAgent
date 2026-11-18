@@ -70,7 +70,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   // The development descriptor is deliberately projected: controls and private checker paths are not writer input.
   const development=Object.fromEntries(['id','prompt','files','caseIds'].filter(key=>input.family.development[key]!==undefined).map(key=>[key,input.family.development[key]]));
   const proofRecords=input.baselineResults.map((result,index)=>({reference:'baseline-'+index,text:JSON.stringify({correct:result.correct,mechanismMatch:result.mechanismMatch,sourceSha256:result.sourceSha256,failure:result.failure})}));
-  const stop=new AbortController();input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
+  const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=['robust decisions','diagnostic reasoning','implementation complexity'].map(async(perspective,index)=>{try{
    const id='principle-'+String.fromCharCode(97+index),directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
    const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return checkVersion(config,retained.candidate);}
@@ -89,8 +89,8 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal),updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
    const candidate={id,instruction:reviewed.changes[0].text,scope:reviewed.changes[0].scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal:reviewed,qa:{verdict:qa.verdict,approval:qa.approval},evidence:written.value.claims.flatMap(claim=>claim.proofs)};
    await save(candidateFile,{identity,candidate});return candidate;
-  }catch(error){stop.abort(error);throw error;}});
-  const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected'),infrastructure=failures.find(row=>row.reason.code!=='FAILURE_DESIGN_REJECTED');if(infrastructure)throw infrastructure.reason;
+  }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}});
+  const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');if(infrastructureCause)throw infrastructureCause;
   if(failures.length){const result={status:'rejected',reason:failures[0].reason.message};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
   assert(new Set(candidates.map(candidate=>candidate.instruction)).size===3,'Three distinct instruction candidates required');await save(registry,{identity,candidates});return candidates;
  };
