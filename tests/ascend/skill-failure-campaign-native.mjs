@@ -15,7 +15,7 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
   const calls=body.messages.flatMap(m=>m.tool_calls??[]),raw=body.messages.find(m=>m.role==='user').content,text=typeof raw==='string'?raw:raw.map(p=>p.text??'').join('\n');
   const review=body.tools.find(tool=>tool.function.name==='submit_review');
   if(review){
-   const shape=review.function.parameters.properties.result.properties,kind=shape.classifications?'classify':shape.family?'isolate':shape.memoryRefs&&shape.scope?'write':shape.answers?'answer':'review';
+   const schema=review.function.parameters.properties.result,shape=schema.properties??schema.anyOf?.find(arm=>arm.properties?.family)?.properties??{},kind=shape.classifications?'classify':shape.family?'isolate':shape.memoryRefs&&shape.scope?'write':shape.answers?'answer':'review';
    const tools=body.messages.filter(m=>m.role==='tool');
    if(!tools.length){reviewSessions[kind]=(reviewSessions[kind]??0)+1;if(['answer','review'].includes(kind))qaSessions++;return {name:'read',args:{path:'input.json',limit:100}};}
    if(String(tools.at(-1).content).includes('Accepted. Finish'))return null;
@@ -28,14 +28,23 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
    const claim=(path,proof)=>({path,kind:'hypothesis',proofs:[proof]});let value;
    if(kind==='classify')value={classifications:input.groups.map(g=>({groupId:g.id,cause:'actor',bucket:'correctness',reason:'The fixture records an actor correctness failure.',coverage:'uncovered',guidanceIds:[],evidenceRefs:g.occurrences.map(o=>o.reference)})),claims:input.groups.map((g,i)=>claim('classifications.'+i+'.reason',selector(g.occurrences[0].reference)))};
    else if(kind==='isolate'){
-    const attempt=++isolationSubmissions,feedback=String(tools.at(-1).content);
-    if(attempt===2)assert.match(feedback,/SyntaxError/);
-    if(attempt===3)assert.match(feedback,/missing fixture dependency/);
+    const attempt=isolationSubmissions+1;
     assert(attempt<=3);
-    const files={...bundle};
-    if(attempt===1)files['dev/private.py']='Private checker executes the candidate.\n';
-    if(attempt===2)files['dev/private.py']='raise ImportError("missing fixture dependency")\n';
-    value={status:'ready',reason:'A retained failure admits controlled replay fixtures.',family,files,claims:[claim('reason',selector(reference))]};
+    const draft=input.draftDirectory;
+    const writes=calls.filter(c=>c.function.name==='write').map(c=>JSON.parse(c.function.arguments));
+    for(const [name,code] of Object.entries(bundle)){
+     const path=join(draft,name);
+     const content=name==='dev/private.py'&&attempt<3
+      ? (attempt===1?'Private checker executes the candidate.\n':'raise ImportError("missing fixture dependency")\n')
+      : code;
+     if(writes.filter(w=>w.path===path).at(-1)?.content!==content)
+      return {name:'write',args:{path,content}};
+    }
+    const submissions=calls.filter(c=>c.function.name==='submit_review'),previous=tools.find(t=>t.tool_call_id===submissions.at(-1)?.id);
+    if(attempt===2)assert.match(String(previous?.content),/SyntaxError/);
+    if(attempt===3)assert.match(String(previous?.content),/missing fixture dependency/);
+    isolationSubmissions++;
+    value={status:'ready',reason:'A retained failure admits controlled replay fixtures.',family,claims:[claim('reason',selector(reference))]};
    }
    else if(kind==='write'){
     if(!calls.some(c=>c.function.name==='mcp__kdb__search'))return {name:'mcp__kdb__search',args:{query:'kernel answer',limit:3}};

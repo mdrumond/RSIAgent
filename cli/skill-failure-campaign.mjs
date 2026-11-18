@@ -146,11 +146,14 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));
   await openRuntime();
   phase('qualify');
+  const modelIdentities=async current=>({actor:await ops.model(current.actor),review:await ops.model(current.skill_writer_actor??current.actor)});
+  const memoryIdentity={snapshot:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null};
   let manifest=await optional(join(cp.directory,'experiment.json'));
   if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
-   manifest={baseline:baseline.text,identities:{model:await ops.model(config.actor),runtime:identity,memory:memory.knowledge.identity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
+   manifest={baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
    cp.initialElapsedSeconds=(now()-cp.startedAt)/1000;await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
-  if((await readConfig(config.root)).skills.activeVersion!==run.base||manifest.identities.memory!==memory.knowledge.identity||hash(manifest.identities.model)!==hash(await ops.model(config.actor))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
+  const currentConfig=skillConfig(await readConfig(config.root));
+  if(currentConfig.skills.activeVersion!==run.base||hash(manifest.identities.memory)!==hash(memoryIdentity)||hash(manifest.identities.model)!==hash(await modelIdentities(currentConfig))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
   const design=await ops.design({config,item:run.snapshot,knowledgeConfig});phase('evaluate');
   const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:180,verificationSeconds:300,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
    {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
