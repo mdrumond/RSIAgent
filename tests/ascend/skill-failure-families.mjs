@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {Type} from 'typebox';
 import {Check} from 'typebox/value';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm,symlink} from 'node:fs/promises';
@@ -6,7 +7,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-import {reviewWritePathAllowed} from '../../cli/skill-review-native.mjs';
+import {REVIEW_CONTRACT_VERSION,reviewSession,reviewWritePathAllowed} from '../../cli/skill-review-native.mjs';
 import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {fingerprint} from '../../controller/evidence.mjs';
@@ -80,6 +81,23 @@ test('source-history Git metadata is materialized for read-only native research'
  const history=join(f.root,'source-history/retained');await mkdir(join(f.root,'source-history'));execFileSync('git',['clone','--bare','-q',repo,history]);execFileSync('git',['--git-dir',history,'config','core.bare','false']);
  const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
+ const isolated=await mkdtemp(join(tmpdir(),'isolated-family-'));t.after(()=>rm(isolated,{recursive:true,force:true}));
+ const result=await prepareFailureFamily({...f,directory:isolated,seconds:30},{session:async options=>{
+  const {directory,writableDirectory,prompt}=options;
+  const source=prompt.sourceInventory.find(row=>row.reference===reference);
+  const resultSchema=Type.Unknown();
+  await mkdir(directory,{recursive:true});
+  await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:resultSchema,writableDirectory}));
+  await writeFile(join(directory,'submission.json'),JSON.stringify({status:'needs-evidence',reason:'Reference unavailable'}));
+  const reviewed=await reviewSession({...options,resultSchema,knowledge:false,proofRequired:false});
+  const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
+  assert.deepEqual(input.filesystemAccess.allowed.find(entry=>entry.path===source.path),{path:source.path,directory:false});
+  assert.ok(!input.filesystemAccess.allowed.some(entry=>entry.path===join(isolated,'sources')));
+  assert.equal(await reviewWritePathAllowed(source.path,writableDirectory),false);
+  assert.equal(await readFile(source.path,'utf8'),f.code);
+  return reviewed;
+ }});
+ assert.equal(result.status,'needs-evidence');
 });
 
 test('no actual failed actor evidence avoids inference entirely',async t=>{
@@ -90,6 +108,36 @@ test('isolation checkpoints elapsed work while native research is still running'
  const f=await fixture(t),directory=join(f.root,'checkpoint');let observed;
  const result=await prepareFailureFamily({...f,directory,seconds:5},{session:async()=>{await new Promise(r=>setTimeout(r,1100));observed=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));return {value:{status:'needs-evidence',reason:'Reference source unavailable'}};}});
  assert.equal(observed.running,true);assert(observed.elapsedSeconds>=.9);assert.equal(result.running,false);assert(result.elapsedSeconds>=observed.elapsedSeconds);
+});
+
+
+test('isolation completion waits for an in-flight heartbeat write',async t=>{
+ const f=await fixture(t),directory=join(f.root,'overlapping-checkpoint');
+ let heartbeatStarted,releaseHeartbeat,writing=false;
+ const heartbeat=new Promise(resolve=>{heartbeatStarted=resolve;}),release=new Promise(resolve=>{releaseHeartbeat=resolve;});
+ const result=await prepareFailureFamily({...f,directory,seconds:5},{
+  saveIsolation:async(file,value)=>{
+   assert.equal(writing,false,'Overlapping isolation writes');
+   writing=true;
+   try{
+    if(value.running&&value.elapsedSeconds>0){
+     heartbeatStarted();
+     await release;
+    }
+    await writeFile(file,JSON.stringify(value));
+   }finally{writing=false;}
+  },
+  session:async()=>{
+   await heartbeat;
+   setTimeout(releaseHeartbeat,50);
+   return {value:{status:'needs-evidence',reason:'Reference unavailable'}};
+  }
+ });
+ const retained=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
+ assert.equal(result.status,'needs-evidence');
+ assert.equal(retained.status,result.status);
+ assert.equal(retained.running,false);
+ assert(retained.elapsedSeconds>=1);
 });
 
 
@@ -134,7 +182,7 @@ test('draft native writes are scoped through existing ancestors and accepted byt
  const f=await fixture(t),draft=join(f.root,'draft'),outside=join(f.root,'outside');await mkdir(draft);await mkdir(outside);await symlink(outside,join(draft,'link'));
  assert.equal(await reviewWritePathAllowed(join(draft,'new/sub/kernel.py'),draft),true);assert.equal(await reviewWritePathAllowed(join(draft,'link/kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(outside,'kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(draft,'kernel.py')),false);
  const directory=join(f.root,'incremental');let manifest;const result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({writableDirectory,validate,resultSchema})=>{
-  const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));assert.equal(Check(resultSchema,{status:wire.status,reason:wire.reason,claims:wire.claims}),false);await assert.rejects(validate(wire),/Missing draft file: dev\//);assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
+  const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));const unavailable={status:'needs-evidence',reason:'No passing reference',claims:wire.claims};assert.equal(Check(resultSchema,unavailable),false);assert.ok(Check(resultSchema,{...unavailable,missing:'passing-reference'}));assert.equal(Check(resultSchema,{...unavailable,missing:'check-not-run'}),false);assert.equal(Check(resultSchema,{status:wire.status,reason:wire.reason,claims:wire.claims}),false);await assert.rejects(validate(wire),/Missing draft file: dev\//);assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
  }});assert.equal(result.family.development.files['kernel.py'],f.code);assert.equal(await readFile(join(directory,'dev/starter.py'),'utf8'),f.code);
 });
 

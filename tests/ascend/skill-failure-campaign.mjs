@@ -144,3 +144,16 @@ test('expired retained experiment never starts a new publication',async t=>{
  f.backlog.checkpoint(run.id,{elapsed:7200,checkpoint:{workflow:'failure-first-v1',startedAt:Date.now()-7201000,directory:f.root,slots,phase:'publish'}});
  await assert.rejects(runCampaignFailureStep(f.config,f.values,{...f.ops,publish:async()=>assert.fail('Expired work cannot promote')}),/allowance exhausted before publication/);
 });
+
+test('A5 uses the same bounded failure-first worker through the normal CLI',async t=>{
+ const f=await fixture(t);
+ f.config.target='a5';
+ await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+ let evaluated=false;
+ const result=await main(['skills-ab','--instance',f.root,'--once'],{failureDependencies:{
+  settled:async()=>true,slots:async()=>slots,memory:async()=>f.memory,
+  step:async(config,input)=>{assert.equal(config.target,'a5');assert.equal(input.slots.length,4);evaluated=true;return {status:'rejected',reason:'baseline-ceiling'};}}});
+ assert.equal(result.status,'rejected');
+ assert.equal(evaluated,true);
+ assert.throws(()=>failureProtocol({...f.config,target:'cpu'}),/A3 or A5/);
+});

@@ -16,7 +16,7 @@ const get=(state,key)=>JSON.parse(state.db.prepare('SELECT value FROM control WH
 const put=(state,key,value)=>state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES(?,?)').run(key,JSON.stringify(value));
 export function failureProtocol(config){
  const requested=config.skills?.failureFirst;
- if(!requested?.enabled||config.target!=='a3')throw Error('Explicit A3 failure-first configuration required');
+ if(!requested?.enabled||!['a3','a5'].includes(config.target))throw Error('Explicit A3 or A5 failure-first configuration required');
  if(!/^[a-f0-9]{40}$/.test(requested.sourceRevision??''))throw Error('Pin the installed machinery source revision before A/B startup');
  const protocol={workflow:'failure-first-v1',actorSeconds:180,verificationSeconds:300,sampleSeconds:480,experimentSeconds:7200,concurrency:4,repetitions:5,candidates:3};
  for(const [key,value]of Object.entries(protocol))if(requested[key]!==undefined&&requested[key]!==value)throw Error('Unsupported failure-first protocol field: '+key);
@@ -41,7 +41,7 @@ export async function selectFailureSlots(config,{directory,signal,retained},depe
  }
  devices.sort((a,b)=>Number(b===config.environment.options.backgroundDevice)-Number(a===config.environment.options.backgroundDevice)||b-a);
  if(retained){if(retained.length!==4||retained.some(s=>!devices.includes(s.physical)||!hosts.some(r=>r.id===s.resource.id)))throw Error('Retained A/B resources are unavailable; keep their exact bindings');return retained;}
- if(hosts.length<4||devices.length<4)throw Error('Four healthy idle unleased A3 devices and host slots required');
+ if(hosts.length<4||devices.length<4)throw Error('Four healthy idle unleased target devices and host slots required');
  return hosts.slice(0,4).map((resource,i)=>({resource,physical:devices[i]}));
 }
 

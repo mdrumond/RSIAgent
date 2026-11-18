@@ -24,7 +24,9 @@ export function failureReceipt(row,task){
  return value;
 }
 export async function failureChecker(task,runtime=null,guard={}){
- const payload={checker:await readFile(task.checker,'utf8'),helpers:task.checkerFiles??{},runtime,seconds:failureProtocol.checkerSeconds,...guard};
+ // On A5 the NPU runtime can take more than five seconds to exit after a
+ // valid receipt. Keep the same elapsed verifier limit and require a clean exit.
+ const payload={checker:await readFile(task.checker,'utf8'),helpers:task.checkerFiles??{},runtime,seconds:failureProtocol.checkerSeconds,...(runtime?.target==='a5'?{cleanupSeconds:15}:{}),...guard};
  assert(!Object.hasOwn(payload.helpers,'oracle.py')&&!Object.hasOwn(payload.helpers,'runtime_identity.py'),'Reserved oracle helper filename');
  if(runtime)payload.runtimeHelper=await readFile(new URL('./skill-suites/runtime-identity.py',import.meta.url),'utf8');
  return (await readFile(new URL('./skill-failure-check.py',import.meta.url),'utf8')).replace('__PAYLOAD__','json.loads('+JSON.stringify(JSON.stringify(payload))+')');
@@ -68,19 +70,26 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
  };
  const checkReferences=async input=>{
   input.signal?.throwIfAborted();signal?.throwIfAborted();assert(Number.isFinite(input.seconds)&&input.seconds>0,'Positive reference allowance required');assert(config.target==='cpu'||runtime,'Identify target before references');
+  const development=input.family.development;
+  const starter=development.controls.negatives.find(n=>hash(n.files['kernel.py'])===hash(development.files['kernel.py']));
+  assert(starter,'Development negative must replay the isolated starter');
+  const checks=[[development,'starter',starter.files],...[development,...input.family.transfer].map(task=>[task,'reference',task.controls.reference.files])];
   const slot=free.pop();assert(slot,'No reference slot');const roots=[],started=performance.now(),diagnostics=[];
-  try{for(const task of [input.family.development,...input.family.transfer]){
-   input.signal?.throwIfAborted();signal?.throwIfAborted();const fingerprint=hash({family:input.family.id,task,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8')}),root=join(input.directory,'references',fingerprint);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
+  try{for(const [task,variant,files] of checks){
+   input.signal?.throwIfAborted();signal?.throwIfAborted();const fingerprint=hash({family:input.family.id,task,variant,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8')}),root=join(input.directory,'references',fingerprint);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
    const left=input.seconds-(performance.now()-started)/1000;assert(left>0,'Reference elapsed allocation exhausted');let rows;
-   try{rows=await verify(root,slot,task,[{key:'reference',files:task.controls.reference.files}],Math.min(300,left),input.signal,'reference-'+fingerprint);}
+   try{rows=await verify(root,slot,task,[{key:variant,files}],Math.min(300,left),input.signal,'reference-'+fingerprint);}
    catch(error){await save(join(root,'reference.json'),{task:task.id,error:{message:error.message,code:error.code??null}});throw error;}
    await save(join(root,'reference.json'),{task:task.id,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
-   const diagnostic={task:task.id,correct:value.correct,reason:value.reason??value.evidence?.reason??null,error:String(row.error??'').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
-   if(value.correct!==true||!task.caseIds.every(id=>value.evidence.checkedCases?.includes(id))){
-    const error=Error('Reference '+task.id+' rejected: '+JSON.stringify(diagnostic));
+   const diagnostic={task:task.id,variant,correct:value.correct,phase:value.evidence?.phase,type:value.evidence?.type,checkedCases:value.evidence?.checkedCases,reason:value.reason??value.evidence?.reason??value.evidence?.message??null,error:[value.error,row.error].filter(Boolean).join('\n').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
+   const passed=variant==='starter'
+     ? value.correct===false&&sameMechanism(value,input.family)&&value.evidence.caseResults.some(row=>!row.correct&&value.evidence.checkedCases?.includes(row.id))
+     : value.correct===true&&task.caseIds.every(id=>value.evidence.checkedCases?.includes(id));
+   if(!passed){
+    const error=Error((variant==='starter'?'Starter must reproduce the declared failure before references run. ':'Reference ')+task.id+' rejected: '+JSON.stringify(diagnostic));
     if(row.sourceFilesMatch===true&&guard?.allChildrenReaped===true&&guard.reason==null&&!input.signal?.aborted&&!signal?.aborted)error.code='FAILURE_REFERENCE_REJECTED';throw error;
    }
-  }return {checked:true,references:diagnostics};
+  }return {checked:true,references:diagnostics.filter(row=>row.variant==='reference')};
   }finally{if((await Promise.all(roots.map(closed))).every(Boolean))free.push(slot);}
  };
  const qualify=async input=>{
