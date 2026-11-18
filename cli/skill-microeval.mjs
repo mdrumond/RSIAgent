@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Short native-Pi skill comparisons. Shadow artifacts never update a campaign. */
-import {mkdir,readFile,writeFile,rename,realpath,appendFile} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,realpath,appendFile,stat} from 'node:fs/promises';
 import {resolve,join,relative,dirname,isAbsolute} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
@@ -15,12 +15,24 @@ import {skillProfile,skillModelFromProfile,skillModelIdentity} from '../controll
 export const isKernelTask=kind=>['a3-kernel','target-kernel'].includes(kind);
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const shellQuote=value=>"'"+String(value).replaceAll("'","'\\''")+"'";
-function sandboxCommand(command,cwd){
+function sandboxCommand(command,cwd,hiddenPaths=[]){
  // Pi still owns Bash execution and cancellation. Bubblewrap makes the host
  // read-only while preserving normal writes inside this sample's work tree.
+ // Mask private/pool directories first, then expose only the current workspace.
  return ['bwrap','--die-with-parent','--new-session','--unshare-pid','--ro-bind','/','/',
-  '--proc','/proc','--dev','/dev','--tmpfs','/tmp','--bind',cwd,cwd,'--chdir',cwd,
+  '--proc','/proc','--dev','/dev','--tmpfs','/tmp',...hiddenPaths.flatMap(path=>['--tmpfs',path]),'--bind',cwd,cwd,'--chdir',cwd,
   '--','bash','-c',command].map(shellQuote).join(' ');
+}
+async function sandboxDirectories(option){
+ if(!option||option===true)return [];
+ if(typeof option!=='object'||Array.isArray(option)||!Array.isArray(option.hiddenPaths)||Object.keys(option).some(key=>key!=='hiddenPaths'))throw Error('Filesystem sandbox requires true or {hiddenPaths:[absolute directories]}');
+ const paths=await Promise.all(option.hiddenPaths.map(async path=>{
+  if(typeof path!=='string'||!isAbsolute(path))throw Error('Hidden sandbox paths must be absolute directories');
+  const canonical=await realpath(path);
+  if(canonical==='/'||!(await stat(canonical)).isDirectory())throw Error('Hidden sandbox paths must be non-root directories');
+  return canonical;
+ }));
+ return [...new Set(paths)].sort((a,b)=>a.length-b.length);
 }
 export function unknownExecution(error){
  if(error.code==='DEVICE_LEASE_BLOCKED'||error.reason==='device-lease-blocked'||/Device reservations require reconciliation/i.test(error.message??''))return {handle:null,reason:'device-lease-blocked',reservations:error.reservations??[]};
@@ -62,15 +74,17 @@ export async function validateKernelReceipt(verification,cwd,{requireLatency=tru
 }
 export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,sampleStopSignal:allocationSignal,sessionDirectory,resumeSession,kind,knowledge,targetEnvironment,targetBash=false,verificationReserved=0,localFilesystemSandbox=false}){
  if(targetBash&&!targetEnvironment)throw Error('Admitted target Bash requires a target environment');
- const begun=performance.now();
+ if(targetBash&&localFilesystemSandbox&&typeof localFilesystemSandbox==='object')throw Error('Local hidden paths cannot protect target Bash');
+ const begun=performance.now(),hiddenPaths=await sandboxDirectories(localFilesystemSandbox);
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
  const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
  let unresolvedExecution;
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
+ if(hiddenPaths.some(path=>path.startsWith(taskRoot+'/')))throw Error('Hidden directories cannot be inside the actor workspace');
  if(localFilesystemSandbox&&!targetBash){
-  let output='';const probe=await local.exec(sandboxCommand('true',taskRoot),taskRoot,{timeout:Math.min(5,remaining()),signal:sampleSignal,onData:chunk=>{output=(output+chunk).slice(-4096);}});
+  let output='';const probe=await local.exec(sandboxCommand('true',taskRoot,hiddenPaths),taskRoot,{timeout:Math.min(5,remaining()),signal:sampleSignal,onData:chunk=>{output=(output+chunk).slice(-4096);}});
   const capability={kind:'local-filesystem-sandbox',available:probe.exitCode===0,exitCode:probe.exitCode,output};await writeFile(join(sessionDirectory,'sandbox-preflight.json'),JSON.stringify(capability,null,2)+'\n');
   if(!capability.available)return {timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
  }
@@ -100,7 +114,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   if(targetEnvironment){const [target]=await createEnvironmentTools({execute:executeTarget},cwd,sdk);pi.registerTool(target);}
   pi.registerTool(sdk.createBashToolDefinition(cwd,{operations:{exec:async(command,path,options)=>{
    const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
-   const operation=targetBash?executeTarget(command,path,{...options,signal:merged}):local.exec(localFilesystemSandbox?sandboxCommand(command,taskRoot):command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
+   const operation=targetBash?executeTarget(command,path,{...options,signal:merged}):local.exec(localFilesystemSandbox?sandboxCommand(command,taskRoot,hiddenPaths):command,path,{...options,signal:merged,timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
    try{return await operation;}finally{pending.delete(operation);}
   }}}));
  };
