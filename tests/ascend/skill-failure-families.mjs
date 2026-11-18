@@ -145,3 +145,16 @@ for(const [name,edit]of [
  ['transfer checker in development public',f=>{f.family.development.publicChecker='layout/./private.py';}],
  ['development helper in transfer public',f=>{f.family.transfer[0].publicChecker='dev/./helper.py';}]
 ])test(name+' is rejected across family task boundaries',async t=>{const f=await fixture(t);edit(f);await assert.rejects(loadFailureFamily({file:await f.write(),config:f.config,item:f.item}),/any family task/);});
+
+
+test('A5 family isolation freezes A5 tasks and refuses an A3 manifest or schema submission',async t=>{
+ const f=await fixture(t);f.config.target='a5';f.family.target='a5';const file=await f.write(),loaded=await loadFailureFamily({file,config:f.config,item:f.item});assert.deepEqual([loaded.development,...loaded.transfer].map(task=>task.target),['a5','a5','a5']);
+ await assert.rejects(loadFailureFamily({file,config:{...f.config,target:'a3'},item:f.item}),/matching A3.A5/);
+ const directory=join(f.root,'a5-isolation'),result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({validate,writableDirectory,prompt,resultSchema})=>{
+  assert.equal(prompt.target,'a5');assert.equal(prompt.contract.target,'a5');const wire={status:'ready',reason:'Retained source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));assert.equal(Check(resultSchema,{...wire,family:{...f.family,target:'a3'}}),false);
+  return {value:await submitDraft(validate,writableDirectory,{...wire,files:f.files})};
+ }});assert.equal(result.family.target,'a5');await assert.rejects(prepareFailureFamily({...f,directory,config:{...f.config,target:'a3'},seconds:30}),/Isolation inputs changed/);
+});
+test('A3 family cannot enter A5 isolation and unsupported targets stop before inference',async t=>{
+ const f=await fixture(t);await assert.rejects(loadFailureFamily({file:await f.write(),config:{...f.config,target:'a5'},item:f.item}),/matching A3.A5/);await assert.rejects(prepareFailureFamily({...f,directory:join(f.root,'unsupported'),config:{...f.config,target:'cpu'}},{session:()=>assert.fail('Unsupported target must not invoke model')}),/A3 or A5/);
+});
