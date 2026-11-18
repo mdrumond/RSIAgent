@@ -1,10 +1,12 @@
 import test from 'node:test';
+import {Check} from 'typebox/value';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,symlink} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
+import {reviewWritePathAllowed} from '../../cli/skill-review-native.mjs';
 import {State} from '../../controller/state.mjs';
 import {CampaignStorage} from '../../controller/storage.mjs';
 import {fingerprint} from '../../controller/evidence.mjs';
@@ -29,6 +31,7 @@ async function fixture(t){
  const write=async(value=family)=>{for(const [p,s]of Object.entries(files)){await mkdir(join(directory,p,'..'),{recursive:true});await writeFile(join(directory,p),s);}const file=join(directory,'family.json');await writeFile(file,JSON.stringify(value));return file;};
  return {root,state,config,backlog,item,attempt,directory,code,reference,group,family,files,write};
 }
+async function submitDraft(validate,draft,{files,...value}){for(const [name,content]of Object.entries(files)){await mkdir(join(draft,name,'..'),{recursive:true});await writeFile(join(draft,name),content);}return validate(value);}
 const classify=bucket=>async({groups,validate})=>validate({classifications:groups.map(g=>({groupId:g.id,cause:bucket==='harness'?'harness':'actor',bucket,coverage:'uncovered',guidanceIds:[],evidenceRefs:[g.occurrences[0].reference],reason:'Observed verification result'}))});
 
 test('classification-only queues facts without proposals, knowledge-gap requests or QA',async t=>{
@@ -62,7 +65,7 @@ for(const [name,edit]of [['legacy suite',f=>{f.family.format=1;}],['seed-only tr
 
 test('native isolation validates its submission, never calls a curriculum, and reuses frozen output',async t=>{
  const f=await fixture(t);let calls=0;const input={...f,directory:join(f.root,'isolated'),seconds:90};
- const dependencies={session:async({seconds,validate})=>{calls++;assert(seconds<=90);return {value:await validate({status:'ready',reason:'A replay is recoverable',family:f.family,files:f.files,claims:[]})};}};
+ const dependencies={session:async({seconds,validate,writableDirectory})=>{calls++;assert(seconds<=90);return {value:await submitDraft(validate,writableDirectory,{status:'ready',reason:'A replay is recoverable',family:f.family,files:f.files,claims:[]})};}};
  const result=await prepareFailureFamily(input,dependencies);assert.equal(result.status,'ready');assert.equal(result.family.provenance.sourceSha256,sha(f.code));assert.equal(calls,1);const again=await prepareFailureFamily(input,{session:()=>assert.fail('Must not rerun accepted research')});assert.equal(again.family.identity,result.family.identity);await writeFile(join(input.directory,'dev/private.py'),'changed');await assert.rejects(prepareFailureFamily(input,dependencies),/Frozen family changed/);
 });
 
@@ -117,11 +120,20 @@ test('A3 investigation actor failures retain exact source admission without admi
 test('native isolation retries syntax and reference failures within one session before accepting corrected files',async t=>{
  const f=await fixture(t),directory=join(f.root,'retry-isolation');let checks=0,sessions=0;
  const checkReferences=async({family,directory:received,seconds,signal})=>{checks++;assert.equal(received,directory);assert(seconds>0&&seconds<=30);assert.equal(signal.aborted,false);assert.equal(family.development.files['kernel.py'],f.code);if(checks===1)throw Error('Reference failed ordinary case');};
- const result=await prepareFailureFamily({...f,directory,seconds:30,checkReferences},{session:async({validate})=>{
-  sessions++;const submission={status:'ready',reason:'Recovered failure',family:f.family,files:{...f.files},claims:[]};submission.files['dev/private.py']='def broken(:\n';
+ const result=await prepareFailureFamily({...f,directory,seconds:30,checkReferences},{session:async({validate:check,writableDirectory})=>{
+  const validate=value=>submitDraft(check,writableDirectory,value);sessions++;const submission={status:'ready',reason:'Recovered failure',family:f.family,files:{...f.files},claims:[]};submission.files['dev/private.py']='def broken(:\n';
   await assert.rejects(validate(submission),/syntax validation failed/);assert.equal(checks,0);
   submission.files['dev/private.py']=f.files['dev/private.py'];for(const path of ['dev/public.py','dev/helper.py']){submission.files[path]='def broken(:\n';await assert.rejects(validate(submission),/syntax validation failed/);assert.equal(checks,0);submission.files[path]=f.files[path];}
   submission.files['dev/private.py']='raise RuntimeError("syntax must not execute checker")\n';await assert.rejects(validate(submission),/Reference failed ordinary case/);assert.equal(checks,1);
   return {value:await validate(submission)};
  }});assert.equal(result.status,'ready');assert.equal(sessions,1);assert.equal(checks,2);
+});
+
+
+test('draft native writes are scoped through existing ancestors and accepted bytes are independent',async t=>{
+ const f=await fixture(t),draft=join(f.root,'draft'),outside=join(f.root,'outside');await mkdir(draft);await mkdir(outside);await symlink(outside,join(draft,'link'));
+ assert.equal(await reviewWritePathAllowed(join(draft,'new/sub/kernel.py'),draft),true);assert.equal(await reviewWritePathAllowed(join(draft,'link/kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(outside,'kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(draft,'kernel.py')),false);
+ const directory=join(f.root,'incremental');let manifest;const result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({writableDirectory,validate,resultSchema})=>{
+  const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
+ }});assert.equal(result.family.development.files['kernel.py'],f.code);assert.equal(await readFile(join(directory,'dev/starter.py'),'utf8'),f.code);
 });
