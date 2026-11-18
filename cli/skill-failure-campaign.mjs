@@ -88,7 +88,10 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    backlog.checkpoint(retained.id,{elapsed,checkpoint:retained.checkpoint});backlog.finish(retained.id,{status,result:{reason:'publication-recovered',published:true,publication}});backlog.meta('failure-first-current',null);
    return {status,published:true,reason:'publication-recovered'};
   }
-  if(item.base!==config.skills.activeVersion){backlog.revise(item.id,{base:config.skills.activeVersion,status:'queued'});return {status:'reclassified',reason:'Active skill changed before screening'};}
+  if(item.base!==config.skills.activeVersion){
+   if(existing)throw Error('Frozen experiment baseline changed; preserve its original run');
+   backlog.revise(item.id,{base:config.skills.activeVersion,status:'queued'});return {status:'reclassified',reason:'Active skill changed before screening'};
+  }
   const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(7200,remainingSeconds),workflow:'failure-first-v1',owner:await processIdentity()});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
   run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots};

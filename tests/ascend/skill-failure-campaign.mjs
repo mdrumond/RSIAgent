@@ -73,3 +73,20 @@ test('settlement status does not start memory or new evaluations',async t=>{
  const run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;f.backlog.checkpoint(run.id,{elapsed:0,checkpoint:{runtimeDirectory:join(f.root,'retained')}});f.backlog.meta('failure-first-current',run.id);
  let observed=0;assert.equal(await failureCampaignSettled(f.config,{settled:async()=>{observed++;return {closed:false};}}),false);assert.equal(observed,1);
 });
+test('resuming retains the original allocation, elapsed isolation time and device bindings',async t=>{
+ const f=await fixture(t),now=Date.now(),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ const checkpoint={workflow:'failure-first-v1',startedAt:now-1000000,directory:join(f.root,'retained-study'),slots};
+ f.backlog.checkpoint(run.id,{elapsed:1000,checkpoint});f.backlog.meta('failure-first-current',run.id);
+ const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,now:()=>now,family:async()=>({status:'needs-evidence',reason:'Unavailable retained source'})});
+ assert.equal(outcome.reason,'needs-evidence');const saved=f.backlog.run(run.id);assert.equal(saved.seconds,7200);assert.equal(saved.elapsed,1000);assert.equal(saved.checkpoint.startedAt,checkpoint.startedAt);assert.deepEqual(saved.checkpoint.slots,slots);
+});
+test('resuming never silently changes a frozen baseline or mutates its queue revision',async t=>{
+ const f=await fixture(t),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ const before=f.backlog.get(f.item.id);await assert.rejects(runCampaignFailureStep({...f.config,skills:{...f.config.skills,activeVersion:'other'}},f.values,f.ops),/Frozen experiment baseline changed/);
+ assert.deepEqual(f.backlog.get(f.item.id),before);assert.equal(f.backlog.run(run.id).seconds,7200);assert.equal(f.calls.length,0);
+});
+test('a resumed experiment refuses substitute devices before research or inference',async t=>{
+ const f=await fixture(t),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ const checkpoint={workflow:'failure-first-v1',startedAt:Date.now(),directory:join(f.root,'retained-study'),slots};f.backlog.checkpoint(run.id,{elapsed:0,checkpoint});
+ await assert.rejects(runCampaignFailureStep(f.config,{...f.values,slots:slots.map((s,i)=>({...s,physical:i+1}))},f.ops),/exact original resource bindings/);assert.equal(f.calls.length,0);assert.deepEqual(f.backlog.run(run.id).checkpoint.slots,slots);
+});
