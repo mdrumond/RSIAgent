@@ -15,7 +15,7 @@ def identity(target=None):
     required = ('torch', 'torch-npu') + (() if target == 'a5' else ('triton',))
     if not all(name in report['packages'] for name in required):
         raise RuntimeError(target.upper() + ' runtime packages missing: ' + ', '.join(required))
-    if target == 'a5' and not any(name in report['packages'] for name in ('catlass', 'catlass-dsl')):
+    if target == 'a5' and not any(name in report['packages'] for name in ('catlass', 'catlass-dsl', 'ascend-catlass-dsl')):
         raise RuntimeError('A5 Catlass package required')
     digests = {}
     def digest(path):
@@ -36,7 +36,7 @@ def identity(target=None):
             path = Path(root) / relative
             if path.is_file():
                 versions.add((relative, digest(path)))
-    board = subprocess.run(['npu-smi', 'info', '-t', 'board', '-i', os.environ['ASCEND_PHYSICAL_DEVICE'], '-c', '0'],
+    board = subprocess.run(['npu-smi', 'info', '-t', 'board', '-i', os.environ['ASCEND_PHYSICAL_DEVICE']] + ([] if target == 'a5' else ['-c', '0']),
                            capture_output=True, text=True, timeout=5, check=True).stdout
     product = re.search(r'Chip Name\s*:\s*(\S+)', board)
     if not product or not versions or not report['compilers']:
