@@ -141,14 +141,14 @@ export function currentAnalysisStages({config,backlog}){
 }
 
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
-export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2},dependencies={}){
+export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2,classificationOnly=false},dependencies={}){
  const ops=await operations(dependencies),now=dependencies.now??(()=>performance.now()),clock=allocation(remainingSeconds,signal,now),entries=await guidanceEntries(config.root,config.skills.activeVersion);
  const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
  const persist=()=>{for(const [id,stage]of Object.entries(stages))Object.assign(stage,coordinates.get(id));backlog.meta('analysis-stages',stages);};
  const eligible=g=>stages[identity(g)]?.status!=='blocked';
  const dirty=[];
  for(let offset=0;dirty.length<limit;offset+=200){const rows=backlog.failures({limit:200,offset,occurrenceLimit:6});dirty.push(...rows.filter(eligible).slice(0,limit-dirty.length));if(rows.length<200)break;}
- const page=learningPage(backlog,config),learningItems=page.items;
+ const page=classificationOnly?{items:[],finish(){}}:learningPage(backlog,config),learningItems=page.items;
  const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(g=>g&&eligible(g)).map(g=>[g.id,g])).values()].slice(0,limit);
  if(!groups.length){page.finish();return {analyzed:0,items:[],remainingSeconds:clock.remaining()};}
  const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results])])),frozen=await freezeGroups(config.root,groups,batch);
@@ -185,6 +185,11 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
   const learned=learningItems.filter(({item})=>item.groupIds.includes(group.id));
   const classification=byGroup[group.id],base=config.skills.activeVersion,common={groupIds:[group.id],objective:classification.bucket,skill:classification.guidanceIds,
    priority:priority(group),reason:classification.reason,base},evidence={groups:[group]},classificationContext={classifications:{[group.id]:classification}};
+  if(classificationOnly){
+   const status=classification.bucket==='harness'?'user-required':classification.bucket==='optimization'?'deferred':'queued';
+   created.push(backlog.upsert({...common,key:'failure-first:'+group.id,workflow:'failure-first-v1',proposal:null,evidence,preparation:classificationContext,status}));
+   backlog.acknowledge(group.id,{classification,count:group.count});stages[identity(group)]={stage:'complete',status:'complete',classification};persist();continue;
+  }
   if(classification.intervention==='user-required'){
    created.push(backlog.upsert({...common,key:'harness:'+group.id,proposal:{action:'no-change',reason:classification.reason},evidence,preparation:classificationContext,status:'user-required'}));
    consumeLearning(backlog,learned);backlog.acknowledge(group.id,{classification,count:group.count});stages[identity(group)]={stage:'complete',status:'complete',classification};persist();continue;
