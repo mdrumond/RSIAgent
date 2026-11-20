@@ -41,17 +41,42 @@ export async function freezeGroups(root,groups,directory){
  const file=join(directory,'groups.json'),prior=await load(file);if(prior)return prior;
  await mkdir(join(directory,'evidence'),{recursive:true});const campaign=await realpath(root),frozen=structuredClone(groups);
  for(const group of frozen){delete group.classification;delete group.dirty;delete group.fresh;}
- for(const group of frozen)for(const observation of [...group.occurrences,...(group.linkedDiagnostics??[])]){
-  const copies=[];
-  for(const original of [...new Set([...(observation.artifacts??[]).map(a=>a.path),...artifactPaths(observation.data)])].slice(0,2)){
-   let path;try{path=await realpath(original);}catch(e){if(e.code==='ENOENT')continue;throw e;}
-   if(!path.startsWith(campaign+sep))continue;
-   const handle=await open(path,'r');let bytes,info;try{info=await handle.stat();if(!info.isFile())continue;const length=Math.min(info.size,32768),buffer=Buffer.alloc(length);if(info.size>length){const half=length/2;await handle.read(buffer,0,half,0);await handle.read(buffer,half,half,info.size-half);}else await handle.read(buffer,0,length,0);bytes=buffer;}finally{await handle.close();}
-   const copied=join(directory,'evidence',hash([observation.reference,path])+'.log');await writeFile(copied,bytes);
-   copies.push({path:copied,sha256:createHash('sha256').update(bytes).digest('hex'),originalBytes:info.size,truncated:info.size>bytes.length,layout:info.size>bytes.length?'head-and-tail':'complete'});
+ const ledgerPath=join(campaign,'state.sqlite');
+ const ledger=existsSync(ledgerPath)?new DatabaseSync(ledgerPath,{readOnly:true}):null;
+ try{
+  const event=ledger?.prepare("SELECT 1 FROM sqlite_master WHERE name='events'").get()
+   ?ledger.prepare("SELECT data FROM events WHERE sequence=? AND type='verification'"):null;
+  for(const group of frozen)for(const observation of [...group.occurrences,...(group.linkedDiagnostics??[])]){
+   const copies=[];
+   const sequence=/^events:(\d+)$/.exec(observation.reference??'');
+   const retained=sequence&&event?.get(Number(sequence[1]));
+   const primary=retained?JSON.parse(retained.data).correctness:null;
+   const verified=typeof primary?.evidence==='string'&&isAbsolute(primary.evidence)
+    &&/^[a-f0-9]{64}$/.test(primary.evidence_sha256??'')?primary:null;
+   const paths=[...(verified?[verified.evidence]:[]),...(observation.artifacts??[]).map(a=>a.path),...artifactPaths(observation.data)];
+   for(const original of [...new Set(paths)].slice(0,2)){
+    let path;try{path=await realpath(original);}catch(e){if(e.code==='ENOENT')continue;throw e;}
+    if(!path.startsWith(campaign+sep))continue;
+    const handle=await open(path,'r');
+    let bytes,info;
+    try{
+     info=await handle.stat();if(!info.isFile())continue;
+     const length=Math.min(info.size,32768),buffer=Buffer.alloc(length);
+     if(original===verified?.evidence){
+      const sourceHash=createHash('sha256');
+      for await(const chunk of handle.createReadStream({autoClose:false,start:0}))sourceHash.update(chunk);
+      if(sourceHash.digest('hex')!==verified.evidence_sha256)continue;
+     }
+     if(info.size>length){const half=length/2;await handle.read(buffer,0,half,0);await handle.read(buffer,half,half,info.size-half);}
+     else await handle.read(buffer,0,length,0);
+     bytes=buffer;
+    }finally{await handle.close();}
+    const copied=join(directory,'evidence',hash([observation.reference,path])+'.log');await writeFile(copied,bytes);
+    copies.push({path:copied,sha256:createHash('sha256').update(bytes).digest('hex'),originalBytes:info.size,truncated:info.size>bytes.length,layout:info.size>bytes.length?'head-and-tail':'complete'});
+   }
+   observation.artifacts=copies;
   }
-  observation.artifacts=copies;
- }
+ }finally{ledger?.close();}
  await save(file,frozen);return frozen;
 }
 const learningIdentity=results=>hash(results.map(r=>({id:r.id,question:r.data.question,findings:r.data.findings,learningTarget:r.data.learningTarget})));

@@ -8,7 +8,7 @@ import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {enqueueLearningRequest} from '../../controller/skill-review.mjs';
-import {currentAnalysisStages,analyzeBacklog,prioritizeBacklog,prepareHypothesis} from '../../cli/skill-backlog-analysis.mjs';
+import {currentAnalysisStages,analyzeBacklog,prioritizeBacklog,prepareHypothesis,freezeGroups} from '../../cli/skill-backlog-analysis.mjs';
 async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'backlog-analysis-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const version=join(root,'skills','versions','baseline');await mkdir(version,{recursive:true});
@@ -387,4 +387,22 @@ test('campaign-clipped classification expiry preserves its unspent original gran
  await assert.rejects(analyzeBacklog({...f,seconds:10,remainingSeconds:10},{now:()=>milliseconds,classify:async input=>{assert.equal(input.seconds,10);milliseconds+=10000;throw Object.assign(Error('Campaign elapsed'),{reviewSession:{kind:'elapsed'}});}}),/Campaign elapsed/);
  const stage=currentAnalysisStages(f)[0];assert.equal(stage.status,'retry');assert.equal(stage.allocatedSeconds,120);assert.equal(stage.elapsedSeconds,110);
  let allowed;await analyzeBacklog({...f,seconds:60,remainingSeconds:60},{now:()=>milliseconds,classify:async input=>{allowed=input.seconds;return classify(input);},review:review()});assert.equal(allowed,10);
+});
+
+test('condensed verification references recover only hash-bound primary log bytes',async t=>{
+ const f=await fixture(t);
+ const diagnostic='Expected a npu device, but got: cpu\n';
+ const path=join(f.root,'device-placement.log');
+ await writeFile(path,diagnostic);
+ f.state.event(null,'verification',{
+  correctness:{passed:false,evidence:path,evidence_sha256:createHash('sha256').update(diagnostic).digest('hex')},
+ });
+ const {sequence}=f.state.db.prepare('SELECT MAX(sequence) sequence FROM events').get();
+ const groups=[{id:'group',occurrences:[{reference:'events:'+sequence,data:{passed:false},artifacts:[]}]}];
+ const [reconstructed]=await freezeGroups(f.root,groups,join(f.directory,'valid'));
+ const [artifact]=reconstructed.occurrences[0].artifacts;
+ assert.equal(await readFile(artifact.path,'utf8'),diagnostic);
+ await writeFile(path,'unrelated replacement');
+ const [changed]=await freezeGroups(f.root,groups,join(f.directory,'changed'));
+ assert.deepEqual(changed.occurrences[0].artifacts,[]);
 });
