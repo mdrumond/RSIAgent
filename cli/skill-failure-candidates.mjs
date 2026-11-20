@@ -1,7 +1,7 @@
 /** Evidence-reviewed instruction candidates; only the tested immutable version can publish. */
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join,resolve} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {Type} from 'typebox';
 import {guidanceEntries} from '../controller/skill-review.mjs';
@@ -9,11 +9,11 @@ import {stages} from '../controller/workflow.mjs';
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {reviewSession,nativeQaAnswer,nativeQaReview} from './skill-review-native.mjs';
-import {runProposalQa} from './skill-review-qa.mjs';
+import {qaIdentity,runProposalQa} from './skill-review-qa.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {readConfig} from './instance.mjs';
-import {pilotWinner,validatePilotTrial,validatePilotManifest} from './skill-failure-pilot.mjs';
+import {focusedBaselineDecision,pilotWinner,validatePilotTrial,validatePilotManifest} from './skill-failure-pilot.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const textHash=value=>createHash('sha256').update(value).digest('hex');
@@ -33,6 +33,21 @@ async function writerHealthy(written){
 }
 function reviewGroups(item){return item.evidence?.groups??[];}
 const designIdentity=({base,baseline,family,results,identities,item})=>hash({base,baseline,family,results,identities,origin:{id:item.id,groupIds:item.groupIds,evidence:item.evidence,classifications:item.preparation?.classifications}});
+function designEvidence(item,task,baselines,qualification){
+ const groups=structuredClone(reviewGroups(item));
+ assert(groups.some(group=>group.occurrences?.length),'Original failure evidence is required');
+ const outcomes=baselines.map(result=>({correct:result.correct,mechanismMatch:result.mechanismMatch,sourceSha256:result.sourceSha256,failure:result.failure}));
+ groups[0].linkedDiagnostics=[...(groups[0].linkedDiagnostics??[]),...outcomes.map((data,index)=>({
+  reference:'failure-first:baseline:'+index,type:'isolated-baseline-verification',data,artifacts:baselines[index].artifacts??[],
+ }))];
+ const development=Object.fromEntries(['id','prompt','files','caseIds'].filter(key=>task[key]!==undefined).map(key=>[key,task[key]]));
+ const proofRecords=outcomes.map((data,index)=>({reference:'baseline-'+index,text:JSON.stringify(data)}));
+ if(qualification){
+  const {referencePassed,negativeFailed,calibrationPassed}=qualification;
+  proofRecords.push({reference:'development-controls',text:JSON.stringify({referencePassed,negativeFailed,calibrationPassed})});
+ }
+ return {groups,development,proofRecords,evaluationContract:{workflow:'failure-first-v1',development,baselineOutcomes:proofRecords}};
+}
 async function checkVersion(config,candidate){
  const effective=await skillInput(join(config.root,'skills','versions',candidate.version));
  assert.equal(effective.text,candidate.text,'Candidate guidance changed after review');assert.equal(effective.sha256,candidate.skillSha256,'Candidate source changed after review');
@@ -54,7 +69,10 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
  return async input=>{
   assert(Number.isFinite(input.remainingSeconds)&&input.remainingSeconds>0,'Positive remaining experiment elapsed allowance required');
   assert.equal(item.objective,'correctness','Failure-first instruction design currently supports correctness only');
-  assert(input.baselineResults?.length===5&&!input.baselineResults.some(row=>row.infrastructure)&&input.baselineResults.filter(row=>row.correct===false&&row.mechanismMatch).length>=3,'Five clean baselines and three matching failures must precede writing');
+  const focused=input.mode==='focused-correctness';
+  const exactFailures=input.baselineResults?.filter(row=>row.correct===false&&row.mechanismMatch).length;
+  const fullPasses=input.baselineResults?.filter(row=>row.correct===true).length;
+  assert(input.baselineResults?.length===5&&!input.baselineResults.some(row=>row.infrastructure)&&exactFailures>=(focused?1:3)&&(!focused||fullPasses<=3),focused?'Baseline evidence does not meet the writing gate':'Five clean baselines and three matching failures must precede writing');
   const base=item.base??config.skills.activeVersion;assert.equal(base,config.skills.activeVersion,'Instruction base changed');
   const manifest=await load(join(input.directory,'..','..','manifest.json')),identities=input.identities??manifest?.identities;assert(identities&&['model','runtime','memory'].every(key=>identities[key]!==undefined),'Frozen model, runtime and memory identities required');
   const baseline=await skillInput(join(config.root,'skills','versions',base)),identity=designIdentity({base,baseline:baseline.sha256,family:input.family,results:input.baselineResults,identities,item});
@@ -62,15 +80,11 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const inputFile=join(input.directory,'design-input.json'),priorInput=await load(inputFile);if(priorInput)assert.equal(priorInput.identity,identity,'Instruction evidence changed');else await save(inputFile,{identity});
   const registry=join(input.directory,'approved-design.json'),cached=await load(registry),dispositionFile=join(input.directory,'design-disposition.json'),disposition=await load(dispositionFile);
   if(cached){assert.equal(cached.identity,identity,'Instruction evidence changed');return Promise.all(cached.candidates.map(candidate=>checkVersion(config,candidate)));}
-  if(disposition){assert.equal(disposition.identity,identity,'Instruction evidence changed');return {status:disposition.status,reason:disposition.reason};}
-  const entries=await guidanceEntries(config.root,base),groups=structuredClone(reviewGroups(item));assert(groups.some(group=>group.occurrences?.length),'Original failure evidence is required');
-  // QA must cite the new trusted baseline observations, not infer them from historical project outcomes.
-  groups[0].linkedDiagnostics=[...(groups[0].linkedDiagnostics??[]),...input.baselineResults.map((result,index)=>({reference:'failure-first:baseline:'+index,type:'isolated-baseline-verification',data:{correct:result.correct,mechanismMatch:result.mechanismMatch,sourceSha256:result.sourceSha256,failure:result.failure},artifacts:result.artifacts??[]}))];
+  if(disposition){assert.equal(disposition.identity,identity,'Instruction evidence changed');const {identity:_,...result}=disposition;return result;}
+  const entries=await guidanceEntries(config.root,base);
+  const {groups,development,proofRecords,evaluationContract}=designEvidence(item,input.family.development,input.baselineResults,focused?input.qualification:undefined);
   const refs=groups.flatMap(group=>[...group.occurrences,...(group.linkedDiagnostics??[])].map(row=>row.reference));
   const started=ops.now(),left=()=>Math.max(0,input.remainingSeconds-(ops.now()-started)/1000),sessionConfig={...knowledgeConfig,project_evidence_root:config.root};
-  // The development descriptor is deliberately projected: controls and private checker paths are not writer input.
-  const development=Object.fromEntries(['id','prompt','files','caseIds'].filter(key=>input.family.development[key]!==undefined).map(key=>[key,input.family.development[key]]));
-  const proofRecords=input.baselineResults.map((result,index)=>({reference:'baseline-'+index,text:JSON.stringify({correct:result.correct,mechanismMatch:result.mechanismMatch,sourceSha256:result.sourceSha256,failure:result.failure})}));
   const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=['robust decisions','diagnostic reasoning','implementation complexity'].map(async(perspective,index)=>{try{
    const id='principle-'+String.fromCharCode(97+index),directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
@@ -78,26 +92,128 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
    if(!written){written=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords,evidenceGroups:groups,
-     prompt:{task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);validate(written.value,written.retrievals??[]);await save(resultFile,written);}
+     prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);validate(written.value,written.retrievals??[]);await save(resultFile,written);}
    else validate(written.value,written.retrievals??[]);
    await writerHealthy(written);
    const memoryEvidence=memoryEntries(written.retrievals??[]),changeId='failure-first-'+hash([identity,id]).slice(0,24);
    const proposal={action:'update',reason:'Instruction grounded in reproduced baseline failures',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:changeId,scope:written.value.scope,text:written.value.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
    const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
    const qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
-    evaluationContract:{workflow:'failure-first-v1',development,baselineOutcomes:proofRecords},seconds:Math.min(300,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return response?.value??response;}});
-   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED'});
+    allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(300,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return response?.value??response;}});
+   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
    assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal),updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
    const candidate={id,instruction:reviewed.changes[0].text,scope:reviewed.changes[0].scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal:reviewed,qa:{verdict:qa.verdict,approval:qa.approval},evidence:written.value.claims.flatMap(claim=>claim.proofs)};
    await save(candidateFile,{identity,candidate});return candidate;
   }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}});
   const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');if(infrastructureCause)throw infrastructureCause;
-  if(failures.length){const result={status:'rejected',reason:failures[0].reason.message};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
+  if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
   assert(new Set(candidates.map(candidate=>candidate.instruction)).size===3,'Three distinct instruction candidates required');await save(registry,{identity,candidates});return candidates;
  };
 }
 
 function trials(rows,task){assert(rows?.length===5,'Every arm requires five trials');return rows.map(row=>{assert(!row.infrastructure,'Infrastructure cannot establish skill benefit');return validatePilotTrial(structuredClone(row),task);});}
+
+function completeOperation(report,directory,id,kind){
+ const operation=report.operations?.[id],path=join(directory,'operations',id);
+ assert(operation?.status==='complete'&&operation.kind===kind&&operation.result!==undefined,'Missing complete '+kind+' operation: '+id);
+ assert.equal(resolve(operation.directory),resolve(path),'Operation directory changed: '+id);
+ return operation;
+}
+
+async function focusedPublicationEvidence(report,manifest,family,directory,{requireTransfer=true}={}){
+ assert.equal(report.manifestSha256,hash(manifest),'Frozen focused pilot manifest or fixture changed');
+ assert(Object.values(report.operations).every(operation=>operation.status==='complete'),'Focused pilot operations remain unresolved');
+ const tasks=[family.development,...family.transfer];
+ assert(new Set(tasks.map(task=>hash(task.files))).size===3&&new Set(family.transfer.map(task=>task.changeType)).size===2&&family.transfer.every(task=>task.changeType&&task.relation),'Two independent transfer fixtures required');
+ const qualification=async task=>{
+  const key=family.id+'--'+task.id,retained=report.qualifications[key];
+  assert(task.controls?.calibration?.files&&retained?.qualified===true&&retained.referencePassed===true&&retained.negativeFailed===true&&retained.calibrationPassed===true,'Focused task controls must qualify: '+task.id);
+  assert.equal(report.checkerHashes?.[key],textHash(await readFile(task.checker)),'Frozen checker changed: '+task.id);
+  assert.deepEqual(retained,completeOperation(report,directory,'qualify--'+key,'qualify').result,'Qualification operation result changed');
+  return retained;
+ };
+ const boundTrials=(rows,phase,task,arm)=>{
+  const prefix=[phase,family.id,task.id,arm].join('--');
+  return trials(rows,task).map((row,index)=>{
+   const operation=completeOperation(report,directory,prefix+'--'+index,'trial');
+   assert.deepEqual(row,validatePilotTrial(operation.result,task),'Trial operation result changed: '+prefix+'--'+index);
+   return row;
+  });
+ };
+ const developmentQualification=await qualification(family.development);
+ const screen=boundTrials(report.screens[family.id],'screen',family.development,'baseline');
+ assert.equal(focusedBaselineDecision(screen),'admitted','Development baseline did not qualify for focused writing');
+ assert.deepEqual(trials(report.development.baseline,family.development),screen,'Focused development baseline must reuse the screened cohort');
+ const development={baseline:screen};
+ for(const candidate of report.candidates)development[candidate.id]=boundTrials(report.development[candidate.id],'development',family.development,candidate.id);
+ const winner=pilotWinner(development,report.candidates);
+ assert(winner&&hash(winner)===hash(report.winner),'Development winner changed');
+ for(const task of requireTransfer?family.transfer:[]){
+  await qualification(task);
+  const rows=report.confirmation[task.id];
+  assert(rows,'Missing focused transfer comparison');
+  const baseline=boundTrials(rows.baseline,'transfer-screen',task,'baseline');
+  assert.equal(focusedBaselineDecision(baseline),'admitted','Transfer baseline did not qualify for a candidate: '+task.id);
+  const candidate=boundTrials(rows[winner.id],'confirmation',task,winner.id);
+  assert(pilotWinner({baseline,[winner.id]:candidate},[winner]),'Both transfers must improve by two successes without control regression');
+ }
+ return {winner,developmentQualification};
+}
+
+async function focusedDesignOperation(report,family,directory,identity){
+ const first=completeOperation(report,directory,'design--'+family.id,'design');
+ let accepted=first;
+ if(report.operations['redesign--'+family.id]){
+  const feedback=first.result?.revisionFeedback;
+  assert(first.result?.status==='rejected'&&typeof feedback==='string'&&feedback.trim(),'Redesign requires retained QA feedback');
+  assert.deepEqual(await load(join(first.directory,'design-disposition.json')),{identity,...first.result},'Redesign QA disposition changed');
+  accepted=completeOperation(report,directory,'redesign--'+family.id,'design');
+ }
+ assert.deepEqual(accepted.result,report.candidates,'Reviewed design operation result changed');
+ return accepted.directory;
+}
+
+async function requireFocusedApproval({config,item,base,family,screen,qualification,designDirectory,identity,winner}){
+ const directory=join(designDirectory,winner.id);
+ const candidate=await load(join(directory,'approved-candidate.json'));
+ assert.deepEqual(candidate,{identity,candidate:winner},'Reviewed candidate receipt changed');
+ const qaDirectory=join(directory,'qa');
+ const initial=await load(join(qaDirectory,'qa.json'));
+ const qa=initial?.format===2?initial:await load(join(qaDirectory,'qa-v2.json'));
+ assert(qa?.format===2&&qa.verdict==='approved'&&qa.proofProtocol==='claim-proofs-v1'&&!qa.retryable&&!qa.inFlight&&!Object.keys(qa.inFlightOperations??{}).length,'Terminal focused QA approval required');
+ assert.deepEqual(qa.proposal,winner.proposal,'QA approved proposal changed');
+ assert.equal(qa.rounds?.at(-1)?.review?.verdict,'approved','Final QA review must approve the candidate');
+ assert.deepEqual(qa.rounds.at(-1).proposal,winner.proposal,'Final QA review approved a different proposal');
+ const writer=await load(join(directory,'writer-result.json'));
+ assert(writer?.value,'Retained writer evidence required for focused QA');
+ const {groups,evaluationContract}=designEvidence(item,family.development,screen,qualification);
+ const entries=await guidanceEntries(config.root,base),memoryEvidence=memoryEntries(writer.retrievals??[]);
+ const expected=qaIdentity({groups,entries,objective:item.objective,target:config.target,memoryEvidence,evaluationContract},winner.proposal);
+ assert.equal(qa.approval,expected,'Focused QA approval changed');
+ assert.equal(winner.qa.approval,expected,'Winner differs from the focused QA approval');
+}
+
+/** Validate the same development and QA evidence used for activation. */
+export async function verifyFocusedSearchableApproval({config,item,result,manifest,family,directory}){
+ assert(manifest.mode==='focused-correctness'&&item.objective==='correctness','Focused correctness evidence required');
+ const base=item.base??config.skills.activeVersion;
+ const baseline=await skillInput(join(config.root,'skills','versions',base));
+ assert.equal(manifest.baseline,baseline.text,'Tested baseline guidance changed');
+ assert.equal(result.candidates?.length,3,'Three reviewed candidates required');
+ const {winner,developmentQualification}=await focusedPublicationEvidence(result,manifest,family,directory,{requireTransfer:false});
+ await checkVersion(config,winner);
+ assert.equal(winner.base,base);
+ assert.equal(winner.baselineSha256,baseline.sha256);
+ const screen=result.screens[family.id];
+ const identity=designIdentity({base,baseline:baseline.sha256,family:{id:family.id,development:family.development,evidence:family.evidence??[]},results:screen,identities:manifest.identities,item});
+ const designDirectory=await focusedDesignOperation(result,family,directory,identity);
+ const registry=await load(join(designDirectory,'approved-design.json'));
+ assert.equal(registry?.identity,identity,'Design evidence identity changed');
+ assert(registry.candidates.some(candidate=>hash(candidate)===hash(winner)),'Winner differs from its reviewed version');
+ await requireFocusedApproval({config,item,base,family,screen,qualification:developmentQualification,designDirectory,identity,winner});
+ return designDirectory;
+}
+
 /** Recheck the persisted evidence and exact reviewed version before the existing atomic publisher. */
 export async function publishFailureWinner({config,item,result,directory,signal,recoverOnly=false},dependencies={}){
  const ops={readConfig,publish:publishSkillVersion,record:async request=>{
@@ -106,17 +222,26 @@ export async function publishFailureWinner({config,item,result,directory,signal,
  const saved=await load(join(directory,'pilot.json')),manifest=validatePilotManifest(await load(join(directory,'manifest.json')));assert(saved&&hash(saved)===hash(result),'Only the persisted complete pilot result can publish');
  const base=item.base??config.skills.activeVersion,baseline=await skillInput(join(config.root,'skills','versions',base));assert.equal(manifest.baseline,baseline.text,'Tested baseline guidance differs from the active skill');
  assert.equal(item.objective,'correctness');assert(result.status==='complete'&&result.promising===true&&result.winner,'Transfer-confirmed result required');
- const family=manifest.families.find(row=>row.id===result.selectedFamily),qualified=result.qualifications[family?.id];assert(family&&qualified?.qualified&&qualified.referencePassed&&qualified.negativeFailed,'Qualified family required');
- const screen=trials(result.screens[family.id],family.development);assert(screen.filter(row=>!row.correct&&row.mechanismMatch).length>=3,'Baseline struggle was not established');
+ const focused=manifest.mode==='focused-correctness';
+ const family=manifest.families.find(row=>row.id===result.selectedFamily);assert(family,'Qualified family required');
  assert(result.candidates.length===3&&new Set(result.candidates.map(candidate=>candidate.id)).size===3,'Three reviewed candidates required');
- const development=Object.fromEntries([['baseline',trials(result.development.baseline,family.development)],...result.candidates.map(candidate=>[candidate.id,trials(result.development[candidate.id],family.development)])]);
- const winner=pilotWinner(development,result.candidates);assert(winner&&hash(winner)===hash(result.winner),'Development winner changed');
- for(const task of family.transfer){const rows=result.confirmation[task.id];assert(rows&&pilotWinner({baseline:trials(rows.baseline,task),[winner.id]:trials(rows[winner.id],task)},[winner]),'Both transfers must improve by two successes without control regression');}
+ let winner,developmentQualification;
+ if(focused){({winner,developmentQualification}=await focusedPublicationEvidence(result,manifest,family,directory));}
+ else{
+  const qualified=result.qualifications[family.id];assert(qualified?.qualified&&qualified.referencePassed&&qualified.negativeFailed,'Qualified family required');
+  const screen=trials(result.screens[family.id],family.development);assert(screen.filter(row=>!row.correct&&row.mechanismMatch).length>=3,'Baseline struggle was not established');
+  const development=Object.fromEntries([['baseline',trials(result.development.baseline,family.development)],...result.candidates.map(candidate=>[candidate.id,trials(result.development[candidate.id],family.development)])]);
+  winner=pilotWinner(development,result.candidates);assert(winner&&hash(winner)===hash(result.winner),'Development winner changed');
+  for(const task of family.transfer){const rows=result.confirmation[task.id];assert(rows&&pilotWinner({baseline:trials(rows.baseline,task),[winner.id]:trials(rows[winner.id],task)},[winner]),'Both transfers must improve by two successes without control regression');}
+ }
  assert.equal(family.transfer.length,2);assert(winner.qa?.verdict==='approved'&&winner.qa.approval,'Reviewed candidate required');await checkVersion(config,winner);
  assert.equal(winner.base,base);assert.equal(baseline.sha256,winner.baselineSha256,'Tested baseline changed');
- const designDirectory=result.operations['design--'+family.id]?.directory;assert(designDirectory,'Missing reviewed design operation');const registry=await load(join(designDirectory,'approved-design.json'));
- assert.equal(registry?.identity,designIdentity({base,baseline:winner.baselineSha256,family:{id:family.id,development:family.development,evidence:family.evidence??[]},results:result.screens[family.id],identities:manifest.identities,item}),'Design evidence identity changed');
+ const designId=designIdentity({base,baseline:winner.baselineSha256,family:{id:family.id,development:family.development,evidence:family.evidence??[]},results:result.screens[family.id],identities:manifest.identities,item});
+ const designDirectory=focused?await focusedDesignOperation(result,family,directory,designId):result.operations['design--'+family.id]?.directory;
+ assert(designDirectory,'Missing reviewed design operation');const registry=await load(join(designDirectory,'approved-design.json'));
+ assert.equal(registry?.identity,designId,'Design evidence identity changed');
  assert(registry.candidates.some(candidate=>hash(candidate)===hash(winner)),'Winner differs from its reviewed version');
+ if(focused)await requireFocusedApproval({config,item,base,family,screen:result.screens[family.id],qualification:developmentQualification,designDirectory,identity:designId,winner});
  const publicationFile=join(directory,'publication.json'),identity=hash({study:result.identity,result:hash(result),base,version:winner.version,text:winner.textSha256,storage:Boolean(config.storage)}),prior=await load(publicationFile);if(prior)assert.equal(prior.identity,identity,'Publication evidence changed');
  const record=async()=>{if(config.storage)await ops.record({config,candidate:winner.version,base,signal});};
  const current=await ops.readConfig(config.root);if(current.skills.activeVersion!==base){if(current.skills.activeVersion===winner.version&&prior){if(!prior.recordComplete)await record();const recovered={...prior,published:true,memoryRecorded:Boolean(config.storage),recordComplete:true,recovered:true};await save(publicationFile,recovered);return recovered;}return {published:false,reason:'stale-base'};}

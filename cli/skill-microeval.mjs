@@ -78,8 +78,8 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const begun=performance.now(),hiddenPaths=await sandboxDirectories(localFilesystemSandbox);
  const sdk=await import('@earendil-works/pi-coding-agent');
  const agentDir=join(sessionDirectory,'agent');await mkdir(agentDir,{recursive:true});
- const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}});
- let unresolvedExecution;
+ const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true,maxRetries:5}});
+ let unresolvedExecution,targetDispatched=false;
  const sampleAbort=new AbortController(),sampleSignal=signal?AbortSignal.any([signal,sampleAbort.signal]):sampleAbort.signal,remaining=()=>Math.max(.001,seconds-(performance.now()-begun)/1000),pending=new Set();
  const local=createLocalExecutionOperations(sdk),{resolveToCwd}=await import(new URL('./core/tools/path-utils.js',import.meta.resolve('@earendil-works/pi-coding-agent')).href),taskRoot=await realpath(cwd);
  if(hiddenPaths.some(path=>path.startsWith(taskRoot+'/')))throw Error('Hidden directories cannot be inside the actor workspace');
@@ -107,6 +107,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
     const merged=options.signal?AbortSignal.any([sampleSignal,options.signal]):sampleSignal;merged.throwIfAborted();
     // Cleanup uses the retained parent allocation plus its cleanup-only grace.
     // The work signal still forbids any new dispatch after work expires.
+    targetDispatched=true;
     const operation=targetEnvironment.execute(command,path,{...options,signal:merged,...(allocationSignal?{stopSignal:allocationSignal}:{}),timeout:Math.min(options.timeout??Infinity,remaining())});pending.add(operation);
     try{const result=await operation;if(!result.settled){unresolvedExecution={handle:result.handle??null};interrupt(Error('Target execution remains unresolved: '+result.handle));}return result;}
     catch(error){const unknown=unknownExecution(error);if(unknown){unresolvedExecution=unknown;interrupt(error);}throw error;}finally{pending.delete(operation);}
@@ -123,7 +124,18 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await skillModelFromProfile(profile,{directory:sessionDirectory??cwd}),thinkingLevel:'off',
   tools:['read','write','edit','grep','find','ls','bash',...(targetEnvironment?['rsi_target']:[]),...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
  let timedOut=false,failure,lastAssistant;
- const unsubscribe=session.subscribe(event=>{if(event.type==='message_end'&&event.message.role==='assistant')lastAssistant=event.message;});
+ const requests=[];
+ const unsubscribe=session.subscribe(event=>{
+  const at=new Date().toISOString();
+  if(event.type==='message_start'&&event.message.role==='assistant')requests.push({event:'response-start',at});
+  if(event.type==='message_end'&&event.message.role==='assistant'){
+   lastAssistant=event.message;
+   const error=lastAssistant.errorMessage??'';
+   requests.push({event:'response-end',at,outcome:lastAssistant.stopReason,timeout:/timed? out|timeout/i.test(error),usage:lastAssistant.usage});
+  }
+  if(event.type==='auto_retry_start'||event.type==='auto_retry_end')
+   requests.push({event:event.type,at,attempt:event.attempt,delayMs:event.delayMs,success:event.success});
+ });
  let aborting;const interrupt=reason=>{sampleAbort.abort(reason);aborting??=session.abort();void aborting.catch(()=>{});};
  const timer=setTimeout(()=>{timedOut=true;interrupt(Error('Sample elapsed allocation exhausted'));},Math.max(1,seconds*1000-(performance.now()-begun)));
  const abort=()=>interrupt(signal.reason??Error('Sample interrupted'));signal?.addEventListener('abort',abort,{once:true});
@@ -141,8 +153,9 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   try{await session.exportToJsonl(join(sessionDirectory,'session.native.jsonl'));}
   finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
+ await writeFile(join(sessionDirectory,'pi-request-events.jsonl'),requests.map(row=>JSON.stringify(row)+'\n').join(''),{mode:0o600});
  const stats=session.getSessionStats();
- return {timedOut,error:failure??null,...(unresolvedExecution?{unresolvedExecution}:{}),tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
+ return {targetDispatched,timedOut,error:failure??null,...(unresolvedExecution?{unresolvedExecution}:{}),tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 

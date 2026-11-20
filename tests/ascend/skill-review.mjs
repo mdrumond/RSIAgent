@@ -340,11 +340,12 @@ test('native classification batches validate all group IDs and correct missing o
  const {nativeClassifyBatch}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'native-batch');
  const groups=['first','second'].map(id=>({id,occurrences:[{reference:id+':event',data:{message:id+' failure'},artifacts:[]}]}));
  const rows=groups.map(group=>({groupId:group.id,cause:'unknown',coverage:'uncovered',guidanceIds:[],reason:'The evidence is inconclusive.',evidenceRefs:[group.occurrences[0].reference]}));
+ const bracketClaims=batchClaims(rows);for(const claim of bracketClaims.claims)claim.path=claim.path.replace(/classifications\.(\d+)\./,'classifications[$1].');
  const provider=await scriptedReview(t,f.root,(_body,n)=>[
   {name:'read',args:{path:'input.json'}},
   {name:'submit_review',args:{result:batchClaims(rows.slice(0,1))}},
   {name:'submit_review',args:{result:batchClaims([rows[0],rows[0]])}},
-  {name:'submit_review',args:{result:batchClaims(rows)}}
+  {name:'submit_review',args:{result:bracketClaims}}
  ][n]);
  const result=await nativeClassifyBatch({directory,config:{actor:provider.profile},groups,entries:[],seconds:30,validate:r=>validateClassificationBatch(r,groups,[])});
  assert.deepEqual(result.value.classifications.map(r=>r.groupId),groups.map(g=>g.id));assert.equal(provider.requests(),5);

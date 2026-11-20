@@ -171,3 +171,112 @@ test('coherently persisted pilot with a different baseline cannot publish',async
  const report={...f.report,identity:'coherently-replaced-study'};await writeFile(join(f.directory,'pilot.json'),JSON.stringify(report));let published=0;
  await assert.rejects(publishFailureWinner({config:f.config,item:f.item,result:report,directory:f.directory},{publish:async()=>{published++;return true;}}),/Tested baseline guidance differs/);assert.equal(published,0);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
+
+test('focused writing requires one exact failure and room for two additional passes',async t=>{
+ const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps);
+ const makeInput=baselineResults=>({...f.input,mode:'focused-correctness',baselineResults});
+ const other={...result(false),mechanismMatch:false};
+ await assert.rejects(design(makeInput([result(true),other,other,other,other])),/writing gate/);
+ await assert.rejects(design(makeInput([result(true),result(true),result(true),result(true),result(false)])),/writing gate/);
+ assert.equal(f.calls.length,0);
+ const rows=await design(makeInput([result(true),result(false),other,other,other]));
+ assert.equal(rows.length,3);
+});
+
+test('focused review returns concrete feedback for one fresh writing attempt',async t=>{
+ const f=await fixture(t);
+ let reject=true;
+ f.deps.qaReview=async()=>reject
+  ?{verdict:'revise',reason:'Specify where the type of the branch result must remain stable',issues:[{issue:'Type stability boundary'}]}
+  :{verdict:'approved',reason:'General instruction with a stated boundary'};
+ const design=createFailureDesign({config:f.config,item:f.item},f.deps),input={...f.input,mode:'focused-correctness'};
+ const first=await design(input);
+ assert.equal(first.status,'rejected');
+ assert.match(first.revisionFeedback,/branch result/);
+ assert.deepEqual(await design(input),first);
+ reject=false;
+ const second=await design({...input,directory:join(f.root,'design-revision'),revisionFeedback:first.revisionFeedback});
+ assert.equal(second.length,3);
+ assert(f.calls.slice(3).every(call=>call.prompt.revisionFeedback===first.revisionFeedback));
+});
+
+async function focusedStudy(t,{redesign=false}={}){
+ const f=await fixture(t),directory=join(f.root,'pilot'),chosen=family();
+ for(const [index,task] of [chosen.development,...chosen.transfer].entries()){
+  task.files={'kernel.py':'retained failing source for '+task.id};
+  task.checker=join(f.root,task.id+'-checker.py');
+  await writeFile(task.checker,'# Frozen private oracle for '+task.id+'\n');
+  task.controls.calibration={files:{'kernel.py':'private calibration for '+task.id}};
+  if(index){task.changeType=index===1?'layout':'operation';task.relation='Independent adaptation for '+task.id;}
+ }
+ if(redesign){
+  const approve=f.deps.qaReview;
+  f.deps.qaReview=async input=>input.directory.includes('/operations/design--')?{
+   verdict:'revise',reason:'Specify the applicability boundary',issues:[{issue:'Scope is incomplete'}],
+  }:approve(input);
+ }
+ const manifest={mode:'focused-correctness',baseline:f.input.baseline,identities:f.input.identities,families:[chosen]};
+ const report=await runFailurePilot({directory,manifest,trialSeconds:1,seconds:120,concurrency:4},{
+  qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+  design:createFailureDesign({config:f.config,item:f.item},f.deps),
+  trial:async input=>{
+   if(input.arm==='baseline')return input.repetition<2?result(true):input.repetition===2?result(false):{...result(false),mechanismMatch:false};
+   return result(input.arm==='principle-a');
+  },
+ });
+ assert.equal(report.promising,true,report.reason);
+ return {...f,directory,manifest,chosen,report};
+}
+
+test('focused pilot publishes the exact reviewed revision after both admitted transfers',async t=>{
+ const f=await focusedStudy(t,{redesign:true}),input={config:f.config,item:f.item,result:f.report,directory:f.directory};
+ assert(f.report.operations['redesign--retained']);
+ const receipt=await publishFailureWinner(input);
+ assert.equal(receipt.published,true);
+ assert.equal((await readConfig(f.root)).skills.activeVersion,f.report.winner.version);
+});
+
+test('focused publication refuses changed transfer fixture and never invokes the publisher',async t=>{
+ const f=await focusedStudy(t),input={config:f.config,item:f.item,result:f.report,directory:f.directory};
+ const manifest=structuredClone(f.manifest);
+ manifest.families[0].transfer[0].files['kernel.py']='different untested transfer';
+ await writeFile(join(f.directory,'manifest.json'),JSON.stringify(manifest));
+ let calls=0;
+ await assert.rejects(publishFailureWinner(input,{publish:()=>++calls}),/fixture|manifest/i);
+ await writeFile(join(f.directory,'manifest.json'),JSON.stringify(f.manifest));
+ await writeFile(f.chosen.transfer[0].checker,'# Changed oracle\n');
+ await assert.rejects(publishFailureWinner(input,{publish:()=>++calls}),/Frozen checker changed/i);
+ assert.equal(calls,0);
+});
+
+test('focused publication refuses independent changes to the QA receipt or completed operation result',async t=>{
+ const f=await focusedStudy(t),input={config:f.config,item:f.item,result:f.report,directory:f.directory};
+ const qa=join(f.report.operations['design--retained'].directory,f.report.winner.id,'qa','qa.json');
+ const original=await readFile(qa,'utf8');
+ const changed={...JSON.parse(original),approval:'changed'};
+ await writeFile(qa,JSON.stringify(changed));
+ let calls=0;
+ await assert.rejects(publishFailureWinner(input,{publish:()=>++calls}),/QA approval/i);
+ await writeFile(qa,original);
+ const writer=join(f.report.operations['design--retained'].directory,f.report.winner.id,'writer-result.json');
+ const writerSnapshot=await readFile(writer,'utf8'),replacedMemory=JSON.parse(writerSnapshot);
+ replacedMemory.retrievals[0].entries[0].text='Different memory from what QA reviewed';
+ await writeFile(writer,JSON.stringify(replacedMemory));
+ await assert.rejects(publishFailureWinner(input,{publish:()=>++calls}),/QA approval/i);
+ await writeFile(writer,writerSnapshot);
+ const tampered=structuredClone(f.report);
+ tampered.operations['confirmation--retained--stride-transfer--principle-a--0'].result=result(false);
+ await writeFile(join(f.directory,'pilot.json'),JSON.stringify(tampered));
+ await assert.rejects(publishFailureWinner({...input,result:tampered},{publish:()=>++calls}),/operation result/i);
+ assert.equal(calls,0);
+});
+
+test('focused publication requires a separate exact baseline recurrence in each transfer',async t=>{
+ const f=await focusedStudy(t),report=structuredClone(f.report);
+ report.confirmation['stride-transfer'].baseline[2].mechanismMatch=false;
+ report.operations['transfer-screen--retained--stride-transfer--baseline--2'].result.mechanismMatch=false;
+ await writeFile(join(f.directory,'pilot.json'),JSON.stringify(report));
+ let calls=0;
+ await assert.rejects(publishFailureWinner({config:f.config,item:f.item,result:report,directory:f.directory},{publish:()=>++calls}),/Transfer baseline/i);
+ assert.equal(calls,0);
+});

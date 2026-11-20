@@ -12,6 +12,7 @@ import {readConfig} from './instance.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {skillModelIdentity,skillConfig} from '../controller/skill-context.mjs';
 import {runFailurePilot} from './skill-failure-pilot.mjs';
+import {searchableMemoryFingerprint} from './skill-searchable.mjs';
 
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const optional=async path=>{try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
@@ -26,7 +27,8 @@ export function failureMemoryGeneration(config,state){
  const generated=table(state.db,'generation_events')?state.db.prepare('SELECT max(sequence) n FROM generation_events').get().n:null;
  let generation=null;const path=join(config.root,'knowledge.sqlite');
  if(existsSync(path)){const db=new DatabaseSync(path,{readOnly:true});try{if(table(db,'active_generation'))generation=db.prepare('SELECT revision FROM active_generation').get()?.revision;}finally{db.close();}}
- return hash({base:config.skills.activeVersion,generation,cutoff,generated,attention:attentionRevision(state.db)});
+ const admissions=searchableMemoryFingerprint(state.db);
+ return hash({base:config.skills.activeVersion,generation,cutoff,generated,attention:attentionRevision(state.db),...(admissions?{admissions}:{})});
 }
 
 export async function failureCampaignStatus(config){
@@ -67,6 +69,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   family:async args=>(await import('./skill-failure-families.mjs')).prepareFailureFamily(args,{session:async input=>(await import('./skill-review-native.mjs')).reviewSession({...input,config:knowledgeConfig})}),
   runtime:async args=>(await import('./skill-failure-runtime.mjs')).createFailureRuntime(args),
   design:async args=>(await import('./skill-failure-candidates.mjs')).createFailureDesign(args),
+  admit:async args=>(await import('./skill-searchable.mjs')).admitSearchableSkill(args),
   publish:async args=>(await import('./skill-failure-candidates.mjs')).publishFailureWinner(args),
   pilot:runFailurePilot,model:skillModelIdentity,input:skillInput,...dependencies};
  let run,cp,timer,runtime,closed=true;
@@ -81,6 +84,21 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(!item)return {status:'idle',reason:'No eligible correctness family'};
   if(item.objective!=='correctness'||item.proposal?.action==='update')throw Error('Legacy proposal cannot enter failure-first screening');
   const retained=existing&&backlog.run(existing.id);
+  if(retained?.checkpoint?.phase==='admit-searchable'){
+   const directory=join(retained.checkpoint.directory,'pilot');
+   const result=await optional(join(directory,'pilot.json'));
+   const admission=await ops.admit({config,item:retained.snapshot,directory,result,signal});
+   if(!admission?.admitted)throw Error(admission?.reason??'Searchable skill admission refused');
+   const elapsed=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
+   const status=elapsed<retained.seconds?'accepted':'inconclusive';
+   const outcome={reason:'searchable-admission-recovered',searchable:true,admission};
+   backlog.atomic(()=>{
+    backlog.checkpoint(retained.id,{elapsed,checkpoint:retained.checkpoint});
+    backlog.finish(retained.id,{status,result:outcome});
+    backlog.meta('failure-first-current',null);
+   });
+   return {status,...outcome};
+  }
   if(retained?.checkpoint?.phase==='publish'){
    const saved=await optional(join(retained.checkpoint.directory,'pilot','pilot.json'));
    const elapsedAtResume=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
@@ -106,7 +124,13 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const remaining=()=>Math.max(0,Math.min(run.seconds-(now()-cp.startedAt)/1000,remainingSeconds));
   const save=()=>{backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});};
   const phase=name=>{cp.phase=name;save();backlog.meta('failure-first-status',{status:'running',phase:name,at:now()});};
-  const finish=(status,result)=>{save();backlog.finish(run.id,{status,result});backlog.meta('failure-first-current',null);backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory});return {status,...result};};
+  const finish=(status,result)=>backlog.atomic(()=>{
+   save();
+   backlog.finish(run.id,{status,result});
+   backlog.meta('failure-first-current',null);
+   backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory});
+   return {status,...result};
+  });
   const failure=new AbortController();save();timer=setInterval(()=>{try{save();}catch(error){failure.abort(error);}},1000);
   if(remaining()<=0)throw Error('Experiment elapsed allowance exhausted');
   const active=AbortSignal.any([failure.signal,...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining()*1000)))]),cleanup=AbortSignal.timeout(Math.max(1,Math.ceil((remaining()+90)*1000)));
@@ -155,7 +179,8 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const memoryIdentity={snapshot:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null};
   let manifest=await optional(join(cp.directory,'experiment.json'));
   if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
-   manifest={baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
+   const focused=[prepared.family.development,...prepared.family.transfer].every(task=>task.controls?.calibration?.files);
+   manifest={...(focused?{mode:'focused-correctness'}:{}),baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
    cp.initialElapsedSeconds=(now()-cp.startedAt)/1000;await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
   const currentConfig=skillConfig(await readConfig(config.root));
   if(currentConfig.skills.activeVersion!==run.base||hash(manifest.identities.memory)!==hash(memoryIdentity)||hash(manifest.identities.model)!==hash(await modelIdentities(currentConfig))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
@@ -164,7 +189,16 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
   closed=await runtime.close();runtime=null;if(!closed)throw Error('Experiment execution remains unresolved');
   if(result.status!=='complete')throw Error(result.reason??'Incomplete experiment');
-  if(!result.promising)return finish('rejected',{reason:result.reason,result});
+  if(!result.promising){
+   if(config.target!=='a5'||manifest.mode!=='focused-correctness'||!result.winner)
+    return finish('rejected',{reason:result.reason,result});
+   phase('admit-searchable');
+   const admission=await ops.admit({config,item:run.snapshot,directory:join(cp.directory,'pilot'),result,signal:active});
+   if(!admission?.admitted)throw Error(admission?.reason??'Searchable skill admission refused');
+   return finish(remaining()>0?'accepted':'inconclusive',{reason:'searchable-development-improvement',searchable:true,result,admission});
+  }
+  if(config.target!=='a5'&&manifest.mode==='focused-correctness')
+   return finish('inconclusive',{reason:'Focused correctness confirmation retained for review',result});
   phase('publish');const publication=await ops.publish({config,item:run.snapshot,result,directory:join(cp.directory,'pilot'),signal:active});
   if(!publication?.published)throw Error(publication?.reason??'Validated skill publication refused');
   return finish('accepted',{reason:'protected-transfer-improvement',result,publication});

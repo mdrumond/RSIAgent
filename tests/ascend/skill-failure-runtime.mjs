@@ -10,7 +10,7 @@ async function oracleRun(root,checker,guard={}){const file=join(root,randomUUID(
 
 test('trusted process guard preserves recorded failure only with source identity and full child closure',async t=>{
  const root=await fixture(t);await writeFile(join(root,'kernel.py'),'answer=0\n');const checker=join(root,'check.py');
- await writeFile(checker,receiptCode('False',"subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);time.sleep(60)"));const failed=await oracleRun(root,checker);assert.equal(failed.correct,false);assert.equal(failed.evidence.cleanupElapsedAfterFailure,true);assert.equal(failed.evidence.processGuard.allChildrenReaped,true);
+ await writeFile(checker,receiptCode('False',"subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);time.sleep(60)"));const failed=await oracleRun(root,checker,{seconds:2,cleanupSeconds:.25});assert.equal(failed.correct,false,JSON.stringify(failed));assert.equal(failed.evidence.cleanupElapsedAfterFailure,true);assert.equal(failed.evidence.processGuard.allChildrenReaped,true);
  for(const ending of ['sys.exit(1)',"raise RuntimeError('after receipt')"]){await writeFile(checker,receiptCode('True',ending));assert.equal((await oracleRun(root,checker)).correct,null);}
  await writeFile(checker,receiptCode('True','time.sleep(60)'));assert.equal((await oracleRun(root,checker)).correct,null);
  await writeFile(checker,receiptCode('True','time.sleep(0.25)'));
@@ -86,7 +86,7 @@ test('production adapter uses native Pi and real MCP warm memory, isolates oracl
  assert.deepEqual(record.filter(r=>r.kind==='actor').map(r=>[r.seconds,r.guidance]),[[10,'complete baseline guidance'],[10,'complete candidate guidance']]);assert.equal(record.filter(r=>r.kind==='verification').slice(-2).every(r=>r.seconds===17),true);
  const count=record.length,reopened=await createFailureRuntime({config,directory,slots,knowledge:memory.knowledge},deps),recovered=await reopened.settle({directory:join(directory,'candidate')});assert.deepEqual(recovered.result,candidate);assert.equal(record.length,count);assert.equal((await failureRuntimeSettled({directory,config},deps)).closed,true);assert.equal(await runtime.close(),true);
  const second={...family,id:'second-family',development:{...family.development,files:{'kernel.py':'answer=-1\n'}}};assert.equal((await runtime.qualify({family:second,directory:join(directory,'second-family'),remainingSeconds:30})).qualified,true);
- const adapter=JSON.parse(await readFile(join(directory,'candidate','adapter.json'),'utf8'));assert.equal(await readFile(join(adapter.cwd,'mask-proof.json'),'utf8'),'hidden');await writeFile(join(adapter.cwd,'kernel.py'),'answer=99\n');await assert.rejects(reopened.settle({directory:join(directory,'candidate')}),/Recovered source changed/);
+ const adapter=JSON.parse(await readFile(join(directory,'candidate','adapter.json'),'utf8'));const requests=(await readFile(join(adapter.cwd,'..','pi-request-events.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert(requests.some(row=>row.event==='response-end'&&row.outcome!== 'error'));assert.equal(await readFile(join(adapter.cwd,'mask-proof.json'),'utf8'),'hidden');await writeFile(join(adapter.cwd,'kernel.py'),'answer=99\n');await assert.rejects(reopened.settle({directory:join(directory,'candidate')}),/Recovered source changed/);
  await writeFile(checker,'changed oracle');await assert.rejects(runtime.qualify({family,directory:join(directory,'changed'),remainingSeconds:30}),/Frozen task changed/);
  await memory.close();await rm(join(memory.config.root,'knowledge.sqlite'));let starts=0;await assert.rejects(prepareFailureMemory({config,directory:join(root,'views'),generation:{revision:'fixed',attention:1}},{ensure:async()=>{starts++;}}),{code:'ENOENT'});assert.equal(starts,0);
 });
@@ -103,14 +103,14 @@ test('unknown custody survives adapter restart, blocks its slot and does not req
  const seen=[];const status=await failureRuntimeSettled({config,directory},{settled:async args=>{seen.push(args);return false;}});assert.equal(status.closed,false);assert.equal(seen.length,1);assert.deepEqual(seen[0].resource,slot.resource);assert.equal(seen[0].binding.python,'qualified-python');assert.deepEqual(seen[0].binding.environment.deviceAffinity,[7]);
  const stopped=await createFailureRuntime({config,directory:join(root,'new'),slots:[slot]},deps);await assert.rejects(stopped.trial({...input,signal:AbortSignal.abort(Error('operator stop'))}),/operator stop/);assert.equal(dispatches,1);
 });
-test('provider EOF returns infrastructure only after actor custody closes and skips scoring',async t=>{
+test('Request timed out returns infrastructure only after actor custody closes and skips scoring',async t=>{
  const root=await fixture(t),checker=join(root,'checker.py');await writeFile(checker,'pass');const directory=join(root,'private'),config={target:'cpu',actor:{},environment:{options:{mode:'local'}}},slots=[{resource:{id:'slot'},physical:1}];let closures=0,verifications=0;
- const runtime=await createFailureRuntime({config,directory,slots},{target:()=>({sample:async()=>({error:'provider EOF',timedOut:false}),sampleSettled:async()=>{closures++;return true;},qualifyBatch:async()=>{verifications++;}}),settled:async()=>true});
- const result=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});assert.equal(result.infrastructure,true);assert.match(result.reason,/provider EOF/);assert.equal(closures,1);assert.equal(verifications,0);assert.equal(await runtime.close(),true);
+ const runtime=await createFailureRuntime({config,directory,slots},{target:()=>({sample:async()=>({error:'Request timed out',timedOut:false,targetDispatched:false}),sampleSettled:async()=>{closures++;return true;},qualifyBatch:async()=>{verifications++;}}),settled:async()=>false});
+ const result=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});assert.equal(result.infrastructure,true);assert.match(result.reason,/Request timed out/);assert.equal(closures,1);assert.equal(verifications,0);assert.equal(await runtime.close(),true);
 });
 test('late trusted verification is not admitted after its own allowance, independently of the actor grant',async t=>{
  const root=await fixture(t),checker=join(root,'checker.py');await writeFile(checker,'pass');const directory=join(root,'private'),config={target:'cpu',actor:{},environment:{options:{mode:'local'}}};let actorSeconds,verificationSeconds;
- const runtime=await createFailureRuntime({config,directory,slots:[{resource:{id:'slot'},physical:1}]},{target:()=>({sample:async input=>{actorSeconds=input.seconds;return {timedOut:false};},sampleSettled:async()=>true,qualifyBatch:async input=>{verificationSeconds=input.seconds;await delay(30);return [];}}),settled:async()=>true});
+ const runtime=await createFailureRuntime({config,directory,slots:[{resource:{id:'slot'},physical:1}]},{target:()=>({sample:async input=>{actorSeconds=input.seconds;return {timedOut:false,targetDispatched:false};},sampleSettled:async()=>true,qualifyBatch:async input=>{verificationSeconds=input.seconds;await delay(30);return [];}}),settled:async({directory})=>directory.endsWith('/verification')});
  const result=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:10,verificationSeconds:.01});assert.equal(result.infrastructure,true);assert.match(result.reason,/timeout/i);assert.equal(actorSeconds,10);assert.equal(verificationSeconds,.01);assert.equal(await runtime.close(),true);
 });
 test('submission checks replay the starter first and return incorrect controls for revision',async t=>{
@@ -122,4 +122,66 @@ test('submission checks replay the starter first and return incorrect controls f
  await writeFile(checker,'corrected checker');bad=false;starterPasses=true;await assert.rejects(runtime.checkReferences({family,directory:join(root,'non-reproduction'),seconds:30}),error=>error.code==='FAILURE_REFERENCE_REJECTED'&&error.message.includes('Starter must reproduce'));assert.equal(calls.length,2);starterPasses=false;const result=await runtime.checkReferences({family,directory:join(root,'accept'),seconds:30});assert.equal(result.checked,true);assert.equal(result.references.length,3);assert.equal(new Set(calls.map(c=>c.directory)).size,6);assert(calls.slice(1).every(c=>c.entries.length===1));
  bad=true;guardReason='rss-limit';await assert.rejects(runtime.checkReferences({family,directory:join(root,'memory'),seconds:30}),error=>error.code!=='FAILURE_REFERENCE_REJECTED');const count=calls.length;await assert.rejects(runtime.checkReferences({family,directory:join(root,'aborted'),seconds:30,signal:AbortSignal.abort(Error('operator stop'))}),/operator stop/);assert.equal(calls.length,count);
  unknown=true;await assert.rejects(runtime.checkReferences({family,directory:join(root,'unknown'),seconds:30}),error=>error.message==='transport disconnected'&&error.code!=='FAILURE_REFERENCE_REJECTED');assert.equal(await runtime.close(),false);await assert.rejects(runtime.checkReferences({family,directory:join(root,'blocked'),seconds:30}),/No reference slot/);
+});
+
+test('focused qualification runs one task and requires matching negative and calibration',async t=>{
+ const root=await fixture(t),checker=join(root,'checker.py');await writeFile(checker,'pass');
+ const control=value=>({files:{'kernel.py':value}}),mechanism={phase:'compile',type:'MixedScalar'};
+ const task={id:'transfer',caseIds:['value'],files:control('negative').files,checker,publicChecker:checker,
+  controls:{reference:control('reference'),calibration:control('calibration'),negatives:[control('negative')]}};
+ const family={id:'family',mechanism,development:{id:'development'},transfer:[task,{id:'other'}]};
+ const config={target:'cpu',actor:{},environment:{options:{mode:'local'}}},calls=[];
+ let calibration=true,negativeType=mechanism.type;
+ const runtime=await createFailureRuntime({config,directory:join(root,'private'),slots:[{resource:{id:'slot'},physical:1}]},{target:()=>({
+  qualifyBatch:async input=>input.entries.map(entry=>{
+   calls.push(entry.key);
+   const correct=entry.key==='reference'||entry.key==='calibration'&&calibration;
+   const sha='a'.repeat(64);
+   return {key:entry.key,sourceFilesMatch:true,sourceFilesSha256:{'kernel.py':sha},
+    output:JSON.stringify({correct,kernelSha256:sha,evidence:{phase:mechanism.phase,type:negativeType,
+     checkedCases:['value'],caseResults:[{id:'value',correct}],processGuard:{allChildrenReaped:true}}})};
+  })
+ }),settled:async()=>true});
+ const run=id=>runtime.qualify({family,task,directory:join(root,id),remainingSeconds:30});
+ assert.equal((await run('pass')).qualified,true);
+ assert.deepEqual(calls.splice(0),['reference','negative-0','calibration']);
+ calibration=false;const rejected=await run('calibration');assert.equal(rejected.qualified,false);assert.equal(rejected.calibrationPassed,false);
+ calibration=true;negativeType='WrongFailure';const unrelated=await run('unrelated');assert.equal(unrelated.qualified,false);assert.equal(unrelated.negativeFailed,false);
+});
+
+test('legacy A5 recovery requires matched terminal Pi evidence and no dispatch',async t=>{
+ const root=await fixture(t),id=randomUUID(),run=join(root,'skills','priority','failure-first',id),directory=join(run,'runtime');
+ const publicRoot=join(run,'public',randomUUID()),trial=join(publicRoot,'micro','development','0-trial'),target=join(trial,'target'),cwd=join(trial,'work');
+ const opId='screen--example--development--baseline--0',operation=join(run,'pilot','operations',opId),sessionId=randomUUID();
+ const events=join(target,'environment-events.jsonl'),native=join(trial,'session.native.jsonl'),original=join(trial,'2026-11-19T10-04-21Z_'+sessionId+'.jsonl');
+ const json=async(path,data)=>{await mkdir(resolve(path,'..'),{recursive:true});await writeFile(path,JSON.stringify(data));};
+ const lines=async(path,data)=>writeFile(path,data.map(x=>JSON.stringify(x)).join('\n')+'\n');
+ const manifest={identities:{source:'863159a786452c9365e8b35de1962996b0b92e29'}};
+ await json(join(run,'experiment.json'),manifest);await json(join(run,'pilot','manifest.json'),manifest);
+ await json(join(run,'pilot','pilot.json'),{status:'inconclusive',reason:'Actor custody remains unresolved',operations:{[opId]:{kind:'trial',status:'complete',directory:operation,result:{infrastructure:true,correct:null,reason:'Actor custody remains unresolved',handle:null}}}});
+ await json(join(operation,'adapter.json'),{publicRoot,privateRoot:join(operation,'verification'),cwd});
+ await json(join(directory,'runtime-contexts.json'),[{root:publicRoot,binding:{target:'a5',environment:{mode:'local',target:'bz-a5-2',deviceAffinity:[5]}}}]);
+ await json(join(trial,'sandbox-preflight.json'),{kind:'local-filesystem-sandbox',available:true,exitCode:0,output:''});
+ await mkdir(join(target,'.ascend-resources','a'.repeat(64)),{recursive:true});await mkdir(join(target,'.executions'));await mkdir(cwd,{recursive:true});
+ const attempt='micro-'+hash(target).slice(0,24),journal=[{type:'resource-policy'},{type:'environment-prepared',data:{project:attempt,attempt}}];
+ await lines(events,journal);
+ const record=[{type:'session',id:sessionId,cwd},{type:'message',message:{role:'user',content:[{type:'text',text:'The model, files and bash are local. Use rsi_target'}]}},{type:'message',message:{role:'assistant',stopReason:'error',errorMessage:'Request timed out',content:[]}}];
+ await lines(original,record);await lines(native,record);
+ const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
+ state.db.exec('CREATE TABLE IF NOT EXISTS skill_backlog_runs(id TEXT PRIMARY KEY,status TEXT,owner TEXT,checkpoint TEXT)');
+ const realOwner=await processIdentity(),child=spawn(process.execPath,['-e','setInterval(()=>{},1000)']);
+ t.after(()=>child.kill());const exited=new Promise((resolve,reject)=>{child.once('exit',resolve);child.once('error',reject);});
+ const stoppedOwner=await processIdentity(child.pid);child.kill();await exited;
+ const checkpoint={directory:run,runtimeDirectory:directory,workflow:'failure-first-v1',phase:'evaluate'};
+ state.db.prepare('INSERT INTO skill_backlog_runs(id,status,owner,checkpoint) VALUES(?,?,?,?)').run(id,'running',JSON.stringify(stoppedOwner),JSON.stringify(checkpoint));
+ const reconcile=async()=> (await failureRuntimeSettled({directory,config:{root,target:'a5'}},{settled:async()=>false})).closed;
+ assert.equal(await reconcile(),true);
+ await rm(native);assert.equal(await reconcile(),false);await writeFile(native,'{broken\n');assert.equal(await reconcile(),false);await lines(native,record);
+ await lines(events,[...journal,{type:'execution-starting',data:{operation:'unexpected'}}]);assert.equal(await reconcile(),false);await lines(events,journal);
+ await json(join(target,'.ascend-command-lease.json'),{token:'unexpected'});assert.equal(await reconcile(),false);await rm(join(target,'.ascend-command-lease.json'));
+ const dispatched=[...record.slice(0,2),{type:'message',message:{role:'assistant',content:[{type:'toolCall',id:'target',name:'rsi_target',arguments:{cmd:'true'}}]}},{type:'message',message:{role:'toolResult',toolCallId:'target',toolName:'rsi_target'}},record.at(-1)];
+ await lines(native,dispatched);await lines(original,dispatched);assert.equal(await reconcile(),false);await lines(native,record);await lines(original,record);
+ await json(join(run,'pilot','manifest.json'),{identities:{source:'different'}});assert.equal(await reconcile(),false);await json(join(run,'pilot','manifest.json'),manifest);
+ state.db.prepare('UPDATE skill_backlog_runs SET owner=? WHERE id=?').run(JSON.stringify(realOwner),id);
+ assert.equal(await reconcile(),false);
 });

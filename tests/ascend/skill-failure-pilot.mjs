@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdir,mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
-import {runFailurePilot,validatePilotManifest,validatePilotTrial,pilotWinner} from '../../cli/skill-failure-pilot.mjs';
+import {runFailurePilot,replayRetainedFailureTask,validatePilotManifest,validatePilotTrial,pilotWinner} from '../../cli/skill-failure-pilot.mjs';
 const task=id=>({id,caseIds:['mechanism','control'],controlCaseIds:['control'],files:{'kernel.py':'public starter'}});
 const family=id=>({id,development:task('development'),evidence:[{reference:'historical:'+id}],transfer:[{...task('transfer-a'),secret:'PRIVATE-A'},{...task('transfer-b'),secret:'PRIVATE-B'}]});
 const candidate=(id,text=id)=>({id,text,evidence:[{reference:'historical:first',startLine:1,endLine:1}]});
@@ -182,4 +183,171 @@ test('candidate IDs containing the operation delimiter never reach development t
 
 test('candidate boundary hyphens cannot alias composite operation IDs',async t=>{
  for(const id of ['principle-','-principle']){const f=await fixture(t);let later=0;const report=await runFailurePilot(f.options,{...f.ops,design:async()=>[candidate(id),...rows.slice(1)],trial:async input=>{if(input.phase!=='screen')later++;return result(false);}});assert.equal(report.status,'inconclusive');assert.equal(later,0);}
+});
+
+test('focused correctness runs each qualified baseline before its treatment',async t=>{
+ const f=await fixture(t);
+ f.manifest.mode='focused-correctness';
+ const qualified=[];
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ({task})=>{
+   qualified.push(task.id);
+   return {qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true};
+  },
+  trial:async input=>{
+   f.calls.push(['trial',input]);
+   return result(input.arm==='baseline'?input.repetition!==0: true,
+    input.arm==='baseline'&&input.repetition>1?{correct:null,reason:'outside scope'}:{});
+  },
+ });
+ assert.deepEqual(qualified,['development','transfer-a','transfer-b']);
+ assert.equal(report.promising,true);
+ for(const taskId of qualified){
+  const trials=f.calls.filter(([k,c])=>k==='trial'&&c.task.id===taskId).map(([,c])=>c);
+  assert.equal(trials.filter(c=>c.arm==='baseline').length,5);
+  assert(trials.slice(0,5).every(c=>c.arm==='baseline'));
+ }
+});
+
+test('focused ceiling and unrelated diagnostics keep the writer idle',async t=>{
+ const f=await fixture(t);
+ f.manifest.mode='focused-correctness';
+ f.manifest.families.push(family('unrelated'));
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+  trial:async input=>input.familyId==='first'?result(input.repetition<4):result(false,{mechanismMatch:false}),
+ });
+ assert.equal(report.screenDecisions.first,'baseline-ceiling');
+ assert.equal(report.screenDecisions.unrelated,'no-exact-recurrence');
+ assert.equal(report.candidates,null);
+ assert.equal(f.calls.length,0);
+});
+
+test('focused writer receives one retry for explicitly actionable review',async t=>{
+ const f=await fixture(t);
+ f.manifest.mode='focused-correctness';
+ const feedback=[];
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+  design:async input=>{
+   feedback.push(input.revisionFeedback);
+   return input.revisionFeedback?rows:{status:'rejected',reason:'Use only archived source',revisionFeedback:'Remove unsupported count'};
+  },
+ });
+ assert.deepEqual(feedback,[undefined,'Remove unsupported count']);
+ assert.equal(report.promising,true);
+});
+
+test('focused transfer stops on device failure without running its treatment',async t=>{
+ const f=await fixture(t);
+ f.manifest.mode='focused-correctness';
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+  trial:async input=>{
+   if(input.phase==='transfer-screen'&&input.repetition===1){
+    return {correct:null,infrastructure:true,reason:'Device became unavailable'};
+   }
+   return f.ops.trial(input);
+  },
+ });
+ assert.equal(report.status,'inconclusive');
+ assert.equal(report.promising,false);
+ assert.equal(report.reason,'Device became unavailable');
+ assert.equal(report.operations['transfer-screen--first--transfer-a--baseline--1'].result.infrastructure,true);
+ assert(!f.calls.some(([kind,input])=>kind==='trial'&&input.phase==='confirmation'));
+});
+
+test('focused calibration failure keeps all model roles idle',async t=>{
+ const f=await fixture(t);
+ f.manifest.mode='focused-correctness';
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:false}),
+ });
+ assert.equal(report.status,'complete');
+ assert.equal(report.promising,false);
+ assert.equal(f.calls.length,0);
+});
+
+test('focused transfer controls use a bounded qualification batch before actor trials',async t=>{
+ const f=await fixture(t);f.manifest.mode='focused-correctness';
+ const settled=new Set();
+ let active=0,peak=0;
+ const report=await runFailurePilot({...f.options,concurrency:2},{...f.ops,
+  qualify:async ({task})=>{
+   active++;peak=Math.max(peak,active);
+   try{await delay(5);settled.add(task.id);
+    return {qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true};
+   }finally{active--;}
+  },
+  trial:async input=>{
+   assert.equal(active,0,'Actors must not compete for qualification custody');
+   if(input.task.id!=='development')assert.deepEqual([...settled].sort(),['development','transfer-a','transfer-b']);
+   return f.ops.trial(input);
+  },
+ });
+ assert.equal(report.status,'complete');
+ assert.equal(report.promising,true);
+ assert.equal(peak,2);
+ assert.match(report.manifestSha256,/^[0-9a-f]{64}$/);
+});
+
+test('qualification exception settles all in-flight slots and never runs transfer actors',async t=>{
+ const f=await fixture(t);f.manifest.mode='focused-correctness';
+ let failed=false,settled=false;
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ({task})=>{
+   if(task.id==='transfer-a'){failed=true;throw Error('Qualification transport failure');}
+   if(task.id==='transfer-b'){await delay(5);settled=true;}
+   return {qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true};
+  },
+ });
+ assert.equal(failed,true);
+ assert.equal(settled,true);
+ assert.equal(report.promising,false);
+ assert.equal(report.status,'needs-settlement');
+ assert(!f.calls.some(([kind,input])=>kind==='trial'&&input.phase==='transfer-screen'));
+});
+
+for(const wins of [true,false])test('retained replay binds all saved actors and controls even if the first checker '+(wins?'qualified a winner':'found no gain'),async t=>{
+ const f=await fixture(t);f.manifest.mode='focused-correctness';
+ const task=f.manifest.families[0].development;
+ const hash=value=>createHash('sha256').update(value).digest('hex');
+ task.checker=join(f.directory,'checker.py');
+ await writeFile(task.checker,'original checker');
+ task.controls={reference:{files:{'kernel.py':'reference'}},
+  negatives:[{files:{'kernel.py':'starter'}}],calibration:{files:{'kernel.py':'calibration'}}};
+ const report=await runFailurePilot(f.options,{...f.ops,
+  qualify:async ()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+  trial:async input=>{
+   const row=await f.ops.trial(input),source=input.arm+' '+input.repetition;
+   const cwd=join(input.directory,'retained');
+   await mkdir(cwd,{recursive:true});
+   await writeFile(join(cwd,'kernel.py'),source);
+   const files={'kernel.py':hash(source)};
+   await writeFile(join(input.directory,'source-manifest.json'),JSON.stringify({cwd,files}));
+   return {...(wins?row:result(false)),sourceSha256:hash(JSON.stringify(files))};
+  },
+ });
+ assert.equal(report.promising,wins);
+ const before=await readFile(join(f.directory,'pilot.json'),'utf8');
+ const checked=[];
+ const candidateId=wins?undefined:'principle-c';
+ const replay=await replayRetainedFailureTask({directory:f.directory,taskId:'development',candidateId,checkerSha256:hash('corrected checker')},{
+  score:async ({record,files})=>{
+   checked.push(record.arm);
+   const source=files['kernel.py'].toString();
+   return {outcome:source==='starter'?'exact-failure':'pass'};
+  }
+ });
+ assert.equal(replay.freshConfirmationRequired,true);
+ assert.equal(checked.filter(a=>a==='baseline').length,5);
+ assert.equal(checked.filter(a=>a==='candidate').length,5);
+ assert(checked.includes('positive')&&checked.includes('negative')&&checked.includes('calibration'));
+ assert.equal(await readFile(join(f.directory,'pilot.json'),'utf8'),before);
+ const stored=JSON.parse(await readFile(replay.path,'utf8'));
+ assert.equal(stored.records.length,13);
+ const first=Object.values(report.operations).find(row=>row.id.startsWith('screen--'));
+ await writeFile(join(first.directory,'retained','kernel.py'),'tampered');
+ await assert.rejects(replayRetainedFailureTask({directory:f.directory,taskId:'development',candidateId,checkerSha256:hash('another checker')},
+  {score:async ()=>assert.fail('No replay after source drift')}),/Source hash mismatch/);
 });

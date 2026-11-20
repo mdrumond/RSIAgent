@@ -41,7 +41,7 @@ const choices=values=>Type.Union(values.map(value=>Type.Literal(value)));
 const strings=()=>Type.Array(nonempty());
 const classificationFields={cause:choices(['actor','harness','specification','provider','unknown']),bucket:Type.Optional(choices(['harness','correctness','optimization'])),reason:nonempty(),coverage:choices(['covered','uncovered','unknown']),guidanceIds:strings(),evidenceRefs:Type.Array(nonempty(),{minItems:1}),gap:Type.Optional(choices(['missing','insufficient','not-followed','unknown']))};
 export const classificationSchema=Type.Object({...classificationFields,claims:selectorClaims(Type.Literal('reason'))},{additionalProperties:false});
-export const classificationBatchSchema=Type.Object({classifications:Type.Array(Type.Object({groupId:nonempty(),...classificationFields},{additionalProperties:false}),{minItems:1}),claims:selectorClaims(Type.String({pattern:'^classifications[.][0-9]+[.]reason$'}))},{additionalProperties:false});
+export const classificationBatchSchema=Type.Object({classifications:Type.Array(Type.Object({groupId:nonempty(),...classificationFields},{additionalProperties:false}),{minItems:1}),claims:selectorClaims(Type.String({pattern:String.raw`^classifications(?:[.][0-9]+|\[[0-9]+\])[.]reason$`}))},{additionalProperties:false});
 const classificationOptions=(input,batch=false)=>({...input,proofRequired:true,selectorOnly:true,resultSchema:batch?classificationBatchSchema:classificationSchema,
  validate:async(value,retrievals)=>({...await input.validate(value,retrievals),claims:value.claims})});
 export const proofResultSchema=Type.Object({claims:claimsSchema},{additionalProperties:true});
@@ -99,6 +99,11 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
  const check=async(result,cached=false)=>{
+  if(schema===classificationBatchSchema&&Array.isArray(result?.claims))
+   result={...result,claims:result.claims.map(claim=>typeof claim?.path==='string'
+    ? {...claim,path:claim.path.replace(/^classifications\[(\d+)\]\.reason$/,'classifications.$1.reason')}
+    : claim)};
+
   let candidate=cached&&selectorOnly?selectorShape(result):result;
   if(cached&&schema===classificationSchema){const {groupId,intervention,...submitted}=candidate;candidate=submitted;}
   if(cached&&schema===classificationBatchSchema)candidate={...candidate,classifications:candidate.classifications?.map(({intervention,...submitted})=>submitted)};

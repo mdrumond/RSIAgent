@@ -157,3 +157,55 @@ test('A5 uses the same bounded failure-first worker through the normal CLI',asyn
  assert.equal(evaluated,true);
  assert.throws(()=>failureProtocol({...f.config,target:'cpu'}),/A3 or A5/);
 });
+
+test('A5 routes a settled focused development winner to searchable admission after failed transfer',async t=>{
+ const f=await fixture(t);
+ f.config.target='a5';
+ await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+ const calibrated=task=>({...task,controls:{calibration:{files:{'kernel.py':'calibration'}}}});
+ const prepared={...family,development:calibrated(family.development),transfer:family.transfer.map(calibrated)};
+ const winner={id:'approved'};
+ let admissions=0;
+ const ops={...f.ops,
+  family:async()=>({status:'ready',family:prepared}),
+  pilot:async({manifest})=>{
+   assert.equal(manifest.mode,'focused-correctness');
+   return {status:'complete',promising:false,winner,reason:'Transfer showed no gain'};
+  },
+  admit:async({result,directory})=>{
+   assert.equal(result.winner,winner);
+   assert(directory.endsWith('/pilot'));
+   assert.equal(f.backlog.run(f.backlog.meta('failure-first-current')).checkpoint.phase,'admit-searchable');
+   admissions++;
+   return {admitted:true,id:'experimental'};
+  },
+  publish:async()=>assert.fail('Failed transfer must not activate guidance'),
+ };
+ const outcome=await runCampaignFailureStep(f.config,f.values,ops);
+ assert.equal(admissions,1);
+ assert.equal(outcome.searchable,true);
+ assert.equal(outcome.admission.id,'experimental');
+ assert.equal((await failureCampaignStatus(f.config)).current,null);
+ assert.equal(JSON.parse(await readFile(join(f.root,'instance.json'),'utf8')).skills.activeVersion,'base');
+});
+
+test('searchable admission recovery reuses persisted evaluation without relaunching actors',async t=>{
+ const f=await fixture(t);
+ f.config.target='a5';
+ await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+ const claimed=f.backlog.claim({base:'base',itemId:f.item.id,seconds:7200,workflow:'failure-first-v1'});
+ const current=claimed.run.id;
+ f.backlog.meta('failure-first-current',current);
+ const directory=join(f.root,'recovered');
+ const checkpoint={workflow:'failure-first-v1',phase:'admit-searchable',directory,slots,startedAt:Date.now()-1000};
+ f.backlog.checkpoint(current,{elapsed:1,checkpoint});
+ await mkdir(join(directory,'pilot'),{recursive:true});
+ const saved={status:'complete',promising:false,winner:{id:'reviewed'}};
+ await writeFile(join(directory,'pilot','pilot.json'),JSON.stringify(saved));
+ const ops={...f.ops,pilot:async()=>assert.fail('Evaluation must not rerun'),
+  family:async()=>assert.fail('Isolation must not rerun'),
+  admit:async input=>{assert.deepEqual(input.result,saved);return {admitted:true,id:'resumed'};}};
+ const outcome=await runCampaignFailureStep(f.config,f.values,ops);
+ assert.equal(outcome.admission.id,'resumed');
+ assert.equal(f.backlog.meta('failure-first-current'),null);
+});
