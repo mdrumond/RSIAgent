@@ -63,6 +63,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  config=skillConfig(config);if(!failureFirstEnabled(config)||!['a3','a5'].includes(config.target))throw Error('Failure-first workflow on A3 or A5 must be explicitly enabled');
  if(slots?.length!==4)throw Error('Failure-first startup requires four reserved healthy devices');
  const {state,backlog}=open(config),now=dependencies.now??Date.now;
+ const invokedAt=now();
  const knowledgeConfig={...memory?.config,project_evidence_root:config.root};
  const ops={
   analyze:async args=>(await import('./skill-backlog-analysis.mjs')).analyzeBacklog(args,{classify:async input=>(await import('./skill-review-native.mjs')).nativeClassifyBatch({...input,config:knowledgeConfig})}),
@@ -87,17 +88,27 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(retained?.checkpoint?.phase==='admit-searchable'){
    const directory=join(retained.checkpoint.directory,'pilot');
    const result=await optional(join(directory,'pilot.json'));
-   const admission=await ops.admit({config,item:retained.snapshot,directory,result,signal});
-   if(!admission?.admitted)throw Error(admission?.reason??'Searchable skill admission refused');
-   const elapsed=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
-   const status=elapsed<retained.seconds?'accepted':'inconclusive';
-   const outcome={reason:'searchable-admission-recovered',searchable:true,admission};
-   backlog.atomic(()=>{
-    backlog.checkpoint(retained.id,{elapsed,checkpoint:retained.checkpoint});
+   const admissionInput={config,item:retained.snapshot,directory,result};
+   const elapsed=()=>Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
+   const finishRecovery=(outcome)=>backlog.atomic(()=>{
+    const spent=elapsed();
+    const status=outcome.admission&&spent<retained.seconds?'accepted':'inconclusive';
+    backlog.checkpoint(retained.id,{elapsed:spent,checkpoint:retained.checkpoint});
     backlog.finish(retained.id,{status,result:outcome});
     backlog.meta('failure-first-current',null);
+    backlog.meta('failure-first-status',{status,reason:outcome.reason,at:now(),lastDirectory:retained.checkpoint.directory});
+    return {status,...outcome};
    });
-   return {status,...outcome};
+   const recovered=await ops.admit({...admissionInput,signal,recoverOnly:true});
+   if(recovered?.admitted)return finishRecovery({reason:'searchable-admission-recovered',searchable:true,admission:recovered});
+   if(recovered?.reason!=='no-prior-admission')throw Error(recovered?.reason??'Searchable skill admission recovery refused');
+   const remaining=Math.min(retained.seconds-elapsed(),remainingSeconds-(now()-invokedAt)/1000);
+   if(remaining<=0)return finishRecovery({reason:'Experiment elapsed allowance exhausted before searchable admission'});
+   const deadline=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.floor(remaining*1000)))]);
+   deadline.throwIfAborted();
+   const admission=await ops.admit({...admissionInput,signal:deadline});
+   if(!admission?.admitted)throw Error(admission?.reason??'Searchable skill admission refused');
+   return finishRecovery({reason:'searchable-development-improvement',searchable:true,result,admission});
   }
   if(retained?.checkpoint?.phase==='publish'){
    const saved=await optional(join(retained.checkpoint.directory,'pilot','pilot.json'));

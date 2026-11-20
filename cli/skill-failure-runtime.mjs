@@ -136,12 +136,16 @@ export async function legacyFailureRuntimePreDispatchClosures({directory,config,
  return closed;
 }
 
+function closedWithoutDispatch({actorClosure,...row}) {
+ return actorClosure?.kind==='native-no-target'&&actorClosure.contextSha256===hash(row);
+}
+
 /** Does not launch KDB, probes or model work; suitable for crash reconciliation. */
-export async function settleFailureRuntime({directory,config,signal,closedInProcess=new Set()},dependencies={}){
+export async function settleFailureRuntime({directory,config,signal},dependencies={}){
  const rows=await read(join(directory,'runtime-contexts.json'))??[],result=[];
  let recovered;
  for(const row of rows){
-  let closed=closedInProcess.has(row.root)||await (dependencies.settled??hypothesisEvaluationSettled)({directory:row.root,config,binding:row.binding,resource:row.resource,signal});
+  let closed=closedWithoutDispatch(row)||await (dependencies.settled??hypothesisEvaluationSettled)({directory:row.root,config,binding:row.binding,resource:row.resource,signal});
   if(!closed){
    recovered??=await legacyFailureRuntimePreDispatchClosures({directory,config,signal});
    closed=recovered.has(row.root);
@@ -158,8 +162,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
  await mkdir(directory,{recursive:true});await mkdir(publicDirectory,{recursive:true});
  const free=[...slots],registry=join(directory,'runtime-contexts.json'),contexts=new Map((await read(registry)??[]).map(r=>[r.root,r])),mechanisms=await read(join(directory,'mechanisms.json'))??{};let writes=Promise.resolve(),runtime=await read(join(directory,'runtime-identity.json'));
  const remember=async row=>{contexts.set(row.root,row);writes=writes.then(()=>save(registry,[...contexts.values()]));await writes;};
- const closedWithoutDispatch=new Set();
- const closed=async root=>{const row=contexts.get(root);return closedWithoutDispatch.has(root)||!row||await (dependencies.settled??hypothesisEvaluationSettled)({directory:root,config,binding:row.binding,resource:row.resource,signal:stopSignal});};
+ const closed=async root=>{const row=contexts.get(root);return !row||closedWithoutDispatch(row)||await (dependencies.settled??hypothesisEvaluationSettled)({directory:root,config,binding:row.binding,resource:row.resource,signal:stopSignal});};
  const target=async(root,slot,kind,fingerprint,work)=>{
   const environment={...config.environment.options,...slot.binding?.environment,deviceAffinity:[slot.physical],remoteDirectory:'rsi-failure-'+hash([fingerprint,kind]).slice(0,20)};delete environment.backgroundDevice;
   const binding={target:config.target,python:environment.python??'python3',...slot.binding,environment};
@@ -236,10 +239,14 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    const profile=skillProfile(config.actor),hiddenPaths=[privateDirectory,publicDirectory,...hiddenDirectories,...(profile.credentials_file?[dirname(profile.credentials_file)]:[])];
    const actor=await host.sample({cwd,sessionDirectory,profile,guidance:input.guidance,prompt:input.task.prompt+'\nUse native local file/Bash tools for edits and rsi_target for device commands. Public check: python3 public_verify.py .',actorBash:'local',seconds:input.actorSeconds??180,signal:input.signal,sampleSignal:input.signal,sampleStopSignal:stopSignal,knowledge,localFilesystemSandbox:{hiddenPaths}});
    assert(await host.sampleSettled({cwd}),'Actor custody remains unresolved');
-   if(actor.targetDispatched===false&&!actor.unresolvedExecution)closedWithoutDispatch.add(publicRoot);
+   if(actor.targetDispatched===false&&!actor.unresolvedExecution){
+    const row=contexts.get(publicRoot);
+    await remember({...row,actorClosure:{kind:'native-no-target',contextSha256:hash(row)}});
+   }
    assert(await closed(publicRoot),'Actor custody remains unresolved');
    if(actor.session){const contamination=kdbContamination(await readFile(actor.session,'utf8'));if(contamination)return contamination;}
-   if(actor.error&&!actor.timedOut)return {infrastructure:true,correct:null,reason:'Native session failed: '+actor.error};
+   if(actor.providerTimeout||actor.error&&!actor.timedOut)
+    return {infrastructure:true,correct:null,reason:'Native session failed: '+(actor.providerTimeout??actor.error)};
    const files={};async function gather(path,prefix=''){for(const entry of await readdir(path,{withFileTypes:true})){if(entry.name.startsWith('.')||['__pycache__','node_modules'].includes(entry.name))continue;const name=prefix+entry.name;if(entry.isDirectory())await gather(join(path,entry.name),name+'/');else if(entry.isFile()&&entry.name!=='public_verify.py'&&(Object.hasOwn(input.task.files,name)||/\.(py|c|cc|cpp|cxx|cce|h|hpp|inc|cmake|sh|json|md)$/.test(name)||['Makefile','CMakeLists.txt'].includes(name))){assert((await stat(join(path,entry.name))).size<=16*1048576,'Source artifact too large');files[name]=await readFile(join(path,entry.name),'utf8');}}}await gather(cwd);assert(files['kernel.py'],'Candidate kernel missing');
    const protectedNames=[...new Set([...Object.keys(input.task.protectedFiles??{}),...['CONTRACT.md','WORKLOAD.md','case.json','cases.json'].filter(n=>Object.hasOwn(input.task.files,n))])];const unchanged=protectedNames.every(name=>files[name]===input.task.files[name])&&(await readFile(join(cwd,'public_verify.py'),'utf8'))===frozen.publicChecker;
    const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],input.verificationSeconds??300,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row,input.task);
@@ -252,6 +259,6 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   finally{if(await closed(publicRoot)&&await closed(privateRoot))free.push(slot);}
  };
  const settle=async op=>{const adapter=await read(join(op.directory,'adapter.json'));if(!adapter)return {closed:false};if(!(await Promise.all((adapter.qualificationRoots??[adapter.publicRoot,adapter.privateRoot]).map(closed))).every(Boolean))return {closed:false};const result=await read(join(op.directory,'operation-result.json')),manifest=await read(join(op.directory,'source-manifest.json'));if(result&&manifest)for(const [name,sha]of Object.entries(manifest.files))assert.equal(hash(await readFile(inside(manifest.cwd,name),'utf8')),sha,'Recovered source changed');return {closed:true,...(result?{result}:{})};};
- return {identify,checkReferences,qualify,trial,settle,close:async()=>{await writes;return (await settleFailureRuntime({directory,config,signal:stopSignal,closedInProcess:closedWithoutDispatch},dependencies)).closed;}};
+ return {identify,checkReferences,qualify,trial,settle,close:async()=>{await writes;return (await settleFailureRuntime({directory,config,signal:stopSignal},dependencies)).closed;}};
 }
 function sameMechanism(value,family){return value.evidence?.phase===family.mechanism?.phase&&value.evidence?.type===family.mechanism?.type&&!!family.mechanism;}

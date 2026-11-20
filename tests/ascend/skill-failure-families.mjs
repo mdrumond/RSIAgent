@@ -233,6 +233,15 @@ test('new A5 authoring requires calibration for every task and reloads a retaine
   const submission={status:'ready',reason:'Source bound',family:f.family,files:f.files,claims:[]};
   await assert.rejects(submitDraft(validate,writableDirectory,submission),/calibration/);
   addCalibration(f);
+  const transfer=f.family.transfer[0];
+  const calibration=transfer.controls.calibration.files['kernel.py'];
+  const original=f.files[calibration];
+  for(const [label,control] of [['reference',transfer.controls.reference],['negative',transfer.controls.negatives[0]]]){
+   f.files[calibration]=f.files[control.files['kernel.py']];
+   await assert.rejects(submitDraft(validate,writableDirectory,submission),new RegExp('A5 task '+transfer.id+' calibration kernel duplicates the '+label));
+   assert.equal(checks,0);
+  }
+  f.files[calibration]=original;
   return {value:await submitDraft(validate,writableDirectory,submission)};
  }});
  assert.equal(checks,1);

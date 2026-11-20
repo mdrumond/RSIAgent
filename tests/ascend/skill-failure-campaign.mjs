@@ -189,7 +189,7 @@ test('A5 routes a settled focused development winner to searchable admission aft
  assert.equal(JSON.parse(await readFile(join(f.root,'instance.json'),'utf8')).skills.activeVersion,'base');
 });
 
-test('searchable admission recovery reuses persisted evaluation without relaunching actors',async t=>{
+async function retainedSearchableAdmission(t,elapsed=1){
  const f=await fixture(t);
  f.config.target='a5';
  await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
@@ -197,15 +197,60 @@ test('searchable admission recovery reuses persisted evaluation without relaunch
  const current=claimed.run.id;
  f.backlog.meta('failure-first-current',current);
  const directory=join(f.root,'recovered');
- const checkpoint={workflow:'failure-first-v1',phase:'admit-searchable',directory,slots,startedAt:Date.now()-1000};
- f.backlog.checkpoint(current,{elapsed:1,checkpoint});
+ const checkpoint={workflow:'failure-first-v1',phase:'admit-searchable',directory,slots,startedAt:Date.now()-elapsed*1000};
+ f.backlog.checkpoint(current,{elapsed,checkpoint});
  await mkdir(join(directory,'pilot'),{recursive:true});
  const saved={status:'complete',promising:false,winner:{id:'reviewed'}};
  await writeFile(join(directory,'pilot','pilot.json'),JSON.stringify(saved));
  const ops={...f.ops,pilot:async()=>assert.fail('Evaluation must not rerun'),
-  family:async()=>assert.fail('Isolation must not rerun'),
-  admit:async input=>{assert.deepEqual(input.result,saved);return {admitted:true,id:'resumed'};}};
- const outcome=await runCampaignFailureStep(f.config,f.values,ops);
+  family:async()=>assert.fail('Isolation must not rerun')};
+ return {f,ops,saved};
+}
+
+test('searchable admission recovery reconciles an existing receipt after expiry without relaunching actors',async t=>{
+ const {f,ops,saved}=await retainedSearchableAdmission(t,7201);
+ const outcome=await runCampaignFailureStep(f.config,f.values,{...ops,admit:async input=>{
+  assert.equal(input.recoverOnly,true);
+  assert.deepEqual(input.result,saved);
+  return {admitted:true,id:'resumed'};
+ }});
+ assert.equal(outcome.status,'inconclusive');
  assert.equal(outcome.admission.id,'resumed');
  assert.equal(f.backlog.meta('failure-first-current'),null);
+});
+
+test('missing searchable receipt after expiry closes the run without a new admission',async t=>{
+ for(const [elapsed,remainingSeconds] of [[7201,600],[1,0]]){
+  const {f,ops}=await retainedSearchableAdmission(t,elapsed);
+  const attempts=[];
+  const outcome=await runCampaignFailureStep(f.config,{...f.values,remainingSeconds},{...ops,admit:async ({recoverOnly})=>{
+   attempts.push(recoverOnly);
+   return {admitted:false,reason:'no-prior-admission'};
+  }});
+  assert.deepEqual(attempts,[true]);
+  assert.equal(outcome.status,'inconclusive');
+  assert.equal(f.backlog.meta('failure-first-current'),null);
+  assert.equal(f.backlog.meta('failure-first-status').status,'inconclusive');
+ }
+});
+
+test('searchable admission recovery starts a fresh write within the remaining allocation',async t=>{
+ const {f,ops,saved}=await retainedSearchableAdmission(t);
+ const outer=new AbortController();
+ const attempts=[];
+ const outcome=await runCampaignFailureStep(f.config,{...f.values,remainingSeconds:60,signal:outer.signal},
+  {...ops,admit:async ({recoverOnly=false,signal,result})=>{
+   attempts.push(recoverOnly);
+   assert.deepEqual(result,saved);
+   if(recoverOnly){
+    assert.equal(signal,outer.signal);
+    return {admitted:false,reason:'no-prior-admission'};
+   }
+   assert.notEqual(signal,outer.signal);
+   signal.throwIfAborted();
+   return {admitted:true,id:'written'};
+  }});
+ assert.deepEqual(attempts,[true,false]);
+ assert.equal(outcome.status,'accepted');
+ assert.equal(outcome.admission.id,'written');
 });

@@ -107,7 +107,39 @@ test('Request timed out returns infrastructure only after actor custody closes a
  const root=await fixture(t),checker=join(root,'checker.py');await writeFile(checker,'pass');const directory=join(root,'private'),config={target:'cpu',actor:{},environment:{options:{mode:'local'}}},slots=[{resource:{id:'slot'},physical:1}];let closures=0,verifications=0;
  const runtime=await createFailureRuntime({config,directory,slots},{target:()=>({sample:async()=>({error:'Request timed out',timedOut:false,targetDispatched:false}),sampleSettled:async()=>{closures++;return true;},qualifyBatch:async()=>{verifications++;}}),settled:async()=>false});
  const result=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});assert.equal(result.infrastructure,true);assert.match(result.reason,/Request timed out/);assert.equal(closures,1);assert.equal(verifications,0);assert.equal(await runtime.close(),true);
+ const operation=join(directory,'op'),offline={
+  settled:async()=>false,target:()=>assert.fail('Custody reconciliation must not launch an actor'),
+ };
+ const recovered=await createFailureRuntime({config,directory,slots},offline);
+ assert.equal(await recovered.close(),true);
+ assert.deepEqual(await recovered.settle({directory:operation}),{closed:true});
+ const registry=join(directory,'runtime-contexts.json'),rows=JSON.parse(await readFile(registry,'utf8'));
+ rows[0].binding.environment.deviceAffinity=[7];await writeFile(registry,JSON.stringify(rows));
+ assert.equal((await failureRuntimeSettled({directory,config},offline)).closed,false);
+
 });
+test('native Pi exhausting the actor grant during provider timeout retry skips scoring',async t=>{
+ const {createServer}=await import('node:http'),{once}=await import('node:events');
+ const root=await fixture(t),checker=join(root,'checker.py'),credentials_file=join(root,'profile.env');
+ await writeFile(checker,'pass');await writeFile(credentials_file,'RSI_TEST_PROVIDER=fixture\n');
+ const server=createServer(async(req,res)=>{
+  for await(const _ of req){}
+  res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'Request timed out'}}));
+ });
+ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const profile={provider:'timeout-fixture',model:'scripted',credential_env:'RSI_TEST_PROVIDER',credentials_file,
+  base_url:`http://127.0.0.1:${server.address().port}/v1`,metadata:{id:'scripted',name:'Fixture',api:'openai-completions',
+   reasoning:false,input:['text'],contextWindow:32000,maxTokens:4096,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}};
+ const directory=join(root,'runtime'),config={target:'cpu',actor:profile,environment:{options:{mode:'local'}}};let scored=0,result;
+ const runtime=await createFailureRuntime({config,directory,slots:[{resource:{id:'slot'},physical:1}]},{
+  target:()=>({sample:async input=>(result=await nativeSample(input)),sampleSettled:async()=>true,qualifyBatch:async()=>{scored++;return [];}}),
+  settled:async()=>true,
+ });
+ const receipt=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});
+ assert.equal(result.timedOut,true);assert.equal(receipt.infrastructure,true);assert.match(receipt.reason,/Request timed out/);
+ assert.equal(scored,0);assert.equal(await runtime.close(),true);
+});
+
 test('late trusted verification is not admitted after its own allowance, independently of the actor grant',async t=>{
  const root=await fixture(t),checker=join(root,'checker.py');await writeFile(checker,'pass');const directory=join(root,'private'),config={target:'cpu',actor:{},environment:{options:{mode:'local'}}};let actorSeconds,verificationSeconds;
  const runtime=await createFailureRuntime({config,directory,slots:[{resource:{id:'slot'},physical:1}]},{target:()=>({sample:async input=>{actorSeconds=input.seconds;return {timedOut:false,targetDispatched:false};},sampleSettled:async()=>true,qualifyBatch:async input=>{verificationSeconds=input.seconds;await delay(30);return [];}}),settled:async({directory})=>directory.endsWith('/verification')});

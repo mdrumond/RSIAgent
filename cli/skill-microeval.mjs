@@ -123,7 +123,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  const manager=resumeSession?sdk.SessionManager.open(resumeSession,sessionDirectory):sdk.SessionManager.create(cwd,sessionDirectory);
  const {session}=await sdk.createAgentSession({cwd,agentDir,settingsManager,...await skillModelFromProfile(profile,{directory:sessionDirectory??cwd}),thinkingLevel:'off',
   tools:['read','write','edit','grep','find','ls','bash',...(targetEnvironment?['rsi_target']:[]),...(bridge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
- let timedOut=false,failure,lastAssistant;
+ let timedOut=false,failure,lastAssistant,providerTimeout;
  const requests=[];
  const unsubscribe=session.subscribe(event=>{
   const at=new Date().toISOString();
@@ -131,7 +131,11 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
   if(event.type==='message_end'&&event.message.role==='assistant'){
    lastAssistant=event.message;
    const error=lastAssistant.errorMessage??'';
-   requests.push({event:'response-end',at,outcome:lastAssistant.stopReason,timeout:/timed? out|timeout/i.test(error),usage:lastAssistant.usage});
+   const timeout=lastAssistant.stopReason==='error'&&/timed? out|timeout/i.test(error);
+   // Pi can end a retry with an aborted assistant message when the actor
+   // grant expires. Only a real subsequent response clears the timeout.
+   if(lastAssistant.stopReason!=='aborted')providerTimeout=timeout?error:undefined;
+   requests.push({event:'response-end',at,outcome:lastAssistant.stopReason,timeout,usage:lastAssistant.usage});
   }
   if(event.type==='auto_retry_start'||event.type==='auto_retry_end')
    requests.push({event:event.type,at,attempt:event.attempt,delayMs:event.delayMs,success:event.success});
@@ -155,7 +159,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  }
  await writeFile(join(sessionDirectory,'pi-request-events.jsonl'),requests.map(row=>JSON.stringify(row)+'\n').join(''),{mode:0o600});
  const stats=session.getSessionStats();
- return {targetDispatched,timedOut,error:failure??null,...(unresolvedExecution?{unresolvedExecution}:{}),tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
+ return {targetDispatched,timedOut,error:failure??null,...(providerTimeout?{providerTimeout}:{}),...(unresolvedExecution?{unresolvedExecution}:{}),tokens:stats.tokens.total>0?stats.tokens.total:null,usage:stats.tokens,
   cost:stats.assistantMessages>0?stats.cost:null,toolCalls:stats.toolCalls,session:manager.getSessionFile()};
 }
 
