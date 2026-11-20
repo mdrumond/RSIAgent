@@ -95,3 +95,33 @@ test('actual Pi still requires explicit audit reads before accepting supported s
  let required;const f=await fixture(t,n=>n===1||n===3?{result:valid()}:n===2?{tool:'read',args:{path:required}}:{});required=join(f.directory,'primary.txt');await writeFile(required,'Observed failure\n');
  const result=await reviewSession({...f,requiredReads:[required]});assert.equal(result.value.reason,'Observed failure');assert.equal(f.bodies.length,4);const termination=JSON.parse(await readFile(join(f.directory,'termination.json')));assert.equal(termination.rejectedSubmissions,1);
 });
+
+test('actual Pi continues a family draft after a normal stop in the same session',async t=>{
+ let draft;
+ const f=await fixture(t,n=>{
+  if(n===1)return {tool:'write',args:{path:join(draft,'kernel.py'),content:'VALUE=1\n'}};
+  if(n===3)return {result:valid()};
+  return {};
+ });
+ draft=join(f.directory,'draft');await mkdir(draft);
+ const result=await reviewSession({...f,writableDirectory:draft,continueFamilyDraft:true});
+ assert.equal(result.value.reason,'Observed failure');
+ assert.equal(await readFile(join(draft,'kernel.py'),'utf8'),'VALUE=1\n');
+ assert.equal(f.bodies.length,4);
+ assert(f.bodies[2].messages.some(message=>message.role==='tool'));
+ assert(f.bodies[2].messages.some(message=>message.role==='assistant'&&message.content==='Finished without submitting'));
+});
+
+test('family draft continuation stops after one reminder or a provider error',async t=>{
+ for(const error of [false,true]){
+  const f=await fixture(t,()=>error?{status:403,error:'Proxy denied'}:{});
+  await assert.rejects(reviewSession({...f,continueFamilyDraft:true}),failure=>failure.reviewSession?.kind===(error?'provider-error':'no-submit'));
+  assert.equal(f.bodies.length,error?1:2);
+ }
+});
+
+test('family draft continuation uses the original elapsed timer',async t=>{
+ const f=await fixture(t,n=>n===1?{}:undefined);
+ await assert.rejects(reviewSession({...f,continueFamilyDraft:true,seconds:0.40}),error=>error.reviewSession?.kind==='elapsed');
+ assert.equal(f.bodies.length,2);
+});
