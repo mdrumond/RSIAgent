@@ -255,13 +255,13 @@ test('searchable admission recovery starts a fresh write within the remaining al
  assert.equal(outcome.admission.id,'written');
 });
 
-test('A5 cleanly sets aside an unsubmitted family and preserves queued work',async t=>{
+for(const kind of ['no-submit','rejected-submissions'])test('A5 sets aside a closed '+kind+' family without scoring it',async t=>{
  const f=await fixture(t);
  f.config.target='a5';
  await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
  const outcome=await runCampaignFailureStep(f.config,f.values,{
   ...f.ops,
-  family:async()=>{throw Object.assign(Error('Review session no-submit'),{reviewSession:{kind:'no-submit'}});},
+  family:async()=>{throw Object.assign(Error('Review session '+kind),{reviewSession:{kind}});},
   pilot:async()=>assert.fail('Unsubmitted family cannot run a pilot'),
   admit:async()=>assert.fail('Unsubmitted family cannot admit a skill'),
  });

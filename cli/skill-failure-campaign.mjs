@@ -176,8 +176,11 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   }catch(error){
    if(referenceError)throw referenceError;
    active.throwIfAborted();
-   if(config.target!=='a5'||error.reviewSession?.kind!=='no-submit')throw error;
-   prepared={status:'unsubmitted',reason:'Family author completed without submitting a validated family'};
+   const disposition=error.reviewSession?.kind;
+   if(config.target!=='a5'||!['no-submit','rejected-submissions'].includes(disposition))throw error;
+   prepared={status:'unsubmitted',reason:disposition==='no-submit'
+    ?'Family author completed without submitting a validated family'
+    :error.message};
   }
   if(referenceError)throw referenceError;
   if(prepared.status!=='ready'){
