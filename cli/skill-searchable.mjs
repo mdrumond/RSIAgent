@@ -62,7 +62,7 @@ function recordAdmission(config,receipt){
   assert.equal(state.db.prepare('SELECT receipt FROM searchable_skill_admissions WHERE id=?').get(receipt.id).receipt,data,'Persisted searchable receipt changed');
  }finally{state.close();}
 }
-async function publishSearchable({config,review,scope,context,provenance,signal},dependencies){
+async function publishSearchable({config,review,scope,context,provenance,signal,recoverOnly=false},dependencies){
  assert(['a3','a5'].includes(config.target),'Searchable guidance requires an explicit A3 or A5 binding');
  assert(text(scope)&&scope.length<=300&&text(context)&&context.length<=1700,'Named bounded scope and evaluation context required');
  assert(text(review.instruction)&&review.instruction.length<=1500&&isHash(review.approval),'Exact reviewed instruction and approval required');
@@ -70,8 +70,21 @@ async function publishSearchable({config,review,scope,context,provenance,signal}
  const id=objectHash({format:1,target:config.target,scope,context,review:{instruction:review.instruction,approval:review.approval}});
  const directory=join(config.root,'skills','searchable',id);
  const evidence=join(directory,'evidence.json');
+ const admission=join(directory,'admission.json');
+ const evidenceRecord={format:1,id,target:config.target,scope,context,review,provenance};
+ const identity={admitted:true,id,evidence,deliveryId:'searchable-skill-'+id};
+ if(recoverOnly){
+  const saved=await optional(admission);
+  if(saved===null)return {admitted:false,reason:'no-prior-admission'};
+  if(!config.storage)assert(text(saved.collection)&&text(saved.entryId),'Invalid searchable KDB receipt');
+  assert.deepEqual(saved,{...identity,...(!config.storage?{collection:saved.collection,entryId:saved.entryId}:{})},'Persisted searchable receipt changed');
+  assert.equal(await read(evidence),JSON.stringify(evidenceRecord,null,2)+'\n','Searchable evidence identity changed');
+  signal?.throwIfAborted();
+  recordAdmission(config,saved);
+  return saved;
+ }
  await mkdir(directory,{recursive:true,mode:0o700});
- await freeze(evidence,{format:1,id,target:config.target,scope,context,review,provenance});
+ await freeze(evidence,evidenceRecord);
  const records=await refs([evidence]);
  const lesson=[
   'Searchable guidance evidence. This note does not activate a skill.',
@@ -84,8 +97,8 @@ async function publishSearchable({config,review,scope,context,provenance,signal}
   ?await publish(config,{id,delivery_id:'searchable-skill-'+id,lesson,kind:'good',target:config.target,evidence:records},{url,signal})
   :await invoke(config,url,'record_lesson',{lesson,outcome:'good',applicability:config.target,evidence:records,attempt_id:'searchable-skill-'+id},{signal});
  assert(written&&(config.storage?text(written.revision):text(written.collection)&&text(written.entry_id)),'Searchable KDB admission returned no stable identity');
- const receipt={admitted:true,id,evidence,deliveryId:'searchable-skill-'+id,...(!config.storage?{collection:written.collection,entryId:written.entry_id}:{})};
- await freeze(join(directory,'admission.json'),receipt);
+ const receipt={...identity,...(!config.storage?{collection:written.collection,entryId:written.entry_id}:{})};
+ await freeze(admission,receipt);
  recordAdmission(config,receipt);
  return receipt;
 }
@@ -151,7 +164,7 @@ async function verifyScopedReport({directory,result,manifest,config}){
 }
 
 /** Admit a settled development winner with evidence limiting its transfer claim. */
-export async function admitSearchableSkill({config,directory,result,item,signal},dependencies={}){
+export async function admitSearchableSkill({config,directory,result,item,signal,recoverOnly=false},dependencies={}){
  if(result?.status!=='complete'||result.promising!==false||!result.winner)
   return {admitted:false,reason:'No settled scoped candidate'};
  const root=await realpath(directory),pilot=join(root,'pilot.json'),manifestPath=join(root,'manifest.json');
@@ -172,7 +185,7 @@ export async function admitSearchableSkill({config,directory,result,item,signal}
  const initialQa=await optional(join(qaDirectory,'qa.json'));
  const qaFile=join(qaDirectory,initialQa?.format===2?'qa.json':'qa-v2.json');
  const sources=[join(design,'approved-design.json'),join(candidateDirectory,'approved-candidate.json'),qaFile];
- return publishSearchable({config,signal,review:{instruction:winner.instruction,approval:winner.qa.approval},
+ return publishSearchable({config,signal,recoverOnly,review:{instruction:winner.instruction,approval:winner.qa.approval},
   scope:config.target+' '+winner.scope+' guidance for '+family.id,
   context:'Development '+score(result.development.baseline).passes+'/5 to '+score(result.development[winner.id]).passes+'/5. Transfer confirmation did not pass: '+transfers.map(transferText).join('; ')+'.',
   provenance:{kind:'settled-failure-pilot',candidateId:winner.id,baseline:manifest.identities.skills??null,

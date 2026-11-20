@@ -124,6 +124,24 @@ test('refuses changed fixture, invalid controls or unresolved operations before 
  await assert.rejects(admitSearchableSkill({config,...data,result:corrupted},blocked),/Trial operation result changed/);
 });
 
+test('recover-only completes an existing admission without starting KDB or creating a receipt',async t=>{
+ const {config,root,state}=await fixture(t),data=await pilot(root);
+ const recover=()=>admitSearchableSkill({config,...data,recoverOnly:true},{
+  verify:data.verify,ensure:()=>assert.fail('Recovery must not reach KDB'),
+ });
+ assert.deepEqual(await recover(),{admitted:false,reason:'no-prior-admission'});
+ await assert.rejects(readFile(join(root,'skills','searchable','admission.json')), {code:'ENOENT'});
+ const first=await admitSearchableSkill({config,...data},{verify:data.verify,ensure:async()=> 'fixture',
+  invoke:async()=>({collection:'stable-collection',entry_id:'stable-entry'}),
+ });
+ state.db.prepare('DELETE FROM searchable_skill_admissions').run();
+ assert.equal(searchableMemoryFingerprint(state.db),null);
+ assert.deepEqual(await recover(),first);
+ assert.equal(searchableMemoryFingerprint(state.db),hash(JSON.stringify([first.id])));
+ await save(first.evidence,{changed:true});
+ await assert.rejects(recover(),/Searchable evidence identity changed/);
+});
+
 test('historical receipt must bind the retained QA packet to the exact writer bytes',async t=>{
  const {config,root}=await fixture(t),data=await historical(root);
  await save(join(data.approvalDirectory,'qa-1','input.json'),{candidate:'Other draft'});
