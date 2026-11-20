@@ -2,6 +2,7 @@
 import { createMcpExtension } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { join } from 'node:path';
+import {searchableExposure} from '../controller/searchable-exposure.mjs';
 
 const searchTool = 'mcp__kdb__search';
 
@@ -29,22 +30,37 @@ export function createKdbBridge({url, attemptId, agentDir, target, generation, a
   const nativeExtension = createMcpExtension({loadConfig: () => config, logPath: join(agentDir, 'mcp.log')});
   const extension = async pi => {
     await nativeExtension(pi);
+    const requests=new Map();
+    const tracked=name=>['mcp__kdb__search','mcp__kdb__read_entry'].includes(name);
+    pi.on('tool_call',request=>{
+      if(tracked(request.toolName))requests.set(request.toolCallId,request.input);
+    });
     pi.on('tool_result', async result => {
       if (!result.toolName.startsWith('mcp__kdb__')) return;
       await event('knowledge-tool-result', {
         attempt_id: attemptId, tool: result.toolName, tool_call_id: result.toolCallId,
         parent_tool_call_id: result.parentToolCallId, failed: result.isError,
       });
-      if(recordRetrieval&&!result.isError&&['mcp__kdb__search','mcp__kdb__read_entry'].includes(result.toolName)) {
+      const args=result.input??requests.get(result.toolCallId)??{};
+      requests.delete(result.toolCallId);
+      if(!result.isError&&tracked(result.toolName)) {
         const wire=result.structuredContent??result.result?.structuredContent;
         const body=wire?.structuredContent??wire;
         const entries=Array.isArray(body?.result)?body.result:typeof body?.text==='string'?[body]:null;
         if(wire?.isError||entries===null){
-          await event('knowledge-retrieval-unavailable',{tool_call_id:result.toolCallId,tool:result.toolName});return;
+          if(recordRetrieval)await event('knowledge-retrieval-unavailable',{tool_call_id:result.toolCallId,tool:result.toolName});
+          return;
         }
-        await recordRetrieval({toolCall:result.toolCallId,operation:result.toolName,
-          arguments:result.input??{},generation:entries[0]?.generation??generation??null,entries});
-        await event('knowledge-retrieval-recorded',{tool_call_id:result.toolCallId,tool:result.toolName,entries:entries.length});
+        if(recordRetrieval){
+          await recordRetrieval({toolCall:result.toolCallId,operation:result.toolName,
+            arguments:args,generation:entries[0]?.generation??generation??null,entries});
+          await event('knowledge-retrieval-recorded',{tool_call_id:result.toolCallId,tool:result.toolName,entries:entries.length});
+        }
+        const exposed=searchableExposure(entries,args);
+        if(exposed.length)await event('searchable-skill-exposed',{
+          tool_call_id:result.toolCallId,operation:result.toolName===searchTool?'search':'read-entry',
+          query:typeof args.query==='string'?args.query:null,entries:exposed,
+        });
       }
     });
   };
