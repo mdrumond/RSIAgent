@@ -173,14 +173,19 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   let prepared;
   try{
    prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(1800,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
-  }catch(error){throw referenceError??error;}
+  }catch(error){
+   if(referenceError)throw referenceError;
+   active.throwIfAborted();
+   if(config.target!=='a5'||error.reviewSession?.kind!=='no-submit')throw error;
+   prepared={status:'unsubmitted',reason:'Family author completed without submitting a validated family'};
+  }
   if(referenceError)throw referenceError;
   if(prepared.status!=='ready'){
    if(runtime){
     closed=await runtime.close();runtime=null;
     if(!closed)throw Error('Submission reference execution remains unresolved');
    }
-   return finish('inconclusive',{reason:'needs-evidence',detail:prepared.reason});
+   return finish('inconclusive',{reason:prepared.status==='unsubmitted'?'family-unsubmitted':'needs-evidence',detail:prepared.reason});
   }
   if(priorFamily&&hash(priorFamily.family)!==hash(prepared.family))throw Error('Frozen failure family changed');
   if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));
