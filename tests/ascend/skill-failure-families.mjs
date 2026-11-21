@@ -16,6 +16,9 @@ import {stages} from '../../controller/workflow.mjs';
 import {analyzeBacklog} from '../../cli/skill-backlog-analysis.mjs';
 import {loadFailureFamily,failureWitness,failureSourceInventory,prepareFailureFamily} from '../../cli/skill-failure-families.mjs';
 const sha=s=>createHash('sha256').update(s).digest('hex');
+const missingFamily=(reference,overrides={})=>({status:'needs-evidence',missing:'passing-reference',reason:'Reference unavailable',
+ verificationReference:reference,claims:[{path:'reason',kind:'hypothesis',proofs:[{reference,startLine:1,endLine:1}]}],...overrides});
+
 const emit=(state,...args)=>{state.event(...args);return state.db.prepare('SELECT MAX(sequence) sequence FROM events').get();};
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'failure-family-'));t.after(()=>rm(root,{recursive:true,force:true}));const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());
@@ -78,8 +81,41 @@ test('native isolation validates its submission, never calls a curriculum, and r
 });
 
 test('missing evidence is terminal without a speculative proposal; unknown interrupted spend cannot renew',async t=>{
- const f=await fixture(t),input={...f,directory:join(f.root,'missing'),seconds:30};let calls=0;const session=async()=>{calls++;return {value:{status:'needs-evidence',reason:'No failed source retained'}};};const value=await prepareFailureFamily(input,{session});assert.equal(value.status,'needs-evidence');await prepareFailureFamily(input,{session});assert.equal(calls,1);
+ const f=await fixture(t),input={...f,directory:join(f.root,'missing'),seconds:30};let calls=0;const session=async()=>{calls++;return {value:missingFamily(f.reference)};};const value=await prepareFailureFamily(input,{session});assert.equal(value.status,'needs-evidence');await prepareFailureFamily(input,{session});assert.equal(calls,1);
  const file=join(input.directory,'isolation.json'),ledger=JSON.parse(await readFile(file,'utf8'));delete ledger.status;ledger.running=true;await writeFile(file,JSON.stringify(ledger));await assert.rejects(prepareFailureFamily(input,{session}),/unknown/);assert.equal(calls,1);
+});
+
+test('an oracle gap needs a source-bound verification and one question before routing to Phase 1',async t=>{
+ const f=await fixture(t),directory=join(f.root,'oracle-gap'),nextQuestion='Does the contract require an independent row sum or a cumulative sum?';
+ const report=missingFamily(f.reference,{missing:'missing-semantics',reason:'The archived expected rows leave the reduction order ambiguous'});
+ const result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({validate})=>{
+  await assert.rejects(validate({...report,verificationReference:'events:1'}),/sourceInventory/);
+  await assert.rejects(validate({...report,claims:missingFamily('events:1').claims}),/Cite the selected verification/);
+  await assert.rejects(validate(report),/discriminating nextQuestion/);
+  return {value:await validate({...report,nextQuestion})};
+ }});
+ assert.equal(result.disposition.route,'phase1');
+ assert.equal(result.disposition.nextQuestion,nextQuestion);
+ assert.equal(result.disposition.verification.sourceSha256,sha(f.code));
+ assert.equal(result.disposition.verification.reference,f.reference);
+ assert.equal(result.disposition.replay,'unverified');
+ assert.deepEqual(result.disposition.passedChecks,[]);
+ const resumed=await prepareFailureFamily({...f,directory,seconds:30},{session:()=>assert.fail('Completed disposition must be retained')});
+ assert.deepEqual(resumed.disposition,result.disposition);
+});
+
+test('a different device failure after an edit is not a reproduced or repaired original failure',async t=>{
+ const f=await fixture(t),directory=join(f.root,'new-failure');
+ const checks=[{variant:'starter',correct:false,mechanismMatch:false,phase:'candidate-call',type:'wrong-output'}];
+ const checkReferences=async()=>{throw Object.assign(Error('Numerical output still fails'),{code:'FAILURE_REFERENCE_REJECTED',diagnostics:checks});};
+ const result=await prepareFailureFamily({...f,directory,seconds:30,checkReferences},{session:async({validate,writableDirectory})=>{
+  await assert.rejects(submitDraft(validate,writableDirectory,{status:'ready',reason:'Compiler error cleared',family:f.family,files:f.files}),/Numerical output still fails/);
+  return {value:await validate(missingFamily(f.reference,{missing:'failure-mechanism',nextQuestion:'Which intermediate output first differs from the reference?'}))};
+ }});
+ assert.equal(result.disposition.route,'probe');
+ assert.equal(result.disposition.replay,'different-failure');
+ assert.deepEqual(result.disposition.checks,checks);
+ assert.deepEqual(result.disposition.passedChecks,[]);
 });
 
 
@@ -95,7 +131,7 @@ test('source-history Git metadata is materialized for read-only native research'
   const resultSchema=Type.Unknown();
   await mkdir(directory,{recursive:true});
   await writeFile(join(directory,'review-contract.json'),JSON.stringify({version:REVIEW_CONTRACT_VERSION,schema:resultSchema,writableDirectory}));
-  await writeFile(join(directory,'submission.json'),JSON.stringify({status:'needs-evidence',reason:'Reference unavailable'}));
+  await writeFile(join(directory,'submission.json'),JSON.stringify(missingFamily(reference)));
   const reviewed=await reviewSession({...options,resultSchema,knowledge:false,proofRequired:false});
   const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
   assert.deepEqual(input.filesystemAccess.allowed.find(entry=>entry.path===source.path),{path:source.path,directory:false});
@@ -113,7 +149,7 @@ test('no actual failed actor evidence avoids inference entirely',async t=>{
 
 test('isolation checkpoints elapsed work while native research is still running',async t=>{
  const f=await fixture(t),directory=join(f.root,'checkpoint');let observed;
- const result=await prepareFailureFamily({...f,directory,seconds:5},{session:async()=>{await new Promise(r=>setTimeout(r,1100));observed=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));return {value:{status:'needs-evidence',reason:'Reference source unavailable'}};}});
+ const result=await prepareFailureFamily({...f,directory,seconds:5},{session:async()=>{await new Promise(r=>setTimeout(r,1100));observed=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));return {value:missingFamily(f.reference)};}});
  assert.equal(observed.running,true);assert(observed.elapsedSeconds>=.9);assert.equal(result.running,false);assert(result.elapsedSeconds>=observed.elapsedSeconds);
 });
 
@@ -137,7 +173,7 @@ test('isolation completion waits for an in-flight heartbeat write',async t=>{
   session:async()=>{
    await heartbeat;
    setTimeout(releaseHeartbeat,50);
-   return {value:{status:'needs-evidence',reason:'Reference unavailable'}};
+   return {value:missingFamily(f.reference)};
   }
  });
  const retained=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
@@ -189,7 +225,7 @@ test('draft native writes are scoped through existing ancestors and accepted byt
  const f=await fixture(t),draft=join(f.root,'draft'),outside=join(f.root,'outside');await mkdir(draft);await mkdir(outside);await symlink(outside,join(draft,'link'));
  assert.equal(await reviewWritePathAllowed(join(draft,'new/sub/kernel.py'),draft),true);assert.equal(await reviewWritePathAllowed(join(draft,'link/kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(outside,'kernel.py'),draft),false);assert.equal(await reviewWritePathAllowed(join(draft,'kernel.py')),false);
  const directory=join(f.root,'incremental');let manifest;const result=await prepareFailureFamily({...f,directory,seconds:30},{session:async({writableDirectory,validate,resultSchema})=>{
-  const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));const unavailable={status:'needs-evidence',reason:'No passing reference',claims:wire.claims};assert.equal(Check(resultSchema,unavailable),false);assert.ok(Check(resultSchema,{...unavailable,missing:'passing-reference'}));assert.equal(Check(resultSchema,{...unavailable,missing:'check-not-run'}),false);assert.equal(Check(resultSchema,{status:wire.status,reason:wire.reason,claims:wire.claims}),false);await assert.rejects(validate(wire),/Missing draft file: dev\//);assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
+  const wire={status:'ready',reason:'Isolated source',family:f.family,claims:[{path:'reason',kind:'observation',proofs:[{reference:f.reference}]}]};assert(Check(resultSchema,wire));const unavailable={status:'needs-evidence',reason:'No passing reference',claims:wire.claims};assert.equal(Check(resultSchema,unavailable),false);assert.ok(Check(resultSchema,{...unavailable,missing:'passing-reference',verificationReference:f.reference}));assert.equal(Check(resultSchema,{...unavailable,missing:'check-not-run'}),false);assert.equal(Check(resultSchema,{status:wire.status,reason:wire.reason,claims:wire.claims}),false);await assert.rejects(validate(wire),/Missing draft file: dev\//);assert.equal(Check(resultSchema,{...wire,files:f.files}),false);assert.equal(Check(resultSchema,{...wire,family:{...f.family,development:{...f.family.development,checker:42}}}),false);manifest=await submitDraft(validate,writableDirectory,{status:'ready',reason:'Isolated source',family:f.family,files:f.files,claims:[]});await writeFile(join(writableDirectory,'dev/starter.py'),'changed after acceptance');return {value:manifest};
  }});assert.equal(result.family.development.files['kernel.py'],f.code);assert.equal(await readFile(join(directory,'dev/starter.py'),'utf8'),f.code);
 });
 

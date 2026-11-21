@@ -6,6 +6,7 @@ import {existsSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../controller/state.mjs';
 import {SkillBacklog} from '../controller/skill-backlog.mjs';
+import {enqueueLearningRequest} from '../controller/skill-review.mjs';
 import {attentionRevision} from '../controller/failure-attention.mjs';
 import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
@@ -152,7 +153,8 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    save();
    backlog.finish(run.id,{status,result});
    backlog.meta('failure-first-current',null);
-   backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory});
+   backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory,
+    ...(result.disposition?{disposition:result.disposition}:{}),...(result.learningRequest?{learningRequest:result.learningRequest}:{})});
    return {status,...result};
   });
   const failure=new AbortController();save();timer=setInterval(()=>{try{save();}catch(error){failure.abort(error);}},1000);
@@ -174,7 +176,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    try{
     const adapter=await openRuntime();
     identity??=await adapter.identify({seconds:Math.min(120,seconds),signal});
-    await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+    return await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
    }catch(error){
     if(error.code!=='FAILURE_REFERENCE_REJECTED'){
      referenceError=error;
@@ -191,7 +193,8 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    active.throwIfAborted();
    const disposition=error.reviewSession?.kind;
    if(config.target!=='a5'||!['no-submit','rejected-submissions'].includes(disposition))throw error;
-   prepared={status:'unsubmitted',reason:disposition==='no-submit'
+   prepared={status:'unsubmitted',disposition:{blocker:disposition,route:'hold',verification:null,replay:'unverified',
+    checks:[],passedChecks:[],nextQuestion:null},reason:disposition==='no-submit'
     ?'Family author completed without submitting a validated family'
     :error.message};
   }
@@ -201,7 +204,18 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
     closed=await runtime.close();runtime=null;
     if(!closed)throw Error('Submission reference execution remains unresolved');
    }
-   return finish('inconclusive',{reason:prepared.status==='unsubmitted'?'family-unsubmitted':'needs-evidence',detail:prepared.reason});
+   const disposition=prepared.disposition;
+   if(disposition?.route==='phase1'){
+    return backlog.atomic(()=>{
+     const {verification,nextQuestion}=disposition;
+     const learningRequest=enqueueLearningRequest(state,{workflow:'failure-first-v1',target:config.target,workKind:'phase1',
+      learningTarget:'device',backlogId:run.item_id,priority:run.snapshot.priority,groupIds:run.snapshot.groupIds,
+      question:nextQuestion,hypothesis:prepared.reason,verification,
+      requiredEvidence:'Use the archived workload and verification '+verification.reference+'. Define an explicit PyTorch reference for each affected stage or output. Document the source of each expected behavior. Use small cases that distinguish the plausible interpretations and show the stage outputs and verifier result.'});
+     return finish('learning',{reason:'phase1-learning-requested',detail:prepared.reason,disposition,learningRequest});
+    });
+   }
+   return finish('inconclusive',{reason:prepared.status==='unsubmitted'?'family-unsubmitted':'needs-evidence',detail:prepared.reason,...(disposition?{disposition}:{})});
   }
   if(priorFamily&&hash(priorFamily.family)!==hash(prepared.family))throw Error('Frozen failure family changed');
   if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));

@@ -130,12 +130,14 @@ export function validateReview(value,groups){
 }
 // Called only when a NEW draft is allocated. Existing drafts retain their frozen request.
 export function claimLearningRequest(state,config,{draft,topic,target}){
- if(config.skills?.review?.enabled!==true&&config.skills?.priority?.enabled!==true)return null;
+ const legacyEnabled=config.skills?.review?.enabled===true||config.skills?.priority?.enabled===true;
+ const failureFirstEnabled=config.skills?.failureFirst?.enabled===true;
+ if(!legacyEnabled&&!failureFirstEnabled)return null;
  if(!has(state.db,'skill_learning_requests'))return null;
  const prioritized=has(state.db,'skill_backlog_items');
  const row=state.db.prepare(`SELECT id,data FROM skill_learning_requests WHERE status='pending' ORDER BY
   ${prioritized?"COALESCE((SELECT priority FROM skill_backlog_items WHERE id=json_extract(skill_learning_requests.data,'$.backlogId')),json_extract(data,'$.priority'),0) DESC,":""} rowid`).all()
-  .find(row=>{const r=JSON.parse(row.data);return r.intervention!=='user-required'&&!['suite','microlearning'].includes(r.workKind)&&r.target===target&&(r.topic===undefined||r.topic===topic);});
+  .find(row=>{const r=JSON.parse(row.data);return (r.workflow==='failure-first-v1'?failureFirstEnabled:legacyEnabled)&&r.intervention!=='user-required'&&!['suite','microlearning'].includes(r.workKind)&&r.target===target&&(r.topic===undefined||r.topic===topic);});
  if(!row)return null;
  const changed=state.db.prepare("UPDATE skill_learning_requests SET status='claimed',draft=? WHERE id=? AND status='pending'").run(draft,row.id).changes;
  return changed?{...JSON.parse(row.data),id:row.id}:null;

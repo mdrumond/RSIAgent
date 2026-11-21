@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {State} from '../../controller/state.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
+import {claimLearningRequest} from '../../controller/skill-review.mjs';
 import {main} from '../../cli/main.mjs';
 import {runCampaignFailureStep,failureCampaignStatus,failureCampaignSettled} from '../../cli/skill-failure-campaign.mjs';
 import {failureProtocol,selectFailureSlots} from '../../cli/skill-failure-worker.mjs';
@@ -40,6 +41,23 @@ test('baseline ceiling advances without designing or publishing an instruction',
 test('unsupported evidence returns needs-evidence without launching legacy learning',async t=>{
  const f=await fixture(t);let runtime=0;const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,family:async()=>({status:'needs-evidence',reason:'No recoverable actor source'}),runtime:async()=>{runtime++;}});
  assert.equal(outcome.reason,'needs-evidence');assert.equal(runtime,0);assert.equal(f.backlog.meta('microlearning-active'),null);
+});
+test('an isolated oracle gap queues one claimable Phase 1 request without running A/B',async t=>{
+ const f=await fixture(t),verification={reference:'events:2',sourceSha256:'a'.repeat(64)},nextQuestion='Which dimension is reduced in the masked tail?';
+ const disposition={blocker:'unreliable-oracle',route:'phase1',verification,nextQuestion};
+ const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,
+  family:async()=>({status:'needs-evidence',reason:'The two reference formulas disagree on a masked tail',disposition}),
+  runtime:async()=>assert.fail('Terminal research gap has no A/B runtime')});
+ assert.equal(outcome.status,'learning');
+ assert.equal(f.backlog.get(f.item.id).status,'learning');
+ assert.equal(f.calls.length,0);
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'wrong-target',target:'a5'}),null);
+ const request=claimLearningRequest(f.state,f.config,{draft:'phase1',target:'a3'});
+ assert.equal(request.id,outcome.learningRequest);
+ assert.equal(request.workKind,'phase1');
+ assert.equal(request.question,nextQuestion);
+ assert.deepEqual(request.verification,verification);
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'repeat',target:'a3'}),null);
 });
 test('scientific QA rejection finishes without development trials',async t=>{
  const f=await fixture(t);const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,design:async()=>async()=>({status:'rejected',reason:'Unsupported instruction'})});assert.equal(outcome.status,'rejected');assert.equal(f.calls.filter(c=>c[0]==='trial').length,5);
