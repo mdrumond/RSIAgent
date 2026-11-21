@@ -649,7 +649,8 @@ async function worker(root,id) {
     if(!url)url=await (await import('./knowledge.mjs')).ensureKnowledgeService(config,{signal:abort.signal});
     await (await import('./memory.mjs')).deliverLessons({config,state,queue:new RecoveryQueue(state,policy(config)),url,signal:abort.signal});
     state.event(id,'memory-updated',{});
-    if(config.skills?.review?.enabled===true||config.skills?.priority?.enabled===true)(await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
+    if(config.skills?.review?.enabled===true||config.skills?.priority?.enabled===true||config.skills?.failureFirst?.enabled===true)
+      (await import('../controller/skill-review.mjs')).recordLearningOutcome(state,state.project(current.project).spec,current);
     if(config.skills?.priority?.enabled) {
       // Failure journals already contain the evidence. No model/skill lock is
       // required to make Phase 1, recovery and curriculum failures discoverable.

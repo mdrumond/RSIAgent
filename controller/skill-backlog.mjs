@@ -141,6 +141,9 @@ export class SkillBacklog {
   for(const occurrence of occurrences)if(occurrence.attemptId)occurrence.skillReads=this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='skill-read' ORDER BY sequence DESC LIMIT 12").all(occurrence.attemptId).map(r=>parse(r.data));
   const linkedDiagnostics=[];
   for(const attempt of [...new Set(occurrences.map(o=>o.attemptId).filter(Boolean))].slice(0,2)){
+   const report=this.db.prepare("SELECT sequence,type,data FROM events WHERE attempt=? AND type='actor-blocker-reported' ORDER BY sequence DESC LIMIT 1").get(attempt);
+   if(report&&(includeRetired||occurrenceAttention(this.db,'events:'+report.sequence)==='active'))
+    linkedDiagnostics.push({reference:'events:'+report.sequence,type:report.type,data:parse(report.data),artifacts:[]});
    for(const row of this.db.prepare(`SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','baseline-preflight-completed','project-invalid','preactor-infrastructure','attempt-error') ORDER BY sequence DESC LIMIT 12`).all(attempt)){
     const data=parse(row.data),reference='events:'+row.sequence;if(failure(row.type,data)&&(includeRetired||occurrenceAttention(this.db,reference)==='active'))linkedDiagnostics.push({reference,type:row.type,data,artifacts:[]});
    }
