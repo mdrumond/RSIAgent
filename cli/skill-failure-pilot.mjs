@@ -177,6 +177,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   if(focused&&designed?.status==='rejected'&&nonempty(designed.revisionFeedback)){
    designed=await invoke('redesign--'+selected.id,'design',{...designInput,revisionFeedback:designed.revisionFeedback},dependencies.design);
   }
+  if(designed?.status==='infrastructure'&&designed.infrastructure===true&&nonempty(designed.reason))return await result('inconclusive',designed.reason);
   if(designed?.status==='rejected'&&nonempty(designed.reason))return await result('complete',designed.reason,{designRejected:true});
   state.candidates=candidates(designed);await persist();
   const arms=focused?state.candidates:[baseline,...state.candidates];

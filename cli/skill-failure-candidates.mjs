@@ -59,8 +59,15 @@ async function writerCall(directory,seconds,signal,fn,now){
  assert(!prior.running,'Interrupted writer elapsed custody is unknown');const remaining=Math.min(seconds,prior.seconds-prior.elapsedSeconds);assert(remaining>0,'Writer elapsed allowance exhausted');
  const started=now();let writes=Promise.resolve();const snapshot=running=>({...prior,elapsedSeconds:prior.elapsedSeconds+(now()-started)/1000,running});
  await save(file,snapshot(true));const timer=setInterval(()=>{writes=writes.then(()=>save(file,snapshot(true)));},1000);
- try{const bounded=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining*1000)))]);bounded.throwIfAborted();return await fn({seconds:remaining,signal:bounded});}
- finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
+ try{
+  const bounded=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining*1000)))]);
+  bounded.throwIfAborted();
+  return {written:await fn({seconds:remaining,signal:bounded})};
+ }catch(error){
+  const terminal=error?.reviewSession;
+  if(terminal?.retryableTimeout===true&&['elapsed','provider-error'].includes(terminal.kind))return {providerTimeout:terminal.kind};
+  throw error;
+ }finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
 }
 
 /** Called only after five clean baseline attempts establish the reproduced struggle. */
@@ -88,11 +95,14 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=['robust decisions','diagnostic reasoning','implementation complexity'].map(async(perspective,index)=>{try{
    const id='principle-'+String.fromCharCode(97+index),directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
-   const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return checkVersion(config,retained.candidate);}
+   const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return await checkVersion(config,retained.candidate);}
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
-   if(!written){written=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords,evidenceGroups:groups,
-     prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);validate(written.value,written.retrievals??[]);await save(resultFile,written);}
+   if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords,evidenceGroups:groups,
+     prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);
+    if(outcome.providerTimeout)return {id,providerTimeout:outcome.providerTimeout};
+    written=outcome.written;validate(written.value,written.retrievals??[]);await save(resultFile,written);
+   }
    else validate(written.value,written.retrievals??[]);
    await writerHealthy(written);
    const memoryEvidence=memoryEntries(written.retrievals??[]),changeId='failure-first-'+hash([identity,id]).slice(0,24);
@@ -106,6 +116,11 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    await save(candidateFile,{identity,candidate});return candidate;
   }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}});
   const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');if(infrastructureCause)throw infrastructureCause;
+  const writers=settled.flatMap(row=>row.status==='fulfilled'&&row.value.providerTimeout?[{id:row.value.id,kind:row.value.providerTimeout}]:[]);
+  if(writers.length){
+   const result={status:'infrastructure',infrastructure:true,correct:null,errorCode:'FAILURE_DESIGN_PROVIDER_TIMEOUT',reason:'Instruction writer provider request timed out',writers};
+   await save(dispositionFile,{identity,...result});return result;
+  }
   if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
   assert(new Set(candidates.map(candidate=>candidate.instruction)).size===3,'Three distinct instruction candidates required');await save(registry,{identity,candidates});return candidates;
  };

@@ -8,12 +8,13 @@ import {stages} from '../../controller/workflow.mjs';
 import {skillInput} from '../../cli/skill-microeval.mjs';
 import {readConfig} from '../../cli/instance.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
-import {runFailurePilot} from '../../cli/skill-failure-pilot.mjs';
+import {runFailurePilot,validatePilotTrial} from '../../cli/skill-failure-pilot.mjs';
 import {qaTopics} from '../../cli/skill-review-qa.mjs';
 import {createFailureDesign,publishFailureWinner} from '../../cli/skill-failure-candidates.mjs';
 import {reviewSession} from '../../cli/skill-review-native.mjs';
 import {validateClaimedResult} from '../../cli/claim-proofs.mjs';
 import {scriptedReview} from './helpers/scripted-review.mjs';
+import {timeoutReviewStream} from './helpers/review-timeout.mjs';
 
 const result=correct=>({correct,mechanismMatch:!correct,caseResults:[{id:'mechanism',correct},{id:'control',correct:true}],sourceSha256:'a'.repeat(64),artifacts:[],handles:[],failure:correct?null:{phase:'candidate',type:'CompilerFailure'}});
 const task=id=>({id,prompt:'Repair the isolated operation',caseIds:['mechanism','control'],controlCaseIds:['control'],files:{'kernel.py':'retained failing source'},checker:'/private/oracle.py',controls:{reference:{files:{'kernel.py':'private reference'}}}});
@@ -129,6 +130,75 @@ test('infrastructure cancellation retains the original cause rather than a sibli
  };
  await assert.rejects(createFailureDesign({config:f.config,item:f.item},f.deps)(f.input),error=>error===cause);assert.equal(cancelled,2);
 });
+test('a closed native writer timeout cohort is inconclusive and retains its five pilot baselines',async t=>{
+ const f=await fixture(t),directory=join(f.root,'timeout-pilot');
+ const manifest={baseline:f.input.baseline,identities:f.input.identities,families:[family()]};
+ const designDirectory=join(directory,'operations','design--retained');
+ const provider=await scriptedReview(t,f.root,()=>null),writers=[];
+ for(const id of ['principle-a','principle-b','principle-c']){
+  const directory=join(designDirectory,id);
+  await mkdir(directory,{recursive:true});
+  await writeFile(join(directory,'writer-spend.json'),JSON.stringify({seconds:180,elapsedSeconds:179,running:false}));
+ }
+ let baselines=0,qualifications=0;
+ const options={directory,manifest,trialSeconds:1,seconds:120,concurrency:4};
+ const deps={
+  qualify:async()=>{qualifications++;return {qualified:true,referencePassed:true,negativeFailed:true};},
+  trial:async({phase,repetition})=>{assert.equal(phase,'screen');baselines++;return baseline()[repetition];},
+  design:createFailureDesign({config:f.config,item:f.item},{
+   session:async input=>{
+    writers.push(input);
+    return reviewSession({...input,config:{actor:provider.profile},knowledge:false},{
+     retrySettings:{maxRetries:1,baseDelayMs:4000},wrapStream:real=>timeoutReviewStream(real,()=>true),
+    });
+   },
+   qa:()=>assert.fail('A timed-out writer submitted no proposal to review'),
+  }),
+ };
+ const report=await runFailurePilot(options,deps);
+ assert.equal(report.status,'inconclusive');
+ assert.equal(report.unresolvedOperation,undefined);
+ assert.equal(report.candidates,null);
+ assert.deepEqual(report.screens.retained,baseline().map(row=>validatePilotTrial(row,manifest.families[0].development)));
+ assert.equal(report.operations['design--retained'].status,'complete');
+ assert.equal(report.operations['design--retained'].result.errorCode,'FAILURE_DESIGN_PROVIDER_TIMEOUT');
+ assert.equal(report.operations['design--retained'].result.writers.length,3);
+ assert(report.operations['design--retained'].result.writers.every(w=>w.kind==='elapsed'));
+ for(const input of writers){
+  assert.equal(input.seconds,1);
+  const spend=JSON.parse(await readFile(join(input.directory,'..','writer-spend.json'),'utf8'));
+  assert.equal(spend.running,false);
+  assert(spend.elapsedSeconds>=179.9);
+ }
+ assert.equal(provider.requests(),0);
+ assert.equal(baselines,5);
+ assert.equal(qualifications,1);
+ const rerun=await runFailurePilot(options,{
+  qualify:()=>assert.fail('Reuse qualified controls'),
+  trial:()=>assert.fail('Reuse all five settled baseline trials'),
+  design:()=>assert.fail('Reuse the settled design outcome'),
+  settle:()=>assert.fail('Closed writer cohort has no unresolved custody'),
+ });
+ assert.equal(rerun.status,'inconclusive');
+ assert.deepEqual(rerun.screens,report.screens);
+ assert.deepEqual(rerun.operations,report.operations);
+ assert.deepEqual(await readdir(join(f.root,'skills/versions')),['base']);
+});
+
+test('an unknown design error keeps the pilot operation unresolved',async t=>{
+ const f=await fixture(t),directory=join(f.root,'error-pilot');
+ const options={directory,manifest:{baseline:f.input.baseline,identities:f.input.identities,families:[family()]},trialSeconds:1,seconds:120};
+ const report=await runFailurePilot(options,{
+  qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true}),
+  trial:async({repetition})=>baseline()[repetition],
+  design:createFailureDesign({config:f.config,item:f.item},{session:async()=>{throw Error('Writer closure unknown');}}),
+ });
+ assert.equal(report.status,'needs-settlement');
+ assert.equal(report.reason,'Writer closure unknown');
+ assert.equal(report.operations['design--retained'].status,'running');
+ assert.equal(report.candidates,null);
+});
+
 test('tampered reviewed guidance cannot be recovered or published',async t=>{
  const f=await fixture(t),design=createFailureDesign({config:f.config,item:f.item},f.deps),rows=await design(f.input),file=join(f.root,'skills/versions',rows[0].version,'skill-map.json'),map=JSON.parse(await readFile(file));await writeFile(join(f.root,'skills/versions',rows[0].version,map.implementation),'Changed after review');
  await assert.rejects(design(f.input),/changed after review/);
