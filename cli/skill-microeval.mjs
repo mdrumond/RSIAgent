@@ -86,7 +86,7 @@ export async function nativeSample({cwd,guidance,prompt,profile,seconds,signal,s
  if(localFilesystemSandbox&&!targetBash){
   let output='';const probe=await local.exec(sandboxCommand('true',taskRoot,hiddenPaths),taskRoot,{timeout:Math.min(5,remaining()),signal:sampleSignal,onData:chunk=>{output=(output+chunk).slice(-4096);}});
   const capability={kind:'local-filesystem-sandbox',available:probe.exitCode===0,exitCode:probe.exitCode,output};await writeFile(join(sessionDirectory,'sandbox-preflight.json'),JSON.stringify(capability,null,2)+'\n');
-  if(!capability.available)return {timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
+  if(!capability.available)return {targetDispatched:false,timedOut:false,error:'Local filesystem sandbox unavailable: '+output.trim(),errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',capability,tokens:null,cost:null,toolCalls:0};
  }
  const bridge=knowledge?createKdbBridge({url:knowledge.url,attentionRevision:knowledge.attentionRevision??0,attemptId:hash(sessionDirectory),agentDir}):null;
  const extension=async pi=>{

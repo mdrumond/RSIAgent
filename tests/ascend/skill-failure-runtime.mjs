@@ -118,6 +118,46 @@ test('Request timed out returns infrastructure only after actor custody closes a
  assert.equal((await failureRuntimeSettled({directory,config},offline)).closed,false);
 
 });
+test('unavailable Bubblewrap reports preflight failure and closes without actor or checker dispatch',async t=>{
+ const root=await fixture(t),directory=join(root,'runtime'),checker=join(root,'checker.py'),bin=join(root,'bin');
+ await mkdir(bin);await writeFile(checker,'pass');
+ const diagnostic='sandbox fixture: Bubblewrap unavailable';
+ await writeFile(join(bin,'bwrap'),`#!/bin/sh\nprintf '%s\n' '${diagnostic}' >&2\nexit 127\n`,{mode:0o700});
+ const provider=await scriptedReview(t,root,()=>null);
+ const config={target:'cpu',actor:provider.profile,environment:{options:{mode:'local'}}};
+ const slots=[{resource:{id:'slot'},physical:1}];
+ let actor,dispatches=0,checks=0;
+ const dependencies={
+  target:()=>({
+   sample:async input=>(actor=await nativeSample({...input,targetEnvironment:{execute:async()=>{dispatches++;}}})),
+   sampleSettled:async()=>true,
+   qualifyBatch:async()=>{checks++;return [];},
+  }),
+  settled:async()=>false,
+ };
+ const runtime=await createFailureRuntime({config,directory,slots},dependencies);
+ const operation=join(directory,'op'),task={id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'};
+ const path=process.env.PATH;process.env.PATH=path?bin+':'+path:bin;
+ let result;
+ try{
+  result=await runtime.trial({directory:operation,task,guidance:'same',actorSeconds:3,verificationSeconds:1});
+ }finally{
+  if(path===undefined)delete process.env.PATH;else process.env.PATH=path;
+ }
+ assert.deepEqual(result,{
+  infrastructure:true,correct:null,reason:'Native session failed: Local filesystem sandbox unavailable: '+diagnostic,
+  errorCode:'LOCAL_SANDBOX_UNAVAILABLE',bucket:'harness',
+ });
+ assert.equal(actor.targetDispatched,false);
+ assert.equal(actor.session,undefined);
+ assert.equal(actor.toolCalls,0);
+ assert.equal(provider.requests(),0);
+ assert.equal(dispatches,0);
+ assert.equal(checks,0);
+ assert.equal(await runtime.close(),true);
+ assert.deepEqual(await runtime.settle({directory:operation}),{closed:true});
+});
+
 test('native Pi exhausting the actor grant during provider timeout retry skips scoring',async t=>{
  const {createServer}=await import('node:http'),{once}=await import('node:events');
  const root=await fixture(t),checker=join(root,'checker.py'),credentials_file=join(root,'profile.env');
