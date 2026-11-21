@@ -306,18 +306,14 @@ const panelAuditSchema=Type.Object({
  audits:Type.Array(Type.Object({claimId:nonempty(),disposition:choices(['verified','disproved','unresolved']),reason:nonempty()},{additionalProperties:false}),{minItems:1}),
  claims:selectorClaims(Type.String({pattern:'^audits[.][0-9]+[.]reason$'})),
 },{additionalProperties:false});
-export async function nativeQaPanelAudit(input,dependencies={}){
- const prompt=await qaPrompt(input);
- const packet=await frozenEvidencePacket(prompt.groups);
- const primary=input.sourceCatalogue?.records??claimEvidence({prompt,packet});
- const inputRecords=claimEvidence({prompt:{proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
- const extras=[...(input.panelAuditEvidence??[]),...(input.panelRevisionSources??[])];
+// Direct readers and proof validation share the same frozen bytes and segment numbering.
+export async function stageAuditSources(directory,sources,packet={observations:[],artifacts:[]}){
  const records=new Map();
- for(const record of [...primary,...inputRecords,...extras]){
+ for(const record of sources){
   // Proof resolution takes the first record for a reference.
   if(!records.has(record.reference)&&record.available!==false&&typeof record.text==='string')records.set(record.reference,record);
  }
- const sourceDirectory=join(input.directory,'sources');await mkdir(sourceDirectory,{recursive:true});
+ const sourceDirectory=join(directory,'sources');await mkdir(sourceDirectory,{recursive:true});
  const sourceIndex=[];
  const observations=new Map(packet.observations.map(row=>[row.reference,row]));
  const artifacts=new Map(packet.artifacts.filter(row=>row.available).map(row=>[row.id,row]));
@@ -326,7 +322,7 @@ export async function nativeQaPanelAudit(input,dependencies={}){
   const stem=String(sourceIndex.length+1)+'-'+record.reference.replace(/[^a-z0-9._-]/gi,'-').slice(0,80);
   for(const [index,text] of segments.entries()){
    const file=join('sources',stem+(segments.length>1?'-part-'+(index+1):'')+'.txt');
-   await writeFile(join(input.directory,file),text);files.push(file);
+   await writeFile(join(directory,file),text);files.push(file);
   }
   const observation=observations.get(record.reference),artifact=artifacts.get(record.reference);
   const role=record.role??record.provenance??observation?.type??(artifact?'frozen-artifact':record.factId?'controller-fact':'source');
@@ -336,15 +332,23 @@ export async function nativeQaPanelAudit(input,dependencies={}){
    ...(record.sourceRefs?.length?{sourceRefs:record.sourceRefs}:{})});
  }
  const indexFile='sources/index.jsonl';
- await writeFile(join(input.directory,indexFile),sourceIndex.map(row=>JSON.stringify(row)).join('\n')+'\n');
+ await writeFile(join(directory,indexFile),sourceIndex.map(row=>JSON.stringify(row)).join('\n')+'\n');
+ return {proofRecords:[...records.values()],indexFile,sourceIndex,allowedPaths:packet.artifacts.filter(row=>row.available).flatMap(row=>row.paths)};
+}
+export async function nativeQaPanelAudit(input,dependencies={}){
+ const prompt=await qaPrompt(input);
+ const packet=await frozenEvidencePacket(prompt.groups);
+ const primary=input.sourceCatalogue?.records??claimEvidence({prompt,packet});
+ const inputRecords=claimEvidence({prompt:{proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
+ const extras=[...(input.panelAuditEvidence??[]),...(input.panelRevisionSources??[])];
+ const {proofRecords,indexFile,sourceIndex,allowedPaths}=await stageAuditSources(input.directory,[...primary,...inputRecords,...extras],packet);
  const selectors=claims=>[...new Set(claims.flatMap(claim=>claim.proofs??[]).map(proof=>JSON.stringify(Object.fromEntries(
   Object.keys(selectorFields).filter(key=>Object.hasOwn(proof,key)).map(key=>[key,proof[key]])))))].map(value=>JSON.parse(value));
  const objections=input.objections.map(({id,kind,path,problem,mentions})=>({id,kind,path,problem,
   citedSelectors:selectors(mentions),answerSelectors:selectors((input.answerClaims??[]).filter(claim=>claim.path===path))}));
  const extraIds=new Set(extras.map(record=>record.reference));
- const allowedPaths=packet.artifacts.filter(row=>row.available).flatMap(row=>row.paths);
  return (dependencies.session??reviewSession)({...input,resultSchema:panelAuditSchema,selectorOnly:true,proofRequired:true,knowledge:false,
-  compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords:[...records.values()],allowedPaths,
+  compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords,allowedPaths,
   prompt:{draft:input.proposal,qaAnswers:input.answers,objective:input.objective,target:input.target,projectSummaries:[],learningProofEvidence:[],
    objections,sourceIndex:indexFile,additionalSources:sourceIndex.filter(row=>extraIds.has(row.reference)),
    task:'Resolve each objection against its exact statement in the draft or QA answers. Start with its cited selectors and relevant additionalSources. sources/index.jsonl maps all frozen references to readable files, roles and related artifacts. Read or grep the source files directly. Multipart file order is selector segment order. Distinguish scored results, intermediate edits, static probes and generic deductions. Use verified for a material objection established by primary evidence, disproved for a refuted objection, unresolved for insufficient evidence. Submit one audits row per exact claimId with disposition and concise reason, and top-level claims with selectors for audits.N.reason. Frequency of an objection is not evidence.'},
