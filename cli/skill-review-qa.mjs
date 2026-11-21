@@ -211,7 +211,7 @@ export async function runProposalQa(input,ops){
      state.answerCorrectionUsed=true;
      state.rounds.push({proposal,answerCorrection:{findings:blocking,previousAnswers:round.answers,previousClaims:round.claims??[]}});
     }else{
-     if(panel||input.allowWriterRevision){state.verdict='inconclusive';state.reason=round.review.reason;if(input.allowWriterRevision)state.revisionFeedback=panel?JSON.stringify({reason:round.review.reason,issues:blocking}):round.review.reason;break;}
+     if(panel||input.allowWriterRevision){state.verdict='inconclusive';state.reason=round.review.reason;if(input.allowWriterRevision)state.revisionFeedback=panel?JSON.stringify({proposal:round.proposal,reason:round.review.reason,issues:blocking}):round.review.reason;break;}
      state.rounds.push({proposal});
     }
     await persist();continue;

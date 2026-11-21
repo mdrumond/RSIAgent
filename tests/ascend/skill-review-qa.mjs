@@ -347,3 +347,21 @@ test('explicit recovery can retry an interrupted audit while keeping every origi
  assert.deepEqual(panel.slots,first.rounds[0].panel.slots);assert.equal(panel.history[0].auditElapsedSeconds,30);
  assert.equal(panel.history[0].auditError.message,'Audit provider disconnected');
 });
+
+test('panel writer correction receives the exact reviewed proposal and every verified finding',async t=>{
+ const input={...await fixture(t),qaPolicy:'panel',allowWriterRevision:true,evaluationContract:{workflow:'failure-first-v1'}};
+ const changed=[{text:'Revision submitted by the answer stage'}],issues=[
+  {kind:'draft',path:'changes.0.text',problem:'The revised rule exceeds its applicability boundary'},
+  {kind:'answer',path:'answers.action.text',problem:'The answer reports an unmeasured value'},
+ ];
+ const report=await runProposalQa(input,{
+  qaAnswer:async()=>({...answers(),changes:changed}),qaReview:async()=>({verdict:'revise',reason:'Source scopes conflict',issues}),
+  qaPanelAudit:async({objections})=>({
+   audits:objections.map(claim=>({claimId:claim.id,disposition:'verified',reason:claim.problem})),
+   claims:objections.map((_,i)=>({path:'audits.'+i+'.reason',proofs:[{reference:'artifact:1',quote:'Scored case',recordSha256:'fixture'}]})),
+  }),
+ });
+ const feedback=JSON.parse(report.revisionFeedback);
+ assert.deepEqual(feedback.proposal,report.rounds[0].proposal);assert.deepEqual(feedback.proposal.changes,changed);
+ assert.deepEqual(feedback.issues,report.rounds[0].review.issues);assert.equal(feedback.issues.length,2);
+});
