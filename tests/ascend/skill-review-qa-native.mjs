@@ -132,3 +132,66 @@ for(const kind of ['available','missing','hash-mismatch','invalid-reference','ou
   assert.match(report.error.reviewSession.lastRejection,kind==='forged-proof'?/quote does not match/i:/actual evidence references/);
  }
 });
+
+async function artifactQaFixture(t){
+ const {root,input}=await fixture(t),path=join(root,'artifact.log'),text='Observed boundary failure';
+ const sha256=createHash('sha256').update(text).digest('hex'),reference='artifact:'+sha256;
+ await writeFile(path,text);
+ input.groups[0].linkedDiagnostics[0].artifacts=[{path,sha256}];
+ const proof={reference,startLine:1,endLine:1};
+ const answer=selected=>({
+  answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text,refs:[reference]}])),
+  claims:qaTopics.map(topic=>({path:'answers.'+topic+'.text',kind:'observation',proofs:[selected]})),
+ });
+ const review=selected=>({verdict:'approved',reason:text,claims:[{path:'reason',kind:'observation',proofs:[selected]}]});
+ return {root,input,text,sha256,proof,answer,review};
+}
+
+test('failure-first native answer and review derive quotes from verified artifact selectors',async t=>{
+ const {root,input,text,sha256,proof,answer,review}=await artifactQaFixture(t);
+ const provider=await scriptedReview(t,root,body=>{
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  const replies=body.messages.filter(message=>message.role==='tool');
+  if(replies.at(-1)?.content.includes('Accepted. Finish'))return null;
+  const build=schema.properties.answers?answer:review;
+  const selected=replies.length?proof:{...proof,quote:text};
+  return {name:'submit_review',args:{result:build(selected)}};
+ });
+ let answering,reviewing;
+ const report=await runProposalQa({...input,config:{actor:provider.profile},evaluationContract:{workflow:'failure-first-v1'},
+  projectSummaries:[],learningProofEvidence:[],validateProposal:value=>value},{
+  qaAnswer:async args=>{answering=args.directory;return (await nativeQaAnswer(args)).value;},
+  qaReview:async args=>{reviewing=args.directory;return (await nativeQaReview(args)).value;},
+ });
+ assert.equal(report.verdict,'approved');
+ assert.equal(provider.requests(),6);
+ for(const directory of [answering,reviewing]){
+  const nativeInput=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
+  assert(nativeInput.frozenEvidence.artifacts.some(artifact=>artifact.id===proof.reference&&artifact.text===text));
+  const settlement=JSON.parse(await readFile(join(directory,'termination.json'),'utf8'));
+  assert.equal(settlement.rejectedSubmissions,1);
+ }
+ for(const claim of [report.rounds[0].claims[0],report.rounds[0].review.claims[0]]){
+  assert.equal(claim.proofs[0].quote,text);
+  assert.equal(claim.proofs[0].sourceSha256,sha256);
+ }
+});
+
+test('failure-first native QA revalidates a legacy cached literal proof in place',async t=>{
+ const {root,input,text,proof,answer,review}=await artifactQaFixture(t);
+ const provider=await scriptedReview(t,root,body=>{
+  if(body.messages.some(message=>message.role==='tool'))return null;
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  const build=schema.properties.answers?answer:review;
+  return {name:'submit_review',args:{result:build({reference:proof.reference,quote:text})}};
+ });
+ for(const [name,adapter]of [['answer',nativeQaAnswer],['review',nativeQaReview]]){
+  const request={...input,directory:join(root,name),config:{actor:provider.profile},validate:value=>value};
+  const cached=await adapter(request);
+  const resumed=await adapter({...request,config:{},evaluationContract:{workflow:'failure-first-v1'}});
+  assert.equal(resumed.recovered,true);
+  assert.equal(resumed.session,cached.session);
+  assert.deepEqual(resumed.value,cached.value);
+ }
+ assert.equal(provider.requests(),4);
+});
