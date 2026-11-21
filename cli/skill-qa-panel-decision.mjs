@@ -79,6 +79,13 @@ export function decideQaPanel(votes, audits = []) {
  const unresolved = claims.filter(claim => claim.audit.disposition === 'unresolved');
  const issues = verified.map(claim => ({
   ...claim.mentions[0].issue,
+  claimId: claim.id,
+  // Pass stable primary selectors to the correcting author. The full audited
+  // excerpts remain in the panel record and can include large quoted inputs.
+  proofs: claim.audit.proofs.map(proof => Object.fromEntries(
+   ['reference', 'startLine', 'endLine', 'segment', 'field', 'factId', 'recordSha256']
+    .filter(key => Object.hasOwn(proof, key)).map(key => [key, proof[key]])
+  )),
   problem: claim.problem + '\nEvidence audit: ' + claim.audit.reason,
  }));
  const result = {approvals, missingSlots, claims, advisories: grouped.advisories, issues};

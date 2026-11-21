@@ -34,10 +34,17 @@ test('audit each distinct claim on a shared target and keep every duplicate ment
  const claims = panelClaims(votes);
  assert.equal(claims.length, 2);
  assert.deepEqual(claims[0].mentions.map(mention => mention.slot), [4, 5]);
- const decision = decideQaPanel(votes, [audit(claims[0], 'disproved'), audit(claims[1], 'verified', 'The artifact binds only the kernel.')]);
+ const decision = decideQaPanel(votes, [audit(claims[0], 'disproved'), {...audit(claims[1], 'verified', 'The artifact binds only the kernel.'), proofs: [
+  materializeProof({reference: source.reference, startLine: 2, endLine: 2}, [source]),
+ ]}]);
  assert.equal(decision.route, 'writer');
  assert.equal(decision.issues.length, 1);
  assert.match(decision.reason, /The artifact binds only the kernel[.]/);
+ assert.equal(decision.issues[0].claimId, claims[1].id);
+ // Feedback identifies the primary span used by the auditor, even when the
+ // original reviewer cited a different span.
+ assert.equal(decision.issues[0].proofs[0].recordSha256, proof.recordSha256);
+ assert.equal(materializeProof(decision.issues[0].proofs[0], [source]).quote, source.text.split('\n')[1]);
 });
 
 test('a verified minority objection sends consolidated evidence to the appropriate author', () => {
