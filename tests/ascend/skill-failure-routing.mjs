@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {State} from '../../controller/state.mjs';
+import {claimLearningRequest} from '../../controller/skill-review.mjs';
 import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {analyzeBacklog} from '../../cli/skill-backlog-analysis.mjs';
 import {runCampaignFailureStep} from '../../cli/skill-failure-campaign.mjs';
@@ -68,6 +69,7 @@ test('a failed target baseline creates a Phase 1 learning request and no runnabl
  assert.equal(request.status,'pending');
  assert.equal(JSON.parse(request.data).backlogId,item.id);
  assert.equal(JSON.parse(request.data).workKind,'phase1');
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'draft',target:'a5'}).backlogId,item.id);
  assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
 });
 

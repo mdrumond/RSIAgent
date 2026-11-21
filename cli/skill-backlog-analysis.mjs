@@ -231,7 +231,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
     const item=backlog.upsert({...common,objective:{human:'harness',phase1:'correctness'}[route]??classification.bucket,
      key:'failure-first:'+group.id,workflow:'failure-first-v1',proposal:null,evidence,preparation:{...classificationContext,...(measurements.length?{measurements}:{})},
      priority:common.priority+bonus,status});
-    if(route==='phase1')queueLearning(backlog,config,item,[{workKind:'phase1',learningTarget:'device',
+    if(route==='phase1')queueLearning(backlog,config,item,[{workflow:'failure-first-v1',workKind:'phase1',learningTarget:'device',
      question:'Can an explicit PyTorch reference reproduce the intended operation independently of the failed target baseline?',
      hypothesis:'Small cases with a separately specified oracle can establish the expected result on the target.',
      requiredEvidence:'Provide the reference and small cases with explicit expected outputs, then check the reference on the target. Original baseline verdict: '+observed.reference}]);
