@@ -8,6 +8,8 @@ import {guidanceEntries} from '../controller/skill-review.mjs';
 import {stages} from '../controller/workflow.mjs';
 import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {skillInput} from './skill-microeval.mjs';
+import {claimEvidence} from './project-summary.mjs';
+import {frozenEvidencePacket} from './skill-review-evidence.mjs';
 import {reviewSession,nativeQaAnswer,nativeQaReview} from './skill-review-native.mjs';
 import {qaIdentity,runProposalQa} from './skill-review-qa.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
@@ -92,13 +94,16 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const {groups,development,proofRecords,evaluationContract}=designEvidence(item,input.family.development,input.baselineResults,focused?input.qualification:undefined);
   const refs=groups.flatMap(group=>[...group.occurrences,...(group.linkedDiagnostics??[])].map(row=>row.reference));
   const started=ops.now(),left=()=>Math.max(0,input.remainingSeconds-(ops.now()-started)/1000),sessionConfig={...knowledgeConfig,project_evidence_root:config.root};
+  input.signal?.throwIfAborted();
+  const primaryRecords=claimEvidence({packet:await frozenEvidencePacket(groups)});
+  const writerProofRecords=[...primaryRecords,...proofRecords];
   const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=['robust decisions','diagnostic reasoning','implementation complexity'].map(async(perspective,index)=>{try{
    const id='principle-'+String.fromCharCode(97+index),directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
    const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return await checkVersion(config,retained.candidate);}
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
-   if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords,evidenceGroups:groups,
+   if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
      prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);
     if(outcome.providerTimeout)return {id,providerTimeout:outcome.providerTimeout};
     written=outcome.written;validate(written.value,written.retrievals??[]);await save(resultFile,written);

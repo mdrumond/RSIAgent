@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,readdir,rm} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {State} from '../../controller/state.mjs';
@@ -89,6 +90,56 @@ test('native Pi submission accepts selector-only prose and preserves reviewed gu
  f.deps.session=async args=>{const reviewed=await reviewSession({...args,knowledge:false,config:{...args.config,actor:provider.profile,skill_writer_actor:provider.profile},validate:value=>args.validate(value,retrievals)});return {...reviewed,retrievals};};
  const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(rows.length,3);assert.equal(submitted,3);assert.equal(provider.requests(),9);for(const row of rows)assert.equal(row.text,(await skillInput(join(f.root,'skills/versions',row.version))).text);
 });
+test('the native design writer cites verified campaign evidence alongside retained baselines',async t=>{
+ const f=await fixture(t),valid=join(f.root,'valid.log'),changed=join(f.root,'changed.log');
+ const sha=text=>createHash('sha256').update(text).digest('hex');
+ const validText='Verifier observed an output mismatch',changedText='Old verifier output';
+ const validRef='artifact:'+sha(validText),changedRef='artifact:'+sha(changedText),unknown='events:9999';
+ await writeFile(valid,validText);
+ await writeFile(changed,'Different output');
+ f.item.evidence.groups[0].occurrences[0].artifacts=[
+  {path:valid,sha256:sha(validText)},
+  {path:changed,sha256:sha(changedText)},
+ ];
+ const retrievals=[{entries:[{collection:'memory',chunk_id:'chunk',text:'Successful bounded formulation'}]}];
+ const directories=[];
+ let submitted=0;
+ const provider=await scriptedReview(t,f.root,body=>{
+  const tools=body.messages.filter(message=>message.role==='tool');
+  if(tools.length===3)return null;
+  const references=tools.length===0?[unknown]:tools.length===1?[changedRef]:['events:1',validRef,'baseline-0'];
+  const value={text:'Check that a simpler representation preserves the original contract. Variant '+(++submitted)+'.',
+   scope:'implementation',memoryRefs:['memory:chunk'],claims:[{path:'text',kind:'hypothesis',
+    proofs:references.map(reference=>({reference,startLine:1,endLine:1})),
+   }]};
+  return {name:'submit_review',args:{result:value}};
+ });
+ f.deps.session=async args=>{
+  directories.push(args.directory);
+  const reviewed=await reviewSession({...args,knowledge:false,
+   config:{...args.config,actor:provider.profile},validate:value=>args.validate(value,retrievals),
+  });
+  return {...reviewed,retrievals};
+ };
+ const candidates=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);
+ assert.equal(candidates.length,3);
+ assert.equal(provider.requests(),12);
+ for(const directory of directories){
+  const native=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
+  const refs=new Set(native.proofSelectors.map(record=>record.reference));
+  assert(refs.has('events:1')&&refs.has(validRef)&&refs.has('baseline-0'));
+  assert(!refs.has(unknown)&&!refs.has(changedRef));
+  const rejected=(await readFile(join(directory,'submission-rejections.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+  assert(rejected.some(row=>row.error.includes(unknown)));
+  assert(rejected.some(row=>row.error.includes(changedRef)));
+ }
+ for(const candidate of candidates){
+  assert.deepEqual(candidate.evidence.map(proof=>proof.reference),['events:1',validRef,'baseline-0']);
+  assert.equal(candidate.evidence[1].quote,validText);
+  assert.equal(candidate.evidence[1].sourceSha256,sha(validText));
+ }
+});
+
 test('default native QA envelopes pass five proof-backed answers and review through proposal QA',async t=>{
  const f=await fixture(t);let answers=0,reviews=0;
  const provider=await scriptedReview(t,f.root,body=>{
