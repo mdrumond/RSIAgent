@@ -328,3 +328,22 @@ test('one lost quorum-deciding vote and scientifically unresolved evidence have 
   assert.equal(result.reasonKind,disposition==='disproved'?'infrastructure':'scientific');
  }
 });
+
+test('explicit recovery can retry an interrupted audit while keeping every original ballot',async t=>{
+ const input={...await fixture(t),qaPolicy:'panel',evaluationContract:{workflow:'failure-first-v1'}};
+ let clock=0;
+ const first=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>answers(),qaReview:async({directory})=>directory.endsWith('-4')?
+  {verdict:'revise',reason:'Wrong source attribution',issues:[{kind:'draft',problem:'Mismatch is from the starter'}]}:{verdict:'approved',reason:'Supported'},
+  qaPanelAudit:async()=>{clock+=30000;throw Error('Audit provider disconnected');}
+ });
+ assert.equal(first.reasonKind,'infrastructure');assert.equal(first.rounds[0].panel.decision.missingSlots.length,0);
+ const resumed=await runProposalQa({...input,retryMissingPanelVotes:true},{now:()=>clock,
+  qaReview:()=>assert.fail('Every vote already submitted'),qaPanelAudit:async({objections,seconds})=>{
+   assert.equal(seconds,90);
+   return {audits:[{claimId:objections[0].id,disposition:'disproved',reason:'The output belongs to the intermediate source'}],
+    claims:[{path:'audits.0.reason',proofs:[{reference:'e:1',quote:'Intermediate output',recordSha256:'fixture'}]}]};
+  }});
+ assert.equal(resumed.verdict,'approved');const panel=resumed.rounds[0].panel;
+ assert.deepEqual(panel.slots,first.rounds[0].panel.slots);assert.equal(panel.history[0].auditElapsedSeconds,30);
+ assert.equal(panel.history[0].auditError.message,'Audit provider disconnected');
+});

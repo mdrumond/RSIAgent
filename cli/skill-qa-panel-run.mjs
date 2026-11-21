@@ -15,12 +15,15 @@ export function replayPanelDecision(panel) {
  return decideQaPanel(panelVotes(panel), panelAudits(panel));
 }
 
-// Re-open only missing votes after an explicit retry at lower provider concurrency.
-export function reopenMissingVotes(round) {
+// Preserve submitted verdicts when retrying an interrupted ballot or its evidence audit.
+export function reopenPanel(round, remaining) {
  const panel=round?.panel;
- if(!panel?.decision?.missingSlots.length || panel.decision.verdict!=='inconclusive')return false;
- (panel.history??=[]).push({slots:panel.slots,audit:panel.audit,auditError:panel.auditError,decision:panel.decision});
- panel.slots=panel.slots.map(slot=>slot?.status==='submitted'?slot:null);
+ if(panel?.decision?.verdict!=='inconclusive')return false;
+ const retryVotes=panel.decision.missingSlots.length>0&&remaining('review')>0;
+ const retryAudit=!!panel.auditError&&remaining('audit')>0;
+ if(!retryVotes&&!retryAudit)return false;
+ (panel.history??=[]).push({slots:panel.slots,audit:panel.audit,auditError:panel.auditError,auditElapsedSeconds:panel.auditElapsedSeconds,decision:panel.decision});
+ if(retryVotes)panel.slots=panel.slots.map(slot=>slot?.status==='submitted'?slot:null);
  for(const key of ['audit','auditError','auditElapsedSeconds','decision'])delete panel[key];
  delete round.review;
  return true;

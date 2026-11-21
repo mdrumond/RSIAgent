@@ -4,7 +4,7 @@ import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {join} from 'node:path';
 import {prepareQaSources,summaryProtocol,validateSummary,summaryItems} from './skill-evidence-summary.mjs';
 import {frozenEvidencePacket,scopedQaGroups} from './skill-review-evidence.mjs';
-import {reopenMissingVotes,runPanelRound} from './skill-qa-panel-run.mjs';
+import {reopenPanel,runPanelRound} from './skill-qa-panel-run.mjs';
 import {projectSummaries,learningProofEvidence} from './project-summary.mjs';
 const reservedThrough=state=>Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0,...Object.values(state.inFlightOperations??{}).map(op=>op.reservedThrough??0));
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -93,7 +93,7 @@ export async function runProposalQa(input,ops){
  let writes=Promise.resolve();
  const persist=()=>{state.elapsedSeconds=elapsed();if(split)state.phaseElapsed=Object.fromEntries(qaLanes.map(lane=>[lane,phaseElapsed(lane)]));const snapshot=JSON.stringify(state,null,2)+'\n';writes=writes.then(async()=>{const tmp=file+'.tmp';await writeFile(tmp,snapshot);await rename(tmp,file);});return writes;};
  const remaining=lane=>Math.max(0,Math.min(state.seconds-elapsed(),split&&lane?state.phaseSeconds[lane]-phaseElapsed(lane):Infinity));
- if(panel&&input.retryMissingPanelVotes&&state.verdict==='inconclusive'&&remaining('review')>0&&reopenMissingVotes(state.rounds.at(-1)))state.retryable=true;
+ if(panel&&input.retryMissingPanelVotes&&state.verdict==='inconclusive'&&reopenPanel(state.rounds.at(-1),remaining))state.retryable=true;
  if(state.verdict&&!state.retryable)return state;
  if(state.retryable){delete state.verdict;delete state.reason;delete state.error;delete state.reasonKind;delete state.retryable;}
  const stop=new AbortController(),signal=AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])]),waiting=[];
