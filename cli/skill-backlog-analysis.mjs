@@ -236,7 +236,9 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
      question:observed.kind==='unresolved-oracle'?'What behavior should the independent reference expect for the disputed cases?':
       'Can an explicit PyTorch reference reproduce the intended operation independently of the failed target baseline?',
      hypothesis:'Small cases with a separately specified oracle can establish the expected result on the target.',
-     requiredEvidence:'Provide the reference and small cases with explicit expected outputs, then check the reference on the target. Original baseline verdict: '+observed.reference}]);
+     verificationReference:observed.reference,
+     requiredEvidence:'Provide the reference and small cases with explicit expected outputs, then check the reference on the target. '+
+      (observed.kind==='unresolved-oracle'?'Original diagnostic group: '+group.id:'Original baseline verdict: '+observed.reference)}]);
     backlog.acknowledge(group.id,{classification,count:group.count});return item;
    });
    created.push(stored);stages[identity(group)]={stage:'complete',status:'complete',classification};persist();continue;

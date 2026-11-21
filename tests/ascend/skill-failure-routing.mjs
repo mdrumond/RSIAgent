@@ -166,6 +166,13 @@ test('a trusted unresolved oracle queues one Phase 1 question with independently
  assert.equal(item.status,'learning');
  const question=claimLearningRequest(f.state,f.config,{draft:'oracle-study',target:'a5'});
  assert.equal(question.backlogId,item.id);
+ assert.equal(question.workKind,'phase1');
+ assert.equal(question.verificationReference,item.evidence.groups[0].occurrences[0].reference);
+ const repeated=f.start('oracle-gap-repeated');
+ await f.verify(repeated,'repeated.log',JSON.stringify(receipt));
+ f.backlog.ingest();
+ await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
+ assert.equal(f.state.db.prepare('SELECT COUNT(*) AS count FROM skill_learning_requests').get().count,1);
  assert.equal(claimLearningRequest(f.state,f.config,{draft:'second',target:'a5'}),null);
  assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
 });
