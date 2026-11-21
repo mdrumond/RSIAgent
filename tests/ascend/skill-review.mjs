@@ -396,9 +396,12 @@ test('failure-first native classification corrects unsupported ownership and reu
   }
   return null;
  });
+ const timings=[];
  const options={directory,config:{actor:provider.profile},groups,entries:[],bucketPolicy:true,failureFirst:true,seconds:30,
+  onModelTiming:(kind,seconds)=>timings.push({kind,seconds}),
   validate:value=>validateClassificationBatch(value,groups,[],{requireBucket:true,failureFirst:true})};
  const first=await nativeClassifyBatch(options);
+ assert.ok(timings.some(row=>row.kind==='piTurnWait'&&row.seconds>0));
  assert.equal(first.value.classifications[0].cause,'unknown');
  assert.equal(first.value.classifications[0].triage.route,'unresolved');
  const before=provider.requests(),replay=await nativeClassifyBatch(options);

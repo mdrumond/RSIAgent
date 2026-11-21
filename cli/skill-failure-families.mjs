@@ -225,7 +225,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
  const now=dependencies.now??(()=>performance.now()),begun=now(),allocation=Math.min(seconds,failureTiming.isolationSeconds-elapsed);
  const left=()=>allocation-(now()-begun)/1000;
  const isolationTimeout=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),bounded=signal?AbortSignal.any([signal,isolationTimeout]):isolationTimeout;
- const timings={focusedQuestion:0,verification:0,piResponse:0,piRetry:0,...prior?.timings};
+ const timings={focusedQuestion:0,verification:0,piTurnWait:0,piResponse:0,piRetry:0,...prior?.timings};
  let focus=new AbortController(),focusedSignal=AbortSignal.any([bounded,focus.signal]);
  let question=prior?.question??{number:1,kind:'isolate-failure',elapsedSeconds:timings.focusedQuestion};
  let ledger={identity,elapsedSeconds:elapsed,timings,question,referenceChecks:observations,running:true},focusStarted,focusTimer,verificationStarted;

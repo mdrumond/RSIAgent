@@ -164,7 +164,7 @@ test('trusted verification has its own elapsed time within isolation and leaves 
     await mkdir(join(writableDirectory,name,'..'),{recursive:true});
     await writeFile(join(writableDirectory,name),content);
    }
-   now+=120000;onModelTiming('piResponse',80);onModelTiming('piRetry',20);
+   now+=120000;onModelTiming('piTurnWait',60);onModelTiming('piResponse',80);onModelTiming('piRetry',20);
    const value=await validate({status:'ready',reason:'Verified starter and references',family:f.family});
    assert.equal(signal.aborted,false);
    now+=59000;
@@ -174,7 +174,7 @@ test('trusted verification has its own elapsed time within isolation and leaves 
  assert.equal(output.status,'ready');
  assert.equal(output.elapsedSeconds,419);
  const saved=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
- assert.deepEqual(saved.timings,{focusedQuestion:179,verification:240,piResponse:80,piRetry:20,handoff:0});
+ assert.deepEqual(saved.timings,{focusedQuestion:179,verification:240,piTurnWait:60,piResponse:80,piRetry:20,handoff:0});
 });
 
 test('a resumed focused question retains its spent time and preserves partial draft on expiry',async t=>{

@@ -169,13 +169,19 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
- let responseStarted,retryStarted;
+ let turnStarted,responseStarted,retryStarted;
+ const recordWait=()=>{
+  if(turnStarted!==undefined){onModelTiming('piTurnWait',(performance.now()-turnStarted)/1000);turnStarted=undefined;}
+ };
  const unsubscribe=session.subscribe(event=>{
   if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
    const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
   }
   if(!onModelTiming)return;
-  if(event.type==='message_start'&&event.message.role==='assistant')responseStarted=performance.now();
+  if(event.type==='turn_start')turnStarted=performance.now();
+  if(event.type==='message_start'&&event.message.role==='assistant'){
+   recordWait();responseStarted=performance.now();
+  }
   if(event.type==='message_end'&&event.message.role==='assistant'&&responseStarted!==undefined){
    onModelTiming('piResponse',(performance.now()-responseStarted)/1000);responseStarted=undefined;
   }
@@ -213,7 +219,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   }
   throw error;
  }finally{
-  clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();await rejectionWrites;
+  recordWait();clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();await rejectionWrites;
   if(responseStarted!==undefined)onModelTiming('piResponse',(performance.now()-responseStarted)/1000);
   if(retryStarted!==undefined)onModelTiming('piRetry',(performance.now()-retryStarted)/1000);
   try{await session.exportToJsonl(join(directory,'session.native.jsonl'));}finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
