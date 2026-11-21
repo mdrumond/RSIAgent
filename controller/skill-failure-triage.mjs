@@ -39,7 +39,8 @@ export function routeFailureClassification(value,group){
  if(invalid)return {route:'phase1',observed:invalid};
  if(value.bucket==='optimization'&&performance)return {route:'optimization',observed:performance};
  if(value.bucket==='correctness'&&candidate)return {route:'baseline',observed:candidate};
- if(value.bucket==='correctness'&&exit)
-  return {route:'probe',observed:exit,question:'Can the retained source and original verifier reproduce a failure inside the candidate or its correctness oracle?'};
- return {route:'unresolved',observed:candidate??exit??performance??null};
+ if(exit)return {route:'unresolved',observed:exit,...(exit.replayEvidence?{
+  question:'Can the retained source and original verifier reproduce a failure inside the candidate or its correctness oracle?'
+ }: {})};
+ return {route:'unresolved',observed:candidate??performance??null};
 }

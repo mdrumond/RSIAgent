@@ -223,7 +223,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    priority:priority(group),reason:classification.reason,base},evidence={groups:[group]},classificationContext={classifications:{[group.id]:classification}};
   if(classificationOnly){
    const {route,observed}=classification.triage;
-   const status={human:'user-required',baseline:'queued',phase1:'learning',probe:observed?.replayEvidence?'queued':'deferred'}[route]??'deferred';
+   const status={human:'user-required',baseline:'queued',phase1:'learning'}[route]??'deferred';
    const measurements=route==='optimization'?(await projectSummaries(config,[group])).flatMap(summary=>
     summary.measurements.filter(m=>m.verified&&m.geometricMeanSpeedup>1).map(m=>({reference:m.reference,projectId:summary.projectId,geometricMeanSpeedup:m.geometricMeanSpeedup}))):[];
    const bonus=Math.min(10,Math.round(10*Math.log2(Math.max(1,...measurements.map(m=>m.geometricMeanSpeedup)))));

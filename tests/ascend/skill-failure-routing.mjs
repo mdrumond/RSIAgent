@@ -46,15 +46,17 @@ test('a hash-bound verifier traceback does not establish ownership; corrected su
  assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
 });
 
-test('verifier replay evidence opens a focused probe while a failed candidate receipt opens baseline screening',async t=>{
+test('raw verifier exits retain a replay question while hash-bound candidate verdicts open baseline screening',async t=>{
  for(const receipt of [false,true]){
   const f=await fixture(t),attempt=f.start('first');
   const output=receipt?JSON.stringify({correct:false,kernelSha256:'a'.repeat(64)}):'TypeError: incompatible operand type';
   await f.verify(attempt,'verifier.log',output);
   f.backlog.ingest();
   const {items:[item]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
-  assert.equal(item.status,'queued');
-  assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,receipt?'baseline':'probe');
+  assert.equal(item.status,receipt?'queued':'deferred');
+  const {route,question}=item.preparation.classifications[item.groupIds[0]].triage;
+  assert.equal(route,receipt?'baseline':'unresolved');
+  assert.equal(Boolean(question),!receipt);
   assert.equal(item.proposal,null);
  }
 });
