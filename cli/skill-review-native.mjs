@@ -150,7 +150,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   pi.on('tool_result',async event=>{if(event.toolName!=='read'||event.isError)return;
    const path=resolveToCwd(event.input.path??'',directory);if(requiredReads.some(p=>resolve(p)===path)){seen.add('file:'+path);await writeFile(coverageFile,JSON.stringify([...seen]));}
   });
-  pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured evidence-supported results; fix any validation rejection.',parameters:Type.Object({result:schema}),
+  pi.registerTool({name:'submit_review',label:'Submit review',description:'Submit structured, evidence-supported results. The controller runs the checks defined for this task on submission and returns feedback you can use to revise.',parameters:Type.Object({result:schema}),
   execute:async(id,{result})=>{
    if(writableDirectory&&(submitting||submitted!==undefined))throw Error('A draft submission is already being checked or has been accepted');
    submitting=true;

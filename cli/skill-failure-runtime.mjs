@@ -27,6 +27,38 @@ export function failureReceipt(row,task){
  if(task&&typeof value.correct==='boolean'){const cases=value.evidence.caseResults,ids=task.caseIds;if(!Array.isArray(cases)||cases.length!==ids.length||new Set(cases.map(c=>c?.id)).size!==ids.length||cases.some(c=>!ids.includes(c?.id)||typeof c.correct!=='boolean')||value.correct!==cases.every(c=>c.correct))return {correct:null,reason:'Explicit case outcomes missing or inconsistent',evidence:value.evidence};}
  return value;
 }
+function submissionDiagnostic(task,variant,value,declaredMechanism){
+ const evidence=value.evidence??{};
+ const observedMechanism={phase:evidence.phase??null,type:evidence.type??null};
+ const missingFields=value.correct===false?Object.keys(observedMechanism)
+  .filter(key=>typeof observedMechanism[key]!=='string'||!observedMechanism[key].trim())
+  .map(key=>'evidence.'+key):[];
+ if(!Array.isArray(evidence.caseResults))missingFields.push('evidence.caseResults');
+ if(typeof value.correct==='boolean'&&!Array.isArray(evidence.checkedCases))missingFields.push('evidence.checkedCases');
+ const checkedCases=Array.isArray(evidence.checkedCases)?evidence.checkedCases:[];
+ const unverifiedCases=task.caseIds.filter(id=>!checkedCases.includes(id));
+ const failedCases=(Array.isArray(evidence.caseResults)?evidence.caseResults:[])
+  .filter(row=>row?.correct===false&&checkedCases.includes(row.id)).map(row=>row.id);
+ const expectedCorrect=variant!=='starter'&&!variant.startsWith('negative-');
+ const declaredFailureObserved=value.correct===false&&sameMechanism(value,{mechanism:declaredMechanism});
+ const mechanismMatch=declaredFailureObserved&&(variant!=='starter'||failedCases.length>0);
+ const passed=expectedCorrect
+  ?value.correct===true&&unverifiedCases.length===0
+  :mechanismMatch;
+ let problem=null;
+ if(!passed){
+  if(value.correct!==true&&value.correct!==false)problem='Checker did not return a valid correctness verdict';
+  else if(missingFields.length)problem='Checker must emit the missing evidence fields';
+  else if(expectedCorrect&&value.correct===false)problem='Passing control failed';
+  else if(value.correct===true&&!expectedCorrect)problem='Failing control passed';
+  else if(value.correct===true)problem='Passing verdict omitted checked cases';
+  else if(!declaredFailureObserved)problem='Checker emitted a different mechanism from the manifest';
+  else problem='Starter verdict did not identify an executed failing case';
+ }
+ return {passed,diagnostic:{expectedCorrect,declaredMechanism,observedMechanism,missingFields,failedCases,unverifiedCases,problem,
+  mechanismMatch,checkedCases,phase:observedMechanism.phase,type:observedMechanism.type,observedCorrect:value.correct??null,
+  correct:value.correct===false?false:value.correct===true&&unverifiedCases.length===0?true:null}};
+}
 export async function failureChecker(task,runtime=null,guard={}){
  // On A5 the NPU runtime can take more than five seconds to exit after a
  // valid receipt. Keep the same elapsed verifier limit and require a clean exit.
@@ -198,29 +230,54 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
  };
  const checkReferences=async input=>{
   input.signal?.throwIfAborted();signal?.throwIfAborted();assert(Number.isFinite(input.seconds)&&input.seconds>0,'Positive reference allowance required');assert(config.target==='cpu'||runtime,'Identify target before references');
-  const development=input.family.development;
-  const starter=development.controls.negatives.find(n=>hash(n.files['kernel.py'])===hash(development.files['kernel.py']));
-  assert(starter,'Development negative must replay the isolated starter');
-  const checks=[[development,'starter',starter.files],...[development,...input.family.transfer].map(task=>[task,'reference',task.controls.reference.files])];
+  const {development,transfer}=input.family,tasks=[development,...transfer];
+  const starterIndex=development.controls.negatives.findIndex(n=>hash(n.files['kernel.py'])===hash(development.files['kernel.py']));
+  assert(starterIndex>=0,'Development negative must replay the isolated starter');
+  const checks=[[development,'starter',development.controls.negatives[starterIndex].files],
+   ...tasks.map(task=>[task,'reference',task.controls.reference.files])];
+  // New A5 submissions carry focused controls. Check them while the author can still revise.
+  if(config.target==='a5'&&tasks.every(task=>task.controls.calibration?.files)){
+   for(const task of tasks){
+    for(const [index,control] of task.controls.negatives.entries())
+     if(task!==development||index!==starterIndex)checks.push([task,'negative-'+index,control.files]);
+    checks.push([task,'calibration',task.controls.calibration.files]);
+   }
+  }
   const slot=free.pop();assert(slot,'No reference slot');const roots=[],started=performance.now(),diagnostics=[];
   try{for(const [task,variant,files] of checks){
-   input.signal?.throwIfAborted();signal?.throwIfAborted();const fingerprint=hash({family:input.family.id,task,variant,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8')}),root=join(input.directory,'references',fingerprint);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
+   input.signal?.throwIfAborted();signal?.throwIfAborted();
+   // Key the execution by its inputs. Compare its verdict to the current declaration below.
+   const fingerprint=hash({submission:input.directory,family:input.family.id,task:task.id,caseIds:task.caseIds,checkerFiles:task.checkerFiles,
+    checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8'),variant,files,runtime,slot});
+   const cache=join(directory,'author-checks',fingerprint+'.json'),retained=await read(cache);
+   const root=retained?.root??join(input.directory,'references',fingerprint);
+   roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
    const began=performance.now(),left=input.seconds-(began-started)/1000;
    if(left<=0)throw failureStageElapsed('isolate');
    const stage=variant==='starter'?'baseline-replay':'verification';
    const allocatedSeconds=Math.min(variant==='starter'?failureTiming.baselineReplaySeconds:failureTiming.verificationSeconds,left);
-   const timing=()=>({stage,allocatedSeconds,elapsedSeconds:(performance.now()-began)/1000});let rows;
-   try{rows=await verify(root,slot,task,[{key:variant,files}],allocatedSeconds,input.signal,'reference-'+fingerprint,stage);}
-   catch(error){await save(join(root,'reference.json'),{task:task.id,timing:timing(),error:{message:error.message,code:error.code??null}});throw error;}
-   const measured=timing();await save(join(root,'reference.json'),{task:task.id,timing:measured,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
-   const mechanismMatch=value.correct===false&&sameMechanism(value,input.family)&&value.evidence.caseResults.some(row=>!row.correct&&value.evidence.checkedCases?.includes(row.id));
-   const completePass=value.correct===true&&task.caseIds.every(id=>value.evidence.checkedCases?.includes(id));
-   const diagnostic={task:task.id,variant,timing:measured,correct:value.correct===false?false:completePass?true:null,sourceSha256:value.kernelSha256,
-    mechanismMatch,phase:value.evidence?.phase,type:value.evidence?.type,checkedCases:value.evidence?.checkedCases,reason:value.reason??value.evidence?.reason??value.evidence?.message??null,error:[value.error,row.error].filter(Boolean).join('\n').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
-   const passed=variant==='starter'?mechanismMatch:completePass;
+   const timing=()=>({stage,allocatedSeconds,elapsedSeconds:(performance.now()-began)/1000});let row,measured;
+   if(retained){
+    assert(contexts.has(root)&&await closed(root),'Retained checker custody remains unresolved');
+    ({row,timing:measured}=retained);
+   }else{
+    let rows;
+    try{rows=await verify(root,slot,{...task,files,controls:undefined},[{key:variant,files}],allocatedSeconds,input.signal,'reference-'+fingerprint,stage);}
+    catch(error){await save(join(root,'reference.json'),{task:task.id,timing:timing(),error:{message:error.message,code:error.code??null}});throw error;}
+    measured=timing();await save(join(root,'reference.json'),{task:task.id,timing:measured,rows});
+    assert.equal(rows.length,1,'Trusted reference row missing');[row]=rows;
+   }
+   const value=failureReceipt(row,task),guard=value.evidence?.processGuard;
+   const settledVerdict=row.sourceFilesMatch===true&&guard?.allChildrenReaped===true&&guard.reason==null&&!input.signal?.aborted&&!signal?.aborted;
+   if(!retained&&settledVerdict)await save(cache,{root,row,timing:measured});
+   const declaredMechanism=variant==='starter'?input.family.mechanism:task.mechanism??input.family.mechanism;
+   const {passed,diagnostic:feedback}=submissionDiagnostic(task,variant,value,declaredMechanism);
+   const diagnostic={task:task.id,variant,...feedback,timing:measured,reused:Boolean(retained),sourceSha256:value.kernelSha256,
+    reason:value.reason??value.evidence?.reason??value.evidence?.message??null,error:[value.error,row.error].filter(Boolean).join('\n').slice(-2048),path:join(root,'reference.json')};
+   diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
    if(!passed){
-    const error=Error((variant==='starter'?'Starter must reproduce the declared failure before references run. ':'Reference ')+task.id+' rejected: '+JSON.stringify(diagnostic));
-    if(row.sourceFilesMatch===true&&guard?.allChildrenReaped===true&&guard.reason==null&&!input.signal?.aborted&&!signal?.aborted){
+    const error=Error((variant==='starter'?'Starter must reproduce the declared failure before references run. ':'')+task.id+' '+variant+' rejected: '+JSON.stringify(diagnostic));
+    if(settledVerdict){
      error.code='FAILURE_REFERENCE_REJECTED';error.diagnostics=diagnostics;
     }
     throw error;

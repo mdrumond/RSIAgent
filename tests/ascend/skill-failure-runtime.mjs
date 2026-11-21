@@ -151,10 +151,57 @@ test('submission checks replay the starter first and return incorrect controls f
  const row=key=>{const correct=bad?null:key!=='starter'||starterPasses;return {key,sourceFilesMatch:true,sourceFilesSha256:{'kernel.py':'sha'},error:bad?'Traceback: ImportError: missing fixture dependency':'',output:JSON.stringify({correct,kernelSha256:'sha',evidence:{phase:'candidate-call',type:'numerics',checkedCases:['value'],caseResults:[{id:'value',correct}],processGuard:{reason:guardReason,allChildrenReaped:true,commandExit:correct?0:1}}})};};
  const runtime=await createFailureRuntime({config,directory,slots:[{resource:{id:'slot'},physical:1}]},{target:()=>({qualifyBatch:async input=>{calls.push(input);if(unknown)throw Object.assign(Error('transport disconnected'),{handle:'remote:fixture:job:unknown'});return [row(input.entries[0].key)];}}),settled:async()=>!unknown});
  await assert.rejects(runtime.checkReferences({family,directory:join(root,'reject'),seconds:30}),error=>error.code==='FAILURE_REFERENCE_REJECTED'&&error.message.includes('ImportError: missing fixture dependency'));assert.equal(calls.length,1);assert.equal(calls[0].entries.length,1);assert.equal(calls[0].entries[0].key,'starter');assert(calls[0].seconds<=30);
- await writeFile(checker,'corrected checker');bad=false;starterPasses=true;await assert.rejects(runtime.checkReferences({family,directory:join(root,'non-reproduction'),seconds:30}),error=>error.code==='FAILURE_REFERENCE_REJECTED'&&error.message.includes('Starter must reproduce'));assert.equal(calls.length,2);starterPasses=false;const result=await runtime.checkReferences({family,directory:join(root,'accept'),seconds:900});assert.equal(result.checked,true);assert.equal(result.references.length,3);assert.equal(new Set(calls.map(c=>c.directory)).size,6);assert(calls.slice(1).every(c=>c.entries.length===1));
+ await writeFile(checker,'corrected checker');bad=false;starterPasses=true;await assert.rejects(runtime.checkReferences({family,directory:join(root,'non-reproduction'),seconds:30}),error=>error.code==='FAILURE_REFERENCE_REJECTED'&&error.message.includes('Starter must reproduce'));assert.equal(calls.length,2);starterPasses=false;await writeFile(checker,'repaired starter checker');const result=await runtime.checkReferences({family,directory:join(root,'accept'),seconds:900});assert.equal(result.checked,true);assert.equal(result.references.length,3);assert.equal(new Set(calls.map(c=>c.directory)).size,6);assert(calls.slice(1).every(c=>c.entries.length===1));
  assert(calls[2].seconds>119&&calls[2].seconds<=120);assert(calls.slice(3).every(c=>c.seconds>299&&c.seconds<=300));assert(result.references.every(row=>Number.isFinite(row.timing.elapsedSeconds)));
- bad=true;guardReason='rss-limit';await assert.rejects(runtime.checkReferences({family,directory:join(root,'memory'),seconds:30}),error=>error.code!=='FAILURE_REFERENCE_REJECTED');const count=calls.length;await assert.rejects(runtime.checkReferences({family,directory:join(root,'aborted'),seconds:30,signal:AbortSignal.abort(Error('operator stop'))}),/operator stop/);assert.equal(calls.length,count);
+ bad=true;guardReason='rss-limit';await writeFile(checker,'checker triggering RSS guard');await assert.rejects(runtime.checkReferences({family,directory:join(root,'memory'),seconds:30}),error=>error.code!=='FAILURE_REFERENCE_REJECTED');const count=calls.length;await assert.rejects(runtime.checkReferences({family,directory:join(root,'aborted'),seconds:30,signal:AbortSignal.abort(Error('operator stop'))}),/operator stop/);assert.equal(calls.length,count);
  unknown=true;await assert.rejects(runtime.checkReferences({family,directory:join(root,'unknown'),seconds:30}),error=>error.message==='transport disconnected'&&error.code!=='FAILURE_REFERENCE_REJECTED');assert.equal(await runtime.close(),false);await assert.rejects(runtime.checkReferences({family,directory:join(root,'blocked'),seconds:30}),/No reference slot/);
+});
+
+test('A5 checker feedback identifies missing evidence and replays only changed or unchecked controls',async t=>{
+ const root=await fixture(t),checker=join(root,'checker.py');
+ const control=text=>({files:{'kernel.py':text}}),mechanism={phase:'candidate-call',type:'numerics'};
+ const task=id=>({id,caseIds:['value','edge'],files:control('fails').files,checker,publicChecker:checker,
+  controls:{reference:control('reference'),negatives:[control('fails')],calibration:control('calibration')}});
+ const development=task('dev');development.controls.negatives.push(control('unexpected-pass'));
+ development.controls.calibration=control('bad-calibration');
+ const family={id:'family',mechanism,development,transfer:[task('layout'),task('operation')]};
+ const config={target:'a5',environment:{options:{mode:'local'}}},calls=[];let settled=true;
+ await writeFile(checker,'initial checker');
+ const runtime=await createFailureRuntime({config,directory:join(root,'runtime'),slots:[{resource:{id:'slot'},physical:1}]},{
+  settled:async()=>settled,
+  target:()=>({runtimeIdentity:async()=>({target:'a5'}),qualifyBatch:async({entries})=>{
+   const [entry]=entries,source=entry.files['kernel.py'];calls.push(entry.key);
+   const correct=!['fails','bad-calibration'].includes(source),initial=(await readFile(checker,'utf8'))==='initial checker';
+   const evidence={...(correct||initial?{}:mechanism),checkedCases:initial?['value']:['value','edge'],
+    caseResults:[{id:'value',correct:correct||source==='bad-calibration'},{id:'edge',correct}],processGuard:{allChildrenReaped:true}};
+   return [{key:entry.key,sourceFilesMatch:true,sourceFilesSha256:{'kernel.py':'sha'},output:JSON.stringify({correct,kernelSha256:'sha',evidence})}];
+  }}),
+ });
+ await runtime.identify();
+ const submit=()=>runtime.checkReferences({family,directory:join(root,'submission'),seconds:30});
+ const reject=async verify=>assert.rejects(submit(),error=>{assert.equal(error.code,'FAILURE_REFERENCE_REJECTED');verify(error.diagnostics.at(-1));return true;});
+ await reject(row=>{
+  assert.equal(row.variant,'starter');assert.deepEqual(row.missingFields,['evidence.phase','evidence.type']);
+  assert.deepEqual(row.declaredMechanism,mechanism);assert.deepEqual(row.observedMechanism,{phase:null,type:null});
+  assert.deepEqual(row.failedCases,['value']);assert.deepEqual(row.unverifiedCases,['edge']);
+ });
+ await reject(row=>assert.equal(row.reused,true));assert.deepEqual(calls.splice(0),['starter']);
+ await writeFile(checker,'checker emits mechanism');
+ await reject(row=>{
+  assert.equal(row.variant,'negative-1');assert.equal(row.expectedCorrect,false);assert.equal(row.observedCorrect,true);
+ });
+ assert.deepEqual(calls.splice(0),['starter','reference','reference','reference','negative-1']);
+ development.controls.negatives[1]=control('fails');
+ await reject(row=>{
+  assert.equal(row.variant,'calibration');assert.equal(row.expectedCorrect,true);assert.equal(row.observedCorrect,false);
+  assert.deepEqual(row.failedCases,['edge']);assert.deepEqual(row.observedMechanism,mechanism);
+ });
+ assert.deepEqual(calls.splice(0),['negative-1','calibration']);
+ development.controls.calibration=control('calibration');
+ const accepted=await submit();assert.equal(accepted.checked,true);assert.equal(accepted.references.length,3);
+ assert(accepted.references.every(row=>row.reused));assert.deepEqual(calls.splice(0),['calibration','negative-0','calibration','negative-0','calibration']);
+ settled=false;
+ await assert.rejects(submit(),error=>error.code!=='FAILURE_REFERENCE_REJECTED'&&calls.length===0);
 });
 
 test('focused qualification runs one task and requires matching negative and calibration',async t=>{
