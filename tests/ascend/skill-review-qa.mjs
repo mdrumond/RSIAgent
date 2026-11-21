@@ -311,3 +311,20 @@ test('lower concurrency retries unresolved provider votes while preserving submi
  assert.equal(calls,3);assert.equal(out.verdict,'approved');
  assert.deepEqual(out.rounds[0].panel.slots.slice(0,2),saved);assert.equal(out.rounds[0].panel.history[0].decision.approvals,2);
 });
+
+test('one lost quorum-deciding vote and scientifically unresolved evidence have distinct outcomes',async t=>{
+ for(const disposition of ['disproved','unresolved']){
+  const input={...await fixture(t),qaPolicy:'panel',evaluationContract:{workflow:'failure-first-v1'}};
+  const result=await runProposalQa(input,{
+   qaAnswer:async()=>answers(),qaReview:async({directory})=>{
+    if(directory.endsWith('-0')||directory.endsWith('-1'))return {verdict:'approved',reason:'Supported'};
+    if(directory.endsWith('-2'))throw Error('Provider disconnected');
+    return {verdict:'revise',reason:'Inspect source role',issues:[{kind:'draft',problem:'Source belongs to an intermediate edit'}]};
+   },qaPanelAudit:async({objections})=>({audits:[{claimId:objections[0].id,disposition,reason:'Intermediate source role checked'}],
+    claims:[{path:'audits.0.reason',proofs:[{reference:'e:1',quote:'Scored output',recordSha256:'fixture'}]}]}),
+  });
+  assert.equal(result.verdict,'inconclusive');
+  assert.deepEqual(result.rounds[0].panel.decision.missingSlots,[3]);
+  assert.equal(result.reasonKind,disposition==='disproved'?'infrastructure':'scientific');
+ }
+});

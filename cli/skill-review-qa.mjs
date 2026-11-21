@@ -217,7 +217,11 @@ export async function runProposalQa(input,ops){
     await persist();continue;
    }
    state.verdict=round.review.verdict;state.reason=round.review.reason;
-   if(panel&&state.verdict==='inconclusive'&&(round.panel.auditError||round.review.missingSlots.length>=3))state.reasonKind='infrastructure';
+   if(panel&&state.verdict==='inconclusive'){
+    const {approvals,missingSlots,claims}=round.review;
+    const missingQuorum=approvals<3&&approvals+missingSlots.length>=3&&claims.every(claim=>claim.audit.disposition==='disproved');
+    if(round.panel.auditError||missingQuorum)state.reasonKind='infrastructure';
+   }
    state.proposal=round.proposal;state.learningRequests=round.review.learningRequests??[];
    if(state.verdict==='approved'){
     if(summarized)for(const key of ['pages','audits'])state.summary[key]=Object.fromEntries(Object.entries(state.summary[key]).sort(([a],[b])=>a.localeCompare(b)));
