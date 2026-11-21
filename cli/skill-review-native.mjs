@@ -339,13 +339,17 @@ export async function nativeQaPanelAudit(input,dependencies={}){
  const prompt=await qaPrompt(input);
  const packet=await frozenEvidencePacket(prompt.groups);
  const primary=input.sourceCatalogue?.records??claimEvidence({prompt,packet});
- const inputRecords=claimEvidence({prompt:{proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
+ const inputRecords=claimEvidence({prompt:{baseline:prompt.baseline,proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
  const extras=[...(input.panelAuditEvidence??[]),...(input.panelRevisionSources??[])];
  const {proofRecords,indexFile,sourceIndex,allowedPaths}=await stageAuditSources(input.directory,[...primary,...inputRecords,...extras],packet);
  const selectors=claims=>[...new Set(claims.flatMap(claim=>claim.proofs??[]).map(proof=>JSON.stringify(Object.fromEntries(
   Object.keys(selectorFields).filter(key=>Object.hasOwn(proof,key)).map(key=>[key,proof[key]])))))].map(value=>JSON.parse(value));
- const objections=input.objections.map(({id,kind,path,problem,mentions})=>({id,kind,path,problem,
-  citedSelectors:selectors(mentions),answerSelectors:selectors((input.answerClaims??[]).filter(claim=>claim.path===path))}));
+ const summaryItems=new Map((input.evidenceSummary?.items??[]).map(item=>[item.id,item]));
+ const objections=input.objections.map(({id,kind,path,problem,mentions})=>{
+  const item=summaryItems.get(mentions[0]?.issue?.summaryItemId);
+  return {id,kind,path,problem,citedSelectors:selectors(mentions),answerSelectors:selectors((input.answerClaims??[]).filter(claim=>claim.path===path)),
+   ...(item?{summaryItem:{id:item.id,text:item.text,kind:item.kind,citedSelectors:selectors([item])}}:{})};
+ });
  const extraIds=new Set(extras.map(record=>record.reference));
  return (dependencies.session??reviewSession)({...input,resultSchema:panelAuditSchema,selectorOnly:true,proofRequired:true,knowledge:false,
   compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords,allowedPaths,

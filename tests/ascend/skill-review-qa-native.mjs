@@ -359,3 +359,16 @@ test('compact audit follows the source index and rematerializes the exact select
  assert.equal(await readFile(join(directory,filename),'utf8'),primary.segments[1]);
  assert((await readFile(join(directory,'input.json'))).length<10000);
 });
+
+test('a summary objection retains the disputed item and the scoped baseline as a citable record',async t=>{
+ const {input}=await fixture(t);
+ const selector={reference:'baseline',startLine:1,endLine:1},summary={id:'item-1',text:'A disputed account of a known baseline',proofs:[selector]};
+ const result=await nativeQaPanelAudit({...input,evidenceSummary:{items:[summary]},sourceCatalogue:{records:[]},
+  objections:[{id:'a',kind:'evidence',problem:'The summary misattributes a baseline',mentions:[{issue:{summaryItemId:summary.id},proofs:[]}]}],
+  validate:value=>value},{session:async options=>{
+   assert.equal(options.prompt.objections[0].summaryItem.text,summary.text);
+   assert.deepEqual(options.prompt.objections[0].summaryItem.citedSelectors,[selector]);
+   return options.proofRecords.find(record=>record.reference==='baseline');
+  }});
+ assert.equal(result.text,input.entries[0].text);
+});
