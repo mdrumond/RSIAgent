@@ -97,7 +97,7 @@ export function hypothesisTarget({root,binding,resource,signal,stopSignal,localE
    const began=performance.now(),evaluation=dirname(dirname(dirname(args.cwd))),taskId=basename(dirname(dirname(args.cwd)));
    const context=await make(args.cwd,join(args.sessionDirectory,'target'),join(evaluation,'frozen',taskId+'.py'),args.sampleSignal??args.signal,args.sampleStopSignal,args.signal);contexts.set(args.cwd,context);
    const left=args.seconds-(performance.now()-began)/1000;if(left<=0)throw Error('Sample elapsed allocation exhausted during preparation');
-   return (dependencies.nativeSample??nativeSample)({...args,targetBash:environmentOptions.mode==='local',sampleStopSignal:cleanup(args.sampleStopSignal),seconds:left,prompt:args.prompt+'\n\nPrepared target:\n'+context.instructions,targetEnvironment:context.env});
+   return (dependencies.nativeSample??nativeSample)({...args,targetBash:args.actorBash==='local'?false:environmentOptions.mode==='local',sampleStopSignal:cleanup(args.sampleStopSignal),seconds:left,prompt:args.prompt+'\n\nPrepared target:\n'+context.instructions,targetEnvironment:context.env});
   },
   sampleSettled:async({cwd})=>{const context=contexts.get(cwd);return Boolean(context?.env.reconcileLease&&await context.env.reconcileLease());},
   verify:async args=>{
