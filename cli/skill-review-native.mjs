@@ -360,7 +360,11 @@ export async function nativeQaPanelAudit(input,dependencies={}){
  const summaryItems=new Map((input.evidenceSummary?.items??[]).map(item=>[item.id,item]));
  const objections=input.objections.map(({id,kind,path,problem,mentions})=>{
   const item=summaryItems.get(mentions[0]?.issue?.summaryItemId);
+  const description=mentions[0]?.issue?.description;
+  const fieldSelectors=field=>selectors(mentions.flatMap(({slot,issueIndex})=>
+   (input.auditVotes?.[slot-1]?.claims??[]).filter(claim=>claim.path==='issues.'+issueIndex+'.'+field)));
   return {id,kind,path,problem,citedSelectors:selectors(mentions),answerSelectors:selectors((input.answerClaims??[]).filter(claim=>claim.path===path)),
+   ...(description&&description!==problem?{description,problemSelectors:fieldSelectors('problem'),descriptionSelectors:fieldSelectors('description')}:{}),
    ...(item?{summaryItem:{id:item.id,text:item.text,kind:item.kind,citedSelectors:selectors([item])}}:{})};
  });
  const extraIds=new Set(extras.map(record=>record.reference));
@@ -368,7 +372,7 @@ export async function nativeQaPanelAudit(input,dependencies={}){
   compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords,allowedPaths,
   prompt:{draft:input.proposal,qaAnswers:input.answers,objective:input.objective,target:input.target,projectSummaries:[],learningProofEvidence:[],
    objections,sourceIndex:indexFile,additionalSources:sourceIndex.filter(row=>extraIds.has(row.reference)),
-   task:'Resolve each objection against its exact statement in the draft or QA answers. Start with its cited selectors and relevant additionalSources. sources/index.jsonl maps all frozen references to readable files, roles and related artifacts. Read or grep the source files directly. Multipart file order is selector segment order. Distinguish scored results, intermediate edits, static probes and generic deductions. Use verified for a material objection established by primary evidence, disproved for a refuted objection, unresolved for insufficient evidence. Submit one audits row per exact claimId with disposition and concise reason, and top-level claims with selectors for audits.N.reason. Frequency of an objection is not evidence.'},
+   task:'Resolve each objection against its exact statement in the draft or QA answers. Treat the reviewer’s problem and description as assertions to check. Inspect the primary sources cited for each and relevant additionalSources. sources/index.jsonl maps all frozen references to readable files, roles and related artifacts. Read or grep the source files directly. Multipart file order is selector segment order. Distinguish scored results, intermediate edits, static probes and generic deductions. Use verified for a material objection established by primary evidence, disproved for a refuted objection, unresolved for insufficient evidence. Submit one audits row per exact claimId with disposition and concise reason, and top-level claims with selectors for audits.N.reason. Frequency of an objection is not evidence.'},
   validate:input.validate});
 }
 export async function nativeQaReview(input,dependencies={}){

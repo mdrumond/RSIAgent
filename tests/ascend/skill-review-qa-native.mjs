@@ -331,6 +331,9 @@ test('compact audit follows the source index and rematerializes the exact select
  const directory=join(root,'audit'),primary={reference:'result:4',role:'intermediate tool output',attemptId:4,
   segments:['A'.repeat(120000),'probe output\nmismatches=1280\n'],text:'A'.repeat(120000)+'probe output\nmismatches=1280\n'};
  const selector={reference:primary.reference,segment:2,startLine:2,endLine:2};
+ const distinct={reference:primary.reference,segment:2,startLine:1,endLine:1};
+ const description='Compare the intermediate value recorded on the second line.';
+ const auditVotes=[{claims:[{path:'issues.0.problem',proofs:[distinct]},{path:'issues.0.description',proofs:[selector]}]}];
  let filename;
  const provider=await scriptedReview(t,root,(body)=>{
   const tools=body.messages.filter(m=>m.role==='tool');
@@ -338,7 +341,9 @@ test('compact audit follows the source index and rematerializes the exact select
   if(tools.length===1){
    const content=typeof tools[0].content==='string'?tools[0].content:tools[0].content.map(c=>c.text).join('');
    const exposed=JSON.parse(content);
-   assert.deepEqual(exposed.objections[0].citedSelectors,[selector]);
+   assert.equal(exposed.objections[0].description,description);
+   assert.deepEqual(exposed.objections[0].problemSelectors,[distinct]);
+   assert.deepEqual(exposed.objections[0].descriptionSelectors,[selector]);
    const row=exposed.additionalSources.find(row=>row.reference===primary.reference);
    assert.equal(row.role,primary.role);assert.equal(row.attemptId,4);filename=row.files[1];
    return {name:'read',args:{path:filename}};
@@ -352,7 +357,7 @@ test('compact audit follows the source index and rematerializes the exact select
   return null;
  });
  const result=await nativeQaPanelAudit({...input,directory,config:{actor:provider.profile},answers:{},
-  objections:[{id:'claim',kind:'draft',path:'changes.0.text',problem:'Execution role was misattributed.',mentions:[{proofs:[{...selector,quote:'mismatches=1280'}]}]}],
+  objections:[{id:'claim',kind:'draft',path:'changes.0.text',problem:'Execution role was misattributed.',mentions:[{slot:1,issueIndex:0,issue:{description},proofs:[distinct,{...selector,quote:'mismatches=1280'}]}]}],auditVotes,
   panelRevisionSources:[primary],validate:v=>v});
  const proof=result.value.claims[0].proofs[0];
  assert.equal(proof.quote,'mismatches=1280');assert.equal(proof.segment,2);

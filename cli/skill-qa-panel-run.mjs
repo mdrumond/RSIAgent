@@ -102,7 +102,7 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
    return value;
   };
   try {
-   const raw = await call('qaPanelAudit', {...payload, objections, validate}, index+'-qaPanelAudit'+suffix, true);
+   const raw = await call('qaPanelAudit', {...payload, objections, auditVotes:panelVotes(panel), validate}, index+'-qaPanelAudit'+suffix, true);
    const result=validate(raw?.value ?? raw);
    appendAudit(retained,result,()=>true);
    panel.audit=retained;
