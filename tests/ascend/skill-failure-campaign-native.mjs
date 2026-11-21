@@ -26,7 +26,7 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
    if(missing)return {name:'read',args:{path:missing}};
    const selector=reference=>{const row=input.proofSelectors.find(s=>s.reference===reference);assert(row,'Missing proof source '+reference);return row.selectors.includes('reference')?{reference}:{reference,startLine:1,endLine:1,...(row.segments.length>1?{segment:1}:{})};};
    const claim=(path,proof)=>({path,kind:'hypothesis',proofs:[proof]});let value;
-   if(kind==='classify')value={classifications:input.groups.map(g=>({groupId:g.id,cause:'actor',bucket:'correctness',reason:'The fixture records an actor correctness failure.',coverage:'uncovered',guidanceIds:[],evidenceRefs:g.occurrences.map(o=>o.reference)})),claims:input.groups.map((g,i)=>claim('classifications.'+i+'.reason',selector(g.occurrences[0].reference)))};
+   if(kind==='classify')value={classifications:input.groups.map(g=>({groupId:g.id,cause:'unknown',bucket:'correctness',reason:'The fixture records a candidate correctness failure.',coverage:'uncovered',guidanceIds:[],evidenceRefs:g.occurrences.map(o=>o.reference)})),claims:input.groups.map((g,i)=>claim('classifications.'+i+'.reason',selector(g.occurrences[0].reference)))};
    else if(kind==='isolate'){
     const attempt=isolationSubmissions+1;
     assert(attempt<=4);
