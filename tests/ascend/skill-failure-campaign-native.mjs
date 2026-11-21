@@ -29,20 +29,21 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
    if(kind==='classify')value={classifications:input.groups.map(g=>({groupId:g.id,cause:'actor',bucket:'correctness',reason:'The fixture records an actor correctness failure.',coverage:'uncovered',guidanceIds:[],evidenceRefs:g.occurrences.map(o=>o.reference)})),claims:input.groups.map((g,i)=>claim('classifications.'+i+'.reason',selector(g.occurrences[0].reference)))};
    else if(kind==='isolate'){
     const attempt=isolationSubmissions+1;
-    assert(attempt<=3);
+    assert(attempt<=4);
     const draft=input.draftDirectory;
     const writes=calls.filter(c=>c.function.name==='write').map(c=>JSON.parse(c.function.arguments));
     for(const [name,code] of Object.entries(bundle)){
      const path=join(draft,name);
      const content=name==='dev/private.py'&&attempt<3
       ? (attempt===1?'Private checker executes the candidate.\n':'raise ImportError("missing fixture dependency")\n')
-      : code;
+      : name==='layout/private.py'&&attempt===3?'raise ImportError("missing transfer dependency")\n':code;
      if(writes.filter(w=>w.path===path).at(-1)?.content!==content)
       return {name:'write',args:{path,content}};
     }
     const submissions=calls.filter(c=>c.function.name==='submit_review'),previous=tools.find(t=>t.tool_call_id===submissions.at(-1)?.id);
     if(attempt===2)assert.match(String(previous?.content),/SyntaxError/);
     if(attempt===3)assert.match(String(previous?.content),/missing fixture dependency/);
+    if(attempt===4)assert.match(String(previous?.content),/missing transfer dependency/);
     isolationSubmissions++;
     value={status:'ready',reason:'A retained failure admits controlled replay fixtures.',family,claims:[claim('reason',selector(reference))]};
    }
@@ -78,7 +79,7 @@ test('actual skills-ab CLI completes all stages, native trials, independent tran
  const callbacks={runtime:args=>createFailureRuntime({...args,config:{...args.config,target:'cpu',environment:{options:{mode:'local',python}}}},{target:localTarget,settled:async()=>true})};
  const slots=Array.from({length:4},(_,physical)=>({resource:{id:'slot-'+physical,available:true,metadata:{kind:'host-slot',pool:'fixture',hostSlot:physical}},physical}));
  const out=await main(['skills-ab','--instance',root,'--once'],{signal:abort.signal,failureDependencies:{settled:async()=>true,slots:async()=>slots,memory:prepareFailureMemory,step:(config,values)=>runCampaignFailureStep(config,values,callbacks)}});
- assert.equal(out.status,'accepted',JSON.stringify(out));assert.equal(models,45);assert.equal(sessions,45);assert.equal(writes,3);assert.equal(qaSessions,6);assert(peak>1&&peak<=4);assert.equal(verificationChecks,models);assert.deepEqual(submissionChecks,['starter','starter','reference','reference','reference']);assert.equal(isolationSubmissions,3);
+ assert.equal(out.status,'accepted',JSON.stringify(out));assert.equal(models,45);assert.equal(sessions,45);assert.equal(writes,3);assert.equal(qaSessions,6);assert(peak>1&&peak<=4);assert.equal(verificationChecks,models);assert.deepEqual(submissionChecks,['starter','starter','reference','reference','reference','reference']);assert.equal(isolationSubmissions,4);
  assert.deepEqual(reviewSessions,{classify:1,isolate:1,write:3,answer:3,review:3});
  const updated=JSON.parse(await readFile(join(root,'instance.json'),'utf8'));assert.notEqual(updated.skills.activeVersion,'base');const effective=await skillInput(join(root,'skills/versions',updated.skills.activeVersion));assert(effective.text.includes('A bounded representation'));
  const backlog=new SkillBacklog(state,{target:'a3'}),item=backlog.list({status:'accepted'})[0];assert(item);assert.equal(backlog.meta('failure-first-current'),null);assert.equal(JSON.parse(state.db.prepare("SELECT value FROM control WHERE key='pause'").get().value),true);

@@ -179,13 +179,15 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   const isolation=new AbortController();
   let referenceError,identity;
+  const familyDirectory=join(cp.directory,'family');
   const checkReferences=async({family,seconds,signal})=>{
    if(referenceError)throw referenceError;
    const started=performance.now();
    try{
     const adapter=await openRuntime();
     identity??=await adapter.identify({seconds:Math.min(120,seconds),signal});
-    return await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+    return await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),
+     cacheScope:familyDirectory,seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
    }catch(error){
     if(error.code!=='FAILURE_REFERENCE_REJECTED'){
      referenceError=error;
@@ -196,7 +198,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   let prepared;
   try{
-   prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
    if(referenceError)throw referenceError;
    active.throwIfAborted();

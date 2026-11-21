@@ -247,7 +247,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   try{for(const [task,variant,files] of checks){
    input.signal?.throwIfAborted();signal?.throwIfAborted();
    // Key the execution by its inputs. Compare its verdict to the current declaration below.
-   const fingerprint=hash({submission:input.directory,family:input.family.id,task:task.id,caseIds:task.caseIds,checkerFiles:task.checkerFiles,
+   const fingerprint=hash({submission:input.cacheScope??input.directory,family:input.family.id,task:task.id,caseIds:task.caseIds,checkerFiles:task.checkerFiles,
     checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8'),variant,files,runtime,slot});
    const cache=join(directory,'author-checks',fingerprint+'.json'),retained=await read(cache);
    const root=retained?.root??join(input.directory,'references',fingerprint);
