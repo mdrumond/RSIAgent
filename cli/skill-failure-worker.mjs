@@ -68,7 +68,8 @@ export async function runFailureCampaign(config,{signal,once=false}={},dependenc
     const next=failureMemoryGeneration(config,state);
     if(!memory||generation!==next){await memory?.close();memory=null;status('memory-readiness');memory=await ops.memory({config,directory:join(config.root,'skills','priority','failure-first-memory'),generation:next,signal:AbortSignal.any([active,AbortSignal.timeout(300000)])});generation=next;}
     status('running');result=await ops.step(config,{slots,memory,remainingSeconds:clock.remaining,signal:active});
-    status(result.status,{reason:result.reason,...(result.stage?{stage:result.stage}:{})});
+    status(result.status,{reason:result.reason,...(result.stage?{stage:result.stage}:{}),
+     ...(result.disposition?{disposition:result.disposition}:{}),...(result.learningRequest?{learningRequest:result.learningRequest}:{})});
     if(once)return result;
     if(result.status==='idle')await ops.wait(30000,undefined,{signal:active});
    }
