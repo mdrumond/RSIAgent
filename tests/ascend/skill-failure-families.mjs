@@ -33,7 +33,7 @@ async function fixture(t){
  return {root,state,config,backlog,item,attempt,directory,code,reference,group,family,files,write};
 }
 async function submitDraft(validate,draft,{files,...value}){for(const [name,content]of Object.entries(files)){await mkdir(join(draft,name,'..'),{recursive:true});await writeFile(join(draft,name),content);}return validate(value);}
-const classify=bucket=>async({groups,validate})=>validate({classifications:groups.map(g=>({groupId:g.id,cause:bucket==='harness'?'harness':'actor',bucket,coverage:'uncovered',guidanceIds:[],evidenceRefs:[g.occurrences[0].reference],reason:'Observed verification result'}))});
+const classify=bucket=>async({groups,validate})=>validate({classifications:groups.map(g=>({groupId:g.id,cause:bucket==='harness'?'harness':'unknown',bucket,coverage:'uncovered',guidanceIds:[],evidenceRefs:[g.occurrences[0].reference],reason:'Observed verification result'}))});
 
 test('classification-only queues facts without proposals, knowledge-gap requests or QA',async t=>{
  const f=await fixture(t);let reviews=0;
@@ -41,7 +41,14 @@ test('classification-only queues facts without proposals, knowledge-gap requests
  assert.equal(reviews,0);assert.equal(result.items[0].status,'queued');assert.equal(result.items[0].proposal,null);assert.equal(result.items[0].workflow,'failure-first-v1');assert.deepEqual(result.items[0].groupIds,[f.group.id]);assert.equal(f.backlog.failures().length,0);assert.equal(f.state.db.prepare("SELECT 1 FROM sqlite_master WHERE name='skill_learning_requests'").get(),undefined);
 });
 for(const [bucket,status]of [['optimization','deferred'],['harness','user-required']])test(bucket+' classification stays outside the correctness actor queue',async t=>{
- const f=await fixture(t);const result=await analyzeBacklog({...f,directory:join(f.root,'analysis'),classificationOnly:true},{classify:classify(bucket),review:()=>assert.fail('No speculative writing')});assert.equal(result.items[0].status,status);assert.equal(result.items[0].proposal,null);assert.equal(f.backlog.claim({base:'base'}),null);
+ const f=await fixture(t);
+ const type=bucket==='harness'?'device-lease-blocked':'verification';
+ const data=bucket==='harness'?{message:'Device lease unavailable'}:{correctness:{passed:true,exitCode:0},performance:{passed:false,exitCode:1}};
+ const {sequence}=emit(f.state,f.attempt.id,type,data);f.backlog.ingest();
+ const group=f.backlog.failures().find(g=>g.occurrences.some(o=>o.reference==='events:'+sequence));
+ f.backlog.acknowledge(f.group.id);
+ const result=await analyzeBacklog({...f,directory:join(f.root,'analysis'),classificationOnly:true},{classify:classify(bucket),review:()=>assert.fail('No speculative writing')});
+ assert.equal(result.items[0].groupIds[0],group.id);assert.equal(result.items[0].status,status);assert.equal(result.items[0].proposal,null);assert.equal(f.backlog.claim({base:'base'}),null);
 });
 
 test('v2 family freezes exact failed code, helpers and explicit transfer roles',async t=>{

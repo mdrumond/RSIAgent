@@ -21,6 +21,18 @@ const open=config=>{const state=new State(join(config.root,'state.sqlite'));retu
 const value=(db,key)=>table(db,'control')?JSON.parse(db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null'):null;
 const table=(db,name)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name);
 const queuedFamily=backlog=>backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:1})[0];
+function requeueUnwitnessedFamilies(backlog){
+ backlog.atomic(()=>{
+  const queued=backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:100});
+  for(const item of queued){
+   const classifications=item.preparation?.classifications;
+   if(!classifications||item.groupIds.every(id=>classifications[id]?.triage))continue;
+   backlog.revise(item.id,{status:'deferred',reason:'Queued classification requires runtime-boundary review'});
+   for(const id of item.groupIds)backlog.reclassify(id);
+  }
+ });
+}
+
 
 export function failureMemoryGeneration(config,state){
  const cutoff=table(state.db,'events')?state.db.prepare('SELECT max(sequence) n FROM events WHERE attempt IS NOT NULL').get().n:null;
@@ -77,6 +89,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  try{
   let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
   const existing=backlog.list({status:'running',limit:1})[0];
+  if(!existing)requeueUnwitnessedFamilies(backlog);
   if(!existing&&!queuedFamily(backlog)){
    await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
     classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,remainingSeconds),limit:2,signal});

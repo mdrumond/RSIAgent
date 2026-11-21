@@ -42,7 +42,7 @@ const fingerprint=hypothesisIdentity;
 const journalFilter=`CASE WHEN type IN ('pi-event','curriculum-checkpoint','native-bash-started','native-bash-completed','knowledge-retrieved','skill-read') THEN 0
  WHEN type='execution-state' THEN CASE WHEN json_valid(data) THEN json_extract(data,'$.state')='stopped' AND COALESCE(json_extract(data,'$.accountingExcluded'),0)=0 AND
  (COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0 OR json_extract(data,'$.nativeState')='failed') ELSE 0 END ELSE
- (type IN ('failure-recorded','project-invalid') OR type LIKE '%error%' OR type LIKE '%failed%' OR type LIKE '%rejected%' OR type LIKE '%unresolved%' OR type LIKE '%blocked%' OR
+ (type IN ('failure-recorded','project-invalid','preactor-infrastructure') OR type LIKE '%error%' OR type LIKE '%failed%' OR type LIKE '%rejected%' OR type LIKE '%unresolved%' OR type LIKE '%blocked%' OR
  CASE WHEN json_valid(data) THEN (json_type(data,'$.passed')='false' OR json_type(data,'$.correct')='false' OR json_type(data,'$.correctness.passed')='false' OR json_type(data,'$.performance.passed')='false' OR
  json_type(data,'$.verification.passed')='false' OR json_type(data,'$.result.passed')='false' OR json_type(data,'$.result.correct')='false' OR json_type(data,'$.verdict.passed')='false' OR
  type='verification' AND COALESCE(json_extract(data,'$.exitCode'),json_extract(data,'$.exit_code'),0)>0) ELSE 0 END) END`;
@@ -53,7 +53,7 @@ function failure(type,data){
  if(data.operator===true||data.operatorRequested===true||['operator-pause','operator-stop'].includes(data.reason)||expected!==undefined&&expected!==0&&actual===expected||
   type==='execution-state'&&(data.accountingExcluded===true||['resource-health','device-lease-control'].includes(data.purpose)))return false;
  return negative(data)||actual!==undefined&&expected!==undefined&&actual!==expected||
-  /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid','generation-invalid','generation-exhausted'].includes(type)||type==='verification'&&actual>0||
+  /error|failed|rejected|unresolved|blocked/.test(type)||['failure-recorded','project-invalid','preactor-infrastructure','generation-invalid','generation-exhausted'].includes(type)||type==='verification'&&actual>0||
   type==='execution-state'&&data.state==='stopped'&&(actual>0||data.nativeState==='failed');
 }
 
@@ -83,12 +83,20 @@ export class SkillBacklog {
     const spec=attempt&&parse(this.db.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project)?.spec??'{}');
     const admission=row.attempt&&this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='job-admitted' ORDER BY sequence LIMIT 1").get(row.attempt);
     const job=admission?parse(admission.data):{},selection=row.attempt&&this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='skills-selected' AND sequence<=? ORDER BY sequence DESC LIMIT 1").get(row.attempt,journal==='events'?row.sequence:Number.MAX_SAFE_INTEGER);
-    const diagnostic=diagnosticIdentity({data}),id=hash([this.target,row.type,diagnostic]);
+    const {correctness,performance}=data;
+    // Identical verifier output remains one diagnostic even when every invocation writes a new log path.
+    const canonical=verdict=>verdict&&/^[a-f0-9]{64}$/.test(verdict.evidence_sha256??'')?{...verdict,evidence:verdict.evidence_sha256}:verdict;
+    const normalizedCorrectness=canonical(correctness),normalizedPerformance=canonical(performance);
+    const verifiers=row.type==='verification'&&(normalizedCorrectness!==correctness||normalizedPerformance!==performance);
+    const diagnostic=diagnosticIdentity({data:verifiers?{...data,correctness:normalizedCorrectness,performance:normalizedPerformance,evidence:null}:data});
+    const id=hash([this.target,row.type,diagnostic]);
     const reference=`${journal}:${row.sequence}`,occurrence={reference,attemptId:row.attempt??null,draftId:row.draft??null,projectId:attempt?.project??null,
      phase:row.phase??data.phase??job.mode??spec?.phase??null,kind:job.kind??null,skillVersion:(selection&&parse(selection.data).version)??job.skillVersion??job.config?.skills?.activeVersion??null,skillReads:[],artifacts:[],created:row.created??null,data,diagnostic};
     if(!this.db.prepare('INSERT OR IGNORE INTO skill_backlog_occurrences VALUES(?,?,?,?)').run(reference,id,row.attempt??null,JSON.stringify(occurrence)).changes)return;
     observeAttentionRecurrence(this.db,{reference,groupId:id,projectId:occurrence.projectId,attemptId:occurrence.attemptId});
     if(occurrenceAttention(this.db,reference)!=='active')return;
+    if(verifiers&&row.attempt&&this.db.prepare(`SELECT 1 FROM skill_backlog_occurrences o
+     WHERE group_id=? AND attempt=? AND reference<>? AND ${activeOccurrenceSql(this.db,'o')} LIMIT 1`).get(id,row.attempt,reference))return;
     const group={id,target:this.target,type:row.type,message:String(data.message??data.error??data.reason??row.type).slice(0,1500)};
     this.db.prepare('INSERT INTO skill_backlog_failures VALUES(?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET dirty=1,fresh=MAX(fresh,excluded.fresh),updated=excluded.updated').run(id,JSON.stringify(group),Number(fresh),this.now());observed++;
    };
@@ -133,7 +141,7 @@ export class SkillBacklog {
   for(const occurrence of occurrences)if(occurrence.attemptId)occurrence.skillReads=this.db.prepare("SELECT data FROM events WHERE attempt=? AND type='skill-read' ORDER BY sequence DESC LIMIT 12").all(occurrence.attemptId).map(r=>parse(r.data));
   const linkedDiagnostics=[];
   for(const attempt of [...new Set(occurrences.map(o=>o.attemptId).filter(Boolean))].slice(0,2)){
-   for(const row of this.db.prepare(`SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','baseline-preflight-completed','project-invalid','attempt-error') ORDER BY sequence DESC LIMIT 12`).all(attempt)){
+   for(const row of this.db.prepare(`SELECT sequence,type,data FROM events WHERE attempt=? AND type IN ('verification','baseline-preflight-completed','project-invalid','preactor-infrastructure','attempt-error') ORDER BY sequence DESC LIMIT 12`).all(attempt)){
     const data=parse(row.data),reference='events:'+row.sequence;if(failure(row.type,data)&&(includeRetired||occurrenceAttention(this.db,reference)==='active'))linkedDiagnostics.push({reference,type:row.type,data,artifacts:[]});
    }
   }
@@ -142,6 +150,7 @@ export class SkillBacklog {
  }
  failures({dirty=true,limit=100,offset=0,occurrenceLimit=20,includeRetired=false}={}){return this.db.prepare(`SELECT id FROM skill_backlog_failures f WHERE ${dirty?'dirty=1':'1'} AND ${includeRetired?'1':analysisScopeSql(this.db)} ${includeRetired?'':`AND EXISTS(SELECT 1 FROM skill_backlog_occurrences o WHERE o.group_id=f.id AND ${activeOccurrenceSql(this.db,'o')})`} ORDER BY fresh DESC,updated DESC,rowid LIMIT ? OFFSET ?`).all(limit,offset).map(r=>this.failure(r.id,{limit:occurrenceLimit,includeRetired}));}
  acknowledge(id,{classification,count}={}){return this.atomic(()=>{const group=this.failure(id,{limit:0});if(!group)return;const data=this.db.prepare('SELECT data FROM skill_backlog_failures WHERE id=?').get(id);this.db.prepare('UPDATE skill_backlog_failures SET data=?,dirty=?,fresh=CASE WHEN ? THEN fresh ELSE 0 END WHERE id=?').run(JSON.stringify({...parse(data.data),...(classification?{classification}:{})}),Number(count!==undefined&&count<group.count),Number(count!==undefined&&count<group.count),id);});}
+ reclassify(id){this.db.prepare('UPDATE skill_backlog_failures SET dirty=1,fresh=1 WHERE id=?').run(id);}
  get(id){const epoch=this.meta('queue-epoch'),key=epoch&&!id.startsWith('epoch:')?'epoch:'+epoch+':'+id:id;const row=this.db.prepare('SELECT data FROM skill_backlog_items WHERE id=? OR key=? OR id=(SELECT item_id FROM skill_backlog_aliases WHERE key=?)').get(id,key,key);return row?parse(row.data):null;}
  list({status,limit=100,includeRetired=false,workflow,objective}={}){
   const predicates=[],args=[];
@@ -156,7 +165,8 @@ export class SkillBacklog {
  completed(item){const identity=fingerprint(item);for(const row of this.db.prepare("SELECT id,status,snapshot FROM skill_backlog_runs WHERE base IS ? AND status IN ('accepted','rejected','inconclusive') ORDER BY rowid DESC").iterate(item.base??null))if(fingerprint(parse(row.snapshot))===identity)return row;return null;}
  upsert(input){return this.atomic(()=>{
   const epoch=this.meta('queue-epoch');if(epoch&&!input.key.startsWith('epoch:'))input={...input,key:'epoch:'+epoch+':'+input.key};
-  if(!input.key||!['harness','correctness','optimization'].includes(input.objective)||!Array.isArray(input.groupIds)||!input.groupIds.length)throw Error('Hypothesis key, objective and failure groups required');
+  const objectives=input.workflow==='failure-first-v1'?['harness','correctness','optimization','unknown']:['harness','correctness','optimization'];
+  if(!input.key||!objectives.includes(input.objective)||!Array.isArray(input.groupIds)||!input.groupIds.length)throw Error('Hypothesis key, objective and failure groups required');
   for(const id of input.groupIds)if(!this.db.prepare('SELECT 1 FROM skill_backlog_failures WHERE id=?').get(id))throw Error('Unknown failure group');
   let prior=this.get(input.key);
   if(!prior)for(const row of this.db.prepare('SELECT data FROM skill_backlog_items ORDER BY rowid').iterate()){const candidate=parse(row.data);if(fingerprint(candidate)===fingerprint(input)){prior=candidate;break;}}

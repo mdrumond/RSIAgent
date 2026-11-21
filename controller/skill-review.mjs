@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {ReviewValidationError,validateReviewReferences} from './review-validation.mjs';
+import {routeFailureClassification} from './skill-failure-triage.mjs';
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const has=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name));
 const negativeVerdict=data=>data&&typeof data==='object'&&(data.passed===false||data.correct===false||
@@ -91,12 +92,12 @@ export async function guidanceEntries(root,version){
   return Promise.all(Object.entries(map).map(async([scope,file])=>({id:scope+'-baseline',scope,text:await readFile(join(directory,file),'utf8'),critical:true,negative:false})));
  }
 }
-export function validateClassification(value,group,entries,{requireBucket=false}={}){
+export function validateClassification(value,group,entries,{requireBucket=false,failureFirst=false}={}){
  if(!value||typeof value!=='object')throw Error('Submit a classification object');
  if(!['actor','harness','specification','provider','unknown'].includes(value.cause))throw Error('cause must be actor, harness, specification, provider or unknown');
  if(requireBucket&&value.cause==='harness'&&value.bucket!=='harness')throw Error('Harness cause requires harness bucket and user intervention');
  if(requireBucket&&value.bucket===undefined)throw Error('Explicit failure bucket required by bucketPolicy');
- if(value.bucket!==undefined&&!['harness','correctness','optimization'].includes(value.bucket))throw Error('Unknown failure bucket');
+ if(value.bucket!==undefined&&!['harness','correctness','optimization',...(failureFirst?['unknown']:[])].includes(value.bucket))throw Error('Unknown failure bucket');
  if(!value.reason?.trim())throw Error('reason must explain the observed evidence; stage labels alone do not establish ownership');
  if(!['covered','uncovered','unknown'].includes(value.coverage))throw Error('coverage must be covered, uncovered or unknown');
  if(!Array.isArray(value.guidanceIds))throw Error('guidanceIds must be an array of existing guidance IDs');
@@ -105,7 +106,9 @@ export function validateClassification(value,group,entries,{requireBucket=false}
  if(value.coverage!=='covered'&&value.guidanceIds.length)throw Error('coverage='+value.coverage+' requires guidanceIds=[]; use covered only when identifying applicable existing guidance');
  const refs=new Set([...group.occurrences,...(group.linkedDiagnostics??[])].map(o=>o.reference));
  validateReviewReferences(value.evidenceRefs,refs,{field:'evidenceRefs',groupId:group.id,required:true,message:'evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group'});
- return {...value,groupId:group.id,intervention:value.cause==='harness'||value.bucket==='harness'?'user-required':null};
+ const triage=failureFirst?routeFailureClassification(value,group):null;
+ return {...value,groupId:group.id,intervention:(failureFirst?triage.route==='human':value.cause==='harness'||value.bucket==='harness')?'user-required':null,
+  ...(triage?{triage}:{})};
 }
 export function validateClassificationBatch(value,groups,entries,policy){
  const rows=value?.classifications,allowedGroupIds=groups.map(group=>group.id),ids=Array.isArray(rows)?rows.map(row=>row?.groupId??null):[];
