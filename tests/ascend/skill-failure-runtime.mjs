@@ -13,9 +13,9 @@ test('trusted process guard preserves recorded failure only with source identity
  await writeFile(checker,receiptCode('False',"subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);time.sleep(60)"));const failed=await oracleRun(root,checker,{seconds:2,cleanupSeconds:.25});assert.equal(failed.correct,false,JSON.stringify(failed));assert.equal(failed.evidence.cleanupElapsedAfterFailure,true);assert.equal(failed.evidence.processGuard.allChildrenReaped,true);
  for(const ending of ['sys.exit(1)',"raise RuntimeError('after receipt')"]){await writeFile(checker,receiptCode('True',ending));assert.equal((await oracleRun(root,checker)).correct,null);}
  await writeFile(checker,receiptCode('True','time.sleep(60)'));assert.equal((await oracleRun(root,checker)).correct,null);
- await writeFile(checker,receiptCode('True','time.sleep(0.25)'));
- assert.equal((await oracleRun(root,checker,{seconds:2})).correct,null);
- const delayed=await oracleRun(root,checker,{seconds:2,cleanupSeconds:1});
+ await writeFile(checker,receiptCode('True','time.sleep(1.25)'));
+ assert.equal((await oracleRun(root,checker,{seconds:4})).correct,null);
+ const delayed=await oracleRun(root,checker,{seconds:4,cleanupSeconds:2});
  assert.equal(delayed.correct,true);assert.equal(delayed.evidence.processGuard.commandExit,0);assert.equal(delayed.evidence.processGuard.allChildrenReaped,true);
  await writeFile(checker,'import time;time.sleep(60)');assert.equal((await oracleRun(root,checker)).correct,null);
  await writeFile(checker,receiptCode('False','time.sleep(60)'));assert.equal((await oracleRun(root,checker,{rssBytes:1})).correct,null);
