@@ -138,3 +138,130 @@ test('every review receives the complete previous issue list after a writer revi
  }});
  assert.equal(result.verdict,'approved');assert.equal(reviews,2);
 });
+
+const failureFirstQa=input=>({...input,evaluationContract:{workflow:'failure-first-v1'},allowWriterRevision:true});
+const answerFinding={kind:'answer',path:'answers.mechanism.text',problem:'Name the observed boundary'};
+const advisoryFinding={kind:'advisory',problem:'An extra example could help'};
+
+test('split QA runs one fresh answer-only correction within cumulative clocks',async t=>{
+ const input=failureFirstQa(await fixture(t));let clock=0,reviewed=0;
+ const grants=[],directories=[];
+ const original=answers();
+ const corrected=answers();corrected.answers.mechanism.text='Observed only on the tail boundary';
+ const report=await runProposalQa(input,{now:()=>clock,
+  qaAnswer:async({seconds,directory,answerCorrection,proposal,validate})=>{
+   grants.push(['answer',seconds]);directories.push(directory);assert.deepEqual(proposal,input.proposal);
+   if(!answerCorrection){clock+=240000;return original;}
+   assert.deepEqual(answerCorrection.findings,[answerFinding]);
+   assert.deepEqual(answerCorrection.previousAnswers,original.answers);
+   assert.throws(()=>validate({...corrected,changes:[{text:'Alter the draft'}]}),/must preserve the proposal/);
+   clock+=40000;return corrected;
+  },
+  qaReview:async({seconds,answers:received,proposal,validate})=>{
+   grants.push(['review',seconds]);assert.deepEqual(proposal,input.proposal);
+   if(!reviewed++){
+    assert.deepEqual(received,original.answers);clock+=220000;
+    assert.throws(()=>validate({verdict:'approved',reason:'Incorrect approval',issues:[answerFinding,advisoryFinding]}),/cannot retain material findings/);
+    assert.throws(()=>validate({verdict:'revise',reason:'Optional only',issues:[advisoryFinding]}),/material finding/);
+    assert.throws(()=>validate({verdict:'revise',reason:'Unknown answer',issues:[{...answerFinding,path:'answers.other.text'}]}),/exact answers/);
+    return {verdict:'revise',reason:'Answer needs boundary',issues:[answerFinding,advisoryFinding]};
+   }
+   assert.deepEqual(received,corrected.answers);clock+=70000;
+   return {verdict:'approved',reason:'Supported',issues:[advisoryFinding]};
+  },
+ });
+ assert.equal(report.qaPolicy,'split');assert.equal(report.seconds,600);
+ assert.deepEqual(report.phaseSeconds,{answer:300,review:300});
+ assert.deepEqual(report.phaseElapsed,{answer:280,review:290});
+ assert.equal(report.elapsedSeconds,570);assert.equal(report.verdict,'approved');
+ assert.equal(report.approval,qaIdentity(input));assert.deepEqual(report.proposal,input.proposal);
+ assert.notEqual(directories[0],directories[1]);
+ assert.deepEqual(grants,[['answer',300],['review',300],['answer',60],['review',80]]);
+});
+
+test('typed answer correction does not overwrite the proposal or repeat indefinitely',async t=>{
+ const input=failureFirstQa(await fixture(t));let corrections=0;
+ const report=await runProposalQa(input,{
+  qaAnswer:async args=>{if(args.answerCorrection)corrections++;return answers();},
+  qaReview:async()=>({verdict:'revise',reason:'Answer remains unsupported',issues:[answerFinding]}),
+ });
+ assert.equal(corrections,1);assert.equal(report.rounds.length,2);
+ assert.equal(report.verdict,'inconclusive');assert.equal(report.revisionFeedback,undefined);
+ assert.equal(report.approval,undefined);
+});
+
+test('material draft issues go to the writer, while missing evidence takes precedence',async t=>{
+ const draft={kind:'draft',problem:'Scope of the instruction is too broad'},evidence={kind:'evidence',problem:'No retained target check'};
+ for(const [issues,writer]of [[[answerFinding,draft,advisoryFinding],true],[[draft,evidence],false]]){
+  const input=failureFirstQa(await fixture(t));
+  const report=await runProposalQa(input,{
+   qaAnswer:async args=>{assert.equal(args.answerCorrection,undefined);return answers();},
+   qaReview:async()=>({verdict:'revise',reason:'Review found material issues',issues}),
+  });
+  assert.equal(report.verdict,'inconclusive');
+  assert.equal(report.revisionFeedback,writer?'Review found material issues':undefined);
+  assert.equal(report.rounds.length,1);
+ }
+});
+
+test('exhausted answer phase cannot borrow review time or trigger a correction',async t=>{
+ const input=failureFirstQa(await fixture(t));let clock=0,answered=0;
+ const report=await runProposalQa(input,{now:()=>clock,
+  qaAnswer:async({seconds})=>{assert.equal(seconds,300);answered++;clock+=300000;return answers();},
+  qaReview:async({seconds})=>{assert.equal(seconds,300);clock+=1000;return {verdict:'revise',reason:'Answer still missing facts',issues:[answerFinding]};},
+ });
+ assert.equal(report.verdict,'inconclusive');assert.equal(report.approval,undefined);
+ assert.equal(report.revisionFeedback,undefined);assert.equal(answered,1);
+ assert.deepEqual(report.phaseElapsed,{answer:300,review:1});
+});
+
+test('experiment override and legacy failure-first checkpoint use the shared spent clock',async t=>{
+ const input=failureFirstQa(await fixture(t)),stop=new AbortController();let clock=0;
+ const shared={...input,qaPolicy:'shared'};
+ await assert.rejects(runProposalQa({...shared,signal:stop.signal},{now:()=>clock,
+  qaAnswer:async({seconds})=>{assert.equal(seconds,300);clock+=80000;stop.abort(Error('pause'));throw stop.signal.reason;},
+ }),/pause/);
+ const path=join(input.directory,'qa.json'),legacy=JSON.parse(await readFile(path,'utf8'));
+ assert.equal(legacy.qaPolicy,'shared');delete legacy.qaPolicy;await writeFile(path,JSON.stringify(legacy));
+ clock+=90000000;
+ const resumed=await runProposalQa(input,{now:()=>clock,
+  qaAnswer:async({seconds,answerCorrection})=>{assert.equal(seconds,220);assert.equal(answerCorrection,undefined);return answers();},
+  qaReview:async({seconds})=>{assert.equal(seconds,220);return {verdict:'revise',reason:'Legacy writer feedback',issues:[answerFinding]};},
+ });
+ assert.equal(resumed.qaPolicy,'shared');assert.equal(resumed.seconds,300);assert.equal(resumed.elapsedSeconds,80);
+ assert.equal(resumed.revisionFeedback,'Legacy writer feedback');assert.equal(resumed.rounds.length,1);
+});
+
+test('split QA restores the charged phase reservation and excludes paused wall time',async t=>{
+ const input=failureFirstQa(await fixture(t)),stop=new AbortController();let clock=0;
+ await assert.rejects(runProposalQa({...input,signal:stop.signal},{now:()=>clock,
+  qaAnswer:async()=>{clock+=80000;stop.abort(Error('pause'));throw stop.signal.reason;},
+ }),/pause/);
+ const path=join(input.directory,'qa.json'),saved=JSON.parse(await readFile(path,'utf8'));
+ assert.deepEqual(saved.phaseElapsed,{answer:80,review:0});
+ saved.inFlightOperations={'0-qaAnswer':{stage:'qaAnswer',lane:'answer',reservedThrough:85,reservedPhaseThrough:85}};
+ await writeFile(path,JSON.stringify(saved));clock+=90000000;
+ const report=await runProposalQa(input,{now:()=>clock,
+  qaAnswer:async({seconds})=>{assert.equal(seconds,215);return answers();},
+  qaReview:async({seconds})=>{assert.equal(seconds,300);return {verdict:'approved',reason:'Supported'};},
+ });
+ assert.equal(report.verdict,'approved');assert.equal(report.elapsedSeconds,85);
+ assert.deepEqual(report.phaseElapsed,{answer:85,review:0});
+});
+
+test('split QA discards a successful response returned after the parent stopped',async t=>{
+ const input=failureFirstQa(await fixture(t)),stop=new AbortController(),cause=Error('Operator stopped review');
+ let clock=0;
+ await assert.rejects(runProposalQa({...input,signal:stop.signal},{now:()=>clock,
+  qaAnswer:async()=>answers(),
+  qaReview:async()=>{clock+=20000;stop.abort(cause);return {verdict:'approved',reason:'Late'};},
+ }),error=>error===cause);
+ const checkpoint=JSON.parse(await readFile(join(input.directory,'qa.json'),'utf8'));
+ assert.equal(checkpoint.approval,undefined);assert.equal(checkpoint.rounds[0].review,undefined);
+ assert.deepEqual(checkpoint.phaseElapsed,{answer:0,review:20});
+ const resumed=await runProposalQa(input,{now:()=>clock,
+  qaAnswer:()=>assert.fail('Retain the completed answers'),
+  qaReview:async({seconds})=>{assert.equal(seconds,280);return {verdict:'approved',reason:'Fresh review'};},
+ });
+ assert.equal(resumed.verdict,'approved');
+});
