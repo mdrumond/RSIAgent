@@ -327,6 +327,31 @@ test('a single focused panel design writes only the approved candidate and repla
  assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
 
+test('focused panel recovery retries missing reviewers with the same audit sources',async t=>{
+ const f=await fixture(t),source={reference:'verification:final',text:'The scored output passed.'};
+ let calls=0;
+ f.deps.qaReview=async()=>{
+  calls++;
+  if(calls<=2)return {verdict:'approved',reason:'General applicable guidance'};
+  if(calls===3)return {verdict:'revise',reason:'Check final status',issues:[{kind:'draft',path:'changes.0.text',problem:'The final output failed.'}]};
+  if(calls<=5)throw Error('Provider timeout');
+  return {verdict:'approved',reason:'Supported by the frozen source'};
+ };
+ f.deps.qaPanelAudit=async request=>{
+  assert.deepEqual(request.panelAuditEvidence,[source]);
+  return {audits:request.objections.map(claim=>({claimId:claim.id,disposition:'disproved',reason:source.text})),
+   claims:[{path:'audits.0.reason',proofs:[{reference:source.reference,quote:source.text,recordSha256:createHash('sha256').update(source.text).digest('hex')}]}]};
+ };
+ const design=createFailureDesign({config:f.config,item:f.item},f.deps);
+ const input={...f.input,mode:'focused-correctness',qaPolicy:'panel',reviewCandidate:'principle-a',panelAuditEvidence:[source]};
+ await assert.rejects(design(input),error=>error.code==='FAILURE_DESIGN_INFRASTRUCTURE');
+ assert.equal(calls,5);
+ const [approved]=await design({...input,retryMissingPanelVotes:true,qaPanelConcurrency:1});
+ assert.equal(approved.qa.verdict,'approved');
+ assert.equal(calls,7);
+ await assert.rejects(design({...input,panelAuditEvidence:[]}),/evidence changed/);
+});
+
 test('focused review returns concrete feedback for one fresh writing attempt',async t=>{
  const f=await fixture(t);
  let reject=true;
