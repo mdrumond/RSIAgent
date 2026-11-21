@@ -294,3 +294,34 @@ test('five isolated native reviewers decide from frozen answers and a primary-so
  }
  await assert.rejects(runProposalQa({...request,frozenQa:{...request.frozenQa,answers:{}}},{}),/changed on resume/);
 });
+
+test('native answer repair and its next reviewers can cite the primary record that verified a finding',async t=>{
+ const {root,input,proof,answer,review}=await artifactQaFixture(t);
+ const primary={reference:'check:score',text:'The intermediate edit produced the mismatch.'};
+ const unrelated={reference:'check:unrelated',text:'Separate experiment'};
+ const selected={reference:primary.reference,startLine:1,endLine:1};
+ let correction=false,objection,reviewed=0;
+ const provider=await scriptedReview(t,root,body=>{
+  if(body.messages.some(message=>message.role==='tool'))return null;
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  let result;
+  if(schema.properties.audits)result={audits:[{claimId:objection.id,disposition:'verified',reason:primary.text}],
+   claims:[{path:'audits.0.reason',kind:'observation',proofs:[selected]}]};
+  else if(schema.properties.answers){
+   result=answer(selected);result.answers.action={text:primary.text,refs:[primary.reference]};
+  }else if(correction)result=review(selected);
+  else {result=review(proof);result.verdict='revise';result.issues=[{kind:'answer',path:'answers.action.text',problem:'The answer cites a different execution'}];result.claims.push({path:'issues.0.problem',kind:'observation',proofs:[proof]});}
+  return {name:'submit_review',args:{result}};
+ });
+ const request={...input,config:{actor:provider.profile},evaluationContract:{workflow:'failure-first-v1'},qaPolicy:'panel',
+  panelAuditEvidence:[primary,unrelated],projectSummaries:[],learningProofEvidence:[],validateProposal:value=>value};
+ request.frozenQa={inputIdentity:qaIdentity(request),draft:request.proposal,proposal:request.proposal,...answer(proof)};
+ const result=await runProposalQa(request,{
+  qaPanelAudit:args=>{[objection]=args.objections;return nativeQaPanelAudit(args);},
+  qaAnswer:async args=>{correction=true;assert.deepEqual(args.panelRevisionSources,[primary]);return (await nativeQaAnswer(args)).value;},
+  qaReview:args=>{reviewed++;assert.deepEqual(args.panelRevisionSources,correction?[primary]:[]);return nativeQaReview(args);},
+ });
+ assert.equal(result.verdict,'approved',result.error?.message??result.reason);assert.equal(reviewed,10);
+ assert.deepEqual(result.rounds[1].answers.action.refs,[primary.reference]);
+ for(const slot of result.rounds[1].panel.slots)assert.equal(slot.vote.claims[0].proofs[0].quote,primary.text);
+});

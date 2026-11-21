@@ -4,7 +4,7 @@ import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {join} from 'node:path';
 import {prepareQaSources,summaryProtocol,validateSummary,summaryItems} from './skill-evidence-summary.mjs';
 import {frozenEvidencePacket,scopedQaGroups} from './skill-review-evidence.mjs';
-import {reopenPanel,runPanelRound} from './skill-qa-panel-run.mjs';
+import {panelCorrectionSources,reopenPanel,runPanelRound} from './skill-qa-panel-run.mjs';
 import {projectSummaries,learningProofEvidence} from './project-summary.mjs';
 const reservedThrough=state=>Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0,...Object.values(state.inFlightOperations??{}).map(op=>op.reservedThrough??0));
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -67,6 +67,8 @@ export async function runProposalQa(input,ops){
  const panelConcurrency=input.qaPanelConcurrency??5;
  if(panel&&(!Number.isSafeInteger(panelConcurrency)||panelConcurrency<1||panelConcurrency>5))throw Error('Panel concurrency must be between one and five');
  if(panel&&state&&state.panelAuditEvidenceIdentity!==digest(input.panelAuditEvidence??[]))throw Error('Panel audit sources changed on resume');
+ if(panel&&state&&(state.panelRevisionIdentity??digest([]))!==digest(input.panelRevisionSources??[]))throw Error('Panel revision sources changed on resume');
+ if(input.frozenQa&&input.panelRevisionSources?.length)throw Error('Frozen initial answers cannot add revision evidence');
  if(input.frozenQa){
   if(!panel||input.frozenQa.inputIdentity!==identity||digest(input.frozenQa.draft)!==digest(input.proposal))throw Error('Frozen answers belong to a different draft or QA input');
   if(state&&state.frozenQaIdentity!==digest(input.frozenQa))throw Error('Frozen QA inputs changed on resume');
@@ -76,7 +78,7 @@ export async function runProposalQa(input,ops){
  if(state&&(state.proofProtocol!==proofProtocol||state.projectFactsIdentity!==projectFactsIdentity||summarized&&state.sourceIdentity!==catalogue.identity)){const upgrade={verdict:state.verdict??null,rounds:state.rounds??[],projectFactsIdentity:state.projectFactsIdentity??null,summary:state.summary??null,sourceIdentity:state.sourceIdentity??null};state={...state,proofUpgrade:upgrade,proofUpgrades:[...(state.proofUpgrades??[]),upgrade],rounds:[],summary:undefined,draft:state.proposal??state.draft??input.proposal};for(const key of ['verdict','approval','proposal','reason','reasonKind','retryable','error'])delete state[key];}
  state.qaPolicy=policy;input={...input,qaPolicy:policy};
  if(split)state.phaseSeconds??=panel?{...panelBudgets}:{answer:phaseSeconds,review:phaseSeconds};
- if(panel)state.panelAuditEvidenceIdentity=digest(input.panelAuditEvidence??[]);
+ if(panel){state.panelAuditEvidenceIdentity=digest(input.panelAuditEvidence??[]);state.panelRevisionIdentity=digest(input.panelRevisionSources??[]);}
  if(input.frozenQa)state.frozenQaIdentity=digest(input.frozenQa);
  state.proofProtocol=proofProtocol;state.projectFactsIdentity=projectFactsIdentity;if(summarized)state.sourceIdentity=catalogue.identity;
  // Reserve a bounded slice before provider work. A hard loss charges that slice,
@@ -173,9 +175,13 @@ export async function runProposalQa(input,ops){
     });
     input={...input,sourceCatalogue:catalogue,evidenceSummary:{items:catalogue.pages.flatMap(p=>summaryItems(summary.pages[p.id].value,p.id))}};
    }
+   const revisionSources=round.answerCorrection?[
+    ...(input.panelRevisionSources??[]),...panelCorrectionSources(round.answerCorrection.findings,input.panelAuditEvidence??[])
+   ]:input.panelRevisionSources??[];
+   const correctionContext=panel?{panelRevisionSources:revisionSources}:{};
    if(!round.answers){
     const artifactRefs=summarized?[]:(await frozenEvidencePacket(scopedQaGroups(input.groups,proposal))).artifacts.filter(a=>a.available).map(a=>a.id);
-    const refs=new Set([...artifactRefs,...(catalogue?.records??[]).map(r=>r.reference),...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...input.projectSummaries.flatMap(s=>[...(s.facts??[]),...(s.references??[])].map(r=>r.reference)),...input.learningProofEvidence.filter(r=>r.available!==false&&typeof r.text==='string').map(r=>r.reference),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
+    const refs=new Set([...revisionSources.map(record=>record.reference),...artifactRefs,...(catalogue?.records??[]).map(r=>r.reference),...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...input.projectSummaries.flatMap(s=>[...(s.facts??[]),...(s.references??[])].map(r=>r.reference)),...input.learningProofEvidence.filter(r=>r.available!==false&&typeof r.text==='string').map(r=>r.reference),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
     const validate=value=>{
      validateQaAnswers(value,refs);
      if(round.answerCorrection&&['changes','memoryRefs','reason'].some(key=>Object.hasOwn(value,key)))throw Error('Answer-only correction must preserve the proposal');
@@ -189,12 +195,12 @@ export async function runProposalQa(input,ops){
      proposal=input.validateProposal(frozen.proposal);
      if(!Array.isArray(frozen.claims)||!frozen.claims.length)throw Error('Frozen answers need their accepted proof claims');
     }
-    const result=frozen?validate({answers:frozen.answers,claims:frozen.claims}):validate(await call('qaAnswer',{proposal,previousReview:state.rounds[index-1]?.review,answerCorrection:round.answerCorrection,validate},`${index}-qaAnswer`));
+    const result=frozen?validate({answers:frozen.answers,claims:frozen.claims}):validate(await call('qaAnswer',{...correctionContext,proposal,previousReview:state.rounds[index-1]?.review,answerCorrection:round.answerCorrection,validate},`${index}-qaAnswer`));
     if(result.changes||result.reason!==undefined)proposal=input.validateProposal({...proposal,...(result.reason!==undefined?{reason:result.reason}:{}),changes:result.changes??proposal.changes,...(result.memoryRefs?{memoryRefs:result.memoryRefs}:{})});
     round.proposal=proposal;round.answers=result.answers;if(result.claims)round.claims=result.claims;await persist();
    }
    if(!round.review){const validate=value=>{validateQaVerdict(value);if(split)validateQaFindings(value);validateSummaryTargets(value,input.evidenceSummary?.items??[]);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
-    const payload={proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate};
+    const payload={...correctionContext,proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate};
     round.review=panel?await runPanelRound({round,payload,index,call,persist,now,signal,concurrency:panelConcurrency}):validate(await call('qaReview',payload,`${index}-qaReview`));await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){

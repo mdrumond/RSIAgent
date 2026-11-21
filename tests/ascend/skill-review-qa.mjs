@@ -365,3 +365,34 @@ test('panel writer correction receives the exact reviewed proposal and every ver
  assert.deepEqual(feedback.proposal,report.rounds[0].proposal);assert.deepEqual(feedback.proposal.changes,changed);
  assert.deepEqual(feedback.issues,report.rounds[0].review.issues);assert.equal(feedback.issues.length,2);
 });
+
+test('a replacement vote preserves audited claims and rechecks only new or differently cited claims',async t=>{
+ for(const replacement of ['approve','changed']){
+  const input={...await fixture(t),qaPolicy:'panel',evaluationContract:{workflow:'failure-first-v1'}};
+  let clock=0;
+  const approve={verdict:'approved',reason:'Supported'},proof=ref=>({reference:ref,quote:'observed',recordSha256:'fixture'});
+  const revise=claims=>({verdict:'revise',reason:'Draft scope',issues:claims.map(([problem])=>({kind:'draft',problem})),
+   claims:claims.map(([,ref],i)=>({path:'issues.'+i+'.problem',proofs:[proof(ref)]}))});
+  const audit=(objections,prefix)=>({
+   audits:objections.map(c=>({claimId:c.id,disposition:'disproved',reason:c.problem})),
+   claims:objections.map((c,i)=>({path:'audits.'+i+'.reason',proofs:[proof(prefix+c.problem)]})),
+  });
+  const first=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>answers(),qaReview:async({directory})=>{
+   if(directory.endsWith('-4'))throw Error('Disconnected');
+   return directory.endsWith('-2')||directory.endsWith('-3')?revise([['First','old'],['Second','old']]):approve;
+  },qaPanelAudit:async({objections})=>{clock+=119000;return audit(objections,'initial-');}});
+  assert.equal(first.reasonKind,'infrastructure');
+  let audited=0;
+  const next=await runProposalQa({...input,retryMissingPanelVotes:true},{now:()=>clock,qaReview:async()=>replacement==='approve'?approve:revise([['First','different'],['Third','new']]),
+   qaPanelAudit:async({objections,seconds})=>{
+    audited++;assert.equal(seconds,1);
+    assert.deepEqual(objections.map(c=>c.problem).sort(),['First','Third']);
+    return audit(objections,'replacement-');
+   }});
+  assert.equal(audited,replacement==='approve'?0:1);
+  assert.equal(next.verdict,replacement==='approve'?'approved':'inconclusive');
+  const checked=Object.fromEntries(next.rounds[0].panel.decision.claims.map(c=>[c.problem,c.audit.proofs[0].reference]));
+  assert.equal(checked.Second,'initial-Second');
+  assert.equal(checked.First,replacement==='approve'?'initial-First':'replacement-First');
+ }
+});

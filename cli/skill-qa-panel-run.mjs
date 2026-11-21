@@ -1,5 +1,10 @@
 import {panelClaims, decideQaPanel} from './skill-qa-panel-decision.mjs';
 
+export function panelCorrectionSources(issues, records) {
+ const refs=new Set(issues.flatMap(issue=>(issue.proofs??[]).map(proof=>proof.reference)));
+ return records.filter(record=>refs.has(record.reference));
+}
+
 export function panelVotes(panel) {
  return panel.slots.map(slot => slot?.status === 'submitted' ? slot.vote : null);
 }
@@ -29,6 +34,31 @@ export function reopenPanel(round, remaining) {
  return true;
 }
 
+function citationSet(claim) {
+ const fields=['reference','sourceSha256','recordSha256','factId','segment','startLine','endLine','field','quote'];
+ const keys=claim.mentions.flatMap(mention=>mention.proofs.map(proof=>JSON.stringify(fields.map(key=>proof[key]))));
+ return JSON.stringify([...new Set(keys)].sort());
+}
+
+// The native claim paths point into their original audit's row order.
+function appendAudit(target, source, select) {
+ for(const [index,row] of (source?.audits??[]).entries()){
+  if(!select(row))continue;
+  const path='audits.'+target.audits.length+'.reason';
+  target.audits.push(row);
+  for(const claim of source.claims??[])if(claim.path==='audits.'+index+'.reason')target.claims.push({...claim,path});
+ }
+}
+
+function priorAudit(panel, objections) {
+ const previous=panel.history?.at(-1),retained={audits:[],claims:[]};
+ if(!previous?.audit)return retained;
+ const keys=new Map(objections.map(claim=>[claim.id,citationSet(claim)]));
+ const reusable=new Set(previous.decision.claims.filter(claim=>keys.get(claim.id)===citationSet(claim)).map(claim=>claim.id));
+ appendAudit(retained,previous.audit,row=>reusable.has(row.claimId));
+ return retained;
+}
+
 const errorInfo = error => ({name: error.name, message: error.message, ...(error.reviewSession ? {reviewSession: error.reviewSession} : {})});
 
 export async function runPanelRound({round, payload, index, call, persist, now, signal, concurrency}) {
@@ -54,7 +84,11 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
  const workers = await Promise.allSettled(Array.from({length: Math.min(concurrency, pending.length)}, worker));
  for (const worker of workers) if (worker.status === 'rejected') throw worker.reason;
  signal.throwIfAborted();
- const objections = panelClaims(panelVotes(panel));
+ const claims = panelClaims(panelVotes(panel));
+ const retained=priorAudit(panel,claims);
+ const audited=new Set(retained.audits.map(row=>row.claimId));
+ const objections=claims.filter(claim=>!audited.has(claim.id));
+ if(!objections.length&&retained.audits.length&&!panel.audit)panel.audit=retained;
  if (objections.length && !panel.audit && !panel.auditError) {
   const started = now();
   const validate = value => {
@@ -69,10 +103,13 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
   };
   try {
    const raw = await call('qaPanelAudit', {...payload, objections, validate}, index+'-qaPanelAudit'+suffix, true);
-   panel.audit = validate(raw?.value ?? raw);
+   const result=validate(raw?.value ?? raw);
+   appendAudit(retained,result,()=>true);
+   panel.audit=retained;
   } catch (error) {
    signal.throwIfAborted();
    panel.auditError = errorInfo(error);
+   if(retained.audits.length)panel.audit=retained;
   }
   panel.auditElapsedSeconds = Math.max(0, (now()-started)/1000);
   await persist();
