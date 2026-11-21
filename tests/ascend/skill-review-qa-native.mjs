@@ -195,3 +195,65 @@ test('failure-first native QA revalidates a legacy cached literal proof in place
  }
  assert.equal(provider.requests(),4);
 });
+
+test('failure-first native QA repairs an answer in fresh sessions and keeps the approved draft',async t=>{
+ const {root,input,text,proof,answer,review}=await artifactQaFixture(t);
+ const answerPath='answers.example.text';
+ const issue={kind:'answer',path:answerPath,problem:'The archived evidence does not show how the passing kernel was edited'};
+ let answerSession=0,reviewSession=0;
+ const provider=await scriptedReview(t,root,body=>{
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  const replies=body.messages.filter(message=>message.role==='tool');
+  if(replies.at(-1)?.content.includes('Accepted. Finish'))return null;
+  let result;
+  if(schema.properties.answers){
+   result=answer(proof);
+   if(answerSession===1)result.answers.example.text='The passing kernel changed its loop';
+   if(answerSession===2&&!replies.length){
+    result.reason='A new rationale for the draft';
+    result.claims.push({path:'reason',kind:'hypothesis',proofs:[proof]});
+   }
+  }else{
+   result=review(proof);
+   if(reviewSession===1){
+    result.verdict='revise';
+    result.issues=[issue];
+    result.claims.push({path:'issues.0.problem',kind:'observation',proofs:[proof]});
+   }else{
+    result.issues=[{kind:'advisory',problem:'An additional example is optional'}];
+    result.claims.push({path:'issues.0.problem',kind:'hypothesis',proofs:[proof]});
+   }
+  }
+  return {name:'submit_review',args:{result}};
+ });
+ const answerDirectories=[],reviewDirectories=[];
+ const report=await runProposalQa({...input,qaPolicy:'split',config:{actor:provider.profile},
+  evaluationContract:{workflow:'failure-first-v1'},projectSummaries:[],learningProofEvidence:[],allowWriterRevision:true,
+  validateProposal:value=>value},{
+  qaAnswer:async args=>{
+   answerSession++;
+   answerDirectories.push(args.directory);
+   if(answerSession===2){
+    assert.equal(args.answerCorrection.previousAnswers.example.text,'The passing kernel changed its loop');
+    assert.deepEqual(args.answerCorrection.findings.map(({kind,path})=>({kind,path})),[{kind:'answer',path:answerPath}]);
+   }
+   return (await nativeQaAnswer(args)).value;
+  },
+  qaReview:async args=>{
+   reviewSession++;
+   reviewDirectories.push(args.directory);
+   assert.deepEqual(args.proposal,input.proposal);
+   assert.equal(args.answers.example.text,reviewSession===1?'The passing kernel changed its loop':text);
+   return (await nativeQaReview(args)).value;
+  },
+ });
+ assert.equal(report.verdict,'approved');
+ assert.equal(report.rounds.length,2);
+ assert.deepEqual(report.proposal,input.proposal);
+ assert.equal(report.rounds[1].review.issues[0].kind,'advisory');
+ assert.equal(new Set(answerDirectories).size,2);
+ assert.equal(new Set(reviewDirectories).size,2);
+ const second=JSON.parse(await readFile(join(answerDirectories[1],'termination.json'),'utf8'));
+ assert.equal(second.rejectedSubmissions,1);
+ assert.equal(provider.requests(),9);
+});
