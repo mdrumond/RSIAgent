@@ -12,7 +12,7 @@ import {claimEvidence} from './project-summary.mjs';
 import {frozenEvidencePacket} from './skill-review-evidence.mjs';
 import {reviewSession,nativeQaAnswer,nativeQaReview,nativeQaPanelAudit} from './skill-review-native.mjs';
 import {qaIdentity,runProposalQa} from './skill-review-qa.mjs';
-import {replayPanelDecision} from './skill-qa-panel-run.mjs';
+import {panelCorrectionSources,replayPanelDecision} from './skill-qa-panel-run.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {readConfig} from './instance.mjs';
@@ -124,7 +124,13 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const started=ops.now(),left=()=>Math.max(0,input.remainingSeconds-(ops.now()-started)/1000),sessionConfig={...knowledgeConfig,project_evidence_root:config.root};
   input.signal?.throwIfAborted();
   const primaryRecords=claimEvidence({packet:await frozenEvidencePacket(groups)});
-  const writerProofRecords=[...primaryRecords,...proofRecords];
+  let panelRevisionSources=[];
+  if(panel&&input.revisionFeedback){
+   const feedback=JSON.parse(input.revisionFeedback);
+   assert(Array.isArray(feedback.issues),'Panel revision must use the verified QA findings');
+   panelRevisionSources=panelCorrectionSources(feedback.issues,input.panelAuditEvidence??[]);
+  }
+  const writerProofRecords=[...primaryRecords,...proofRecords,...panelRevisionSources];
   const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=perspectives.flatMap((perspective,index)=>{
    const id='principle-'+String.fromCharCode(97+index);
@@ -138,7 +144,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
    if(input.frozenQa)assert(written,'Frozen panel replay requires its retained writer result');
    if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
-     prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);
+     prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,...(panelRevisionSources.length?{revisionSources:panelRevisionSources}:{}),entries},validate}),ops.now);
     if(outcome.providerTimeout)return {id,providerTimeout:outcome.providerTimeout};
     written=outcome.written;validate(written.value,written.retrievals??[]);await save(resultFile,written);
    }
@@ -148,8 +154,8 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const proposal={action:'update',reason:'Instruction grounded in reproduced baseline failures',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:changeId,scope:written.value.scope,text:written.value.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
    const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
    const qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
-    ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency,panelAuditEvidence:input.panelAuditEvidence,retryMissingPanelVotes:input.retryMissingPanelVotes}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
-   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
+    ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency,panelAuditEvidence:input.panelAuditEvidence,panelRevisionSources,retryMissingPanelVotes:input.retryMissingPanelVotes}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
+   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:panel?qa.revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
    assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal);
    if(panel)verifyPanelApproval(qa,reviewed);
    const updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
