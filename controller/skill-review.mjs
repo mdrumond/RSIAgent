@@ -107,7 +107,7 @@ export function validateClassification(value,group,entries,{requireBucket=false,
  const refs=new Set([...group.occurrences,...(group.linkedDiagnostics??[])].map(o=>o.reference));
  validateReviewReferences(value.evidenceRefs,refs,{field:'evidenceRefs',groupId:group.id,required:true,message:'evidenceRefs must contain actual occurrence or linked-diagnostic reference IDs from this group'});
  const triage=failureFirst?routeFailureClassification(value,group):null;
- return {...value,groupId:group.id,intervention:(failureFirst?triage.route==='human':value.cause==='harness'||value.bucket==='harness')?'user-required':null,
+ return {...value,groupId:group.id,intervention:(failureFirst?['human','specification'].includes(triage.route):value.cause==='harness'||value.bucket==='harness')?'user-required':null,
   ...(triage?{triage}:{})};
 }
 export function validateClassificationBatch(value,groups,entries,policy){

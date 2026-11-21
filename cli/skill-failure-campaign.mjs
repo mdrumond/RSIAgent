@@ -5,6 +5,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../controller/state.mjs';
+import {failureRoutingRevision} from '../controller/skill-failure-triage.mjs';
 import {SkillBacklog} from '../controller/skill-backlog.mjs';
 import {enqueueLearningRequest} from '../controller/skill-review.mjs';
 import {attentionRevision} from '../controller/failure-attention.mjs';
@@ -28,7 +29,7 @@ function requeueUnwitnessedFamilies(backlog){
   const queued=backlog.list({status:'queued',workflow:'failure-first-v1',objective:'correctness',limit:100});
   for(const item of queued){
    const classifications=item.preparation?.classifications;
-   if(!classifications||item.groupIds.every(id=>classifications[id]?.triage))continue;
+   if(!classifications||item.preparation.failureRoutingRevision===failureRoutingRevision)continue;
    backlog.revise(item.id,{status:'deferred',reason:'Queued classification requires runtime-boundary review'});
    for(const id of item.groupIds)backlog.reclassify(id);
   }

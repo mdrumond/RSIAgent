@@ -1,3 +1,4 @@
+import {failureRoutingRevision,verifierBoundaryKind} from '../controller/skill-failure-triage.mjs';
 import {projectSummaries} from './project-summary.mjs';
 import {hypothesisCaseReadiness} from './skill-priority-cases.mjs';
 /** Campaign-local failure analysis. Model work never holds the foreground ledger. */
@@ -48,7 +49,7 @@ export async function freezeGroups(root,groups,directory){
   const event=ledger?.prepare("SELECT 1 FROM sqlite_master WHERE name='events'").get()
    ?ledger.prepare("SELECT data FROM events WHERE sequence=? AND type='verification'"):null;
   for(const group of frozen)for(const observation of [...group.occurrences,...(group.linkedDiagnostics??[])]){
-   const copies=[];
+   const copies=[];delete observation.verifiedBoundaryKind;
    const sequence=/^events:(\d+)$/.exec(observation.reference??'');
    const retained=sequence&&event?.get(Number(sequence[1]));
    const primary=retained?JSON.parse(retained.data).correctness:null;
@@ -78,8 +79,8 @@ export async function freezeGroups(root,groups,directory){
      const last=bytes.toString('utf8').trimEnd().split('\n').at(-1);
      try{
       const verdict=JSON.parse(last);
-      if(verdict?.correct===false&&/^[a-f0-9]{64}$/.test(verdict.kernelSha256??''))
-       observation.verifierVerdict={correct:false,kernelSha256:verdict.kernelSha256};
+      const kind=verifierBoundaryKind(verdict);
+      if(kind)observation.verifiedBoundaryKind=kind;
      }catch(error){if(!(error instanceof SyntaxError))throw error;}
     }
 
@@ -179,7 +180,7 @@ export function currentAnalysisStages({config,backlog}){
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2,classificationOnly=false},dependencies={}){
  const ops=await operations(dependencies),now=dependencies.now??(()=>performance.now()),clock=allocation(remainingSeconds,signal,now),entries=await guidanceEntries(config.root,config.skills.activeVersion);
  const policy={requireBucket:true,failureFirst:classificationOnly};
- const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count,...(classificationOnly?['evidence-routing']:[])]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
+ const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count,...(classificationOnly?[failureRoutingRevision]:[])]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
  const persist=()=>{for(const [id,stage]of Object.entries(stages))Object.assign(stage,coordinates.get(id));backlog.meta('analysis-stages',stages);};
  const eligible=g=>stages[identity(g)]?.status!=='blocked';
  const dirty=[];
@@ -187,7 +188,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
  const page=classificationOnly?{items:[],finish(){}}:learningPage(backlog,config),learningItems=page.items;
  const groups=[...new Map([...dirty,...learningItems.flatMap(({item})=>item.groupIds.map(id=>backlog.failure(id,{limit:6})))].filter(g=>g&&eligible(g)).map(g=>[g.id,g])).values()].slice(0,limit);
  if(!groups.length){page.finish();return {analyzed:0,items:[],remainingSeconds:clock.remaining()};}
- const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results]),...(classificationOnly?['evidence-routing']:[])])),frozen=await freezeGroups(config.root,groups,batch);
+ const batch=join(directory,hash([config.skills.activeVersion,groups,learningItems.map(({item,results})=>[item.id,results]),...(classificationOnly?[failureRoutingRevision]:[])])),frozen=await freezeGroups(config.root,groups,batch);
  const classificationFile=join(batch,'classifications.json');let classifications=await load(classificationFile);
  if(!classifications&&frozen.every(g=>stages[identity(g)]?.classification))classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};
  const stageError=(error,spent,cap)=>spent>=cap-.05||['rejected-submissions','no-submit','interrupted-unknown-spend'].includes(error.reviewSession?.kind);
@@ -223,16 +224,17 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
    priority:priority(group),reason:classification.reason,base},evidence={groups:[group]},classificationContext={classifications:{[group.id]:classification}};
   if(classificationOnly){
    const {route,observed}=classification.triage;
-   const status={human:'user-required',baseline:'queued',phase1:'learning'}[route]??'deferred';
+   const status={human:'user-required',specification:'user-required',baseline:'queued',phase1:'learning'}[route]??'deferred';
    const measurements=route==='optimization'?(await projectSummaries(config,[group])).flatMap(summary=>
     summary.measurements.filter(m=>m.verified&&m.geometricMeanSpeedup>1).map(m=>({reference:m.reference,projectId:summary.projectId,geometricMeanSpeedup:m.geometricMeanSpeedup}))):[];
    const bonus=Math.min(10,Math.round(10*Math.log2(Math.max(1,...measurements.map(m=>m.geometricMeanSpeedup)))));
    const stored=backlog.atomic(()=>{
-    const item=backlog.upsert({...common,objective:{human:'harness',phase1:'correctness',unresolved:'unknown'}[route]??classification.bucket,
-     key:'failure-first:'+group.id,workflow:'failure-first-v1',proposal:null,evidence,preparation:{...classificationContext,...(measurements.length?{measurements}:{})},
+    const item=backlog.upsert({...common,objective:{human:'harness',specification:'correctness',phase1:'correctness',unresolved:'unknown'}[route]??classification.bucket,
+     key:'failure-first:'+group.id,workflow:'failure-first-v1',proposal:null,evidence,preparation:{...classificationContext,failureRoutingRevision,...(measurements.length?{measurements}:{})},
      priority:common.priority+bonus,status});
     if(route==='phase1')queueLearning(backlog,config,item,[{workflow:'failure-first-v1',workKind:'phase1',learningTarget:'device',
-     question:'Can an explicit PyTorch reference reproduce the intended operation independently of the failed target baseline?',
+     question:observed.kind==='unresolved-oracle'?'What behavior should the independent reference expect for the disputed cases?':
+      'Can an explicit PyTorch reference reproduce the intended operation independently of the failed target baseline?',
      hypothesis:'Small cases with a separately specified oracle can establish the expected result on the target.',
      requiredEvidence:'Provide the reference and small cases with explicit expected outputs, then check the reference on the target. Original baseline verdict: '+observed.reference}]);
     backlog.acknowledge(group.id,{classification,count:group.count});return item;

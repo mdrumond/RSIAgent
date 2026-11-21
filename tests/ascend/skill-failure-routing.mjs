@@ -141,3 +141,45 @@ test('a native provider failure stays in human review even when the actor report
  assert.equal(item.preparation.classifications[item.groupIds[0]].triage.observed.kind,'provider');
  assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
 });
+
+test('a verified declaration-only rejection reaches specification review without an experiment or curriculum work',async t=>{
+ const f=await fixture(t),attempt=f.start('declaration');
+ const verdict={passed:false,mode:'verify',flag_value:false,cases:10,failures:[{case:'<declaration>'}]};
+ await f.verify(attempt,'verify.log',JSON.stringify(verdict));
+ f.backlog.ingest();
+ const result=await runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
+  analyze:()=>f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness',cause:'specification'}))),
+  family:()=>assert.fail('A declaration-only rejection must not use an experiment slot')});
+ assert.equal(result.status,'idle');
+ const [item]=f.backlog.list({status:'user-required'});
+ assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,'specification');
+ assert.equal(f.state.db.prepare("SELECT name FROM sqlite_master WHERE name='skill_learning_requests'").get(),undefined);
+});
+
+test('a trusted unresolved oracle queues one Phase 1 question with independently specified expected outputs',async t=>{
+ const f=await fixture(t),attempt=f.start('oracle-gap');
+ const receipt={correct:null,evidence:{oracle:{status:'unresolved'}}};
+ await f.verify(attempt,'verify.log',JSON.stringify(receipt));
+ f.backlog.ingest();
+ const {items:[item]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
+ assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,'phase1');
+ assert.equal(item.status,'learning');
+ const question=claimLearningRequest(f.state,f.config,{draft:'oracle-study',target:'a5'});
+ assert.equal(question.backlogId,item.id);
+ assert.equal(claimLearningRequest(f.state,f.config,{draft:'second',target:'a5'}),null);
+ assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
+});
+
+test('numerical evidence still queues baseline isolation when a declaration also fails',async t=>{
+ const f=await fixture(t),attempt=f.start('compound');
+ const receipt={correct:false,kernelSha256:'a'.repeat(64),evidence:{caseResults:[
+  {id:'declaration',kind:'declaration',correct:false},
+  {id:'numerical',kind:'numerical',correct:false},
+  {id:'control',kind:'numerical',correct:true}
+ ]}};
+ await f.verify(attempt,'verify.log',JSON.stringify(receipt));
+ f.backlog.ingest();
+ const {items:[item]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness'})));
+ assert.equal(item.preparation.classifications[item.groupIds[0]].triage.route,'baseline');
+ assert.equal(item.status,'queued');
+});

@@ -1,5 +1,24 @@
+export const failureRoutingRevision='evidence-routing-v2';
+
 const infrastructureExits=new Set([124,125,126,127]);
 const executed=exit=>Number.isInteger(exit)&&exit>=0&&exit<128&&!infrastructureExits.has(exit);
+
+// Read only structural facts from verifier output. Free-form failure messages
+// cannot establish that a requirement or oracle was the failing boundary.
+export function verifierBoundaryKind(receipt){
+ if(receipt?.correct===false||receipt?.correct===null){
+  if(receipt.evidence?.oracle?.status==='unresolved')return 'unresolved-oracle';
+  const cases=receipt.evidence?.caseResults;
+  if(Array.isArray(cases)&&cases.some(row=>row?.kind==='declaration'&&row.correct===false)
+    &&cases.some(row=>row?.kind==='numerical'&&row.correct===true)
+    &&cases.every(row=>row?.correct===true||row?.kind==='declaration'&&row.correct===false))return 'declaration-only';
+  if(receipt.correct===false&&/^[a-f0-9]{64}$/.test(receipt.kernelSha256??''))return 'candidate-verdict';
+ }
+ if(receipt?.passed===false&&receipt.mode==='verify'&&receipt.flag_value===false&&
+   Number.isInteger(receipt.cases)&&receipt.cases>0&&Array.isArray(receipt.failures)&&receipt.failures.length===1&&receipt.failures[0]?.case==='<declaration>')
+  return 'declaration-only';
+ return null;
+}
 
 function observedBoundary(row,type){
  const data=row.data??{};
@@ -14,9 +33,9 @@ function observedBoundary(row,type){
  if(correctness?.passed===true&&performance?.passed===false&&!performance.skipped&&executed(performance.exitCode))
   return {kind:'performance',reference:row.reference};
  if(correctness?.passed!==false||!executed(correctness.exitCode))return null;
- const receipt=correctness.receipt??row.verifierVerdict;
- if(receipt?.correct===false&&/^[a-f0-9]{64}$/.test(receipt.kernelSha256??''))
-  return {kind:'candidate-verdict',reference:row.reference};
+ const receiptKind=verifierBoundaryKind(correctness.receipt);
+ const kind=receiptKind&&receiptKind!=='candidate-verdict'?receiptKind:row.verifiedBoundaryKind??receiptKind;
+ if(kind)return {kind,reference:row.reference};
  return {kind:'verifier-exit',reference:row.reference,replayEvidence:row.artifacts?.some(artifact=>artifact.primaryVerification===true)===true};
 }
 
@@ -32,13 +51,16 @@ export function routeFailureClassification(value,group){
  const find=kind=>boundaries.find(boundary=>boundary.kind===kind);
  const provider=find('provider'),infrastructure=find('infrastructure')??provider,invalid=find('invalid-baseline');
  const candidate=find('candidate-verdict'),exit=find('verifier-exit'),performance=find('performance');
- const attributed={harness:find('infrastructure'),provider,specification:invalid};
+ const declaration=find('declaration-only'),oracle=find('unresolved-oracle');
+ const attributed={harness:find('infrastructure'),provider,specification:invalid??declaration??oracle};
  if(value.cause!=='unknown'&&!attributed[value.cause])
   throw Error('Ownership '+value.cause+' needs a cited runtime boundary that establishes it. A failed command or verifier exit does not locate the fault. Use cause=unknown if that boundary is absent. Available runtime boundaries: '+JSON.stringify(scoped));
  if(value.bucket==='harness'&&!infrastructure)
   throw Error('Harness routing requires a cited infrastructure boundary. Use bucket=unknown when the origin of a failure remains unresolved.');
  if(infrastructure)return {route:'human',observed:infrastructure};
- if(invalid)return {route:'phase1',observed:invalid};
+ if(candidate&&(declaration||oracle))return {route:'unresolved',observed:declaration??oracle};
+ if(declaration)return {route:'specification',observed:declaration};
+ if(oracle||invalid)return {route:'phase1',observed:oracle??invalid};
  if(value.bucket==='optimization'&&performance)return {route:'optimization',observed:performance};
  if(value.bucket==='correctness'&&candidate)return {route:'baseline',observed:candidate};
  if(exit)return {route:'unresolved',observed:exit,...(exit.replayEvidence?{
