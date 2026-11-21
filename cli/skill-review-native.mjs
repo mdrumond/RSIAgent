@@ -101,15 +101,16 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const coverageFile=join(directory,'read-evidence.json');
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
  const schema=resultSchema??(proofRequired?proofResultSchema:Type.Unknown());
+ const isClassificationBatch=schema===classificationBatchSchema||schema===failureFirstBatchSchema;
  const check=async(result,cached=false)=>{
-  if(schema===classificationBatchSchema&&Array.isArray(result?.claims))
+  if(isClassificationBatch&&Array.isArray(result?.claims))
    result={...result,claims:result.claims.map(claim=>typeof claim?.path==='string'
     ? {...claim,path:claim.path.replace(/^classifications\[(\d+)\]\.reason$/,'classifications.$1.reason')}
     : claim)};
 
   let candidate=cached&&selectorOnly?selectorShape(result):result;
   if(cached&&schema===classificationSchema){const {groupId,intervention,...submitted}=candidate;candidate=submitted;}
-  if(cached&&schema===classificationBatchSchema)candidate={...candidate,classifications:candidate.classifications?.map(({intervention,...submitted})=>submitted)};
+  if(cached&&isClassificationBatch)candidate={...candidate,classifications:candidate.classifications?.map(({intervention,triage,...submitted})=>submitted)};
   if((proofRequired||resultSchema)&&!Check(schema,candidate)){const paths=Errors(schema,candidate).slice(0,4).map(e=>(e.instancePath||'/')+' '+e.message).join('; ');
    throw Error((selectorOnly?'Submit only the result schema: claims contain path, kind and selector-only proofs {reference,startLine?,endLine?,segment?,field?}; omit claim.text, quote, hashes, fact values and input metadata.':'Submission must match the submit_review result schema: claims is a required TOP-LEVEL array of {path,kind,proofs} (text may be omitted); nested claims and reasonClaims do not replace it.')+' Invalid fields: '+paths);
   }

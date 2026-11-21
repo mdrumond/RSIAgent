@@ -228,7 +228,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
     summary.measurements.filter(m=>m.verified&&m.geometricMeanSpeedup>1).map(m=>({reference:m.reference,projectId:summary.projectId,geometricMeanSpeedup:m.geometricMeanSpeedup}))):[];
    const bonus=Math.min(10,Math.round(10*Math.log2(Math.max(1,...measurements.map(m=>m.geometricMeanSpeedup)))));
    const stored=backlog.atomic(()=>{
-    const item=backlog.upsert({...common,objective:{human:'harness',phase1:'correctness'}[route]??classification.bucket,
+    const item=backlog.upsert({...common,objective:{human:'harness',phase1:'correctness',unresolved:'unknown'}[route]??classification.bucket,
      key:'failure-first:'+group.id,workflow:'failure-first-v1',proposal:null,evidence,preparation:{...classificationContext,...(measurements.length?{measurements}:{})},
      priority:common.priority+bonus,status});
     if(route==='phase1')queueLearning(backlog,config,item,[{workflow:'failure-first-v1',workKind:'phase1',learningTarget:'device',

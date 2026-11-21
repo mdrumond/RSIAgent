@@ -381,6 +381,32 @@ test('native classification repairs coverage and references from actual copyable
  assert.equal(replay.recovered,true);assert.equal(provider.requests(),before);
 });
 
+test('failure-first native classification corrects unsupported ownership and reuses the validated cache',async t=>{
+ const {nativeClassifyBatch}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'native-runtime-boundary');
+ const groups=[{id:'one',type:'verification',occurrences:[{reference:'event:one',data:{message:'Device mismatch',correctness:{passed:false,exitCode:1}},artifacts:[]}]}];
+ const row={groupId:'one',cause:'unknown',bucket:'correctness',coverage:'unknown',guidanceIds:[],
+  reason:'The failing verifier did not locate which component placed the tensor.',evidenceRefs:['event:one']};
+ const result=batchClaims([row]);result.claims[0].path='classifications[0].reason';
+ const provider=await scriptedReview(t,f.root,(body,n)=>{
+  if(n===0)return {name:'read',args:{path:'input.json'}};
+  if(n===1)return {name:'submit_review',args:{result:batchClaims([{...row,cause:'actor'}])}};
+  if(n===2){
+   assert.match(String(body.messages.filter(m=>m.role==='tool').at(-1).content),/runtime boundary/);
+   return {name:'submit_review',args:{result}};
+  }
+  return null;
+ });
+ const options={directory,config:{actor:provider.profile},groups,entries:[],bucketPolicy:true,failureFirst:true,seconds:30,
+  validate:value=>validateClassificationBatch(value,groups,[],{requireBucket:true,failureFirst:true})};
+ const first=await nativeClassifyBatch(options);
+ assert.equal(first.value.classifications[0].cause,'unknown');
+ assert.equal(first.value.classifications[0].triage.route,'unresolved');
+ const before=provider.requests(),replay=await nativeClassifyBatch(options);
+ assert.equal(replay.recovered,true);
+ assert.equal(provider.requests(),before);
+ assert.deepEqual(replay.value,first.value);
+});
+
 test('native classification accepts primary selectors and refuses copied proof metadata or invalid source ranges',async t=>{
  const {nativeClassify}=await import('../../cli/skill-review-native.mjs'),f=await fixture(t),directory=join(f.root,'selector-classification');
  const group={id:'one',occurrences:[{reference:'event:one',data:{message:'An observed failure'},artifacts:[]}]};

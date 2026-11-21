@@ -207,7 +207,7 @@ test('a question making concrete draft progress can hand off to a distinct quest
   }
   assert.equal(await readFile(join(writableDirectory,'partial.py'),'utf8'),'pass');
   now+=175000;
-  return {value:{status:'needs-evidence',reason:'Reference semantics unavailable'}};
+  return {value:missingFamily(f.reference,{reason:'Reference semantics unavailable'})};
  }});
  assert.equal(result.status,'needs-evidence');assert.equal(result.elapsedSeconds,356);assert.equal(result.question.elapsedSeconds,175);
  assert.deepEqual(seen.map(q=>q.number),[1,2]);assert.equal(seen[0].nativeDirectory,seen[1].nativeDirectory);
