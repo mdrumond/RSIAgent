@@ -352,6 +352,36 @@ test('focused panel recovery retries missing reviewers with the same audit sourc
  await assert.rejects(design({...input,panelAuditEvidence:[]}),/evidence changed/);
 });
 
+test('a fresh panel writer can cite the primary source that established a verified defect',async t=>{
+ const f=await fixture(t),record={reference:'final-score:1',text:'The terminal verifier failed.'};
+ const irrelevant={reference:'unused:2',text:'Different experiment.'};
+ const input={...f.input,mode:'focused-correctness',qaPolicy:'panel',reviewCandidate:'principle-a',panelAuditEvidence:[record,irrelevant]};
+ const design=createFailureDesign({config:f.config,item:f.item},{
+  ...f.deps,
+  qaReview:async request=>request.directory.includes('second-writer')?{verdict:'approved',reason:'Corrected.'}:
+   {verdict:'revise',reason:'Specify the boundary.',issues:[{kind:'draft',path:'changes.0.text',problem:'The final verifier is misidentified.'}]},
+  qaPanelAudit:async request=>({audits:request.objections.map(claim=>({claimId:claim.id,disposition:'verified',reason:record.text})),
+   claims:[{path:'audits.0.reason',proofs:[{reference:record.reference,quote:record.text,recordSha256:createHash('sha256').update(record.text).digest('hex'),startLine:1,endLine:1}]}]}),
+  session:async args=>{
+   const written=await f.deps.session(args);
+   if(args.prompt.revisionFeedback){
+    assert.deepEqual(args.prompt.revisionSources,[record]);
+    assert(!args.proofRecords.some(row=>row.reference===irrelevant.reference));
+    const value={...written.value,text:'Check the terminal verification result before attributing a repair.'};
+    value.claims=[{path:'text',kind:'hypothesis',proofs:[{reference:record.reference,startLine:1,endLine:1}]}];
+    validateClaimedResult(value,args.proofRecords);
+    return {...written,value};
+   }
+   return written;
+  },
+ });
+ const first=await design(input);
+ assert.equal(first.status,'rejected');
+ const [revised]=await design({...input,directory:join(f.root,'second-writer'),revisionFeedback:first.revisionFeedback});
+ assert.equal(revised.evidence[0].reference,record.reference);
+ assert.equal(f.calls.length,2);
+});
+
 test('focused review returns concrete feedback for one fresh writing attempt',async t=>{
  const f=await fixture(t);
  let reject=true;
