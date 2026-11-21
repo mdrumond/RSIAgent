@@ -206,6 +206,7 @@ test('A5 checker feedback identifies missing evidence and replays only changed o
  development.controls.calibration=control('bad-calibration');
  const family={id:'family',mechanism,development,transfer:[task('layout'),task('operation')]};
  const config={target:'a5',environment:{options:{mode:'local'}}},calls=[];let settled=true;
+ const mismatch={edge:{relativeError:1.25,wrongElements:18,totalElements:32}},longDetail={value:{message:'x'.repeat(3000)}};
  await writeFile(checker,'initial checker');
  const runtime=await createFailureRuntime({config,directory:join(root,'runtime'),slots:[{resource:{id:'slot'},physical:1}]},{
   settled:async()=>settled,
@@ -213,17 +214,20 @@ test('A5 checker feedback identifies missing evidence and replays only changed o
    const [entry]=entries,source=entry.files['kernel.py'];calls.push(entry.key);
    const correct=!['fails','bad-calibration'].includes(source),initial=(await readFile(checker,'utf8'))==='initial checker';
    const evidence={...(correct||initial?{}:mechanism),checkedCases:initial?['value']:['value','edge'],
+    detail:initial?longDetail:source==='bad-calibration'?mismatch:undefined,
     caseResults:[{id:'value',correct:correct||source==='bad-calibration'},{id:'edge',correct}],processGuard:{allChildrenReaped:true}};
    return [{key:entry.key,sourceFilesMatch:true,sourceFilesSha256:{'kernel.py':'sha'},output:JSON.stringify({correct,kernelSha256:'sha',evidence})}];
   }}),
  });
  await runtime.identify();
  const submit=()=>runtime.checkReferences({family,directory:join(root,'submission'),seconds:30});
- const reject=async verify=>assert.rejects(submit(),error=>{assert.equal(error.code,'FAILURE_REFERENCE_REJECTED');verify(error.diagnostics.at(-1));return true;});
+ const reject=async verify=>assert.rejects(submit(),error=>{assert.equal(error.code,'FAILURE_REFERENCE_REJECTED');verify(error.diagnostics.at(-1),error.message);return true;});
  await reject(row=>{
   assert.equal(row.variant,'starter');assert.deepEqual(row.missingFields,['evidence.phase','evidence.type']);
   assert.deepEqual(row.declaredMechanism,mechanism);assert.deepEqual(row.observedMechanism,{phase:null,type:null});
   assert.deepEqual(row.failedCases,['value']);assert.deepEqual(row.unverifiedCases,['edge']);
+  assert.equal(row.detail.truncated,true);assert(JSON.stringify(longDetail).startsWith(row.detail.preview));
+  assert(row.detail.preview.length<JSON.stringify(longDetail).length);
  });
  await reject(row=>assert.equal(row.reused,true));assert.deepEqual(calls.splice(0),['starter']);
  await writeFile(checker,'checker emits mechanism');
@@ -232,9 +236,10 @@ test('A5 checker feedback identifies missing evidence and replays only changed o
  });
  assert.deepEqual(calls.splice(0),['starter','reference','reference','reference','negative-1']);
  development.controls.negatives[1]=control('fails');
- await reject(row=>{
+ await reject((row,message)=>{
   assert.equal(row.variant,'calibration');assert.equal(row.expectedCorrect,true);assert.equal(row.observedCorrect,false);
   assert.deepEqual(row.failedCases,['edge']);assert.deepEqual(row.observedMechanism,mechanism);
+  assert.deepEqual(row.detail,mismatch);assert(message.includes(JSON.stringify(mismatch)));
  });
  assert.deepEqual(calls.splice(0),['negative-1','calibration']);
  development.controls.calibration=control('calibration');

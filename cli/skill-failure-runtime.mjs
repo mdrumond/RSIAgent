@@ -45,7 +45,7 @@ function submissionDiagnostic(task,variant,value,declaredMechanism){
  const passed=expectedCorrect
   ?value.correct===true&&unverifiedCases.length===0
   :mechanismMatch;
- let problem=null;
+ let problem=null,detail;
  if(!passed){
   if(value.correct!==true&&value.correct!==false)problem='Checker did not return a valid correctness verdict';
   else if(missingFields.length)problem='Checker must emit the missing evidence fields';
@@ -54,8 +54,12 @@ function submissionDiagnostic(task,variant,value,declaredMechanism){
   else if(value.correct===true)problem='Passing verdict omitted checked cases';
   else if(!declaredFailureObserved)problem='Checker emitted a different mechanism from the manifest';
   else problem='Starter verdict did not identify an executed failing case';
+  if(evidence.detail!==undefined){
+   const encoded=JSON.stringify(evidence.detail),limit=2048;
+   detail=encoded.length<=limit?evidence.detail:{preview:encoded.slice(0,limit),truncated:true};
+  }
  }
- return {passed,diagnostic:{expectedCorrect,declaredMechanism,observedMechanism,missingFields,failedCases,unverifiedCases,problem,
+ return {passed,diagnostic:{expectedCorrect,declaredMechanism,observedMechanism,missingFields,failedCases,unverifiedCases,problem,detail,
   mechanismMatch,checkedCases,phase:observedMechanism.phase,type:observedMechanism.type,observedCorrect:value.correct??null,
   correct:value.correct===false?false:value.correct===true&&unverifiedCases.length===0?true:null}};
 }
