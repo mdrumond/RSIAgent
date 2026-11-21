@@ -84,7 +84,7 @@ export async function reviewWritePathAllowed(path,directory){
  if(!directory)return false;const root=await realpath(directory);let cursor=resolve(path);
  while(true){try{const actual=await realpath(cursor);return actual!==root&&actual.startsWith(root+'/')||actual===root&&cursor!==resolve(path);}catch(error){if(error.code!=='ENOENT')throw error;const parent=dirname(cursor);if(parent===cursor)return false;cursor=parent;}}
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,previousResultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming},{wrapStream,retrySettings}={}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,previousResultSchema,proofRecords,requiredReads=[],compactEvidence=false,inlineProofSelectors=true,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming},{wrapStream,retrySettings}={}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
@@ -101,7 +101,7 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const proofSources=()=>proofRecords?[...proofRecords,...claimEvidence({prompt:{entries:prompt.entries,baseline:prompt.baseline,proposal:prompt.proposal,answers:prompt.answers,answerClaims:prompt.answerClaims},retrievals})]:claimEvidence({prompt,packet,retrievals});
  const catalogueFile=join(directory,'proof-selectors.json');let catalogueWrites=Promise.resolve();
  const refreshCatalogue=()=>catalogueWrites=catalogueWrites.then(async()=>{const catalogue=proofSelectorCatalogue([...proofSources(),...(discoveryProofRecords?await discoveryProofRecords():[])]),temporary=catalogueFile+'.'+randomUUID()+'.tmp';await writeFile(temporary,JSON.stringify(catalogue,null,2));await rename(temporary,catalogueFile);return catalogue;});
- if(proofRequired)prompt={...prompt,proofInstructions:(selectorOnly?selectorInstructions:proofInstructions)+' After KDB search/read_entry, read proofSelectorsFile for newly retrieved references and actual line/segment bounds. Submit selectors only; never copy source prose into proof metadata.',proofSelectorsFile:catalogueFile,proofSelectors:await refreshCatalogue(),proofEvidence:compactEvidence?undefined:proofSources()};
+ if(proofRequired){const selectors=await refreshCatalogue();prompt={...prompt,proofInstructions:(selectorOnly?selectorInstructions:proofInstructions)+' After KDB search/read_entry, read proofSelectorsFile for newly retrieved references and actual line/segment bounds. Submit selectors only; never copy source prose into proof metadata.',proofSelectorsFile:catalogueFile,proofSelectors:inlineProofSelectors?selectors:undefined,proofEvidence:compactEvidence?undefined:proofSources()};}
  await writeFile(join(directory,'input.json'),JSON.stringify(prompt,null,2));
  const coverageFile=join(directory,'read-evidence.json');
  const seen=new Set(JSON.parse(await readFile(coverageFile,'utf8').catch(e=>{if(e.code!=='ENOENT')throw e;return '[]';})));
@@ -307,19 +307,47 @@ const panelAuditSchema=Type.Object({
  claims:selectorClaims(Type.String({pattern:'^audits[.][0-9]+[.]reason$'})),
 },{additionalProperties:false});
 export async function nativeQaPanelAudit(input,dependencies={}){
- const prompt=await qaPrompt(input),extra=input.panelAuditEvidence??[],compact=input.evidenceSummary&&input.sourceCatalogue;
- const objections=input.objections.map(({id,kind,path,problem,mentions})=>{
-  const cited=new Set(mentions.flatMap(mention=>mention.proofs).map(proof=>JSON.stringify(Object.fromEntries(
-   Object.keys(selectorFields).filter(key=>Object.hasOwn(proof,key)).map(key=>[key,proof[key]])))));
-  return {id,kind,path,problem,citedSelectors:[...cited].map(value=>JSON.parse(value))};
- });
- const allowed=(input.learning??[]).flatMap(([,record])=>['verified-cpu','verified-device','verified-project'].includes(record.result?.status)?[record.result.project?.source,...(record.result.project?.verifier?.files??[]),...(record.result.evidence??[]).flatMap(e=>e.log?[e.log]:[])].filter(Boolean):[]);
+ const prompt=await qaPrompt(input);
+ const packet=await frozenEvidencePacket(prompt.groups);
+ const primary=input.sourceCatalogue?.records??claimEvidence({prompt,packet});
+ const inputRecords=claimEvidence({prompt:{proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
+ const extras=[...(input.panelAuditEvidence??[]),...(input.panelRevisionSources??[])];
+ const records=new Map();
+ for(const record of [...primary,...inputRecords,...extras]){
+  // Proof resolution takes the first record for a reference.
+  if(!records.has(record.reference)&&record.available!==false&&typeof record.text==='string')records.set(record.reference,record);
+ }
+ const sourceDirectory=join(input.directory,'sources');await mkdir(sourceDirectory,{recursive:true});
+ const sourceIndex=[];
+ const observations=new Map(packet.observations.map(row=>[row.reference,row]));
+ const artifacts=new Map(packet.artifacts.filter(row=>row.available).map(row=>[row.id,row]));
+ for(const record of records.values()){
+  const segments=record.segments??[record.text],files=[];
+  const stem=String(sourceIndex.length+1)+'-'+record.reference.replace(/[^a-z0-9._-]/gi,'-').slice(0,80);
+  for(const [index,text] of segments.entries()){
+   const file=join('sources',stem+(segments.length>1?'-part-'+(index+1):'')+'.txt');
+   await writeFile(join(input.directory,file),text);files.push(file);
+  }
+  const observation=observations.get(record.reference),artifact=artifacts.get(record.reference);
+  const role=record.role??record.provenance??observation?.type??(artifact?'frozen-artifact':record.factId?'controller-fact':'source');
+  sourceIndex.push({reference:record.reference,role,...(record.attemptId!==undefined?{attemptId:record.attemptId}:{}),files,
+   ...(observation?.artifacts?.length?{artifacts:observation.artifacts}:{}),
+   ...(artifact?{fullFiles:artifact.paths,layout:artifact.layout}:{}),
+   ...(record.sourceRefs?.length?{sourceRefs:record.sourceRefs}:{})});
+ }
+ const indexFile='sources/index.jsonl';
+ await writeFile(join(input.directory,indexFile),sourceIndex.map(row=>JSON.stringify(row)).join('\n')+'\n');
+ const selectors=claims=>[...new Set(claims.flatMap(claim=>claim.proofs??[]).map(proof=>JSON.stringify(Object.fromEntries(
+  Object.keys(selectorFields).filter(key=>Object.hasOwn(proof,key)).map(key=>[key,proof[key]])))))].map(value=>JSON.parse(value));
+ const objections=input.objections.map(({id,kind,path,problem,mentions})=>({id,kind,path,problem,
+  citedSelectors:selectors(mentions),answerSelectors:selectors((input.answerClaims??[]).filter(claim=>claim.path===path))}));
+ const extraIds=new Set(extras.map(record=>record.reference));
+ const allowedPaths=packet.artifacts.filter(row=>row.available).flatMap(row=>row.paths);
  return (dependencies.session??reviewSession)({...input,resultSchema:panelAuditSchema,selectorOnly:true,proofRequired:true,knowledge:false,
-  compactEvidence:!!compact,evidenceGroups:compact?[]:prompt.groups,proofRecords:compact?input.sourceCatalogue.records:undefined,
-  discoveryProofRecords:extra.length?async()=>extra:undefined,allowedPaths:compact?[...allowed,input.sourceCatalogue.directory]:allowed,
-  prompt:{...prompt,...(compact?{evidenceSummary:compactSummary(input.evidenceSummary,input.sourceCatalogue)}:{}),answers:input.answers,answerClaims:input.answerClaims,
-   objections,...(extra.length?{primaryAuditEvidence:extra}:{}),
-   task:'Check each objection against frozen primary evidence. Submit audits with the exact claimId, disposition (verified, disproved or unresolved), and a concise reason. Verify whether each objection is materially correct for the exact statement it challenges. Identify the source, attempt and execution role when that affects the claim. Distinguish final scores, intermediate edits, retained source, and static probes. An objection and the frequency of its repetition are not evidence. Read the cited primary excerpts in context. If an essential identity or measurement is missing, choose unresolved. Supply proof selectors for each audits.N.reason. Resolve wording-only questions from the actual draft or answer.'},
+  compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords:[...records.values()],allowedPaths,
+  prompt:{draft:input.proposal,qaAnswers:input.answers,objective:input.objective,target:input.target,projectSummaries:[],learningProofEvidence:[],
+   objections,sourceIndex:indexFile,additionalSources:sourceIndex.filter(row=>extraIds.has(row.reference)),
+   task:'Resolve each objection against its exact statement in the draft or QA answers. Start with its cited selectors and relevant additionalSources. sources/index.jsonl maps all frozen references to readable files, roles and related artifacts. Read or grep the source files directly. Multipart file order is selector segment order. Distinguish scored results, intermediate edits, static probes and generic deductions. Use verified for a material objection established by primary evidence, disproved for a refuted objection, unresolved for insufficient evidence. Submit one audits row per exact claimId with disposition and concise reason, and top-level claims with selectors for audits.N.reason. Frequency of an objection is not evidence.'},
   validate:input.validate});
 }
 export async function nativeQaReview(input,dependencies={}){

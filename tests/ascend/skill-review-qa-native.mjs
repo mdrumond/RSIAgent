@@ -325,3 +325,37 @@ test('native answer repair and its next reviewers can cite the primary record th
  assert.deepEqual(result.rounds[1].answers.action.refs,[primary.reference]);
  for(const slot of result.rounds[1].panel.slots)assert.equal(slot.vote.claims[0].proofs[0].quote,primary.text);
 });
+
+test('compact audit follows the source index and rematerializes the exact selected primary span',async t=>{
+ const {root,input}=await fixture(t);
+ const directory=join(root,'audit'),primary={reference:'result:4',role:'intermediate tool output',attemptId:4,
+  segments:['A'.repeat(120000),'probe output\nmismatches=1280\n'],text:'A'.repeat(120000)+'probe output\nmismatches=1280\n'};
+ const selector={reference:primary.reference,segment:2,startLine:2,endLine:2};
+ let filename;
+ const provider=await scriptedReview(t,root,(body)=>{
+  const tools=body.messages.filter(m=>m.role==='tool');
+  if(!tools.length)return {name:'read',args:{path:'input.json'}};
+  if(tools.length===1){
+   const content=typeof tools[0].content==='string'?tools[0].content:tools[0].content.map(c=>c.text).join('');
+   const exposed=JSON.parse(content);
+   assert.deepEqual(exposed.objections[0].citedSelectors,[selector]);
+   const row=exposed.additionalSources.find(row=>row.reference===primary.reference);
+   assert.equal(row.role,primary.role);assert.equal(row.attemptId,4);filename=row.files[1];
+   return {name:'read',args:{path:filename}};
+  }
+  if(tools.length===2){
+   const content=JSON.stringify(tools[1].content);
+   assert.match(content,/mismatches=1280/);
+   return {name:'submit_review',args:{result:{audits:[{claimId:'claim',disposition:'verified',reason:'Intermediate output reports 1280 mismatches.'}],
+    claims:[{path:'audits.0.reason',kind:'observation',proofs:[selector]}]}}};
+  }
+  return null;
+ });
+ const result=await nativeQaPanelAudit({...input,directory,config:{actor:provider.profile},answers:{},
+  objections:[{id:'claim',kind:'draft',path:'changes.0.text',problem:'Execution role was misattributed.',mentions:[{proofs:[{...selector,quote:'mismatches=1280'}]}]}],
+  panelRevisionSources:[primary],validate:v=>v});
+ const proof=result.value.claims[0].proofs[0];
+ assert.equal(proof.quote,'mismatches=1280');assert.equal(proof.segment,2);
+ assert.equal(await readFile(join(directory,filename),'utf8'),primary.segments[1]);
+ assert((await readFile(join(directory,'input.json'))).length<10000);
+});
