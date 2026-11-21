@@ -30,7 +30,10 @@ test('parallel repeated trials freeze one winner and independently confirm both 
  const calls=f.calls.filter(([kind])=>kind==='trial').map(([,input])=>input);
  assert.equal(calls.length,45);assert.equal(new Set(calls.map(c=>c.directory)).size,45);
  assert.equal(calls.filter(c=>c.phase==='screen').length,5);assert.equal(calls.filter(c=>c.phase==='development').length,20);assert.equal(calls.filter(c=>c.phase==='confirmation').length,20);
- assert.deepEqual(calls.filter(c=>c.phase==='development').slice(0,4).map(c=>c.arm),['baseline',...rows.map(r=>r.id)]);
+ for(let repetition=0;repetition<5;repetition++){
+  const arms=calls.filter(c=>c.phase==='development'&&c.repetition===repetition).map(c=>c.arm).sort();
+  assert.deepEqual(arms,['baseline',...rows.map(r=>r.id)]);
+ }
  for(const [kind,input]of f.calls){if(kind==='design'||input.phase!=='confirmation'){const encoded=JSON.stringify(input);assert(!encoded.includes('PRIVATE-A'));assert(!encoded.includes('PRIVATE-B'));}}
  for(const [,input]of f.calls.filter(([kind])=>kind==='trial'))assert.deepEqual(input.identities,f.manifest.identities);
  const count=f.calls.length,replayed=await runFailurePilot(f.options,{...f.ops,trial:()=>{throw Error('Must not replay');},design:()=>{throw Error('Must not redraft');}});

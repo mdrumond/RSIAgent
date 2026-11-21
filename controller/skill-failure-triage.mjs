@@ -5,6 +5,8 @@ function observedBoundary(row,type){
  const data=row.data??{};
  if(['device-lease-blocked','execution-unresolved','preactor-infrastructure'].includes(type))
   return {kind:'infrastructure',reference:row.reference};
+ if(['rejected','attempt-error'].includes(type)&&data.actorStatus?.kind==='provider-error')
+  return {kind:'provider',reference:row.reference};
  if(type==='project-invalid'&&data.reason==='target-baseline-failed'&&data.passed===false&&executed(data.exitCode))
   return {kind:'invalid-baseline',reference:row.reference};
  if(type!=='verification')return null;
@@ -28,9 +30,9 @@ export function routeFailureClassification(value,group){
  const scoped=all.some(boundary=>direct.has(boundary.reference))?all.filter(boundary=>direct.has(boundary.reference)):all;
  const boundaries=scoped.filter(boundary=>value.evidenceRefs.includes(boundary.reference));
  const find=kind=>boundaries.find(boundary=>boundary.kind===kind);
- const infrastructure=find('infrastructure'),invalid=find('invalid-baseline');
+ const provider=find('provider'),infrastructure=find('infrastructure')??provider,invalid=find('invalid-baseline');
  const candidate=find('candidate-verdict'),exit=find('verifier-exit'),performance=find('performance');
- const attributed={harness:infrastructure,specification:invalid};
+ const attributed={harness:find('infrastructure'),provider,specification:invalid};
  if(value.cause!=='unknown'&&!attributed[value.cause])
   throw Error('Ownership '+value.cause+' needs a cited runtime boundary that establishes it. A failed command or verifier exit does not locate the fault. Use cause=unknown if that boundary is absent. Available runtime boundaries: '+JSON.stringify(scoped));
  if(value.bucket==='harness'&&!infrastructure)

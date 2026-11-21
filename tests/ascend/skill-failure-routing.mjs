@@ -129,3 +129,15 @@ test('optimization ranks verified speed gains on related successes and keeps the
  assert.equal(measured.evidence.groups[0].occurrences[0].projectId,'faster');
  assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
 });
+
+test('a native provider failure stays in human review even when the actor reports a correctness hypothesis',async t=>{
+ const f=await fixture(t),attempt=f.start('provider-stop');
+ f.state.event(attempt,'actor-blocker-reported',{categoryHypothesis:'correctness'});
+ f.state.event(attempt,'rejected',{actorStatus:{kind:'provider-error',report:'submitted'}});
+ f.backlog.ingest();
+ const {items:[item]}=await f.analyze(({groups:[group],validate})=>validate(classification(group,{bucket:'correctness',cause:'provider'})));
+ assert.equal(item.objective,'harness');
+ assert.equal(item.status,'user-required');
+ assert.equal(item.preparation.classifications[item.groupIds[0]].triage.observed.kind,'provider');
+ assert.equal(f.backlog.claim({base:'base',workflow:'failure-first-v1'}),null);
+});
