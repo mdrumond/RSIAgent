@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {nativeQaAnswer,nativeQaReview,reviewSession,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
-import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
+import {nativeQaAnswer,nativeQaReview,nativeQaPanelAudit,reviewSession,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
+import {runProposalQa,qaTopics,qaIdentity} from '../../cli/skill-review-qa.mjs';
 import {scriptedReview} from './helpers/scripted-review.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'qa-native-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -256,4 +256,41 @@ test('failure-first native QA repairs an answer in fresh sessions and keeps the 
  const second=JSON.parse(await readFile(join(answerDirectories[1],'termination.json'),'utf8'));
  assert.equal(second.rejectedSubmissions,1);
  assert.equal(provider.requests(),9);
+});
+
+test('five isolated native reviewers decide from frozen answers and a primary-source audit',async t=>{
+ const {root,input,proof,answer,review}=await artifactQaFixture(t);
+ const extra={reference:'check:execution',text:'The mismatching output belongs to the intermediate edit.'};
+ const issue={path:'changes.0.text',kind:'draft',problem:'The mismatch belongs to the starter'};
+ let issued=0,objections;
+ const stages=new Set();
+ const provider=await scriptedReview(t,root,body=>{
+  if(body.messages.some(m=>m.role==='tool'))return null;
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  let result;
+  if(schema.properties.audits){
+   result={audits:[{claimId:objections[0].id,disposition:'disproved',reason:extra.text}],claims:[{path:'audits.0.reason',kind:'observation',proofs:[{reference:extra.reference,startLine:1,endLine:1}]}]};
+  }else{
+   result=review(proof);
+   if(++issued===1){result.verdict='revise';result.issues=[issue];result.claims.push({path:'issues.0.problem',kind:'observation',proofs:[proof]});}
+  }
+  return {name:'submit_review',args:{result}};
+ });
+ const request={...input,config:{actor:provider.profile},evaluationContract:{workflow:'failure-first-v1'},qaPolicy:'panel',seconds:600,
+  panelAuditEvidence:[extra],projectSummaries:[],learningProofEvidence:[],validateProposal:value=>value};
+ request.frozenQa={inputIdentity:qaIdentity(request),draft:request.proposal,proposal:request.proposal,...answer(proof)};
+ const out=await runProposalQa(request,{
+  qaReview:async args=>{stages.add(args.directory);return nativeQaReview(args);},
+  qaPanelAudit:async args=>{objections=args.objections;return nativeQaPanelAudit(args);},
+ });
+ assert.equal(out.verdict,'approved',out.error?.message??out.reason);
+ const panel=out.rounds[0].panel;
+ assert.equal(panel.decision.approvals,4);assert.equal(stages.size,5);assert.equal(provider.requests(),12);
+ assert.equal(panel.decision.claims[0].audit.proofs[0].quote,extra.text);
+ for(const directory of stages){
+  const seen=JSON.parse(await readFile(join(directory,'input.json')));
+  assert.deepEqual(seen.answers,request.frozenQa.answers);assert.equal(seen.primaryAuditEvidence,undefined);
+  assert.equal(seen.objections,undefined);
+ }
+ await assert.rejects(runProposalQa({...request,frozenQa:{...request.frozenQa,answers:{}}},{}),/changed on resume/);
 });

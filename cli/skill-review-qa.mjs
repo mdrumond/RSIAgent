@@ -4,12 +4,13 @@ import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {join} from 'node:path';
 import {prepareQaSources,summaryProtocol,validateSummary,summaryItems} from './skill-evidence-summary.mjs';
 import {frozenEvidencePacket,scopedQaGroups} from './skill-review-evidence.mjs';
+import {reopenMissingVotes,runPanelRound} from './skill-qa-panel-run.mjs';
 import {projectSummaries,learningProofEvidence} from './project-summary.mjs';
 const reservedThrough=state=>Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0,...Object.values(state.inFlightOperations??{}).map(op=>op.reservedThrough??0));
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export const qaTopics=['action','mechanism','example','evidence','objective'];
 export const qaFindingKinds=['answer','draft','evidence','advisory'];
-const qaLanes=['answer','review'];
+const panelBudgets={answer:300,review:600,audit:120};
 const phaseSeconds=300;
 const findings=value=>(value.issues??[]).filter(issue=>issue?.kind!=='advisory');
 function validateQaFindings(value){
@@ -48,8 +49,8 @@ export async function runProposalQa(input,ops){
  const concurrency=input.qaConcurrency??input.config?.skill_qa_concurrency??1;
  if(!Number.isSafeInteger(concurrency)||concurrency<1)throw Error('QA concurrency must be a positive integer');
  const requestedPolicy=input.qaPolicy,failureFirst=input.evaluationContract?.workflow==='failure-first-v1';
- if(requestedPolicy!==undefined&&!['shared','split'].includes(requestedPolicy))throw Error('Unknown QA policy: '+requestedPolicy);
- if(requestedPolicy==='split'&&!failureFirst)throw Error('Split QA requires a failure-first evaluation contract');
+ if(requestedPolicy!==undefined&&!['shared','split','panel'].includes(requestedPolicy))throw Error('Unknown QA policy: '+requestedPolicy);
+ if(['split','panel'].includes(requestedPolicy)&&!failureFirst)throw Error('Split QA requires a failure-first evaluation contract');
  const entered=(ops.now??Date.now)(),summarized=typeof ops.qaSummarize==='function'&&typeof ops.qaAuditSummary==='function';
  input={...input,projectSummaries:input.projectSummaries??await projectSummaries(input.config,input.groups),learningProofEvidence:input.learningProofEvidence??await learningProofEvidence(input.learning,input.learningEvidence)};
  const projectFactsIdentity=digest(input.projectSummaries),catalogue=summarized?await prepareQaSources(input):null,proofProtocol=summarized?summaryProtocol:'claim-proofs-v1';
@@ -62,11 +63,21 @@ export async function runProposalQa(input,ops){
  if(state&&state.inputIdentity!==identity)throw Error('QA input changed; use a new proposal QA directory');
  if(state?.qaPolicy&&requestedPolicy&&state.qaPolicy!==requestedPolicy)throw Error('Retained QA policy changed');
  const policy=state?.qaPolicy??(state?'shared':requestedPolicy??(failureFirst?'split':'shared'));
- const split=policy==='split';
- state??={format:2,qaPolicy:policy,proofProtocol,projectFactsIdentity,...(summarized?{sourceIdentity:catalogue.identity}:{}),protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:split?2*phaseSeconds:phaseSeconds,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
+ const panel=policy==='panel',split=policy!=='shared',qaLanes=panel?Object.keys(panelBudgets):['answer','review'];
+ const panelConcurrency=input.qaPanelConcurrency??5;
+ if(panel&&(!Number.isSafeInteger(panelConcurrency)||panelConcurrency<1||panelConcurrency>5))throw Error('Panel concurrency must be between one and five');
+ if(panel&&state&&state.panelAuditEvidenceIdentity!==digest(input.panelAuditEvidence??[]))throw Error('Panel audit sources changed on resume');
+ if(input.frozenQa){
+  if(!panel||input.frozenQa.inputIdentity!==identity||digest(input.frozenQa.draft)!==digest(input.proposal))throw Error('Frozen answers belong to a different draft or QA input');
+  if(state&&state.frozenQaIdentity!==digest(input.frozenQa))throw Error('Frozen QA inputs changed on resume');
+ }
+ if(state?.frozenQaIdentity&&!input.frozenQa)throw Error('Resume requires the original frozen QA inputs');
+ state??={format:2,qaPolicy:policy,proofProtocol,projectFactsIdentity,...(summarized?{sourceIdentity:catalogue.identity}:{}),protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:panel?1020:split?2*phaseSeconds:phaseSeconds,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
  if(state&&(state.proofProtocol!==proofProtocol||state.projectFactsIdentity!==projectFactsIdentity||summarized&&state.sourceIdentity!==catalogue.identity)){const upgrade={verdict:state.verdict??null,rounds:state.rounds??[],projectFactsIdentity:state.projectFactsIdentity??null,summary:state.summary??null,sourceIdentity:state.sourceIdentity??null};state={...state,proofUpgrade:upgrade,proofUpgrades:[...(state.proofUpgrades??[]),upgrade],rounds:[],summary:undefined,draft:state.proposal??state.draft??input.proposal};for(const key of ['verdict','approval','proposal','reason','reasonKind','retryable','error'])delete state[key];}
  state.qaPolicy=policy;input={...input,qaPolicy:policy};
- if(split)state.phaseSeconds??={answer:phaseSeconds,review:phaseSeconds};
+ if(split)state.phaseSeconds??=panel?{...panelBudgets}:{answer:phaseSeconds,review:phaseSeconds};
+ if(panel)state.panelAuditEvidenceIdentity=digest(input.panelAuditEvidence??[]);
+ if(input.frozenQa)state.frozenQaIdentity=digest(input.frozenQa);
  state.proofProtocol=proofProtocol;state.projectFactsIdentity=projectFactsIdentity;if(summarized)state.sourceIdentity=catalogue.identity;
  // Reserve a bounded slice before provider work. A hard loss charges that slice,
  // never paused wall time; graceful completion releases the unused reservation.
@@ -82,6 +93,7 @@ export async function runProposalQa(input,ops){
  let writes=Promise.resolve();
  const persist=()=>{state.elapsedSeconds=elapsed();if(split)state.phaseElapsed=Object.fromEntries(qaLanes.map(lane=>[lane,phaseElapsed(lane)]));const snapshot=JSON.stringify(state,null,2)+'\n';writes=writes.then(async()=>{const tmp=file+'.tmp';await writeFile(tmp,snapshot);await rename(tmp,file);});return writes;};
  const remaining=lane=>Math.max(0,Math.min(state.seconds-elapsed(),split&&lane?state.phaseSeconds[lane]-phaseElapsed(lane):Infinity));
+ if(panel&&input.retryMissingPanelVotes&&state.verdict==='inconclusive'&&remaining('review')>0&&reopenMissingVotes(state.rounds.at(-1)))state.retryable=true;
  if(state.verdict&&!state.retryable)return state;
  if(state.retryable){delete state.verdict;delete state.reason;delete state.error;delete state.reasonKind;delete state.retryable;}
  const stop=new AbortController(),signal=AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])]),waiting=[];
@@ -95,12 +107,12 @@ export async function runProposalQa(input,ops){
   });
   await Promise.allSettled(workers);if(failed)throw failed;signal.throwIfAborted();
  };
- const call=async(name,payload,key)=>{
-  await acquire();let heartbeat,started;
-  const lane=name==='qaReview'?'review':'answer',phase=phaseClocks[lane];
+ const call=async(name,payload,key,independent=false)=>{
+  if(!independent)await acquire();let heartbeat,started;
+  const lane=name==='qaReview'?'review':name==='qaPanelAudit'?'audit':'answer',phase=phaseClocks[lane];
   try{
    signal.throwIfAborted();if(remaining(lane)<=0)throw new DOMException('QA '+lane+' elapsed allocation exhausted','TimeoutError');
-   const seconds=Math.min(remaining(lane),input.seconds??phaseSeconds),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),bounded=AbortSignal.any([signal,deadline]);
+   const seconds=Math.min(remaining(lane),input.seconds??(panel?state.phaseSeconds[lane]:phaseSeconds)),deadline=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),bounded=AbortSignal.any([signal,deadline]);
    if(split){started=now();if(!phase.active)phase.started=started;phase.active++;}
    const directory=join(input.directory,'sessions',state.protocol,identity,state.proofProtocol,projectFactsIdentity,...(summarized?[catalogue.identity]:[]),key);await mkdir(directory,{recursive:true});
    const reserve=()=>{(state.inFlightOperations??={})[key]={stage:name,reservedThrough:Math.min(state.seconds,elapsed()+5),...(split?{lane,reservedPhaseThrough:Math.min(state.phaseSeconds[lane],phaseElapsed(lane)+5)}:{})};return persist();};
@@ -112,12 +124,12 @@ export async function runProposalQa(input,ops){
     if(deadline.aborted||(now()-started)/1000>seconds)throw new DOMException('QA '+lane+' elapsed allocation exhausted','TimeoutError');
    }
    return result;
-  }catch(error){failedLane??=lane;stop.abort(error);throw error;}
+  }catch(error){if(!independent){failedLane??=lane;stop.abort(error);}throw error;}
   finally{
    clearInterval(heartbeat);
    if(started!==undefined){const spent=phaseElapsed(lane);phase.active--;if(!phase.active)phase.spent=spent;}
    if(state.inFlightOperations){delete state.inFlightOperations[key];if(!Object.keys(state.inFlightOperations).length)delete state.inFlightOperations;}
-   try{await persist();}finally{release();}
+   try{await persist();}finally{if(!independent)release();}
   }
  };
 
@@ -172,12 +184,18 @@ export async function runProposalQa(input,ops){
      if(value.changes||value.reason!==undefined){const revised=input.validateProposal({...proposal,...(value.reason!==undefined?{reason:value.reason}:{}),changes:value.changes??proposal.changes,...(value.memoryRefs?{memoryRefs:value.memoryRefs}:{})});return {...value,changes:revised.changes};}
      return value;
     };
-    const result=validate(await call('qaAnswer',{proposal,previousReview:state.rounds[index-1]?.review,answerCorrection:round.answerCorrection,validate},`${index}-qaAnswer`));
+    const frozen=index===0&&input.frozenQa;
+    if(frozen){
+     proposal=input.validateProposal(frozen.proposal);
+     if(!Array.isArray(frozen.claims)||!frozen.claims.length)throw Error('Frozen answers need their accepted proof claims');
+    }
+    const result=frozen?validate({answers:frozen.answers,claims:frozen.claims}):validate(await call('qaAnswer',{proposal,previousReview:state.rounds[index-1]?.review,answerCorrection:round.answerCorrection,validate},`${index}-qaAnswer`));
     if(result.changes||result.reason!==undefined)proposal=input.validateProposal({...proposal,...(result.reason!==undefined?{reason:result.reason}:{}),changes:result.changes??proposal.changes,...(result.memoryRefs?{memoryRefs:result.memoryRefs}:{})});
     round.proposal=proposal;round.answers=result.answers;if(result.claims)round.claims=result.claims;await persist();
    }
    if(!round.review){const validate=value=>{validateQaVerdict(value);if(split)validateQaFindings(value);validateSummaryTargets(value,input.evidenceSummary?.items??[]);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
-    round.review=validate(await call('qaReview',{proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate},`${index}-qaReview`));await persist();}
+    const payload={proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate};
+    round.review=panel?await runPanelRound({round,payload,index,call,persist,now,signal,concurrency:panelConcurrency}):validate(await call('qaReview',payload,`${index}-qaReview`));await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){
     const blocking=findings(round.review),answerOnly=split&&blocking.length>0&&blocking.every(issue=>issue?.kind==='answer');
@@ -193,12 +211,13 @@ export async function runProposalQa(input,ops){
      state.answerCorrectionUsed=true;
      state.rounds.push({proposal,answerCorrection:{findings:blocking,previousAnswers:round.answers,previousClaims:round.claims??[]}});
     }else{
-     if(input.allowWriterRevision){state.verdict='inconclusive';state.reason=round.review.reason;state.revisionFeedback=round.review.reason;break;}
+     if(panel||input.allowWriterRevision){state.verdict='inconclusive';state.reason=round.review.reason;if(input.allowWriterRevision)state.revisionFeedback=panel?JSON.stringify({reason:round.review.reason,issues:blocking}):round.review.reason;break;}
      state.rounds.push({proposal});
     }
     await persist();continue;
    }
    state.verdict=round.review.verdict;state.reason=round.review.reason;
+   if(panel&&state.verdict==='inconclusive'&&(round.panel.auditError||round.review.missingSlots.length>=3))state.reasonKind='infrastructure';
    state.proposal=round.proposal;state.learningRequests=round.review.learningRequests??[];
    if(state.verdict==='approved'){
     if(summarized)for(const key of ['pages','audits'])state.summary[key]=Object.fromEntries(Object.entries(state.summary[key]).sort(([a],[b])=>a.localeCompare(b)));

@@ -265,3 +265,49 @@ test('split QA discards a successful response returned after the parent stopped'
  });
  assert.equal(resumed.verdict,'approved');
 });
+
+test('panel interruption retains submitted votes and resumes only unfinished slots',async t=>{
+ const input={...await fixture(t),qaPolicy:'panel',evaluationContract:{workflow:'failure-first-v1'},projectSummaries:[],learningProofEvidence:[]};
+ const controller=new AbortController(),paths=[];
+ let active=0,peak=0;
+ const vote={verdict:'approved',reason:'Bounded by observed evidence'};
+ const call=async({directory,signal})=>{
+  paths.push(directory);peak=Math.max(peak,++active);
+  try{
+   if(directory.endsWith('-0')||directory.endsWith('-1'))return vote;
+   await new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));
+  }finally{active--;}
+ };
+ const job=runProposalQa({...input,signal:controller.signal},{qaAnswer:async()=>answers(),qaReview:call});
+ let saved;
+ for(let i=0;i<300;i++){
+  try{saved=JSON.parse(await readFile(join(input.directory,'qa.json')));}catch{}
+  if(saved?.rounds[0]?.panel?.slots.filter(row=>row?.status==='submitted').length===2&&paths.length===5)break;
+  await new Promise(resolve=>setTimeout(resolve,10));
+ }
+ controller.abort(Error('Pause'));
+ await assert.rejects(job,/Pause/);assert.equal(paths.length,5);assert(peak>=3);
+ const reran=[];
+ const out=await runProposalQa(input,{qaReview:async({directory})=>{reran.push(directory);return vote;}});
+ assert.equal(out.verdict,'approved');assert.equal(reran.length,3);
+ assert(!reran.some(path=>path.endsWith('-0')||path.endsWith('-1')));
+});
+
+test('lower concurrency retries unresolved provider votes while preserving submitted verdicts and time',async t=>{
+ const input={...await fixture(t),qaPolicy:'panel',evaluationContract:{workflow:'failure-first-v1'}};
+ const approved={verdict:'approved',reason:'Supported by execution'};
+ let clock=0;
+ const first=await runProposalQa(input,{now:()=>clock,qaAnswer:async()=>answers(),qaReview:async({directory})=>{
+  clock+=5000;
+  if(directory.endsWith('-0')||directory.endsWith('-1'))return approved;
+  throw Object.assign(Error('Provider unavailable'),{reviewSession:{kind:'provider-error'}});
+ }});
+ assert.equal(first.reasonKind,'infrastructure');assert.equal(first.rounds[0].panel.decision.approvals,2);
+ const saved=first.rounds[0].panel.slots.slice(0,2);
+ let calls=0,active=0;
+ const out=await runProposalQa({...input,qaPanelConcurrency:1,retryMissingPanelVotes:true},{now:()=>clock,qaReview:async({seconds})=>{
+  assert.equal(++active,1);assert(seconds<600);await new Promise(r=>setImmediate(r));active--;calls++;return approved;
+ }});
+ assert.equal(calls,3);assert.equal(out.verdict,'approved');
+ assert.deepEqual(out.rounds[0].panel.slots.slice(0,2),saved);assert.equal(out.rounds[0].panel.history[0].decision.approvals,2);
+});
