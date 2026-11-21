@@ -11,7 +11,7 @@ import {readConfig} from '../../cli/instance.mjs';
 import {publishSkillVersion} from '../../cli/skills.mjs';
 import {runFailurePilot,validatePilotTrial} from '../../cli/skill-failure-pilot.mjs';
 import {qaTopics} from '../../cli/skill-review-qa.mjs';
-import {createFailureDesign,publishFailureWinner} from '../../cli/skill-failure-candidates.mjs';
+import {createFailureDesign,publishFailureWinner,verifyPanelApproval} from '../../cli/skill-failure-candidates.mjs';
 import {reviewSession} from '../../cli/skill-review-native.mjs';
 import {validateClaimedResult} from '../../cli/claim-proofs.mjs';
 import {scriptedReview} from './helpers/scripted-review.mjs';
@@ -302,6 +302,29 @@ test('focused writing requires one exact failure and room for two additional pas
  assert.equal(f.calls.length,0);
  const rows=await design(makeInput([result(true),result(false),other,other,other]));
  assert.equal(rows.length,3);
+});
+
+test('a single focused panel design writes only the approved candidate and replays all votes for scoring',async t=>{
+ const f=await fixture(t);
+ const design=createFailureDesign({config:f.config,item:f.item},f.deps);
+ const input={...f.input,mode:'focused-correctness',qaPolicy:'panel',reviewCandidate:'principle-b'};
+ const candidates=await design(input);
+ assert.deepEqual(candidates.map(candidate=>candidate.id),['principle-b']);
+ assert.equal(f.calls.length,1);
+ const record=JSON.parse(await readFile(join(input.directory,'principle-b/qa/qa.json'),'utf8'));
+ const candidate=candidates[0];
+ assert.equal(record.rounds.at(-1).panel.decision.approvals,5);
+ verifyPanelApproval(record,candidate.proposal);
+ const changed=structuredClone(record);
+ for(const slot of changed.rounds.at(-1).panel.slots.slice(0,3))slot.status='missing';
+ assert.throws(()=>verifyPanelApproval(changed,candidate.proposal),/votes do not approve/);
+ assert.throws(()=>verifyPanelApproval(record,{...candidate.proposal,reason:'different draft'}),/different proposal/);
+ assert.deepEqual(await design(input),candidates);
+ assert.equal(f.calls.length,1);
+ await assert.rejects(design({...input,reviewCandidate:'principle-a'}),/evidence changed/);
+ await writeFile(join(input.directory,'principle-b/qa/qa.json'),JSON.stringify(changed));
+ await assert.rejects(design(input),/votes do not approve/);
+ assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
 
 test('focused review returns concrete feedback for one fresh writing attempt',async t=>{

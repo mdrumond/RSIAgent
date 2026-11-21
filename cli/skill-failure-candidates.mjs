@@ -10,8 +10,9 @@ import {applyProposal,writeVersion} from '../controller/skill-evolution.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {claimEvidence} from './project-summary.mjs';
 import {frozenEvidencePacket} from './skill-review-evidence.mjs';
-import {reviewSession,nativeQaAnswer,nativeQaReview} from './skill-review-native.mjs';
+import {reviewSession,nativeQaAnswer,nativeQaReview,nativeQaPanelAudit} from './skill-review-native.mjs';
 import {qaIdentity,runProposalQa} from './skill-review-qa.mjs';
+import {replayPanelDecision} from './skill-qa-panel-run.mjs';
 import {validateReviewProposal} from './skill-review.mjs';
 import {publishSkillVersion} from './skills.mjs';
 import {readConfig} from './instance.mjs';
@@ -55,6 +56,17 @@ async function checkVersion(config,candidate){
  assert.equal(effective.text,candidate.text,'Candidate guidance changed after review');assert.equal(effective.sha256,candidate.skillSha256,'Candidate source changed after review');
  assert.equal(textHash(candidate.text),candidate.textSha256,'Candidate text identity mismatch');return candidate;
 }
+/** Reconstruct the panel vote before opening device trials for its exact proposal. */
+export function verifyPanelApproval(qa,proposal){
+ assert.equal(qa?.qaPolicy,'panel','Expected panel QA');
+ assert.equal(qa.verdict,'approved','Panel QA must approve the candidate');
+ const round=qa.rounds?.at(-1);
+ assert.deepEqual(round?.proposal,proposal,'Panel reviewed a different proposal');
+ const decision=replayPanelDecision(round.panel);
+ assert.equal(decision.verdict,'approved','Retained panel votes do not approve the candidate');
+ assert.deepEqual(round.panel.decision,decision,'Retained panel decision changed');
+}
+
 async function writerCall(directory,seconds,signal,fn,now){
  signal?.throwIfAborted();
  const file=join(directory,'writer-spend.json'),prior=await load(file)??{seconds:180,elapsedSeconds:0};
@@ -74,7 +86,7 @@ async function writerCall(directory,seconds,signal,fn,now){
 
 /** Called only after five clean baseline attempts establish the reproduced struggle. */
 export function createFailureDesign({config,item,knowledgeConfig=config},dependencies={}){
- const ops={session:reviewSession,qa:runProposalQa,qaAnswer:nativeQaAnswer,qaReview:nativeQaReview,now:Date.now,...dependencies};
+ const ops={session:reviewSession,qa:runProposalQa,qaAnswer:nativeQaAnswer,qaReview:nativeQaReview,qaPanelAudit:nativeQaPanelAudit,now:Date.now,...dependencies};
  return async input=>{
   assert(Number.isFinite(input.remainingSeconds)&&input.remainingSeconds>0,'Positive remaining experiment elapsed allowance required');
   assert.equal(item.objective,'correctness','Failure-first instruction design currently supports correctness only');
@@ -86,9 +98,25 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const manifest=await load(join(input.directory,'..','..','manifest.json')),identities=input.identities??manifest?.identities;assert(identities&&['model','runtime','memory'].every(key=>identities[key]!==undefined),'Frozen model, runtime and memory identities required');
   const baseline=await skillInput(join(config.root,'skills','versions',base)),identity=designIdentity({base,baseline:baseline.sha256,family:input.family,results:input.baselineResults,identities,item});
   assert.equal(input.baseline??manifest?.baseline,baseline.text,'Tested baseline guidance differs from the active skill');
-  const inputFile=join(input.directory,'design-input.json'),priorInput=await load(inputFile);if(priorInput)assert.equal(priorInput.identity,identity,'Instruction evidence changed');else await save(inputFile,{identity});
+  const perspectives=['robust decisions','diagnostic reasoning','implementation complexity'];
+  const panel=input.qaPolicy==='panel';
+  if(panel)assert(focused&&['principle-a','principle-b','principle-c'].includes(input.reviewCandidate),'Select one focused candidate for panel review');
+  else assert(!input.reviewCandidate&&!input.frozenQa,'Frozen candidate review requires the panel policy');
+  const designInput={identity,...(panel?{qaPolicy:'panel',reviewCandidate:input.reviewCandidate,frozenQaSha256:input.frozenQa?hash(input.frozenQa):null,
+   revisionFeedback:input.revisionFeedback??null}:{})};
+  const inputFile=join(input.directory,'design-input.json'),priorInput=await load(inputFile);
+  if(priorInput)assert.deepEqual(priorInput,designInput,'Instruction evidence changed');else await save(inputFile,designInput);
   const registry=join(input.directory,'approved-design.json'),cached=await load(registry),dispositionFile=join(input.directory,'design-disposition.json'),disposition=await load(dispositionFile);
-  if(cached){assert.equal(cached.identity,identity,'Instruction evidence changed');return Promise.all(cached.candidates.map(candidate=>checkVersion(config,candidate)));}
+  async function restoreCandidate(candidate){
+   if(panel){
+    assert.equal(candidate.id,input.reviewCandidate,'Retained candidate differs from panel selection');
+    const qa=await load(join(input.directory,candidate.id,'qa','qa.json'));
+    verifyPanelApproval(qa,candidate.proposal);
+    assert.equal(qa.approval,candidate.qa.approval,'Retained candidate panel approval changed');
+   }
+   return checkVersion(config,candidate);
+  }
+  if(cached){assert.equal(cached.identity,identity,'Instruction evidence changed');return Promise.all(cached.candidates.map(restoreCandidate));}
   if(disposition){assert.equal(disposition.identity,identity,'Instruction evidence changed');const {identity:_,...result}=disposition;return result;}
   const entries=await guidanceEntries(config.root,base);
   const {groups,development,proofRecords,evaluationContract}=designEvidence(item,input.family.development,input.baselineResults,focused?input.qualification:undefined);
@@ -98,11 +126,17 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const primaryRecords=claimEvidence({packet:await frozenEvidencePacket(groups)});
   const writerProofRecords=[...primaryRecords,...proofRecords];
   const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
-  const pending=['robust decisions','diagnostic reasoning','implementation complexity'].map(async(perspective,index)=>{try{
-   const id='principle-'+String.fromCharCode(97+index),directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
-   const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return await checkVersion(config,retained.candidate);}
+  const pending=perspectives.flatMap((perspective,index)=>{
+   const id='principle-'+String.fromCharCode(97+index);
+   if(panel&&id!==input.reviewCandidate)return [];
+   return [runCandidate(id,perspective)];
+  });
+  async function runCandidate(id,perspective){try{
+   const directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
+   const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return await restoreCandidate(retained.candidate);}
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
+   if(input.frozenQa)assert(written,'Frozen panel replay requires its retained writer result');
    if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
      prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,entries},validate}),ops.now);
     if(outcome.providerTimeout)return {id,providerTimeout:outcome.providerTimeout};
@@ -114,12 +148,14 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const proposal={action:'update',reason:'Instruction grounded in reproduced baseline failures',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:changeId,scope:written.value.scope,text:written.value.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
    const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
    const qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
-    allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return response?.value??response;}});
+    ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
    if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
-   assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal),updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
-   const candidate={id,instruction:reviewed.changes[0].text,scope:reviewed.changes[0].scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal:reviewed,qa:{verdict:qa.verdict,approval:qa.approval},evidence:written.value.claims.flatMap(claim=>claim.proofs)};
+   assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal);
+   if(panel)verifyPanelApproval(qa,reviewed);
+   const updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
+   const candidate={id,instruction:reviewed.changes[0].text,scope:reviewed.changes[0].scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal:reviewed,qa:{verdict:qa.verdict,approval:qa.approval,...(panel?{policy:'panel'}:{})},evidence:written.value.claims.flatMap(claim=>claim.proofs)};
    await save(candidateFile,{identity,candidate});return candidate;
-  }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}});
+  }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}}
   const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');if(infrastructureCause)throw infrastructureCause;
   const writers=settled.flatMap(row=>row.status==='fulfilled'&&row.value.providerTimeout?[{id:row.value.id,kind:row.value.providerTimeout}]:[]);
   if(writers.length){
@@ -127,7 +163,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    await save(dispositionFile,{identity,...result});return result;
   }
   if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
-  assert(new Set(candidates.map(candidate=>candidate.instruction)).size===3,'Three distinct instruction candidates required');await save(registry,{identity,candidates});return candidates;
+  assert(new Set(candidates.map(candidate=>candidate.instruction)).size===(panel?1:perspectives.length),'Distinct instruction candidates required for all selected perspectives');await save(registry,{identity,candidates});return candidates;
  };
 }
 
@@ -201,6 +237,7 @@ async function requireFocusedApproval({config,item,base,family,screen,qualificat
  const initial=await load(join(qaDirectory,'qa.json'));
  const qa=initial?.format===2?initial:await load(join(qaDirectory,'qa-v2.json'));
  assert(qa?.format===2&&qa.verdict==='approved'&&qa.proofProtocol==='claim-proofs-v1'&&!qa.retryable&&!qa.inFlight&&!Object.keys(qa.inFlightOperations??{}).length,'Terminal focused QA approval required');
+ if(qa.qaPolicy==='panel'||winner.qa.policy==='panel')verifyPanelApproval(qa,winner.proposal);
  assert.deepEqual(qa.proposal,winner.proposal,'QA approved proposal changed');
  assert.equal(qa.rounds?.at(-1)?.review?.verdict,'approved','Final QA review must approve the candidate');
  assert.deepEqual(qa.rounds.at(-1).proposal,winner.proposal,'Final QA review approved a different proposal');
