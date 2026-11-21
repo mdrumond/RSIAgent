@@ -1,0 +1,89 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {decideQaPanel, panelClaims} from '../../cli/skill-qa-panel-decision.mjs';
+import {materializeProof} from '../../cli/claim-proofs.mjs';
+
+const source = {reference: 'trial:4', text: 'Intermediate edit: 1280 wrong.\nFinal score: pass.'};
+const proof = materializeProof({reference: source.reference, startLine: 1, endLine: 1}, [source]);
+const approved = {verdict: 'approved', reason: 'The evidence supports the instruction.'};
+const draft = {kind: 'draft', path: 'changes.0.text', problem: 'The scored starter had 1280 wrong.'};
+const answer = {kind: 'answer', path: 'answers.action.text', problem: 'The answer treats static analysis as a device measurement.'};
+const evidence = {kind: 'evidence', problem: 'The final score is missing.'};
+const revise = (...issues) => ({
+ verdict: 'revise', reason: 'Concrete defects need correction.', issues,
+ claims: issues.map((issue, index) => ({path: 'issues.' + index + '.problem', proofs: [proof]})),
+});
+const audit = (claim, disposition, reason = 'The output is from the intermediate edit.') => ({
+ claimId: claim.id, disposition, reason, proofs: [proof],
+});
+
+test('a disproved minority objection does not veto three explicit approvals', () => {
+ const votes = [approved, approved, approved, revise(draft), null];
+ const [claim] = panelClaims(votes);
+ assert.equal(claim.mentions[0].slot, 4);
+ assert.deepEqual(claim.mentions[0].proofs, [proof]);
+ const decision = decideQaPanel(votes, [audit(claim, 'disproved')]);
+ assert.equal(decision.verdict, 'approved');
+ assert.equal(decision.approvals, 3);
+ assert.deepEqual(decision.missingSlots, [5]);
+});
+
+test('audit each distinct claim on a shared target and keep every duplicate mention', () => {
+ const other = {...draft, problem: 'The hash identifies the tree.'};
+ const votes = [approved, approved, approved, revise(draft, other), revise(draft)];
+ const claims = panelClaims(votes);
+ assert.equal(claims.length, 2);
+ assert.deepEqual(claims[0].mentions.map(mention => mention.slot), [4, 5]);
+ const decision = decideQaPanel(votes, [audit(claims[0], 'disproved'), audit(claims[1], 'verified', 'The artifact binds only the kernel.')]);
+ assert.equal(decision.route, 'writer');
+ assert.equal(decision.issues.length, 1);
+ assert.match(decision.reason, /The artifact binds only the kernel[.]/);
+});
+
+test('a verified minority objection sends consolidated evidence to the appropriate author', () => {
+ for (const [issues, route] of [[[answer], 'answer'], [[answer, draft], 'writer'], [[draft, evidence], 'evidence']]) {
+  const votes = [approved, approved, approved, approved, revise(...issues)];
+  const decision = decideQaPanel(votes, panelClaims(votes).map(claim => audit(claim, 'verified')));
+  assert.equal(decision.verdict, 'revise');
+  assert.equal(decision.route, route);
+  assert.deepEqual(decision.issues.map(issue => issue.kind), issues.map(issue => issue.kind));
+ }
+});
+
+test('unresolved, conflicting, absent, and unmaterialized audit evidence keeps the decision inconclusive', () => {
+ const votes = [approved, approved, approved, approved, revise(draft)];
+ const [claim] = panelClaims(votes);
+ const verified = audit(claim, 'verified');
+ for (const audits of [[], [audit(claim, 'unresolved')], [verified, audit(claim, 'disproved')], [{...verified, proofs: [{reference: source.reference}]}]]) {
+  const decision = decideQaPanel(votes, audits);
+  assert.equal(decision.verdict, 'inconclusive');
+  assert.equal(decision.claims[0].audit.disposition, 'unresolved');
+ }
+});
+
+test('missing slots and invalid approvals never reduce the majority threshold', () => {
+ const votes = [approved, approved, {...approved, issues: [draft]}, null, null];
+ const decision = decideQaPanel(votes);
+ assert.equal(decision.approvals, 2);
+ assert.deepEqual(decision.missingSlots, [3, 4, 5]);
+ assert.equal(decision.verdict, 'inconclusive');
+ assert.throws(() => decideQaPanel([approved, approved]));
+});
+
+test('even disproving every objection does not turn a revision vote into an explicit approval', () => {
+ const votes = [approved, approved, revise(draft), revise(draft), revise(draft)];
+ const [claim] = panelClaims(votes);
+ assert.equal(decideQaPanel(votes, [audit(claim, 'disproved')]).verdict, 'inconclusive');
+});
+
+test('retain advisory notes and surface missing evidence expressed in a verdict reason', () => {
+ const advisory = {kind: 'advisory', problem: 'A shorter example may help.'};
+ const abstention = {verdict: 'inconclusive', reason: 'No final score exists.', claims: [{path: 'reason', proofs: [proof]}]};
+ const votes = [{...approved, issues: [advisory]}, approved, approved, approved, abstention];
+ const [claim] = panelClaims(votes);
+ assert.equal(claim.kind, 'evidence');
+ assert.deepEqual(claim.mentions[0].proofs, [proof]);
+ const decision = decideQaPanel(votes, [audit(claim, 'disproved')]);
+ assert.equal(decision.verdict, 'approved');
+ assert.deepEqual(decision.advisories[0].issue, advisory);
+});
