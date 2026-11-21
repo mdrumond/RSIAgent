@@ -1,4 +1,5 @@
 /** Protected replay families, derived from observed campaign failures before instruction writing. */
+import {setTimeout as delay} from 'node:timers/promises';
 import {readFile,writeFile,mkdir,realpath,stat,rename,readdir} from 'node:fs/promises';
 import {dirname,resolve,join,relative,isAbsolute} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -221,14 +222,16 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
  if(prior?.running)throw Error('Interrupted isolation elapsed custody is unknown');
  const elapsed=prior?.elapsedSeconds??0;
  const saveIsolation=dependencies.saveIsolation??save;
- const observations=prior?.referenceChecks??{};
+ const observations=prior?.referenceChecks??{},completedChecks=prior?.completedReferenceChecks??{};
+ let recovery=prior?.recovery??{contexts:0};
+ let lastChecked=prior?.lastChecked??null;
  const now=dependencies.now??(()=>performance.now()),begun=now(),allocation=Math.min(seconds,failureTiming.isolationSeconds-elapsed);
  const left=()=>allocation-(now()-begun)/1000;
  const isolationTimeout=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),bounded=signal?AbortSignal.any([signal,isolationTimeout]):isolationTimeout;
  const timings={focusedQuestion:0,verification:0,piTurnWait:0,piResponse:0,piRetry:0,...prior?.timings};
  let focus=new AbortController(),focusedSignal=AbortSignal.any([bounded,focus.signal]);
  let question=prior?.question??{number:1,kind:'isolate-failure',elapsedSeconds:timings.focusedQuestion};
- let ledger={identity,elapsedSeconds:elapsed,timings,question,referenceChecks:observations,running:true},focusStarted,focusTimer,verificationStarted;
+ let ledger={identity,elapsedSeconds:elapsed,timings,question,referenceChecks:observations,completedReferenceChecks:completedChecks,recovery,lastChecked,running:true},focusStarted,focusTimer,verificationStarted;
  const focusDelta=()=>focusStarted===undefined?0:(now()-focusStarted)/1000;
  const focusedElapsed=()=>timings.focusedQuestion+focusDelta();
  const questionElapsed=()=>question.elapsedSeconds+focusDelta();
@@ -244,6 +247,8 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
   ledger.elapsedSeconds=elapsed+(now()-begun)/1000;
   ledger.timings={...timings,focusedQuestion:focusedElapsed(),verification:verificationElapsed(),handoff:Math.max(0,ledger.elapsedSeconds-focusedElapsed()-verificationElapsed())};
   ledger.question={...question,elapsedSeconds:questionElapsed()};
+  ledger.recovery=recovery;
+  ledger.lastChecked=lastChecked;
   await saveIsolation(stateFile,ledger);
  };
  await saveIsolation(stateFile,ledger);
@@ -273,9 +278,14 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
      :question.kind==='finish-draft'
       ? 'What is the next missing piece needed to check the retained draft against the observed failure? Inspect the current files and focus on that piece.'
       :'What mechanism from this retained failure can be verified by replaying it?';
-    result=await session({directory:join(directory,'research'),config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.map(source=>source.path)],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
+    const research=join(directory,recovery.contexts?'research-recovery-'+recovery.contexts:'research');
+    const authorRecovery=recovery.contexts?{
+     task:'Continue the current question from the saved draft and trusted checker feedback. Prior dialogue is unavailable.',
+     trustedChecker:lastChecked?{reason:lastChecked.reason,diagnostics:observations[lastChecked.reference]??[]}:null
+    }:null;
+    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.map(source=>source.path)],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
    onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
-   prompt:{target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:'Write the Python files incrementally using native write/edit under draftDirectory; submit only the typed family manifest and claims, never inline file contents. Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. If you cannot establish the family, submit needs-evidence with the closest blocker: retained-source, failure-mechanism, passing-reference, missing-semantics, or unreliable-oracle. Select verificationReference from sourceInventory and cite its original failed verification or primary diagnostic in reason. Explain what the recorded check actually showed and what remains unknown. A compiler error disappearing, compilation succeeding, or one local pass does not establish full correctness. Never blame a component without execution evidence identifying the first failing boundary. With an oracle or semantics gap, provide one nextQuestion that a small Phase 1 exercise with staged PyTorch outputs could resolve. For other gaps, include nextQuestion only if a specific probe could distinguish plausible explanations. When the draft files and manifest are complete, submit ready to run host syntax checks and replay the unchanged development starter on the target before testing the references. Preserve the original verifier’s input placement and invocation, or justify changes with evidence. Use the exact phase and type emitted by the checker for the reproduced failure. You do not need to execute a checker yourself. A failed check is returned in the submit_review tool result so you can edit the draft and resubmit within the same session. If continuing a draft, inspect draftDirectory for reusable files. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family whose file references are relative to draftDirectory: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; enforce a 90-second elapsed deadline per case. Final JSON is one line containing correct and evidence.caseResults. The trusted guard supplies the candidate hash. evidence.caseResults contains exactly one {id,correct:boolean} for every frozen case; overall correct is true only when all cases pass. checkedCases lists actual execution coverage only, including failed cases; unverified cases must not be marked successful. Include evidence.phase and type for failures. Public and private checkers are separate. The trusted runtime will qualify all controls on the configured target; no claim of execution from code alone.'+(focusedCalibration?' For every A5 task supply controls.calibration with a distinct implementation expected to pass the frozen cases without the target failing construct. Do not copy a reference, negative, or starter into the calibration control. The trusted runtime will verify these outcomes.':''),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
+   prompt:{...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:'Write the Python files incrementally using native write/edit under draftDirectory; submit only the typed family manifest and claims, never inline file contents. Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. If you cannot establish the family, submit needs-evidence with the closest blocker: retained-source, failure-mechanism, passing-reference, missing-semantics, or unreliable-oracle. Select verificationReference from sourceInventory and cite its original failed verification or primary diagnostic in reason. Explain what the recorded check actually showed and what remains unknown. A compiler error disappearing, compilation succeeding, or one local pass does not establish full correctness. Never blame a component without execution evidence identifying the first failing boundary. With an oracle or semantics gap, provide one nextQuestion that a small Phase 1 exercise with staged PyTorch outputs could resolve. For other gaps, include nextQuestion only if a specific probe could distinguish plausible explanations. When the draft files and manifest are complete, submit ready to run host syntax checks and replay the unchanged development starter on the target before testing the references. Preserve the original verifier’s input placement and invocation, or justify changes with evidence. Use the exact phase and type emitted by the checker for the reproduced failure. You do not need to execute a checker yourself. A failed check is returned in the submit_review tool result so you can edit the draft and resubmit within the same session. If continuing a draft, inspect draftDirectory for reusable files. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family whose file references are relative to draftDirectory: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; enforce a 90-second elapsed deadline per case. Final JSON is one line containing correct and evidence.caseResults. The trusted guard supplies the candidate hash. evidence.caseResults contains exactly one {id,correct:boolean} for every frozen case; overall correct is true only when all cases pass. checkedCases lists actual execution coverage only, including failed cases; unverified cases must not be marked successful. Include evidence.phase and type for failures. Public and private checkers are separate. The trusted runtime will qualify all controls on the configured target; no claim of execution from code alone.'+(focusedCalibration?' For every A5 task supply controls.calibration with a distinct implementation expected to pass the frozen cases without the target failing construct. Do not copy a reference, negative, or starter into the calibration control. The trusted runtime will verify these outcomes.':''),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
     if(value.status==='needs-evidence'){disposition=await validateDisposition(value);return value;}
     if(!value.family||value.files)throw Error('Submit a typed family manifest referencing draftDirectory files, without inline file contents');
@@ -295,29 +305,50 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
       }
      }
     }
-    await checkPythonSyntax({config,family,manifest:value.family,directory,signal:bounded});
+    let retained=completedChecks[family.identity];
+    if(!retained)await checkPythonSyntax({config,family,manifest:value.family,directory,signal:bounded});
     if(checkReferences){
      checkFocus();
      const remaining=left();if(remaining<=0)throw failureStageElapsed('isolate');
-     stopFocus();verificationStarted=now();
-     try{
-      const verified=await checkReferences({family,directory,seconds:remaining,signal:bounded});
-      if(verified?.diagnostics)observations[family.provenance.reference]=verified.diagnostics;
-     }
-     catch(error){
-      if(error.code==='FAILURE_REFERENCE_REJECTED'){
-       rejection=error;
-       if(error.diagnostics)observations[family.provenance.reference]=error.diagnostics;
+     if(!retained){
+      stopFocus();verificationStarted=now();
+      try{
+       const verified=await checkReferences({family,directory,seconds:remaining,signal:bounded});
+       retained={diagnostics:verified?.diagnostics??[]};
+      }catch(error){
+       if(error.code!=='FAILURE_REFERENCE_REJECTED')throw Error('Family reference checks failed: '+error.message,{cause:error});
+       retained={reason:error.message,diagnostics:error.diagnostics??[]};
+      }finally{
+       timings.verification=verificationElapsed();
+       verificationStarted=undefined;
+       if(!bounded.aborted)startFocus();
       }
-      throw Error('Family reference checks failed: '+error.message,{cause:error});
+      completedChecks[family.identity]=retained;
      }
-     finally{timings.verification=verificationElapsed();verificationStarted=undefined;if(!bounded.aborted)startFocus();}
+     lastChecked={reference:family.provenance.reference,reason:retained.reason??null};
+     observations[lastChecked.reference]=retained.diagnostics;
+     pending=pending.then(checkpoint);await pending;
+     if(retained.reason!==undefined){
+      rejection=Object.assign(Error(retained.reason),{code:'FAILURE_REFERENCE_REJECTED',diagnostics:retained.diagnostics});
+      throw Error('Family reference checks failed: '+rejection.message,{cause:rejection});
+     }
     }
     bounded.throwIfAborted();return value;
     }});
     checkFocus();
    }catch(error){
     result=undefined;
+    if(error.reviewSession?.retryableTimeout===true){
+     if(bounded.aborted||focus.signal.aborted||left()<=0)throw error;
+     // The question clock keeps running during recovery backoff. Another
+     // session gets the same question, along with saved files and evidence.
+     const backoff=Math.min(30,2**Math.min(recovery.contexts,5))*1000;
+     await (dependencies.retryDelay??delay)(backoff,undefined,{signal:focusedSignal});
+     checkFocus();
+     recovery={contexts:recovery.contexts+1};
+     pending=pending.then(checkpoint);await pending;
+     continue;
+    }
     if(bounded.aborted||left()<=0||!(focus.signal.aborted||['no-submit','rejected-submissions'].includes(error.reviewSession?.kind)))throw error;
     const fingerprint=await draftFingerprint(draft);
     if(fingerprint===question.draftFingerprint)throw error;

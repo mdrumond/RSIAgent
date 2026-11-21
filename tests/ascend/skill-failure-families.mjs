@@ -15,6 +15,8 @@ import {SkillBacklog} from '../../controller/skill-backlog.mjs';
 import {stages} from '../../controller/workflow.mjs';
 import {analyzeBacklog} from '../../cli/skill-backlog-analysis.mjs';
 import {loadFailureFamily,failureWitness,failureSourceInventory,prepareFailureFamily} from '../../cli/skill-failure-families.mjs';
+import {scriptedReview} from './helpers/scripted-review.mjs';
+import {timeoutReviewStream} from './helpers/review-timeout.mjs';
 const sha=s=>createHash('sha256').update(s).digest('hex');
 const missingFamily=(reference,overrides={})=>({status:'needs-evidence',missing:'passing-reference',reason:'Reference unavailable',
  verificationReference:reference,claims:[{path:'reason',kind:'hypothesis',proofs:[{reference,startLine:1,endLine:1}]}],...overrides});
@@ -350,4 +352,77 @@ test('new A5 authoring requires calibration for every task and reloads a retaine
  }});
  assert.equal(checks,1);
  assert.equal(result.status,'ready');
+});
+
+test('exhausted native retries reopen the same question with the draft and settled checker feedback',async t=>{
+ const f=await fixture(t),directory=join(f.root,'native-recovery'),draft=join(directory,'draft');
+ const diagnostics=[{variant:'starter',correct:false,mechanismMatch:false,type:'wrong-output'}];
+ const submission={status:'ready',reason:'Observed numerical mismatch',family:f.family,claims:missingFamily(f.reference).claims};
+ await submitDraft(value=>value,draft,{...submission,files:f.files});
+
+ const provider=await scriptedReview(t,f.root,(_body,n)=>{
+  if(n===2)return {name:'write',args:{path:join(draft,'dev/private.py'),content:'print("corrected checker")\n'}};
+  if(n===4)return null;
+  return {name:'submit_review',args:{result:submission}};
+ });
+ const sessions=[],checks=[],backoffs=[];
+ let now=0,providerFaults=0;
+ const output=await prepareFailureFamily({...f,directory,checkReferences:async({family})=>{
+  checks.push(family.identity);now+=4000;
+  if(checks.length===1)throw Object.assign(Error('Starter returned the wrong output'),{code:'FAILURE_REFERENCE_REJECTED',diagnostics});
+  return {diagnostics:[]};
+ }},{
+  now:()=>now,
+  retryDelay:async(ms,_,{signal})=>{assert.equal(signal.aborted,false);backoffs.push(ms);now+=ms;},
+  session:async options=>{
+   const first=sessions.length===0;
+   sessions.push({directory:options.directory,question:options.prompt.focusedQuestion,recovery:options.prompt.recovery,seconds:options.seconds});
+   now+=10000;
+   const {config}=options;
+   return reviewSession({...options,config:{...config,actor:provider.profile},proofRequired:false,knowledge:false},{
+    retrySettings:{maxRetries:1,baseDelayMs:10},
+    wrapStream:stream=>timeoutReviewStream(stream,()=>{
+     if(!first||provider.requests()===0)return false;
+     providerFaults++;return true;
+    })
+   });
+  }
+ });
+ assert.equal(output.status,'ready');
+ assert.equal(providerFaults,2);
+ assert.equal(provider.requests(),5);
+ assert.deepEqual(backoffs,[1000]);
+ assert.equal(checks.length,2,'unchanged rejected submission must not rerun an already settled checker');
+ assert.notEqual(checks[0],checks[1]);
+ assert.notEqual(sessions[0].directory,sessions[1].directory);
+ assert.deepEqual(sessions[0].question,sessions[1].question);
+ assert.equal(sessions[0].seconds-sessions[1].seconds,15);
+ assert.deepEqual(sessions[1].recovery.trustedChecker,{reason:'Starter returned the wrong output',diagnostics});
+ assert.equal(await readFile(join(draft,'dev/private.py'),'utf8'),'print("corrected checker")\n');
+ const settled=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
+ assert.equal(settled.question.elapsedSeconds,21);
+ assert.equal(settled.timings.verification,8);
+ assert.equal(settled.elapsedSeconds,29);
+ const terminated=JSON.parse(await readFile(join(sessions[0].directory,'termination.json'),'utf8'));
+ assert.equal(terminated.retryableTimeout,true);
+ assert.equal(terminated.nativeRetries,1);
+});
+
+test('retry backoff cannot renew an exhausted question even with new draft files',async t=>{
+ const f=await fixture(t),directory=join(f.root,'recovery-expiry');let now=0,sessions=0;
+ const terminal=Object.assign(Error('Provider timed out'),{reviewSession:{kind:'provider-error',retryableTimeout:true}});
+ const output=await prepareFailureFamily({...f,directory},{
+  now:()=>now,retryDelay:async ms=>{now+=ms;},
+  session:async({writableDirectory})=>{
+   sessions++;
+   await writeFile(join(writableDirectory,'partial.py'),'pass');
+   now+=179500;
+   throw terminal;
+  }
+ });
+ assert.equal(output.status,'expired');
+ assert.equal(output.stage,'focused-question');
+ assert.equal(output.question.number,1);
+ assert.equal(output.question.elapsedSeconds,180.5);
+ assert.equal(sessions,1);
 });

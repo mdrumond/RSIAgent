@@ -79,7 +79,7 @@ export async function reviewWritePathAllowed(path,directory){
  if(!directory)return false;const root=await realpath(directory);let cursor=resolve(path);
  while(true){try{const actual=await realpath(cursor);return actual!==root&&actual.startsWith(root+'/')||actual===root&&cursor!==resolve(path);}catch(error){if(error.code!=='ENOENT')throw error;const parent=dirname(cursor);if(parent===cursor)return false;cursor=parent;}}
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming},{wrapStream,retrySettings}={}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
@@ -163,13 +163,15 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
    finally{submitting=false;}
   }});};
  const sessionFile=join(directory,'native-session.json');let retained;try{retained=compatible?JSON.parse(await readFile(sessionFile,'utf8')):undefined;}catch(e){if(e.code!=='ENOENT')throw e;}
- const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
+ const settingsManager=sdk.SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:true,...retrySettings}}),manager=retained?sdk.SessionManager.open(retained.path,directory):sdk.SessionManager.create(directory,directory);
  await writeFile(sessionFile,JSON.stringify({path:manager.getSessionFile()}));
  const loader=new sdk.DefaultResourceLoader({cwd:directory,agentDir,settingsManager,noExtensions:true,noSkills:true,noContextFiles:true,
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
- let turnStarted,responseStarted,retryStarted;
+ if(wrapStream)session.agent.streamFunction=wrapStream(session.agent.streamFunction);
+ let turnStarted,responseStarted,retryStarted,latestProviderError,retryError;
+ let providerErrors=0,nativeRetries=0;
  const recordWait=()=>{
   if(turnStarted!==undefined){onModelTiming('piTurnWait',(performance.now()-turnStarted)/1000);turnStarted=undefined;}
  };
@@ -177,6 +179,12 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
    const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
   }
+  if(event.type==='message_end'&&event.message.role==='assistant'){
+   latestProviderError=event.message.stopReason==='error'?event.message.errorMessage??'Unknown provider error':undefined;
+   if(latestProviderError)providerErrors++;
+   if(event.message.stopReason!=='aborted')retryError=undefined;
+  }
+  if(event.type==='auto_retry_start'){nativeRetries++;retryError=event.errorMessage;}
   if(!onModelTiming)return;
   if(event.type==='turn_start')turnStarted=performance.now();
   if(event.type==='message_start'&&event.message.role==='assistant'){
@@ -193,8 +201,10 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
  const initialMessages=session.messages.length;
  const termination=async(kind,error)=>{
   await rejectionWrites;
-  const providerMessages=session.messages.slice(initialMessages).filter(m=>m.role==='assistant'&&m.stopReason==='error');
-  const detail={kind,rejectedSubmissions,providerErrors:providerMessages.length,...(lastRejection?{lastRejection}:{}),...(error||providerMessages.length?{cause:sanitize(providerMessages.at(-1)?.errorMessage??error?.message??error)}:{})};
+  const terminalError=latestProviderError??(kind==='elapsed'?retryError:undefined);
+  const retryableTimeout=(kind==='provider-error'||kind==='elapsed')&&/\b(?:timed[\s-]+out|timeout|ETIMEDOUT)\b/i.test(terminalError??'');
+  const detail={kind,rejectedSubmissions,providerErrors,nativeRetries,...(retryableTimeout?{retryableTimeout}:{}),
+   ...(lastRejection?{lastRejection}:{}),...(terminalError||error?{cause:sanitize(terminalError??error?.message??error)}:{})};
   await writeFile(join(directory,'termination.json'),JSON.stringify(detail,null,2));return detail;
  };
  let expired=false;const abort=()=>{void session.abort();},timer=setTimeout(()=>{expired=true;abort();},seconds*1000);signal?.addEventListener('abort',abort,{once:true});
@@ -204,16 +214,20 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
   if(continueFamilyDraft&&submitted===undefined){
    const responses=session.messages.slice(initialMessages).filter(m=>m.role==='assistant');
-   if(responses.at(-1)?.stopReason==='stop'&&!responses.some(m=>m.stopReason==='error')){
+   if(responses.at(-1)?.stopReason==='stop'){
     await session.prompt('Continue from the draft and evidence in this session. Call submit_review with status ready and the completed family manifest. If required evidence is genuinely unavailable, call submit_review with status needs-evidence and identify what is missing. Address any tool validation feedback before finishing.');
     await session.waitForIdle();signal?.throwIfAborted();if(expired)throw new DOMException('Review session elapsed allocation exhausted','TimeoutError');
    }
   }
-  if(submitted===undefined){const provider=session.messages.slice(initialMessages).some(m=>m.role==='assistant'&&m.stopReason==='error'),kind=provider?'provider-error':rejectedSubmissions?'rejected-submissions':'no-submit',detail=await termination(kind);
+  if(submitted===undefined){const kind=latestProviderError?'provider-error':rejectedSubmissions?'rejected-submissions':'no-submit',detail=await termination(kind);
    throw Object.assign(Error('Review session '+kind+(detail.cause?': '+detail.cause:detail.lastRejection?': '+detail.lastRejection:'')),{reviewSession:detail});}
   await termination('submitted');
   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
  }catch(error){
+  if(submitted!==undefined&&!signal?.aborted&&!expired){
+   await termination('submitted');
+   return {value:submitted,retrievals,stats:session.getSessionStats(),session:manager.getSessionFile()};
+  }
   if(!error.reviewSession){const elapsed=expired||signal?.reason?.name==='TimeoutError',detail=await termination(elapsed?'elapsed':signal?.aborted?'cancelled':'provider-error',error);
    if(!signal?.aborted||elapsed){const wrapped=Error('Review session '+detail.kind+': '+detail.cause);wrapped.name=elapsed?'TimeoutError':error.name;wrapped.reviewSession=detail;throw wrapped;}
   }

@@ -7,6 +7,7 @@ import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {Type} from 'typebox';
 import {reviewSession,nativeQaReview} from '../../cli/skill-review-native.mjs';
+import {timeoutReviewStream} from './helpers/review-timeout.mjs';
 import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
 const claim=path=>({path,kind:'observation',proofs:[{reference:'raw',startLine:1,endLine:1}]});
 const valid=()=>({reason:'Observed failure',claims:[claim('reason')]});
@@ -124,4 +125,35 @@ test('family draft continuation uses the original elapsed timer',async t=>{
  const f=await fixture(t,n=>n===1?{}:undefined);
  await assert.rejects(reviewSession({...f,continueFamilyDraft:true,seconds:0.40}),error=>error.reviewSession?.kind==='elapsed');
  assert.equal(f.bodies.length,2);
+});
+
+test('Pi retries a provider timeout and does not mistake a later no-submit for a timeout',async t=>{
+ const f=await fixture(t,()=>({}));let injected=0;
+ await assert.rejects(reviewSession(f,{
+  wrapStream:stream=>timeoutReviewStream(stream,()=>++injected===1),retrySettings:{maxRetries:1,baseDelayMs:10}
+ }),error=>{
+  assert.equal(error.reviewSession.kind,'no-submit');
+  assert.equal(error.reviewSession.retryableTimeout,undefined);
+  assert.equal(error.reviewSession.nativeRetries,1);
+  assert.equal(error.reviewSession.providerErrors,1);
+  return true;
+ });
+ assert.equal(f.bodies.length,1);
+});
+
+test('Pi retains a validated submission when the following request exhausts native retries',async t=>{
+ const f=await fixture(t,n=>{assert.equal(n,1);return {result:valid()};});
+ let validations=0,requests=0;
+ const input={...f,validate:value=>{validations++;return value;}};
+ const out=await reviewSession(input,{
+  wrapStream:stream=>timeoutReviewStream(stream,()=>++requests>1),retrySettings:{maxRetries:1,baseDelayMs:10}
+ });
+ assert.equal(out.value.reason,valid().reason);
+ assert.equal(validations,1);
+ assert.equal(requests,3);
+ assert.equal(f.bodies.length,1);
+ const terminal=JSON.parse(await readFile(join(f.directory,'termination.json'),'utf8'));
+ assert.equal(terminal.kind,'submitted');
+ assert.equal(terminal.providerErrors,2);
+ assert.equal(terminal.nativeRetries,1);
 });
