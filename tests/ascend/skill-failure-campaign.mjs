@@ -98,6 +98,16 @@ test('resuming retains the original allocation, elapsed isolation time and devic
  const outcome=await runCampaignFailureStep(f.config,f.values,{...f.ops,now:()=>now,family:async()=>({status:'needs-evidence',reason:'Unavailable retained source'})});
  assert.equal(outcome.reason,'needs-evidence');const saved=f.backlog.run(run.id);assert.equal(saved.seconds,7200);assert.equal(saved.elapsed,1000);assert.equal(saved.checkpoint.startedAt,checkpoint.startedAt);assert.deepEqual(saved.checkpoint.slots,slots);
 });
+test('a resumed stage cannot spend more than the retained remaining parent clock',async t=>{
+ const f=await fixture(t),now=Date.now(),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ f.backlog.checkpoint(run.id,{elapsed:7150,checkpoint:{workflow:'failure-first-v1',startedAt:now-1000,directory:join(f.root,'retained-study'),slots}});
+ const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,now:()=>now,family:async({seconds})=>{
+  assert.equal(seconds,50);
+  return {status:'expired',stage:'isolate',reason:'Isolation elapsed allowance exhausted'};
+ },runtime:()=>assert.fail('A spent isolation cannot start qualification')});
+ assert.equal(result.status,'inconclusive');assert.equal(result.reason,'stage-elapsed');assert.equal(result.stage,'isolate');
+ assert.equal(f.backlog.run(run.id).elapsed,7150);
+});
 test('resuming never silently changes a frozen baseline or mutates its queue revision',async t=>{
  const f=await fixture(t),run=f.backlog.claim({base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
  const before=f.backlog.get(f.item.id);await assert.rejects(runCampaignFailureStep({...f.config,skills:{...f.config.skills,activeVersion:'other'}},f.values,f.ops),/Frozen experiment baseline changed/);

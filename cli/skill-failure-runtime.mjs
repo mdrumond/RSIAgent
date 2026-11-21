@@ -8,7 +8,8 @@ import {skillProfile} from '../controller/skill-context.mjs';
 import {ownerStopped} from '../controller/lifecycle.mjs';
 import {DatabaseSync} from 'node:sqlite';
 import {homedir} from 'node:os';
-export const failureProtocol=Object.freeze({actorSeconds:180,verificationSeconds:300,checkerSeconds:180,cleanupSeconds:90});
+import {failureStageElapsed,failureTiming} from './skill-failure-protocol.mjs';
+export const failureProtocol=Object.freeze({actorSeconds:failureTiming.actorSeconds,verificationSeconds:failureTiming.verificationSeconds,checkerSeconds:180,cleanupSeconds:90});
 const hash=x=>createHash('sha256').update(typeof x==='string'?x:JSON.stringify(x)).digest('hex');
 const read=async p=>{try{return JSON.parse(await readFile(p,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;return null;}};
 const save=async(p,x)=>{await mkdir(dirname(p),{recursive:true});const tmp=p+'.'+randomUUID();await writeFile(tmp,JSON.stringify(x,null,2),{mode:0o600});await rename(tmp,p);};
@@ -173,11 +174,21 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   const bytes={files:task.files,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8'),helpers:task.checkerFiles??{},cases:task.caseIds,controls:task.controls};
   const file=join(directory,'tasks',hash([familyId,task.id])+'.json'),frozen={sha256:hash(bytes)},old=await read(file);if(old)assert.deepEqual(old,frozen,'Frozen task changed');else await save(file,frozen);return {...frozen,...bytes};
  };
- const verify=async(root,slot,task,entries,seconds,work,familyId)=>{
-  assert(Number.isFinite(seconds)&&seconds>0,'Positive verification allowance required');const timeout=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),bounded=work?AbortSignal.any([work,timeout]):timeout;bounded.throwIfAborted();
-  const frozen=await freeze(task,familyId),host=await target(root,slot,'private',hash([frozen.sha256,runtime]),bounded),checker=await failureChecker(task,runtime);
-  const rows=await host.qualifyBatch({directory:root,entries:entries.map((e,i)=>({...e,cwd:'candidate-'+i,checker,args:['.'],timeoutSeconds:195})),seconds,signal:bounded,sampleStopSignal:stopSignal});
-  assert(await closed(root),'Verification custody remains unresolved');bounded.throwIfAborted();return rows;
+ const verify=async(root,slot,task,entries,seconds,work,familyId,stage='verification')=>{
+  assert(Number.isFinite(seconds)&&seconds>0,'Positive verification allowance required');
+  const started=performance.now(),timeout=AbortSignal.timeout(Math.max(1,Math.ceil(seconds*1000))),bounded=work?AbortSignal.any([work,timeout]):timeout;
+  try{
+   bounded.throwIfAborted();
+   const frozen=await freeze(task,familyId),host=await target(root,slot,'private',hash([frozen.sha256,runtime]),bounded),checker=await failureChecker(task,runtime);
+   bounded.throwIfAborted();
+   const left=seconds-(performance.now()-started)/1000;
+   if(left<=0)throw failureStageElapsed(stage);
+   const rows=await host.qualifyBatch({directory:root,entries:entries.map((e,i)=>({...e,cwd:'candidate-'+i,checker,args:['.'],timeoutSeconds:195})),seconds:left,signal:bounded,sampleStopSignal:stopSignal});
+   assert(await closed(root),'Verification custody remains unresolved');bounded.throwIfAborted();return rows;
+  }catch(error){
+   if(!work?.aborted&&(timeout.aborted||performance.now()-started>=seconds*1000)&&await closed(root))throw failureStageElapsed(stage);
+   throw error;
+  }
  };
  const identify=async({seconds=120,signal:work=signal}={})=>{
   work?.throwIfAborted();
@@ -194,13 +205,17 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   const slot=free.pop();assert(slot,'No reference slot');const roots=[],started=performance.now(),diagnostics=[];
   try{for(const [task,variant,files] of checks){
    input.signal?.throwIfAborted();signal?.throwIfAborted();const fingerprint=hash({family:input.family.id,task,variant,checker:await readFile(task.checker,'utf8'),publicChecker:await readFile(task.publicChecker,'utf8')}),root=join(input.directory,'references',fingerprint);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});
-   const left=input.seconds-(performance.now()-started)/1000;assert(left>0,'Reference elapsed allocation exhausted');let rows;
-   try{rows=await verify(root,slot,task,[{key:variant,files}],Math.min(300,left),input.signal,'reference-'+fingerprint);}
-   catch(error){await save(join(root,'reference.json'),{task:task.id,error:{message:error.message,code:error.code??null}});throw error;}
-   await save(join(root,'reference.json'),{task:task.id,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
+   const began=performance.now(),left=input.seconds-(began-started)/1000;
+   if(left<=0)throw failureStageElapsed('isolate');
+   const stage=variant==='starter'?'baseline-replay':'verification';
+   const allocatedSeconds=Math.min(variant==='starter'?failureTiming.baselineReplaySeconds:failureTiming.verificationSeconds,left);
+   const timing=()=>({stage,allocatedSeconds,elapsedSeconds:(performance.now()-began)/1000});let rows;
+   try{rows=await verify(root,slot,task,[{key:variant,files}],allocatedSeconds,input.signal,'reference-'+fingerprint,stage);}
+   catch(error){await save(join(root,'reference.json'),{task:task.id,timing:timing(),error:{message:error.message,code:error.code??null}});throw error;}
+   const measured=timing();await save(join(root,'reference.json'),{task:task.id,timing:measured,rows});assert.equal(rows.length,1,'Trusted reference row missing');const row=rows[0],value=failureReceipt(row,task),guard=value.evidence?.processGuard;
    const mechanismMatch=value.correct===false&&sameMechanism(value,input.family)&&value.evidence.caseResults.some(row=>!row.correct&&value.evidence.checkedCases?.includes(row.id));
    const completePass=value.correct===true&&task.caseIds.every(id=>value.evidence.checkedCases?.includes(id));
-   const diagnostic={task:task.id,variant,correct:value.correct===false?false:completePass?true:null,sourceSha256:value.kernelSha256,
+   const diagnostic={task:task.id,variant,timing:measured,correct:value.correct===false?false:completePass?true:null,sourceSha256:value.kernelSha256,
     mechanismMatch,phase:value.evidence?.phase,type:value.evidence?.type,checkedCases:value.evidence?.checkedCases,reason:value.reason??value.evidence?.reason??value.evidence?.message??null,error:[value.error,row.error].filter(Boolean).join('\n').slice(-2048),path:join(root,'reference.json')};diagnostics.push(diagnostic);await save(join(input.directory,'reference-results.json'),diagnostics);
    const passed=variant==='starter'?mechanismMatch:completePass;
    if(!passed){
@@ -221,7 +236,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    const root=join(input.directory,'controls',task.id);roots.push(root);await save(join(input.directory,'adapter.json'),{qualificationRoots:roots});const entries=[{key:'reference',files:task.controls.reference.files},...task.controls.negatives.map((n,i)=>({key:'negative-'+i,files:n.files}))];
    if(input.task){assert(task.controls.calibration?.files,'Focused task calibration is required');entries.push({key:'calibration',files:task.controls.calibration.files});}
    const left=input.remainingSeconds-(performance.now()-start)/1000;assert(left>0,'Qualification elapsed allocation exhausted');
-   const rows=await verify(root,slot,task,entries,Math.min(left,entries.length*300),input.signal,input.family.id);assert.equal(rows.length,entries.length,'Trusted control rows missing');
+   const rows=await verify(root,slot,task,entries,Math.min(left,failureTiming.verificationSeconds),input.signal,input.family.id);assert.equal(rows.length,entries.length,'Trusted control rows missing');
    for(const row of rows){
     const value=failureReceipt(row,task);if(typeof value.correct!=='boolean')throw Error(value.evidence?.reason??value.reason??'Control infrastructure failure');
     if(value.correct)assert(task.caseIds.every(id=>value.evidence.checkedCases?.includes(id)),'Reference receipt omits frozen cases');
@@ -233,7 +248,8 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   }finally{if((await Promise.all(roots.map(closed))).every(Boolean))free.push(slot);}
  };
  const trial=async input=>{
-  input.signal?.throwIfAborted();signal?.throwIfAborted();assert(Number.isFinite(input.actorSeconds??180)&&(input.actorSeconds??180)>0&&(input.actorSeconds??180)<=180&&Number.isFinite(input.verificationSeconds??300)&&(input.verificationSeconds??300)>0&&(input.verificationSeconds??300)<=300,'Trial grants exceed the frozen protocol');
+  const {actorSeconds=failureTiming.actorSeconds,verificationSeconds=failureTiming.verificationSeconds}=input;
+  input.signal?.throwIfAborted();signal?.throwIfAborted();assert(Number.isFinite(actorSeconds)&&actorSeconds>0&&actorSeconds<=failureTiming.actorSeconds&&Number.isFinite(verificationSeconds)&&verificationSeconds>0&&verificationSeconds<=failureTiming.verificationSeconds,'Trial grants exceed the frozen protocol');
   assert(config.target==='cpu'||runtime,'Identify target before trials');const slot=free.pop();assert(slot,'No admitted trial slot');
   const publicRoot=join(publicDirectory,randomUUID()),privateRoot=join(input.directory,'verification'),cwd=join(publicRoot,'micro',input.task.id,'0-trial','work'),sessionDirectory=dirname(cwd);let host;
   try{
@@ -241,7 +257,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    await mkdir(join(publicRoot,'micro','frozen'),{recursive:true});await writeFile(join(publicRoot,'micro','frozen',input.task.id+'.py'),frozen.publicChecker);
    await save(join(input.directory,'adapter.json'),{publicRoot,privateRoot,cwd});host=await target(publicRoot,slot,'public',frozen.sha256,input.signal);
    const profile=skillProfile(config.actor),hiddenPaths=[privateDirectory,publicDirectory,...hiddenDirectories,...(profile.credentials_file?[dirname(profile.credentials_file)]:[])];
-   const actor=await host.sample({cwd,sessionDirectory,profile,guidance:input.guidance,prompt:input.task.prompt+'\nUse native local file/Bash tools for edits and rsi_target for device commands. Public check: python3 public_verify.py .',actorBash:'local',seconds:input.actorSeconds??180,signal:input.signal,sampleSignal:input.signal,sampleStopSignal:stopSignal,knowledge,localFilesystemSandbox:{hiddenPaths}});
+   const actor=await host.sample({cwd,sessionDirectory,profile,guidance:input.guidance,prompt:input.task.prompt+'\nUse native local file/Bash tools for edits and rsi_target for device commands. Public check: python3 public_verify.py .',actorBash:'local',seconds:actorSeconds,signal:input.signal,sampleSignal:input.signal,sampleStopSignal:stopSignal,knowledge,localFilesystemSandbox:{hiddenPaths}});
    assert(await host.sampleSettled({cwd}),'Actor custody remains unresolved');
    if(actor.targetDispatched===false&&!actor.unresolvedExecution){
     const row=contexts.get(publicRoot);
@@ -253,13 +269,13 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
     return {infrastructure:true,correct:null,reason:'Native session failed: '+(actor.providerTimeout??actor.error)};
    const files={};async function gather(path,prefix=''){for(const entry of await readdir(path,{withFileTypes:true})){if(entry.name.startsWith('.')||['__pycache__','node_modules'].includes(entry.name))continue;const name=prefix+entry.name;if(entry.isDirectory())await gather(join(path,entry.name),name+'/');else if(entry.isFile()&&entry.name!=='public_verify.py'&&(Object.hasOwn(input.task.files,name)||/\.(py|c|cc|cpp|cxx|cce|h|hpp|inc|cmake|sh|json|md)$/.test(name)||['Makefile','CMakeLists.txt'].includes(name))){assert((await stat(join(path,entry.name))).size<=16*1048576,'Source artifact too large');files[name]=await readFile(join(path,entry.name),'utf8');}}}await gather(cwd);assert(files['kernel.py'],'Candidate kernel missing');
    const protectedNames=[...new Set([...Object.keys(input.task.protectedFiles??{}),...['CONTRACT.md','WORKLOAD.md','case.json','cases.json'].filter(n=>Object.hasOwn(input.task.files,n))])];const unchanged=protectedNames.every(name=>files[name]===input.task.files[name])&&(await readFile(join(cwd,'public_verify.py'),'utf8'))===frozen.publicChecker;
-   const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],input.verificationSeconds??300,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row,input.task);
+   const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],verificationSeconds,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row,input.task);
    await save(join(input.directory,'verification.json'),row);if(typeof value.correct!=='boolean')return {infrastructure:true,correct:null,reason:value.evidence?.reason??value.reason??'Verification unavailable'};
    const correct=value.correct&&unchanged,result={correct,mechanismMatch:!correct&&unchanged&&sameMechanism(value,{mechanism:input.task.mechanism??mechanisms[input.familyId]}),caseResults:value.evidence.caseResults.map(c=>({...c,correct:unchanged&&c.correct})),sourceSha256:hash(row.sourceFilesSha256),artifacts:[{path:join(input.directory,'verification.json')},...(actor.session?[{path:actor.session}]:[])],handles:[row.handle],actorTimedOut:actor.timedOut,failure:correct?null:unchanged?value.evidence:{phase:'protected-input',reason:'Protected actor input changed'}};
    if(value.correct)assert(input.task.caseIds.every(id=>value.evidence.checkedCases?.includes(id)),'Successful receipt omits frozen cases');
    if(input.mode==='focused-correctness'&&!unchanged)Object.assign(result,{correct:null,reason:'Protected actor input changed'});
    await save(join(input.directory,'source-manifest.json'),{files:row.sourceFilesSha256,cwd});await save(join(input.directory,'operation-result.json'),result);return result;
-  }catch(error){return {infrastructure:true,correct:null,reason:error.message,handle:error.handle??null};}
+  }catch(error){return {infrastructure:true,correct:null,reason:error.message,handle:error.handle??null,...(error.failureStage?{stage:error.failureStage}:{})};}
   finally{if(await closed(publicRoot)&&await closed(privateRoot))free.push(slot);}
  };
  const settle=async op=>{const adapter=await read(join(op.directory,'adapter.json'));if(!adapter)return {closed:false};if(!(await Promise.all((adapter.qualificationRoots??[adapter.publicRoot,adapter.privateRoot]).map(closed))).every(Boolean))return {closed:false};const result=await read(join(op.directory,'operation-result.json')),manifest=await read(join(op.directory,'source-manifest.json'));if(result&&manifest)for(const [name,sha]of Object.entries(manifest.files))assert.equal(hash(await readFile(inside(manifest.cwd,name),'utf8')),sha,'Recovered source changed');return {closed:true,...(result?{result}:{})};};

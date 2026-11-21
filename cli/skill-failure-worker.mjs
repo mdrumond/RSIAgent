@@ -11,6 +11,7 @@ import {deviceLeaseReceipt} from '../integrations/environments/device-leases.mjs
 import {readConfig,updateConfigImmediate} from './instance.mjs';
 import {withSkillLock} from './evolution-lock.mjs';
 import {failureFirstEnabled,runCampaignFailureStep,failureMemoryGeneration,failureCampaignSettled} from './skill-failure-campaign.mjs';
+import {failureTiming} from './skill-failure-protocol.mjs';
 
 const get=(state,key)=>JSON.parse(state.db.prepare('SELECT value FROM control WHERE key=?').get(key)?.value??'null');
 const put=(state,key,value)=>state.db.prepare('INSERT OR REPLACE INTO control(key,value) VALUES(?,?)').run(key,JSON.stringify(value));
@@ -18,7 +19,7 @@ export function failureProtocol(config){
  const requested=config.skills?.failureFirst;
  if(!requested?.enabled||!['a3','a5'].includes(config.target))throw Error('Explicit A3 or A5 failure-first configuration required');
  if(!/^[a-f0-9]{40}$/.test(requested.sourceRevision??''))throw Error('Pin the installed machinery source revision before A/B startup');
- const protocol={workflow:'failure-first-v1',actorSeconds:180,verificationSeconds:300,sampleSeconds:480,experimentSeconds:7200,concurrency:4,repetitions:5,candidates:3};
+ const protocol={workflow:'failure-first-v1',...failureTiming,sampleSeconds:failureTiming.actorSeconds+failureTiming.verificationSeconds,concurrency:4,repetitions:5,candidates:3};
  for(const [key,value]of Object.entries(protocol))if(requested[key]!==undefined&&requested[key]!==value)throw Error('Unsupported failure-first protocol field: '+key);
  if(requested.objectives&&JSON.stringify(requested.objectives)!==JSON.stringify(['correctness']))throw Error('Initial failure-first rollout supports correctness only');
  return protocol;
@@ -67,7 +68,7 @@ export async function runFailureCampaign(config,{signal,once=false}={},dependenc
     const next=failureMemoryGeneration(config,state);
     if(!memory||generation!==next){await memory?.close();memory=null;status('memory-readiness');memory=await ops.memory({config,directory:join(config.root,'skills','priority','failure-first-memory'),generation:next,signal:AbortSignal.any([active,AbortSignal.timeout(300000)])});generation=next;}
     status('running');result=await ops.step(config,{slots,memory,remainingSeconds:clock.remaining,signal:active});
-    status(result.status,{reason:result.reason});
+    status(result.status,{reason:result.reason,...(result.stage?{stage:result.stage}:{})});
     if(once)return result;
     if(result.status==='idle')await ops.wait(30000,undefined,{signal:active});
    }

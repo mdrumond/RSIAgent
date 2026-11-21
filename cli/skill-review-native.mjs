@@ -79,7 +79,7 @@ export async function reviewWritePathAllowed(path,directory){
  if(!directory)return false;const root=await realpath(directory);let cursor=resolve(path);
  while(true){try{const actual=await realpath(cursor);return actual!==root&&actual.startsWith(root+'/')||actual===root&&cursor!==resolve(path);}catch(error){if(error.code!=='ENOENT')throw error;const parent=dirname(cursor);if(parent===cursor)return false;cursor=parent;}}
 }
-export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false}){
+export async function reviewSession({directory,config,prompt,validate,signal,seconds,knowledge=false,evidenceGroups=[],allowedPaths=[],proofRequired=false,resultSchema,proofRecords,requiredReads=[],compactEvidence=false,selectorOnly=false,discoveryProofRecords,writableDirectory,continueFamilyDraft=false,onModelTiming}){
  const sdk=await import('@earendil-works/pi-coding-agent'),agentDir=join(directory,'agent');
  await mkdir(agentDir,{recursive:true});
  // Use the pinned Pi path resolver so policy and native filesystem tools agree.
@@ -168,9 +168,21 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   extensionFactories:[extension,...(bridge?[bridge.extension]:[])]});await loader.reload();
  const {session}=await sdk.createAgentSession({cwd:directory,agentDir,settingsManager,...await skillModelFromProfile(config.skill_writer_actor??config.actor,{directory}),thinkingLevel:'off',
   tools:['read','grep','find','ls',...(writableDirectory?['write','edit']:[]),'submit_review',...(knowledge?['mcp__kdb__search','mcp__kdb__read_entry']:[])],resourceLoader:loader,sessionManager:manager});
- const unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
-  const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
- }});
+ let responseStarted,retryStarted;
+ const unsubscribe=session.subscribe(event=>{
+  if(event.type==='tool_execution_end'&&event.toolName==='submit_review'&&event.isError){
+   const error=(event.result?.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');void recordRejection(event.toolCallId,error);
+  }
+  if(!onModelTiming)return;
+  if(event.type==='message_start'&&event.message.role==='assistant')responseStarted=performance.now();
+  if(event.type==='message_end'&&event.message.role==='assistant'&&responseStarted!==undefined){
+   onModelTiming('piResponse',(performance.now()-responseStarted)/1000);responseStarted=undefined;
+  }
+  if(event.type==='auto_retry_start')retryStarted=performance.now();
+  if(event.type==='auto_retry_end'&&retryStarted!==undefined){
+   onModelTiming('piRetry',(performance.now()-retryStarted)/1000);retryStarted=undefined;
+  }
+ });
  const initialMessages=session.messages.length;
  const termination=async(kind,error)=>{
   await rejectionWrites;
@@ -201,6 +213,8 @@ export async function reviewSession({directory,config,prompt,validate,signal,sec
   throw error;
  }finally{
   clearTimeout(timer);signal?.removeEventListener('abort',abort);unsubscribe();await rejectionWrites;
+  if(responseStarted!==undefined)onModelTiming('piResponse',(performance.now()-responseStarted)/1000);
+  if(retryStarted!==undefined)onModelTiming('piRetry',(performance.now()-retryStarted)/1000);
   try{await session.exportToJsonl(join(directory,'session.native.jsonl'));}finally{await session.extensionRunner?.emit({type:'session_shutdown',reason:'quit'});await session.dispose();}
  }
 }

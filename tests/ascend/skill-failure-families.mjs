@@ -153,6 +153,67 @@ test('isolation checkpoints elapsed work while native research is still running'
  assert.equal(observed.running,true);assert(observed.elapsedSeconds>=.9);assert.equal(result.running,false);assert(result.elapsedSeconds>=observed.elapsedSeconds);
 });
 
+test('trusted verification has its own elapsed time within isolation and leaves Pi question time available',async t=>{
+ const f=await fixture(t),directory=join(f.root,'split-stage-time');let now=0;
+ const output=await prepareFailureFamily({...f,directory,checkReferences:async({seconds,signal})=>{
+  assert(seconds<=1080);assert.equal(signal.aborted,false);
+  now+=240000;
+ }},{
+  now:()=>now,session:async({validate,writableDirectory,onModelTiming,signal})=>{
+   for(const [name,content] of Object.entries(f.files)){
+    await mkdir(join(writableDirectory,name,'..'),{recursive:true});
+    await writeFile(join(writableDirectory,name),content);
+   }
+   now+=120000;onModelTiming('piResponse',80);onModelTiming('piRetry',20);
+   const value=await validate({status:'ready',reason:'Verified starter and references',family:f.family});
+   assert.equal(signal.aborted,false);
+   now+=59000;
+   return {value};
+  }
+ });
+ assert.equal(output.status,'ready');
+ assert.equal(output.elapsedSeconds,419);
+ const saved=JSON.parse(await readFile(join(directory,'isolation.json'),'utf8'));
+ assert.deepEqual(saved.timings,{focusedQuestion:179,verification:240,piResponse:80,piRetry:20,handoff:0});
+});
+
+test('a resumed focused question retains its spent time and preserves partial draft on expiry',async t=>{
+ const f=await fixture(t),directory=join(f.root,'resumed-focused-question'),input={...f,directory};let now=0;
+ await mkdir(join(directory,'draft'),{recursive:true});await writeFile(join(directory,'draft','partial.py'),'pass');
+ const providerError=Error('Retryable provider disconnect');
+ await assert.rejects(prepareFailureFamily(input,{now:()=>now,session:async()=>{
+  now+=170000;
+  throw providerError;
+ }}),error=>error===providerError);
+ const expired=await prepareFailureFamily(input,{now:()=>now,session:async({writableDirectory})=>{
+  assert.equal(await readFile(join(writableDirectory,'partial.py'),'utf8'),'pass');
+  now+=11000;
+  return {value:{status:'needs-evidence',reason:'Late submission'}};
+ }});
+ assert.equal(expired.status,'expired');assert.equal(expired.stage,'focused-question');
+ assert.equal(expired.timings.focusedQuestion,181);assert.equal(expired.elapsedSeconds,181);
+ const retained=await prepareFailureFamily(input,{session:()=>assert.fail('A spent question cannot be granted a new allowance')});
+ assert.deepEqual(retained,expired);
+});
+
+test('a question making concrete draft progress can hand off to a distinct question within isolation',async t=>{
+ const f=await fixture(t),directory=join(f.root,'question-handoff'),seen=[];let now=0;
+ const result=await prepareFailureFamily({...f,directory},{now:()=>now,session:async({directory:nativeDirectory,writableDirectory,prompt})=>{
+  seen.push({nativeDirectory,...prompt.focusedQuestion});
+  if(seen.length===1){
+   await writeFile(join(writableDirectory,'partial.py'),'pass');
+   now+=181000;
+   return {value:{status:'needs-evidence',reason:'Late submission'}};
+  }
+  assert.equal(await readFile(join(writableDirectory,'partial.py'),'utf8'),'pass');
+  now+=175000;
+  return {value:{status:'needs-evidence',reason:'Reference semantics unavailable'}};
+ }});
+ assert.equal(result.status,'needs-evidence');assert.equal(result.elapsedSeconds,356);assert.equal(result.question.elapsedSeconds,175);
+ assert.deepEqual(seen.map(q=>q.number),[1,2]);assert.equal(seen[0].nativeDirectory,seen[1].nativeDirectory);
+ assert.notEqual(seen[0].prompt,seen[1].prompt);
+});
+
 
 test('isolation completion waits for an in-flight heartbeat write',async t=>{
  const f=await fixture(t),directory=join(f.root,'overlapping-checkpoint');

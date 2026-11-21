@@ -13,6 +13,7 @@ import {readConfig} from './instance.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {skillModelIdentity,skillConfig} from '../controller/skill-context.mjs';
 import {runFailurePilot} from './skill-failure-pilot.mjs';
+import {failureTiming} from './skill-failure-protocol.mjs';
 import {searchableMemoryFingerprint} from './skill-searchable.mjs';
 
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
@@ -49,12 +50,14 @@ export async function failureCampaignStatus(config){
  try{
   const active=backlog.meta('failure-first-current'),run=active&&backlog.run(active),cp=run?.checkpoint;
   const pilot=cp&&await optional(join(cp.directory,'pilot','pilot.json'));
+  const isolation=cp?.phase==='isolate'&&await optional(join(cp.directory,'family','isolation.json'));
   const operations=Object.values(pilot?.operations??{}),running=operations.filter(o=>o.status==='running');
   const screen=Object.values(pilot?.screens??{}).flat(),last=backlog.meta('failure-first-status');
   return {...backlog.status(),...last,workflow:'failure-first-v1',current:run?{id:run.id,itemId:run.item_id,phase:cp.phase,
    elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,directory:cp.directory}:null,
    activeWork:run?{kind:'failure-first',stage:running[0]?.kind??cp.phase,id:run.id}:null,
    operations:running.map(o=>({id:o.id,elapsedSeconds:o.elapsedSeconds,allocatedSeconds:o.allocatedSeconds})),
+   ...(isolation?{isolation:{elapsedSeconds:isolation.elapsedSeconds,allocatedSeconds:failureTiming.isolationSeconds,timings:isolation.timings}}:{}),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
    hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
@@ -77,6 +80,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  if(slots?.length!==4)throw Error('Failure-first startup requires four reserved healthy devices');
  const {state,backlog}=open(config),now=dependencies.now??Date.now;
  const invokedAt=now();
+ const campaignLeft=()=>Math.max(0,remainingSeconds-(now()-invokedAt)/1000);
  const knowledgeConfig={...memory?.config,project_evidence_root:config.root};
  const ops={
   analyze:async args=>(await import('./skill-backlog-analysis.mjs')).analyzeBacklog(args,{classify:async input=>(await import('./skill-review-native.mjs')).nativeClassifyBatch({...input,config:knowledgeConfig})}),
@@ -86,14 +90,14 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   admit:async args=>(await import('./skill-searchable.mjs')).admitSearchableSkill(args),
   publish:async args=>(await import('./skill-failure-candidates.mjs')).publishFailureWinner(args),
   pilot:runFailurePilot,model:skillModelIdentity,input:skillInput,...dependencies};
- let run,cp,timer,runtime,closed=true;
+ let run,cp,timer,runtime,closed=true,save;
  try{
   let ingestion;const until=now()+1000;do{ingestion=backlog.ingest({limit:100});}while(ingestion.progress&&now()<until);
   const existing=backlog.list({status:'running',limit:1})[0];
   if(!existing)requeueUnwitnessedFamilies(backlog);
   if(!existing&&!queuedFamily(backlog)){
    await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
-    classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,remainingSeconds),limit:2,signal});
+    classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,campaignLeft()),limit:2,signal});
   }
   const item=existing??queuedFamily(backlog);
   if(!item)return {status:'idle',reason:'No eligible correctness family'};
@@ -116,7 +120,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    const recovered=await ops.admit({...admissionInput,signal,recoverOnly:true});
    if(recovered?.admitted)return finishRecovery({reason:'searchable-admission-recovered',searchable:true,admission:recovered});
    if(recovered?.reason!=='no-prior-admission')throw Error(recovered?.reason??'Searchable skill admission recovery refused');
-   const remaining=Math.min(retained.seconds-elapsed(),remainingSeconds-(now()-invokedAt)/1000);
+   const remaining=Math.min(retained.seconds-elapsed(),campaignLeft());
    if(remaining<=0)return finishRecovery({reason:'Experiment elapsed allowance exhausted before searchable admission'});
    const deadline=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.floor(remaining*1000)))]);
    deadline.throwIfAborted();
@@ -127,7 +131,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(retained?.checkpoint?.phase==='publish'){
    const saved=await optional(join(retained.checkpoint.directory,'pilot','pilot.json'));
    const elapsedAtResume=Math.max(retained.elapsed,(now()-retained.checkpoint.startedAt)/1000);
-   const remaining=Math.min(retained.seconds-elapsedAtResume,remainingSeconds);
+   const remaining=Math.min(retained.seconds-elapsedAtResume,campaignLeft());
    const alreadyChanged=(await readConfig(config.root)).skills.activeVersion!==retained.base;
    if(!alreadyChanged&&remaining<=0)throw Error('Experiment elapsed allowance exhausted before publication recovery');
    const deadline=alreadyChanged?signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.floor(remaining*1000)))]);
@@ -141,19 +145,23 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    if(existing)throw Error('Frozen experiment baseline changed; preserve its original run');
    backlog.revise(item.id,{base:config.skills.activeVersion,status:'queued'});return {status:'reclassified',reason:'Active skill changed before screening'};
   }
-  const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(7200,remainingSeconds),workflow:'failure-first-v1',owner:await processIdentity()});
+  const owner=await processIdentity();
+  if(campaignLeft()<=0)throw Error('Campaign elapsed allowance exhausted');
+  const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(failureTiming.experimentSeconds,campaignLeft()),workflow:'failure-first-v1',owner});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
   run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots};
   if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
+  const resumedAt=now(),retainedElapsed=Math.max(run.elapsed,(resumedAt-cp.startedAt)/1000);
+  const elapsed=()=>retainedElapsed+(now()-resumedAt)/1000;
+  const remaining=()=>Math.max(0,Math.min(run.seconds-elapsed(),campaignLeft()));
+  save=()=>{backlog.checkpoint(run.id,{elapsed:elapsed(),checkpoint:cp});};
   backlog.meta('failure-first-current',run.id);await mkdir(cp.directory,{recursive:true});
-  const remaining=()=>Math.max(0,Math.min(run.seconds-(now()-cp.startedAt)/1000,remainingSeconds));
-  const save=()=>{backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});};
   const phase=name=>{cp.phase=name;save();backlog.meta('failure-first-status',{status:'running',phase:name,at:now()});};
   const finish=(status,result)=>backlog.atomic(()=>{
    save();
    backlog.finish(run.id,{status,result});
    backlog.meta('failure-first-current',null);
-   backlog.meta('failure-first-status',{status,reason:result.reason,at:now(),lastDirectory:cp.directory,
+   backlog.meta('failure-first-status',{status,reason:result.reason,...(result.stage?{stage:result.stage}:{}),at:now(),lastDirectory:cp.directory,
     ...(result.disposition?{disposition:result.disposition}:{}),...(result.learningRequest?{learningRequest:result.learningRequest}:{})});
    return {status,...result};
   });
@@ -187,7 +195,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   let prepared;
   try{
-   prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(1800,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:join(cp.directory,'family'),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
    if(referenceError)throw referenceError;
    active.throwIfAborted();
@@ -198,12 +206,13 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
     ?'Family author completed without submitting a validated family'
     :error.message};
   }
-  if(referenceError)throw referenceError;
+  if(referenceError&&(prepared.status!=='expired'||referenceError.failureStage!==prepared.stage))throw referenceError;
   if(prepared.status!=='ready'){
    if(runtime){
     closed=await runtime.close();runtime=null;
     if(!closed)throw Error('Submission reference execution remains unresolved');
    }
+   if(prepared.status==='expired')return finish('inconclusive',{reason:'stage-elapsed',stage:prepared.stage,detail:prepared.reason,timings:prepared.timings});
    const disposition=prepared.disposition;
    if(disposition?.route==='phase1'){
     return backlog.atomic(()=>{
@@ -215,7 +224,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
      return finish('learning',{reason:'phase1-learning-requested',detail:prepared.reason,disposition,learningRequest});
     });
    }
-   return finish('inconclusive',{reason:prepared.status==='unsubmitted'?'family-unsubmitted':'needs-evidence',detail:prepared.reason,...(disposition?{disposition}:{})});
+   return finish('inconclusive',{reason:prepared.status==='unsubmitted'?'family-unsubmitted':'needs-evidence',detail:prepared.reason,timings:prepared.timings,...(disposition?{disposition}:{})});
   }
   if(priorFamily&&hash(priorFamily.family)!==hash(prepared.family))throw Error('Frozen failure family changed');
   if(!priorFamily)await writeFile(join(cp.directory,'family-ready.json'),JSON.stringify(prepared));
@@ -227,11 +236,11 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
    const focused=[prepared.family.development,...prepared.family.transfer].every(task=>task.controls?.calibration?.files);
    manifest={...(focused?{mode:'focused-correctness'}:{}),baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
-   cp.initialElapsedSeconds=(now()-cp.startedAt)/1000;await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
+   cp.initialElapsedSeconds=elapsed();await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
   const currentConfig=skillConfig(await readConfig(config.root));
   if(currentConfig.skills.activeVersion!==run.base||hash(manifest.identities.memory)!==hash(memoryIdentity)||hash(manifest.identities.model)!==hash(await modelIdentities(currentConfig))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
   const design=await ops.design({config,item:run.snapshot,knowledgeConfig});phase('evaluate');
-  const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:180,verificationSeconds:300,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
+  const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:failureTiming.actorSeconds,verificationSeconds:failureTiming.verificationSeconds,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
    {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
   closed=await runtime.close();runtime=null;if(!closed)throw Error('Experiment execution remains unresolved');
   if(result.status!=='complete')throw Error(result.reason??'Incomplete experiment');
@@ -249,11 +258,10 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(!publication?.published)throw Error(publication?.reason??'Validated skill publication refused');
   return finish('accepted',{reason:'protected-transfer-improvement',result,publication});
  }catch(error){
-  cp&&(cp.unresolved=!closed);if(run&&cp){saveFailure();}
-  function saveFailure(){backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});}
+  if(cp&&save){cp.unresolved=!closed;save();}
   throw error;
  }finally{
-  clearInterval(timer);if(runtime){closed=await runtime.close().catch(()=>false);if(cp){cp.unresolved=!closed;backlog.checkpoint(run.id,{elapsed:Math.max(run.elapsed,(now()-cp.startedAt)/1000),checkpoint:cp});}}
+  clearInterval(timer);if(runtime){closed=await runtime.close().catch(()=>false);cp.unresolved=!closed;save();}
   state.close();
  }
 }

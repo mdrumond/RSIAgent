@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {Type} from 'typebox';
 import {reviewSession} from './skill-review-native.mjs';
 import {freezeGroups} from './skill-backlog-analysis.mjs';
+import {failureStageElapsed,failureTiming} from './skill-failure-protocol.mjs';
 
 const canonical=x=>Array.isArray(x)?x.map(canonical):x&&typeof x==='object'?Object.fromEntries(Object.keys(x).sort().map(k=>[k,canonical(x[k])])):x;
 const git=promisify(execFile),sha=x=>createHash('sha256').update(typeof x==='string'||Buffer.isBuffer(x)?x:JSON.stringify(canonical(x))).digest('hex');
@@ -198,22 +199,57 @@ async function freezeDraft(manifest,draft,directory){
  if(names.size>64)throw Error('Bounded family file bundle required');let size=0;const bytes=[];for(const name of names){if(['family.json','isolation.json','draft','research','sources','evidence'].includes(relative(directory,resolve(directory,name)).split('/')[0]))throw Error('Reserved family file');const content=await utf8(await scoped(draft,name).catch(error=>{if(error.code==='ENOENT')throw Error('Missing draft file: '+name+'. Write it under draftDirectory, then resubmit the manifest.');throw error;}));size+=Buffer.byteLength(content);if(size>4194304)throw Error('Bounded family file bundle required');bytes.push([name,content]);}
  for(const [name,content]of bytes){const path=resolve(directory,name);if(!inside(directory,path))throw Error('Family output path escapes accepted directory');await mkdir(dirname(path),{recursive:true});await writeFile(path,content,{mode:0o600});}
 }
+async function draftFingerprint(draft){
+ const files=(await readdir(draft,{recursive:true,withFileTypes:true})).filter(e=>e.isFile());
+ const inputs=files.map(file=>join(file.parentPath,file.name)).sort();
+ const hashes=[];let bytes=0;
+ for(const path of inputs.slice(0,64)){
+  const size=(await stat(path)).size;if(size>1048576||bytes+size>4194304)continue;
+  const content=await readFile(path);bytes+=content.length;hashes.push([relative(draft,path),sha(content)]);
+ }
+ return sha(hashes);
+}
 /** A bounded native research session may produce fixtures, never skill instructions or curriculum jobs. */
-export async function prepareFailureFamily({config,backlog,item,directory,seconds=1800,signal,checkReferences},dependencies={}){
+export async function prepareFailureFamily({config,backlog,item,directory,seconds=failureTiming.isolationSeconds,signal,checkReferences},dependencies={}){
  if(!['a3','a5'].includes(config.target))throw Error('Failure isolation requires A3 or A5 target');
- if(!Number.isFinite(seconds)||seconds<=0||seconds>1800)throw Error('Isolation must fit 1800 elapsed seconds');await mkdir(directory,{recursive:true});
+ if(!Number.isFinite(seconds)||seconds<=0||seconds>failureTiming.isolationSeconds)throw Error('Isolation must fit '+failureTiming.isolationSeconds+' elapsed seconds');await mkdir(directory,{recursive:true});
  const draft=join(directory,'draft');await mkdir(draft,{recursive:true});
  const file=join(directory,'family.json'),stateFile=join(directory,'isolation.json'),prior=await optional(stateFile),identity=sha([item.id,item.base,item.evidence,config.target]);
  if(prior&&prior.identity!==identity)throw Error('Isolation inputs changed');
  if(prior?.status==='ready'){const family=await loadFailureFamily({file,config,item});if(prior.familyIdentity!==family.identity)throw Error('Frozen family changed');return {status:'ready',family,elapsedSeconds:prior.elapsedSeconds};}
- if(prior?.status==='needs-evidence')return prior;
+ if(['needs-evidence','expired'].includes(prior?.status))return prior;
  if(prior?.running)throw Error('Interrupted isolation elapsed custody is unknown');
- const elapsed=prior?.elapsedSeconds??0;if(elapsed>=1800)throw Error('Isolation elapsed allowance exhausted');
+ const elapsed=prior?.elapsedSeconds??0;
  const saveIsolation=dependencies.saveIsolation??save;
  const observations=prior?.referenceChecks??{};
- const begun=performance.now(),bounded=AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(Math.min(seconds,1800-elapsed)*1000)))]);let ledger={identity,elapsedSeconds:elapsed,running:true,referenceChecks:observations};await saveIsolation(stateFile,ledger);
- const checkpoint=async()=>{ledger.elapsedSeconds=elapsed+(performance.now()-begun)/1000;await saveIsolation(stateFile,ledger);};let pending=Promise.resolve();const timer=setInterval(()=>{pending=pending.then(checkpoint);},1000);
+ const now=dependencies.now??(()=>performance.now()),begun=now(),allocation=Math.min(seconds,failureTiming.isolationSeconds-elapsed);
+ const left=()=>allocation-(now()-begun)/1000;
+ const isolationTimeout=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),bounded=signal?AbortSignal.any([signal,isolationTimeout]):isolationTimeout;
+ const timings={focusedQuestion:0,verification:0,piResponse:0,piRetry:0,...prior?.timings};
+ let focus=new AbortController(),focusedSignal=AbortSignal.any([bounded,focus.signal]);
+ let question=prior?.question??{number:1,kind:'isolate-failure',elapsedSeconds:timings.focusedQuestion};
+ let ledger={identity,elapsedSeconds:elapsed,timings,question,referenceChecks:observations,running:true},focusStarted,focusTimer,verificationStarted;
+ const focusDelta=()=>focusStarted===undefined?0:(now()-focusStarted)/1000;
+ const focusedElapsed=()=>timings.focusedQuestion+focusDelta();
+ const questionElapsed=()=>question.elapsedSeconds+focusDelta();
+ const verificationElapsed=()=>timings.verification+(verificationStarted===undefined?0:(now()-verificationStarted)/1000);
+ const stopFocus=()=>{clearTimeout(focusTimer);timings.focusedQuestion=focusedElapsed();question.elapsedSeconds=questionElapsed();focusStarted=undefined;};
+ const checkFocus=()=>{if(questionElapsed()>=failureTiming.actorSeconds)focus.abort(failureStageElapsed('focused-question'));focusedSignal.throwIfAborted();};
+ const startFocus=()=>{
+  checkFocus();focusStarted=now();
+  focusTimer=setTimeout(()=>focus.abort(failureStageElapsed('focused-question')),Math.max(1,Math.ceil((failureTiming.actorSeconds-questionElapsed())*1000)));
+  focusTimer.unref();
+ };
+ const checkpoint=async()=>{
+  ledger.elapsedSeconds=elapsed+(now()-begun)/1000;
+  ledger.timings={...timings,focusedQuestion:focusedElapsed(),verification:verificationElapsed(),handoff:Math.max(0,ledger.elapsedSeconds-focusedElapsed()-verificationElapsed())};
+  ledger.question={...question,elapsedSeconds:questionElapsed()};
+  await saveIsolation(stateFile,ledger);
+ };
+ await saveIsolation(stateFile,ledger);
+ let pending=Promise.resolve();const timer=setInterval(()=>{pending=pending.then(checkpoint);},1000);
  try{
+  signal?.throwIfAborted();if(left()<=0)throw failureStageElapsed('isolate');
   const sources=await failureSourceInventory({config,item,directory:join(directory,'sources'),signal:bounded});
   bounded.throwIfAborted();if(!sources.length){
    ledger.status='needs-evidence';ledger.reason='No recoverable source bound to an actual actor correctness failure';
@@ -224,8 +260,22 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
   let disposition;
   const validateDisposition=value=>isolationDisposition({value,sources,groups,config,item,observations,signal:bounded});
   const focusedCalibration=config.target==='a5';
-  const session=dependencies.session??reviewSession,result=await session({directory:join(directory,'research'),config,seconds:Math.max(.001,Math.min(seconds,1800-elapsed)-(performance.now()-begun)/1000),signal:bounded,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.map(source=>source.path)],proofRequired:true,selectorOnly:true,continueFamilyDraft:true,resultSchema:resultSchema(config.target),
-   prompt:{target:config.target,draftDirectory:draft,task:'Write the Python files incrementally using native write/edit under draftDirectory; submit only the typed family manifest and claims, never inline file contents. Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. If you cannot establish the family, submit needs-evidence with the closest blocker: retained-source, failure-mechanism, passing-reference, missing-semantics, or unreliable-oracle. Select verificationReference from sourceInventory and cite its original failed verification or primary diagnostic in reason. Explain what the recorded check actually showed and what remains unknown. A compiler error disappearing, compilation succeeding, or one local pass does not establish full correctness. Never blame a component without execution evidence identifying the first failing boundary. With an oracle or semantics gap, provide one nextQuestion that a small Phase 1 exercise with staged PyTorch outputs could resolve. For other gaps, include nextQuestion only if a specific probe could distinguish plausible explanations. When the draft files and manifest are complete, submit ready to run host syntax checks and replay the unchanged development starter on the target before testing the references. Preserve the original verifier’s input placement and invocation, or justify changes with evidence. Use the exact phase and type emitted by the checker for the reproduced failure. You do not need to execute a checker yourself. A failed check is returned in the submit_review tool result so you can edit the draft and resubmit within the same session. If continuing a draft, inspect draftDirectory for reusable files. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family whose file references are relative to draftDirectory: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; enforce a 90-second elapsed deadline per case. Final JSON is one line containing correct and evidence.caseResults. The trusted guard supplies the candidate hash. evidence.caseResults contains exactly one {id,correct:boolean} for every frozen case; overall correct is true only when all cases pass. checkedCases lists actual execution coverage only, including failed cases; unverified cases must not be marked successful. Include evidence.phase and type for failures. Public and private checkers are separate. The trusted runtime will qualify all controls on the configured target; no claim of execution from code alone.'+(focusedCalibration?' For every A5 task supply controls.calibration with a distinct implementation expected to pass the frozen cases without the target failing construct. Do not copy a reference, negative, or starter into the calibration control. The trusted runtime will verify these outcomes.':''),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
+  const session=dependencies.session??reviewSession;
+  question.draftFingerprint??=await draftFingerprint(draft);
+  let result;
+  while(!result){
+   let rejection;
+   try{
+    if(left()<=0)throw failureStageElapsed('isolate');
+    startFocus();
+    const nextQuestion=question.kind==='revise-checked-draft'
+     ? 'What correction addresses the first failed trusted check from the previous submission? Use the checker feedback in this session.'
+     :question.kind==='finish-draft'
+      ? 'What is the next missing piece needed to check the retained draft against the observed failure? Inspect the current files and focus on that piece.'
+      :'What mechanism from this retained failure can be verified by replaying it?';
+    result=await session({directory:join(directory,'research'),config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.map(source=>source.path)],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
+   onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
+   prompt:{target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:'Write the Python files incrementally using native write/edit under draftDirectory; submit only the typed family manifest and claims, never inline file contents. Isolate one actual failed actor correctness attempt from these campaign records. Inspect successful projects and KDB memories for a passing reference. If you cannot establish the family, submit needs-evidence with the closest blocker: retained-source, failure-mechanism, passing-reference, missing-semantics, or unreliable-oracle. Select verificationReference from sourceInventory and cite its original failed verification or primary diagnostic in reason. Explain what the recorded check actually showed and what remains unknown. A compiler error disappearing, compilation succeeding, or one local pass does not establish full correctness. Never blame a component without execution evidence identifying the first failing boundary. With an oracle or semantics gap, provide one nextQuestion that a small Phase 1 exercise with staged PyTorch outputs could resolve. For other gaps, include nextQuestion only if a specific probe could distinguish plausible explanations. When the draft files and manifest are complete, submit ready to run host syntax checks and replay the unchanged development starter on the target before testing the references. Preserve the original verifier’s input placement and invocation, or justify changes with evidence. Use the exact phase and type emitted by the checker for the reproduced failure. You do not need to execute a checker yourself. A failed check is returned in the submit_review tool result so you can edit the draft and resubmit within the same session. If continuing a draft, inspect draftDirectory for reusable files. Do not write a skill instruction, propose changes to skills, or start a curriculum project. If ready, return a protected v2 family whose file references are relative to draftDirectory: one development task and two distinct transfer tasks; controls reference and negatives for each. Freeze all cases now, before any instruction writer. Transfers must change distinct layout/operation/dtype/boundary properties, never just seeds. Keep private checker/helper files out of editable and public files. Checker API: argv1 is candidate directory; enforce a 90-second elapsed deadline per case. Final JSON is one line containing correct and evidence.caseResults. The trusted guard supplies the candidate hash. evidence.caseResults contains exactly one {id,correct:boolean} for every frozen case; overall correct is true only when all cases pass. checkedCases lists actual execution coverage only, including failed cases; unverified cases must not be marked successful. Include evidence.phase and type for failures. Public and private checkers are separate. The trusted runtime will qualify all controls on the configured target; no claim of execution from code alone.'+(focusedCalibration?' For every A5 task supply controls.calibration with a distinct implementation expected to pass the frozen cases without the target failing construct. Do not copy a reference, negative, or starter into the calibration control. The trusted runtime will verify these outcomes.':''),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
     if(value.status==='needs-evidence'){disposition=await validateDisposition(value);return value;}
     if(!value.family||value.files)throw Error('Submit a typed family manifest referencing draftDirectory files, without inline file contents');
@@ -246,22 +296,51 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
      }
     }
     await checkPythonSyntax({config,family,manifest:value.family,directory,signal:bounded});
-    if(checkReferences){const remaining=Math.min(seconds,1800-elapsed)-(performance.now()-begun)/1000;bounded.throwIfAborted();if(remaining<=0)throw Error('Isolation elapsed allowance exhausted before reference checks');try{
-     const result=await checkReferences({family,directory,seconds:remaining,signal:bounded});
-     if(result?.diagnostics)observations[family.provenance.reference]=result.diagnostics;
-    }catch(error){
-     if(error.code==='FAILURE_REFERENCE_REJECTED'&&error.diagnostics)observations[family.provenance.reference]=error.diagnostics;
-     throw Error('Family reference checks failed: '+error.message,{cause:error});
-    }}
+    if(checkReferences){
+     checkFocus();
+     const remaining=left();if(remaining<=0)throw failureStageElapsed('isolate');
+     stopFocus();verificationStarted=now();
+     try{
+      const verified=await checkReferences({family,directory,seconds:remaining,signal:bounded});
+      if(verified?.diagnostics)observations[family.provenance.reference]=verified.diagnostics;
+     }
+     catch(error){
+      if(error.code==='FAILURE_REFERENCE_REJECTED'){
+       rejection=error;
+       if(error.diagnostics)observations[family.provenance.reference]=error.diagnostics;
+      }
+      throw Error('Family reference checks failed: '+error.message,{cause:error});
+     }
+     finally{timings.verification=verificationElapsed();verificationStarted=undefined;if(!bounded.aborted)startFocus();}
+    }
     bounded.throwIfAborted();return value;
-   }});
-  bounded.throwIfAborted();const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;
+    }});
+    checkFocus();
+   }catch(error){
+    result=undefined;
+    if(bounded.aborted||left()<=0||!(focus.signal.aborted||['no-submit','rejected-submissions'].includes(error.reviewSession?.kind)))throw error;
+    const fingerprint=await draftFingerprint(draft);
+    if(fingerprint===question.draftFingerprint)throw error;
+    stopFocus();
+    question={number:question.number+1,kind:rejection?'revise-checked-draft':'finish-draft',elapsedSeconds:0,draftFingerprint:fingerprint};
+    focus=new AbortController();focusedSignal=AbortSignal.any([bounded,focus.signal]);
+    // Serialize with heartbeat because resuming this loop must retain which question owns the new grant.
+    pending=pending.then(checkpoint);await pending;
+   }finally{stopFocus();}
+  }
+  if(left()<=0)throw failureStageElapsed('isolate');
+  const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;
+  bounded.throwIfAborted();
   if(!family)disposition??=await validateDisposition(value);
-  ledger={identity,status:value.status,reason:value.reason,referenceChecks:observations,
-   ...(family?{familyIdentity:family.identity}:{disposition}),elapsedSeconds:elapsed+(performance.now()-begun)/1000,running:false};
+  Object.assign(ledger,{status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{disposition}),elapsedSeconds:elapsed+(now()-begun)/1000,running:false});
   return family?{status:'ready',family,elapsedSeconds:ledger.elapsedSeconds}:ledger;
+ }catch(error){
+  const exhausted=error.failureStage??signal?.reason?.failureStage??(!signal?.aborted&&(isolationTimeout.aborted||left()<=0?'isolate':focus.signal.aborted?'focused-question':null));
+  if(!exhausted)throw error;
+  return Object.assign(ledger,{status:'expired',stage:exhausted,reason:failureStageElapsed(exhausted).message});
  }finally{
   clearInterval(timer);
+  stopFocus();
   await pending;
   ledger.running=false;
   await checkpoint();
