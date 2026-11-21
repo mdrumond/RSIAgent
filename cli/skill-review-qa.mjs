@@ -3,6 +3,7 @@ import {createHash} from 'node:crypto';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {join} from 'node:path';
 import {prepareQaSources,summaryProtocol,validateSummary,summaryItems} from './skill-evidence-summary.mjs';
+import {frozenEvidencePacket,scopedQaGroups} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence} from './project-summary.mjs';
 const reservedThrough=state=>Math.max(state.elapsedSeconds??0,state.inFlight?.reservedThrough??0,...Object.values(state.inFlightOperations??{}).map(op=>op.reservedThrough??0));
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -125,7 +126,8 @@ export async function runProposalQa(input,ops){
     input={...input,sourceCatalogue:catalogue,evidenceSummary:{items:catalogue.pages.flatMap(p=>summaryItems(summary.pages[p.id].value,p.id))}};
    }
    if(!round.answers){
-    const refs=new Set([...(catalogue?.records??[]).map(r=>r.reference),...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...input.projectSummaries.flatMap(s=>[...(s.facts??[]),...(s.references??[])].map(r=>r.reference)),...input.learningProofEvidence.filter(r=>r.available!==false&&typeof r.text==='string').map(r=>r.reference),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
+    const artifactRefs=summarized?[]:(await frozenEvidencePacket(scopedQaGroups(input.groups,proposal))).artifacts.filter(a=>a.available).map(a=>a.id);
+    const refs=new Set([...artifactRefs,...(catalogue?.records??[]).map(r=>r.reference),...input.groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(o=>o.reference)),...input.entries.map(e=>e.id),...input.projectSummaries.flatMap(s=>[...(s.facts??[]),...(s.references??[])].map(r=>r.reference)),...input.learningProofEvidence.filter(r=>r.available!==false&&typeof r.text==='string').map(r=>r.reference),...(proposal.memoryRefs??[]),...(input.learning??[]).flatMap(([,record])=>(record.result?.evidence??[]).flatMap(e=>e.reference?[e.reference]:[]))]);
     const validate=value=>{
      validateQaAnswers(value,refs);
      if(value.memoryRefs?.some(ref=>!(input.proposal.memoryRefs??[]).includes(ref)))throw Error('QA revisions cannot introduce unretrieved memory references');

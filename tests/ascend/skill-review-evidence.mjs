@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {frozenEvidencePacket,scopedBaseline} from '../../cli/skill-review-evidence.mjs';
 test('frozen diagnostics deliver content, deduplicate, and distinguish missing and truncated evidence',async t=>{
  const root=await mkdtemp(join(tmpdir(),'review-packet-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -10,6 +11,21 @@ test('frozen diagnostics deliver content, deduplicate, and distinguish missing a
  const packet=await frozenEvidencePacket([{occurrences:[{reference:'event:1',artifacts:[{path:file}]},{reference:'event:2',artifacts:[{path:file}]},{reference:'event:3',artifacts:[{path:join(root,'missing')}]},{reference:'event:4'}]}],{limit:16});
  assert.equal(packet.artifacts.length,2);assert.equal(packet.artifacts[0].text,'HEAD....'+'....TAIL');assert.equal(packet.artifacts[0].truncated,true);
  assert.deepEqual(packet.observations[0].artifacts,packet.observations[1].artifacts);assert.equal(packet.artifacts[1].available,false);assert.equal(packet.artifacts[1].reason,'ENOENT');assert.ok(packet.observations[3].unavailable);
+});
+test('a declared artifact digest binds the full file even when only an excerpt is presented',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'review-packet-digest-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ const path=join(root,'retained.log'),text='HEAD'+'.'.repeat(80)+'TAIL';
+ const sha256=createHash('sha256').update(text).digest('hex');
+ const groups=[{occurrences:[{reference:'event:1',artifacts:[{path,sha256}]}]}];
+ await writeFile(path,text);
+ const first=await frozenEvidencePacket(groups,{limit:16});
+ assert.equal(first.artifacts[0].id,'artifact:'+sha256);
+ assert.equal(first.artifacts[0].available,true);
+ assert.equal(first.artifacts[0].text,'HEAD........TAIL');
+ await writeFile(path,text.slice(0,40)+'!'+text.slice(41));
+ const changed=await frozenEvidencePacket(groups,{limit:16});
+ assert.equal(changed.artifacts[0].available,false);
+ assert.equal(changed.artifacts[0].reason,'ARTIFACT_HASH_MISMATCH');
 });
 test('scoped baseline retains global and protected constraints and relevant stage',()=>{
  const entries=[{id:'global',scope:'global-kdb'},{id:'safe',scope:'verify',critical:true},{id:'actor',scope:'actor'},{id:'unrelated',scope:'postprocess'}];

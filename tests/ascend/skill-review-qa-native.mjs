@@ -1,10 +1,13 @@
 import test from 'node:test';
+import {createHash} from 'node:crypto';
 import {Type} from 'typebox';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {nativeQaAnswer,nativeQaReview,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
+import {nativeQaAnswer,nativeQaReview,reviewSession,REVIEW_CONTRACT_VERSION} from '../../cli/skill-review-native.mjs';
+import {runProposalQa,qaTopics} from '../../cli/skill-review-qa.mjs';
+import {scriptedReview} from './helpers/scripted-review.mjs';
 async function fixture(t){
  const root=await mkdtemp(join(tmpdir(),'qa-native-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const proposalDirectory=join(root,'writer');await mkdir(proposalDirectory);
@@ -90,4 +93,42 @@ test('session input exposes the same canonical paths used for filesystem admissi
  const out=await reviewSession({directory,config:{},prompt:{},allowedPaths:[primary,source],validate:x=>x});assert.equal(out.recovered,true);
  const input=JSON.parse(await readFile(join(directory,'input.json'),'utf8'));
  assert.deepEqual(input.filesystemAccess.allowed,[{path:directory,directory:true},{path:primary,directory:true},{path:source,directory:false}]);assert.deepEqual(input.filesystemAccess.requiredReads,[]);
+});
+
+for(const kind of ['available','missing','hash-mismatch','invalid-reference','out-of-scope','forged-proof'])test('native QA scoped artifact reference: '+kind,async t=>{
+ const {root,input}=await fixture(t);
+ const artifact=join(root,'verification.txt'),body='Verifier reported a numerical mismatch\n';
+ const sha256=createHash('sha256').update(body).digest('hex');
+ if(kind!=='missing')await writeFile(artifact,kind==='hash-mismatch'?'Changed verification\n':body);
+ const evidence={path:artifact,sha256};
+ const observations=input.groups[0].occurrences;
+ (kind==='out-of-scope'?observations[1]:input.groups[0].linkedDiagnostics[0]).artifacts=[evidence];
+ const artifactRef='artifact:'+sha256,ref=kind==='invalid-reference'?'artifact:'+'0'.repeat(64):artifactRef;
+ const artifactProof=kind==='available'||kind==='forged-proof';
+ const answer={
+  answers:Object.fromEntries(qaTopics.map(topic=>[topic,{text:'Evidence supports this boundary',refs:['baseline',ref]}])),
+  claims:qaTopics.map(topic=>({path:'answers.'+topic+'.text',kind:'observation',proofs:[{
+   reference:artifactProof?artifactRef:'baseline',startLine:1,endLine:1,
+   ...(kind==='forged-proof'?{quote:'Invented verifier output'}:{}),
+  }]})),
+ };
+ const provider=await scriptedReview(t,root,(_message,n)=>n===0?{name:'submit_review',args:{result:answer}}:null);
+ let sessionInput,reviewed=0;
+ const report=await runProposalQa({...input,config:{actor:provider.profile},projectSummaries:[],learningProofEvidence:[],validateProposal:value=>value},{
+  qaAnswer:async args=>(await nativeQaAnswer(args,{session:async options=>{
+   sessionInput=join(options.directory,'input.json');return reviewSession(options);
+  }})).value,
+  qaReview:async()=>{reviewed++;return {verdict:'approved',reason:'Fixture reviewed the accepted answers'};},
+ });
+ const native=JSON.parse(await readFile(sessionInput,'utf8'));
+ assert.equal(native.proofSelectors.some(selector=>selector.reference===artifactRef),['available','invalid-reference','forged-proof'].includes(kind));
+ if(kind==='available'){
+  assert.equal(report.verdict,'approved');assert.equal(reviewed,1);
+  assert.deepEqual(report.rounds[0].answers.action.refs,['baseline',artifactRef]);
+  const proof=report.rounds[0].claims[0].proofs[0];
+  assert.equal(proof.sourceSha256,sha256);assert.equal(proof.quote,body.trim());
+ }else{
+  assert.equal(report.verdict,'inconclusive');assert.equal(reviewed,0);
+  assert.match(report.error.reviewSession.lastRejection,kind==='forged-proof'?/quote does not match/i:/actual evidence references/);
+ }
 });

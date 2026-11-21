@@ -6,7 +6,7 @@ import {randomUUID} from 'node:crypto';
 import {proofSelectorCatalogue} from './claim-proofs.mjs';
 import {Check,Errors} from 'typebox/value';
 import {discoveryProofSources} from './skill-discovery-proofs.mjs';
-import {frozenEvidencePacket,scopedBaseline} from './skill-review-evidence.mjs';
+import {frozenEvidencePacket,scopedBaseline,scopedQaGroups} from './skill-review-evidence.mjs';
 import {projectSummaries,learningProofEvidence,claimEvidence,validateClaimedResult,proofInstructions} from './project-summary.mjs';
 import {skillConfig,skillModelFromProfile} from '../controller/skill-context.mjs';
 import {ensureKnowledgeService} from './knowledge.mjs';
@@ -276,8 +276,7 @@ async function qaPrompt(input){
  }
  const cited=new Set(input.proposal.memoryRefs??[]);
  memory=memory.filter(item=>cited.has(item.ref??item.citationId??`${item.collection}:${item.entry_id??item.chunk_id??item.id}`));
- const refs=new Set((input.proposal.changes??[]).flatMap(change=>change.evidenceRefs??[]));
- const groups=input.groups.filter(group=>[...group.occurrences,...(group.linkedDiagnostics??[])].some(item=>refs.has(item.reference))).map(group=>({...group,occurrences:group.occurrences.filter(item=>refs.has(item.reference)),linkedDiagnostics:group.linkedDiagnostics??[]}));
+ const groups=scopedQaGroups(input.groups,input.proposal);
  return {projectSummaries:input.projectSummaries,learningProofEvidence:input.learningProofEvidence,learningEvidence:input.learningEvidence??[],proposal:input.proposal,baseline:scopedBaseline(input.entries,input.proposal),objective:input.objective,target:input.target,groups,memory,
   learning:input.learning??[],evaluationContract:input.evaluationContract??null,questions:{action:'Is a concrete actor edit justified? If so, what is the smallest edit and what must remain unchanged? Otherwise state no justified edit and the missing fact.',mechanism:'What supported mechanism links the edit to the failure? If unknown, identify the unresolved question rather than inventing a cause.',example:'Give a source-supported worked example and applicability boundary; label mathematical deductions and unknowns.',evidence:'Separate observed execution, mathematical deduction, retained code, memory reports and untested claims; establish checkpoint and target applicability.',objective:'Is this correctness or optimization? Is the guidance already satisfied, documentation-only, or demanding unnecessary optimization?'},
   rules:'Only supplied evidence is available. Do not run benchmarks or search live sources. A retained source file is not necessarily the executed failing or passing checkpoint: require an explicit artifact identity link before attributing its behavior to a run. Memory reports establish what was reported, not independent execution. Mathematical deductions are allowed but must name their source-supported premises and remain distinct from measured facts; generic mathematical or explicitly CPU-scoped conclusions do not require an NPU run. Assess the union of all cited evidence: each material clause must be supported somewhere, not independently by every citation. No source edit is required when evidence is insufficient or the retained code already satisfies the proposed rule; identify the missing fact instead. Documentation-only corrections are not useful optimization approvals. Explicitly untested optimization hypotheses need no prior speedup measurement. The actor sees the skill text, not these answers.'};
