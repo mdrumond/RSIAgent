@@ -372,3 +372,23 @@ test('a summary objection retains the disputed item and the scoped baseline as a
   }});
  assert.equal(result.text,input.entries[0].text);
 });
+
+test('ordinary audit exposes the frozen starter bytes and retains scoped project and attempt identities',async t=>{
+ const {input}=await fixture(t);
+ const rows=[1,2].map(n=>({reference:'event:'+n,attemptId:'attempt-'+n,projectId:'project-'+n,data:{measured:n}}));
+ const groups=[{id:'g',occurrences:rows,linkedDiagnostics:[]}];
+ const proposal={...input.proposal,changes:[{...input.proposal.changes[0],evidenceRefs:rows.map(r=>r.reference)}]};
+ const contract={workflow:'failure-first-v1',development:{files:{'kernel.py':'first line\nexpected address'},caseIds:['frozen']},baselineOutcomes:[]};
+ await nativeQaPanelAudit({...input,proposal,groups,evaluationContract:contract,objections:[],validate:v=>v},{session:async request=>{
+  const index=(await readFile(join(request.directory,request.prompt.sourceIndex),'utf8')).trim().split('\n').map(JSON.parse);
+  for(const row of rows){
+   const entry=index.find(i=>i.reference===row.reference);
+   assert.equal(entry.attemptId,row.attemptId);
+   assert.equal(entry.projectId,row.projectId);
+  }
+  const starter=index.find(i=>i.reference==='development-file:kernel.py');
+  assert.equal(await readFile(join(request.directory,starter.files[0]),'utf8'),contract.development.files['kernel.py']);
+  const frozen=index.find(i=>i.reference==='input:evaluationContract');
+  assert.deepEqual(JSON.parse(await readFile(join(request.directory,frozen.files[0]),'utf8')),contract);
+ }});
+});

@@ -326,7 +326,7 @@ export async function stageAuditSources(directory,sources,packet={observations:[
   }
   const observation=observations.get(record.reference),artifact=artifacts.get(record.reference);
   const role=record.role??record.provenance??observation?.type??(artifact?'frozen-artifact':record.factId?'controller-fact':'source');
-  sourceIndex.push({reference:record.reference,role,...(record.attemptId!==undefined?{attemptId:record.attemptId}:{}),files,
+  sourceIndex.push({reference:record.reference,role,attemptId:record.attemptId??observation?.attemptId,projectId:record.projectId??observation?.projectId,files,
    ...(observation?.artifacts?.length?{artifacts:observation.artifacts}:{}),
    ...(artifact?{fullFiles:artifact.paths,layout:artifact.layout}:{}),
    ...(record.sourceRefs?.length?{sourceRefs:record.sourceRefs}:{})});
@@ -338,8 +338,21 @@ export async function stageAuditSources(directory,sources,packet={observations:[
 export async function nativeQaPanelAudit(input,dependencies={}){
  const prompt=await qaPrompt(input);
  const packet=await frozenEvidencePacket(prompt.groups);
+ const originalRows=new Map(prompt.groups.flatMap(group=>[...group.occurrences,...(group.linkedDiagnostics??[])]).map(row=>[row.reference,row]));
+ for(const observation of packet.observations){
+  const original=originalRows.get(observation.reference);
+  observation.attemptId=original?.attemptId;
+  observation.projectId=original?.projectId;
+ }
  const primary=input.sourceCatalogue?.records??claimEvidence({prompt,packet});
  const inputRecords=claimEvidence({prompt:{baseline:prompt.baseline,proposal:input.proposal,answers:input.answers,answerClaims:input.answerClaims}});
+ const contract=prompt.evaluationContract;
+ if(contract){
+  inputRecords.push({reference:'input:evaluationContract',role:'frozen evaluation contract',text:JSON.stringify(contract,null,2)});
+  for(const [name,text] of Object.entries(contract.development?.files??{})){
+   if(typeof text==='string')inputRecords.push({reference:'development-file:'+name,role:'frozen development starter file',text});
+  }
+ }
  const extras=[...(input.panelAuditEvidence??[]),...(input.panelRevisionSources??[])];
  const {proofRecords,indexFile,sourceIndex,allowedPaths}=await stageAuditSources(input.directory,[...primary,...inputRecords,...extras],packet);
  const selectors=claims=>[...new Set(claims.flatMap(claim=>claim.proofs??[]).map(proof=>JSON.stringify(Object.fromEntries(
