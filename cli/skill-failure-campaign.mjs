@@ -258,6 +258,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:failureTiming.actorSeconds,verificationSeconds:failureTiming.verificationSeconds,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
    {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
   closed=await runtime.close();runtime=null;if(!closed)throw Error('Experiment execution remains unresolved');
+  if(result.status==='inconclusive'&&result.designUnavailable)return finish('inconclusive',{reason:result.reason,stage:'design',result});
   if(result.status!=='complete')throw Error(result.reason??'Incomplete experiment');
   if(!result.promising){
    if(config.target!=='a5'||manifest.mode!=='focused-correctness'||!result.winner)

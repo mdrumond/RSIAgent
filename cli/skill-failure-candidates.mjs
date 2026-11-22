@@ -1,6 +1,7 @@
 /** Evidence-reviewed instruction candidates; only the tested immutable version can publish. */
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
+import {setTimeout as delay} from 'node:timers/promises';
 import {join,resolve} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {Type} from 'typebox';
@@ -70,7 +71,7 @@ export function verifyPanelApproval(qa,proposal){
 async function writerCall(directory,seconds,signal,fn,now){
  signal?.throwIfAborted();
  const file=join(directory,'writer-spend.json'),prior=await load(file)??{seconds:180,elapsedSeconds:0};
- assert(!prior.running,'Interrupted writer elapsed custody is unknown');const remaining=Math.min(seconds,prior.seconds-prior.elapsedSeconds);assert(remaining>0,'Writer elapsed allowance exhausted');
+ assert(!prior.running,'Interrupted writer elapsed custody is unknown');const remaining=Math.min(seconds,prior.seconds-prior.elapsedSeconds);if(remaining<=0)return {providerTimeout:'elapsed'};
  const started=now();let writes=Promise.resolve();const snapshot=running=>({...prior,elapsedSeconds:prior.elapsedSeconds+(now()-started)/1000,running});
  await save(file,snapshot(true));const timer=setInterval(()=>{writes=writes.then(()=>save(file,snapshot(true)));},1000);
  try{
@@ -79,7 +80,8 @@ async function writerCall(directory,seconds,signal,fn,now){
   return {written:await fn({seconds:remaining,signal:bounded})};
  }catch(error){
   const terminal=error?.reviewSession;
-  if(terminal?.retryableTimeout===true&&['elapsed','provider-error'].includes(terminal.kind))return {providerTimeout:terminal.kind};
+  signal?.throwIfAborted();
+  if(terminal?.kind==='elapsed'||terminal?.retryableTimeout===true&&terminal.kind==='provider-error')return {providerTimeout:terminal.kind};
   throw error;
  }finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
 }
@@ -87,7 +89,7 @@ async function writerCall(directory,seconds,signal,fn,now){
 /** Called only after five clean baseline attempts establish the reproduced struggle. */
 export function createFailureDesign({config,item,knowledgeConfig=config},dependencies={}){
  const ops={session:reviewSession,qa:runProposalQa,qaAnswer:nativeQaAnswer,qaReview:nativeQaReview,qaPanelAudit:nativeQaPanelAudit,now:Date.now,...dependencies};
- return async input=>{
+ const design=async input=>{
   assert(Number.isFinite(input.remainingSeconds)&&input.remainingSeconds>0,'Positive remaining experiment elapsed allowance required');
   assert.equal(item.objective,'correctness','Failure-first instruction design currently supports correctness only');
   const focused=input.mode==='focused-correctness';
@@ -131,21 +133,25 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    panelRevisionSources=panelCorrectionSources(feedback.issues,input.panelAuditEvidence??[]);
   }
   const writerProofRecords=[...primaryRecords,...proofRecords,...panelRevisionSources];
-  const stop=new AbortController();let infrastructureCause;input={...input,signal:AbortSignal.any([stop.signal,...(input.signal?[input.signal]:[])])};
   const pending=perspectives.flatMap((perspective,index)=>{
    const id='principle-'+String.fromCharCode(97+index);
    if(panel&&id!==input.reviewCandidate)return [];
    return [runCandidate(id,perspective)];
   });
-  async function runCandidate(id,perspective){try{
+  async function runCandidate(id,perspective){
    const directory=join(input.directory,id),candidateFile=join(directory,'approved-candidate.json');
    const retained=await load(candidateFile);if(retained){assert.equal(retained.identity,identity,'Candidate evidence changed');return await restoreCandidate(retained.candidate);}
    await mkdir(directory,{recursive:true});const resultFile=join(directory,'writer-result.json');let written=await load(resultFile);
    const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope),'Unknown instruction scope');const known=new Set(memoryEntries(retrievals).map(entry=>entry.ref));assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.has(ref)),'Supporting memory must use retrieved collection:chunk_id references. Allowed: '+JSON.stringify([...known]));return value;};
    if(input.frozenQa)assert(written,'Frozen panel replay requires its retained writer result');
-   if(!written){const outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
+   if(!written){let outcome,pause=1;do{outcome=await writerCall(directory,Math.min(180,left()),input.signal,limits=>ops.session({...limits,directory:join(directory,'writer'),config:sessionConfig,knowledge:true,proofRequired:true,selectorOnly:true,resultSchema:schema,proofRecords:writerProofRecords,evidenceGroups:groups,
      prompt:{...(input.revisionFeedback?{revisionFeedback:input.revisionFeedback}:{}),task:'Derive one broadly applicable instruction from the reproduced failure and baseline outcomes, considering '+perspective+'. Search relevant successful memory. State a general principle and when it applies, leaving diagnosis, algorithms and testing choices to the actor. Do not prescribe the exact repair, include code, benchmark identifiers, case constants or claims of universal compiler causes. Use at most 150 words. Return text,scope,memoryRefs,claims. text contains the broad instruction. memoryRefs must use collection:chunk_id from actual KDB results; claims.path is text, with source selectors only.',development,baselineOutcomes:proofRecords,...(panelRevisionSources.length?{revisionSources:panelRevisionSources}:{}),entries},validate}),ops.now);
-    if(outcome.providerTimeout)return {id,providerTimeout:outcome.providerTimeout};
+    if(!outcome.providerTimeout)break;
+    const spent=await load(join(directory,'writer-spend.json'));
+    if(outcome.providerTimeout==='elapsed'||Math.min(left(),spent.seconds-spent.elapsedSeconds)<=pause)return {id,providerTimeout:outcome.providerTimeout};
+    await delay(pause*1000,undefined,{signal:input.signal});pause=Math.min(60,pause*2);
+   }while(left()>0);
+   if(!outcome.written)return {id,providerTimeout:outcome.providerTimeout};
     written=outcome.written;validate(written.value,written.retrievals??[]);await save(resultFile,written);
    }
    else validate(written.value,written.retrievals??[]);
@@ -153,24 +159,54 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const memoryEvidence=memoryEntries(written.retrievals??[]),changeId='failure-first-'+hash([identity,id]).slice(0,24);
    const proposal={action:'update',reason:'Instruction grounded in reproduced baseline failures',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:changeId,scope:written.value.scope,text:written.value.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
    const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
-   const qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
+   let qa,pause=1;do{qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
     ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency,panelAuditEvidence:input.panelAuditEvidence,panelRevisionSources,retryMissingPanelVotes:input.retryMissingPanelVotes}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
+   if(qa.reasonKind!=='infrastructure'||!qa.retryable||Math.min(left(),qa.seconds-qa.elapsedSeconds)<=pause)break;
+   await delay(pause*1000,undefined,{signal:input.signal});pause=Math.min(60,pause*2);
+   }while(left()>0);
    if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:panel?qa.revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
    assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal);
    if(panel)verifyPanelApproval(qa,reviewed);
    const updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
    const candidate={id,instruction:reviewed.changes[0].text,scope:reviewed.changes[0].scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal:reviewed,qa:{verdict:qa.verdict,approval:qa.approval,...(panel?{policy:'panel'}:{})},evidence:written.value.claims.flatMap(claim=>claim.proofs)};
    await save(candidateFile,{identity,candidate});return candidate;
-  }catch(error){if(error.code!=='FAILURE_DESIGN_REJECTED'){infrastructureCause??=error;stop.abort(infrastructureCause);}throw error;}}
-  const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');if(infrastructureCause)throw infrastructureCause;
+  }
+  const settled=await Promise.allSettled(pending),failures=settled.filter(row=>row.status==='rejected');
+  input.signal?.throwIfAborted();
+  const unexpected=failures.find(row=>!['FAILURE_DESIGN_INFRASTRUCTURE','FAILURE_DESIGN_REJECTED'].includes(row.reason.code));
+  if(unexpected)throw unexpected.reason;
   const writers=settled.flatMap(row=>row.status==='fulfilled'&&row.value.providerTimeout?[{id:row.value.id,kind:row.value.providerTimeout}]:[]);
+  const candidates=settled.flatMap(row=>row.status==='fulfilled'&&!row.value.providerTimeout?[row.value]:[]);
+  if(candidates.length){
+   const unique=[...new Map(candidates.map(candidate=>[candidate.instruction,candidate])).values()];
+   await save(registry,{identity,candidates:unique});return unique;
+  }
+  const infra=failures.find(row=>row.reason.code==='FAILURE_DESIGN_INFRASTRUCTURE');
+  if(infra){const result={status:'infrastructure',infrastructure:true,correct:null,reason:infra.reason.message};await save(dispositionFile,{identity,...result});return result;}
   if(writers.length){
    const result={status:'infrastructure',infrastructure:true,correct:null,errorCode:'FAILURE_DESIGN_PROVIDER_TIMEOUT',reason:'Instruction writer provider request timed out',writers};
    await save(dispositionFile,{identity,...result});return result;
   }
-  if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}const candidates=settled.map(row=>row.value);
-  assert(new Set(candidates.map(candidate=>candidate.instruction)).size===(panel?1:perspectives.length),'Distinct instruction candidates required for all selected perspectives');await save(registry,{identity,candidates});return candidates;
+  if(failures.length){const feedback=failures.map(row=>row.reason.revisionFeedback).filter(Boolean);const result={status:'rejected',reason:failures[0].reason.message,...(focused&&!input.revisionFeedback&&feedback.length?{revisionFeedback:feedback.join('\n')}: {})};await save(dispositionFile,{identity,...result});return result;}
+  throw Error('Design completed without a lane disposition');
  };
+ design.canResume=async op=>{
+  if(!await load(join(op.directory,'design-input.json')))return false;
+  for(const id of ['principle-a','principle-b','principle-c']){
+   const lane=join(op.directory,id),spend=await load(join(lane,'writer-spend.json'));
+   if(!spend||spend.running!==false)return false;
+   if(!await load(join(lane,'writer-result.json'))){
+    const termination=await load(join(lane,'writer','termination.json'));
+    if(!['elapsed','provider-error','cancelled','submitted'].includes(termination?.kind))return false;
+   }
+   for(const name of ['qa.json','qa-v2.json']){
+    const qa=await load(join(lane,'qa',name));
+    if(qa?.inFlight||Object.keys(qa?.inFlightOperations??{}).length)return false;
+   }
+  }
+  return true;
+ };
+ return design;
 }
 
 function trials(rows,task){assert(rows?.length===5,'Every arm requires five trials');return rows.map(row=>{assert(!row.infrastructure,'Infrastructure cannot establish skill benefit');return validatePilotTrial(structuredClone(row),task);});}
@@ -262,7 +298,7 @@ export async function verifyFocusedSearchableApproval({config,item,result,manife
  const base=item.base??config.skills.activeVersion;
  const baseline=await skillInput(join(config.root,'skills','versions',base));
  assert.equal(manifest.baseline,baseline.text,'Tested baseline guidance changed');
- assert.equal(result.candidates?.length,3,'Three reviewed candidates required');
+ assert(result.candidates?.length>=1&&result.candidates.length<=3,'Reviewed candidates required');
  const {winner,developmentQualification}=await focusedPublicationEvidence(result,manifest,family,directory,{requireTransfer:false});
  await checkVersion(config,winner);
  assert.equal(winner.base,base);
@@ -272,6 +308,7 @@ export async function verifyFocusedSearchableApproval({config,item,result,manife
  const designDirectory=await focusedDesignOperation(result,family,directory,identity);
  const registry=await load(join(designDirectory,'approved-design.json'));
  assert.equal(registry?.identity,identity,'Design evidence identity changed');
+ assert.deepEqual(registry.candidates,result.candidates,'Reviewed candidate cohort changed');
  assert(registry.candidates.some(candidate=>hash(candidate)===hash(winner)),'Winner differs from its reviewed version');
  await requireFocusedApproval({config,item,base,family,screen,qualification:developmentQualification,designDirectory,identity,winner});
  return designDirectory;
@@ -287,7 +324,7 @@ export async function publishFailureWinner({config,item,result,directory,signal,
  assert.equal(item.objective,'correctness');assert(result.status==='complete'&&result.promising===true&&result.winner,'Transfer-confirmed result required');
  const focused=manifest.mode==='focused-correctness';
  const family=manifest.families.find(row=>row.id===result.selectedFamily);assert(family,'Qualified family required');
- assert(result.candidates.length===3&&new Set(result.candidates.map(candidate=>candidate.id)).size===3,'Three reviewed candidates required');
+ assert(result.candidates.length>=1&&result.candidates.length<=3&&new Set(result.candidates.map(candidate=>candidate.id)).size===result.candidates.length,'Reviewed candidates required');
  let winner,developmentQualification;
  if(focused){({winner,developmentQualification}=await focusedPublicationEvidence(result,manifest,family,directory));}
  else{
@@ -303,6 +340,7 @@ export async function publishFailureWinner({config,item,result,directory,signal,
  const designDirectory=focused?await focusedDesignOperation(result,family,directory,designId):result.operations['design--'+family.id]?.directory;
  assert(designDirectory,'Missing reviewed design operation');const registry=await load(join(designDirectory,'approved-design.json'));
  assert.equal(registry?.identity,designId,'Design evidence identity changed');
+ assert.deepEqual(registry.candidates,result.candidates,'Reviewed candidate cohort changed');
  assert(registry.candidates.some(candidate=>hash(candidate)===hash(winner)),'Winner differs from its reviewed version');
  if(focused)await requireFocusedApproval({config,item,base,family,screen:result.screens[family.id],qualification:developmentQualification,designDirectory,identity:designId,winner});
  const publicationFile=join(directory,'publication.json'),identity=hash({study:result.identity,result:hash(result),base,version:winner.version,text:winner.textSha256,storage:Boolean(config.storage)}),prior=await load(publicationFile);if(prior)assert.equal(prior.identity,identity,'Publication evidence changed');

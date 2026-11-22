@@ -140,7 +140,7 @@ async function verifyScopedReport({directory,result,manifest,config}){
  const base=boundTrials(result,directory,family,family.development,'screen','baseline',result.screens?.[family.id]);
  assert(base&&score(base).exactFailures>=1&&score(base).passes<=3,'Development baseline did not qualify');
  assert.deepEqual(arm(result.development?.baseline,family.development),base,'Development must reuse the screened baseline');
- assert(result.candidates?.length===3&&new Set(result.candidates.map(c=>c.id)).size===3,'Three distinct reviewed candidates required');
+ assert(result.candidates?.length>=1&&result.candidates.length<=3&&new Set(result.candidates.map(c=>c.id)).size===result.candidates.length,'Distinct reviewed candidates required');
  const checked={baseline:base};
  for(const c of result.candidates){
   assert(candidateId(c.id),'Invalid reviewed candidate identifier');

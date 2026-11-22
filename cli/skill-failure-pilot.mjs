@@ -39,7 +39,7 @@ export function validatePilotTrial(result,task){
 }
 function candidates(value){
  const rows=Array.isArray(value)?value:value?.candidates;
- if(rows?.length!==3||rows.some(c=>!slug(c.id)||c.id==='baseline'||!nonempty(c.text)||!Array.isArray(c.evidence)||!c.evidence.length||c.evidence.some(p=>!nonempty(p.reference)))||new Set(rows.map(c=>c.id)).size!==3||new Set(rows.map(c=>c.text)).size!==3)throw Error('Three distinct candidate IDs/texts with evidence selectors required');
+ if(!Array.isArray(rows)||rows.length<1||rows.length>3||rows.some(c=>!slug(c.id)||c.id==='baseline'||!nonempty(c.text)||!Array.isArray(c.evidence)||!c.evidence.length||c.evidence.some(p=>!nonempty(p.reference)))||new Set(rows.map(c=>c.id)).size!==rows.length||new Set(rows.map(c=>c.text)).size!==rows.length)throw Error('Distinct candidate IDs/texts with evidence selectors required');
  return rows;
 }
 const passes=rows=>rows.filter(r=>r.correct===true).length;
@@ -99,6 +99,10 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   if(focused)state.manifestSha256=manifestSha256;
   last=now();
   for(const op of Object.values(state.operations).filter(op=>op.status==='running')){
+   if(op.kind==='design'&&await dependencies.design.canResume?.(clone(op))){
+    op.elapsedSeconds+=Math.max(0,wall()-op.runningAt)/1000;delete op.runningAt;op.status='resumable';
+    continue;
+   }
    const settled=dependencies.settle&&await dependencies.settle({...clone(op),directory:trialAttemptDirectory(op)});
    if(!settled?.closed)return await result('needs-settlement','Interrupted operation custody remains unresolved',{unresolvedOperation:op.id});
    op.elapsedSeconds+=Math.max(0,wall()-op.runningAt)/1000;
@@ -113,6 +117,8 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    (op.result.reason==='Operation elapsed allocation exhausted before result admission'&&op.elapsedSeconds<op.allocatedSeconds));
   const invoke=async(id,kind,input,fn,cap=remaining(),retryAllowed=()=>true)=>{
    const prior=state.operations[id];let attempts;
+   const spent=prior?.status==='resumable'?prior.elapsedSeconds:0;
+   if(prior?.status==='resumable'){cap=prior.allocatedSeconds-spent;if(cap<=0){prior.result={status:'infrastructure',infrastructure:true,correct:null,reason:'Design elapsed allocation exhausted'};prior.status='complete';await persist();return clone(prior.result);}}
    if(prior?.status==='complete'){
     if(!interruptedTrial(prior)||!dependencies.settle)return clone(prior.result);
     expired();
@@ -129,8 +135,8 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
     if(!retryAllowed())return clone(prior.result);
    }
    expired();if(kind==='trial'&&remaining()<cap)throw Object.assign(Error('Insufficient pilot elapsed time for a full actor and verification allocation'),{code:'PILOT_ADMISSION_BUDGET'});
-   const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',...(attempts?{attempts}:{}),directory:join(directory,'operations',id),allocatedSeconds:available,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
-   state.operations[id]=op;working.set(id,{at:now(),prior:0});await mkdir(trialAttemptDirectory(op),{recursive:true});await persist();
+   const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',...(attempts?{attempts}:{}),directory:join(directory,'operations',id),allocatedSeconds:available+spent,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
+   state.operations[id]=op;working.set(id,{at:now(),prior:spent});await mkdir(trialAttemptDirectory(op),{recursive:true});await persist();
    const timeout=AbortSignal.timeout(Math.max(1,Math.ceil(available*1000))),bounded=AbortSignal.any([active,timeout]);
    try{const answer=await fn({...clone(input),directory:trialAttemptDirectory(op),remainingSeconds:available,signal:bounded});
     if(bounded.aborted||(now()-working.get(id).at)/1000>available||remaining()<=0){op.result={infrastructure:true,correct:null,reason:'Operation elapsed allocation exhausted before result admission'};op.status='complete';throw Error('Operation elapsed allocation exhausted');}
@@ -199,7 +205,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   if(focused&&designed?.status==='rejected'&&nonempty(designed.revisionFeedback)){
    designed=await invoke('redesign--'+selected.id,'design',{...designInput,revisionFeedback:designed.revisionFeedback},dependencies.design);
   }
-  if(designed?.status==='infrastructure'&&designed.infrastructure===true&&nonempty(designed.reason))return await result('inconclusive',designed.reason);
+  if(designed?.status==='infrastructure'&&designed.infrastructure===true&&nonempty(designed.reason))return await result('inconclusive',designed.reason,{designUnavailable:true});
   if(designed?.status==='rejected'&&nonempty(designed.reason))return await result('complete',designed.reason,{designRejected:true});
   state.candidates=candidates(designed);await persist();
   const arms=focused?state.candidates:[baseline,...state.candidates];

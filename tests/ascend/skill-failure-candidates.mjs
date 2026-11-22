@@ -172,14 +172,17 @@ test('one scientific rejection lets pending approved siblings finish without inf
   await new Promise((resolve,reject)=>{const aborted=()=>{cancelled++;reject(new DOMException('Sibling cancelled','AbortError'));};if(input.signal.aborted)return aborted();input.signal.addEventListener('abort',aborted,{once:true});setTimeout(()=>{input.signal.removeEventListener('abort',aborted);resolve();},25);});
   completed++;return {verdict:'approved',approval:'reviewed',proposal:input.proposal};
  };
- const out=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.equal(out.status,'rejected');assert.equal(completed,2);assert.equal(cancelled,0);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
+ const out=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);assert.deepEqual(out.map(candidate=>candidate.id),['principle-b','principle-c']);assert.equal(completed,2);assert.equal(cancelled,0);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
-test('infrastructure cancellation retains the original cause rather than a sibling AbortError',async t=>{
- const f=await fixture(t);let entered=0,cancelled=0,ready;const allEntered=new Promise(resolve=>{ready=resolve;}),cause=Object.assign(Error('Memory transport disconnected'),{code:'FAILURE_DESIGN_INFRASTRUCTURE'});
- f.deps.qa=async input=>{if(++entered===3)ready();await allEntered;if(input.directory.endsWith('principle-c/qa'))throw cause;
-  await new Promise((_resolve,reject)=>{const aborted=()=>{cancelled++;reject(new DOMException('Sibling cancelled','AbortError'));};if(input.signal.aborted)aborted();else input.signal.addEventListener('abort',aborted,{once:true});});
+test('a peer QA infrastructure interruption leaves independent reviewed drafts eligible',async t=>{
+ const f=await fixture(t);
+ f.deps.qa=async input=>{
+  if(input.directory.endsWith('principle-c/qa'))return {verdict:'inconclusive',reason:'Memory transport disconnected',reasonKind:'infrastructure'};
+  await new Promise(resolve=>setTimeout(resolve,25));input.signal.throwIfAborted();
+  return {verdict:'approved',approval:'reviewed',proposal:input.proposal};
  };
- await assert.rejects(createFailureDesign({config:f.config,item:f.item},f.deps)(f.input),error=>error===cause);assert.equal(cancelled,2);
+ const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);
+ assert.deepEqual(rows.map(row=>row.id),['principle-a','principle-b']);
 });
 test('a closed native writer timeout cohort is inconclusive and retains its five pilot baselines',async t=>{
  const f=await fixture(t),directory=join(f.root,'timeout-pilot');
@@ -272,7 +275,7 @@ test('failed transfer, partial results and changed approval cannot publish',asyn
  const f=await study(t);const input={config:f.config,item:f.item,directory:f.directory};
  const partial=structuredClone(f.report);partial.confirmation['stride-transfer'].baseline.pop();await writeFile(join(f.directory,'pilot.json'),JSON.stringify(partial));await assert.rejects(publishFailureWinner({...input,result:partial}),/five trials/);
  const bad=structuredClone(f.report);bad.confirmation['reduce-transfer'][bad.winner.id]=Array.from({length:5},()=>result(false));await writeFile(join(f.directory,'pilot.json'),JSON.stringify(bad));await assert.rejects(publishFailureWinner({...input,result:bad}),/Both transfers/);
- const approval=structuredClone(f.report);approval.winner.qa.approval='unreviewed';approval.candidates.find(row=>row.id===approval.winner.id).qa.approval='unreviewed';await writeFile(join(f.directory,'pilot.json'),JSON.stringify(approval));await assert.rejects(publishFailureWinner({...input,result:approval}),/reviewed version/);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
+ const approval=structuredClone(f.report);approval.winner.qa.approval='unreviewed';approval.candidates.find(row=>row.id===approval.winner.id).qa.approval='unreviewed';await writeFile(join(f.directory,'pilot.json'),JSON.stringify(approval));await assert.rejects(publishFailureWinner({...input,result:approval}),/reviewed version|cohort changed/);assert.equal((await readConfig(f.root)).skills.activeVersion,'base');
 });
 test('changed active baseline refuses publication and a lost publisher acknowledgement recovers idempotently',async t=>{
  const f=await study(t);let calls=0;const stale=await publishFailureWinner({config:f.config,item:f.item,result:f.report,directory:f.directory},{readConfig:async()=>({skills:{activeVersion:'someone-else'}}),publish:()=>calls++});assert.equal(stale.published,false);assert.equal(calls,0);
@@ -399,7 +402,7 @@ test('focused review returns concrete feedback for one fresh writing attempt',as
  assert(f.calls.slice(3).every(call=>call.prompt.revisionFeedback===first.revisionFeedback));
 });
 
-async function focusedStudy(t,{redesign=false}={}){
+async function focusedStudy(t,{redesign=false,partial=false}={}){
  const f=await fixture(t),directory=join(f.root,'pilot'),chosen=family();
  for(const [index,task] of [chosen.development,...chosen.transfer].entries()){
   task.files={'kernel.py':'retained failing source for '+task.id};
@@ -407,6 +410,13 @@ async function focusedStudy(t,{redesign=false}={}){
   await writeFile(task.checker,'# Frozen private oracle for '+task.id+'\n');
   task.controls.calibration={files:{'kernel.py':'private calibration for '+task.id}};
   if(index){task.changeType=index===1?'layout':'operation';task.relation='Independent adaptation for '+task.id;}
+ }
+ if(partial){
+  const session=f.deps.session;
+  f.deps.session=async input=>{
+   if(input.directory.includes('principle-a/'))return session(input);
+   throw Object.assign(Error('Writer exhausted'),{reviewSession:{kind:'elapsed'}});
+  };
  }
  if(redesign){
   const approve=f.deps.qaReview;
@@ -478,4 +488,38 @@ test('focused publication requires a separate exact baseline recurrence in each 
  let calls=0;
  await assert.rejects(publishFailureWinner({config:f.config,item:f.item,result:report,directory:f.directory},{publish:()=>++calls}),/Transfer baseline/i);
  assert.equal(calls,0);
+});
+
+test('an independently approved singleton reaches publication only after development and both transfers',async t=>{
+ const f=await focusedStudy(t,{partial:true});
+ assert.deepEqual(f.report.candidates.map(candidate=>candidate.id),['principle-a']);
+ assert.equal(Object.keys(f.report.confirmation).length,2);
+ const saved=await publishFailureWinner({config:f.config,item:f.item,result:f.report,directory:f.directory});
+ assert.equal(saved.published,true);
+});
+
+test('resume reuses a saved draft while both closed exhausted writers stay idle',async t=>{
+ const f=await fixture(t),options={directory:join(f.root,'pilot'),manifest:{baseline:f.input.baseline,identities:f.input.identities,families:[family()]},trialSeconds:1,seconds:120};
+ const session=f.deps.session;let checks=0,writes=0;
+ const design=createFailureDesign({config:f.config,item:f.item},{...f.deps,session:async input=>{
+  writes++;
+  if(input.directory.includes('principle-c/'))return session(input);
+  await mkdir(input.directory,{recursive:true});
+  await writeFile(join(input.directory,'termination.json'),JSON.stringify({kind:'elapsed'}));
+  throw Object.assign(Error('Writer exhausted'),{reviewSession:{kind:'elapsed'}});
+ },qa:async()=>{throw Error('Interrupted after writer submitted');}});
+ const base={qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true}),trial:async input=>{checks++;return input.phase==='screen'?baseline()[input.repetition]:result(input.arm!=='baseline');}};
+ const first=await runFailurePilot(options,{...base,design});
+ assert.equal(first.status,'needs-settlement');assert.equal(checks,5);
+ const op=first.operations['design--retained'];
+ for(const id of ['principle-a','principle-b']){
+  await writeFile(join(op.directory,id,'writer-spend.json'),JSON.stringify({seconds:180,elapsedSeconds:180.01,running:false}));
+ }
+ const resume=createFailureDesign({config:f.config,item:f.item},{...f.deps,session:()=>assert.fail('Writer dispatched during recovery')});
+ const qa=join(op.directory,'principle-c','qa');await mkdir(qa,{recursive:true});
+ await writeFile(join(qa,'qa.json'),JSON.stringify({inFlightOperations:{request:{stage:'qaAnswer'}}}));
+ assert.equal(await resume.canResume(op),false);
+ await rm(join(qa,'qa.json'));
+ const second=await runFailurePilot(options,{...base,design:resume,qualify:()=>assert.fail('Repeated controls'),trial:async input=>{assert.notEqual(input.phase,'screen');return result(input.arm!=='baseline');}});
+ assert.equal(writes,3);assert.equal(second.promising,true,second.reason);assert.deepEqual(second.candidates.map(row=>row.id),['principle-c']);
 });
