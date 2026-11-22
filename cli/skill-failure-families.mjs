@@ -53,8 +53,8 @@ const fingerprintedFile=name=>!name.split('/').some(p=>['.git','node_modules','_
 async function treeFingerprint(repository,tree,signal){
  signal?.throwIfAborted();
  const key=repository+'\0'+tree;if(treeFingerprints.has(key))return treeFingerprints.get(key);
- const records=(await gitRead(repository,['ls-tree','-rz',tree],signal)).split('\0').filter(Boolean).map(line=>{const tab=line.indexOf('\t');return {mode:line.slice(0,6),path:line.slice(tab+1)};}).filter(r=>fingerprintedFile(r.path));
- if(records.length>128||records.some(r=>!['100644','100755'].includes(r.mode)))return null;
+ const records=(await gitRead(repository,['ls-tree','-rlz',tree],signal)).split('\0').filter(Boolean).map(line=>{const tab=line.indexOf('\t');return {mode:line.slice(0,6),size:Number(line.slice(0,tab).trim().split(/\s+/).at(-1)),path:line.slice(tab+1)};}).filter(r=>fingerprintedFile(r.path));
+ if(records.length>128||records.some(r=>r.size>1048576||!['100644','100755'].includes(r.mode)))return null;
  records.sort((a,b)=>{const left=a.path.split('/'),right=b.path.split('/');for(let i=0;i<Math.min(left.length,right.length);i++)if(left[i]!==right[i])return left[i]<right[i]?-1:1;return left.length-right.length;});
  const hash=createHash('sha256');let size=0;for(const r of records){signal?.throwIfAborted();const code=await gitRead(repository,['show',tree+':'+r.path],signal,true);size+=Buffer.byteLength(code);if(size>8388608)return null;hash.update(JSON.stringify([r.path,sha(code)])+'\n');}
  const result=hash.digest('hex');if(treeFingerprints.size>=16)treeFingerprints.delete(treeFingerprints.keys().next().value);treeFingerprints.set(key,result);return result;
@@ -157,21 +157,26 @@ export async function failureSourceInventory({config,item,directory,signal}){
   if(!candidates.length)return [];
   const repositories=[];for(const entry of (await readdir(join(root,'source-history'),{withFileTypes:true}).catch(e=>{if(e.code==='ENOENT')return [];throw e;})).slice(0,256))if(entry.isDirectory())repositories.push(join(root,'source-history',entry.name));
   const sources=[];await mkdir(directory,{recursive:true});
-  for(const {row,attempt,reference}of candidates.slice(0,6)){signal?.throwIfAborted();
+  for(const {row,attempt,reference,data}of candidates.slice(0,6)){signal?.throwIfAborted();
+   const fallback=[],retained=[];
    const spec=JSON.parse(db.prepare('SELECT spec FROM projects WHERE id=?').get(attempt.project)?.spec??'{}');
-   for(const path of [spec.source&&join(spec.source,'kernel.py'),join(root,'attempts',attempt.id,'source/kernel.py')].filter(Boolean))try{const relativePath=relative(root,path),witness=await failureWitness({config,item,provenance:{reference,source:{path:relativePath}},signal});sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
-   if(sources.some(s=>s.reference===reference))continue;
+   for(const path of [spec.source&&join(spec.source,'kernel.py'),join(root,'attempts',attempt.id,'source/kernel.py')].filter(Boolean))try{const relativePath=relative(root,path),witness=await failureWitness({config,item,provenance:{reference,source:{path:relativePath}},signal});fallback.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
+   if(fallback.length&&!hex(data.fingerprint)){sources.push(...fallback);continue;}
    const snapshots=sourceTrees(db,attempt.id,row.sequence);
    for(const snapshot of snapshots){const tree=snapshot.tree;
-    for(const repository of [...(spec.source?[spec.source]:[]),...repositories]){signal?.throwIfAborted();
+    for(const candidate of [...(spec.source?[spec.source]:[]),...repositories]){signal?.throwIfAborted();
+     const repository=await realpath(candidate).catch(()=>null);if(!repository||!inside(root,repository))continue;
      let names;try{names=(await gitRead(repository,['ls-tree','-r','--name-only',tree],signal)).trim().split('\n');}catch{continue;}
+     const matching=hex(data.fingerprint)&&await treeFingerprint(repository,tree,signal)===data.fingerprint;
+     if(!matching&&fallback.length)break;
      for(const file of names.filter(n=>/(^|\/)(kernel|solution|main)\.(py|cpp|c|cce)$/.test(n)).slice(0,8)){
       const provenance={reference,source:{...(snapshot.iterationId?{iterationId:snapshot.iterationId}:{snapshotReference:snapshot.snapshotReference}),repository:relative(root,repository),file}};
-      try{const witness=await failureWitness({config,item,provenance,signal}),path=join(directory,sha([reference,tree,file])+'.txt');await writeFile(path,witness.code);sources.push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
+      try{const witness=await failureWitness({config,item,provenance,signal}),path=join(directory,sha([reference,tree,file])+'.txt');await writeFile(path,witness.code);(matching?retained:fallback).push({reference,source:witness.source,sourceSha256:witness.sourceSha256,path});}catch{}
      }break;
     }
-    if(sources.some(s=>s.reference===reference))break;
+    if(retained.length||(!hex(data.fingerprint)&&fallback.length))break;
    }
+   sources.push(...(retained.length?retained:fallback));
   }
   for(const entry of sources){
    const {attempt,row}=candidates.find(c=>c.reference===entry.reference);

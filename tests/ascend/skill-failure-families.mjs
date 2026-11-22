@@ -121,6 +121,23 @@ test('a different device failure after an edit is not a reproduced or repaired o
 });
 
 
+test('an oversized unrelated Git object preserves hash-bound kernel evidence and omits unverified helpers',async t=>{
+ const f=await fixture(t),history=join(f.root,'source-history','large');
+ await rm(join(f.root,'kernel.py'));await mkdir(history,{recursive:true});
+ execFileSync('git',['init','-q',history]);
+ await writeFile(join(history,'kernel.py'),f.code);
+ await writeFile(join(history,'tensor.bin'),Buffer.alloc(1048577));
+ execFileSync('git',['-C',history,'add','.']);
+ const tree=execFileSync('git',['-C',history,'write-tree'],{encoding:'utf8'}).trim();
+ emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree});
+ const event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:45,fingerprint:await fingerprint(history),
+  correctness:{passed:false,receipt:{kernelSha256:sha(f.code)}}});
+ f.item.evidence.groups[0].occurrences=[{reference:'events:'+event.sequence}];
+ const [entry]=await failureSourceInventory({...f,directory:join(f.root,'index')});
+ assert.equal(await readFile(entry.path,'utf8'),f.code);assert.equal(entry.source.tree,tree);
+ assert.deepEqual(entry.replayInputs,[]);
+});
+
 test('source-history Git metadata is materialized for read-only native research',async t=>{
  const f=await fixture(t),repo=join(f.root,'work');await mkdir(repo);execFileSync('git',['init','-q',repo]);await writeFile(join(repo,'kernel.py'),f.code);await writeFile(join(repo,'check_helpers.py'),'COUNT=7\n');execFileSync('git',['-C',repo,'add','kernel.py','check_helpers.py']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','retained']);const tree=execFileSync('git',['-C',repo,'rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim();
  const history=join(f.root,'source-history/retained');await mkdir(join(f.root,'source-history'));execFileSync('git',['clone','--bare','-q',repo,history]);execFileSync('git',['--git-dir',history,'config','core.bare','false']);
@@ -129,7 +146,7 @@ test('source-history Git metadata is materialized for read-only native research'
  await writeFile(join(investigation,'check.py'),'assert True');
  await symlink(join(f.root,'retained.py'),join(investigation,'good','outside'));
  const proposal=emit(f.state,f.attempt.id,'curriculum-proposal',{proposal:{verifier:'check.py',controls:{positive:'good',negative:['bad','../../outside']}}});
- const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
+ const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false,receipt:{kernelSha256:sha(f.code)}}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
  const isolated=await mkdtemp(join(tmpdir(),'isolated-family-'));t.after(()=>rm(isolated,{recursive:true,force:true}));
  const result=await prepareFailureFamily({...f,directory:isolated,seconds:30},{session:async options=>{
