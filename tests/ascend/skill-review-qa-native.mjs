@@ -397,3 +397,33 @@ test('ordinary audit exposes the frozen starter bytes and retains scoped project
   assert.deepEqual(JSON.parse(await readFile(join(request.directory,frozen.files[0]),'utf8')),contract);
  }});
 });
+
+test('a native answer repairs all rejected evidence refs from one checker response',async t=>{
+ const {root,input,proof,answer,review}=await artifactQaFixture(t);
+ let corrections=0;
+ const provider=await scriptedReview(t,root,body=>{
+  const outputs=body.messages.filter(message=>message.role==='tool');
+  if(String(outputs.at(-1)?.content).includes('Accepted. Finish'))return null;
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  if(!schema.properties.answers)return {name:'submit_review',args:{result:review(proof)}};
+  const value=answer(proof);
+  for(const topic of ['action','mechanism'])value.answers[topic].refs=['input:proposal'];
+  if(outputs.length){
+   const message=String(outputs.at(-1).content),begin=message.indexOf('[{"path":');
+   const details=JSON.parse(message.slice(begin,message.lastIndexOf(']')+1));
+   for(const {path,unknown,eligibleCitedRefs} of details){
+    const [,topic]=path.split('.');
+    value.answers[topic].refs=value.answers[topic].refs.filter(ref=>!unknown.includes(ref)).concat(eligibleCitedRefs);
+   }
+   corrections++;
+  }
+  return {name:'submit_review',args:{result:value}};
+ });
+ const result=await runProposalQa({...input,config:{actor:provider.profile},evaluationContract:{workflow:'failure-first-v1'},
+  projectSummaries:[],learningProofEvidence:[],validateProposal:value=>value},{
+  qaAnswer:async args=>(await nativeQaAnswer(args)).value,qaReview:async args=>(await nativeQaReview(args)).value,
+ });
+ assert.equal(result.verdict,'approved',result.error?.message??result.reason);assert.equal(corrections,1);
+ assert.deepEqual(result.rounds[0].answers.action.refs,[proof.reference]);
+ assert.deepEqual(result.rounds[0].answers.mechanism.refs,[proof.reference]);
+});

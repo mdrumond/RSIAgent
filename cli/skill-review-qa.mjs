@@ -26,9 +26,18 @@ function validateQaFindings(value){
 }
 export function validateQaAnswers(value,refs){
  if(!value?.answers)throw Error('QA requires five structured answers');
- for(const topic of qaTopics){const answer=value.answers[topic];
-  if(!answer?.text?.trim()||!Array.isArray(answer.refs)||answer.refs.some(ref=>!refs.has(ref)))throw Error('QA answer requires text and actual evidence references: '+topic);
+ const invalid=[];
+ for(const topic of qaTopics){
+  const answer=value.answers[topic];
+  if(!answer?.text?.trim()||!Array.isArray(answer.refs))throw Error('QA answer requires text and actual evidence references: '+topic);
+  const unknown=[...new Set(answer.refs.filter(ref=>!refs.has(ref)))];
+  if(unknown.length){
+   const related=(value.claims??[]).filter(claim=>claim.path==='answers.'+topic+'.text')
+    .flatMap(claim=>(claim.proofs??[]).map(proof=>proof.reference)).filter(ref=>refs.has(ref));
+   invalid.push({path:'answers.'+topic+'.refs',unknown,eligibleCitedRefs:[...new Set([...answer.refs.filter(ref=>refs.has(ref)),...related])]});
+  }
  }
+ if(invalid.length)throw Error('QA answer requires actual evidence references. Correct the listed refs using evidence that supports the answer. Input selectors can identify proposal text in claim proofs. '+JSON.stringify(invalid));
  return value;
 }
 export function validateQaVerdict(value){
