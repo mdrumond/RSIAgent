@@ -267,3 +267,17 @@ test('unexpected classifier errors propagate to the campaign worker',async t=>{
   analyze:args=>analyzeBacklog(args,{classify:()=>{throw Error('unexpected database error');}})
  }),/unexpected database error/);
 });
+
+test('elapsed page preparation returns to the worker before a classifier request is started',async t=>{
+ const f=await fixture(t);
+ await f.verify(f.start('clock'),'one.log','first failure');
+ let now=0;
+ const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
+  analyze:args=>analyzeBacklog({...args,remainingSeconds:1},{now:()=>{const before=now;now+=1000;return before;},
+   classify:()=>assert.fail('Expired page must not start a provider request')})
+ });
+ const result=await step();
+ assert.equal(result.status,'idle');
+ assert.equal(result.classificationPage,'retry');
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
+});

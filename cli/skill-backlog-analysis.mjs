@@ -30,7 +30,7 @@ function allocation(seconds,signal,now=()=>performance.now()){
  if(!Number.isFinite(seconds)||seconds<=0)throw Error('Positive remaining elapsed allowance required');
  const started=now(),remaining=()=>Math.max(0,seconds-(now()-started)/1000);
  return {remaining,elapsed:()=>seconds-remaining(),call:async(fn,input,cap=120)=>{
-  signal?.throwIfAborted();const left=Math.min(remaining(),cap);if(left<=0)throw Error('Analysis elapsed allocation exhausted');
+  signal?.throwIfAborted();const left=Math.min(remaining(),cap);if(left<=0)throw Object.assign(Error('Analysis elapsed allocation exhausted'),{code:'ANALYSIS_PAGE_ELAPSED'});
   return unwrap(await fn({...input,seconds:left,signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left*1000)))])}));
  }};
 }
@@ -229,7 +229,7 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
     const elapsedSeconds=spent+(now()-begun)/1000,status=stageError(error,elapsedSeconds,grantSeconds)?'blocked':'retry';
     for(const group of members)stages[identity(group)]={stage:'classification',status,spendFile,allocatedSeconds:grantSeconds,reason:error.message,elapsedSeconds};
     persist();
-    const pageFailure=['elapsed','no-submit','rejected-submissions','interrupted-unknown-spend'].includes(error.reviewSession?.kind)||error.reviewSession?.retryableTimeout===true;
+    const pageFailure=error.code==='ANALYSIS_PAGE_ELAPSED'||['elapsed','no-submit','rejected-submissions','interrupted-unknown-spend'].includes(error.reviewSession?.kind)||error.reviewSession?.retryableTimeout===true;
     if(classificationOnly&&!signal?.aborted&&pageFailure)
      return {analyzed:0,items:[],classificationPage:{status,reason:error.message}};
     throw error;
