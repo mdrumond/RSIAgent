@@ -1,5 +1,5 @@
 /** Evidence-reviewed instruction candidates; only the tested immutable version can publish. */
-import {reviewScopedArtifact,scopedReviewIdentity,scopedPolicy} from './skill-scoped-review.mjs';
+import {reviewScopedArtifact,scopedReviewIdentity,scopedPolicy,scopedSession} from './skill-scoped-review.mjs';
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -99,13 +99,15 @@ export function validateAdditiveDesignChange(changes,changeId){
 }
 
 /** Freeze a single additive diff before the experiment author sees it. */
-export async function prepareScopedWriting({config,knowledgeConfig=config,item,directory,seconds,signal},dependencies={}){
+export async function prepareScopedWriting({config,knowledgeConfig=config,item,directory,seconds,signal,frozenContext},dependencies={}){
  const session=dependencies.session??reviewSession,review=dependencies.review??reviewScopedArtifact;
  const base=item.base,entries=await guidanceEntries(config.root,base),baseline=await skillInput(join(config.root,'skills','versions',base));
  const groups=reviewGroups(item),refs=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(r=>r.reference));
  assert(refs.length&&base===config.skills.activeVersion,'Ranked original evidence and active skill base required');
  const brief={issue:item.id,groupIds:item.groupIds,objective:item.objective,reason:item.reason,classifications:item.preparation?.classifications,evidence:refs};
- const identity=hash({policy:scopedPolicy,brief,base,baseline:baseline.sha256,groups});
+ const identity=hash({policy:scopedPolicy,brief,base,baseline:baseline.sha256,groups,frozenContext});
+ const contextFile=join(directory,'context.json'),context=await load(contextFile);
+ if(context)assert.equal(context.identity,identity,'Ranked writing input changed');else await save(contextFile,{identity});
  const start=performance.now(),left=()=>{signal?.throwIfAborted();const remaining=seconds-(performance.now()-start)/1000;assert(remaining>0,'Writing elapsed allowance exhausted');return remaining;};
  let feedback;
  for(let revision=1;;revision++){
@@ -113,7 +115,7 @@ export async function prepareScopedWriting({config,knowledgeConfig=config,item,d
   await mkdir(round,{recursive:true});
   const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope));const known=memoryEntries(retrievals).map(e=>e.ref);assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.includes(ref)),'Use retrieved memory references');return value;};
   let written=await load(draftFile);
-  if(!written){written=await session({directory:join(round,'writer'),config:knowledgeConfig,seconds:left(),signal,knowledge:true,evidenceGroups:groups,proofRequired:true,selectorOnly:true,resultSchema:schema,
+  if(!written){written=await scopedSession(session,{directory:join(round,'writer'),config:knowledgeConfig,seconds:left(),signal,knowledge:true,evidenceGroups:groups,proofRequired:true,selectorOnly:true,resultSchema:schema,
    prompt:{brief,entries,feedback,task:'Propose a single broadly applicable additive instruction for this ranked failure. Use the original failure evidence and retrieve relevant successful memory. Return text of at most 150 words, scope, memoryRefs from your retrievals, and claims for text. Address a prior reviewer defect when present.'},validate});
    await save(draftFile,{...written,scopedIdentity:identity});written={...written,scopedIdentity:identity};}
   assert.equal(written.scopedIdentity,identity,'Ranked writing input changed');validate(written.value,written.retrievals??[]);await writerHealthy(written);

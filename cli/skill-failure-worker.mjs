@@ -19,7 +19,8 @@ export function failureProtocol(config){
  const requested=config.skills?.failureFirst;
  if(!requested?.enabled||!['a3','a5'].includes(config.target))throw Error('Explicit A3 or A5 failure-first configuration required');
  if(!/^[a-f0-9]{40}$/.test(requested.sourceRevision??''))throw Error('Pin the installed machinery source revision before A/B startup');
- const protocol={workflow:'failure-first-v1',...failureTiming,sampleSeconds:failureTiming.actorSeconds+failureTiming.verificationSeconds,concurrency:4,repetitions:5,candidates:3};
+ if(requested.experimentPolicy!==undefined&&requested.experimentPolicy!=='scoped-v1')throw Error('Unknown failure-first experiment policy');
+ const protocol={...(requested.experimentPolicy?{experimentPolicy:requested.experimentPolicy}:{}),workflow:'failure-first-v1',...failureTiming,sampleSeconds:failureTiming.actorSeconds+failureTiming.verificationSeconds,concurrency:4,repetitions:5,candidates:requested.experimentPolicy?1:3};
  for(const [key,value]of Object.entries(protocol))if(requested[key]!==undefined&&requested[key]!==value)throw Error('Unsupported failure-first protocol field: '+key);
  if(requested.objectives&&JSON.stringify(requested.objectives)!==JSON.stringify(['correctness']))throw Error('Initial failure-first rollout supports correctness only');
  return protocol;

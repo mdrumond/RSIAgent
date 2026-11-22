@@ -186,7 +186,13 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   let writing;
   if(cp.experimentPolicy===scopedPolicy){
    phase('writing');
-   writing=await ops.writing({config,knowledgeConfig,item:run.snapshot,directory:join(cp.directory,'writing'),seconds:remaining(),signal:active});
+   try{
+    writing=await ops.writing({config,knowledgeConfig,item:run.snapshot,directory:join(cp.directory,'writing'),seconds:remaining(),signal:active,
+     frozenContext:{memory:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null,writer:await ops.model(config.skill_writer_actor??config.actor),source:config.skills.failureFirst.sourceRevision}});
+   }catch(error){
+    if(!signal?.aborted&&error.reviewSession)return finish('inconclusive',{reason:'writing-'+error.reviewSession.kind,stage:'writing',detail:error.message});
+    throw error;
+   }
   }
   phase('isolate');
   const priorFamily=await optional(join(cp.directory,'family-ready.json'));
@@ -226,6 +232,10 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   try{
    prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(writing?{approvedInstruction:writing.fields}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
+   if(writing&&referenceError?.reviewSession&&!signal?.aborted){
+    if(runtime){closed=await runtime.close();runtime=null;if(!closed)throw Error('Test review execution remains unresolved');}
+    return finish('inconclusive',{reason:'test-review-'+referenceError.reviewSession.kind,stage:'test-review',detail:referenceError.message});
+   }
    if(referenceError)throw referenceError;
    active.throwIfAborted();
    const disposition=error.reviewSession?.kind;

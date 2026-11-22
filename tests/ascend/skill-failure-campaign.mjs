@@ -382,3 +382,22 @@ test('scoped campaign repairs immutable writing and test independently before ma
   assert.equal(events.filter(([event,lane])=>event==='trial'&&lane!=='baseline').length,baseline==='reproduced'?15:0);
  }
 });
+
+test('a closed writer provider timeout resumes its request within the original grant',async()=>{
+ const {scopedSession}=await import('../../cli/skill-scoped-review.mjs');
+ const grants=[];
+ const value=await scopedSession(async args=>{
+  grants.push(args.seconds);
+  if(grants.length===1)throw Object.assign(Error('Request timed out'),{reviewSession:{kind:'provider-error',retryableTimeout:true}});
+  return 'submitted';
+ },{seconds:4});
+ assert.equal(value,'submitted');assert.equal(grants.length,2);assert(grants[1]<grants[0]-.8);
+});
+test('a normally closed writer without submission releases its family and leaves the next eligible',async t=>{
+ const f=await fixture(t);
+ f.config.skills.failureFirst.experimentPolicy='scoped-v1';
+ const error=Object.assign(Error('Finished without submission'),{reviewSession:{kind:'no-submit'}});
+ const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,writing:async()=>{throw error;},runtime:async()=>assert.fail('Closed writer requested evaluation')});
+ assert.equal(result.status,'inconclusive');assert.equal(result.reason,'writing-no-submit');
+ assert.equal(f.backlog.run(f.item.id),null);
+});

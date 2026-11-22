@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {setTimeout as delay} from 'node:timers/promises';
 import {join} from 'node:path';
 import {Type} from 'typebox';
 import {reviewSession} from './skill-review-native.mjs';
@@ -15,6 +16,21 @@ const verdictSchema=Type.Union([
 
 export function scopedReviewIdentity({scope,brief,fields,sources=[]}){
  return artifactHash({scope,brief,fields,sources:sources.map(({reference,text})=>[reference,artifactHash(text)])});
+}
+
+// Pi retries individual requests. Reopen a closed timed-out turn under its original elapsed grant.
+export async function scopedSession(session,request){
+ const started=performance.now();let pause=1;
+ for(;;){
+  request.signal?.throwIfAborted();
+  const left=()=>request.seconds-(performance.now()-started)/1000;
+  try{return await session({...request,seconds:Math.max(.001,left())});}
+  catch(error){
+   request.signal?.throwIfAborted();
+   if(!error.reviewSession?.retryableTimeout||error.reviewSession.kind!=='provider-error'||left()<=pause)throw error;
+   await delay(pause*1000,undefined,{signal:request.signal});pause=Math.min(30,pause*2);
+  }
+ }
 }
 
 export async function reviewScopedArtifact({scope,fields,brief,directory,config,seconds,signal,allowedPaths=[],evidenceGroups=[],sources=[]},session=reviewSession){
@@ -36,7 +52,7 @@ export async function reviewScopedArtifact({scope,fields,brief,directory,config,
  for(const [key,text] of Object.entries(fields))displayed[key]=text.length<=2000?text:await page(key,text);
  const evidence=[];
  for(const {reference,text} of sources)evidence.push(await page(reference,text));
- const {value}=await session({directory,config,seconds,signal,knowledge:false,allowedPaths:[...allowedPaths,sourceDirectory],evidenceGroups,resultSchema:verdictSchema,
+ const {value}=await scopedSession(session,{directory,config,seconds,signal,knowledge:false,allowedPaths:[...allowedPaths,sourceDirectory],evidenceGroups,resultSchema:verdictSchema,
   prompt:{scope,brief,fields:displayed,evidence,task:scope==='writing'?'Review only the proposed instruction for factual accuracy, applicability to the ranked issue, and clear reusable guidance. Benchmark design and empirical effectiveness are evaluated later. Approve the submitted text or quote one material defect for the writer.':'Review whether this test discriminates the ranked failure, whether the oracle and controls test the stated mechanism, and whether transfers preserve it. Inspect the referenced checker files. Approve the submitted test or quote one material defect for the test author.'},validate});
  return {...validate(value),identity:scopedReviewIdentity({scope,brief,fields,sources})};
 }
