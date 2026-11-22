@@ -203,7 +203,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    ...(focused?{mode:manifest.mode,qualification:state.qualifications[selected.id+'--'+selected.development.id]}:{})};
   let designed=await invoke('design--'+selected.id,'design',designInput,dependencies.design);
   if(focused&&designed?.status==='rejected'&&nonempty(designed.revisionFeedback)){
-   designed=await invoke('redesign--'+selected.id,'design',{...designInput,revisionFeedback:designed.revisionFeedback},dependencies.design);
+   designed=await invoke('redesign--'+selected.id,'design',{...designInput,revisionFeedback:designed.revisionFeedback,...(designed.revisionCandidates?{revisionCandidates:designed.revisionCandidates}:{})},dependencies.design);
   }
   if(designed?.status==='infrastructure'&&designed.infrastructure===true&&nonempty(designed.reason))return await result('inconclusive',designed.reason,{designUnavailable:true});
   if(designed?.status==='rejected'&&nonempty(designed.reason))return await result('complete',designed.reason,{designRejected:true});

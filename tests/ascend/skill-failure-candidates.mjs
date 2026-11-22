@@ -491,7 +491,9 @@ test('focused publication requires a separate exact baseline recurrence in each 
 });
 
 test('an independently approved singleton reaches publication only after development and both transfers',async t=>{
- const f=await focusedStudy(t,{partial:true});
+ const f=await focusedStudy(t,{partial:true,redesign:true});
+ assert.deepEqual(f.report.operations['design--retained'].result.revisionCandidates,['principle-a']);
+ assert.equal(f.calls.filter(call=>call.directory.includes('/redesign--')).length,1);
  assert.deepEqual(f.report.candidates.map(candidate=>candidate.id),['principle-a']);
  assert.equal(Object.keys(f.report.confirmation).length,2);
  const saved=await publishFailureWinner({config:f.config,item:f.item,result:f.report,directory:f.directory});

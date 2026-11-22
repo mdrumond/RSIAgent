@@ -83,7 +83,7 @@ async function writerCall(directory,seconds,signal,fn,now){
   const terminal=error?.reviewSession;
   signal?.throwIfAborted();
   if(unsubmittedKinds.includes(terminal?.kind)||terminal?.kind==='provider-error'&&!terminal.retryableTimeout)return {unavailable:terminal.kind};
-  if(terminal?.kind==='elapsed'||terminal?.retryableTimeout===true&&terminal.kind==='provider-error')return {providerTimeout:terminal.kind};
+  if(terminal?.kind==='elapsed'||terminal?.retryableTimeout===true&&terminal.kind==='provider-error')return {providerTimeout:terminal.kind,observedTimeout:terminal.retryableTimeout===true};
   throw error;
  }finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
 }
@@ -106,7 +106,9 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const panel=input.qaPolicy==='panel';
   if(panel)assert(focused&&['principle-a','principle-b','principle-c'].includes(input.reviewCandidate),'Select one focused candidate for panel review');
   else assert(!input.reviewCandidate&&!input.frozenQa,'Frozen candidate review requires the panel policy');
-  const designInput={identity,...(panel?{qaPolicy:'panel',reviewCandidate:input.reviewCandidate,frozenQaSha256:input.frozenQa?hash(input.frozenQa):null,
+  const laneIds=perspectives.map((_,index)=>'principle-'+String.fromCharCode(97+index));
+  if(input.revisionCandidates)assert(!panel&&input.revisionFeedback&&Array.isArray(input.revisionCandidates)&&input.revisionCandidates.length&&input.revisionCandidates.every(id=>laneIds.includes(id)),'Invalid redesign lanes');
+  const designInput={identity,...(input.revisionCandidates?{revisionCandidates:input.revisionCandidates,revisionFeedback:input.revisionFeedback}:{}),...(panel?{qaPolicy:'panel',reviewCandidate:input.reviewCandidate,frozenQaSha256:input.frozenQa?hash(input.frozenQa):null,
    panelAuditEvidenceSha256:hash(input.panelAuditEvidence??[]),revisionFeedback:input.revisionFeedback??null}:{})};
   const inputFile=join(input.directory,'design-input.json'),priorInput=await load(inputFile);
   if(priorInput)assert.deepEqual(priorInput,designInput,'Instruction evidence changed');else await save(inputFile,designInput);
@@ -137,7 +139,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   const writerProofRecords=[...primaryRecords,...proofRecords,...panelRevisionSources];
   const pending=perspectives.flatMap((perspective,index)=>{
    const id='principle-'+String.fromCharCode(97+index);
-   if(panel&&id!==input.reviewCandidate)return [];
+   if(panel&&id!==input.reviewCandidate||input.revisionCandidates&&!input.revisionCandidates.includes(id))return [];
    return [runCandidate(id,perspective)];
   });
   async function runCandidate(id,perspective){
@@ -154,10 +156,10 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
     if(outcome.unavailable)return {id,unavailable:outcome.unavailable};
     if(!outcome.providerTimeout)break;
     const spent=await load(join(directory,'writer-spend.json'));
-    if(outcome.providerTimeout==='elapsed'||Math.min(left(),spent.seconds-spent.elapsedSeconds)<=pause)return {id,providerTimeout:outcome.providerTimeout};
+    if(outcome.providerTimeout==='elapsed'||Math.min(left(),spent.seconds-spent.elapsedSeconds)<=pause)return {id,providerTimeout:outcome.providerTimeout,observedTimeout:outcome.observedTimeout===true};
     await delay(pause*1000,undefined,{signal:input.signal});pause=Math.min(60,pause*2);
    }while(left()>0);
-   if(!outcome.written)return {id,providerTimeout:outcome.providerTimeout};
+   if(!outcome.written)return {id,providerTimeout:outcome.providerTimeout,observedTimeout:outcome.observedTimeout===true};
     written=outcome.written;validate(written.value,written.retrievals??[]);await save(resultFile,written);
    }
    else validate(written.value,written.retrievals??[]);
@@ -170,7 +172,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    if(panel||qa.reasonKind!=='infrastructure'||!qa.retryable||!qa.error?.reviewSession?.retryableTimeout||Math.min(left(),qa.seconds-qa.elapsedSeconds)<=pause)break;
    await delay(pause*1000,undefined,{signal:input.signal});pause=Math.min(60,pause*2);
    }while(left()>0);
-   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:panel?qa.revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
+   if(qa.verdict!=='approved')throw Object.assign(Error(qa.reason??'Instruction review rejected'),{lane:id,code:qa.reasonKind==='infrastructure'?'FAILURE_DESIGN_INFRASTRUCTURE':'FAILURE_DESIGN_REJECTED',...(qa.revisionFeedback?.trim()?{revisionFeedback:panel?qa.revisionFeedback:id+': '+qa.revisionFeedback}:{} )});
    assert(qa.approval&&left()>0,'QA approval and remaining experiment time required');const reviewed=validateProposal(qa.proposal);
    if(panel)verifyPanelApproval(qa,reviewed);
    const updated=applyProposal(entries,reviewed.changes,{allowPruning:false,history:[]}),version=await writeVersion(config.root,updated,join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
@@ -187,11 +189,16 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    const unique=[...new Map(candidates.map(candidate=>[candidate.instruction,candidate])).values()];
    await save(registry,{identity,candidates:unique});return unique;
   }
+  const revisions=failures.filter(row=>row.reason.code==='FAILURE_DESIGN_REJECTED'&&row.reason.revisionFeedback);
+  if(focused&&!input.revisionFeedback&&revisions.length){
+   const result={status:'rejected',reason:revisions[0].reason.message,revisionFeedback:revisions.map(row=>row.reason.revisionFeedback).join('\n'),...(!panel?{revisionCandidates:revisions.map(row=>row.reason.lane)}:{}),...(writers.length?{writers}:{})};
+   await save(dispositionFile,{identity,...result});return result;
+  }
   const infra=failures.find(row=>row.reason.code==='FAILURE_DESIGN_INFRASTRUCTURE');
   if(infra&&panel)throw infra.reason;
   if(infra){const result={status:'infrastructure',infrastructure:true,correct:null,reason:infra.reason.message};await save(dispositionFile,{identity,...result});return result;}
   if(writers.length){
-   const onlyTimeouts=settled.every(row=>row.status==='fulfilled'&&row.value.providerTimeout);
+   const onlyTimeouts=settled.every(row=>row.status==='fulfilled'&&row.value.observedTimeout);
    const result={status:'infrastructure',infrastructure:true,correct:null,errorCode:onlyTimeouts?'FAILURE_DESIGN_PROVIDER_TIMEOUT':'FAILURE_DESIGN_UNAVAILABLE',reason:onlyTimeouts?'Instruction writer provider request timed out':'No writer produced a review-approved instruction',writers};
    await save(dispositionFile,{identity,...result});return result;
   }
@@ -203,7 +210,8 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
   if(!input)return false;
   const ids=['principle-a','principle-b','principle-c'];
   if(input.qaPolicy==='panel'&&!ids.includes(input.reviewCandidate))return false;
-  for(const id of input.qaPolicy==='panel'?[input.reviewCandidate]:ids){
+  if(input.revisionCandidates&&(!Array.isArray(input.revisionCandidates)||!input.revisionCandidates.length||!input.revisionCandidates.every(id=>ids.includes(id))))return false;
+  for(const id of input.qaPolicy==='panel'?[input.reviewCandidate]:(input.revisionCandidates??ids)){
    const lane=join(op.directory,id),spend=await load(join(lane,'writer-spend.json')),draft=await load(join(lane,'writer-result.json'));
    if(spend?spend.running!==false:!(input.frozenQaSha256&&draft))return false;
    if(!draft){
