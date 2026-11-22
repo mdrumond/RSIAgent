@@ -144,7 +144,7 @@ export async function legacyFailureRuntimePreDispatchClosures({directory,config,
   for(const [key,operation] of Object.entries(pilot.operations)){
    signal?.throwIfAborted();
    const op=join(pilotDirectory,'operations',key),result=operation.result;
-   if(!/^screen--[\w-]+--development--baseline--\d+$/.test(key)||operation.directory!==op||operation.kind!=='trial'||
+   if(!/^screen--[\w-]+--development--baseline--\d+$/.test(key)||operation.directory!==op||operation.kind!=='trial'||operation.attempts?.length||
       result?.infrastructure!==true||result.correct!==null||result.handle||
       !['Actor custody remains unresolved','Operation elapsed allocation exhausted before result admission'].includes(result.reason))continue;
    try{
@@ -328,7 +328,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
    if(actor.session){const contamination=kdbContamination(await readFile(actor.session,'utf8'));if(contamination)return contamination;}
    if(actor.providerTimeout||actor.error&&!actor.timedOut)
     return {infrastructure:true,correct:null,reason:'Native session failed: '+(actor.providerTimeout??actor.error),
-     ...(actor.errorCode?{errorCode:actor.errorCode}:{}),...(actor.bucket?{bucket:actor.bucket}:{})};
+     ...(actor.providerTimeout?{errorCode:'FAILURE_TRIAL_PROVIDER_TIMEOUT'}:actor.errorCode?{errorCode:actor.errorCode}:{}),...(actor.bucket?{bucket:actor.bucket}:{})};
    const files={};async function gather(path,prefix=''){for(const entry of await readdir(path,{withFileTypes:true})){if(entry.name.startsWith('.')||['__pycache__','node_modules'].includes(entry.name))continue;const name=prefix+entry.name;if(entry.isDirectory())await gather(join(path,entry.name),name+'/');else if(entry.isFile()&&entry.name!=='public_verify.py'&&(Object.hasOwn(input.task.files,name)||/\.(py|c|cc|cpp|cxx|cce|h|hpp|inc|cmake|sh|json|md)$/.test(name)||['Makefile','CMakeLists.txt'].includes(name))){assert((await stat(join(path,entry.name))).size<=16*1048576,'Source artifact too large');files[name]=await readFile(join(path,entry.name),'utf8');}}}await gather(cwd);assert(files['kernel.py'],'Candidate kernel missing');
    const protectedNames=[...new Set([...Object.keys(input.task.protectedFiles??{}),...['CONTRACT.md','WORKLOAD.md','case.json','cases.json'].filter(n=>Object.hasOwn(input.task.files,n))])];const unchanged=protectedNames.every(name=>files[name]===input.task.files[name])&&(await readFile(join(cwd,'public_verify.py'),'utf8'))===frozen.publicChecker;
    const rows=await verify(privateRoot,slot,input.task,[{key:'verification',files}],verificationSeconds,input.signal,input.familyId);assert.equal(rows.length,1,'Trusted verification row missing');const row=rows[0],value=failureReceipt(row,input.task);

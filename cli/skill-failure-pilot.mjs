@@ -111,7 +111,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
   const interruptedTrial=op=>op?.kind==='trial'&&op.result?.infrastructure===true&&op.result.correct===null&&(
    op.result.errorCode==='FAILURE_TRIAL_PROVIDER_TIMEOUT'||/^Native session failed: Request timed out\.?$/i.test(op.result.reason)||
    (op.result.reason==='Operation elapsed allocation exhausted before result admission'&&op.elapsedSeconds<op.allocatedSeconds));
-  const invoke=async(id,kind,input,fn,cap=remaining())=>{
+  const invoke=async(id,kind,input,fn,cap=remaining(),retryAllowed=()=>true)=>{
    const prior=state.operations[id];let attempts;
    if(prior?.status==='complete'){
     if(!interruptedTrial(prior)||!dependencies.settle)return clone(prior.result);
@@ -126,6 +126,7 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
     const pause=Math.min(60,2**Math.min(attempts.length-1,6));
     if(remaining()<cap+pause)throw Object.assign(Error('Insufficient elapsed time for interrupted trial recovery'),{code:'PILOT_ADMISSION_BUDGET'});
     await delay(pause*1000,undefined,{signal:active});
+    if(!retryAllowed())return clone(prior.result);
    }
    expired();if(kind==='trial'&&remaining()<cap)throw Object.assign(Error('Insufficient pilot elapsed time for a full actor and verification allocation'),{code:'PILOT_ADMISSION_BUDGET'});
    const available=kind==='trial'?cap:Math.min(cap,remaining()),op={id,kind,status:'running',...(attempts?{attempts}:{}),directory:join(directory,'operations',id),allocatedSeconds:available,...(kind==='trial'?{actorSeconds:input.actorSeconds,verificationSeconds:input.verificationSeconds}:{}),elapsedSeconds:0,runningAt:wall()};
@@ -141,11 +142,11 @@ export async function runFailurePilot({directory,manifest,seconds=7200,trialSeco
    const outputs=Object.fromEntries(arms.map(a=>[a.id,[]]));let cursor=0,failure;
    const workers=Array.from({length:Math.min(concurrency,cells.length)},async()=>{
     while(!failure&&cursor<cells.length){const {arm,repetition}=cells[cursor++],id=[phase,family.id,task.id,arm.id,repetition].join('--');
-     try{let answer;do{answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,...(manifest.mode?{mode:manifest.mode}:{}),actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds),task);
-      }while(dependencies.settle&&interruptedTrial(state.operations[id]));
+     try{let answer;do{answer=validatePilotTrial(await invoke(id,'trial',{phase,familyId:family.id,task,arm:arm.id,guidance:arm.text,repetition,identities:manifest.identities,...(manifest.mode?{mode:manifest.mode}:{}),actorSeconds:trialSeconds,verificationSeconds},dependencies.trial,trialSeconds+verificationSeconds,()=>!failure),task);
+      }while(!failure&&dependencies.settle&&interruptedTrial(state.operations[id]));
       outputs[arm.id][repetition]=answer;
       if(answer.infrastructure)throw Object.assign(Error(answer.reason),{code:'PILOT_INFRASTRUCTURE'});}
-     catch(error){failure??=error;}
+     catch(error){if(!failure||error.code==='PILOT_CUSTODY')failure=error;}
     }
    });await Promise.all(workers);if(failure)throw failure;
    return outputs;

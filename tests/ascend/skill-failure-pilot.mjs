@@ -359,10 +359,10 @@ test('closed Pi timeout retries its own cell with fresh comparable grants while 
  const f=await fixture(t),calls=[],timeouts=new Set();
  const options={...f.options,verificationSeconds:2};
  const report=await runFailurePilot(options,{...f.ops,
-  settle:async op=>{assert.equal(op.result.reason,'Native session failed: Request timed out.');return {closed:true};},
+  settle:async op=>{assert.equal(op.result.errorCode,'FAILURE_TRIAL_PROVIDER_TIMEOUT');return {closed:true};},
   trial:async input=>{
    calls.push(input);
-   if(input.repetition===0&&!timeouts.size){timeouts.add(input.directory);return {infrastructure:true,correct:null,reason:'Native session failed: Request timed out.'};}
+   if(input.repetition===0&&!timeouts.size){timeouts.add(input.directory);return {infrastructure:true,correct:null,reason:'Native session failed: upstream provider timeout at gateway',errorCode:'FAILURE_TRIAL_PROVIDER_TIMEOUT'};}
    await delay(5);input.signal.throwIfAborted();return result(true);
   }});
  assert.equal(report.status,'complete');assert.equal(calls.length,6);
@@ -387,4 +387,25 @@ test('old sibling cancellation migrates only after settlement and leaves scored 
  const recovered=await runFailurePilot(f.options,{...adapters,settle:async()=>({closed:true})});
  assert.equal(recovered.status,'complete');assert.equal(calls.length,1);assert.equal(recovered.operations[op.id].attempts[0].elapsedSeconds,3);
  assert.deepEqual(recovered.qualifications,original.qualifications);
+});
+
+test('terminal sibling failure prevents retry dispatch and lets a scored sibling finish',async t=>{
+ const f=await fixture(t),calls=[];
+ const terminal={infrastructure:true,correct:null,reason:'Verification unavailable'};
+ const report=await runFailurePilot(f.options,{...f.ops,settle:async()=>({closed:true}),trial:async input=>{
+  calls.push(input.repetition);
+  if(input.repetition===0)return {...terminal,reason:'Native session failed: Request timed out.'};
+  if(input.repetition===1){await delay(20);return terminal;}
+  await delay(40);input.signal.throwIfAborted();return result(true);
+ }});
+ assert.equal(report.reason,terminal.reason);assert.equal(calls.filter(id=>id===0).length,1);
+ assert(Object.values(report.operations).some(op=>op.kind==='trial'&&op.result.correct));
+});
+
+test('remaining pilot allowance caps repeated closed provider timeouts',async t=>{
+ const f=await fixture(t);let calls=0,clock=0;
+ const report=await runFailurePilot({...f.options,seconds:4,trialSeconds:2,concurrency:1},{...f.ops,now:()=>clock,
+  settle:async()=>({closed:true}),trial:async()=>{calls++;clock+=1000;return {infrastructure:true,correct:null,reason:'Native session failed: Request timed out.'};}});
+ assert.equal(calls,2);assert.equal(report.status,'inconclusive');assert.match(report.reason,/elapsed time/);
+ assert.equal(report.elapsedSeconds,2);assert.equal(report.screens.first,undefined);
 });

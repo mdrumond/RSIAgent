@@ -164,7 +164,7 @@ test('native Pi exhausting the actor grant during provider timeout retry skips s
  await writeFile(checker,'pass');await writeFile(credentials_file,'RSI_TEST_PROVIDER=fixture\n');
  const server=createServer(async(req,res)=>{
   for await(const _ of req){}
-  res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'Request timed out'}}));
+  res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'upstream provider timeout at gateway'}}));
  });
  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
  const profile={provider:'timeout-fixture',model:'scripted',credential_env:'RSI_TEST_PROVIDER',credentials_file,
@@ -176,7 +176,7 @@ test('native Pi exhausting the actor grant during provider timeout retry skips s
   settled:async()=>true,
  });
  const receipt=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});
- assert.equal(result.timedOut,true);assert.equal(receipt.infrastructure,true);assert.match(receipt.reason,/Request timed out/);
+ assert.equal(result.timedOut,true);assert.equal(receipt.infrastructure,true);assert.equal(receipt.errorCode,'FAILURE_TRIAL_PROVIDER_TIMEOUT');assert.match(receipt.reason,/timeout at gateway/);
  assert.equal(scored,0);assert.equal(await runtime.close(),true);
 });
 
@@ -301,6 +301,9 @@ test('legacy A5 recovery requires matched terminal Pi evidence and no dispatch',
  state.db.prepare('INSERT INTO skill_backlog_runs(id,status,owner,checkpoint) VALUES(?,?,?,?)').run(id,'running',JSON.stringify(stoppedOwner),JSON.stringify(checkpoint));
  const reconcile=async()=> (await failureRuntimeSettled({directory,config:{root,target:'a5'}},{settled:async()=>false})).closed;
  assert.equal(await reconcile(),true);
+ const pilotFile=join(run,'pilot','pilot.json'),archived=JSON.parse(await readFile(pilotFile));
+ archived.operations[opId].attempts=[{}];await json(pilotFile,archived);assert.equal(await reconcile(),false);
+ delete archived.operations[opId].attempts;await json(pilotFile,archived);
  await rm(native);assert.equal(await reconcile(),false);await writeFile(native,'{broken\n');assert.equal(await reconcile(),false);await lines(native,record);
  await lines(events,[...journal,{type:'execution-starting',data:{operation:'unexpected'}}]);assert.equal(await reconcile(),false);await lines(events,journal);
  await json(join(target,'.ascend-command-lease.json'),{token:'unexpected'});assert.equal(await reconcile(),false);await rm(join(target,'.ascend-command-lease.json'));
