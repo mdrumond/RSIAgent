@@ -74,6 +74,12 @@ export async function runProposalQa(input,ops){
  const policy=state?.qaPolicy??(state?'shared':requestedPolicy??(failureFirst?'split':'shared'));
  const panel=policy==='panel',split=policy!=='shared',qaLanes=panel?Object.keys(panelBudgets):['answer','review'];
  const panelConcurrency=input.qaPanelConcurrency??5;
+ if(input.panelAuditPolicy!==undefined&&(!panel||input.panelAuditPolicy!=='assertions'))throw Error('Assertion audits require the panel policy');
+ if(input.panelAssertions!==undefined&&!input.panelAuditPolicy)throw Error('A frozen assertion partition requires assertion audits');
+ const auditPolicy=input.panelAuditPolicy??'objections';
+ if(auditPolicy==='assertions'&&(!Number.isFinite(input.seconds)||input.seconds<=0))throw Error('Assertion audits require a positive elapsed grant');
+ if(state&&(state.panelAuditPolicy??'objections')!==auditPolicy)throw Error('Retained audit policy changed');
+ if(state&&auditPolicy==='assertions'&&state.panelAssertionsIdentity!==digest(input.panelAssertions??null))throw Error('Retained assertion partition changed');
  if(panel&&(!Number.isSafeInteger(panelConcurrency)||panelConcurrency<1||panelConcurrency>5))throw Error('Panel concurrency must be between one and five');
  if(panel&&state&&state.panelAuditEvidenceIdentity!==digest(input.panelAuditEvidence??[]))throw Error('Panel audit sources changed on resume');
  if(panel&&state&&(state.panelRevisionIdentity??digest([]))!==digest(input.panelRevisionSources??[]))throw Error('Panel revision sources changed on resume');
@@ -83,10 +89,11 @@ export async function runProposalQa(input,ops){
   if(state&&state.frozenQaIdentity!==digest(input.frozenQa))throw Error('Frozen QA inputs changed on resume');
  }
  if(state?.frozenQaIdentity&&!input.frozenQa)throw Error('Resume requires the original frozen QA inputs');
- state??={format:2,qaPolicy:policy,proofProtocol,projectFactsIdentity,...(summarized?{sourceIdentity:catalogue.identity}:{}),protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:panel?1020:split?2*phaseSeconds:phaseSeconds,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
+ state??={format:2,qaPolicy:policy,proofProtocol,projectFactsIdentity,...(summarized?{sourceIdentity:catalogue.identity}:{}),protocol:'skill-qa-v2',inputIdentity:identity,startedAt:now(),seconds:auditPolicy==='assertions'?input.seconds:panel?1020:split?2*phaseSeconds:phaseSeconds,elapsedSeconds:input.priorElapsedSeconds??0,draft:input.proposal,rounds:[]};
  if(state&&(state.proofProtocol!==proofProtocol||state.projectFactsIdentity!==projectFactsIdentity||summarized&&state.sourceIdentity!==catalogue.identity)){const upgrade={verdict:state.verdict??null,rounds:state.rounds??[],projectFactsIdentity:state.projectFactsIdentity??null,summary:state.summary??null,sourceIdentity:state.sourceIdentity??null};state={...state,proofUpgrade:upgrade,proofUpgrades:[...(state.proofUpgrades??[]),upgrade],rounds:[],summary:undefined,draft:state.proposal??state.draft??input.proposal};for(const key of ['verdict','approval','proposal','reason','reasonKind','retryable','error'])delete state[key];}
+ if(auditPolicy==='assertions'){state.panelAuditPolicy=auditPolicy;state.panelAssertionsIdentity=digest(input.panelAssertions??null);}
  state.qaPolicy=policy;input={...input,qaPolicy:policy};
- if(split)state.phaseSeconds??=panel?{...panelBudgets}:{answer:phaseSeconds,review:phaseSeconds};
+ if(split)state.phaseSeconds??=panel?{...panelBudgets,...(auditPolicy==='assertions'?{audit:state.seconds}:{})}:{answer:phaseSeconds,review:phaseSeconds};
  if(panel){state.panelAuditEvidenceIdentity=digest(input.panelAuditEvidence??[]);state.panelRevisionIdentity=digest(input.panelRevisionSources??[]);}
  if(input.frozenQa)state.frozenQaIdentity=digest(input.frozenQa);
  state.proofProtocol=proofProtocol;state.projectFactsIdentity=projectFactsIdentity;if(summarized)state.sourceIdentity=catalogue.identity;
@@ -210,7 +217,7 @@ export async function runProposalQa(input,ops){
    }
    if(!round.review){const validate=value=>{validateQaVerdict(value);if(split)validateQaFindings(value);validateSummaryTargets(value,input.evidenceSummary?.items??[]);if(value.learningRequests?.length)input.validateProposal({...round.proposal,learningRequests:value.learningRequests});return value;};
     const payload={...correctionContext,proposal:round.proposal,answers:round.answers,answerClaims:round.claims,previousReview:state.rounds[index-1]?.review,validate};
-    round.review=panel?await runPanelRound({round,payload,index,call,persist,now,signal,concurrency:panelConcurrency}):validate(await call('qaReview',payload,`${index}-qaReview`));await persist();}
+    round.review=panel?await runPanelRound({round,payload,index,call,persist,now,signal,concurrency:panelConcurrency,auditPolicy,partition:input.panelAssertions}):validate(await call('qaReview',payload,`${index}-qaReview`));await persist();}
    if(remaining()<=0)throw Error('QA elapsed allocation exhausted');
    if(round.review.verdict==='revise'){
     const blocking=findings(round.review),answerOnly=split&&blocking.length>0&&blocking.every(issue=>issue?.kind==='answer');

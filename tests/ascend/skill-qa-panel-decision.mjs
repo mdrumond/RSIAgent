@@ -94,3 +94,17 @@ test('retain advisory notes and surface missing evidence expressed in a verdict 
  assert.equal(decision.verdict, 'approved');
  assert.deepEqual(decision.advisories[0].issue, advisory);
 });
+
+test('checked premises and recommendations cannot establish a material defect or remove uncertainty',async()=>{
+ const {assertionVerdict,validateAssertionPlan}=await import('../../cli/skill-qa-assertions.mjs');
+ const proof={reference:'receipt:1',quote:'checker passed',recordSha256:'fixed'};
+ const row=(id,role,label)=>({id,objectionId:'parent',sourceField:'problem',assertion:id,role,label,reason:'recorded result',basis:'check',bindings:[{role:'check',reference:proof.reference}],proofs:[proof]});
+ const atoms=[row('a','material_claim','contradicted'),row('b','factual_premise','supported'),row('c','proposed_action','supported')];
+ validateAssertionPlan(atoms,[{id:'parent',problem:'Compound assertion'}]);
+ assert.equal(assertionVerdict(atoms).disposition,'disproved');
+ atoms.push(row('d','material_claim','insufficient'));
+ assert.equal(assertionVerdict(atoms).disposition,'unresolved');
+ assert.throws(()=>validateAssertionPlan(atoms.slice(1,3),[{id:'parent',problem:'Compound assertion'}]),/material claim/);
+ const bad={...atoms[0],proofs:[{...proof,reference:'input:answers'}],bindings:[{role:'check',reference:'input:answers'}]};
+ assert.throws(()=>assertionVerdict([bad]),/only what was written/);
+});

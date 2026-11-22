@@ -432,3 +432,45 @@ test('a native answer repairs all rejected evidence refs from one checker respon
  assert.deepEqual(result.rounds[0].answers.action.refs,[proof.reference]);
  assert.deepEqual(result.rounds[0].answers.mechanism.refs,[alternate.reference]);
 });
+
+test('assertion-based panel independently checks each clause and corrects only the verified defect',async t=>{
+ const {root,input,proof,answer}=await artifactQaFixture(t);
+ const objection='The starter was scored and the edited actor was unscored.';
+ const atom=(id,role,assertion)=>({id,objectionId:'',sourceField:'problem',role,assertion});
+ const parts=[atom('first','material_claim','The starter was scored.'),atom('second','material_claim','The edited actor was unscored.'),atom('remedy','proposed_action','Replace the entire draft.')];
+ let voters=0;
+ const dirs=new Set(),received=[];
+ const provider=await scriptedReview(t,root,body=>{
+  const tools=body.messages.filter(m=>m.role==='tool');
+  if(!tools.length)return {name:'read',args:{path:'input.json'}};
+  if(String(tools.at(-1).content).includes('Accepted. Finish'))return null;
+  const content=tools.at(-1).content;
+  const payload=JSON.parse(typeof content==='string'?content:content.find(part=>part.type==='text').text);
+  const schema=body.tools.find(tool=>tool.function.name==='submit_review').function.parameters.properties.result;
+  if(schema.properties.assertions){
+   assert.equal(payload.objections[0].id,parts[0].objectionId);return {name:'submit_review',args:{result:{assertions:parts}}};
+  }
+  const part=parts.find(p=>p.id===payload.assertion.id);
+  assert(part);received.push(part.id);
+  const label=part.id==='first'?'supported':part.id==='second'?'contradicted':'supported';
+  return {name:'submit_review',args:{result:{basis:'check',label,reason:'Observed boundary failure',bindings:[{role:'check',reference:proof.reference}],claims:[{path:'reason',kind:'observation',proofs:[proof]}]}}};
+ });
+ const request={...input,config:{actor:provider.profile},qaPolicy:'panel',panelAuditPolicy:'assertions',qaPanelConcurrency:2,
+  evaluationContract:{workflow:'failure-first-v1'},allowWriterRevision:true,projectSummaries:[],learningProofEvidence:[],validateProposal:p=>p};
+ const out=await runProposalQa(request,{
+  qaAnswer:async()=>answer(proof),
+  qaReview:async()=>++voters===1?{verdict:'revise',reason:'Check both baselines',issues:[{kind:'draft',path:'changes.0.text',problem:objection}]}:{verdict:'approved',reason:'Acceptable'},
+  qaPanelAudit:async args=>{
+   for(const part of parts)part.objectionId=args.objections[0].id;
+   return nativeQaPanelAudit(args,{session:async options=>{dirs.add(options.directory);if(options.prompt.assertion){
+    assert.equal(options.prompt.objections,undefined);assert.equal(options.prompt.votes,undefined);
+   }return reviewSession(options);}});
+  },
+ });
+ assert.equal(dirs.size,4);assert.deepEqual(received.sort(),['first','remedy','second']);
+ const decision=out.rounds[0].panel.decision;
+ assert.equal(decision.approvals,4);assert.equal(decision.verdict,'revise');
+ assert.equal(decision.claims[0].audit.assertions.length,3);assert(decision.issues[0].problem.includes(parts[0].assertion));
+ assert(!decision.issues[0].problem.includes(parts[1].assertion));assert(!decision.issues[0].problem.includes(parts[2].assertion));
+ await assert.rejects(runProposalQa({...request,panelAuditPolicy:undefined},{}),/audit policy changed/);
+});

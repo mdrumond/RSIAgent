@@ -1,3 +1,4 @@
+import {assertionVerdict} from './skill-qa-assertions.mjs';
 import {createHash} from 'node:crypto';
 
 const panelSize = 5;
@@ -61,6 +62,11 @@ function resolveAudit(claim, audits) {
  const matching = audits.filter(audit => audit?.claimId === claim.id);
  const audit = matching[0];
  if (matching.length === 1 && hasText(audit.reason)) {
+  if(audit.assertions){
+   if(audit.assertions.some(atom=>atom.objectionId!==claim.id))throw Error('Assertion belongs to another objection');
+   const decision=assertionVerdict(audit.assertions);
+   if(decision.disposition!==audit.disposition||decision.reason!==audit.reason||JSON.stringify(decision.proofs)!==JSON.stringify(audit.proofs))throw Error('Retained assertion disposition changed');
+  }
   if (audit.disposition === 'unresolved') return {...claim, audit};
   const materialized = Array.isArray(audit.proofs) && audit.proofs.length > 0 &&
    audit.proofs.every(proof => hasText(proof?.reference) && hasText(proof.quote) && hasText(proof.recordSha256));
@@ -79,6 +85,7 @@ export function decideQaPanel(votes, audits = []) {
  const unresolved = claims.filter(claim => claim.audit.disposition === 'unresolved');
  const issues = verified.map(claim => ({
   ...claim.mentions[0].issue,
+  ...(claim.audit.assertions?{description:claim.audit.reason}:{}),
   claimId: claim.id,
   // Pass stable primary selectors to the correcting author. The full audited
   // excerpts remain in the panel record and can include large quoted inputs.
@@ -86,7 +93,7 @@ export function decideQaPanel(votes, audits = []) {
    ['reference', 'startLine', 'endLine', 'segment', 'field', 'factId', 'recordSha256']
     .filter(key => Object.hasOwn(proof, key)).map(key => [key, proof[key]])
   )),
-  problem: claim.problem + '\nEvidence audit: ' + claim.audit.reason,
+  problem: claim.audit.assertions?claim.audit.reason:claim.problem + '\nEvidence audit: ' + claim.audit.reason,
  }));
  const result = {approvals, missingSlots, claims, advisories: grouped.advisories, issues};
  if (unresolved.length) return {...result, verdict: 'inconclusive', route: 'inconclusive', reason: 'Material objections still require evidence.'};

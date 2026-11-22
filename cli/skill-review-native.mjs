@@ -3,6 +3,7 @@ import {mkdir,readFile,writeFile,appendFile,cp,symlink,realpath,stat,rename} fro
 import {join,resolve,dirname} from 'node:path';
 import {Type} from 'typebox';
 import {randomUUID} from 'node:crypto';
+import {nativeAssertionAudit} from './skill-qa-assertions.mjs';
 import {proofSelectorCatalogue} from './claim-proofs.mjs';
 import {Check,Errors} from 'typebox/value';
 import {discoveryProofSources} from './skill-discovery-proofs.mjs';
@@ -306,6 +307,11 @@ const panelAuditSchema=Type.Object({
  audits:Type.Array(Type.Object({claimId:nonempty(),disposition:choices(['verified','disproved','unresolved']),reason:nonempty()},{additionalProperties:false}),{minItems:1}),
  claims:selectorClaims(Type.String({pattern:'^audits[.][0-9]+[.]reason$'})),
 },{additionalProperties:false});
+const assertionSchemas={
+ partition:Type.Object({assertions:Type.Array(Type.Object({id:nonempty(),objectionId:nonempty(),role:choices(['material_claim','factual_premise','proposed_action']),sourceField:nonempty(),assertion:nonempty()},{additionalProperties:false}),{minItems:1})},{additionalProperties:false}),
+ assessment:Type.Object({basis:choices(['text','source','actor','check','contract']),label:choices(['supported','contradicted','insufficient']),reason:nonempty(),
+  bindings:Type.Array(Type.Object({role:choices(['text','source','actor','check','contract']),reference:nonempty()},{additionalProperties:false}),{minItems:1}),claims:selectorClaims()},{additionalProperties:false}),
+};
 // Direct readers and proof validation share the same frozen bytes and segment numbering.
 export async function stageAuditSources(directory,sources,packet={observations:[],artifacts:[]}){
  const records=new Map();
@@ -367,6 +373,11 @@ export async function nativeQaPanelAudit(input,dependencies={}){
    ...(description&&description!==problem?{description,problemSelectors:fieldSelectors('problem'),descriptionSelectors:fieldSelectors('description')}:{}),
    ...(item?{summaryItem:{id:item.id,text:item.text,kind:item.kind,citedSelectors:selectors([item])}}:{})};
  });
+ if(input.panelAuditPolicy==='assertions'){
+  const value=await nativeAssertionAudit({input,objections,session:dependencies.session??reviewSession,schemas:assertionSchemas,proofRecords,
+   sourceDirectory:join(input.directory,'sources'),indexFile:join(input.directory,indexFile),allowedPaths});
+  return {value:input.validate(value)};
+ }
  const extraIds=new Set(extras.map(record=>record.reference));
  return (dependencies.session??reviewSession)({...input,resultSchema:panelAuditSchema,selectorOnly:true,proofRequired:true,knowledge:false,
   compactEvidence:true,inlineProofSelectors:false,evidenceGroups:[],proofRecords,allowedPaths,

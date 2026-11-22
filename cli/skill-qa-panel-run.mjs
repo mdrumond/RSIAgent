@@ -1,3 +1,4 @@
+import {validateAssertionPlan} from './skill-qa-assertions.mjs';
 import {panelClaims, decideQaPanel} from './skill-qa-panel-decision.mjs';
 
 export function panelCorrectionSources(issues, records) {
@@ -17,7 +18,9 @@ export function panelAudits(panel) {
 }
 
 export function replayPanelDecision(panel) {
- return decideQaPanel(panelVotes(panel), panelAudits(panel));
+ const audits=panelAudits(panel);
+ if(panel.auditPolicy==='assertions'&&audits.some(row=>!Array.isArray(row.assertions)))throw Error('Retained assertion judgments are missing');
+ return decideQaPanel(panelVotes(panel),audits);
 }
 
 // Preserve submitted verdicts when retrying an interrupted ballot or its evidence audit.
@@ -61,8 +64,9 @@ function priorAudit(panel, objections) {
 
 const errorInfo = error => ({name: error.name, message: error.message, ...(error.reviewSession ? {reviewSession: error.reviewSession} : {})});
 
-export async function runPanelRound({round, payload, index, call, persist, now, signal, concurrency}) {
+export async function runPanelRound({round, payload, index, call, persist, now, signal, concurrency, auditPolicy, partition}) {
  const panel = round.panel ??= {slots: Array(5).fill(null)};
+ if(auditPolicy==='assertions')panel.auditPolicy=auditPolicy;
  const suffix=panel.history?.length?'-retry-'+panel.history.length:'';
  const pending = panel.slots.flatMap((slot, i) => slot ? [] : [i]);
  async function worker() {
@@ -85,6 +89,7 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
  for (const worker of workers) if (worker.status === 'rejected') throw worker.reason;
  signal.throwIfAborted();
  const claims = panelClaims(panelVotes(panel));
+ if(partition&&claims.length)validateAssertionPlan(partition,claims);
  const retained=priorAudit(panel,claims);
  const audited=new Set(retained.audits.map(row=>row.claimId));
  const objections=claims.filter(claim=>!audited.has(claim.id));
@@ -95,6 +100,11 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
    if (!Array.isArray(value?.audits)) throw Error('Audit requires a list of dispositions');
    const ids = new Set(objections.map(item => item.id));
    for (const row of value.audits) {
+    if(auditPolicy==='assertions'){
+     const owner=objections.find(objection=>objection.id===row.claimId);
+     if(!owner)throw Error('Unexpected assertion audit objection');
+     validateAssertionPlan(row.assertions,[owner]);
+    }
     if (!ids.delete(row.claimId)) throw Error('Unexpected or repeated objection: '+row.claimId);
     if (!['verified','disproved','unresolved'].includes(row.disposition) || !row.reason?.trim()) throw Error('Provide an audit disposition and its supporting reason');
    }
