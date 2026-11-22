@@ -5,6 +5,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {State} from '../controller/state.mjs';
+import {hasClassifiableFailures} from './skill-backlog-analysis.mjs';
 import {failureRoutingRevision} from '../controller/skill-failure-triage.mjs';
 import {SkillBacklog} from '../controller/skill-backlog.mjs';
 import {enqueueLearningRequest} from '../controller/skill-review.mjs';
@@ -63,14 +64,15 @@ export async function failureCampaignStatus(config){
   const isolation=cp?.phase==='isolate'&&await optional(join(cp.directory,'family','isolation.json'));
   const operations=Object.values(pilot?.operations??{}),running=operations.filter(o=>o.status==='running');
   const screen=Object.values(pilot?.screens??{}).flat(),last=backlog.meta('failure-first-status');
-  return {...backlog.status(),...last,workflow:'failure-first-v1',current:run?{id:run.id,itemId:run.item_id,phase:cp.phase,
+  const counts=backlog.status();
+  return {...counts,...last,workflow:'failure-first-v1',current:run?{id:run.id,itemId:run.item_id,phase:cp.phase,
    elapsedSeconds:run.elapsed,allocatedSeconds:run.seconds,directory:cp.directory}:null,
    activeWork:run?{kind:'failure-first',stage:running[0]?.kind??cp.phase,id:run.id}:null,
    operations:running.map(o=>({id:o.id,elapsedSeconds:o.elapsedSeconds,allocatedSeconds:o.allocatedSeconds})),
    ...(isolation?{isolation:{elapsedSeconds:isolation.elapsedSeconds,allocatedSeconds:failureTiming.isolationSeconds,timings:isolation.timings}}:{}),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||backlog.status().dirtyFailures>0||!!queuedFamily(backlog))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||hasClassifiableFailures(config,backlog,counts.dirtyFailures)||!!queuedFamily(backlog))};
  }finally{state.close();}
 }
 
@@ -106,8 +108,9 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const existing=backlog.list({status:'running',limit:1})[0];
   if(!existing){reconsiderVerifierExits(backlog);requeueUnwitnessedFamilies(backlog);}
   if(!existing&&!queuedFamily(backlog)){
-   await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
+   const analysis=await ops.analyze({config,backlog,directory:join(config.root,'skills','priority','failure-first-analysis',hash(backlog.meta('queue-epoch'))),
     classificationOnly:true,seconds:120,remainingSeconds:Math.min(120,campaignLeft()),limit:2,signal});
+   if(analysis?.classificationPage)return {status:'idle',reason:analysis.classificationPage.reason,classificationPage:analysis.classificationPage.status};
   }
   const item=existing??queuedFamily(backlog);
   if(!item)return {status:'idle',reason:'No eligible correctness family'};

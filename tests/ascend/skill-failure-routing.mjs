@@ -233,3 +233,37 @@ test('an empty campaign stays idle across the admission upgrade',async t=>{
  const f=await fixture(t);
  assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
 });
+
+test('a timed-out classification page retains its grant and stops requesting devices when only blocked pages remain',async t=>{
+ const f=await fixture(t),attempt=f.start('page');
+ await f.verify(attempt,'one.log','first failure');
+ const values={slots:[0,1,2,3],remainingSeconds:1000,memory:{}};
+ let milliseconds=0;
+ const grants=[];
+ const step=classify=>runCampaignFailureStep(f.config,values,{
+  analyze:args=>analyzeBacklog({...args,remainingSeconds:500},{now:()=>milliseconds,classify})
+ });
+ const timeout=seconds=>({seconds:grant})=>{
+  grants.push(grant);milliseconds+=seconds*1000;
+  throw Object.assign(Error('Review timed out'),{reviewSession:{kind:'elapsed'}});
+ };
+ assert.equal((await step(timeout(40))).classificationPage,'retry');
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
+ assert.equal((await step(timeout(80))).classificationPage,'blocked');
+ assert.deepEqual(grants,[120,80]);
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
+ assert.equal(f.backlog.failures().length,1);
+ await f.verify(attempt,'two.log','second failure');
+ f.backlog.ingest();
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
+ await step(({groups:[fresh],validate})=>validate(classification(fresh)));
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
+});
+
+test('unexpected classifier errors propagate to the campaign worker',async t=>{
+ const f=await fixture(t);
+ await f.verify(f.start('broken'),'one.log','first failure');
+ await assert.rejects(runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:1000,memory:{}},{
+  analyze:args=>analyzeBacklog(args,{classify:()=>{throw Error('unexpected database error');}})
+ }),/unexpected database error/);
+});

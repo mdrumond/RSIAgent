@@ -177,11 +177,25 @@ export function currentAnalysisStages({config,backlog}){
  return Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch&&s.base===config.skills.activeVersion&&s.groupId&&backlog.failureCount(s.groupId)===s.count).map(([id,stage])=>({id,...stage}));
 }
 
+const classificationCoordinate=(epoch,base,id,count)=>hash([epoch,base,id,count,failureRoutingRevision]);
+
+export function hasClassifiableFailures(config,backlog,dirtyCount){
+ if(!dirtyCount)return false;
+ const epoch=backlog.meta('queue-epoch'),base=config.skills.activeVersion;
+ const blocked=Object.entries(backlog.meta('analysis-stages')??{}).filter(([key,s])=>
+  s.status==='blocked'&&key===classificationCoordinate(epoch,base,s.groupId,s.count));
+ if(blocked.length<dirtyCount)return true;
+ const keys=new Set(blocked.map(([key])=>key));
+ for(const {id,count} of backlog.dirtyFailureCounts())
+  if(!keys.has(classificationCoordinate(epoch,base,id,count)))return true;
+ return false;
+}
+
 /** Analyze a bounded page. New evidence remains dirty after failures or elapsed expiry. */
 export async function analyzeBacklog({config,backlog,directory,signal,seconds=120,remainingSeconds=seconds+3600,limit=2,classificationOnly=false},dependencies={}){
  const ops=await operations(dependencies),now=dependencies.now??(()=>performance.now()),clock=allocation(remainingSeconds,signal,now),entries=await guidanceEntries(config.root,config.skills.activeVersion);
  const policy={requireBucket:true,failureFirst:classificationOnly};
- const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=hash([epoch,config.skills.activeVersion,g.id,g.count,...(classificationOnly?[failureRoutingRevision]:[])]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
+ const epoch=backlog.meta('queue-epoch'),stages=Object.fromEntries(Object.entries(backlog.meta('analysis-stages')??{}).filter(([,s])=>s.epoch===epoch)),coordinates=new Map(),identity=g=>{const id=classificationOnly?classificationCoordinate(epoch,config.skills.activeVersion,g.id,g.count):hash([epoch,config.skills.activeVersion,g.id,g.count]);coordinates.set(id,{epoch,base:config.skills.activeVersion,groupId:g.id,count:g.count});return id;};
  const persist=()=>{for(const [id,stage]of Object.entries(stages))Object.assign(stage,coordinates.get(id));backlog.meta('analysis-stages',stages);};
  const eligible=g=>stages[identity(g)]?.status!=='blocked';
  const dirty=[];
@@ -206,12 +220,20 @@ export async function analyzeBacklog({config,backlog,directory,signal,seconds=12
     if(prior?.running)throw Object.assign(Error('Interrupted classification elapsed custody is unknown; explicit review required'),{reviewSession:{kind:'interrupted-unknown-spend'}});
     for(const group of members)stages[identity(group)]={stage:'classification',status:'running',spendFile,allocatedSeconds:grantSeconds,elapsedSeconds:spent};persist();
     finishClassification=await trackSpending(spendFile,spent,now,{allocatedSeconds:grantSeconds});
-    if(spent>=grantSeconds)throw Error('Classification elapsed allowance exhausted');
+    if(spent>=grantSeconds)throw Object.assign(Error('Classification elapsed allowance exhausted'),{reviewSession:{kind:'elapsed'}});
     const accepted=validateClassificationBatch(await clock.call(ops.classify,{directory:join(resolve(spendFile,'..'),'classify'),config,groups:members,entries,bucketPolicy:true,failureFirst:classificationOnly,
      validate:value=>validateClassificationBatch(value,members,entries,policy)},grantSeconds-spent),members,entries,policy);
     for(const group of members)stages[identity(group)]={stage:'proposal',status:'pending',classification:accepted.classifications.find(c=>c.groupId===group.id)};
     persist();
-   }catch(error){for(const group of members)stages[identity(group)]={stage:'classification',status:stageError(error,spent+(now()-begun)/1000,grantSeconds)?'blocked':'retry',spendFile,allocatedSeconds:grantSeconds,reason:error.message,elapsedSeconds:spent+(now()-begun)/1000};persist();throw error;}
+   }catch(error){
+    const elapsedSeconds=spent+(now()-begun)/1000,status=stageError(error,elapsedSeconds,grantSeconds)?'blocked':'retry';
+    for(const group of members)stages[identity(group)]={stage:'classification',status,spendFile,allocatedSeconds:grantSeconds,reason:error.message,elapsedSeconds};
+    persist();
+    const pageFailure=['elapsed','no-submit','rejected-submissions','interrupted-unknown-spend'].includes(error.reviewSession?.kind)||error.reviewSession?.retryableTimeout===true;
+    if(classificationOnly&&!signal?.aborted&&pageFailure)
+     return {analyzed:0,items:[],classificationPage:{status,reason:error.message}};
+    throw error;
+   }
    finally{await finishClassification?.();}
   }
   classifications={classifications:frozen.map(g=>stages[identity(g)].classification)};await save(classificationFile,classifications);

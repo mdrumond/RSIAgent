@@ -130,6 +130,10 @@ export class SkillBacklog {
    return {observed,progress,...this.status()};
   });
  }
+ dirtyFailureCounts(){
+  return this.db.prepare(`SELECT f.id,count(*) AS count FROM skill_backlog_failures f JOIN skill_backlog_occurrences o ON o.group_id=f.id
+   WHERE f.dirty=1 AND ${analysisScopeSql(this.db)} AND ${activeOccurrenceSql(this.db,'o')} GROUP BY f.id`).iterate();
+ }
  failureCount(id){return this.db.prepare(`SELECT COUNT(*) n FROM skill_backlog_occurrences o WHERE group_id=? AND ${activeOccurrenceSql(this.db,'o')}`).get(id).n;}
  failure(id,{limit=20,offset=0,includeRetired=false}={}){
   const row=this.db.prepare('SELECT data,dirty FROM skill_backlog_failures WHERE id=?').get(id);if(!row)return null;
