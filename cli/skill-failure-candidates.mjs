@@ -1,4 +1,5 @@
 /** Evidence-reviewed instruction candidates; only the tested immutable version can publish. */
+import {reviewScopedArtifact,scopedReviewIdentity,scopedPolicy} from './skill-scoped-review.mjs';
 import assert from 'node:assert/strict';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -95,6 +96,47 @@ export function validateAdditiveDesignChange(changes,changeId){
  const mismatches=Object.entries(required).filter(([key,value])=>change?.[key]!==value)
   .map(([key,value])=>'changes[0].'+key+' must be '+JSON.stringify(value)+'; received '+(JSON.stringify(change?.[key])??'missing'));
  if(mismatches.length)throw Error('Preserve the reviewed change fields: '+mismatches.join('. '));
+}
+
+/** Freeze a single additive diff before the experiment author sees it. */
+export async function prepareScopedWriting({config,knowledgeConfig=config,item,directory,seconds,signal},dependencies={}){
+ const session=dependencies.session??reviewSession,review=dependencies.review??reviewScopedArtifact;
+ const base=item.base,entries=await guidanceEntries(config.root,base),baseline=await skillInput(join(config.root,'skills','versions',base));
+ const groups=reviewGroups(item),refs=groups.flatMap(g=>[...g.occurrences,...(g.linkedDiagnostics??[])].map(r=>r.reference));
+ assert(refs.length&&base===config.skills.activeVersion,'Ranked original evidence and active skill base required');
+ const brief={issue:item.id,groupIds:item.groupIds,objective:item.objective,reason:item.reason,classifications:item.preparation?.classifications,evidence:refs};
+ const identity=hash({policy:scopedPolicy,brief,base,baseline:baseline.sha256,groups});
+ const start=performance.now(),left=()=>{signal?.throwIfAborted();const remaining=seconds-(performance.now()-start)/1000;assert(remaining>0,'Writing elapsed allowance exhausted');return remaining;};
+ let feedback;
+ for(let revision=1;;revision++){
+  const round=join(directory,'revision-'+revision),draftFile=join(round,'writer-result.json');
+  await mkdir(round,{recursive:true});
+  const validate=(value,retrievals)=>{assertInstruction(value.text);assert(scopes.includes(value.scope));const known=memoryEntries(retrievals).map(e=>e.ref);assert(value.memoryRefs?.length&&value.memoryRefs.every(ref=>known.includes(ref)),'Use retrieved memory references');return value;};
+  let written=await load(draftFile);
+  if(!written){written=await session({directory:join(round,'writer'),config:knowledgeConfig,seconds:left(),signal,knowledge:true,evidenceGroups:groups,proofRequired:true,selectorOnly:true,resultSchema:schema,
+   prompt:{brief,entries,feedback,task:'Propose a single broadly applicable additive instruction for this ranked failure. Use the original failure evidence and retrieve relevant successful memory. Return text of at most 150 words, scope, memoryRefs from your retrievals, and claims for text. Address a prior reviewer defect when present.'},validate});
+   await save(draftFile,{...written,scopedIdentity:identity});written={...written,scopedIdentity:identity};}
+  assert.equal(written.scopedIdentity,identity,'Ranked writing input changed');validate(written.value,written.retrievals??[]);await writerHealthy(written);
+  const proofSources=written.value.claims.flatMap(c=>c.proofs).filter(p=>typeof p.quote==='string').map(p=>({reference:p.reference,text:p.quote}));
+  const sources=[...memoryEntries(written.retrievals).filter(e=>written.value.memoryRefs.includes(e.ref)).map(e=>({reference:e.ref,text:e.text??e.content??JSON.stringify(e)})),...proofSources];
+  const fields={text:written.value.text,scope:written.value.scope},reviewFile=join(round,'writing-review.json');
+  let qa=await load(reviewFile);
+  if(!qa){qa=await review({scope:'writing',fields,brief,directory:join(round,'review'),config:knowledgeConfig,evidenceGroups:groups,sources,seconds:left(),signal});await save(reviewFile,qa);}
+  assert.equal(qa.identity,scopedReviewIdentity({scope:'writing',brief,fields,sources}),'Writing review differs from draft');
+  if(qa.verdict==='revise'){feedback={previous:fields,field:qa.field,quote:qa.quote,defect:qa.defect};continue;}
+  assert.equal(qa.verdict,'approved');
+  const proposal={action:'update',reason:'Instruction grounded in ranked failure',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:'failure-first-'+identity.slice(0,24),scope:fields.scope,text:fields.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
+  validateReviewProposal(proposal,groups,item.preparation?.classifications??{});
+  const prior=await load(join(directory,'approved.json'));
+  if(prior){
+   assert.equal(prior.identity,identity);assert.equal(prior.revision,revision);assert.deepEqual(prior.fields,fields);assert.deepEqual(prior.candidate.proposal,proposal);
+   assert.equal(prior.candidate.qa.approval,qa.identity);await checkVersion(config,prior.candidate);return prior;
+  }
+  const version=await writeVersion(config.root,applyProposal(entries,proposal.changes,{allowPruning:false,history:[]}),join(config.root,'skills','versions',base)),effective=await skillInput(join(config.root,'skills','versions',version));
+  const candidate={id:'principle-a',instruction:fields.text,scope:fields.scope,version,text:effective.text,textSha256:textHash(effective.text),skillSha256:effective.sha256,base,baselineSha256:baseline.sha256,proposal,qa:{policy:scopedPolicy,verdict:'approved',approval:qa.identity},evidence:written.value.claims.flatMap(c=>c.proofs)};
+  const approval={identity,brief,fields,sources,groups,candidate,revision};
+  await save(join(directory,'approved.json'),approval);return approval;
+ }
 }
 
 /** Called only after five clean baseline attempts establish the reproduced struggle. */
@@ -321,6 +363,25 @@ async function requireFocusedApproval({config,item,base,family,screen,qualificat
  assert.equal(winner.qa.approval,expected,'Winner differs from the focused QA approval');
 }
 
+async function verifyScopedApproval({directory,manifest,report,family,winner,item}){
+ const root=join(directory,'..'),writing=await load(join(root,'writing','approved.json'));
+ assert.equal(hash(writing),manifest.writingApproval,'Reviewed writing artifact changed');
+ assert.deepEqual(writing.candidate,winner,'Trial winner differs from the approved writing');
+ const round=join(root,'writing','revision-'+writing.revision);
+ const writer=await load(join(round,'writer-result.json')),review=await load(join(round,'writing-review.json'));
+ assert.equal(writer.scopedIdentity,writing.identity);
+ assert.deepEqual(writing.fields,{text:writer.value.text,scope:writer.value.scope});
+ assert.equal(writing.brief.issue,item.id);assert.deepEqual(writing.brief.groupIds,item.groupIds);
+ assert.equal(review.verdict,'approved');assert.equal(review.identity,scopedReviewIdentity({scope:'writing',brief:writing.brief,fields:writing.fields,sources:writing.sources}));
+ assert.equal(review.identity,winner.qa.approval);
+ const test=await load(join(root,'test-approved.json'));
+ assert.equal(hash(test),manifest.testApproval,'Reviewed test approval changed');
+ assert.equal(test.family,family.identity);assert.equal(test.writing,review.identity);assert.equal(test.review.verdict,'approved');
+ const design=completeOperation(report,directory,'design--'+family.id,'design');
+ assert.deepEqual(design.result,[winner]);assert.deepEqual(report.candidates,[winner]);
+ return round;
+}
+
 /** Validate the same development and QA evidence used for activation. */
 export async function verifyFocusedSearchableApproval({config,item,result,manifest,family,directory}){
  assert(manifest.mode==='focused-correctness'&&item.objective==='correctness','Focused correctness evidence required');
@@ -332,6 +393,7 @@ export async function verifyFocusedSearchableApproval({config,item,result,manife
  await checkVersion(config,winner);
  assert.equal(winner.base,base);
  assert.equal(winner.baselineSha256,baseline.sha256);
+ if(manifest.experimentPolicy===scopedPolicy)return verifyScopedApproval({directory,manifest,report:result,family,winner,item});
  const screen=result.screens[family.id];
  const identity=designIdentity({base,baseline:baseline.sha256,family:{id:family.id,development:family.development,evidence:family.evidence??[]},results:screen,identities:manifest.identities,item});
  const designDirectory=await focusedDesignOperation(result,family,directory,identity);
@@ -365,6 +427,8 @@ export async function publishFailureWinner({config,item,result,directory,signal,
  }
  assert.equal(family.transfer.length,2);assert(winner.qa?.verdict==='approved'&&winner.qa.approval,'Reviewed candidate required');await checkVersion(config,winner);
  assert.equal(winner.base,base);assert.equal(baseline.sha256,winner.baselineSha256,'Tested baseline changed');
+ if(manifest.experimentPolicy===scopedPolicy)await verifyScopedApproval({directory,manifest,report:result,family,winner,item});
+ else{
  const designId=designIdentity({base,baseline:winner.baselineSha256,family:{id:family.id,development:family.development,evidence:family.evidence??[]},results:result.screens[family.id],identities:manifest.identities,item});
  const designDirectory=focused?await focusedDesignOperation(result,family,directory,designId):result.operations['design--'+family.id]?.directory;
  assert(designDirectory,'Missing reviewed design operation');const registry=await load(join(designDirectory,'approved-design.json'));
@@ -372,6 +436,7 @@ export async function publishFailureWinner({config,item,result,directory,signal,
  assert.deepEqual(registry.candidates,result.candidates,'Reviewed candidate cohort changed');
  assert(registry.candidates.some(candidate=>hash(candidate)===hash(winner)),'Winner differs from its reviewed version');
  if(focused)await requireFocusedApproval({config,item,base,family,screen:result.screens[family.id],qualification:developmentQualification,designDirectory,identity:designId,winner});
+ }
  const publicationFile=join(directory,'publication.json'),identity=hash({study:result.identity,result:hash(result),base,version:winner.version,text:winner.textSha256,storage:Boolean(config.storage)}),prior=await load(publicationFile);if(prior)assert.equal(prior.identity,identity,'Publication evidence changed');
  const record=async()=>{if(config.storage)await ops.record({config,candidate:winner.version,base,signal});};
  const current=await ops.readConfig(config.root);if(current.skills.activeVersion!==base){if(current.skills.activeVersion===winner.version&&prior){if(!prior.recordComplete)await record();const recovered={...prior,published:true,memoryRecorded:Boolean(config.storage),recordComplete:true,recovered:true};await save(publicationFile,recovered);return recovered;}return {published:false,reason:'stale-base'};}

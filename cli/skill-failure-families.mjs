@@ -298,11 +298,11 @@ async function draftFingerprint(draft){
  return sha(hashes);
 }
 /** A bounded native research session may produce fixtures, never skill instructions or curriculum jobs. */
-export async function prepareFailureFamily({config,backlog,item,directory,seconds=failureTiming.isolationSeconds,signal,checkReferences},dependencies={}){
+export async function prepareFailureFamily({config,backlog,item,directory,seconds=failureTiming.isolationSeconds,signal,checkReferences,approvedInstruction},dependencies={}){
  if(!['a3','a5'].includes(config.target))throw Error('Failure isolation requires A3 or A5 target');
  if(!Number.isFinite(seconds)||seconds<=0||seconds>failureTiming.isolationSeconds)throw Error('Isolation must fit '+failureTiming.isolationSeconds+' elapsed seconds');await mkdir(directory,{recursive:true});
  const draft=join(directory,'draft');await mkdir(draft,{recursive:true});
- const file=join(directory,'family.json'),stateFile=join(directory,'isolation.json'),prior=await optional(stateFile),identity=sha([item.id,item.base,item.evidence,config.target]);
+ const file=join(directory,'family.json'),stateFile=join(directory,'isolation.json'),prior=await optional(stateFile),identity=sha([item.id,item.base,item.evidence,config.target,...(approvedInstruction?[approvedInstruction]:[])]);
  if(prior&&prior.identity!==identity)throw Error('Isolation inputs changed');
  if(prior?.status==='ready'){const family=await loadFailureFamily({file,config,item});if(prior.familyIdentity!==family.identity)throw Error('Frozen family changed');return {status:'ready',family,elapsedSeconds:prior.elapsedSeconds};}
  if(['needs-evidence','expired'].includes(prior?.status))return prior;
@@ -351,7 +351,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
   const groups=await freezeGroups(config.root,item.evidence?.groups??[],join(directory,'evidence'));bounded.throwIfAborted();
   let disposition;
   const validateDisposition=value=>isolationDisposition({value,sources,groups,config,item,observations,signal:bounded});
-  const focusedCalibration=config.target==='a5';
+  const focusedCalibration=config.target==='a5'||Boolean(approvedInstruction);
   const session=dependencies.session??reviewSession;
   question.draftFingerprint??=await draftFingerprint(draft);
   let result;
@@ -372,7 +372,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
     }:null;
     result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target),
    onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
-   prompt:{...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
+   prompt:{...(approvedInstruction?{approvedInstruction,testObjective:'Design or reuse a discriminating experiment for this immutable instruction and the original ranked failure. Keep the evaluated actor task blind to the instruction.'}:{}),...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
     if(value.status==='needs-evidence'){disposition=await validateDisposition(value);return value;}
     if(!value.family||value.files)throw Error('Submit a typed family manifest referencing draftDirectory files, without inline file contents');

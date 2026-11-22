@@ -14,6 +14,7 @@ import {processIdentity,ownerStopped} from '../controller/lifecycle.mjs';
 import {readConfig} from './instance.mjs';
 import {skillInput} from './skill-microeval.mjs';
 import {skillModelIdentity,skillConfig} from '../controller/skill-context.mjs';
+import {scopedPolicy,reviewScopedTest} from './skill-scoped-review.mjs';
 import {runFailurePilot} from './skill-failure-pilot.mjs';
 import {failureTiming} from './skill-failure-protocol.mjs';
 import {searchableMemoryFingerprint} from './skill-searchable.mjs';
@@ -97,6 +98,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
  const ops={
   analyze:async args=>(await import('./skill-backlog-analysis.mjs')).analyzeBacklog(args,{classify:async input=>(await import('./skill-review-native.mjs')).nativeClassifyBatch({...input,config:knowledgeConfig})}),
   family:async args=>(await import('./skill-failure-families.mjs')).prepareFailureFamily(args,{session:async input=>(await import('./skill-review-native.mjs')).reviewSession({...input,config:knowledgeConfig})}),
+  writing:async args=>(await import('./skill-failure-candidates.mjs')).prepareScopedWriting(args),testReview:reviewScopedTest,
   runtime:async args=>(await import('./skill-failure-runtime.mjs')).createFailureRuntime(args),
   design:async args=>(await import('./skill-failure-candidates.mjs')).createFailureDesign(args),
   admit:async args=>(await import('./skill-searchable.mjs')).admitSearchableSkill(args),
@@ -162,7 +164,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(campaignLeft()<=0)throw Error('Campaign elapsed allowance exhausted');
   const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(failureTiming.experimentSeconds,campaignLeft()),workflow:'failure-first-v1',owner});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
-  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots};
+  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots,...(config.skills.failureFirst.experimentPolicy===scopedPolicy?{experimentPolicy:scopedPolicy}:{})};
   if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
   const resumedAt=now(),retainedElapsed=Math.max(run.elapsed,(resumedAt-cp.startedAt)/1000);
   const elapsed=()=>retainedElapsed+(now()-resumedAt)/1000;
@@ -181,6 +183,11 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   const failure=new AbortController();save();timer=setInterval(()=>{try{save();}catch(error){failure.abort(error);}},1000);
   if(remaining()<=0)throw Error('Experiment elapsed allowance exhausted');
   const active=AbortSignal.any([failure.signal,...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(remaining()*1000)))]),cleanup=AbortSignal.timeout(Math.max(1,Math.ceil((remaining()+90)*1000)));
+  let writing;
+  if(cp.experimentPolicy===scopedPolicy){
+   phase('writing');
+   writing=await ops.writing({config,knowledgeConfig,item:run.snapshot,directory:join(cp.directory,'writing'),seconds:remaining(),signal:active});
+  }
   phase('isolate');
   const priorFamily=await optional(join(cp.directory,'family-ready.json'));
   const openRuntime=async()=>{
@@ -198,8 +205,15 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    try{
     const adapter=await openRuntime();
     identity??=await adapter.identify({seconds:Math.min(120,seconds),signal});
-    return await adapter.checkReferences({family,directory:join(cp.directory,'submission-checks',randomUUID()),
+    const checked=await adapter.checkReferences({family,...(writing?{focused:true}:{}),directory:join(cp.directory,'submission-checks',randomUUID()),
      cacheScope:familyDirectory,seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+    if(writing){
+     const review=await ops.testReview({writing,family,directory:join(cp.directory,'test-reviews',family.identity),config:knowledgeConfig,
+      seconds:Math.min(remaining(),seconds-(performance.now()-started)/1000),signal});
+     if(review.verdict!=='approved')throw Object.assign(Error(review.field+' '+JSON.stringify(review.quote)+': '+review.defect),{code:'FAILURE_REFERENCE_REJECTED',diagnostics:checked.diagnostics});
+     await writeFile(join(cp.directory,'test-approved.json'),JSON.stringify({family:family.identity,writing:writing.candidate.qa.approval,review}));
+    }
+    return checked;
    }catch(error){
     if(error.code!=='FAILURE_REFERENCE_REJECTED'){
      referenceError=error;
@@ -210,7 +224,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   let prepared;
   try{
-   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(writing?{approvedInstruction:writing.fields}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
    if(referenceError)throw referenceError;
    active.throwIfAborted();
@@ -250,11 +264,18 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   let manifest=await optional(join(cp.directory,'experiment.json'));
   if(!manifest){const baseline=await ops.input(join(config.root,'skills','versions',run.base));identity??=await runtime.identify({seconds:Math.min(120,remaining()),signal:active});
    const focused=[prepared.family.development,...prepared.family.transfer].every(task=>task.controls?.calibration?.files);
-   manifest={...(focused?{mode:'focused-correctness'}:{}),baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
+   let testApproval;
+   if(writing){
+    const reviewed=await optional(join(cp.directory,'test-approved.json'));
+    if(!focused||reviewed?.family!==prepared.family.identity||reviewed.writing!==writing.candidate.qa.approval||reviewed.review.verdict!=='approved')throw Error('Scoped experiment requires its qualified and reviewed test family');
+    testApproval=hash(reviewed);
+   }
+   manifest={...(writing?{experimentPolicy:scopedPolicy,writingApproval:hash(writing),testApproval}:{}),...(focused?{mode:'focused-correctness'}:{}),baseline:baseline.text,identities:{model:await modelIdentities(config),runtime:identity,memory:memoryIdentity,skills:baseline.sha256,source:config.skills.failureFirst.sourceRevision,dependencies:hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8'))},families:[prepared.family]};
    cp.initialElapsedSeconds=elapsed();await writeFile(join(cp.directory,'experiment.json'),JSON.stringify(manifest));save();}
   const currentConfig=skillConfig(await readConfig(config.root));
   if(currentConfig.skills.activeVersion!==run.base||hash(manifest.identities.memory)!==hash(memoryIdentity)||hash(manifest.identities.model)!==hash(await modelIdentities(currentConfig))||manifest.identities.skills!==(await ops.input(join(config.root,'skills','versions',run.base))).sha256||manifest.identities.source!==config.skills.failureFirst.sourceRevision||manifest.identities.dependencies!==hash(await readFile(new URL('../npm-shrinkwrap.json',import.meta.url),'utf8')))throw Error('Frozen experiment baseline, model, machinery or memory changed');
-  const design=await ops.design({config,item:run.snapshot,knowledgeConfig});phase('evaluate');
+  if(writing&&manifest.writingApproval!==hash(writing))throw Error('Frozen reviewed instruction changed');
+  const design=writing?Object.assign(async()=>[writing.candidate],{canResume:async()=>true}):await ops.design({config,item:run.snapshot,knowledgeConfig});phase('evaluate');
   const result=await ops.pilot({directory:join(cp.directory,'pilot'),manifest,seconds:run.seconds,trialSeconds:failureTiming.actorSeconds,verificationSeconds:failureTiming.verificationSeconds,concurrency:4,initialElapsedSeconds:cp.initialElapsedSeconds,signal:active},
    {qualify:runtime.qualify,trial:runtime.trial,settle:runtime.settle,design});
   closed=await runtime.close();runtime=null;if(!closed)throw Error('Experiment execution remains unresolved');

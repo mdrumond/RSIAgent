@@ -240,7 +240,7 @@ export async function createFailureRuntime({config,directory,publicDirectory,pri
   const checks=[[development,'starter',development.controls.negatives[starterIndex].files],
    ...tasks.map(task=>[task,'reference',task.controls.reference.files])];
   // New A5 submissions carry focused controls. Check them while the author can still revise.
-  if(config.target==='a5'&&tasks.every(task=>task.controls.calibration?.files)){
+  if((config.target==='a5'||input.focused)&&tasks.every(task=>task.controls.calibration?.files)){
    for(const task of tasks){
     for(const [index,control] of task.controls.negatives.entries())
      if(task!==development||index!==starterIndex)checks.push([task,'negative-'+index,control.files]);

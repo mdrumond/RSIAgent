@@ -14,12 +14,12 @@ const slots=Array.from({length:4},(_,i)=>({resource:{id:'slot-'+i,available:true
 const task=id=>({id,caseIds:['large','control'],controlCaseIds:['control'],files:{'kernel.py':'starter'},prompt:'Repair the isolated behavior'});
 const family={id:'actual-failure',development:task('development'),transfer:[task('layout'),task('aggregate')],evidence:[]};
 const result=correct=>({correct,mechanismMatch:!correct,caseResults:['large','control'].map(id=>({id,correct})),sourceSha256:'a'.repeat(64),artifacts:[],handles:[]});
-async function fixture(t){
+async function fixture(t,target='a3'){
  const root=await mkdtemp(join(tmpdir(),'failure-campaign-'));t.after(()=>rm(root,{recursive:true,force:true}));
- const config={format:1,root,target:'a3',mode:'phase1',projects:[],concurrency:5,actor:{},environment:{options:{target:'fixture'}},skills:{activeVersion:'base',background:true,tuningDisabled:false,failureFirst:{enabled:true,sourceRevision:'a'.repeat(40)}}};
+ const config={format:1,root,target,mode:'phase1',projects:[],concurrency:5,actor:{},environment:{options:{target:'fixture'}},skills:{activeVersion:'base',background:true,tuningDisabled:false,failureFirst:{enabled:true,sourceRevision:'a'.repeat(40)}}};
  await writeFile(join(root,'instance.json'),JSON.stringify(config));const state=new State(join(root,'state.sqlite'));t.after(()=>state.close());state.db.exec('CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
  for(const [key,value]of Object.entries({pause:true,'campaign-budget':{seconds:10000,elapsed:125,cycle:'retained',boot:'prior-boot',monotonic:0,running:false}}))state.db.prepare('insert into control values(?,?)').run(key,JSON.stringify(value));
- state.event(null,'generation-rejected',{message:'Actual test fixture rejection'});const backlog=new SkillBacklog(state,{target:'a3'});backlog.ingest();const g=backlog.failures()[0];backlog.acknowledge(g.id);
+ state.event(null,'generation-rejected',{message:'Actual test fixture rejection'});const backlog=new SkillBacklog(state,{target});backlog.ingest();const g=backlog.failures()[0];backlog.acknowledge(g.id);
  const item=backlog.upsert({key:'first',workflow:'failure-first-v1',priority:10,reason:'Observed failure',objective:'correctness',skill:'implementation',base:'base',groupIds:[g.id],proposal:null,evidence:{groups:[g]}});
  const calls=[],memory={config:{root:join(root,'view')},knowledge:{identity:'frozen-memory'},close:async()=>calls.push('memory-close')};
  const ops={analyze:async()=>{},family:async()=>({status:'ready',family}),model:async()=>({id:'model'}),input:async()=>({text:'baseline-guidance',sha256:'skill-hash'}),
@@ -328,4 +328,57 @@ test('continuous worker releases resources after the last classification page bl
  assert.equal(result.classificationPage,'blocked');
  assert.equal(closed,true);
  assert.deepEqual(JSON.parse(f.state.db.prepare("SELECT value FROM control WHERE key='skill-background-resources'").get().value),[]);
+});
+
+test('scoped campaign repairs immutable writing and test independently before matched baseline-first trials',async t=>{
+ const {prepareScopedWriting}=await import('../../cli/skill-failure-candidates.mjs');
+ const {reviewScopedArtifact,reviewScopedTest}=await import('../../cli/skill-scoped-review.mjs');
+ const {skillInput}=await import('../../cli/skill-microeval.mjs');
+ const {stages}=await import('../../controller/workflow.mjs');
+ for(const baseline of ['pass','unrelated','reproduced']){
+  const f=await fixture(t,'a5'),events=[],approved='Check the shape assumptions against all supported inputs.';
+  f.config.skills.failureFirst.experimentPolicy='scoped-v1';await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
+  const base=join(f.root,'skills','versions','base'),scopeNames=['global-kdb',...stages];
+  await mkdir(base,{recursive:true});await writeFile(join(base,'skill-map.json'),JSON.stringify(Object.fromEntries(scopeNames.map(s=>[s,s+'.md']))));
+  await writeFile(join(base,'guidance.json'),JSON.stringify(scopeNames.map(scope=>({id:scope,scope,text:'Base '+scope,critical:true,negative:false}))));
+  for(const scope of scopeNames)await writeFile(join(base,scope+'.md'),'Base '+scope);
+  const checker=join(f.root,'checker.py');await writeFile(checker,'pass');
+  const groups=f.item.evidence.groups;
+  const ops={...f.ops,input:skillInput,
+   writing:args=>prepareScopedWriting(args,{session:async request=>{
+    const text=request.prompt.feedback?approved:'Always change the shape.';events.push(['writer',text]);
+    if(request.prompt.feedback)assert.equal(request.prompt.feedback.quote,'Always');
+    const retrievals=[{entries:[{collection:'memory',chunk_id:'known',text:'A preserved shape. Shape changes can invalidate strides.'}]}];
+    return {value:request.validate({text,scope:'implementation',memoryRefs:['memory:known'],claims:[{path:'text',proofs:[{reference:groups[0].occurrences[0].reference}]}]},retrievals),retrievals};
+   },review:args=>reviewScopedArtifact(args,async request=>{
+    const {fields,evidence}=request.prompt;
+    assert.match(await readFile(evidence.find(e=>e.name==='memory:known').path,'utf8'),/invalidate strides/);
+    events.push(['writing-review',fields.text]);
+    return {value:request.validate(fields.text===approved?{verdict:'approved'}:{verdict:'revise',field:'text',quote:'Always',defect:'The recommendation is unconditional.'})};
+   })}),
+   family:async args=>{
+    assert.equal(args.approvedInstruction.text,approved);let submitted;
+    for(const prompt of ['Return zero','Repair the implementation']){
+     events.push(['test-author',prompt]);const tasks=['development','stride','layout'].map((id,i)=>({...task(id),files:{'kernel.py':'source '+i},prompt,checker,publicChecker:checker,changeType:['','layout','boundary'][i],relation:'Transfer',controls:{negatives:[{files:{}}],calibration:{files:{}},reference:{files:{}}}}));
+     submitted={id:'family',identity:prompt,mechanism:{phase:'check',type:'shape'},development:tasks[0],transfer:tasks.slice(1)};
+     try{await args.checkReferences({family:submitted,seconds:60,signal:args.signal});break;}
+     catch(error){assert.equal(error.code,'FAILURE_REFERENCE_REJECTED');assert.match(error.message,/ignores the input/);}
+    }
+    return {status:'ready',family:submitted};
+   },
+   testReview:args=>reviewScopedTest(args,request=>reviewScopedArtifact(request,async model=>{
+    const {fields}=model.prompt;assert.equal(fields['development.checker'],'pass');assert(fields['development.controls']);assert.deepEqual(model.evidenceGroups,groups);events.push(['test-review',fields['development.prompt']]);
+    return {value:model.validate(fields['development.prompt']==='Return zero'?{verdict:'revise',field:'development.prompt',quote:'Return zero',defect:'This ignores the input.'}:{verdict:'approved'})};
+   })),
+   runtime:async()=>({...await f.ops.runtime(),checkReferences:async()=>({diagnostics:[]}),qualify:async()=>({qualified:true,referencePassed:true,negativeFailed:true,calibrationPassed:true}),
+    trial:async input=>{events.push(['trial',input.arm]);if(input.arm!=='baseline')assert(input.guidance.includes(approved));
+     const value=result(input.arm!=='baseline'||baseline==='pass');value.mechanismMatch=!value.correct&&baseline==='reproduced';return value;}}),
+   publish:async args=>(await import('../../cli/skill-failure-candidates.mjs')).publishFailureWinner(args,{publish:async()=>true}),
+   design:async()=>assert.fail('Legacy writing after screening'),};
+  const outcome=await runCampaignFailureStep(f.config,f.values,ops);
+  assert.deepEqual(events.slice(0,8).map(e=>e[0]),['writer','writing-review','writer','writing-review','test-author','test-review','test-author','test-review']);
+  assert.deepEqual(events.slice(8,13).map(e=>e[1]),Array(5).fill('baseline'));
+  assert.equal(outcome.status,baseline==='reproduced'?'accepted':'rejected',outcome.reason);
+  assert.equal(events.filter(([event,lane])=>event==='trial'&&lane!=='baseline').length,baseline==='reproduced'?15:0);
+ }
 });

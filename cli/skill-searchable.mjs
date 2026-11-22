@@ -180,11 +180,18 @@ export async function admitSearchableSkill({config,directory,result,item,signal,
  const verified=await verify({config,item,result,manifest,family,directory:root,qualification:developmentQualification});
  assert(text(verified),'Verified focused approval provenance is missing');
  const design=await realpath(verified);
+ let sources;
+ if(manifest.experimentPolicy==='scoped-v1'){
+  const writing=await realpath(join(root,'..','writing'));
+  assert(within(writing,design),'Scoped writing approval is outside the experiment');
+  sources=[join(writing,'approved.json'),join(design,'writer-result.json'),join(design,'writing-review.json'),join(root,'..','test-approved.json')];
+ }else{
  assert(within(root,design),'Verified design is outside the pilot');
  const candidateDirectory=join(design,winner.id),qaDirectory=join(candidateDirectory,'qa');
  const initialQa=await optional(join(qaDirectory,'qa.json'));
  const qaFile=join(qaDirectory,initialQa?.format===2?'qa.json':'qa-v2.json');
- const sources=[join(design,'approved-design.json'),join(candidateDirectory,'approved-candidate.json'),qaFile];
+ sources=[join(design,'approved-design.json'),join(candidateDirectory,'approved-candidate.json'),qaFile];
+ }
  return publishSearchable({config,signal,recoverOnly,review:{instruction:winner.instruction,approval:winner.qa.approval},
   scope:config.target+' '+winner.scope+' guidance for '+family.id,
   context:'Development '+score(result.development.baseline).passes+'/5 to '+score(result.development[winner.id]).passes+'/5. Transfer confirmation did not pass: '+transfers.map(transferText).join('; ')+'.',
