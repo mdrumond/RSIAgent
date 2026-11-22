@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {join} from 'node:path';
+import {materializeProof} from './claim-proofs.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const text=value=>typeof value==='string'&&Boolean(value.trim());
 const roles=['material_claim','factual_premise','proposed_action'];
 const labels=['supported','contradicted','insufficient'];
 const bindingRoles=['text','source','actor','check','contract'];
-function validateBindings(row,proofs){
+function validateBindings(row,proofs,sourceRoles=new Map()){
  assert(row.bindings?.length&&row.bindings.every(binding=>bindingRoles.includes(binding.role)&&proofs.some(p=>p.reference===binding.reference)),'Every evidence binding needs a proof from the same source');
  for(const binding of row.bindings){
+  const declared=sourceRoles.get(binding.reference);
+  const required=binding.reference.startsWith('development-file:')?'source':binding.reference==='input:evaluationContract'?'contract':bindingRoles.includes(declared)?declared:undefined;
+  if(required)assert.equal(binding.role,required,binding.reference+' supplies '+required+' evidence');
   if(['input:proposal','input:answers','input:answerClaims'].includes(binding.reference))assert.equal(binding.role,'text','Draft and QA text establish only what was written');
  }
  assert(bindingRoles.includes(row.basis),'Identify the type of evidence the assertion requires');
@@ -47,16 +51,29 @@ export function assertionVerdict(atoms){
 }
 
 // Each evaluator receives one assertion and the original target. Sibling verdicts are withheld.
-export async function auditAssertions({objections,partition,identify,evaluate,concurrency,signal}){
- const atoms=validateAssertionPlan(partition??await identify(objections),objections),rows=[];
+export async function auditAssertions({objections,partition,identify,evaluate,concurrency,signal,checkpoint={},persist=async()=>{},restore=row=>row}){
  const parents=new Map(objections.map(row=>[row.id,row]));
+ const supplied=(partition??[]).filter(atom=>parents.has(atom.objectionId));
+ const frozenIds=new Set(supplied.map(atom=>atom.objectionId));
+ const newObjections=objections.filter(row=>!frozenIds.has(row.id));
+ const plans=checkpoint.plans??={},completed=checkpoint.assessments??={};
+ const planKey=hash(newObjections);
+ let fresh=plans[planKey]??[];
+ if(newObjections.length&&!plans[planKey]){
+  fresh=validateAssertionPlan(await identify(newObjections),newObjections);
+  plans[planKey]=fresh;await persist();
+ }
+ const atoms=validateAssertionPlan([...supplied,...fresh],objections),rows=[];
  let cursor=0;
  const workers=await Promise.allSettled(Array.from({length:Math.min(concurrency,atoms.length)},async()=>{
   while(cursor<atoms.length){
    signal?.throwIfAborted();
    const i=cursor++,atom=atoms[i];
-   const result=await evaluate(atom,parents.get(atom.objectionId));
+   const parent=parents.get(atom.objectionId),key=hash([parent,atom]);
+   if(completed[key]){rows[i]=restore(completed[key]);continue;}
+   const result=await evaluate(atom,parent);
    rows[i]={...atom,label:result.label,reason:result.reason,basis:result.basis,bindings:result.bindings,proofs:result.claims.filter(c=>c.path==='reason').flatMap(c=>c.proofs)};
+   validateBindings(rows[i],rows[i].proofs);completed[key]=rows[i];await persist();
   }
  }));
  for(const worker of workers)if(worker.status==='rejected')throw worker.reason;
@@ -71,7 +88,8 @@ export async function auditAssertions({objections,partition,identify,evaluate,co
  return {audits,claims};
 }
 
-export async function nativeAssertionAudit({input,objections,session,schemas,proofRecords,sourceDirectory,indexFile,allowedPaths}){
+export async function nativeAssertionAudit({input,objections,session,schemas,proofRecords,sourceIndex,sourceDirectory,indexFile,allowedPaths}){
+ const sourceRoles=new Map(sourceIndex.map(row=>[row.reference,row.role]));
  const start=performance.now();
  const invoke=async(directory,params)=>{
   input.signal?.throwIfAborted();
@@ -81,14 +99,16 @@ export async function nativeAssertionAudit({input,objections,session,schemas,pro
    knowledge:false,evidenceGroups:[],compactEvidence:true,...params})).value;
  };
  const task={draft:input.proposal,answers:input.answers,objective:input.objective,target:input.target,projectSummaries:[],learningProofEvidence:[]};
- return auditAssertions({objections,partition:input.panelAssertions?.filter(atom=>objections.some(row=>row.id===atom.objectionId)),
+ return auditAssertions({objections,partition:input.panelAssertions,
   concurrency:input.qaPanelConcurrency??5,signal:input.signal,
+  checkpoint:input.assertionCheckpoint,persist:input.persistAssertions,
+  restore:row=>({...row,proofs:row.proofs.map(proof=>materializeProof(proof,proofRecords))}),
   identify:async group=>(await invoke('partition-'+hash(group),{resultSchema:schemas.partition,
    prompt:{...task,objections:group,task:'Separate each objection into independently checkable assertions, preserving all material allegations, their qualifiers and target. Record whether each is a material claim of a defect, supporting factual premise, or proposed action. Preserve meaningful distinctions between actors, source versions, receipts, and requirements. Include an explicit testable material claim for every objection. Use sourceField problem or description as appropriate. Assign unique IDs. Do not judge truth or return findings.'},
    validate:value=>{validateAssertionPlan(value.assertions,group);return value;}})).assertions,
   evaluate:async(atom,parent)=>invoke('assertion-'+hash([parent.id,atom]),{resultSchema:schemas.assessment,proofRequired:true,selectorOnly:true,
    proofRecords,inlineProofSelectors:false,allowedPaths:[sourceDirectory,...allowedPaths],
-   prompt:{...task,assertion:atom,parent:{path:parent.path,problem:parent.problem,description:parent.description,citedSelectors:parent.citedSelectors},
+   prompt:{...task,assertion:atom,parent,
     sourceIndex:indexFile,task:'Judge only this assertion. Separate static source, scored actor, verifier and task contract. Check the exact quoted draft or answer and opposing evidence. Trace source and run identities before making measured claims. Use supported, contradicted or insufficient. Cite primary evidence with selectors for reason. Set basis to the evidence type needed to decide this specific assertion. Bind each source used to the role it plays (text, source, actor, check, contract). An objection or the draft alone cannot establish an execution result. Treat a proposed action as a claim about whether the evidence warrants it.'},
-   validate:value=>{validateBindings(value,value.claims.filter(c=>c.path==='reason').flatMap(c=>c.proofs));return value;}})});
+   validate:value=>{validateBindings(value,value.claims.filter(c=>c.path==='reason').flatMap(c=>c.proofs),sourceRoles);return value;}})});
 }

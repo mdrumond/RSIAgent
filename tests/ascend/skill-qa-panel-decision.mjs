@@ -107,4 +107,26 @@ test('checked premises and recommendations cannot establish a material defect or
  assert.throws(()=>validateAssertionPlan(atoms.slice(1,3),[{id:'parent',problem:'Compound assertion'}]),/material claim/);
  const bad={...atoms[0],proofs:[{...proof,reference:'input:answers'}],bindings:[{role:'check',reference:'input:answers'}]};
  assert.throws(()=>assertionVerdict([bad]),/only what was written/);
+ for(const [reference,role] of [['development-file:kernel.py','source'],['input:evaluationContract','contract']]){
+  const item={...atoms[0],proofs:[{...proof,reference}],basis:'actor',bindings:[{role:'actor',reference}]};
+  assert.throws(()=>assertionVerdict([item]),/supplies/);
+  assert.equal(assertionVerdict([{...item,basis:role,bindings:[{role,reference}]}]).disposition,'disproved');
+ }
+});
+
+test('a new objection is partitioned around frozen claims and a retry reuses checked siblings',async()=>{
+ const {auditAssertions}=await import('../../cli/skill-qa-assertions.mjs');
+ const objection=id=>({id,problem:'Verify '+id});
+ const atom=id=>({id,objectionId:id,sourceField:'problem',role:'material_claim',assertion:'Verify '+id});
+ const proof={reference:'actor:1',quote:'observed',recordSha256:'frozen'},plans=[],calls=[],checkpoint={};
+ let interrupt=true;
+ const request={objections:[objection('retained'),objection('new')],partition:[atom('retained'),atom('old')],
+  identify:async rows=>{plans.push(rows.map(row=>row.id));return rows.map(row=>atom(row.id));},
+  evaluate:async part=>{calls.push(part.id);if(part.id==='new'&&interrupt)throw Error('Provider unavailable');
+   return {label:'contradicted',basis:'actor',bindings:[{role:'actor',reference:'actor:1'}],reason:'observed',claims:[{path:'reason',proofs:[proof]}]};},
+  checkpoint,concurrency:2};
+ await assert.rejects(auditAssertions(request),/Provider unavailable/);
+ interrupt=false;
+ const result=await auditAssertions(request);
+ assert.deepEqual(plans,[['new']]);assert.deepEqual(calls,['retained','new','new']);assert.equal(result.audits.length,2);
 });

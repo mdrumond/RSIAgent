@@ -376,6 +376,15 @@ test('a summary objection retains the disputed item and the scoped baseline as a
    return options.proofRecords.find(record=>record.reference==='baseline');
   }});
  assert.equal(result.text,input.entries[0].text);
+ const proof={...selector,recordSha256:'verified',quote:input.entries[0].text};
+ const atom={id:'a1',objectionId:'a',role:'material_claim',sourceField:'problem',assertion:'The summary misattributes a baseline'};
+ const audited=await nativeQaPanelAudit({...input,seconds:15,panelAuditPolicy:'assertions',panelAssertions:[atom],evidenceSummary:{items:[summary]},
+  objections:[{id:'a',kind:'evidence',problem:atom.assertion,mentions:[{issue:{summaryItemId:summary.id},proofs:[]}]}],validate:value=>value},{session:async options=>{
+   assert.equal(options.prompt.parent.summaryItem.text,summary.text);
+   assert.deepEqual(options.prompt.parent.summaryItem.citedSelectors,[selector]);
+   return {value:{basis:'source',label:'supported',reason:'Baseline source',bindings:[{role:'source',reference:'baseline'}],claims:[{path:'reason',proofs:[proof]}]}};
+  }});
+ assert.equal(audited.value.audits[0].disposition,'verified');
 });
 
 test('ordinary audit exposes the frozen starter bytes and retains scoped project and attempt identities',async t=>{

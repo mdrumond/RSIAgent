@@ -374,7 +374,7 @@ export async function nativeQaPanelAudit(input,dependencies={}){
    ...(item?{summaryItem:{id:item.id,text:item.text,kind:item.kind,citedSelectors:selectors([item])}}:{})};
  });
  if(input.panelAuditPolicy==='assertions'){
-  const value=await nativeAssertionAudit({input,objections,session:dependencies.session??reviewSession,schemas:assertionSchemas,proofRecords,
+  const value=await nativeAssertionAudit({input,objections,session:dependencies.session??reviewSession,schemas:assertionSchemas,proofRecords,sourceIndex,
    sourceDirectory:join(input.directory,'sources'),indexFile:join(input.directory,indexFile),allowedPaths});
   return {value:input.validate(value)};
  }

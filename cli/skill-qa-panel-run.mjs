@@ -89,7 +89,7 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
  for (const worker of workers) if (worker.status === 'rejected') throw worker.reason;
  signal.throwIfAborted();
  const claims = panelClaims(panelVotes(panel));
- if(partition&&claims.length)validateAssertionPlan(partition,claims);
+ if(partition&&claims.length&&index===0&&!panel.history?.length)validateAssertionPlan(partition,claims);
  const retained=priorAudit(panel,claims);
  const audited=new Set(retained.audits.map(row=>row.claimId));
  const objections=claims.filter(claim=>!audited.has(claim.id));
@@ -112,10 +112,11 @@ export async function runPanelRound({round, payload, index, call, persist, now, 
    return value;
   };
   try {
-   const raw = await call('qaPanelAudit', {...payload, objections, auditVotes:panelVotes(panel), validate}, index+'-qaPanelAudit'+suffix, true);
+   const recovery=auditPolicy==='assertions'?{assertionCheckpoint:panel.assertionCheckpoint??={},persistAssertions:persist}:{};
+   const raw = await call('qaPanelAudit', {...payload,...recovery, objections, auditVotes:panelVotes(panel), validate}, index+'-qaPanelAudit'+suffix, true);
    const result=validate(raw?.value ?? raw);
    appendAudit(retained,result,()=>true);
-   panel.audit=retained;
+   panel.audit=retained;delete panel.assertionCheckpoint;
   } catch (error) {
    signal.throwIfAborted();
    panel.auditError = errorInfo(error);
