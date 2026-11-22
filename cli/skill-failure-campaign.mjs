@@ -72,7 +72,7 @@ export async function failureCampaignStatus(config){
    ...(isolation?{isolation:{elapsedSeconds:isolation.elapsedSeconds,allocatedSeconds:failureTiming.isolationSeconds,timings:isolation.timings}}:{}),
    screen:{completed:screen.length,passed:screen.filter(r=>r.correct===true).length,matchingFailures:screen.filter(r=>r.correct===false&&r.mechanismMatch).length},
    resources:cp?.slots??value(state.db,'skill-background-resources')??[],pending:!!run,unresolved:!!cp?.unresolved,
-   hasWork:!config.skills.tuningDisabled&&(!!run||hasClassifiableFailures(config,backlog,counts.dirtyFailures)||!!queuedFamily(backlog))};
+   hasWork:!config.skills.tuningDisabled&&(!!run||!counts.backfillComplete||counts.ingestion.freshPending||hasClassifiableFailures(config,backlog,counts.dirtyFailures)||!!queuedFamily(backlog))};
  }finally{state.close();}
 }
 

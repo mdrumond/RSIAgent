@@ -254,6 +254,8 @@ test('a timed-out classification page retains its grant and stops requesting dev
  assert.equal((await failureCampaignStatus(f.config)).hasWork,false);
  assert.equal(f.backlog.failures().length,1);
  await f.verify(attempt,'two.log','second failure');
+ // The new journal row must wake the controller before the ingestion cursor reaches it.
+ assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
  f.backlog.ingest();
  assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
  await step(({groups:[fresh],validate})=>validate(classification(fresh)));
