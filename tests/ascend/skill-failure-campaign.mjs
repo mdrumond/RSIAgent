@@ -335,8 +335,8 @@ test('scoped campaign repairs immutable writing and test independently before ma
  const {reviewScopedArtifact,reviewScopedTest}=await import('../../cli/skill-scoped-review.mjs');
  const {skillInput}=await import('../../cli/skill-microeval.mjs');
  const {stages}=await import('../../controller/workflow.mjs');
- for(const baseline of ['pass','unrelated','reproduced']){
-  const f=await fixture(t,'a5'),events=[],approved='Check the shape assumptions against all supported inputs.';
+ for(const [target,baseline] of [['a5','pass'],['a5','unrelated'],['a5','reproduced'],['a3','reproduced']]){
+  const f=await fixture(t,target),events=[],approved='Check the shape assumptions against all supported inputs.';
   delete f.config.skills.failureFirst.experimentPolicy;await writeFile(join(f.root,'instance.json'),JSON.stringify(f.config));
   const base=join(f.root,'skills','versions','base'),scopeNames=['global-kdb',...stages];
   await mkdir(base,{recursive:true});await writeFile(join(base,'skill-map.json'),JSON.stringify(Object.fromEntries(scopeNames.map(s=>[s,s+'.md']))));

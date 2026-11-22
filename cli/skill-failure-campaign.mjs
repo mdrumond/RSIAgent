@@ -299,7 +299,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
    if(!admission?.admitted)throw Error(admission?.reason??'Searchable skill admission refused');
    return finish(remaining()>0?'accepted':'inconclusive',{reason:'searchable-development-improvement',searchable:true,result,admission});
   }
-  if(config.target!=='a5'&&manifest.mode==='focused-correctness')
+  if(config.target!=='a5'&&manifest.mode==='focused-correctness'&&manifest.experimentPolicy!==scopedPolicy)
    return finish('inconclusive',{reason:'Focused correctness confirmation retained for review',result});
   phase('publish');const publication=await ops.publish({config,item:run.snapshot,result,directory:join(cp.directory,'pilot'),signal:active});
   if(!publication?.published)throw Error(publication?.reason??'Validated skill publication refused');
