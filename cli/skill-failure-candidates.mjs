@@ -88,6 +88,15 @@ async function writerCall(directory,seconds,signal,fn,now){
  }finally{clearInterval(timer);await writes;await save(file,snapshot(false));}
 }
 
+// QA may revise the instruction while preserving the additive change under review.
+export function validateAdditiveDesignChange(changes,changeId){
+ if(changes?.length!==1)throw Error('Expected exactly one change in changes; received '+(changes?.length??0));
+ const change=changes[0],required={id:changeId,action:'upsert',critical:false,negative:false};
+ const mismatches=Object.entries(required).filter(([key,value])=>change?.[key]!==value)
+  .map(([key,value])=>'changes[0].'+key+' must be '+JSON.stringify(value)+'; received '+(JSON.stringify(change?.[key])??'missing'));
+ if(mismatches.length)throw Error('Preserve the reviewed change fields: '+mismatches.join('. '));
+}
+
 /** Called only after five clean baseline attempts establish the reproduced struggle. */
 export function createFailureDesign({config,item,knowledgeConfig=config},dependencies={}){
  const ops={session:reviewSession,qa:runProposalQa,qaAnswer:nativeQaAnswer,qaReview:nativeQaReview,qaPanelAudit:nativeQaPanelAudit,now:Date.now,...dependencies};
@@ -166,7 +175,7 @@ export function createFailureDesign({config,item,knowledgeConfig=config},depende
    await writerHealthy(written);
    const memoryEvidence=memoryEntries(written.retrievals??[]),changeId='failure-first-'+hash([identity,id]).slice(0,24);
    const proposal={action:'update',reason:'Instruction grounded in reproduced baseline failures',groupIds:item.groupIds,memoryRefs:written.value.memoryRefs,changes:[{action:'upsert',id:changeId,scope:written.value.scope,text:written.value.text,critical:false,negative:false,evidenceRefs:refs,response:'actor-change'}]};
-   const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});assert(value.changes?.length===1&&value.changes[0].id===changeId&&value.changes[0].action==='upsert'&&value.changes[0].critical===false&&value.changes[0].negative===false,'Only one additive instruction may be reviewed');assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
+   const validateProposal=value=>{validateReviewProposal(value,groups,item.preparation?.classifications??{});validateAdditiveDesignChange(value.changes,changeId);assertInstruction(value.changes[0].text);assert(value.memoryRefs.every(ref=>memoryEvidence.some(entry=>entry.ref===ref)),'QA cannot introduce unretrieved memory');return value;};
    let qa,pause=1;do{qa=await ops.qa({directory:join(directory,'qa'),config:sessionConfig,proposal:validateProposal(proposal),groups,entries,objective:'correctness',target:config.target,memoryEvidence,proposalDirectory:join(directory,'writer'),validateProposal,
     ...(panel?{qaPolicy:'panel',frozenQa:input.frozenQa,qaPanelConcurrency:input.qaPanelConcurrency,panelAuditEvidence:input.panelAuditEvidence,panelRevisionSources,retryMissingPanelVotes:input.retryMissingPanelVotes}:{}),allowWriterRevision:focused&&!input.revisionFeedback,evaluationContract,seconds:Math.min(panel?1020:600,left()),signal:AbortSignal.any([...(input.signal?[input.signal]:[]),AbortSignal.timeout(Math.max(1,Math.ceil(left()*1000)))])},{qaAnswer:async request=>{const response=await ops.qaAnswer(request);return response?.value??response;},qaReview:async request=>{const response=await ops.qaReview(request);return panel?response:response?.value??response;},qaPanelAudit:ops.qaPanelAudit});
    if(panel||qa.reasonKind!=='infrastructure'||!qa.retryable||!qa.error?.reviewSession?.retryableTimeout||Math.min(left(),qa.seconds-qa.elapsedSeconds)<=pause)break;

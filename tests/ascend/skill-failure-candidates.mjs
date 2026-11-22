@@ -549,3 +549,20 @@ test('panel custody checks only the selected lane and requires a closed or froze
  await writeFile(join(directory,'design-input.json'),JSON.stringify({...input,frozenQaSha256:'frozen'}));
  assert.equal(await design.canResume({directory}),true);
 });
+
+test('QA repairs a changed review flag while retaining its substantive revision',async t=>{
+ const f=await fixture(t);let repairs=0;
+ f.deps.qa=async input=>{
+  const proposal=structuredClone(input.proposal),change=proposal.changes[0];
+  change.text+=' Include one independent check.';change.negative=true;
+  try{input.validateProposal(proposal);assert.fail('Changed flag accepted');}catch(error){
+   const field=/changes\[0\]\.(\w+) must be (false|true); received (false|true)/.exec(error.message);
+   assert(field,error.message);assert.equal(JSON.parse(field[3]),change[field[1]]);
+   change[field[1]]=JSON.parse(field[2]);repairs++;
+  }
+  return {verdict:'approved',approval:'reviewed',proposal:input.validateProposal(proposal)};
+ };
+ const rows=await createFailureDesign({config:f.config,item:f.item},f.deps)(f.input);
+ assert.equal(repairs,3);assert.equal(rows.length,3);
+ for(const row of rows){assert.equal(row.proposal.changes[0].negative,false);assert(row.instruction.endsWith('Include one independent check.'));}
+});
