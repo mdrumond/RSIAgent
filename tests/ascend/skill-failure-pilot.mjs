@@ -409,3 +409,15 @@ test('remaining pilot allowance caps repeated closed provider timeouts',async t=
  assert.equal(calls,2);assert.equal(report.status,'inconclusive');assert.match(report.reason,/elapsed time/);
  assert.equal(report.elapsedSeconds,2);assert.equal(report.screens.first,undefined);
 });
+
+test('resume reconciles durable provider timeout from a running operation before retrying',async t=>{
+ const f=await fixture(t),options={...f.options,concurrency:1};
+ const first=await runFailurePilot(options,{...f.ops,trial:async()=>{throw Error('worker interrupted after adapter return');}});
+ assert.equal(first.status,'needs-settlement');
+ const timeout={infrastructure:true,correct:null,reason:'Gateway timeout',errorCode:'FAILURE_TRIAL_PROVIDER_TIMEOUT'};
+ let retries=0;
+ const second=await runFailurePilot(options,{...f.ops,settle:async()=>({closed:true,result:timeout}),trial:async input=>{
+  if(input.repetition===0){retries++;assert.equal(input.directory.endsWith('/retry-1'),true);}return result(true);
+ }});
+ assert.equal(second.status,'complete');assert.equal(retries,1);
+});

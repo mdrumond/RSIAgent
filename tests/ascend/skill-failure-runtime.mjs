@@ -178,6 +178,7 @@ test('native Pi exhausting the actor grant during provider timeout retry skips s
  const receipt=await runtime.trial({directory:join(directory,'op'),task:{id:'dev',caseIds:['value'],files:{'kernel.py':'answer=0'},checker,publicChecker:checker,prompt:'Fixture'},guidance:'same',actorSeconds:1,verificationSeconds:1});
  assert.equal(result.timedOut,true);assert.equal(receipt.infrastructure,true);assert.equal(receipt.errorCode,'FAILURE_TRIAL_PROVIDER_TIMEOUT');assert.match(receipt.reason,/timeout at gateway/);
  assert.equal(scored,0);assert.equal(await runtime.close(),true);
+ assert.deepEqual(await runtime.settle({directory:join(directory,'op')}),{closed:true,result:receipt});
 });
 
 test('late trusted verification is not admitted after its own allowance, independently of the actor grant',async t=>{
