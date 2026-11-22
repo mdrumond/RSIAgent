@@ -2,7 +2,7 @@ import test from 'node:test';
 import {Type} from 'typebox';
 import {Check} from 'typebox/value';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm,symlink} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,symlink,cp} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
@@ -457,4 +457,30 @@ test('retry backoff cannot renew an exhausted question even with new draft files
  assert.equal(output.question.number,1);
  assert.equal(output.question.elapsedSeconds,180.5);
  assert.equal(sessions,1);
+});
+
+test('a retained proposal lets a read-only researcher request the trusted checker before asserting a positive control',async t=>{
+ const f=await fixture(t);
+ for(const task of [f.family.development,...f.family.transfer]){
+  const path=task.id+'/alternate.py';f.files[path]='def run(x): return x * 1\n';task.controls.calibration={files:{'kernel.py':path}};
+ }
+ const previous=join(f.root,'skills','priority','failure-first','previous'),archived=join(previous,'family');
+ await f.write();await mkdir(previous,{recursive:true});await cp(f.directory,archived,{recursive:true});
+ const old=await loadFailureFamily({file:join(archived,'family.json'),config:f.config,item:f.item});
+ await writeFile(join(previous,'family-ready.json'),JSON.stringify({status:'ready',family:old}));
+ f.backlog.db.prepare("INSERT INTO skill_backlog_runs(id,item_id,revision,base,seconds,status,snapshot,checkpoint) VALUES(?,?,?,?,?,?,?,?)")
+  .run('previous',f.item.id,1,f.item.base,7200,'inconclusive',JSON.stringify(f.item),JSON.stringify({directory:previous}));
+ const directory=join(f.root,'new-author');let checks=0;
+ const result=await prepareFailureFamily({...f,directory,seconds:60,approvedInstruction:{text:'Check the work assigned to each index.'},
+  checkReferences:async({family})=>{checks++;assert.equal(family.identity,old.identity);assert.equal(family.transfer.length,2);return {diagnostics:[{variant:'reference',correct:true}]};}},
+ {session:async({validate,prompt,resultSchema,allowedPaths})=>{
+  const offered=prompt.retainedTest;assert.equal(offered.runId,'previous');assert(allowedPaths.includes(offered.directory));
+  const manifest=JSON.parse(await readFile(offered.manifest));assert.deepEqual(JSON.parse(await readFile(offered.editableTemplate)),manifest);
+  assert.equal(await readFile(join(offered.directory,manifest.development.checker),'utf8'),f.files['dev/private.py']);
+  assert.deepEqual(manifest.development.controls,f.family.development.controls);
+  await assert.rejects(validate(missingFamily(f.reference)),/try-retained/);
+  const request={status:'try-retained',familyIdentity:offered.identity,reason:'Check the retained controls',claims:missingFamily(f.reference).claims};
+  assert(Check(resultSchema,request));return {value:await validate(request)};
+ }});
+ assert.equal(checks,1);assert.equal(result.status,'ready');assert.equal(result.family.identity,old.identity);
 });

@@ -424,3 +424,21 @@ test('a changed reviewed artifact gets a new native submission and unchanged inp
   assert.equal((await reviewScopedArtifact({...args,fields:{text}},session)).verdict,verdict);
  assert.equal(answers.size,2);
 });
+
+test('controlled replay claims a fresh experiment while preserving approved writing and spent elapsed time',async t=>{
+ const {createHash}=await import('node:crypto');const f=await fixture(t,'a5');delete f.config.skills.failureFirst.experimentPolicy;
+ const prior=f.backlog.claim({itemId:f.item.id,base:'base',seconds:7200,workflow:'failure-first-v1'}).run;
+ const directory=join(f.root,'skills','priority','failure-first',prior.id),writing=join(directory,'writing');
+ const bytes=JSON.stringify({revision:1,qa:'prior approved bytes'}),source='b'.repeat(40);
+ await mkdir(join(writing,'revision-1'),{recursive:true});await mkdir(join(directory,'family'));
+ for(const [name,value] of Object.entries({'approved.json':bytes,'context.json':'{}','revision-1/writing-review.json':'{}','revision-1/writer-result.json':'{}'}))await writeFile(join(writing,name),value);
+ await writeFile(join(directory,'family','isolation.json'),JSON.stringify({elapsedSeconds:120,status:'needs-evidence',running:false,question:{number:1}}));
+ f.backlog.checkpoint(prior.id,{elapsed:273,checkpoint:{directory,experimentPolicy:'scoped-v1',phase:'isolate',slots}});f.backlog.finish(prior.id,{status:'inconclusive',result:{reason:'needs-evidence'}});
+ f.backlog.revise(f.item.id,{status:'queued',tests:{scopedWritingReplay:{sourceRunId:prior.id,sourceRevision:source,approvalSha256:createHash('sha256').update(bytes).digest('hex')}}});
+ let checked=false;
+ const result=await runCampaignFailureStep(f.config,f.values,{...f.ops,writing:async args=>{
+  assert.equal(await readFile(join(args.directory,'approved.json'),'utf8'),bytes);assert.equal(args.frozenContext.source,source);
+  assert(args.seconds<=7200-273);return {fields:{text:'Retained instruction'}};
+ },family:async args=>{checked=true;assert.equal(args.priorIsolation.elapsedSeconds,120);return {status:'needs-evidence',reason:'Still missing an oracle'};}});
+ assert(checked);assert.equal(result.status,'inconclusive');assert.equal(f.backlog.run(prior.id).elapsed,273);
+});

@@ -238,16 +238,18 @@ const familySchema=(target,focused)=>Type.Object({format:Type.Literal(2),id:name
 const claimSchema=Type.Array(Type.Object({path:Type.Literal('reason'),kind:Type.Union([Type.Literal('observation'),Type.Literal('hypothesis')]),proofs:Type.Array(selector,{minItems:1})},{additionalProperties:false}),{minItems:1});
 const missingEvidence=['retained-source','failure-mechanism','passing-reference','missing-semantics','unreliable-oracle'];
 const isOracleGap=blocker=>['missing-semantics','unreliable-oracle'].includes(blocker);
-const resultSchema=(target,focused)=>Type.Union([
+const resultSchema=(target,focused,reusable)=>Type.Union([
+ ...(reusable?[Type.Object({status:Type.Literal('try-retained'),familyIdentity:nameSchema,reason:nameSchema,claims:claimSchema},{additionalProperties:false})]:[]),
  Type.Object({status:Type.Literal('ready'),reason:nameSchema,family:familySchema(target,focused),claims:claimSchema},{additionalProperties:false}),
  Type.Object({status:Type.Literal('needs-evidence'),missing:Type.Union(missingEvidence.map(Type.Literal)),reason:nameSchema,verificationReference:nameSchema,
   nextQuestion:Type.Optional(nameSchema),claims:claimSchema},{additionalProperties:false})
 ]);
-function authorInstructions(focusedCalibration){
+function authorInstructions(focusedCalibration,scopedWriting){
  return [
   'Inspect the relevant replayInputs in sourceInventory with native read. Their roles and provenance identify retained checker dependencies and declared historical controls; use trusted qualification to establish their behavior. Use native write/edit to assemble the file-backed draft under draftDirectory. Call submit_review with status ready, the typed manifest and evidence claims to run syntax and trusted target checks. The controller replays the development starter first. The tool returns rejected fields and observed control outcomes so you can revise and resubmit. Use the saved draft if one is present.',
   'Answer the focused question for one retained actor correctness failure. Cite the original verification or primary diagnostic. Inspect successful projects and KDB memory for a passing reference. Preserve the verifier’s input placement and invocation or explain isolation edits using evidence. Attribute behaviour only where a check directly establishes it.',
-  'Freeze one development task and two transfer tasks with meaningful, distinct layout, operation, dtype, or boundary adaptations. Use paths relative to draftDirectory and separate the public and private checkers. Keep private helpers out of editable files. Include a passing reference and failing negative controls for each task. Skill writing starts after the family is established.'+
+  'Freeze one development task and two transfer tasks with meaningful, distinct layout, operation, dtype, or boundary adaptations. Use paths relative to draftDirectory and separate the public and private checkers. Keep private helpers out of editable files. Include a proposed positive reference and negative controls for each task.'+
+   (scopedWriting?' The instruction has already been approved. You design the experiment. You have native read/write/edit tools. The controller executes the proposed controls through submit_review; ready requests a check and does not assert that a control passed. Report measured outcomes only after the controller returns them.':' Skill writing starts after the family is established.')+
    (focusedCalibration?' Include a distinct passing calibration for every task that exercises the same oracle without using the failing construct.':''),
   'The checker receives the candidate directory in argv1. Enforce a 90-second elapsed deadline per case. End with one JSON line containing correct and evidence.caseResults. Supply one {id,correct:boolean} row for every frozen case. Mark a case true only after it passes, and mark overall correct true only if all cases pass. Set evidence.checkedCases to the IDs actually executed, including any observed failed case. On every failing exit emit evidence.phase and evidence.type, and align the manifest mechanism with the values the checker actually reports for the reproduced failure. The trusted guard supplies the candidate hash.',
   'If the evidence cannot support a family, use submit_review with status needs-evidence. Pick the closest blocker, select verificationReference from sourceInventory, cite the original evidence, and explain the unknown. For an oracle or semantics gap, give one question that a small Phase 1 exercise with staged PyTorch outputs could answer. For other gaps, include a question when a specific probe can distinguish plausible explanations.',
@@ -287,6 +289,42 @@ async function freezeDraft(manifest,draft,directory){
  if(names.size>64)throw Error('Bounded family file bundle required');let size=0;const bytes=[];for(const name of names){if(['family.json','isolation.json','draft','research','sources','evidence'].includes(relative(directory,resolve(directory,name)).split('/')[0]))throw Error('Reserved family file');const content=await utf8(await scoped(draft,name).catch(error=>{if(error.code==='ENOENT')throw Error('Missing draft file: '+name+'. Write it under draftDirectory, then resubmit the manifest.');throw error;}));size+=Buffer.byteLength(content);if(size>4194304)throw Error('Bounded family file bundle required');bytes.push([name,content]);}
  for(const [name,content]of bytes){const path=resolve(directory,name);if(!inside(directory,path))throw Error('Family output path escapes accepted directory');await mkdir(dirname(path),{recursive:true});await writeFile(path,content,{mode:0o600});}
 }
+// Earlier scores are historical. Only source files from a verified same-item archive are candidates for a fresh check.
+async function reusableFamily({backlog,config,item,directory,signal}){
+ if(!backlog?.db)return null;
+ const rows=backlog.db.prepare("SELECT id,json_extract(checkpoint,'$.directory') AS directory FROM skill_backlog_runs WHERE item_id=? AND base=? AND status!='running' AND checkpoint IS NOT NULL ORDER BY rowid DESC").iterate(item.id,item.base);
+ for(const row of rows){
+  signal?.throwIfAborted();
+  const previous=row.directory;
+  if(!previous||!previous.endsWith(join('skills','priority','failure-first',row.id)))continue;
+  const packet=await optional(join(previous,'family-ready.json'));
+  if(!packet?.family?.identity)continue;
+  const archiveRoot=resolve(previous,'../../../..'),source=join(previous,'family'),file=join(source,'family.json');
+  let old,fresh;
+  try{
+   old=await loadFailureFamily({file,config:{...config,project_evidence_root:archiveRoot},item,signal});
+   if(old.identity!==packet.family.identity)continue;
+   fresh=await loadFailureFamily({file,config,item,signal});
+  }catch(error){signal?.throwIfAborted();continue;}
+  if(['reference','attemptId','projectId','sourceSha256'].some(key=>old.provenance[key]!==fresh.provenance[key]))continue;
+  if(old.provenance.verificationSha256!==fresh.provenance.verificationSha256){
+   // Cloning a campaign relocates archive paths. Require the complete original event, modulo that prefix.
+   const eventIdentity=root=>{
+    const db=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});
+    try{return sha(JSON.stringify(failedRecord(db,item,old.provenance).data).replaceAll(root+'/', '<campaign>/'));}
+    finally{db.close();}
+   };
+   if(eventIdentity(archiveRoot)!==eventIdentity(await realpath(config.project_evidence_root??config.root)))continue;
+  }
+  const manifest=await optional(file),home=join(directory,'retained-family',old.identity);
+  await mkdir(home,{recursive:true});await freezeDraft(manifest,source,home);
+  await save(join(home,'family.json'),manifest);
+  const verified=await loadFailureFamily({file:join(home,'family.json'),config,item,signal});
+  if(verified.identity!==fresh.identity)throw Error('Retained test files changed during transfer');
+  return {id:old.id,identity:old.identity,currentIdentity:verified.identity,runId:row.id,directory:home,manifest:join(home,'family.json')};
+ }
+ return null;
+}
 async function draftFingerprint(draft){
  const files=(await readdir(draft,{recursive:true,withFileTypes:true})).filter(e=>e.isFile());
  const inputs=files.map(file=>join(file.parentPath,file.name)).sort();
@@ -298,7 +336,7 @@ async function draftFingerprint(draft){
  return sha(hashes);
 }
 /** A bounded native research session may produce fixtures, never skill instructions or curriculum jobs. */
-export async function prepareFailureFamily({config,backlog,item,directory,seconds=failureTiming.isolationSeconds,signal,checkReferences,approvedInstruction},dependencies={}){
+export async function prepareFailureFamily({config,backlog,item,directory,seconds=failureTiming.isolationSeconds,signal,checkReferences,approvedInstruction,priorIsolation},dependencies={}){
  if(!['a3','a5'].includes(config.target))throw Error('Failure isolation requires A3 or A5 target');
  if(!Number.isFinite(seconds)||seconds<=0||seconds>failureTiming.isolationSeconds)throw Error('Isolation must fit '+failureTiming.isolationSeconds+' elapsed seconds');await mkdir(directory,{recursive:true});
  const draft=join(directory,'draft');await mkdir(draft,{recursive:true});
@@ -307,7 +345,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
  if(prior?.status==='ready'){const family=await loadFailureFamily({file,config,item});if(prior.familyIdentity!==family.identity)throw Error('Frozen family changed');return {status:'ready',family,elapsedSeconds:prior.elapsedSeconds};}
  if(['needs-evidence','expired'].includes(prior?.status))return prior;
  if(prior?.running)throw Error('Interrupted isolation elapsed custody is unknown');
- const elapsed=prior?.elapsedSeconds??0;
+ const elapsed=prior?.elapsedSeconds??priorIsolation?.elapsedSeconds??0;
  const saveIsolation=dependencies.saveIsolation??save;
  const observations=prior?.referenceChecks??{},completedChecks=prior?.completedReferenceChecks??{};
  let recovery=prior?.recovery??{contexts:0};
@@ -315,9 +353,9 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
  const now=dependencies.now??(()=>performance.now()),begun=now(),allocation=Math.min(seconds,failureTiming.isolationSeconds-elapsed);
  const left=()=>allocation-(now()-begun)/1000;
  const isolationTimeout=AbortSignal.timeout(Math.max(1,Math.ceil(allocation*1000))),bounded=signal?AbortSignal.any([signal,isolationTimeout]):isolationTimeout;
- const timings={focusedQuestion:0,verification:0,piTurnWait:0,piResponse:0,piRetry:0,...prior?.timings};
+ const timings={focusedQuestion:0,verification:0,piTurnWait:0,piResponse:0,piRetry:0,...(prior?.timings??priorIsolation?.timings)};
  let focus=new AbortController(),focusedSignal=AbortSignal.any([bounded,focus.signal]);
- let question=prior?.question??{number:1,kind:'isolate-failure',elapsedSeconds:timings.focusedQuestion};
+ let question=prior?.question??{number:priorIsolation?priorIsolation.question.number+1:1,kind:'isolate-failure',elapsedSeconds:priorIsolation?0:timings.focusedQuestion};
  let ledger={identity,elapsedSeconds:elapsed,timings,question,referenceChecks:observations,completedReferenceChecks:completedChecks,recovery,lastChecked,running:true},focusStarted,focusTimer,verificationStarted;
  const focusDelta=()=>focusStarted===undefined?0:(now()-focusStarted)/1000;
  const focusedElapsed=()=>timings.focusedQuestion+focusDelta();
@@ -349,6 +387,12 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
    return ledger;
   }
   const groups=await freezeGroups(config.root,item.evidence?.groups??[],join(directory,'evidence'));bounded.throwIfAborted();
+  const reusable=approvedInstruction&&checkReferences?await reusableFamily({backlog,config,item,directory,signal:bounded}):null;
+  let editableTemplate;
+  if(reusable&&!(await readdir(draft)).length){
+   const manifest=await optional(reusable.manifest);await freezeDraft(manifest,reusable.directory,draft);
+   editableTemplate=join(draft,'family.json');await save(editableTemplate,manifest);
+  }
   let disposition;
   const validateDisposition=value=>isolationDisposition({value,sources,groups,config,item,observations,signal:bounded});
   const focusedCalibration=config.target==='a5'||Boolean(approvedInstruction);
@@ -370,18 +414,29 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
      task:'Continue the current question from the saved draft and trusted checker feedback. Prior dialogue is unavailable.',
      trustedChecker:lastChecked?{reason:lastChecked.reason,diagnostics:observations[lastChecked.reference]??[]}:null
     }:null;
-    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target,focusedCalibration),
+    result=await session({directory:research,config,seconds:Math.max(.001,left()),signal:focusedSignal,writableDirectory:draft,knowledge:true,evidenceGroups:groups,allowedPaths:[config.project_evidence_root??config.root,...sources.flatMap(source=>[source.path,...source.replayInputs.map(input=>input.path)]),...(reusable?[reusable.directory]:[])],proofRequired:true,selectorOnly:true,resultSchema:resultSchema(config.target,focusedCalibration,reusable),
    onModelTiming:(kind,seconds)=>{timings[kind]+=seconds;},
-   prompt:{...(approvedInstruction?{approvedInstruction,testObjective:'Design or reuse a discriminating experiment for this immutable instruction and the original ranked failure. Keep the evaluated actor task blind to the instruction.'}:{}),...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
+   prompt:{...(reusable?{retainedTest:{...reusable,editableTemplate,tryRetained:{status:'try-retained',familyIdentity:reusable.identity},action:'Inspect this read-only same-failure family and its files. Submit status try-retained with familyIdentity, reason, and original evidence claims to run the proposed family unchanged. Or adapt its files under draftDirectory and submit status ready. The controller runs the checks and the independent reviewer.'}}:{}),...(approvedInstruction?{approvedInstruction,testObjective:'Design or reuse a discriminating experiment for this immutable instruction and the original ranked failure. Keep the evaluated actor task blind to the instruction.'}:{}),...(authorRecovery?{recovery:authorRecovery}:{}),target:config.target,draftDirectory:draft,focusedQuestion:{number:question.number,prompt:nextQuestion},task:authorInstructions(focusedCalibration,Boolean(approvedInstruction)),contract:{format:2,target:config.target,objective:'correctness',id:'family-id',mechanism:{phase:'exact checker phase',type:'exact checker failure type'},provenance:{reference:'events:N',source:{path:'campaign-relative retained kernel OR snapshotReference OR iterationId, repository and file'},isolationEdits:'Only if adjusting orthogonal issues'},development:{id:'development',prompt:'fixed task contract',caseIds:['case'],files:{'kernel.py':'dev/starter.py'},checker:'dev/private.py',publicChecker:'dev/public.py',controls:{reference:{files:{'kernel.py':'dev/reference.py'}},negatives:[{files:{'kernel.py':'dev/starter.py'}}],...(focusedCalibration?{calibration:{files:{'kernel.py':'dev/calibration.py'}}}:{})}},transfer:'exactly two task records, each additionally changeType and relation'},groupIds:item.groupIds,sourceInventory:sources},
    validate:async value=>{
-    if(value.status==='needs-evidence'){disposition=await validateDisposition(value);return value;}
+    if(value.status==='needs-evidence'){
+     if(reusable&&value.missing==='passing-reference'&&!observations[value.verificationReference]&&!lastChecked){
+      throw Error('A retained proposed reference can be checked by the controller now. Submit try-retained with familyIdentity '+reusable.identity+' to measure it. If a different missing fact prevents testing this family, identify that fact.');
+     }
+     disposition=await validateDisposition(value);return value;
+    }
+    const submission=value;let proposedRoot=draft;
+    if(value.status==='try-retained'){
+     if(!reusable||value.familyIdentity!==reusable.identity)throw Error('Choose the offered retained family identity');
+     proposedRoot=reusable.directory;
+     value={status:'ready',reason:value.reason,claims:value.claims,family:await optional(reusable.manifest)};
+    }
     if(!value.family||value.files)throw Error('Submit a typed family manifest referencing draftDirectory files, without inline file contents');
     if(focusedCalibration){
      for(const task of [value.family.development,...(value.family.transfer??[])]){
       if(!text(task?.controls?.calibration?.files?.['kernel.py']))throw Error(config.target.toUpperCase()+' task '+(task?.id??'unknown')+' requires a calibration kernel before qualification');
      }
     }
-    await freezeDraft(value.family,draft,directory);
+    await freezeDraft(value.family,proposedRoot,directory);
     await save(file,value.family);const family=await loadFailureFamily({file,config,item,signal:bounded});
     if(focusedCalibration){
      for(const task of [family.development,...family.transfer]){
@@ -420,7 +475,7 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
       throw Error('Family reference checks failed: '+rejection.message,{cause:rejection});
      }
     }
-    bounded.throwIfAborted();return value;
+    bounded.throwIfAborted();return submission;
     }});
     checkFocus();
    }catch(error){
@@ -447,10 +502,10 @@ export async function prepareFailureFamily({config,backlog,item,directory,second
    }finally{stopFocus();}
   }
   if(left()<=0)throw failureStageElapsed('isolate');
-  const value=result.value??result,family=value.status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;
+  const value=result.value??result,status=value.status==='try-retained'?'ready':value.status,family=status==='ready'?await loadFailureFamily({file,config,item,signal:bounded}):null;
   bounded.throwIfAborted();
   if(!family)disposition??=await validateDisposition(value);
-  Object.assign(ledger,{status:value.status,reason:value.reason,...(family?{familyIdentity:family.identity}:{disposition}),elapsedSeconds:elapsed+(now()-begun)/1000,running:false});
+  Object.assign(ledger,{status,reason:value.reason,...(family?{familyIdentity:family.identity}:{disposition}),elapsedSeconds:elapsed+(now()-begun)/1000,running:false});
   return family?{status:'ready',family,elapsedSeconds:ledger.elapsedSeconds}:ledger;
  }catch(error){
   const exhausted=error.failureStage??signal?.reason?.failureStage??(!signal?.aborted&&(isolationTimeout.aborted||left()<=0?'isolate':focus.signal.aborted?'focused-question':null));

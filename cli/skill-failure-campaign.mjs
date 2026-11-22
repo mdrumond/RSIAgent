@@ -1,6 +1,6 @@
 /** Campaign admission for the failure-first experiment; legacy comparisons stay frozen. */
 import {readFile,mkdir,writeFile} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join,dirname} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
@@ -87,6 +87,34 @@ export async function failureCampaignSettled(config,dependencies={}){
  }finally{state.close();}
 }
 
+async function scopedReplay(backlog,config,item){
+ const request=item.tests?.scopedWritingReplay;
+ if(!request)return null;
+ const previous=backlog.run(request.sourceRunId);
+ if(!previous||previous.id!==request.sourceRunId||previous.status!=='inconclusive'||previous.item_id!==item.id||previous.base!==item.base||
+    previous.checkpoint?.unresolved||previous.checkpoint?.experimentPolicy!==scopedPolicy||
+    previous.checkpoint?.directory!==join(config.root,'skills','priority','failure-first',previous.id)||
+    !/^[a-f0-9]{40}$/.test(request.sourceRevision)||!/^[a-f0-9]{64}$/.test(request.approvalSha256))throw Error('Scoped replay requires a settled same-item writing checkpoint and pinned approval');
+ const directory=previous.checkpoint.directory,writing=join(directory,'writing'),bytes=await readFile(join(writing,'approved.json'));
+ if(createHash('sha256').update(bytes).digest('hex')!==request.approvalSha256)throw Error('Retained writing approval bytes differ');
+ const approval=JSON.parse(bytes),isolation=await optional(join(directory,'family','isolation.json'));
+ if(previous.result?.reason!=='needs-evidence'||isolation?.running||isolation?.status!=='needs-evidence'||!Number.isFinite(previous.elapsed)||previous.elapsed<0||
+    !Number.isFinite(isolation.elapsedSeconds)||isolation.elapsedSeconds<0||!Number.isInteger(approval.revision)||approval.revision<1)throw Error('An exactly charged, completed isolation hold is required for replay');
+ return {request,previous,writing,approval,isolation};
+}
+
+async function stageScopedWriting(origin,destination){
+ const files=['approved.json','context.json'];
+ for(let revision=1;revision<=origin.approval.revision;revision++)
+  for(const name of ['writing-review.json','writer-result.json'])files.push(join('revision-'+revision,name));
+ for(const name of files){
+  const file=join(destination,name);await mkdir(dirname(file),{recursive:true});
+  const bytes=await readFile(join(origin.writing,name));
+  try{await writeFile(file,bytes,{flag:'wx'});}
+  catch(error){if(error.code!=='EEXIST')throw error;if(!(await readFile(file)).equals(bytes))throw Error('Scoped replay writing copy changed: '+name);}
+ }
+}
+
 /** One ranked family owns the complete two-hour ledger and all child operation handles. */
 export async function runCampaignFailureStep(config,{slots,memory,remainingSeconds,signal},dependencies={}){
  config=skillConfig(config);if(!failureFirstEnabled(config)||!['a3','a5'].includes(config.target))throw Error('Failure-first workflow on A3 or A5 must be explicitly enabled');
@@ -162,9 +190,11 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   }
   const owner=await processIdentity();
   if(campaignLeft()<=0)throw Error('Campaign elapsed allowance exhausted');
-  const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(failureTiming.experimentSeconds,campaignLeft()),workflow:'failure-first-v1',owner});
+  const origin=await scopedReplay(backlog,config,item);
+  const inherited=origin?.previous.elapsed??0;
+  const claimed=backlog.claim({base:config.skills.activeVersion,itemId:item.id,seconds:Math.min(origin?.previous.seconds??failureTiming.experimentSeconds,campaignLeft()+inherited),workflow:'failure-first-v1',owner});
   if(!claimed)return {status:'idle',reason:'Family already completed'};
-  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now(),directory:join(config.root,'skills','priority','failure-first',run.id),slots,experimentPolicy:existing?'legacy':experimentPolicy(config.skills.failureFirst)};
+  run=claimed.run;cp=run.checkpoint??{workflow:'failure-first-v1',startedAt:now()-inherited*1000,directory:join(config.root,'skills','priority','failure-first',run.id),slots,experimentPolicy:origin?scopedPolicy:existing?'legacy':experimentPolicy(config.skills.failureFirst),...(origin?{writingReplay:origin.request,inheritedElapsedSeconds:inherited}:{})};
   if(cp.workflow!=='failure-first-v1'||hash(cp.slots)!==hash(slots))throw Error('Retained experiment requires its exact original resource bindings');
   const resumedAt=now(),retainedElapsed=Math.max(run.elapsed,(resumedAt-cp.startedAt)/1000);
   const elapsed=()=>retainedElapsed+(now()-resumedAt)/1000;
@@ -187,8 +217,9 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   if(cp.experimentPolicy===scopedPolicy){
    phase('writing');
    try{
+    if(origin)await stageScopedWriting(origin,join(cp.directory,'writing'));
     writing=await ops.writing({config,knowledgeConfig,item:run.snapshot,directory:join(cp.directory,'writing'),seconds:remaining(),signal:active,
-     frozenContext:{memory:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null,writer:await ops.model(config.skill_writer_actor??config.actor),source:config.skills.failureFirst.sourceRevision}});
+     frozenContext:{memory:memory.knowledge.identity,attentionRevision:memory.knowledge.attentionRevision??null,writer:await ops.model(config.skill_writer_actor??config.actor),source:origin?.request.sourceRevision??config.skills.failureFirst.sourceRevision}});
    }catch(error){
     if(!signal?.aborted&&error.reviewSession)return finish('inconclusive',{reason:'writing-'+error.reviewSession.kind,stage:'writing',detail:error.message});
     throw error;
@@ -230,7 +261,7 @@ export async function runCampaignFailureStep(config,{slots,memory,remainingSecon
   };
   let prepared;
   try{
-   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(writing?{approvedInstruction:writing.fields}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
+   prepared=await ops.family({config,backlog,item:run.snapshot,directory:familyDirectory,...(writing?{approvedInstruction:writing.fields}:{}),...(origin?{priorIsolation:origin.isolation}:{}),seconds:Math.min(failureTiming.isolationSeconds,remaining()),signal:AbortSignal.any([active,isolation.signal]),checkReferences});
   }catch(error){
    if(writing&&referenceError?.reviewSession&&!signal?.aborted){
     if(runtime){closed=await runtime.close();runtime=null;if(!closed)throw Error('Test review execution remains unresolved');}
