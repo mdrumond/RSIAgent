@@ -216,7 +216,8 @@ test('an upgrade wakes a previously deferred coverage failure for exactly one ne
  assert.equal(f.backlog.status().dirtyFailures,0);
  assert.equal((await failureCampaignStatus(f.config)).hasWork,true);
  let classifications=0,families=0;
- const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
+ const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{knowledge:{identity:'routing-fixture'}}},{
+  writing:async()=>({fields:{text:'Approved fixture'}}),
   analyze:()=>f.analyze(({groups:[current],validate})=>{
    classifications++;return validate(classification(current,{bucket:'correctness'}));
   }),
@@ -274,7 +275,8 @@ test('elapsed page preparation returns to the worker before a classifier request
  const f=await fixture(t);
  await f.verify(f.start('clock'),'one.log','first failure');
  let now=0;
- const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{}},{
+ const step=()=>runCampaignFailureStep(f.config,{slots:[0,1,2,3],remainingSeconds:100,memory:{knowledge:{identity:'routing-fixture'}}},{
+  writing:async()=>({fields:{text:'Approved fixture'}}),
   analyze:args=>analyzeBacklog({...args,remainingSeconds:1},{now:()=>{const before=now;now+=1000;return before;},
    classify:()=>assert.fail('Expired page must not start a provider request')})
  });
