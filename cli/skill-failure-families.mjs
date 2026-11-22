@@ -117,16 +117,23 @@ async function isolationInputs({root,db,attempt,row,source,directory,signal}){
   // The controller accepted this proposal after checking its declared sibling fixture directories.
   if(inside(root,base)&&await realpath(base).catch(()=>null)===base&&proposal){
    const provenance={declaration:'events:'+record.sequence};
-   const readArchived=async(name,role)=>{
+   const readArchived=async(name,role,details=provenance)=>{
     signal?.throwIfAborted();
     const path=resolve(base,name);
     if(!inside(base,path)||seen.has(path)||await realpath(path).catch(()=>null)!==path)return;
     seen.add(path);const info=await stat(path);
     if(info.isFile()&&info.size<=1048576&&bytes+info.size<=8388608)
-     await retain(name,role,await readFile(path),provenance);
+     await retain(name,role,await readFile(path),details);
    };
    const localName=name=>text(name)&&inside(base,resolve(base,name))?relative(base,resolve(base,name)):null;
-   const verifier=localName(proposal.verifier);if(verifier)await readArchived(verifier,'verifier');
+   const verifier=localName(proposal.verifier);
+   if(verifier){
+    const invocation={...provenance};
+    if(text(proposal.verifier_command)&&proposal.verifier_command.length<=8192)invocation.command=proposal.verifier_command;
+    if(Array.isArray(proposal.verifier_args)&&proposal.verifier_args.every(arg=>typeof arg==='string')&&JSON.stringify(proposal.verifier_args).length<=8192)
+     invocation.args=proposal.verifier_args;
+    await readArchived(verifier,'verifier',invocation);
+   }
    const controls=proposal.controls??{},fixtures=[[controls.positive,'positive-control'],...(Array.isArray(controls.negative)?controls.negative.slice(0,8):[]).map(name=>[name,'negative-control'])];
    let inspected=0;
    async function visit(name,role){

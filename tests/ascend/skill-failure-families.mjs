@@ -145,7 +145,7 @@ test('source-history Git metadata is materialized for read-only native research'
  for(const name of ['good','bad','undeclared']){await mkdir(join(investigation,name),{recursive:true});await writeFile(join(investigation,name,'candidate.py'),name);}
  await writeFile(join(investigation,'check.py'),'assert True');
  await symlink(join(f.root,'retained.py'),join(investigation,'good','outside'));
- const proposal=emit(f.state,f.attempt.id,'curriculum-proposal',{proposal:{verifier:join(investigation,'check.py'),controls:{positive:join(investigation,'good'),negative:['bad','../../outside']}}});
+ const proposal=emit(f.state,f.attempt.id,'curriculum-proposal',{proposal:{verifier:join(investigation,'check.py'),verifier_args:['--mode','reach'],verifier_command:"python ../check.py --mode reach",controls:{positive:join(investigation,'good'),negative:['bad','../../outside']}}});
  const snapshot=emit(f.state,f.attempt.id,'source-snapshot',{tree_oid:tree}),event=emit(f.state,f.attempt.id,'verification',{actor_elapsed:60,fingerprint:await fingerprint(repo),correctness:{passed:false,receipt:{kernelSha256:sha(f.code)}}}),reference='events:'+event.sequence;f.item.evidence.groups[0].occurrences=[{reference}];
  const rows=await failureSourceInventory({...f,directory:join(f.root,'source-index')});const recovered=rows.find(r=>r.reference===reference&&r.source.snapshotReference);assert.ok(recovered);assert.equal(await readFile(recovered.path,'utf8'),f.code);assert.equal(recovered.source.snapshotReference,'events:'+snapshot.sequence);assert.equal(recovered.source.repository,'source-history/retained');
  const isolated=await mkdtemp(join(tmpdir(),'isolated-family-'));t.after(()=>rm(isolated,{recursive:true,force:true}));
@@ -156,6 +156,8 @@ test('source-history Git metadata is materialized for read-only native research'
   assert.deepEqual(Object.keys(inputs).sort(),['bad/candidate.py','check.py','check_helpers.py','good/candidate.py']);
   assert.equal(inputs['check_helpers.py'].tree,tree);
   assert.equal(await readFile(inputs['check_helpers.py'].path,'utf8'),'COUNT=7\n');
+  assert.deepEqual(inputs['check.py'].args,['--mode','reach']);
+  assert.equal(inputs['check.py'].command,'python ../check.py --mode reach');
   assert.equal(inputs['check.py'].declaration,'events:'+proposal.sequence);
   assert.equal(inputs['good/candidate.py'].role,'positive-control');
   assert.equal(inputs['bad/candidate.py'].role,'negative-control');
